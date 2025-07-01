@@ -64,14 +64,14 @@
 
 ## Installation
 
-Install ADscan using pip or pipx:
+Install ADscan using pipx (recommended):
 
 ```sh
-pip install adscan
-```
-Or, using pipx:
-```sh
 pipx install adscan
+```
+Or, using pip:
+```sh
+pip install adscan
 ```
 
 After installation, verify that the `adscan` command is available:
