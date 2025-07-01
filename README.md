@@ -82,7 +82,7 @@
 
 ## Installation
 
-Install ADscan using pipx (recommended):
+1.  Install ADscan using pipx (recommended):
 
 ```sh
 pipx install adscan
@@ -99,6 +99,22 @@ adscan --version
 ```
 
 Alternatively, download a pre-built binary from the [releases](https://github.com/ADscanPro/adscan/releases) page and place it in your `$PATH`.
+
+2.  **Run the Installer**:
+    ```sh
+    adscan install
+    ```
+    This command will:
+    - Set up the necessary Python virtual environment.
+    - Install all required Python packages.
+    - Download and configure external tools and wordlists.
+
+3.  **Verify the Installation**:
+    After the installation completes, you can check if all components are set up correctly:
+    ```sh
+    adscan check
+    ```
+    This command will perform a series of checks and report the status of dependencies and tools.
 
 ⚡ Ready to hack your first domain?
 Run `adscan start` and share your asciicast with #adscan on Twitter.
