@@ -9,9 +9,14 @@
 
 **ADscan** is a pentesting tool focused on automating the collection and enumeration of information in **Active Directory**. It offers an interactive shell with a wide range of commands to streamline auditing and penetration testing processes in Windows/AD environments.
 
----
 
-> **Edition**: **LITE edition** of ADscan. This edition includes core domain enumeration, credential dumping, and vulnerability scanning. *Trust relationships enumeration and advanced modules are available in the upcoming PRO edition.*
+> **🔥 Why ADscan-LITE?**  
+> • Shrinks AD recon/exploitation from **hours to minutes** – auto-roots some retired HTB machines.  
+> • 100 % CLI → perfect for CTFs, jump-boxes and headless labs.
+> • Seamless path to the coming PRO edition (Q4-2025).
+> 👉 **Reserve -50 % Founder price** → [wait-list](https://adscanpro.com/pro-waitlist)
+
+---
 
 > **Announcement:** ADscan was officially announced at the Hackén 2025 cybersecurity conference.
 
@@ -24,33 +29,46 @@
 - [Basic Usage Example](#basic-usage-example)
 - [Interactive Demos](#interactive-demos)
 - [Reporting Bugs](#reporting-bugs)
-- [Future Development (TODO)](#future-development-todo)
+- [Roadmap](#roadmap)
 - [Acknowledgements](#acknowledgements)
 
 ---
 
 ## Key Features
 
-- **Advanced Interactive Shell**: A powerful and user-friendly command-line interface built with, featuring:
-    - Intelligent, context-aware command and argument autocompletion.
-    - Persistent command history for easier recall and repetition of commands.
-    - Enhanced navigation and editing capabilities.
-- **Structured Output**:
-    - Clear, colored, and well-formatted output for better readability.
-    - Less verbose logging by default, with options for more detailed information.
-    - Consistent and aesthetically pleasing user experience.
-- **Sequential & Controlled Execution**: Operations are now primarily sequential, reducing network noise and providing more predictable behavior, especially in sensitive environments.
-- **Unauthenticated Enumeration**: Supports SMB, LDAP, and Kerberos scans without credentials.
-- **Authenticated Enumeration**: Allows authentication using a username and password (or NTLM hashes) to perform tasks such as:
-    - Enumeration of domains, users, and groups.
-    - Enumeration of Domain Controllers (DCs) and password policies.
-    - **PRO only**: Trust relationships enumeration.
-    - Credential dumping (SAM, LSA, DPAPI, DCSync, among others).
-    - Exploitation of vulnerabilities and insecure configurations (Kerberoast, AS-REP Roasting, SMB misconfigurations, ADCS, delegations, etc.).
-- **Cracking Module**: Integration with Hashcat and automated hash extraction for subsequent cracking.
-- **Integrated BloodHound**: Runs BloodHound for advanced analysis of attack paths in AD.
-- **Workspace Management**: Create, select, delete, and save different workspaces to organize auditing projects.
-- **Credential Persistence**: Internally stores discovered or injected credentials for automatic reuse in various modules.
+### Core engine (both Lite & Pro)
+| Feature |
+|---------|
+| Advanced interactive shell (autocomplete, history) |
+| Colored, structured output |
+| Sequential unauth/auth scans (SMB · LDAP · RPC) |
+| Workspace & credential persistence |
+| Credential dump – SAM · LSA · DPAPI · DCSync |
+| Auto AS-REP Roast & Kerberoast (includes preauth) enumeration & cracking |
+| BloodHound integration |
+| Shadow Creds / ACL path finding |
+| Auto compromised user privilege escalation |
+
+### What Lite gives you today   🔓
+| Feature |
+|---------|
+| Auto-pwn some HTB boxes |
+| Semi-automatic workflow prompts |
+| Community support on Discord |
+
+### What PRO adds in Q4-2025   🔒
+| Feature |
+|---------|
+| Trust-relationships auto-enumeration |
+| ADCS ESC auto-exploit |
+| One-click Word/PDF report |
+| Auto Cloud NTLM hash cracking |
+| Auto CVE enumeration on DCs and all domain computers |
+| Auto common pentest misconfiguration checks like LAPS, connection permissions (WinRM, RDP, SMB), Domain Admin sessions, etc.
+
+
+> **PRO activation** will be delivered as a simple license command when the edition ships.  
+> Lock the lifetime discount now → [Founder wait-list](https://adscanpro.com/pro-waitlist)
 
 ---
 
@@ -81,6 +99,9 @@ adscan --version
 ```
 
 Alternatively, download a pre-built binary from the [releases](https://github.com/ADscanPro/adscan/releases) page and place it in your `$PATH`.
+
+⚡ Ready to hack your first domain?
+Run `adscan start` and share your asciicast with #adscan on Twitter.
 
 ---
 
@@ -175,13 +196,14 @@ Alternatively, download a pre-built binary from the [releases](https://github.co
 
 ---
 
-## 🎥 Interactive Demos
+## Interactive Demos
 
 ### ⚙️ Semi-Automatic Mode (`auto=False`)
 
 [![asciicast](https://asciinema.org/a/GJqRmSw6dj7oxsSKDHVIWyZpZ.svg)](https://asciinema.org/a/GJqRmSw6dj7oxsSKDHVIWyZpZ)
 
-> In this demo, the “Forest” machine from HackTheBox is solved using ADscan in semi-automatic mode, with user intervention at each key step.
+_Auto-powns **Forest** (HTB retired) in < 1 min with ADscan-LITE._  
+Want trust-enum & PDF report? 👉 [Join Founder wait-list](https://adscanpro.com/pro-waitlist)
 
 ---
 
@@ -195,26 +217,20 @@ Alternatively, download a pre-built binary from the [releases](https://github.co
 
 ## Reporting Bugs
 
-If you encounter any bugs or unexpected errors while using ADscan, please open an issue in the “Issues” section of this GitHub repository.
+If you encounter any bugs or unexpected errors while using ADscan, please open an issue in the “Issues” section of this GitHub repository or chat on our [Discord](https://discord.com/invite/fXBR3P8H74)
 
-Your feedback is very important for improving the tool.
+Your feedback shapes the roadmap to PRO.
 
 ---
 
-## Future Development (TODO)
+## Roadmap
 
-The following are planned improvements and features:
-
-- **CVE Exploitation Expansion**: Add more specific CVE checks and exploitation modules (e.g., PrintNightmare variants, DropTheMic, etc.).
-- **Enhanced Kerberos Attacks**: Deepen support for various delegation types (e.g., Unconstrained Delegation exploitation) and other Kerberos-based attacks.
-- **Advanced ADCS Exploitation**: Incorporate more Active Directory Certificate Services escalation techniques.
-- **Broader Enumeration**: Add modules for Pre-Windows 2000 (pre2k) compatibility enumeration and SCCM/MECM discovery and exploitation vectors.
-- **NTLM Relay & Sniffing**: Integrate or improve NTLM relay attack capabilities and internal network sniffing features.
-- **ACL & Security Descriptor Analysis**: More granular ACL analysis and exploitation paths.
-- **Automated Reporting**: Generate comprehensive audit reports in multiple formats (JSON, HTML, Markdown).
-- **Post-Exploitation Integration**: Better hooks or modules for common post-exploitation activities.
-- **Visualizations**: Simple in-CLI visualizations for domain structure or trust relationships.
-- **Configuration Hardening Checks**: Modules to identify common AD misconfigurations beyond direct vulnerabilities.
+|Quarter|Milestone|
+|---|---|
+|**Q3-2025**| more ACL exploitation & pre2k module · Kerberos Unconstrained exploit|
+|**Q4-2025**|**PRO launch** – trust enum, ADCS ESC exploit, auto Word/PDF report|
+|**Q1-2026**|NTLM relay chain · SCCM module|
+|**Q2-2026**|PwnDoc report integration · Hyper-Fast Cloud computing cracking for AS-REP and Kerberoast hashes|
 
 ---
 
@@ -225,7 +241,6 @@ The following are planned improvements and features:
 - **Impacket**: For its invaluable suite of Python classes for working with network protocols.
 - **Rich**: For making the CLI beautiful and user-friendly.
 - **Prompt Toolkit**: For the advanced interactive shell capabilities.
-- **Impacket**: For its collection of indispensable scripts (secretsdump, GetUserSPNs, etc.).
 - **Certipy**: Highly useful for enumerating ADCS escalations.
 - And all other open-source tools and libraries that make ADscan possible.
 
@@ -233,6 +248,5 @@ And thanks to the entire community of pentesters and researchers who have contri
 
 ---
 
-## License
-
-This project is licensed under an EULA License. See the [LICENSE](LICENSE) file for details.
+© 2025 Yeray Martín Domínguez – Released under EULA.
+ADscan 2.0.0-lite · PRO edition arrives Q4-2025.
