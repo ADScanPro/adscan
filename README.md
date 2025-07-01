@@ -218,6 +218,10 @@ Run `adscan start` and share your asciicast with #adscan on Twitter.
 
 [![asciicast](https://asciinema.org/a/GJqRmSw6dj7oxsSKDHVIWyZpZ.svg)](https://asciinema.org/a/GJqRmSw6dj7oxsSKDHVIWyZpZ)
 
+### ⚙️ Automatic Mode (`auto=True`)
+
+[![asciicast](https://asciinema.org/a/723304.svg)](https://asciinema.org/a/723304)
+
 _Auto-powns **Forest** (HTB retired) in < 1 min with ADscan-LITE._  
 Want trust-enum & PDF report? 👉 [Join Founder wait-list](https://adscanpro.com/pro-waitlist)
 
