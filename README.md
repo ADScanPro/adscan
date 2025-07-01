@@ -95,22 +95,22 @@ Alternatively, download a pre-built binary from the [releases](https://github.co
 1.  **Start the Tool**:
     To launch the interactive shell, run:
     ```sh
-adscan start
-```
+    adscan start
+    ```
 
 2.  **Verbose Mode (Optional)**:
     For more detailed output during startup and operations, use the `-v` or `--verbose` flag:
     ```sh
-adscan start -v
-# or
-adscan start --verbose
-```
+    adscan start -v
+    # or
+    adscan start --verbose
+    ```
 
 3.  **The Interactive Prompt**:
     Once started, you will see the ADscan prompt, which includes the current workspace:
     ```sh
     (ADscan:your_workspace) > 
-```
+    ```
 
 4.  **Getting Help**:
     - For a list of all command categories:
