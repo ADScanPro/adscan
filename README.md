@@ -68,7 +68,9 @@ Install ADscan using pip or pipx:
 
 ```sh
 pip install adscan
-# Or, using pipx:
+```
+Or, using pipx:
+```sh
 pipx install adscan
 ```
 
