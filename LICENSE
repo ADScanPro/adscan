@@ -1,0 +1,58 @@
+END-USER LICENSE AGREEMENT (“EULA”)
+Version 1.0 – [01-Jul-2025]
+
+IMPORTANT: Read this EULA carefully before installing or using ADscan Lite (“Software”).
+By clicking “I Accept”, executing the Software, or otherwise using it, you (“Licensee”)
+agree to be bound by all terms.
+
+1.  GRANT OF LICENSE  
+    1.1  Licensor: Yeray Martín Domínguez, Vitoria-Gasteiz (Spain).  
+    1.2  License: Licensor grants Licensee a revocable, non-exclusive, non-transferable,
+         worldwide, royalty-free right to install and run the Software **solely for
+         internal security-assessment purposes, including paid pentesting services performed
+         for third parties**. No ownership rights are conveyed.
+
+2.  RESTRICTIONS  
+    Licensee shall NOT, and shall not permit any third party to:  
+    a. copy, distribute, publish, sublicense, sell, rent, lease or host the Software;  
+    b. modify, adapt, translate, merge or create derivative works;  
+    c. reverse engineer, decompile, disassemble, or otherwise attempt to derive
+       source code or underlying ideas, except to the extent such activity is expressly
+       permitted by applicable law notwithstanding this limitation;  
+    d. remove proprietary notices, trademarks or labels;  
+    e. use the Software to develop or enhance a competing product or service.
+
+3.  INTELLECTUAL PROPERTY  
+    All right, title and interest in and to the Software and any copies thereof remain
+    with Licensor. The Software is protected by copyright laws and international treaties.
+
+4.  UPDATES & SUPPORT  
+    Licensor may provide Updates at its sole discretion. Any Update is governed by this
+    EULA unless a separate license accompanies it.
+
+5.  WARRANTY DISCLAIMER  
+    THE SOFTWARE IS PROVIDED “AS IS” WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+    INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+    PURPOSE, AND NON-INFRINGEMENT. :contentReference[oaicite:13]{index=13}
+
+6.  LIMITATION OF LIABILITY  
+    IN NO EVENT WILL LICENSOR BE LIABLE FOR ANY INDIRECT, SPECIAL, INCIDENTAL OR
+    CONSEQUENTIAL DAMAGES, OR FOR ANY LOSS OF PROFITS, DATA, OR BUSINESS, ARISING OUT OF
+    OR RELATING TO THIS EULA OR USE OF THE SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+    OF SUCH DAMAGES.
+
+7.  TERMINATION  
+    This EULA terminates automatically if Licensee breaches any provision. Upon termination
+    Licensee must destroy all copies of the Software. Sections 3, 5, 6 and 9 survive.
+
+8.  EXPORT & COMPLIANCE  
+    Licensee shall comply with all applicable export-control and sanctions regulations.
+
+9.  GOVERNING LAW & VENUE  
+    This EULA is governed by the laws of Spain. Any dispute shall be resolved exclusively
+    in the courts of Santa Cruz de Tenerife.
+
+10. ENTIRE AGREEMENT  
+    This EULA constitutes the entire agreement and supersedes all prior understandings.
+
+© 2025 Yeray Martín Domínguez – adscanpro.com – hello@adscanpro.com
