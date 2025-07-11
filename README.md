@@ -1,12 +1,4 @@
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/fc67100a-28d6-4276-b487-0254dbf32b27" 
-       alt="logo" 
-       width="400" 
-       height="auto">
-</p>
-
 <img width="1024" height="1024" alt="adscan_logo_horizontal_tagline" src="https://github.com/user-attachments/assets/77f3b465-faf6-4ea2-8838-9fcda31f993c" />
-
 
 # ADscan
 
