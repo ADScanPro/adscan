@@ -6,9 +6,9 @@
 
 
 > **🔥 Why ADscan-LITE?**  
-> • Shrinks AD recon/exploitation from **hours to minutes** – auto-roots some retired HTB machines.  
-> • 100 % CLI → perfect for CTFs, jump-boxes and headless labs.
-> • Seamless path to the coming PRO edition (Q4-2025).
+> Shrinks AD recon/exploitation from **hours to minutes** – auto-roots some retired HTB machines.  
+> 100 % CLI → perfect for CTFs, jump-boxes and headless labs.
+> Seamless path to the coming PRO edition (Q4-2025).
 > 👉 **Reserve -50 % Founder price** → [wait-list](https://adscanpro.com/pro-waitlist)
 
 ---
