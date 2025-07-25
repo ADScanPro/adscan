@@ -118,12 +118,6 @@ Run `adscan start` and share your asciicast with #adscan on Twitter.
 
 ## Running ADscan
 
-> **Tip (Optional):** To avoid manually prefixing `sudo`, you can add the following alias to your shell RC (e.g., `~/.bashrc` or `~/.zshrc`):
->
-> ```sh
-> alias adscan='sudo -E $(which adscan)'
-> ```
-
 1.  **Start the Tool**:
     To launch the interactive shell, run:
     ```sh
@@ -189,7 +183,6 @@ Run `adscan start` and share your asciicast with #adscan on Twitter.
       (ADscan:my_audit) > set hosts 192.168.1.0/24
       (ADscan:my_audit) > start_unauth
       ```
-      Ensure your DNS (`/etc/resolv.conf`) is correctly configured or use `update_resolv_conf <domain> <dc_ip>` within the tool.
 
     - **Authenticated Scan** (if you have credentials):
       ```sh
