@@ -2,18 +2,17 @@
 
 # ADscan
 
-**ADscan** is a pentesting tool focused on automating the collection and enumeration of information in **Active Directory**. It offers an interactive shell with a wide range of commands to streamline auditing and penetration testing processes in Windows/AD environments.
+**ADscan** is a pentesting tool focused on automating collection, enumeration and common attack paths in **Active Directory**. It provides an interactive TUI with a wide range of commands to streamline internal audits and AD-focused pentests.
 
-
-> **🔥 Why ADscan-LITE?**  
-> Shrinks AD recon/exploitation from **hours to minutes** – auto-roots some retired HTB machines.  
-> 100 % CLI → perfect for CTFs, jump-boxes and headless labs.
-> Seamless path to the coming PRO edition (Q4-2025).
-> 👉 **Reserve -50 % Founder price** → [wait-list](https://adscanpro.com/pro-waitlist)
+> **🔥 Why ADscan‑LITE?**  
+> Shrinks AD recon/exploitation from **hours to minutes** – auto‑roots several retired HTB machines.  
+> 100% CLI → perfect for CTFs, jump‑boxes and headless labs.  
+> Seamless path to the coming **PRO** edition (target: late‑2025 / early‑2026).  
+> 👉 **Request a 14‑day POV (free – no card):** [adscanpro.com](https://adscanpro.com/?utm_source=github&utm_medium=readme&utm_campaign=lite_cta)
 
 ---
 
-> **Announcement:** ADscan was officially announced at the Hackén 2025 cybersecurity conference.
+> **Announcement:** ADscan was presented at the **Hackén 2025** cybersecurity conference.
 
 ## Table of Contents
 
@@ -31,172 +30,190 @@
 
 ## Key Features
 
-### Core engine (both Lite & Pro)
-| Feature |
-|---------|
-| Advanced interactive shell (autocomplete, history) |
-| Colored, structured output |
-| Sequential unauth/auth scans (SMB · LDAP · RPC) |
-| Workspace & credential persistence |
-| Credential dump – SAM · LSA · DPAPI · DCSync |
-| Auto AS-REP Roast & Kerberoast (includes preauth) enumeration & cracking |
-| BloodHound integration |
-| Shadow Creds / ACL path finding |
-| Auto compromised user privilege escalation |
+### Core engine (Lite & Pro foundation)
 
-### What Lite gives you today   🔓
-| Feature |
-|---------|
-| Auto-pwn some HTB boxes |
-| Semi-automatic workflow prompts |
-| Community support on Discord |
+| Capability                                                                          |
+| ----------------------------------------------------------------------------------- |
+| Interactive shell (autocomplete, history)                                           |
+| Colored, structured output (Rich)                                                   |
+| Sequential unauth/auth scans (SMB · LDAP · RPC)                                     |
+| Workspaces & credential persistence                                                 |
+| Kerberos enumeration & roasting (AS‑REP / Kerberoast) + cracking helpers            |
+| BloodHound collection helpers                                                       |
+| (When available) credential dump / post‑ex primitives (SAM · LSA · DPAPI · DCSync)* |
 
-### What PRO adds in Q4-2025   🔒
-| Feature |
-|---------|
-| Trust-relationships auto-enumeration |
-| ADCS ESC auto-exploit |
-| One-click Word/PDF report |
-| Auto Cloud NTLM hash cracking |
-| Auto CVE enumeration on DCs and all domain computers |
-| Auto common pentest misconfiguration checks like LAPS, connection permissions (WinRM, RDP, SMB), Domain Admin sessions, etc.
+> *Availability depends on license and safety prompts. Disruptive actions always require explicit confirmation.
 
+### What LITE gives you today 🔓
+
+|Feature|
+|---|
+|Auto‑pwn some HTB boxes|
+|Semi‑automatic workflow prompts|
+|Community support on Discord|
+
+### What PRO adds (target: late‑2025 / early‑2026) 🔒
+
+|Feature|
+|---|
+|Trust‑relationships auto‑enumeration|
+|ADCS ESC auto‑exploit|
+|One‑click **Word/PDF** report (MITRE/CVSS templated)|
+|Cloud‑accelerated NTLM/TGS/AS‑REP cracking orchestration|
+|Broad CVE/misconfig checks (LAPS, WinRM/RDP/SMB access, DA sessions, etc.)|
 
 > **PRO activation** will be delivered as a simple license command when the edition ships.  
-> Lock the lifetime discount now → [Founder wait-list](https://adscanpro.com/pro-waitlist)
+> Want early access for your consultancy? 👉 **Request a 14‑day POV**: [adscanpro.com](https://adscanpro.com/?utm_source=github&utm_medium=readme&utm_campaign=lite_cta)
 
 ---
 
 ## System Requirements
 
-- **Operating System**: Linux (Debian, Ubuntu, Kali Linux, and other Debian-based distributions, including older versions).
-- **Privileges**: Root access is required for installation and full functionality (e.g., network operations, tool installation).
-- **Dependencies**: All necessary external tools and Python libraries are managed and installed by the `install` command.
+- **OS**: Linux (Debian/Ubuntu/Kali and other Debian‑based distros). Older versions supported.
+    
+- **Privileges**: Root access required for installation & full functionality (tooling installs, low‑level ops).
+    
+- **Dependencies**: Managed via `adscan install` (external tools + Python libs).
+    
 
 ---
 
 ## Installation
 
-1.  Install ADscan using pipx (recommended):
+1. **Install with pipx (recommended):**
+    
 
 ```sh
 pipx install adscan
 ```
-Or, using pip:
+
+Or using pip:
+
 ```sh
 pip install adscan
 ```
 
-After installation, verify that the `adscan` command is available:
+Verify the CLI is available:
 
 ```sh
 adscan --version
 ```
 
-Alternatively, download a pre-built binary from the [releases](https://github.com/ADscanPro/adscan/releases) page and place it in your `$PATH`.
+Alternatively, download a pre‑built binary from the [releases](https://github.com/ADscanPro/adscan/releases) page.
 
-2.  **Run the Installer**:
-    ```sh
-    adscan install
-    ```
-    This command will:
-    - Set up the necessary Python virtual environment.
-    - Install all required Python packages.
-    - Download and configure external tools and wordlists.
+2. **Run the installer**
+    
 
-3.  **Verify the Installation**:
-    After the installation completes, you can check if all components are set up correctly:
-    ```sh
-    adscan check
-    ```
-    This command will perform a series of checks and report the status of dependencies and tools.
+```sh
+adscan install
+```
 
-⚡ Ready to hack your first domain?
-Run `adscan start` and share your asciicast with #adscan on Twitter.
+This will:
+
+- Set up the Python virtual environment.
+    
+- Install required Python packages.
+    
+- Download & configure external tools and wordlists.
+    
+
+3. **Verify installation**
+    
+
+```sh
+adscan check
+```
+
+Performs checks and reports the status of dependencies and tools.
+
+⚡ Ready to hack your first domain?  
+Run `adscan start` and share your asciicast with #adscan on X/Twitter.
 
 ---
 
 ## Running ADscan
 
-1.  **Start the Tool**:
-    To launch the interactive shell, run:
-    ```sh
-    adscan start
-    ```
+1. **Start the TUI**
+    
 
-2.  **Verbose Mode (Optional)**:
-    For more detailed output during startup and operations, use the `-v` or `--verbose` flag:
-    ```sh
-    adscan start -v
-    # or
-    adscan start --verbose
-    ```
+```sh
+adscan start
+```
 
-3.  **The Interactive Prompt**:
-    Once started, you will see the ADscan prompt, which includes the current workspace:
-    ```sh
-    (ADscan:your_workspace) > 
-    ```
+2. **Verbose mode (optional)**
+    
 
-4.  **Getting Help**:
-    - For a list of all command categories:
-      ```sh
-      (ADscan:your_workspace) > help
-      ```
-    - For help on a specific category or command:
-      ```sh
-      (ADscan:your_workspace) > help <category_or_command>
-      ```
+```sh
+adscan start -v
+# or
+adscan start --verbose
+```
+
+3. **Interactive prompt**
+    
+
+```text
+(ADscan:your_workspace) >
+```
+
+4. **Getting help**
+    
+
+```sh
+help                 # categories
+help <command>       # command‑level help
+```
 
 ---
 
 ## Basic Usage Example
 
-1.  **Create or Select a Workspace**:
-    Organize your audits by creating or selecting a workspace.
-    ```sh
-    (ADscan) > workspace create my_audit
-    (ADscan:my_audit) > 
-    ```
-    Or select an existing one:
-    ```sh
-    (ADscan) > workspace select
-    # (Follow prompts to choose a workspace)
-    ```
+1. **Create/select a workspace**
+    
 
-2.  **Configure Network Interface**:
-    Set the network interface for operations. Your IP will be automatically assigned to the `myip` variable.
-    ```sh
-    (ADscan:my_audit) > set iface eth0
-    ```
+```sh
+(ADscan) > workspace create my_audit
+(ADscan:my_audit) >
+# or
+(ADscan) > workspace select
+```
 
-3.  **Choose Automation Level**:
-    - `set auto True`: More automation, fewer prompts (good for CTFs).
-    - `set auto False`: Semi-automatic, more control (recommended for real audits).
-    ```sh
-    (ADscan:my_audit) > set auto False
-    ```
+2. **Configure network interface**
+    
 
-4.  **Perform Scans**:
-    - **Unauthenticated Scan** (if you don't have credentials yet):
-      ```sh
-      (ADscan:my_audit) > set hosts 192.168.1.0/24
-      (ADscan:my_audit) > start_unauth
-      ```
+```sh
+(ADscan:my_audit) > set iface eth0
+```
 
-    - **Authenticated Scan** (if you have credentials):
-      ```sh
-      (ADscan:my_audit) > start_auth <domain_name> <username> <password_or_hash>
-      ```
+3. **Choose automation level**
+    
 
-5.  **Enumeration and Exploitation**:
-    The tool will guide you through enumeration options based on scan results. Specific commands are also available:
-    ```sh
-    (ADscan:my_audit) > dump_lsa <domain> <user> <password> <host> <islocal>
-    (ADscan:my_audit) > kerberoast <domain>
-    (ADscan:my_audit) > bloodhound_python <domain>
-    ```
-    Exploitation actions always require confirmation, even in automatic mode.
+```sh
+(ADscan:my_audit) > set auto False   # recommended for real audits
+# set auto True   # faster for labs/CTFs
+```
+
+4. **Run scans**
+    
+
+- **Unauthenticated**
+    
+
+```sh
+(ADscan:my_audit) > set hosts 192.168.1.0/24
+(ADscan:my_audit) > start_unauth
+```
+
+- **Authenticated**
+    
+
+```sh
+(ADscan:my_audit) > start_auth <domain> <pdc_ip> <username> <password_or_hash>
+```
+
+5. **Enumeration & exploitation**  
+    Follow interactive prompts. Disruptive actions always prompt for confirmation, even in `auto=True`.
+    
 
 ---
 
@@ -208,26 +225,32 @@ Run `adscan start` and share your asciicast with #adscan on Twitter.
 
 ### ⚙️ Automatic Mode (`auto=True`)
 
-[![asciicast](https://asciinema.org/a/GJqRmSw6dj7oxsSKDHVIWyZpZ.svg)](https://asciinema.org/a/723304)
+[![asciicast](https://asciinema.org/a/723117.svg)](https://asciinema.org/a/734180)
 
-_Auto-powns **Forest** (HTB retired) in < 1 min with ADscan-LITE._  
-Want trust-enum & PDF report? 👉 [Join Founder wait-list](https://adscanpro.com/pro-waitlist)
+_Auto‑pwns **Forest** (HTB retired) in ~3 minutes with ADscan‑LITE._  
+Want trust‑enum, CVE, report and much more? 👉 **Request a 14‑day POV**: [adscanpro.com](https://adscanpro.com/?utm_source=github&utm_medium=readme&utm_campaign=lite_cta)
 
 ---
 
-## Highlighted Features
+## Highlight: Modes & Data Handling
 
-- **Automatic/Semi-Automatic Mode**: While `auto=True` speeds up scanning, it is recommended to use `auto=False` for more control in large networks. _Exploitation actions always require confirmation._
-- **Data Backup**: Credentials and progress are automatically stored in JSON files within each workspace, making it easier to resume the audit after restarting the tool.
-- **Service Detection**: Based on _nmap_, _netexec_, and other utilities, it groups IPs according to detected services (SMB, WinRM, LDAP, etc.) for subsequent exploitation.
+- **Automatic/Semi‑Automatic**: `auto=True` accelerates enumeration; `auto=False` provides more control for production networks.
+    
+- **Evidence & backups**: Credentials and progress are stored per‑workspace (JSON), making it easy to resume.
+    
+- **Service detection**: IPs are grouped by detected services (SMB, WinRM, LDAP, etc.) for next steps.
+    
+- **Safety**: Potentially disruptive operations are gated and require explicit confirmation.
+    
+- **Telemetry**: Opt‑in by default for the LITE build; toggle off anytime with `set telemetry off` (no sensitive payloads; used to improve speed & stability).
+    
 
 ---
 
 ## Reporting Bugs
 
-If you encounter any bugs or unexpected errors while using ADscan, please open an issue in the “Issues” section of this GitHub repository or chat on our [Discord](https://discord.com/invite/fXBR3P8H74)
-
-Your feedback shapes the roadmap to PRO.
+Open an issue in this repo or chat on **Discord**: [https://discord.com/invite/fXBR3P8H74](https://discord.com/invite/fXBR3P8H74)  
+Your feedback shapes the PRO roadmap.
 
 ---
 
@@ -235,26 +258,33 @@ Your feedback shapes the roadmap to PRO.
 
 |Quarter|Milestone|
 |---|---|
-|**Q3-2025**| more ACL exploitation & pre2k module · Kerberos Unconstrained exploit|
-|**Q4-2025**|**PRO launch** – trust enum, ADCS ESC exploit, auto Word/PDF report|
-|**Q1-2026**|NTLM relay chain · SCCM module|
-|**Q2-2026**|PwnDoc report integration · Hyper-Fast Cloud computing cracking for AS-REP and Kerberoast hashes|
+|**Q3‑2025**|More ACL exploitation & pre‑2k module · Kerberos unconstrained pathing|
+|**Q4‑2025**|**PRO** release target – trust enum, ADCS ESC exploit, auto Word/PDF report|
+|**Q1‑2026**|NTLM relay chain · SCCM module|
+|**Q2‑2026**|PwnDoc report integration · Cloud‑accelerated cracking for AS‑REP/Kerberoast|
+
+> Timelines are targets, not promises; feature scope may adjust based on POV feedback.
 
 ---
 
 ## Acknowledgements
 
-- **NetExec**: For its powerful assistance in SMB, WinRM, etc. enumeration.
-- **BloodHound & bloodhound.py**: An essential tool for collecting and analyzing AD attack paths.
-- **Impacket**: For its invaluable suite of Python classes for working with network protocols.
-- **Rich**: For making the CLI beautiful and user-friendly.
-- **Prompt Toolkit**: For the advanced interactive shell capabilities.
-- **Certipy**: Highly useful for enumerating ADCS escalations.
-- And all other open-source tools and libraries that make ADscan possible.
-
-And thanks to the entire community of pentesters and researchers who have contributed knowledge and tools to the Active Directory ecosystem.
+- **NetExec** — SMB/WinRM enumeration
+    
+- **BloodHound & bloodhound.py** — AD attack path collection & analysis
+    
+- **Impacket** — network protocol tooling
+    
+- **Rich** — CLI UX
+    
+- **Prompt Toolkit** — interactive shell
+    
+- **Certipy** — ADCS escalation enumeration
+    
+- And the broader community of researchers and maintainers powering the AD ecosystem.
+    
 
 ---
 
-© 2025 Yeray Martín Domínguez – Released under EULA.
-ADscan 2.0.0-lite · PRO edition arrives Q4-2025.
+© 2025 Yeray Martín Domínguez – Released under EULA.  
+ADscan 2.1.2‑lite · PRO edition target: late‑2025 / early‑2026.
