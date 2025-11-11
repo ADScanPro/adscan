@@ -115,7 +115,6 @@ This will:
 - Install required Python packages.
     
 - Download & configure external tools and wordlists.
-    
 
 3. **Verify installation**
     
@@ -267,6 +266,19 @@ Your feedback shapes the PRO roadmap.
 
 ---
 
+## Compromise Coverage Lab Matrix
+
+| Provider | Lab / Machine | Status |
+| --- | --- | --- |
+| Hack The Box | Active (retired) | ✅ |
+| Hack The Box | Forest (retired) | ✅ |
+| Hack The Box | Sauna (retired) | ✅ |
+| Hack The Box | Cicada (retired) | ✅ |
+
+> Looking for contributions: if you maintain AD-centric labs (HTB, TryHackMe, VulnLab, custom GOAD snapshots) that ADscan compromises end-to-end, open an issue or PR with details so we can expand the matrix.
+
+---
+
 ## Acknowledgements
 
 - **NetExec** — SMB/WinRM enumeration
@@ -287,4 +299,4 @@ Your feedback shapes the PRO roadmap.
 ---
 
 © 2025 Yeray Martín Domínguez – Released under EULA.  
-ADscan 2.1.2‑lite · PRO edition target: late‑2025 / early‑2026.
+ADscan 2.2.0‑lite · PRO edition target: late‑2025 / early‑2026.
