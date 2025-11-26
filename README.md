@@ -24,7 +24,6 @@
 - [Interactive Demos](#interactive-demos)
 - [Reporting Bugs](#reporting-bugs)
 - [Roadmap](#roadmap)
-- [Acknowledgements](#acknowledgements)
 
 ---
 
