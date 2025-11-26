@@ -314,27 +314,8 @@ Your feedback shapes the PRO roadmap.
 | Hack The Box | Cicada (retired) | ✅ |
 
 > Looking for contributions: if you maintain AD-centric labs (HTB, TryHackMe, VulnLab, custom GOAD snapshots) that ADscan compromises end-to-end, open an issue or PR with details so we can expand the matrix.
-
----
-
-## Acknowledgements
-
-- **NetExec** — SMB/WinRM enumeration
     
-- **BloodHound & bloodhound.py** — AD attack path collection & analysis
-    
-- **Impacket** — network protocol tooling
-    
-- **Rich** — CLI UX
-    
-- **Prompt Toolkit** — interactive shell
-    
-- **Certipy** — ADCS escalation enumeration
-    
-- And the broader community of researchers and maintainers powering the AD ecosystem.
-    
-
 ---
 
 © 2025 Yeray Martín Domínguez – Released under EULA.  
-ADscan 2.2.0‑lite · PRO edition target: late‑2025 / early‑2026.
+ADscan 2.3.0‑lite · PRO edition target: late‑2025 / early‑2026.
