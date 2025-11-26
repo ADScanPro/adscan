@@ -115,6 +115,8 @@ This will:
 - Install required Python packages.
     
 - Download & configure external tools and wordlists.
+    
+- Launch BloodHound CE and configure the admin account automatically (`admin` / `Adscan4thewin!` by default).
 
 3. **Verify installation**
     
@@ -131,6 +133,10 @@ Run `adscan start` and share your asciicast with #adscan on X/Twitter.
 ---
 
 ## Running ADscan
+
+### Interactive Mode
+
+The primary way to use ADscan is through the interactive TUI:
 
 1. **Start the TUI**
     
@@ -162,6 +168,39 @@ adscan start --verbose
 help                 # categories
 help <command>       # command‑level help
 ```
+
+### CI/CD Mode (Non-Interactive)
+
+For automated testing and CI/CD pipelines, use the `ci` command:
+
+```sh
+# Unauthenticated scan
+adscan ci unauth --type ctf --interface tun0 --hosts 10.10.10.10
+
+# Authenticated scan
+adscan ci auth --type ctf --interface tun0 --domain example.local --dc-ip 10.10.10.1 --username user --password pass
+
+# Keep workspace after scan (useful for debugging)
+adscan ci unauth --type ctf --interface tun0 --hosts 10.10.10.10 --keep-workspace
+```
+
+**CI Command Options:**
+- `mode`: `auth` or `unauth` (required)
+- `--type`, `-t`: Workspace type: `ctf` or `audit` (required)
+- `--interface`, `-i`: Network interface to use (required)
+- `--hosts`: CIDR range (required for `unauth` mode)
+- `--domain`: Domain to scan (required for `auth` mode)
+- `--dc-ip`: PDC IP for `auth` mode
+- `--username`, `-u`: Username for `auth` mode
+- `--password`, `-p`: Password for `auth` mode
+- `--workspace`, `-w`: Optional workspace name (random if omitted)
+- `--keep-workspace`: Keep the workspace after scan completion (do not delete auto-created workspace)
+- `--verbose`, `-v`: Enable verbose mode
+
+**Exit Codes:**
+- `0`: Scan completed successfully with flags validated
+- `1`: Scan failed
+- `2`: Scan successful but flags invalid/missing
 
 ---
 
@@ -272,12 +311,30 @@ Your feedback shapes the PRO roadmap.
 | --- | --- | --- |
 | Hack The Box | Active (retired) | ✅ |
 | Hack The Box | Forest (retired) | ✅ |
-| Hack The Box | Sauna (retired) | ✅ |
 | Hack The Box | Cicada (retired) | ✅ |
 
-> Looking for contributions: if you maintain AD-centric labs (HTB, TryHackMe, VulnLab, custom GOAD snapshots) that ADscan compromises end-to-end, open an issue or PR with details so we can expand the matrix.    
+> Looking for contributions: if you maintain AD-centric labs (HTB, TryHackMe, VulnLab, custom GOAD snapshots) that ADscan compromises end-to-end, open an issue or PR with details so we can expand the matrix.
+
+---
+
+## Acknowledgements
+
+- **NetExec** — SMB/WinRM enumeration
+    
+- **BloodHound & bloodhound.py** — AD attack path collection & analysis
+    
+- **Impacket** — network protocol tooling
+    
+- **Rich** — CLI UX
+    
+- **Prompt Toolkit** — interactive shell
+    
+- **Certipy** — ADCS escalation enumeration
+    
+- And the broader community of researchers and maintainers powering the AD ecosystem.
+    
 
 ---
 
 © 2025 Yeray Martín Domínguez – Released under EULA.  
-ADscan 2.2.1‑lite · PRO edition target: late‑2025 / early‑2026.
+ADscan 2.2.0‑lite · PRO edition target: late‑2025 / early‑2026.
