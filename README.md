@@ -593,6 +593,3 @@ ADscan LITE 2.2.1 | PRO edition: Q4 2025
 **⭐ Star this repo if ADscan helped you!** | **🔗 Share with [#adscan](https://twitter.com/search?q=%23adscan)**
 
 Made with ❤️ for the pentesting community
-
-</div>
->>>>>>> d236bb8 (Update README.md)
