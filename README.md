@@ -516,7 +516,7 @@ ADscan 2.3.0‑lite · PRO edition target: late‑2025 / early‑2026.
 =======
 ## 📚 Documentation
 
-Comprehensive documentation available at **[docs.adscanpro.com](https://adscanpro.com/docs)**
+Comprehensive documentation available at **[adscanpro.com/docs](https://adscanpro.com/docs)**
 
 - 📖 [Getting Started](https://adscanpro.com/docs/getting-started)
 - 🔧 [Command Reference](https://adscanpro.com/docs/commands)
