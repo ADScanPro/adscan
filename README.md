@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 <img width="1024" height="1024" alt="adscan_logo_horizontal_tagline" src="https://github.com/user-attachments/assets/77f3b465-faf6-4ea2-8838-9fcda31f993c" />
 
 # ADscan
