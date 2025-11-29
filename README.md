@@ -202,7 +202,6 @@ Comprehensive documentation available at **[adscanpro.com/docs](https://adscanpr
 - 📖 [Getting Started](https://adscanpro.com/docs/getting-started)
 - 🔧 [Command Reference](https://adscanpro.com/docs/commands)
 - 🎓 [CTF Walkthrough](https://adscanpro.com/docs/guides/ctf-walkthrough)
-- 🏢 [Enterprise Audit Guide](https://adscanpro.com/docs/guides/enterprise-audit)
 
 ---
 
