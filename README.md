@@ -1,5 +1,3 @@
-<div align="center">
-  
 # ADscan
 
 <div align="center">
