@@ -6,7 +6,7 @@
 
 **Automated Active Directory Security Scanner**
 
-[![Version](https://img.shields.io/badge/version-3.0.1--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
+[![Version](https://img.shields.io/badge/version-3.0.2--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
 [![License](https://img.shields.io/badge/license-EULA-red.svg)](https://github.com/ADscanPro/adscan/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://github.com/ADscanPro/adscan)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -265,7 +265,7 @@ Comprehensive documentation available at **[adscanpro.com/docs](https://adscanpr
 ## 📜 License
 
 © 2025 Yeray Martín Domínguez — Released under custom EULA
-ADscan LITE 3.0.1 | PRO edition: Q4 2025
+ADscan LITE 3.0.2 | PRO edition: Q4 2025
 
 ---
 
