@@ -1,10 +1,10 @@
 <div align="center">
-
-<img width="800" alt="ADscan Logo" src="https://github.com/user-attachments/assets/77f3b465-faf6-4ea2-8838-9fcda31f993c" />
-
+  
 # ADscan
 
-**Automated Active Directory Security Scanner**
+<div align="center">
+
+<img width="800" alt="ADscan Logo" src="https://github.com/user-attachments/assets/77f3b465-faf6-4ea2-8838-9fcda31f993c" />
 
 [![Version](https://img.shields.io/badge/version-3.0.2--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
 [![License](https://img.shields.io/badge/license-EULA-red.svg)](https://github.com/ADscanPro/adscan/blob/main/LICENSE)
