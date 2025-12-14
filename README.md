@@ -135,7 +135,6 @@ ADscan supports non-interactive mode for automated testing.
 - **Telemetry**: Opt-in by default (toggle with `set telemetry off`)
 - **No sensitive data**: Only anonymized error data and feature usage
 - **Local-first**: All data stored in `~/.adscan/workspaces/`
-- **Open source LITE**: Transparent security tool
 
 ---
 
