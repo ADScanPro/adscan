@@ -96,15 +96,9 @@ adscan start
 
 ---
 
-## 🎬 Interactive Demos
+## 🎬 Demo
 
-### Semi-Automatic Mode (`auto=False`)
-
-[![asciicast](https://asciinema.org/a/GJqRmSw6dj7oxsSKDHVIWyZpZ.svg)](https://asciinema.org/a/GJqRmSw6dj7oxsSKDHVIWyZpZ)
-
-### Automatic Mode (`auto=True`)
-
-[![asciicast](https://asciinema.org/a/723117.svg)](https://asciinema.org/a/734180)
+[![asciicast](https://asciinema.org/a/734180.svg)](https://asciinema.org/a/734180?autoplay=1)
 
 _Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 
