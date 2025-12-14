@@ -17,6 +17,14 @@
 
 ---
 
+## 🎬 Demo
+
+[![asciicast](https://asciinema.org/a/734180.svg)](https://asciinema.org/a/734180?autoplay=1)
+
+_Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
+
+---
+
 ## 🎯 Overview
 
 **ADscan** is a professional pentesting tool that automates Active Directory reconnaissance, enumeration, and exploitation. It reduces AD assessment time from **hours to minutes** with an intelligent interactive CLI.
@@ -99,14 +107,6 @@ adscan start
 ```
 
 > **📚 Complete installation guide, quick start, and full documentation → [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=install_cta)**
-
----
-
-## 🎬 Demo
-
-[![asciicast](https://asciinema.org/a/734180.svg)](https://asciinema.org/a/734180?autoplay=1)
-
-_Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 
 ---
 
