@@ -11,7 +11,7 @@
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Discord](https://img.shields.io/discord/1355089867096199300?color=7289da&label=Discord&logo=discord&logoColor=white)](https://discord.com/invite/fXBR3P8H74)
 
-[Features](#-features) • [Installation](#-installation) • [Quick Start](#-quick-start) • [Documentation](https://adscanpro.com/docs) • [Discord](https://discord.com/invite/fXBR3P8H74)
+**[📚 Complete Documentation → adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=docs_cta)** • [Discord](https://discord.com/invite/fXBR3P8H74)
 
 </div>
 
@@ -29,13 +29,7 @@
 - 🔐 **Semi/automatic modes** for labs and production environments
 - 📊 **BloodHound integration** with automated path analysis
 
-> **Try ADscan PRO** — Request a **30-day paid POV (Proof of Value)** at [adscanpro.com](https://adscanpro.com/?utm_source=github&utm_medium=readme&utm_campaign=lite_cta)
->
-> POV details:
-> - **Duration**: 30 days
-> - **Launch pricing (beta)**: **€497 + VAT** (first **3–5 teams**: **€297 + VAT** in exchange for a case study + testimonial + detailed feedback)
-> - **Guarantee**: **100% refund** if, after onboarding + an agreed baseline, you don't get at least one usable credential **or** ADscan doesn't save **≥1 full day** of work
-> - **Limited exception**: up to **2 case-study POV slots** may be fee-waived for perfect-fit teams who agree to measure baseline vs ADscan and provide a case study
+> **Try ADscan PRO** — Request a 14-day free POV at [adscanpro.com](https://adscanpro.com/?utm_source=github&utm_medium=readme&utm_campaign=lite_cta) 🔥
 
 ---
 
@@ -85,80 +79,20 @@
 
 ---
 
-## 🚀 Installation
-
-### Option 1: pipx (Recommended)
+## 🚀 Quick Install
 
 ```bash
+# Install via pipx (recommended)
 pipx install adscan
-```
 
-### Option 2: pip
-
-```bash
-pip install adscan
-```
-
-### Option 3: Pre-built Binary
-
-```bash
-# Download latest release
-wget https://github.com/ADscanPro/adscan/releases/latest/download/adscan
-chmod +x adscan
-sudo mv adscan /usr/local/bin/
-```
-
-### Install Dependencies
-
-```bash
-# Setup Python environment, tools, and wordlists
+# Install dependencies
 adscan install
 
-# Verify installation
-adscan check
+# Start ADscan
+adscan start
 ```
 
-**⚡ Ready to hack!** — Run `adscan start` and share your results with [#adscan](https://twitter.com/search?q=%23adscan) on X/Twitter.
-
----
-
-## ⚡ Quick Start
-
-### 1️⃣ Start ADscan
-
-```bash
-adscan start -v
-```
-
-### 2️⃣ Create Workspace
-
-```bash
-(ADscan) > workspace create my_audit
-```
-
-### 3️⃣ Configure Scan
-
-```bash
-(ADscan:my_audit) > set iface tun0
-(ADscan:my_audit) > set auto False  # Semi-automatic (recommended)
-```
-
-### 4️⃣ Run Scan
-
-**Unauthenticated:**
-```bash
-(ADscan:my_audit) > set hosts 192.168.1.0/24
-(ADscan:my_audit) > start_unauth
-```
-
-**Authenticated:**
-```bash
-(ADscan:my_audit) > start_auth domain.local 10.10.10.1 username password
-```
-
-### 5️⃣ Follow Prompts
-
-ADscan guides you through enumeration and exploitation automatically! 🎯
+> **📚 Complete installation guide, quick start, and full documentation → [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=install_cta)**
 
 ---
 
@@ -178,35 +112,9 @@ _Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 
 ## 🤖 CI/CD Mode
 
-Run ADscan non-interactively for automated testing:
+ADscan supports non-interactive mode for automated testing. 
 
-```bash
-# Unauthenticated scan
-adscan ci unauth --type ctf --interface tun0 --hosts 10.10.10.10
-
-# Authenticated scan
-adscan ci auth --type ctf --interface tun0 \
-  --domain example.local --dc-ip 10.10.10.1 \
-  --username user --password pass
-
-# Keep workspace for debugging
-adscan ci unauth --type ctf --interface tun0 --hosts 10.10.10.10 --keep-workspace
-```
-
-**Exit Codes:**
-- `0`: Success with flags validated
-- `1`: Scan failed
-- `2`: Scan successful but flags invalid/missing
-
----
-
-## 📚 Documentation
-
-Comprehensive documentation available at **[adscanpro.com/docs](https://adscanpro.com/docs)**
-
-- 📖 [Getting Started](https://adscanpro.com/docs/getting-started)
-- 🔧 [Command Reference](https://adscanpro.com/docs/commands)
-- 🎓 [CTF Walkthrough](https://adscanpro.com/docs/guides/ctf-walkthrough)
+> **📚 Complete CI/CD documentation and examples → [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=cicd_cta)**
 
 ---
 
@@ -231,16 +139,13 @@ Comprehensive documentation available at **[adscanpro.com/docs](https://adscanpr
 
 ---
 
-## 🗺️ Roadmap
+## 📚 Documentation
 
-| Quarter | Milestone |
-|---------|-----------|
-| **Q3 2025** | More ACL exploitation, pre-2k module, Kerberos unconstrained pathing |
-| **Q4 2025** | **PRO release** — Trust enum, ADCS ESC, auto reports |
-| **Q1 2026** | NTLM relay chain, SCCM module |
-| **Q2 2026** | PwnDoc integration, cloud-accelerated cracking |
+**All documentation, guides, walkthroughs, and command references are available at:**
 
-> Timelines are targets, not promises. Features may adjust based on feedback.
+### **[→ adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=docs_section)**
+
+Includes installation guides, quick start, complete command reference, CTF walkthroughs, lab guides, best practices, and more.
 
 ---
 
@@ -258,6 +163,7 @@ Comprehensive documentation available at **[adscanpro.com/docs](https://adscanpr
 - 💬 Chat on [Discord](https://discord.com/invite/fXBR3P8H74)
 - 🐛 Report bugs via [GitHub Issues](https://github.com/ADscanPro/adscan/issues)
 - 📧 Enterprise support: [hello@adscanpro.com](mailto:hello@adscanpro.com)
+- 📚 **[Complete documentation → adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=support_cta)**
 
 ---
 
