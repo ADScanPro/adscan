@@ -29,7 +29,13 @@
 - 🔐 **Semi/automatic modes** for labs and production environments
 - 📊 **BloodHound integration** with automated path analysis
 
-> **Try ADscan PRO** — Request a 14-day free POV at [adscanpro.com](https://adscanpro.com/?utm_source=github&utm_medium=readme&utm_campaign=lite_cta) 🔥
+> **Try ADscan PRO** — Request a **30-day paid POV (Proof of Value)** at [adscanpro.com](https://adscanpro.com/?utm_source=github&utm_medium=readme&utm_campaign=lite_cta)
+>
+> POV details:
+> - **Duration**: 30 days
+> - **Launch pricing (beta)**: **€497 + VAT** (first **3–5 teams**: **€297 + VAT** in exchange for a case study + testimonial + detailed feedback)
+> - **Guarantee**: **100% refund** if, after onboarding + an agreed baseline, you don't get at least one usable credential **or** ADscan doesn't save **≥1 full day** of work
+> - **Limited exception**: up to **2 case-study POV slots** may be fee-waived for perfect-fit teams who agree to measure baseline vs ADscan and provide a case study
 
 ---
 
