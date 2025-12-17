@@ -53,8 +53,8 @@ _Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 >   - Modes: automatic / semi-automatic / manual
 >   - 1:1 onboarding (60-90 min) + priority support
 >   - MITRE-mapped report templates
-> - **📊 In exchange**: Measured case study (baseline vs agent performance) + honest testimonial + detailed feedback
-> - **Zero risk**: If the agent doesn't deliver results (≥1 credential OR ≥1 day saved), simply walk away—no strings attached
+> - **📊 In exchange**: Measured case study (baseline vs ADscan) + honest testimonial + detailed feedback
+> - **Zero risk**: If it doesn't deliver results (≥1 credential OR ≥1 day saved), simply walk away—no strings attached
 
 ---
 
