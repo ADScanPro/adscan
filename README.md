@@ -27,23 +27,34 @@ _Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 
 ## 🎯 Overview
 
-**ADscan** is a professional pentesting tool that automates Active Directory reconnaissance, enumeration, and exploitation. It reduces AD assessment time from **hours to minutes** with an intelligent interactive CLI.
+**ADscan** is an interactive CLI that automates and orchestrates Active Directory pentesting workflows. It helps teams ship internal AD engagements faster by reducing manual glue-work (tool handoffs, copy/paste, evidence collection, reporting).
+
+### Operation Modes
+
+- 🤖 **Automatic** (`auto=True`, labs/CTF): minimal prompts, fast flow
+- 🤝 **Semi-automatic** (`auto=False`, internal/prod): prompts before risky actions
+- 🎮 **Manual**: full operator control
 
 ### Why ADscan?
 
-- 🚀 **Auto-pwns retired HTB machines** (Forest, Active, Cicada)
-- ⚡ **Shrinks AD recon from hours to minutes**
-- 🎮 **Perfect for CTFs, labs, and jump-boxes** (100% CLI)
-- 🔐 **Semi/automatic modes** for labs and production environments
-- 📊 **BloodHound integration** with automated path analysis
+- 🚀 **Auto-pwns retired HTB machines** in minutes (Forest, Active, Cicada)
+- ⚡ **Save time**: less glue-work, more repeatable workflows
+- 🎮 **Built for pentesters**: CLI-first, designed for operators
+- 🧾 **Evidence packaging**: workspace outputs + report templates
 
-> **Try ADscan PRO** — Request a **30-day paid POV (Proof of Value)** at [adscanpro.com](https://adscanpro.com/?utm_source=github&utm_medium=readme&utm_campaign=lite_cta)
+> **Try ADscan PRO** — Request a **FREE 30-Day POV (first 5 teams)** at [adscanpro.com](https://adscanpro.com/?utm_source=github&utm_medium=readme&utm_campaign=lite_cta)
 >
-> POV details:
-> - **Duration**: 30 days
-> - **Launch pricing (beta)**: **€497 + VAT** (first **3–5 teams**: **€297 + VAT** in exchange for a case study + testimonial + detailed feedback)
-> - **Guarantee**: **100% refund** if, after onboarding + an agreed baseline, you don't get at least one usable credential **or** ADscan doesn't save **≥1 full day** of work
-> - **Limited exception**: up to **2 case-study POV slots** may be fee-waived for perfect-fit teams who agree to measure baseline vs ADscan and provide a case study
+> **🔥 30-Day POV — COMPLETELY FREE (First 5 Teams Only):**
+> - **⚡ LIMITED**: Only **5 FREE POV slots** available
+> - **Duration**: 1 internal AD pentest project
+> - **Team**: Up to 5 pentesters
+> - **Pricing**: **100% FREE** for first 5 teams (after that: €497 + VAT standard)
+> - **Includes**:
+>   - Modes: automatic / semi-automatic / manual
+>   - 1:1 onboarding (60-90 min) + priority support
+>   - MITRE-mapped report templates
+> - **📊 In exchange**: Measured case study (baseline vs agent performance) + honest testimonial + detailed feedback
+> - **Zero risk**: If the agent doesn't deliver results (≥1 credential OR ≥1 day saved), simply walk away—no strings attached
 
 ---
 
@@ -55,12 +66,13 @@ _Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 
 ### 🔓 LITE (Free)
 
-- ✅ Interactive shell (autocomplete, history)
-- ✅ Unauthenticated & authenticated scans
-- ✅ Kerberos attacks (AS-REP, Kerberoast)
-- ✅ BloodHound data collection
-- ✅ Credential dumping (SAM, LSA, DCSync)
-- ✅ Workspace & credential management
+**Core capabilities:**
+- ✅ Three operation modes (automatic/semi-automatic/manual)
+- ✅ Unauthenticated & authenticated reconnaissance
+- ✅ Kerberos exploitation (AS-REP, Kerberoast)
+- ✅ BloodHound integration & analysis
+- ✅ Credential harvesting (SAM, LSA, DCSync)
+- ✅ Workspace & evidence management
 - ✅ Community Discord support
 
 </td>
@@ -68,13 +80,15 @@ _Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 
 ### 🔒 PRO (Coming Q4 2025)
 
-- 🎯 Trust relationship auto-enum
-- 🎫 ADCS ESC auto-exploit
-- 📄 One-click Word/PDF reports
+**Planned enhancements:**
+- 🎯 Trust relationship autonomous enumeration
+- 🎫 ADCS ESC auto-exploitation
+- 📄 MITRE-mapped Word/PDF reports (auto-generated)
 - ☁️ Cloud-accelerated hash cracking
-- 🔍 Broad CVE/misconfig checks
+- 🔍 CVE/misconfig autonomous scanning
+- 🤖 Advanced automated attack chains
 - 🏢 Priority enterprise support
-- 🚀 Advanced automation features
+- 🚀 LLM-enhanced strategic reasoning (Gen2)
 
 </td>
 </tr>
