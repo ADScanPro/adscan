@@ -4,7 +4,7 @@
 
 <img width="800" alt="ADscan Logo" src="https://github.com/user-attachments/assets/77f3b465-faf6-4ea2-8838-9fcda31f993c" />
 
-[![Version](https://img.shields.io/badge/version-3.1.3--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
+[![Version](https://img.shields.io/badge/version-3.1.4--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
 [![downloads](https://static.pepy.tech/badge/adscan)](https://pepy.tech/projects/cai-adscan)
 [![License](https://img.shields.io/badge/license-EULA-red.svg)](https://github.com/ADscanPro/adscan/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://github.com/ADscanPro/adscan)
@@ -189,7 +189,7 @@ Includes installation guides, quick start, complete command reference, CTF walkt
 ## 📜 License
 
 © 2025 Yeray Martín Domínguez — Released under custom EULA
-ADscan LITE 3.1.3 | PRO edition: Q4 2025
+ADscan LITE 3.1.4 | PRO edition: Q4 2025
 
 ---
 
