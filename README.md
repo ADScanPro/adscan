@@ -88,7 +88,6 @@ _Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 - 🔍 CVE/misconfig autonomous scanning
 - 🤖 Advanced automated attack chains
 - 🏢 Priority enterprise support
-- 🚀 LLM-enhanced strategic reasoning (Gen2)
 
 </td>
 </tr>
