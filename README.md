@@ -4,7 +4,7 @@
 
 <img width="800" alt="ADscan Logo" src="https://github.com/user-attachments/assets/77f3b465-faf6-4ea2-8838-9fcda31f993c" />
 
-[![Version](https://img.shields.io/badge/version-3.1.4--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
+[![Version](https://img.shields.io/badge/version-3.2.1--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
 [![downloads](https://static.pepy.tech/badge/adscan)](https://pepy.tech/projects/cai-adscan)
 [![License](https://img.shields.io/badge/license-EULA-red.svg)](https://github.com/ADscanPro/adscan/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://github.com/ADscanPro/adscan)
@@ -100,9 +100,10 @@ _Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 | Requirement | Details |
 |------------|---------|
 | **OS** | Linux (Debian/Ubuntu/Kali and other Debian-based distros) |
-| **Privileges** | Root access required |
-| **Python** | 3.8+ (managed automatically with binary) |
-| **Network** | Internet for installation, target network access |
+| **Docker** | Docker Engine + Compose (plugin or `docker-compose`) |
+| **Privileges** | User must be able to run Docker (`docker` group or `sudo`) |
+| **Python** | Not required for Docker mode (pipx wrapper only) |
+| **Network** | Internet to pull images, target network access |
 
 ---
 
@@ -112,11 +113,31 @@ _Auto-pwns **HTB Forest** in ~3 minutes_ 🚀
 # Install via pipx (recommended)
 pipx install adscan
 
-# Install dependencies
+# Install (pulls the latest ADscan image + BloodHound CE images)
 adscan install
 
 # Start ADscan
 adscan start
+```
+
+### BloodHound CE Password
+
+During `adscan install`, ADscan will try to ensure the BloodHound CE `admin`
+password is set to a known value for a smooth first-time experience:
+
+```bash
+adscan install --bh-admin-password 'Adscan4thewin!'
+```
+
+If the automatic password change fails (for example because BloodHound CE isn’t
+ready yet), ADscan prints the exact manual steps to finish it in the web UI.
+
+### Legacy (Host) Installer
+
+ADscan also includes a legacy host-based installer for environments where Docker is not available:
+
+```bash
+adscan install --legacy
 ```
 
 > **📚 Complete installation guide, quick start, and full documentation → [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=install_cta)**
@@ -147,7 +168,7 @@ ADscan supports non-interactive mode for automated testing.
 
 - **Telemetry**: Opt-in by default (toggle with `set telemetry off`)
 - **No sensitive data**: Only anonymized error data and feature usage
-- **Local-first**: All data stored in `~/.adscan/workspaces/`
+- **Local-first**: All data stored in `$ADSCAN_HOME/workspaces/` (default: `~/.adscan/workspaces/`)
 
 ---
 
@@ -188,7 +209,7 @@ Includes installation guides, quick start, complete command reference, CTF walkt
 ## 📜 License
 
 © 2025 Yeray Martín Domínguez — Released under custom EULA
-ADscan LITE 3.1.4 | PRO edition: Q4 2025
+ADscan LITE 3.2.1 | PRO edition: Q4 2025
 
 ---
 
