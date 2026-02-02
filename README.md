@@ -1,5 +1,3 @@
-# ADscan
-
 <div align="center">
 
 <img width="740" height="198" alt="adscan_wordmark_horizontal_transparent_cropped" src="https://github.com/user-attachments/assets/4902f205-d9bc-453e-b2ac-8c7d7fa2f329" />
