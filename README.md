@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img width="453" height="426" alt="ADscan_wordmark_stacked_transparent_cropped" src="https://github.com/user-attachments/assets/0c5067cc-39bf-41d5-b707-1678ed0b36d8" />
+<img width="740" height="198" alt="adscan_wordmark_horizontal_transparent_cropped" src="https://github.com/user-attachments/assets/4902f205-d9bc-453e-b2ac-8c7d7fa2f329" />
 
 [![Version](https://img.shields.io/badge/version-4.1.0--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
 [![downloads](https://static.pepy.tech/badge/adscan)](https://pepy.tech/projects/cai-adscan)
