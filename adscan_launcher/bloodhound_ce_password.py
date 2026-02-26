@@ -19,6 +19,7 @@ The automation is designed to be safe:
 from __future__ import annotations
 
 import os
+import re
 import time
 
 import requests
@@ -39,21 +40,75 @@ from adscan_launcher.output import (
 
 _DEFAULT_BH_BASE_URL = f"http://127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
 _DEFAULT_BH_CONTAINER_NAME = "bloodhound-bloodhound-1"
+_DEFAULT_PASSWORD_PATTERNS = (
+    re.compile(r"initial\s+password\s+set\s+to:\s*([^\s\"']+)", re.IGNORECASE),
+    re.compile(r"initial\s+admin\s+password:\s*([^\s\"']+)", re.IGNORECASE),
+    re.compile(r'"initialPassword"\s*:\s*"([^"]+)"'),
+)
 
 
 def _parse_initial_password_from_logs(logs: str) -> str | None:
     """Parse the initial admin password from BloodHound CE logs."""
     if not logs:
         return None
-    for line in logs.splitlines():
-        if "Initial Password Set To:" not in line:
+    for pattern in _DEFAULT_PASSWORD_PATTERNS:
+        match = pattern.search(logs)
+        if not match:
             continue
-        password_part = line.split("Initial Password Set To:", 1)[1].strip()
-        if not password_part:
-            continue
-        parts = password_part.split()
-        return parts[0] if parts else password_part
+        candidate = str(match.group(1) or "").strip()
+        if candidate:
+            return candidate
     return None
+
+
+def _list_bloodhound_container_candidates(
+    *, preferred_container_name: str
+) -> list[str]:
+    """Return likely BloodHound CE web container names.
+
+    We prefer the canonical container name but include dynamic matches to handle
+    custom compose project names.
+    """
+    candidates: list[str] = []
+    preferred = str(preferred_container_name or "").strip()
+    if preferred:
+        candidates.append(preferred)
+    if not docker_available():
+        return candidates
+
+    try:
+        proc = run_docker(
+            ["docker", "ps", "-a", "--format", "{{.Names}}"],
+            check=False,
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[bloodhound-ce] container listing probe exception: {exc}")
+        return candidates
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        if stderr:
+            print_info_debug(f"[bloodhound-ce] container listing probe stderr: {stderr}")
+        return candidates
+
+    dynamic: list[str] = []
+    for raw_line in (proc.stdout or "").splitlines():
+        name = str(raw_line or "").strip()
+        if not name:
+            continue
+        lowered = name.lower()
+        if "bloodhound" not in lowered:
+            continue
+        if re.search(r"(?:^|[-_])bloodhound(?:[-_])", lowered):
+            dynamic.append(name)
+
+    for name in dynamic:
+        if name not in candidates:
+            candidates.append(name)
+    return candidates
 
 
 def _try_bloodhound_login(
@@ -88,28 +143,48 @@ def _get_initial_password_from_container_logs(
     if not docker_available():
         return None
 
+    candidates = _list_bloodhound_container_candidates(
+        preferred_container_name=container_name
+    )
+    print_info_debug(
+        "[bloodhound-ce] password log probe container candidates: "
+        f"{mark_sensitive(', '.join(candidates) if candidates else '<none>', 'detail')}"
+    )
+
     for attempt in range(1, poll_attempts + 1):
-        try:
-            proc = run_docker(
-                ["docker", "logs", container_name],
-                check=False,
-                capture_output=True,
-                timeout=30,
-            )
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_info_debug(
-                f"[bloodhound-ce] password log probe exception (attempt {attempt}/{poll_attempts}): {exc}"
-            )
-            proc = None
+        for candidate in candidates:
+            try:
+                proc = run_docker(
+                    ["docker", "logs", candidate],
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except Exception as exc:
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    "[bloodhound-ce] password log probe exception "
+                    f"(attempt {attempt}/{poll_attempts}, container={candidate}): {exc}"
+                )
+                proc = None
 
-        logs = ""
-        if proc is not None and proc.returncode == 0:
-            logs = proc.stdout or ""
+            logs = ""
+            if proc is not None and proc.returncode == 0:
+                logs = proc.stdout or ""
+            elif proc is not None and proc.stderr:
+                print_info_debug(
+                    "[bloodhound-ce] password log probe stderr "
+                    f"(attempt {attempt}/{poll_attempts}, container={candidate}): "
+                    f"{mark_sensitive((proc.stderr or '').strip(), 'detail')}"
+                )
 
-        pw = _parse_initial_password_from_logs(logs)
-        if pw:
-            return pw
+            pw = _parse_initial_password_from_logs(logs)
+            if pw:
+                print_info_debug(
+                    "[bloodhound-ce] initial password detected from container "
+                    f"{mark_sensitive(candidate, 'detail')}"
+                )
+                return pw
 
         if attempt < poll_attempts:
             time.sleep(poll_interval_seconds)

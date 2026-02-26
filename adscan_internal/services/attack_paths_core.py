@@ -361,21 +361,65 @@ def _expand_group_ancestors(
     group_to_parents: dict[str, Any],
     cache: dict[str, set[str]],
 ) -> set[str]:
+    """Expand recursive parent groups without Python recursion.
+
+    The previous recursive implementation could hit ``RecursionError`` in very
+    large/degenerate environments (deep nested groups or accidental cycles).
+    This iterative DFS keeps the same cache contract while avoiding call-stack
+    growth.
+    """
     if group_label in cache:
         return cache[group_label]
-    parents = group_to_parents.get(group_label, []) if group_to_parents else []
-    results: set[str] = set()
-    if isinstance(parents, list):
+
+    def _parent_labels(label: str) -> list[str]:
+        parents = group_to_parents.get(label, []) if group_to_parents else []
+        if not isinstance(parents, list):
+            return []
+        normalized: list[str] = []
         for parent in parents:
             parent_label = _canonical_membership_label(domain, parent)
             if not parent_label:
                 continue
-            results.add(parent_label)
-            results.update(
-                _expand_group_ancestors(domain, parent_label, group_to_parents, cache)
-            )
-    cache[group_label] = results
-    return results
+            normalized.append(parent_label)
+        return normalized
+
+    stack: list[tuple[str, bool]] = [(group_label, False)]
+    resolving: set[str] = set()
+
+    while stack:
+        current, expanded = stack.pop()
+        if current in cache:
+            continue
+
+        if expanded:
+            results: set[str] = set()
+            for parent_label in _parent_labels(current):
+                if parent_label == current:
+                    continue
+                results.add(parent_label)
+                parent_cached = cache.get(parent_label)
+                if parent_cached:
+                    results.update(parent_cached)
+            results.discard(current)
+            cache[current] = results
+            resolving.discard(current)
+            continue
+
+        if current in resolving:
+            continue
+        resolving.add(current)
+        stack.append((current, True))
+
+        for parent_label in _parent_labels(current):
+            if (
+                parent_label in cache
+                or parent_label in resolving
+                or parent_label == current
+            ):
+                continue
+            stack.append((parent_label, False))
+
+    return cache.get(group_label, set())
 
 
 def build_group_membership_index(

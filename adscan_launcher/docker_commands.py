@@ -547,8 +547,8 @@ def _wait_for_bloodhound_ce_api_ready(
         time.sleep(interval_seconds)
 
     print_warning(
-        "BloodHound CE API did not become ready within 60 seconds. "
-        "The containers may still be initializing."
+        "BloodHound CE API did not become ready within "
+        f"{timeout_seconds} seconds. The containers may still be initializing."
     )
     print_instruction(
         "Wait a moment and retry. If it keeps failing, check the BloodHound CE "
@@ -564,7 +564,72 @@ def _wait_for_bloodhound_ce_api_ready(
             "[bloodhound-ce] readiness probe last status: "
             f"{mark_sensitive(str(last_status), 'status')}"
         )
+    _print_bloodhound_ce_readiness_diagnostics()
     return False
+
+
+def _print_bloodhound_ce_readiness_diagnostics() -> None:
+    """Print best-effort docker diagnostics when BloodHound CE readiness fails."""
+
+    def _run_docker_debug(command: list[str]) -> str | None:
+        try:
+            proc = run_docker(
+                command,
+                check=False,
+                capture_output=True,
+                timeout=20,
+            )
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                "[bloodhound-ce] readiness diagnostics command failed: "
+                f"{mark_sensitive(shell_quote_cmd(command), 'detail')} "
+                f"error={mark_sensitive(str(exc), 'error')}"
+            )
+            return None
+
+        stdout = str(proc.stdout or "").strip()
+        stderr = str(proc.stderr or "").strip()
+        if proc.returncode != 0 and stderr:
+            print_info_debug(
+                "[bloodhound-ce] readiness diagnostics stderr: "
+                f"{mark_sensitive(stderr, 'detail')}"
+            )
+        if stdout:
+            return stdout
+        return None
+
+    ps_output = _run_docker_debug(
+        ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}"]
+    )
+    if not ps_output:
+        print_info_debug("[bloodhound-ce] readiness diagnostics: no docker ps output.")
+        return
+
+    lines = [line for line in ps_output.splitlines() if "bloodhound" in line.lower()]
+    if not lines:
+        print_info_debug(
+            "[bloodhound-ce] readiness diagnostics: no bloodhound containers found in docker ps."
+        )
+        return
+
+    print_info_debug(
+        "[bloodhound-ce] readiness diagnostics containers:\n"
+        f"{mark_sensitive(chr(10).join(lines), 'detail')}"
+    )
+
+    for line in lines[:3]:
+        name = line.split("\t", 1)[0].strip()
+        if not name:
+            continue
+        logs = _run_docker_debug(["docker", "logs", "--tail", "80", name])
+        if not logs:
+            continue
+        print_info_debug(
+            "[bloodhound-ce] readiness diagnostics logs "
+            f"({mark_sensitive(name, 'detail')}):\n"
+            f"{mark_sensitive(logs, 'detail')}"
+        )
 
 
 def _resolve_self_executable() -> str:

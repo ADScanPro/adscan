@@ -22,6 +22,7 @@ from rich.table import Table
 from rich.text import Text
 
 from adscan_internal import (
+    print_error,
     print_exception,
     print_info,
     print_info_debug,
@@ -1860,7 +1861,17 @@ def offer_attack_paths_for_execution(
             require_high_value_target=require_high_value_target,
         )
 
-    summaries = _compute_summaries()
+    try:
+        summaries = _compute_summaries()
+    except RecursionError as exc:
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            "Attack-path computation failed while expanding nested group memberships "
+            f"for {marked_domain}. The environment appears to have deep or cyclic "
+            "group nesting."
+        )
+        return False
     if not summaries:
         if start_norm == "owned":
             marked_domain = mark_sensitive(domain, "domain")
@@ -1923,7 +1934,17 @@ def offer_attack_paths_for_execution_for_principals(
             require_high_value_target=require_high_value_target,
         )
 
-    summaries = _compute_summaries()
+    try:
+        summaries = _compute_summaries()
+    except RecursionError as exc:
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            "Attack-path computation failed while expanding nested group memberships "
+            f"for {marked_domain}. The environment appears to have deep or cyclic "
+            "group nesting."
+        )
+        return False
 
     return offer_attack_paths_for_execution_summaries(
         shell,

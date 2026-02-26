@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -11,6 +12,7 @@ from typing import Any, Iterable
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
     mark_sensitive,
+    print_info,
     print_info_debug,
     print_info_verbose,
     print_exception,
@@ -1073,19 +1075,80 @@ def _expand_group_ancestors(
     """Return recursive ancestor groups for a canonical group label."""
     if group_label in cache:
         return cache[group_label]
-    parents = group_to_parents.get(group_label, []) if group_to_parents else []
-    results: set[str] = set()
-    if isinstance(parents, list):
+
+    def _parent_labels(label: str) -> list[str]:
+        parents = group_to_parents.get(label, []) if group_to_parents else []
+        if not isinstance(parents, list):
+            return []
+        labels: list[str] = []
         for parent in parents:
-            parent_label = _canonical_membership_label(domain, parent)
-            if not parent_label:
+            normalized = _canonical_membership_label(domain, parent)
+            if normalized:
+                labels.append(normalized)
+        return labels
+
+    stack: list[tuple[str, bool]] = [(group_label, False)]
+    resolving: set[str] = set()
+
+    while stack:
+        current, expanded = stack.pop()
+        if current in cache:
+            continue
+
+        if expanded:
+            results: set[str] = set()
+            for parent_label in _parent_labels(current):
+                if parent_label == current:
+                    continue
+                results.add(parent_label)
+                parent_cached = cache.get(parent_label)
+                if parent_cached:
+                    results.update(parent_cached)
+            results.discard(current)
+            cache[current] = results
+            resolving.discard(current)
+            continue
+
+        if current in resolving:
+            continue
+        resolving.add(current)
+        stack.append((current, True))
+
+        for parent_label in _parent_labels(current):
+            if (
+                parent_label in cache
+                or parent_label in resolving
+                or parent_label == current
+            ):
                 continue
-            results.add(parent_label)
-            results.update(
-                _expand_group_ancestors(domain, parent_label, group_to_parents, cache)
-            )
-    cache[group_label] = results
-    return results
+            stack.append((parent_label, False))
+
+    return cache.get(group_label, set())
+
+
+def _log_attack_path_compute_timing(
+    *,
+    domain: str,
+    scope: str,
+    elapsed_seconds: float,
+    path_count: int,
+    max_depth: int,
+    require_high_value_target: bool,
+    target_mode: str,
+) -> None:
+    """Emit centralized timing metrics for attack-path computations."""
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info_verbose(
+        f"[attack_paths] compute scope={scope} domain={marked_domain} "
+        f"paths={path_count} max_depth={max_depth} "
+        f"high_value_only={require_high_value_target!r} target_mode={target_mode} "
+        f"elapsed={elapsed_seconds:.2f}s"
+    )
+    if elapsed_seconds >= 30.0:
+        print_info(
+            f"Attack-path computation ({scope}) for {marked_domain} "
+            f"took {elapsed_seconds:.1f}s ({path_count} paths)."
+        )
 
 
 __all__ = [
@@ -5324,6 +5387,7 @@ def compute_display_paths_for_user(
                 jon.snow -> Domain Users -> jon.snow -> ...
              because our DFS only returns simple paths (no repeated nodes).
     """
+    started_at = time.monotonic()
     base_graph = load_attack_graph(shell, domain)
     runtime_graph: dict[str, Any] = dict(base_graph)
     runtime_graph["nodes"] = dict(
@@ -5366,7 +5430,7 @@ def compute_display_paths_for_user(
             principal_node_ids=candidate_to_ids,
             skip_tier0_principals=True,
         )
-    return _sort_display_paths(
+    records = _sort_display_paths(
         attack_paths_core.compute_display_paths_for_start_node(
             runtime_graph,
             domain=domain,
@@ -5379,6 +5443,16 @@ def compute_display_paths_for_user(
             filter_shortest_paths=False,
         )
     )
+    _log_attack_path_compute_timing(
+        domain=domain,
+        scope="user",
+        elapsed_seconds=max(0.0, time.monotonic() - started_at),
+        path_count=len(records),
+        max_depth=max_depth,
+        require_high_value_target=require_high_value_target,
+        target_mode=target_mode,
+    )
+    return records
 
 
 def compute_display_paths_for_domain(
@@ -5400,6 +5474,7 @@ def compute_display_paths_for_domain(
     context-only `MemberOf` step so the operator can understand why the path is
     surfaced.
     """
+    started_at = time.monotonic()
     base_graph = load_attack_graph(shell, domain)
     runtime_graph: dict[str, Any] = dict(base_graph)
     runtime_graph["nodes"] = dict(
@@ -5430,7 +5505,7 @@ def compute_display_paths_for_domain(
                 principal_node_ids=candidate_to_ids,
                 skip_tier0_principals=True,
             )
-    return _sort_display_paths(
+    records = _sort_display_paths(
         attack_paths_core.compute_display_paths_for_domain(
             runtime_graph,
             domain=domain,
@@ -5441,6 +5516,16 @@ def compute_display_paths_for_domain(
             expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
         )
     )
+    _log_attack_path_compute_timing(
+        domain=domain,
+        scope="domain",
+        elapsed_seconds=max(0.0, time.monotonic() - started_at),
+        path_count=len(records),
+        max_depth=max_depth,
+        require_high_value_target=require_high_value_target,
+        target_mode=target_mode,
+    )
+    return records
 
 
 def _filter_contained_paths_for_domain_listing(
@@ -5572,7 +5657,6 @@ def compute_display_paths_for_owned_users(
     owned = get_owned_domain_usernames(shell, domain)
     if not owned:
         return []
-
     return compute_display_paths_for_principals(
         shell,
         domain,
@@ -5682,9 +5766,19 @@ def compute_display_paths_for_principals(
     This is used to implement `attack_paths <domain> owned` without spamming one
     identical membership-originating path per owned user.
     """
+    started_at = time.monotonic()
     normalized_principals = [str(p or "").strip().lower() for p in principals]
     normalized_principals = [p for p in normalized_principals if p]
     if not normalized_principals:
+        _log_attack_path_compute_timing(
+            domain=domain,
+            scope="principals",
+            elapsed_seconds=max(0.0, time.monotonic() - started_at),
+            path_count=0,
+            max_depth=max_depth,
+            require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
+        )
         return []
 
     base_graph = load_attack_graph(shell, domain)
@@ -5702,7 +5796,7 @@ def compute_display_paths_for_principals(
             )
 
     snapshot = _load_membership_snapshot(shell, domain)
-    return _sort_display_paths(
+    records = _sort_display_paths(
         attack_paths_core.compute_display_paths_for_principals(
             runtime_graph,
             domain=domain,
@@ -5715,6 +5809,16 @@ def compute_display_paths_for_principals(
             filter_shortest_paths=False,
         )
     )
+    _log_attack_path_compute_timing(
+        domain=domain,
+        scope="principals",
+        elapsed_seconds=max(0.0, time.monotonic() - started_at),
+        path_count=len(records),
+        max_depth=max_depth,
+        require_high_value_target=require_high_value_target,
+        target_mode=target_mode,
+    )
+    return records
 
 
 def compute_attack_path_metrics(

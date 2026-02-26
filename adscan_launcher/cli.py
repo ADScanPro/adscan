@@ -290,6 +290,26 @@ def _consume_trailing_global_flags(
     return remaining
 
 
+def _consume_ci_remainder_global_flags(ns: argparse.Namespace) -> None:
+    """Consume launcher-global flags from `ci` remainder args.
+
+    For `adscan ci`, argparse stores everything after `ci` in `ns.args`
+    (`argparse.REMAINDER`), so trailing launcher flags (e.g. `--debug --dev`)
+    never appear in `unknown`.
+
+    If the remainder starts with `--`, treat it as an explicit passthrough
+    separator and leave tokens untouched.
+    """
+    if str(getattr(ns, "command", "") or "") != "ci":
+        return
+
+    remainder = list(getattr(ns, "args", []) or [])
+    if not remainder or remainder[0] == "--":
+        return
+
+    setattr(ns, "args", _consume_trailing_global_flags(ns, remainder))
+
+
 def _should_print_debug_enabled_banner(command: str | None) -> bool:
     """Return whether launcher should emit the debug-enabled confirmation."""
     return command in (None, "start", "ci", "install", "check")
@@ -386,6 +406,7 @@ def main(argv: list[str] | None = None) -> None:
 
     ns, unknown = parser.parse_known_args(raw_argv)
     unknown = _consume_trailing_global_flags(ns, unknown)
+    _consume_ci_remainder_global_flags(ns)
     known_cmds = {"install", "check", "start", "ci", "update", "upgrade", "version"}
     if getattr(ns, "command", None) in known_cmds and unknown:
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
