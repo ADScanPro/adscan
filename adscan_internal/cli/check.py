@@ -1,0 +1,3274 @@
+"""Helpers for legacy `adscan check`.
+
+This module hosts small, dependency-light helpers used by `handle_check` to
+keep `adscan.py` slimmer while preserving behaviour.
+
+The functions here intentionally rely on dependency injection so we don't
+introduce import cycles back into `adscan.py`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+import os
+import shutil
+import subprocess
+import sys
+import signal
+from typing import Any, Dict, List
+
+
+@dataclass(frozen=True)
+class VirtualEnvCheckConfig:
+    """Configuration for checking the legacy host virtual environment."""
+
+    adscan_base_dir: str
+    venv_path: str
+    full_container_runtime: bool
+    fix_mode: bool
+
+
+@dataclass(frozen=True)
+class VirtualEnvCheckDeps:
+    """Dependency bundle for virtual environment checks."""
+
+    ensure_dir_writable: Callable[..., bool]
+    install_pyenv_python_and_venv: Callable[..., tuple[bool, object, object]]
+    run_command: Callable[..., object]
+    path_exists: Callable[[str], bool]
+    print_success: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    telemetry_capture_exception: Callable[[BaseException], None]
+    print_exception: Callable[..., None] | None = None
+
+
+def check_virtual_environment(
+    *,
+    config: VirtualEnvCheckConfig,
+    deps: VirtualEnvCheckDeps,
+) -> tuple[bool, bool]:
+    """Check the ADscan host virtual environment status.
+
+    This is the legacy host-based venv check used by `handle_check`. In the FULL
+    Docker runtime, this check is skipped because tool envs are pre-provisioned.
+
+    Args:
+        config: Static configuration for the venv check.
+        deps: Injected dependencies (I/O, subprocess, telemetry, printing).
+
+    Returns:
+        Tuple of:
+            - adscan_venv_ok: Whether the venv is usable.
+            - all_ok: Whether the overall check should remain successful so far.
+    """
+    all_ok = True
+    venv_python = os.path.join(config.venv_path, "bin", "python")
+    adscan_venv_ok = False
+
+    if config.full_container_runtime:
+        deps.print_info_verbose(
+            "Running inside the ADscan FULL container - skipping host virtual environment checks."
+        )
+        return True, all_ok
+
+    if deps.path_exists(venv_python):
+        adscan_venv_ok = True
+        try:
+            # Keep the command identical to the legacy behaviour.
+            version_probe = (
+                "import sys; "
+                "print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"
+            )
+            result = deps.run_command(
+                [venv_python, "-c", version_probe],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            python_version = getattr(result, "stdout", "").strip()
+
+            if python_version == "3.12.3":
+                deps.print_success(
+                    f"Virtual environment found: {config.venv_path} (Python {python_version})"
+                )
+            else:
+                deps.print_warning(
+                    f"Virtual environment using Python {python_version}, but 3.12.3 is recommended."
+                )
+        except Exception as exc:  # noqa: BLE001 - must mirror legacy behaviour
+            deps.telemetry_capture_exception(exc)
+            deps.print_warning(
+                f"Found virtual environment, but couldn't verify Python version: {exc}"
+            )
+        return adscan_venv_ok, all_ok
+
+    deps.print_error(f"Virtual environment not found at {config.venv_path}.")
+    if not config.fix_mode:
+        deps.print_instruction("Run: adscan check --fix")
+        return False, False
+
+    deps.print_info("Attempting to create the ADscan virtual environment (--fix)...")
+    try:
+        if not deps.ensure_dir_writable(
+            config.adscan_base_dir,
+            description="ADscan base",
+            fix=True,
+            recursive=True,
+        ):
+            deps.print_error(
+                "Cannot create the virtual environment because the ADscan base directory is not writable."
+            )
+            deps.print_instruction(
+                f'Run: sudo chown -R $USER:$USER "{config.adscan_base_dir}"'
+            )
+            return False, False
+
+        ok, _, _ = deps.install_pyenv_python_and_venv(
+            python_version="3.12.3",
+            venv_path=config.venv_path,
+        )
+        if ok and deps.path_exists(venv_python):
+            deps.print_success(f"Virtual environment created: {config.venv_path}")
+            return True, all_ok
+
+        deps.print_error("Failed to create the virtual environment automatically.")
+        deps.print_instruction("Run: adscan check --fix")
+        return False, False
+    except Exception as exc:  # noqa: BLE001 - legacy catch-all for installation attempts
+        deps.telemetry_capture_exception(exc)
+        deps.print_error("Failed to create the virtual environment automatically.")
+        if deps.print_exception is not None:
+            deps.print_exception(show_locals=False, exception=exc)
+        return False, False
+
+
+@dataclass(frozen=True)
+class CoreDepsCheckConfig:
+    """Configuration for checking core dependencies in system Python."""
+
+    core_requirements: List[str]
+
+
+@dataclass(frozen=True)
+class CoreDepsCheckDeps:
+    """Dependency bundle for core dependency checks."""
+
+    run_command: Callable[..., object]
+    get_clean_env_for_compilation: Callable[[], Dict[str, str]]
+    parse_requirement_spec: Callable[[str], Dict[str, Any]]
+    get_python_package_version: Callable[[str, str], str | None]
+    assess_version_compliance: Callable[..., tuple[str, str]]
+    get_installed_vcs_reference: Callable[..., Dict[str, Any] | None]
+    get_installed_vcs_reference_by_url: Callable[..., Dict[str, Any] | None]
+    normalize_vcs_repo_url: Callable[[str], str]
+    vcs_reference_matches: Callable[[str | None, str | None], bool]
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_success_verbose: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+    telemetry_capture_exception: Callable[[BaseException], None]
+
+
+def check_core_dependencies(
+    *,
+    config: CoreDepsCheckConfig,
+    deps: CoreDepsCheckDeps,
+) -> bool:
+    """Check that core dependencies are installed and at expected versions."""
+    deps.print_info("Checking core dependencies in system Python...")
+
+    # Find system python3 executable (same logic as handle_install)
+    system_python = shutil.which("python3")
+    if not system_python:
+        # Fallback to sys.executable if python3 not found (but this might be PyInstaller binary)
+        system_python = sys.executable
+        deps.print_warning("python3 not found in PATH, using sys.executable")
+
+    if not system_python:
+        deps.print_warning(
+            "Could not determine system Python executable for core dependencies verification"
+        )
+        return False
+
+    deps.print_info_verbose(f"Verifying core dependencies using: {system_python}")
+    core_requirements = config.core_requirements
+    missing_core_deps: List[str] = []
+    core_version_issues: List[str] = []
+
+    clean_env = deps.get_clean_env_for_compilation()
+
+    for dep in core_requirements:
+        spec_info = deps.parse_requirement_spec(dep)
+        package_name = spec_info.get("package_name") or dep
+        try:
+            import_name = package_name.replace("-", "_")
+            result = deps.run_command(
+                [system_python, "-c", f"import {import_name}"],
+                capture_output=True,
+                check=False,
+                env=clean_env,
+            )
+            if result.returncode == 0:
+                deps.print_success_verbose(
+                    f"Core dependency '{package_name}' is installed in system Python"
+                )
+                installed_version = deps.get_python_package_version(
+                    system_python, package_name
+                )
+                specifier = spec_info.get("specifier")
+                enforce_latest = specifier is None and not spec_info.get(
+                    "is_vcs", False
+                )
+                status, message = deps.assess_version_compliance(
+                    package_name,
+                    installed_version,
+                    specifier=specifier,
+                    enforce_latest=enforce_latest,
+                )
+                if status == "error":
+                    deps.print_error(message)
+                    core_version_issues.append(message)
+                elif status == "warning":
+                    deps.print_warning(message)
+                else:
+                    deps.print_success_verbose(message)
+
+                expected_vcs_ref = spec_info.get("vcs_reference")
+                if spec_info.get("is_vcs") and expected_vcs_ref:
+                    vcs_meta = deps.get_installed_vcs_reference(
+                        system_python, package_name
+                    )
+                    if not vcs_meta:
+                        repo_url = spec_info.get("vcs_url")
+                        normalized_url = (
+                            deps.normalize_vcs_repo_url(repo_url) if repo_url else None
+                        )
+                        if normalized_url:
+                            vcs_meta = deps.get_installed_vcs_reference_by_url(
+                                system_python, normalized_url
+                            )
+                    commit_id = None
+                    if vcs_meta:
+                        commit_id = vcs_meta.get("commit_id") or vcs_meta.get(
+                            "requested_revision"
+                        )
+                    if deps.vcs_reference_matches(commit_id, expected_vcs_ref):
+                        short_commit = commit_id[:12] if commit_id else "unknown"
+                        deps.print_success_verbose(
+                            f"{package_name} matches expected VCS reference "
+                            f"{expected_vcs_ref} (installed {short_commit})"
+                        )
+                    else:
+                        if commit_id:
+                            issue = (
+                                f"{package_name} VCS reference mismatch "
+                                f"(expected {expected_vcs_ref}, got {commit_id})"
+                            )
+                            deps.print_error(issue)
+                            core_version_issues.append(issue)
+                        else:
+                            warning = (
+                                f"{package_name} is installed from VCS but its commit "
+                                f"could not be determined (expected {expected_vcs_ref})."
+                            )
+                            deps.print_warning(warning)
+            else:
+                deps.print_error(
+                    f"Core dependency '{package_name}' is NOT installed in system Python"
+                )
+                missing_core_deps.append(package_name)
+        except Exception as exc:  # noqa: BLE001
+            deps.telemetry_capture_exception(exc)
+            deps.print_warning(
+                f"Could not verify core dependency '{package_name}': {exc}"
+            )
+            missing_core_deps.append(package_name)
+
+    all_ok = True
+    if missing_core_deps:
+        deps.print_error(
+            "Missing core dependencies in system Python: "
+            + ", ".join(missing_core_deps)
+        )
+        deps.print_instruction(
+            "Run: adscan install (will install core dependencies in system Python)"
+        )
+        all_ok = False
+    if core_version_issues:
+        deps.print_error("Core dependency version mismatches detected.")
+        for issue in core_version_issues:
+            deps.print_error(f"  - {issue}")
+        deps.print_instruction(
+            "Run: adscan install (will synchronize core dependency versions)"
+        )
+        all_ok = False
+    if not missing_core_deps and not core_version_issues:
+        deps.print_success("All core dependencies are installed in system Python")
+
+    return all_ok
+
+
+# ─── Go Toolchain / htb-cli Check ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class GoToolchainCheckConfig:
+    """Configuration for Go toolchain and htb-cli checks."""
+
+    full_container_runtime: bool
+    fix_mode: bool
+    session_env: str
+
+
+@dataclass(frozen=True)
+class GoToolchainCheckDeps:
+    """Dependency bundle for Go toolchain and htb-cli checks."""
+
+    # Go helpers
+    configure_go_official_path: Callable[[], None]
+    configure_go_path: Callable[[], None]
+    is_go_available: Callable[[os._Environ[str]], tuple[bool, str]]
+    is_go_bin_in_path: Callable[[], tuple[bool, str | None]]
+
+    # htb-cli helpers
+    is_htb_cli_installed: Callable[[], tuple[bool, str | None]]
+    is_htb_cli_accessible: Callable[[], tuple[bool, str | None]]
+
+    # System helpers
+    os_environ: os._Environ[str]
+    subprocess_run: Callable[..., subprocess.CompletedProcess[str]]
+
+    # Output
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+
+
+def check_go_toolchain(
+    *, config: GoToolchainCheckConfig, deps: GoToolchainCheckDeps
+) -> bool:
+    """Check Go toolchain and (in CI) htb-cli installation/accessibility."""
+
+    if config.full_container_runtime:
+        deps.print_info(
+            "Skipping Go toolchain and htb-cli verification (running in container)."
+        )
+        return True
+
+    all_ok = True
+    deps.print_info("Checking Go toolchain...")
+
+    if config.fix_mode:
+        deps.configure_go_official_path()
+        if config.session_env == "ci":
+            deps.configure_go_path()
+
+    go_available, go_version = deps.is_go_available(deps.os_environ)
+    if go_available:
+        deps.print_success(f"Go found: {go_version}")
+
+        go_path_check = deps.subprocess_run(
+            ["which", "go"], capture_output=True, text=True, check=False
+        )
+        if go_path_check.returncode == 0:
+            go_binary_path = go_path_check.stdout.strip()
+            if "/usr/local/go/bin/go" in go_binary_path:
+                deps.print_info(
+                    "Go is installed from official golang.org source (latest version)"
+                )
+            else:
+                deps.print_warning(
+                    "Go appears to be installed via system package manager (apt)"
+                )
+                deps.print_info(
+                    "   Consider installing from official source for latest version:"
+                )
+                deps.print_info(
+                    "   Run: adscan install (will install Go from golang.org)"
+                )
+    else:
+        deps.print_warning("Go not found")
+        deps.print_info(
+            "   Install with: adscan install (will install Go from official golang.org source)"
+        )
+        deps.print_info(
+            "   Or manually: curl -L https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -"
+        )
+        all_ok = False
+
+    if config.session_env != "ci":
+        deps.print_info_verbose(
+            f"Skipping htb-cli verification in environment '{config.session_env}' (CI-only)."
+        )
+        return all_ok
+
+    # CI-only htb-cli checks
+    deps.print_info("Checking htb-cli...")
+
+    htb_cli_installed, htb_cli_path = deps.is_htb_cli_installed()
+    if htb_cli_installed:
+        deps.print_success(f"htb-cli binary found at: {htb_cli_path}")
+    else:
+        deps.print_warning(
+            f"htb-cli binary not found at expected location: {htb_cli_path}"
+        )
+        deps.print_info(
+            "   Install with: go install github.com/GoToolSharing/htb-cli@latest"
+        )
+        deps.print_info(
+            "   Or run: adscan install (will install htb-cli automatically)"
+        )
+        all_ok = False
+
+    go_bin_in_path, _ = deps.is_go_bin_in_path()
+    if go_bin_in_path:
+        deps.print_success("~/go/bin is in PATH")
+    else:
+        deps.print_warning("~/go/bin not found in PATH")
+        deps.print_info("   Run: adscan install (will configure PATH automatically)")
+        deps.print_info("   Or manually add to your shell config:")
+        deps.print_info('   export PATH="$HOME/go/bin:$PATH"')
+
+    htb_cli_accessible, _ = deps.is_htb_cli_accessible()
+    if htb_cli_accessible:
+        deps.print_success("htb-cli is accessible in PATH")
+    else:
+        if htb_cli_installed:
+            deps.print_warning(
+                "htb-cli binary exists but may not be accessible until terminal restart"
+            )
+            deps.print_info(
+                "   Try restarting your terminal or run: source ~/.bashrc (or ~/.zshrc)"
+            )
+        else:
+            deps.print_warning("htb-cli is not accessible")
+            deps.print_info(
+                "   Install with: go install github.com/GoToolSharing/htb-cli@latest"
+            )
+
+    if htb_cli_installed and htb_cli_accessible:
+        deps.print_success("htb-cli is installed and accessible")
+    elif htb_cli_installed:
+        deps.print_warning(
+            "htb-cli is installed but may require terminal restart to access"
+        )
+    else:
+        deps.print_warning("htb-cli is not installed")
+        deps.print_info("   Run: adscan install (will install htb-cli automatically)")
+        all_ok = False
+
+    return all_ok
+@dataclass(frozen=True)
+class ExternalToolsCheckConfig:
+    """Configuration for checking external Python tools in isolated venvs."""
+
+    pip_tools_config: Mapping[str, Dict[str, Any]]
+    tool_venvs_base_dir: str
+    fix_mode: bool
+
+
+@dataclass(frozen=True)
+class ExternalToolsCheckDeps:
+    """Dependency bundle for external Python tools checks."""
+
+    run_command: Callable[..., subprocess.CompletedProcess]
+    parse_requirement_spec: Callable[[str], Dict[str, Any]]
+    build_venv_exec_env: Callable[..., Dict[str, str]]
+    check_executable_help_works: Callable[..., bool]
+    fix_isolated_python_tool_venv: Callable[[str], bool]
+    diagnose_manspider_help_failure: Callable[..., None]
+    ensure_isolated_tool_extra_specs_installed: Callable[..., bool]
+    get_clean_env_for_compilation: Callable[[], Dict[str, str]]
+    get_python_package_version: Callable[..., str | None]
+    assess_version_compliance: Callable[..., tuple[str, str]]
+    get_installed_vcs_reference: Callable[..., Dict[str, Any] | None]
+    get_installed_vcs_reference_by_url: Callable[..., Dict[str, Any] | None]
+    normalize_vcs_repo_url: Callable[[str], str]
+    vcs_reference_matches: Callable[[str | None, str | None], bool]
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_success_verbose: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+    telemetry_capture_exception: Callable[[BaseException], None]
+
+
+def check_external_tools(
+    *,
+    config: ExternalToolsCheckConfig,
+    deps: ExternalToolsCheckDeps,
+) -> bool:
+    """Check that external Python tools in their isolated venvs are healthy."""
+    deps.print_info("Checking external Python tools in their isolated environments...")
+
+    missing_tools: List[str] = []
+    tool_version_issues: List[str] = []
+    all_ok = True
+
+    for tool_key, tool_cfg in config.pip_tools_config.items():
+        tool_dir_name = tool_key
+        check_target = tool_cfg["check_target"]
+        check_type = tool_cfg["check_type"]
+        spec_info = deps.parse_requirement_spec(tool_cfg["spec"])
+        extra_specs = tool_cfg.get("extra_specs", [])
+        specifier = spec_info.get("specifier")
+        enforce_latest = specifier is None and not spec_info.get("is_vcs", False)
+        requirement_package = spec_info.get("package_name")
+
+        tool_specific_venv_path = os.path.join(
+            config.tool_venvs_base_dir, tool_dir_name, "venv"
+        )
+        tool_specific_python = os.path.join(tool_specific_venv_path, "bin", "python")
+        tool_specific_executable = os.path.join(
+            tool_specific_venv_path,
+            "bin",
+            check_target if check_type == "executable" else "",
+        )
+        tool_failed = False
+
+        if not os.path.exists(tool_specific_venv_path):
+            deps.print_error(
+                f"Missing venv for {tool_dir_name} at {tool_specific_venv_path}"
+            )
+            if config.fix_mode and deps.fix_isolated_python_tool_venv(tool_dir_name):
+                deps.print_success(f"{tool_dir_name}: venv recreated successfully.")
+            else:
+                missing_tools.append(f"{tool_dir_name} (venv missing)")
+                all_ok = False
+                continue
+        elif config.fix_mode and extra_specs:
+            deps.ensure_isolated_tool_extra_specs_installed(
+                tool_name=tool_dir_name,
+                tool_python=tool_specific_python,
+                venv_path=tool_specific_venv_path,
+                extra_specs=extra_specs,
+            )
+
+        if check_type == "executable":
+            if os.path.exists(tool_specific_executable) and os.access(
+                tool_specific_executable, os.X_OK
+            ):
+                deps.print_success(
+                    f"Tool {tool_dir_name} ({check_target}) executable found."
+                )
+                exec_env = deps.build_venv_exec_env(
+                    venv_path=tool_specific_venv_path,
+                    python_executable=tool_specific_python,
+                )
+                help_ok = deps.check_executable_help_works(
+                    tool_name=tool_dir_name,
+                    executable_path=tool_specific_executable,
+                    env=exec_env,
+                    fix=config.fix_mode,
+                )
+                if not help_ok and config.fix_mode:
+                    deps.print_warning(
+                        f"{tool_dir_name} failed its help probe; attempting to recreate its isolated venv..."
+                    )
+                    if deps.fix_isolated_python_tool_venv(tool_dir_name):
+                        exec_env = deps.build_venv_exec_env(
+                            venv_path=tool_specific_venv_path,
+                            python_executable=tool_specific_python,
+                        )
+                        help_ok = deps.check_executable_help_works(
+                            tool_name=tool_dir_name,
+                            executable_path=tool_specific_executable,
+                            env=exec_env,
+                            fix=False,
+                        )
+
+                if not help_ok:
+                    if tool_dir_name == "manspider":
+                        deps.diagnose_manspider_help_failure(
+                            tool_python=tool_specific_python,
+                            env=exec_env,
+                        )
+                    deps.print_error(
+                        f"{tool_dir_name}: executable exists but failed to run (--help/-h)."
+                    )
+                    missing_tools.append(f"{tool_dir_name} (executable broken)")
+                    all_ok = False
+                    tool_failed = True
+            else:
+                deps.print_error(
+                    f"Tool {tool_dir_name} ({check_target}) executable NOT found or not executable at {tool_specific_executable}"  # noqa: E501
+                )
+                if config.fix_mode and deps.fix_isolated_python_tool_venv(
+                    tool_dir_name
+                ):
+                    deps.print_success(
+                        f"{tool_dir_name}: reinstalled; re-run `adscan check` to verify."
+                    )
+                else:
+                    missing_tools.append(
+                        f"{tool_dir_name} ({check_target} executable)"
+                    )
+                all_ok = False
+                tool_failed = True
+        elif check_type == "module":
+            env = deps.build_venv_exec_env(
+                venv_path=tool_specific_venv_path,
+                python_executable=tool_specific_python,
+            )
+            try:
+                deps.run_command(
+                    [tool_specific_python, "-c", f"import {check_target}"],
+                    capture_output=True,
+                    check=True,
+                    env=env,
+                )
+                deps.print_success(
+                    f"Tool {tool_dir_name} (module {check_target}) importable."
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                if config.fix_mode:
+                    deps.print_warning(
+                        f"{tool_dir_name} import check failed; attempting to recreate its isolated venv..."  # noqa: E501
+                    )
+                    if deps.fix_isolated_python_tool_venv(tool_dir_name):
+                        env = deps.build_venv_exec_env(
+                            venv_path=tool_specific_venv_path,
+                            python_executable=tool_specific_python,
+                        )
+                        try:
+                            deps.run_command(
+                                [tool_specific_python, "-c", f"import {check_target}"],
+                                capture_output=True,
+                                check=True,
+                                env=env,
+                            )
+                            deps.print_success(
+                                f"Tool {tool_dir_name} (module {check_target}) importable after repair."  # noqa: E501
+                            )
+                            continue
+                        except (subprocess.CalledProcessError, FileNotFoundError):
+                            pass
+
+                error_message = str(exc)
+                if isinstance(exc, subprocess.CalledProcessError) and exc.returncode < 0:
+                    try:
+                        signal_name = signal.Signals(-exc.returncode).name
+                        error_message = (
+                            f"Command died with <Signals.{signal_name}: {-exc.returncode}>."
+                        )
+                    except Exception:  # noqa: BLE001
+                        error_message = f"Command died with signal {-exc.returncode}."
+
+                if isinstance(exc, subprocess.CalledProcessError):
+                    if exc.stdout:
+                        error_message += f"\nStdout: {exc.stdout.strip()}"
+                    if exc.stderr:
+                        error_message += f"\nStderr: {exc.stderr.strip()}"
+
+                deps.print_error(
+                    f"Tool {tool_dir_name} (module {check_target}) NOT importable using {tool_specific_python}. Error: {error_message}"  # noqa: E501
+                )
+                missing_tools.append(f"{tool_dir_name} (module {check_target})")
+                all_ok = False
+                tool_failed = True
+        else:
+            deps.print_warning(
+                f"Unknown check_type '{check_type}' for tool {tool_dir_name}. Skipping check."
+            )
+            tool_failed = True
+            all_ok = False
+
+        if (
+            not tool_failed
+            and requirement_package
+            and os.path.exists(tool_specific_python)
+            and (specifier or enforce_latest or spec_info.get("is_vcs"))
+        ):
+            version_env = deps.get_clean_env_for_compilation()
+            version_env["VIRTUAL_ENV"] = tool_specific_venv_path
+            tool_bin_path = os.path.dirname(tool_specific_python)
+            version_env["PATH"] = (
+                f"{tool_bin_path}{os.pathsep}{version_env.get('PATH', '')}"
+            )
+            version_env.pop("PYTHONHOME", None)
+            version_env.pop("PYTHONPATH", None)
+
+            if specifier or enforce_latest:
+                installed_version = deps.get_python_package_version(
+                    tool_specific_python,
+                    requirement_package,
+                    env=version_env,
+                )
+                status, message = deps.assess_version_compliance(
+                    requirement_package,
+                    installed_version,
+                    specifier=specifier,
+                    enforce_latest=enforce_latest,
+                )
+                if status == "error":
+                    if config.fix_mode and deps.fix_isolated_python_tool_venv(
+                        tool_dir_name
+                    ):
+                        deps.print_warning(
+                            f"{tool_dir_name}: {message} (attempting --fix reinstall to satisfy requirement)"  # noqa: E501
+                        )
+                        installed_version = deps.get_python_package_version(
+                            tool_specific_python,
+                            requirement_package,
+                            env=version_env,
+                        )
+                        status, message = deps.assess_version_compliance(
+                            requirement_package,
+                            installed_version,
+                            specifier=specifier,
+                            enforce_latest=enforce_latest,
+                        )
+                    if status == "error":
+                        issue_message = f"{tool_dir_name}: {message}"
+                        deps.print_error(issue_message)
+                        tool_version_issues.append(issue_message)
+                        all_ok = False
+                elif status == "warning":
+                    deps.print_warning(f"{tool_dir_name}: {message}")
+                else:
+                    deps.print_success_verbose(f"{tool_dir_name}: {message}")
+
+            expected_vcs_ref = spec_info.get("vcs_reference")
+            if spec_info.get("is_vcs") and expected_vcs_ref:
+                vcs_meta = deps.get_installed_vcs_reference(
+                    tool_specific_python,
+                    requirement_package,
+                    env=version_env,
+                )
+                if not vcs_meta:
+                    repo_url = spec_info.get("vcs_url")
+                    normalized_url = (
+                        deps.normalize_vcs_repo_url(repo_url) if repo_url else None
+                    )
+                    if normalized_url:
+                        vcs_meta = deps.get_installed_vcs_reference_by_url(
+                            tool_specific_python,
+                            normalized_url,
+                            env=version_env,
+                        )
+                commit_id = None
+                if vcs_meta:
+                    commit_id = vcs_meta.get("commit_id") or vcs_meta.get(
+                        "requested_revision"
+                    )
+                if deps.vcs_reference_matches(commit_id, expected_vcs_ref):
+                    short_commit = commit_id[:12] if commit_id else "unknown"
+                    deps.print_success_verbose(
+                        f"{tool_dir_name}: VCS reference matches {expected_vcs_ref} (installed {short_commit})"  # noqa: E501
+                    )
+                else:
+                    issue_message = (
+                        f"{tool_dir_name}: installed from VCS but commit could not be determined "
+                        f"(expected {expected_vcs_ref})."
+                    )
+                    deps.print_warning(issue_message)
+
+    if missing_tools:
+        deps.print_error(
+            "Issues found with external Python tools: " + ", ".join(missing_tools)
+        )
+        deps.print_instruction("Try: adscan check --fix")
+        all_ok = False
+    if tool_version_issues:
+        deps.print_error("Version mismatches detected for external Python tools.")
+        for issue in tool_version_issues:
+            deps.print_error(f"  - {issue}")
+        deps.print_instruction("Try: adscan check --fix")
+        all_ok = False
+    if not missing_tools and not tool_version_issues and all_ok:
+        deps.print_success(
+            "All key external Python tools seem to be correctly installed in their isolated environments."  # noqa: E501
+        )
+
+    return all_ok
+
+
+@dataclass(frozen=True)
+class SystemPackagesCheckConfig:
+    """Configuration for checking essential system packages."""
+
+    system_packages_to_verify: Mapping[str, Dict[str, Any]]
+    fix_mode: bool
+
+
+@dataclass(frozen=True)
+class SystemPackagesCheckDeps:
+    """Dependency bundle for system packages verification."""
+
+    verify_system_packages: Callable[..., Dict[str, Any]]
+    run_command: Callable[..., subprocess.CompletedProcess]
+    get_clean_env_for_compilation: Callable[[], Dict[str, str]]
+    apply_effective_user_home_to_env: Callable[[Dict[str, str]], None]
+    sudo_validate: Callable[[], bool]
+    print_info: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+    telemetry_capture_exception: Callable[[BaseException], None]
+    print_exception: Callable[..., None]
+
+
+def check_system_packages(
+    *,
+    config: SystemPackagesCheckConfig,
+    deps: SystemPackagesCheckDeps,
+) -> tuple[bool, List[str]]:
+    """Check essential system packages and optionally attempt --fix via apt-get."""
+    deps.print_info("Checking for essential system packages...")
+    package_results = deps.verify_system_packages(
+        config.system_packages_to_verify, mode="check"
+    )
+
+    missing_pkgs = list(package_results.get("missing", []))
+    if missing_pkgs:
+        deps.print_error(f"Missing system packages: {', '.join(missing_pkgs)}")
+        deps.print_instruction(
+            f"Try installing them with: sudo apt install {' '.join(missing_pkgs)}"
+        )
+
+        if config.fix_mode:
+            if not shutil.which("apt-get"):
+                deps.print_warning(
+                    "Automatic package installation requires apt-get (Debian-based systems)."
+                )
+                return False, missing_pkgs
+            if not deps.sudo_validate():
+                deps.print_warning(
+                    "Cannot auto-install system packages without sudo privileges."
+                )
+                return False, missing_pkgs
+            try:
+                deps.print_info(
+                    "Attempting to install missing system packages (requested via --fix)..."
+                )
+                install_env = deps.get_clean_env_for_compilation()
+                deps.apply_effective_user_home_to_env(install_env)
+                install_env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+                install_env.setdefault("NEEDRESTART_MODE", "a")
+
+                deps.run_command(
+                    ["sudo", "apt-get", "update"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=install_env,
+                    timeout=600,
+                )
+                deps.run_command(
+                    ["sudo", "apt-get", "install", "-y"] + missing_pkgs,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=install_env,
+                    timeout=1800,
+                )
+                # Re-verify
+                package_results = deps.verify_system_packages(
+                    config.system_packages_to_verify, mode="check"
+                )
+                if package_results.get("missing"):
+                    deps.print_error(
+                        "Some system packages are still missing after --fix: "
+                        + ", ".join(package_results["missing"])
+                    )
+                    return False, list(package_results["missing"])
+                deps.print_success(
+                    "Essential system packages installed successfully (--fix)."
+                )
+                return True, []
+            except subprocess.CalledProcessError as exc:
+                deps.telemetry_capture_exception(exc)
+                deps.print_error("Failed to install missing system packages with --fix.")
+                deps.print_exception(show_locals=False, exception=exc)
+                return False, missing_pkgs
+            except Exception as exc:  # noqa: BLE001
+                deps.telemetry_capture_exception(exc)
+                deps.print_error(
+                    "Unexpected error while attempting to install system packages (--fix)."
+                )
+                deps.print_exception(show_locals=False, exception=exc)
+                return False, missing_pkgs
+        return False, missing_pkgs
+
+    deps.print_success("Essential system packages seem to be installed.")
+    return True, []
+
+
+@dataclass(frozen=True)
+class LibreOfficeCheckConfig:
+    """Configuration for checking LibreOffice availability (none needed)."""
+
+
+@dataclass(frozen=True)
+class LibreOfficeCheckDeps:
+    """Dependency bundle for LibreOffice check."""
+
+    is_libreoffice_available: Callable[[], tuple[bool, str]]
+    print_info: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+
+
+def check_libreoffice(
+    *,
+    config: LibreOfficeCheckConfig,
+    deps: LibreOfficeCheckDeps,
+) -> bool:
+    """Check whether LibreOffice is available for PDF report generation.
+
+    Returns:
+        True if libreoffice is present, False otherwise. Note: this is optional and
+        should not fail the overall check on its own.
+    """
+    deps.print_info("Checking libreoffice for PDF conversion...")
+    libreoffice_available, libreoffice_info = deps.is_libreoffice_available()
+    if libreoffice_available:
+        deps.print_success(f"libreoffice is available: {libreoffice_info}")
+        return True
+    deps.print_warning(f"libreoffice is not available: {libreoffice_info}")
+    deps.print_info("libreoffice is required for PDF report generation")
+    deps.print_instruction("Install with: sudo apt-get install -y libreoffice")
+    return False
+
+
+@dataclass(frozen=True)
+class ExternalBinaryToolsCheckConfig:
+    """Configuration for checking non-Python external tools (files on disk)."""
+
+    external_tools_config: Mapping[str, Dict[str, Any]]
+    tools_install_dir: str
+    venv_path: str
+    full_container_runtime: bool
+    fix_mode: bool
+
+
+@dataclass(frozen=True)
+class ExternalBinaryToolsCheckDeps:
+    """Dependency bundle for external binary tools verification."""
+
+    expand_effective_user_path: Callable[[str], str]
+    preflight_install_dns: Callable[..., bool]
+    setup_external_tool: Callable[..., bool]
+    print_info: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+
+
+def check_external_binary_tools(
+    *,
+    config: ExternalBinaryToolsCheckConfig,
+    deps: ExternalBinaryToolsCheckDeps,
+) -> tuple[bool, list[str]]:
+    """Check presence of external binary tools and optionally attempt --fix reinstall."""
+    deps.print_info("Checking for external tools...")
+    external_tools_to_verify: Dict[str, str] = {}
+    external_tool_check_to_base: Dict[str, str] = {}
+
+    for tool_name, tool_cfg in config.external_tools_config.items():
+        # Conditional checks (skip in CE or legacy depending on metadata)
+        if "condition" in tool_cfg:
+            # Only known condition used in current code is "legacy_only"
+            # The caller should pre-filter mode; we keep the key here for parity.
+            pass
+
+        # Multiple check paths (e.g., PKINITtools)
+        if "check_paths" in tool_cfg:
+            for check_path in tool_cfg["check_paths"]:
+                check_name = f"{tool_name}_{check_path.split('/')[-1].replace('.py', '')}"
+                external_tools_to_verify[check_name] = (
+                    os.path.join(config.tools_install_dir, check_path)
+                )
+                external_tool_check_to_base[check_name] = tool_name
+        elif "check_path" in tool_cfg:
+            check_path = tool_cfg["check_path"]
+            if check_path.startswith("~"):
+                external_tools_to_verify[tool_name] = deps.expand_effective_user_path(
+                    check_path
+                )
+                external_tool_check_to_base[tool_name] = tool_name
+            elif check_path.startswith("/"):
+                external_tools_to_verify[tool_name] = check_path
+                external_tool_check_to_base[tool_name] = tool_name
+            else:
+                external_tools_to_verify[tool_name] = os.path.join(
+                    config.tools_install_dir, check_path
+                )
+                external_tool_check_to_base[tool_name] = tool_name
+
+        # Optional venv-link check (not applicable in full container runtime)
+        if tool_cfg.get("check_venv_link", False) and not config.full_container_runtime:
+            binary_name = tool_cfg.get("name", tool_name)
+            external_tools_to_verify[f"{tool_name}_venv_link"] = os.path.join(
+                config.venv_path, "bin", binary_name
+            )
+            external_tool_check_to_base[f"{tool_name}_venv_link"] = tool_name
+
+    missing_checks: list[str] = []
+    missing_bases: set[str] = set()
+
+    for tool_check_name, tool_path in external_tools_to_verify.items():
+        if os.path.exists(tool_path):
+            deps.print_success(f"{tool_check_name} found at {tool_path}")
+            continue
+        missing_checks.append(tool_check_name)
+        missing_bases.add(external_tool_check_to_base.get(tool_check_name, tool_check_name))
+
+    if missing_checks and config.fix_mode:
+        deps.print_info("Attempting to install missing external tools (--fix)...")
+        github_ok = deps.preflight_install_dns(
+            ["github.com"], attempts=2, backoff_seconds=2, context_label="check --fix external tools"
+        )
+        for base_tool in sorted(missing_bases):
+            tool_cfg = config.external_tools_config.get(base_tool)
+            if not tool_cfg:
+                continue
+            deps.print_info(f"Repairing external tool: {base_tool} (--fix)...")
+            # setup_external_tool(name, config, github_dns_ok, force_reinstall)
+            deps.setup_external_tool(base_tool, tool_cfg, github_dns_ok=github_ok, force_reinstall=False)
+
+        # Re-check after fix attempt
+        still_missing: list[str] = []
+        for tool_check_name in missing_checks:
+            tool_path = external_tools_to_verify.get(tool_check_name)
+            if tool_path and os.path.exists(tool_path):
+                deps.print_success(f"{tool_check_name} found at {tool_path}")
+            else:
+                deps.print_error(f"{tool_check_name} not found at {tool_path}. Try reinstalling.")
+                still_missing.append(tool_check_name)
+        return (len(still_missing) == 0), still_missing
+
+    # No fix mode or nothing missing
+    return (len(missing_checks) == 0), missing_checks
+
+
+# ─── DNS/Unbound Resolver Check ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class DNSResolverCheckConfig:
+    """Configuration for DNS resolver (Unbound) checks."""
+
+    fix_mode: bool
+    full_container_runtime: bool
+
+
+@dataclass(frozen=True)
+class DNSResolverCheckDeps:
+    """Dependency bundle for DNS resolver checks."""
+
+    # Low-level DNS/Unbound helpers from adscan.py
+    is_unbound_listening_local: Callable[[], bool]
+    get_port_53_listeners_text: Callable[[bool], str]
+    extract_process_names_from_ss: Callable[[str], set[str]]
+    stop_dns_resolver_service_for_unbound: Callable[..., None]
+    start_unbound_without_systemd: Callable[[], bool]
+    start_unbound_without_systemd_via_sudo: Callable[[], bool]
+
+    # System/runtime helpers
+    is_systemd_available: Callable[[], bool]
+    build_effective_user_env_for_command: Callable[..., dict]
+    sudo_validate: Callable[[], bool]
+    sudo_prefix_args: Callable[[], list[str]]
+    run_command: Callable[..., object]
+
+    # Output
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    print_info_debug: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+    telemetry_capture_exception: Callable[[BaseException], None]
+
+
+def check_dns_resolver(
+    *, config: DNSResolverCheckConfig, deps: DNSResolverCheckDeps
+) -> bool:
+    """Check DNS resolver (Unbound) status and fix conflicts if requested.
+
+    Returns:
+        bool: True if Unbound is active and ready, False otherwise.
+    """
+    all_ok = True
+    try:
+        in_container = config.full_container_runtime
+        systemd_available = deps.is_systemd_available()
+        dnsmasq_active = None
+        unbound_active = None
+        if systemd_available:
+            dnsmasq_active = deps.run_command(
+                ["systemctl", "is-active", "dnsmasq"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            unbound_active = deps.run_command(
+                ["systemctl", "is-active", "unbound"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        # When unprivileged, `ss -p` may hide process names. In `--fix`, we use `sudo -n`
+        # (if available) so we can reliably detect which resolver holds port 53.
+        sudo_ss = bool(config.fix_mode and os.geteuid() != 0 and shutil.which("sudo"))
+        listeners = deps.get_port_53_listeners_text(use_sudo=sudo_ss)
+        listener_processes = deps.extract_process_names_from_ss(listeners)
+        dnsmasq_occupies_53 = "dnsmasq" in listener_processes
+
+        if dnsmasq_occupies_53:
+            deps.print_warning(
+                "dnsmasq is active and is using port 53; this can prevent Unbound (ADscan DNS) from starting."
+            )
+
+            # In containers, service management is often unavailable and stopping a working
+            # resolver can break outbound DNS (pip/git). Only auto-mitigate on host systems.
+            if in_container:
+                deps.print_info_verbose(
+                    "Container environment detected; not stopping dnsmasq automatically."
+                )
+            elif config.fix_mode:
+                # Only auto-mitigate when the user explicitly requested repairs.
+                deps.stop_dns_resolver_service_for_unbound(
+                    "dnsmasq",
+                    systemd_available=systemd_available,
+                    context="check --fix",
+                )
+            else:
+                deps.print_info_verbose(
+                    "Run `adscan check --fix` to stop dnsmasq automatically."
+                )
+
+            # Refresh status
+            if systemd_available:
+                unbound_active = deps.run_command(
+                    ["systemctl", "is-active", "unbound"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+        unbound_ok = False
+        if systemd_available:
+            unbound_ok = bool(unbound_active and unbound_active.returncode == 0)
+        else:
+            unbound_ok = deps.is_unbound_listening_local()
+
+        if not unbound_ok:
+            if in_container:
+                deps.print_info(
+                    "Unbound service is not active, but this is a container environment; "
+                    "skipping automatic DNS service management."
+                )
+            elif config.fix_mode:
+                deps.print_warning("Unbound service is not active (local DNS may not work).")
+                deps.print_info_verbose("Attempting to start Unbound...")
+
+                # Proactively stop known conflicting DNS resolvers in --fix.
+                if not in_container:
+                    # Refresh listeners using sudo (if available) so we see process names.
+                    listeners = deps.get_port_53_listeners_text(use_sudo=sudo_ss)
+                    listener_processes = deps.extract_process_names_from_ss(listeners)
+                    # Always stop dnsmasq when it's active: it is the main legacy conflict.
+                    if dnsmasq_active and dnsmasq_active.returncode == 0:
+                        deps.stop_dns_resolver_service_for_unbound(
+                            "dnsmasq",
+                            systemd_available=systemd_available,
+                            context="unbound start preflight (dnsmasq active)",
+                        )
+                    # Some distros run systemd-resolved on 127.0.0.53:53; it can also block Unbound.
+                    if "systemd-resolved" in listener_processes:
+                        deps.stop_dns_resolver_service_for_unbound(
+                            "systemd-resolved",
+                            systemd_available=systemd_available,
+                            context="unbound start preflight",
+                        )
+
+                    # For additional resolvers, warn (we avoid blindly stopping unknown services).
+                    other_procs = sorted(
+                        p
+                        for p in listener_processes
+                        if p not in {"dnsmasq", "unbound", "systemd-resolved"}
+                    )
+                    if other_procs:
+                        deps.print_warning(
+                            "Another DNS resolver appears to be listening on port 53; "
+                            "this can prevent Unbound from starting."
+                        )
+                        deps.print_info_verbose(
+                            f"[dns] Port 53 listeners: {', '.join(other_procs)}"
+                        )
+
+                if systemd_available:
+                    unbound_env = deps.build_effective_user_env_for_command(
+                        ["systemctl", "start", "unbound"], shell=False
+                    )
+                    if os.geteuid() != 0 and not deps.sudo_validate():
+                        deps.print_warning(
+                            "Cannot start Unbound automatically without sudo privileges."
+                        )
+                    else:
+                        deps.run_command(
+                            (deps.sudo_prefix_args() + ["systemctl", "enable", "unbound"])
+                            if os.geteuid() != 0
+                            else ["systemctl", "enable", "unbound"],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            env=unbound_env if os.geteuid() != 0 else None,
+                        )
+                        deps.run_command(
+                            (deps.sudo_prefix_args() + ["systemctl", "start", "unbound"])
+                            if os.geteuid() != 0
+                            else ["systemctl", "start", "unbound"],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            env=unbound_env if os.geteuid() != 0 else None,
+                        )
+                    unbound_active = deps.run_command(
+                        ["systemctl", "is-active", "unbound"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    unbound_ok = bool(unbound_active and unbound_active.returncode == 0)
+                else:
+                    unbound_ok = deps.start_unbound_without_systemd()
+                    if not unbound_ok:
+                        unbound_ok = deps.start_unbound_without_systemd_via_sudo()
+
+                if unbound_ok:
+                    deps.print_success("Unbound service is active and ready")
+                else:
+                    deps.print_warning("Unbound service could not be started automatically.")
+                    if listeners:
+                        deps.print_info_verbose(
+                            f"[dns] Port 53 listeners after start attempt:\n{listeners}"
+                        )
+                    if systemd_available:
+                        deps.print_instruction("Try: sudo systemctl start unbound")
+                    else:
+                        deps.print_instruction(
+                            "Try: sudo unbound -d -p -c /etc/unbound/unbound.conf"
+                        )
+                        deps.print_info(
+                            "If this is a container, run it as root or grant CAP_NET_BIND_SERVICE "
+                            "so Unbound can bind to port 53."
+                        )
+                    all_ok = False
+            else:
+                deps.print_warning("Unbound service is not active (local DNS may not work).")
+                deps.print_instruction(
+                    "Run: adscan check --fix (attempts to start Unbound and resolve conflicts)"
+                )
+                all_ok = False
+    except Exception as e:
+        deps.telemetry_capture_exception(e)
+        deps.print_info_debug("[dns] Could not fully verify local DNS resolver services.")
+
+    return all_ok
+
+
+# ─── Docker/Compose Check (BloodHound CE) ────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class DockerComposeCheckConfig:
+    """Configuration for Docker/Compose checks (BloodHound CE)."""
+
+    bh_mode: str  # "ce" or other
+    fix_mode: bool
+    full_container_runtime: bool
+    bloodhound_ce_dir: str
+
+
+@dataclass(frozen=True)
+class DockerComposeCheckDeps:
+    """Dependency bundle for Docker/Compose checks."""
+
+    # Docker/BloodHound helpers
+    is_docker_official_installed: Callable[[], tuple[bool, str]]
+    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
+    check_bloodhound_ce_running: Callable[[], bool]
+    start_bloodhound_ce: Callable[[], bool]
+    get_bloodhound_cli_executable_path: Callable[[], str | None]
+
+    # System helpers
+    is_docker_env: Callable[[], bool]
+    expand_effective_user_path: Callable[[str], str]
+    path_exists: Callable[[str], bool]
+    path_access: Callable[[str, int], bool]
+
+    # Output
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_success_verbose: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+    print_exception: Callable[..., None]
+    telemetry_capture_exception: Callable[[BaseException], None]
+
+
+def check_docker_compose(
+    *, config: DockerComposeCheckConfig, deps: DockerComposeCheckDeps
+) -> bool:
+    """Check Docker/Compose for BloodHound CE and fix if needed.
+
+    Returns:
+        bool: True if all checks pass, False otherwise.
+    """
+    # Only check if BloodHound CE mode is enabled
+    if config.bh_mode != "ce":
+        return True
+
+    all_ok = True
+    deps.print_info("Checking Docker and Docker Compose for BloodHound CE...")
+    in_docker_container = deps.is_docker_env()
+
+    if in_docker_container:
+        deps.print_warning(
+            "Running inside a Docker container - BloodHound CE checks will be informational only"
+        )
+        deps.print_info(
+            "Docker-in-Docker (DinD) is not supported in most CI/CD environments"
+        )
+
+    # Check official Docker Engine
+    docker_installed, docker_version = deps.is_docker_official_installed()
+    if docker_installed:
+        deps.print_success(f"Official Docker Engine found: {docker_version}")
+    else:
+        if in_docker_container:
+            deps.print_warning(
+                f"Docker not found (expected in container environment): {docker_version}"
+            )
+        else:
+            deps.print_error(
+                "Docker not found or not official. BloodHound CE requires official Docker Engine."
+            )
+            deps.print_instruction("Run: adscan install --only bloodhound")
+            all_ok = False
+
+    # Check Docker Compose plugin
+    compose_available, compose_version = deps.is_docker_compose_plugin_available()
+    if compose_available:
+        deps.print_success(f"Docker Compose plugin found: {compose_version}")
+    else:
+        if in_docker_container:
+            deps.print_warning(
+                f"Docker Compose not found (expected in container environment): {compose_version}"
+            )
+        else:
+            deps.print_error(
+                "Docker Compose plugin not found. BloodHound CE requires Docker Compose plugin."
+            )
+            deps.print_instruction("Run: adscan install --only bloodhound")
+            all_ok = False
+
+    # Check BloodHound CE configuration
+    bloodhound_config = deps.expand_effective_user_path(
+        "~/.config/bloodhound/docker-compose.yml"
+    )
+    if deps.path_exists(bloodhound_config):
+        deps.print_success(f"BloodHound CE configuration found: {bloodhound_config}")
+    else:
+        deps.print_warning(
+            f"BloodHound CE configuration not found at {bloodhound_config}"
+        )
+        deps.print_info("This will be created automatically when needed.")
+
+    # Check bloodhound-cli installation
+    deps.print_info("Checking bloodhound-cli installation...")
+    bloodhound_cli_path = os.path.join(config.bloodhound_ce_dir, "bloodhound-ce-cli")
+    if deps.path_exists(bloodhound_cli_path) and deps.path_access(bloodhound_cli_path, os.X_OK):
+        deps.print_success(f"bloodhound-cli found at: {bloodhound_cli_path}")
+    else:
+        deps.print_warning("bloodhound-cli not found or not executable")
+        if not in_docker_container:
+            if config.fix_mode:
+                deps.print_info("Installing bloodhound-cli (--fix)...")
+                try:
+                    # Reuse the same resolution logic used during installation:
+                    # prefer venv-installed bloodhound-cli, then bundled CLI in
+                    # BLOODHOUND_CE_DIR, and finally PATH. If it is still not
+                    # found, instruct the user to install it manually.
+                    cli_path = deps.get_bloodhound_cli_executable_path()
+                    if not cli_path:
+                        deps.print_warning(
+                            "bloodhound-cli executable not found; install it via "
+                            "`pip install bloodhound-cli` or rerun `adscan install`."
+                        )
+                    if deps.path_exists(bloodhound_cli_path) and deps.path_access(
+                        bloodhound_cli_path, os.X_OK
+                    ):
+                        deps.print_success("bloodhound-cli installed successfully")
+                    else:
+                        deps.print_error("Failed to install bloodhound-cli")
+                        all_ok = False
+                except Exception as e:
+                    deps.telemetry_capture_exception(e)
+                    deps.print_error("Failed to install bloodhound-cli.")
+                    deps.print_exception(show_locals=False, exception=e)
+                    all_ok = False
+            else:
+                deps.print_info(
+                    "Run `adscan check --fix` to install bloodhound-cli automatically."
+                )
+                all_ok = False
+        else:
+            deps.print_info(
+                "Skipping bloodhound-cli installation (running in container)"
+            )
+
+    # Check BloodHound CE containers status
+    deps.print_info("Checking BloodHound CE containers status...")
+    if deps.check_bloodhound_ce_running():
+        deps.print_success("All 3 BloodHound CE containers are running")
+    else:
+        if in_docker_container:
+            deps.print_warning(
+                "BloodHound CE containers are not running (expected in container environment)"
+            )
+            deps.print_info(
+                "BloodHound CE requires Docker-in-Docker which is not available in this environment"
+            )
+        else:
+            deps.print_warning("BloodHound CE containers are not running")
+            try:
+                if config.fix_mode:
+                    if deps.start_bloodhound_ce():
+                        deps.print_success_verbose(
+                            "BloodHound CE containers started successfully"
+                        )
+                    else:
+                        deps.print_error("Failed to start BloodHound CE containers")
+                        deps.print_info("Try running: adscan install --only bloodhound")
+                        all_ok = False
+                else:
+                    deps.print_info(
+                        "Run `adscan check --fix` to attempt starting BloodHound CE containers automatically."
+                    )
+                    all_ok = False
+            except Exception as e:
+                deps.telemetry_capture_exception(e)
+                deps.print_error("Error starting BloodHound CE containers.")
+                deps.print_exception(show_locals=False, exception=e)
+                deps.print_info("Try running: adscan install --only bloodhound")
+                all_ok = False
+
+    return all_ok
+
+
+# ─── Go Toolchain and htb-cli Check ────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class GoToolsCheckConfig:
+    """Configuration for Go toolchain checks."""
+
+    full_container_runtime: bool
+    fix_mode: bool
+    session_env: str
+
+
+@dataclass(frozen=True)
+class GoToolsCheckDeps:
+    """Dependency bundle for Go toolchain checks."""
+
+    # Go helpers
+    is_go_available: Callable[[os._Environ[str]], tuple[bool, str]]
+    configure_go_official_path: Callable[[], None]
+    configure_go_path: Callable[[], None]
+    is_htb_cli_available: Callable[[], tuple[bool, str]]
+
+    # System helpers
+    os_environ: os._Environ[str]
+    subprocess_run: Callable[..., Any]
+
+    # Output
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_warning: Callable[[str], None]
+
+
+def check_go_tools(
+    *, config: GoToolsCheckConfig, deps: GoToolsCheckDeps
+) -> bool:
+    """Check Go toolchain and htb-cli (CI-only) status."""
+
+    all_ok = True
+
+    if config.full_container_runtime:
+        deps.print_info(
+            "Skipping Go toolchain and htb-cli verification (running in container)."
+        )
+        return all_ok
+
+    deps.print_info("Checking Go toolchain...")
+
+    # Configure PATH only when explicitly requested
+    if config.fix_mode:
+        deps.configure_go_official_path()
+        if config.session_env == "ci":
+            deps.configure_go_path()
+
+    go_available, go_version = deps.is_go_available(deps.os_environ)
+    if go_available:
+        deps.print_success(f"Go found: {go_version}")
+
+        go_path_check = deps.subprocess_run(
+            ["which", "go"], capture_output=True, text=True, check=False
+        )
+        if go_path_check.returncode == 0:
+            go_binary_path = go_path_check.stdout.strip()
+            if "/usr/local/go/bin/go" in go_binary_path:
+                deps.print_info(
+                    "Go is installed from official golang.org source (latest version)"
+                )
+            else:
+                deps.print_warning(
+                    "Go appears to be installed via system package manager (apt)"
+                )
+                deps.print_info(
+                    "   Consider installing from official source for latest version:"
+                )
+                deps.print_info(
+                    "   Run: adscan install (will install Go from golang.org)"
+                )
+    else:
+        deps.print_warning("Go not found")
+        deps.print_info(
+            "   Install with: adscan install (will install Go from official golang.org source)"
+        )
+        deps.print_info(
+            "   Or manually: curl -L https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xzf -"
+        )
+        all_ok = False
+
+    if config.session_env != "ci":
+        deps.print_info_verbose(
+            f"Skipping htb-cli verification in environment '{config.session_env}' (CI-only)."
+        )
+        return all_ok
+
+    deps.print_info("Checking htb-cli installation (CI-only)...")
+    htb_cli_available, htb_cli_version = deps.is_htb_cli_available()
+    if htb_cli_available:
+        deps.print_success(f"htb-cli found: {htb_cli_version}")
+    else:
+        deps.print_warning("htb-cli not found")
+        deps.print_info(
+            "htb-cli is only required in CI environments (for HTB validations)."
+        )
+        all_ok = False
+
+    return all_ok
+
+# ─── Rust Tools Check (rusthound-ce) ──────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RustToolsCheckConfig:
+    """Configuration for Rust tools checks."""
+
+    full_container_runtime: bool
+    fix_mode: bool
+
+
+@dataclass(frozen=True)
+class RustToolsCheckDeps:
+    """Dependency bundle for Rust tools checks."""
+
+    # Rust/rusthound helpers
+    is_rustup_available: Callable[[os._Environ[str]], tuple[bool, str]]
+    get_rusthound_verification_status: Callable[..., dict]
+    configure_cargo_path: Callable[[], None]
+
+    # System helpers
+    shutil_which: Callable[[str], str | None]
+    os_environ: os._Environ[str]
+
+    # Output
+    print_info: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+
+
+def check_rust_tools(
+    *, config: RustToolsCheckConfig, deps: RustToolsCheckDeps
+) -> bool:
+    """Check Rust toolchain and rusthound-ce installation.
+
+    Returns:
+        bool: True if all checks pass, False otherwise.
+    """
+    all_ok = True
+
+    if config.full_container_runtime:
+        deps.print_info("Checking RustHound-CE (container image)...")
+        rusthound_path = deps.shutil_which("rusthound-ce")
+        if rusthound_path:
+            deps.print_success(f"RustHound-CE found: {rusthound_path}")
+        else:
+            deps.print_error("RustHound-CE not found in this container image.")
+            all_ok = False
+    else:
+        deps.print_info("Checking Rust toolchain and rusthound-ce...")
+
+        # Configure PATH for consistent verification (same as install)
+        if config.fix_mode:
+            deps.configure_cargo_path()
+
+        # Check rustup availability first (recommended installation method)
+        rustup_available, rustup_version = deps.is_rustup_available(
+            deps.os_environ
+        )
+        if rustup_available:
+            deps.print_success(f"rustup found: {rustup_version}")
+            deps.print_info("Using official Rust installer (recommended)")
+        else:
+            deps.print_warning("rustup not found")
+            deps.print_info("rustup is the official Rust installer and is recommended")
+            deps.print_info(
+                "   Install with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+            )
+            deps.print_info("   Or run: adscan install (will install rustup automatically)")
+
+        # Use the unified verification function with current environment
+        rusthound_status = deps.get_rusthound_verification_status(
+            env=deps.os_environ
+        )
+        if (
+            not isinstance(rusthound_status, dict)
+            or "verification_results" not in rusthound_status
+        ):
+            deps.print_error("Error getting rusthound verification status")
+            all_ok = False
+            return all_ok
+        verification_results = rusthound_status["verification_results"]
+        messages = rusthound_status["messages"]
+
+        # Check cargo availability
+        if verification_results["cargo_available"]:
+            deps.print_success(messages["cargo"])
+            # If cargo is available but rustup is not, it might be from apt (old version)
+            if not rustup_available:
+                deps.print_warning(
+                    "cargo appears to be installed via system package manager (apt)"
+                )
+                deps.print_info(
+                    "   This may cause compatibility issues with newer Rust crates"
+                )
+                deps.print_info(
+                    "   Consider migrating to rustup: adscan install --only rusthound"
+                )
+        else:
+            deps.print_warning(messages["cargo"])
+            deps.print_info(
+                f"Cargo check failed: {verification_results['cargo_version']}"
+            )
+            # Print cargo-related recommendations
+            for recommendation in messages["recommendations"]:
+                if (
+                    "cargo" in recommendation.lower()
+                    or "rustup" in recommendation.lower()
+                ):
+                    deps.print_info(recommendation)
+            all_ok = False
+
+        # Check rusthound-ce installation
+        if verification_results["rusthound_installed"]:
+            deps.print_success(messages["rusthound_installed"])
+        else:
+            deps.print_warning(messages["rusthound_installed"])
+            # Show relevant recommendations for rusthound installation
+            for recommendation in messages["recommendations"]:
+                if "rusthound" in recommendation.lower() and (
+                    "install" in recommendation or "cargo install" in recommendation
+                ):
+                    deps.print_info(recommendation)
+            all_ok = False
+
+        # Check cargo bin in PATH
+        if verification_results["cargo_bin_in_path"]:
+            deps.print_success(messages["cargo_bin_path"])
+        else:
+            deps.print_warning(messages["cargo_bin_path"])
+            # Print relevant recommendations for cargo bin PATH
+            for recommendation in messages["recommendations"]:
+                if (
+                    "export PATH" in recommendation
+                    or "install --only rusthound" in recommendation
+                ):
+                    deps.print_info(recommendation)
+
+        # Check rusthound-ce accessibility
+        if verification_results["rusthound_accessible"]:
+            deps.print_success(messages["rusthound_accessible"])
+        else:
+            deps.print_warning(messages["rusthound_accessible"])
+            # Print relevant recommendations for rusthound accessibility
+            for recommendation in messages["recommendations"]:
+                if (
+                    "restarting terminal" in recommendation
+                    or "install --only rusthound" in recommendation
+                    or "configure PATH automatically" in recommendation
+                ):
+                    deps.print_info(recommendation)
+
+        # Overall RustHound-CE status
+        if verification_results["overall_status"]:
+            deps.print_success(messages["overall"])
+        else:
+            deps.print_warning(messages["overall"])
+            # Print general installation recommendations
+            for recommendation in messages["recommendations"]:
+                if (
+                    "install --only rusthound" in recommendation
+                    and "fix" in recommendation
+                ):
+                    deps.print_info(recommendation)
+                    break
+            all_ok = False
+
+    return all_ok
+
+
+# ─── Pyenv Check ──────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PyenvCheckConfig:
+    """Configuration for pyenv checks."""
+
+    full_container_runtime: bool
+    fix_mode: bool
+    python_version: str
+    venv_path: str
+
+
+@dataclass(frozen=True)
+class PyenvCheckDeps:
+    """Dependency bundle for pyenv checks."""
+
+    check_and_ensure_pyenv_status: Callable[..., Dict[str, Any]]
+    install_pyenv_python_and_venv: Callable[..., tuple[bool, List[str], str]]
+    expand_effective_user_path: Callable[[str], str]
+    regenerate_pyenv_shims: Callable[[], bool]
+    fix_pyenv_shims_permissions: Callable[[], bool]
+    mark_sensitive: Callable[..., Any]
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+    print_exception: Callable[..., None]
+    telemetry_capture_exception: Callable[[BaseException], None]
+
+
+def check_pyenv_status(
+    *, config: PyenvCheckConfig, deps: PyenvCheckDeps
+) -> bool:
+    """Check pyenv and Python version management status.
+
+    Returns:
+        bool: True if pyenv checks pass, False otherwise.
+    """
+    if config.full_container_runtime:
+        deps.print_info_verbose(
+            "Skipping pyenv verification (running in container)."
+        )
+        return True
+
+    deps.print_info("Checking pyenv and Python version management...")
+
+    try:
+        pyenv_status = deps.check_and_ensure_pyenv_status(
+            python_version=config.python_version,
+            auto_configure=config.fix_mode,
+        )
+
+        if pyenv_status.get("installed") and pyenv_status.get("accessible"):
+            deps.print_success("pyenv is installed and accessible")
+            if pyenv_status.get("python_installed"):
+                deps.print_success(
+                    f"Python {config.python_version} is installed via pyenv"
+                )
+            else:
+                deps.print_warning(
+                    f"Python {config.python_version} is not installed via pyenv"
+                )
+                if config.fix_mode:
+                    deps.print_info(
+                        f"Installing Python {config.python_version} via pyenv (--fix)..."
+                    )
+                    ok, _, _ = deps.install_pyenv_python_and_venv(
+                        python_version=config.python_version,
+                        venv_path=config.venv_path,
+                    )
+                    if ok:
+                        deps.print_success(
+                            f"Python {config.python_version} installed successfully"
+                        )
+                    else:
+                        deps.print_error(
+                            f"Failed to install Python {config.python_version}"
+                        )
+                        return False
+                else:
+                    deps.print_instruction(
+                        f"Run: adscan check --fix (will install Python {config.python_version})"
+                    )
+                    return False
+        else:
+            deps.print_warning("pyenv is not installed or not accessible")
+            if config.fix_mode:
+                deps.print_info("Installing pyenv (--fix)...")
+                deps.print_instruction(
+                    "Please install pyenv manually: "
+                    "curl https://pyenv.run | bash"
+                )
+                return False
+            else:
+                deps.print_instruction(
+                    "Install pyenv: curl https://pyenv.run | bash"
+                )
+                return False
+
+        if pyenv_status.get("shims_need_rehash"):
+            if config.fix_mode:
+                deps.print_info("Regenerating pyenv shims (--fix)...")
+                if deps.regenerate_pyenv_shims():
+                    deps.print_success("pyenv shims regenerated successfully")
+                else:
+                    deps.print_warning("Failed to regenerate pyenv shims")
+            else:
+                deps.print_warning("pyenv shims need regeneration")
+                deps.print_instruction("Run: adscan check --fix")
+
+        return True
+
+    except Exception as exc:
+        deps.telemetry_capture_exception(exc)
+        deps.print_error("Error checking pyenv status")
+        deps.print_exception(show_locals=False, exception=exc)
+        return False
+
+
+@dataclass(frozen=True)
+class CheckConfig:
+    """Configuration for the main check process.
+
+    Attributes:
+        args: Optional argparse.Namespace with check arguments.
+        adscan_base_dir: Base directory for ADscan installation.
+        tools_install_dir: Directory for external tools.
+        wordlists_install_dir: Directory for wordlists.
+        tool_venvs_base_dir: Base directory for tool virtual environments.
+        venv_path: Path to the main virtual environment.
+        bloodhound_ce_dir: Path to BloodHound CE directory.
+        core_requirements: Core Python requirements.
+        pip_tools_config: Configuration for pip tools.
+        external_tools_config: Configuration for external tools.
+        system_packages_config: Configuration for system packages.
+        python_version: Python version to check (default: "3.12.3").
+    """
+
+    args: Any | None
+    adscan_base_dir: str
+    tools_install_dir: str
+    wordlists_install_dir: str
+    tool_venvs_base_dir: str
+    venv_path: str
+    bloodhound_ce_dir: str
+    core_requirements: List[str]
+    pip_tools_config: Dict[str, Any]
+    external_tools_config: Dict[str, Any]
+    system_packages_config: Dict[str, str]
+    python_version: str
+
+
+@dataclass(frozen=True)
+class CheckDeps:
+    """Dependency bundle for the main check flow."""
+
+    # Environment detection
+    is_full_adscan_container_runtime: Callable[[], bool]
+    determine_session_environment: Callable[[], str]
+    get_bloodhound_mode: Callable[[], str]
+
+    # Directory operations
+    ensure_dir_writable: Callable[..., bool]
+
+    # Check helpers (already in check.py)
+    check_virtual_environment: Callable[..., tuple[bool, bool]]
+    check_core_dependencies: Callable[..., bool]
+    check_external_tools: Callable[..., bool]
+    check_system_packages: Callable[..., tuple[bool, List[str]]]
+    check_dns_resolver: Callable[..., bool]
+    check_external_binary_tools: Callable[..., tuple[bool, List[str]]]
+    check_docker_compose: Callable[..., bool]
+    check_rust_tools: Callable[..., bool]
+    check_go_toolchain: Callable[..., bool]
+    check_pyenv_status: Callable[..., bool]
+
+    # Helper functions
+    is_libreoffice_available: Callable[[], tuple[bool, str]]
+    print_check_summary: Callable[[bool], None]
+
+    # Wordlist service
+    WordlistService: type
+
+    # Command execution
+    run_command: Callable[..., object]
+    get_clean_env_for_compilation: Callable[[], Dict[str, str]]
+    parse_requirement_spec: Callable[[str], Any]
+    get_python_package_version: Callable[..., str | None]
+    assess_version_compliance: Callable[..., bool]
+    get_installed_vcs_reference: Callable[..., str | None]
+    get_installed_vcs_reference_by_url: Callable[..., str | None]
+    normalize_vcs_repo_url: Callable[[str], str]
+    vcs_reference_matches: Callable[..., bool]
+    build_venv_exec_env: Callable[..., Dict[str, str]]
+    check_executable_help_works: Callable[..., bool]
+    fix_isolated_python_tool_venv: Callable[..., bool]
+    diagnose_manspider_help_failure: Callable[..., None]
+    ensure_isolated_tool_extra_specs_installed: Callable[..., bool]
+    verify_system_packages: Callable[..., tuple[bool, List[str]]]
+    apply_effective_user_home_to_env: Callable[..., Dict[str, str]]
+    sudo_validate: Callable[..., bool]
+    is_unbound_listening_local: Callable[[], bool]
+    get_port_53_listeners_text: Callable[[], str]
+    extract_process_names_from_ss: Callable[[str], List[str]]
+    stop_dns_resolver_service_for_unbound: Callable[[], bool]
+    start_unbound_without_systemd: Callable[[], bool]
+    start_unbound_without_systemd_via_sudo: Callable[[], bool]
+    is_systemd_available: Callable[[], bool]
+    build_effective_user_env_for_command: Callable[..., Dict[str, str]]
+    sudo_prefix_args: Callable[..., List[str]]
+    expand_effective_user_path: Callable[[str], str]
+    preflight_install_dns: Callable[[], bool]
+    setup_external_tool: Callable[..., bool]
+    is_docker_official_installed: Callable[[], tuple[bool, str]]
+    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
+    check_bloodhound_ce_running: Callable[[], bool]
+    start_bloodhound_ce: Callable[[], bool]
+    get_bloodhound_cli_executable_path: Callable[[], str]
+    is_docker_env: Callable[[], bool]
+    is_rustup_available: Callable[[], tuple[bool, str]]
+    get_rusthound_verification_status: Callable[[], Dict[str, Any]]
+    configure_cargo_path: Callable[[], bool]
+    configure_go_official_path: Callable[[], bool]
+    configure_go_path: Callable[[], bool]
+    is_go_available: Callable[[], tuple[bool, str]]
+    is_go_bin_in_path: Callable[[], tuple[bool, str]]
+    is_htb_cli_installed: Callable[[], tuple[bool, str]]
+    is_htb_cli_accessible: Callable[[], tuple[bool, str]]
+    check_and_ensure_pyenv_status: Callable[..., Dict[str, Any]]
+    install_pyenv_python_and_venv: Callable[..., tuple[bool, List[str], str]]
+    regenerate_pyenv_shims: Callable[[], bool]
+    fix_pyenv_shims_permissions: Callable[[], bool]
+
+    # Telemetry
+    telemetry_capture: Callable[[str, Dict[str, Any]], None]
+    telemetry_capture_exception: Callable[[BaseException], None]
+
+    # Output functions
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    print_info_debug: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_success_verbose: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+    print_exception: Callable[..., None]
+
+    # Interactive prompts
+    confirm_ask: Callable[..., bool]
+    track_docs_link_shown: Callable[[str, str], None]
+
+    # Standard library
+    os_getenv: Callable[[str, str | None], str | None]
+    os_path_exists: Callable[[str], bool]
+    os_path_access: Callable[[str, int], bool]
+    sys_stdin_isatty: Callable[[], bool]
+    argparse_namespace: type
+    shutil_which: Callable[[str], str | None]
+    os_environ: Dict[str, str]
+    subprocess_run: Callable[..., Any]
+
+    # Mark sensitive
+    mark_sensitive: Callable[..., Any]
+
+    # Global state setter (for _LAST_CHECK_SESSION_EXTRA)
+    set_last_check_session_extra: Callable[[Dict[str, Any] | None], None]
+
+    # Recursive check (for interactive fix prompt)
+    handle_check: Callable[[Any], bool]
+
+
+def run_check(
+    *,
+    config: CheckConfig,
+    deps: CheckDeps,
+) -> bool:
+    """Main check orchestrator.
+
+    This function orchestrates the complete check process for ADscan,
+    including virtual environment, dependencies, tools, wordlists, Docker,
+    Rust, Go, and pyenv checks.
+
+    All I/O, subprocess calls, and telemetry are injected via ``deps`` to keep
+    this function testable and to avoid circular imports with ``adscan.py``.
+
+    Returns:
+        True if all checks passed, False otherwise.
+    """
+    deps.print_info("Checking adscan installation status...")
+    deps.set_last_check_session_extra(None)
+
+    all_ok = True
+    full_container_runtime = deps.is_full_adscan_container_runtime()
+    session_env = deps.determine_session_environment()
+    fix_mode = bool(getattr(config.args, "fix", False)) if config.args is not None else False
+    fix_trigger = (
+        getattr(config.args, "fix_trigger", None) if config.args is not None and fix_mode else None
+    )
+    pre_fix_failed = (
+        bool(getattr(config.args, "pre_fix_failed", False))
+        if config.args is not None and fix_mode
+        else False
+    )
+    missing_tools: List[str] = []
+    tool_version_issues: List[str] = []
+    missing_system_packages_count = 0
+    dnsmasq_occupies_53_for_check: bool | None = None
+    unbound_ok_for_check: bool | None = None
+
+    if full_container_runtime:
+        deps.set_last_check_session_extra({"mode": "container"})
+
+    if fix_mode:
+        deps.telemetry_capture(
+            "check_fix_started",
+            properties={"trigger": fix_trigger or "flag"},
+        )
+        # Older versions (or legacy sudo aliases) could create root-owned ~/.adscan,
+        # which then breaks `--fix` because we can't create venvs/tools directories.
+        deps.ensure_dir_writable(
+            config.adscan_base_dir,
+            description="ADscan base",
+            fix=True,
+            recursive=True,
+        )
+        deps.ensure_dir_writable(
+            config.tools_install_dir,
+            description="ADscan tools",
+            fix=True,
+            recursive=True,
+        )
+        deps.ensure_dir_writable(
+            config.wordlists_install_dir,
+            description="ADscan wordlists",
+            fix=True,
+            recursive=True,
+        )
+
+    # 1. Check Virtual Environment (host/legacy installer only)
+    #
+    # In the FULL Docker runtime image, ADscan runs as a self-contained binary with
+    # pre-provisioned tool envs under `/opt/adscan`. A host-based venv is not required.
+    from adscan_internal.cli.check import (
+        VirtualEnvCheckConfig,
+        VirtualEnvCheckDeps,
+    )
+
+    adscan_venv_ok, all_ok = deps.check_virtual_environment(
+        config=VirtualEnvCheckConfig(
+            adscan_base_dir=config.adscan_base_dir,
+            venv_path=config.venv_path,
+            full_container_runtime=full_container_runtime,
+            fix_mode=fix_mode,
+        ),
+        deps=VirtualEnvCheckDeps(
+            ensure_dir_writable=deps.ensure_dir_writable,
+            install_pyenv_python_and_venv=deps.install_pyenv_python_and_venv,
+            run_command=deps.run_command,
+            path_exists=deps.os_path_exists,
+            print_success=deps.print_success,
+            print_warning=deps.print_warning,
+            print_error=deps.print_error,
+            print_instruction=deps.print_instruction,
+            print_info=deps.print_info,
+            print_info_verbose=deps.print_info_verbose,
+            telemetry_capture_exception=deps.telemetry_capture_exception,
+            print_exception=deps.print_exception,
+        ),
+    )
+
+    # 2. Check Core Dependencies in System Python (delegated helper)
+    from adscan_internal.cli.check import (
+        CoreDepsCheckConfig,
+        CoreDepsCheckDeps,
+    )
+
+    core_ok = deps.check_core_dependencies(
+        config=CoreDepsCheckConfig(core_requirements=config.core_requirements),
+        deps=CoreDepsCheckDeps(
+            run_command=deps.run_command,
+            get_clean_env_for_compilation=deps.get_clean_env_for_compilation,
+            parse_requirement_spec=deps.parse_requirement_spec,
+            get_python_package_version=lambda py, pkg: deps.get_python_package_version(
+                py, pkg, env=deps.get_clean_env_for_compilation()
+            ),
+            assess_version_compliance=deps.assess_version_compliance,
+            get_installed_vcs_reference=lambda py, pkg: deps.get_installed_vcs_reference(
+                py, pkg, env=deps.get_clean_env_for_compilation()
+            ),
+            get_installed_vcs_reference_by_url=lambda py, url: deps.get_installed_vcs_reference_by_url(  # noqa: E501
+                py, url, env=deps.get_clean_env_for_compilation()
+            ),
+            normalize_vcs_repo_url=deps.normalize_vcs_repo_url,
+            vcs_reference_matches=deps.vcs_reference_matches,
+            print_info=deps.print_info,
+            print_info_verbose=deps.print_info_verbose,
+            print_success=deps.print_success,
+            print_success_verbose=deps.print_success_verbose,
+            print_warning=deps.print_warning,
+            print_error=deps.print_error,
+            print_instruction=deps.print_instruction,
+            telemetry_capture_exception=deps.telemetry_capture_exception,
+        ),
+    )
+    all_ok = all_ok and core_ok
+
+    # 3. Check External Python Tool Dependencies in their isolated venvs (delegated)
+    from adscan_internal.cli.check import (
+        ExternalToolsCheckConfig,
+        ExternalToolsCheckDeps,
+    )
+
+    if adscan_venv_ok:  # Only if main venv exists (or we're in FULL container runtime)
+        tools_ok = deps.check_external_tools(
+            config=ExternalToolsCheckConfig(
+                pip_tools_config=config.pip_tools_config,
+                tool_venvs_base_dir=config.tool_venvs_base_dir,
+                fix_mode=fix_mode,
+            ),
+            deps=ExternalToolsCheckDeps(
+                run_command=deps.run_command,
+                parse_requirement_spec=deps.parse_requirement_spec,
+                build_venv_exec_env=deps.build_venv_exec_env,
+                check_executable_help_works=deps.check_executable_help_works,
+                fix_isolated_python_tool_venv=deps.fix_isolated_python_tool_venv,
+                diagnose_manspider_help_failure=deps.diagnose_manspider_help_failure,
+                ensure_isolated_tool_extra_specs_installed=deps.ensure_isolated_tool_extra_specs_installed,
+                get_clean_env_for_compilation=deps.get_clean_env_for_compilation,
+                get_python_package_version=deps.get_python_package_version,
+                assess_version_compliance=deps.assess_version_compliance,
+                get_installed_vcs_reference=deps.get_installed_vcs_reference,
+                get_installed_vcs_reference_by_url=deps.get_installed_vcs_reference_by_url,
+                normalize_vcs_repo_url=deps.normalize_vcs_repo_url,
+                vcs_reference_matches=deps.vcs_reference_matches,
+                print_info=deps.print_info,
+                print_info_verbose=deps.print_info_verbose,
+                print_success=deps.print_success,
+                print_success_verbose=deps.print_success_verbose,
+                print_warning=deps.print_warning,
+                print_error=deps.print_error,
+                print_instruction=deps.print_instruction,
+                telemetry_capture_exception=deps.telemetry_capture_exception,
+            ),
+        )
+        all_ok = all_ok and tools_ok
+    else:
+        deps.print_info_verbose(
+            "Skipping external Python tool verification because the main environment is not ready."
+        )
+
+    # 4. Check System Packages (delegated)
+    from adscan_internal.cli.check import (
+        SystemPackagesCheckConfig,
+        SystemPackagesCheckDeps,
+    )
+    bh_mode = deps.get_bloodhound_mode()
+    system_packages_to_verify = config.system_packages_config.copy()
+    if bh_mode == "ce":
+        system_packages_to_verify.pop("neo4j", None)
+
+    sp_ok, sp_missing = deps.check_system_packages(
+        config=SystemPackagesCheckConfig(
+            system_packages_to_verify=system_packages_to_verify,
+            fix_mode=fix_mode,
+        ),
+        deps=SystemPackagesCheckDeps(
+            verify_system_packages=deps.verify_system_packages,
+            run_command=deps.run_command,
+            get_clean_env_for_compilation=deps.get_clean_env_for_compilation,
+            apply_effective_user_home_to_env=deps.apply_effective_user_home_to_env,
+            sudo_validate=deps.sudo_validate,
+            print_info=deps.print_info,
+            print_success=deps.print_success,
+            print_warning=deps.print_warning,
+            print_error=deps.print_error,
+            print_instruction=deps.print_instruction,
+            telemetry_capture_exception=deps.telemetry_capture_exception,
+            print_exception=deps.print_exception,
+        ),
+    )
+    if not sp_ok:
+        all_ok = False
+        missing_system_packages_count = len(sp_missing)
+
+    # DNS resolver conflicts (dnsmasq vs Unbound) - delegated helper
+    from adscan_internal.cli.check import (
+        DNSResolverCheckConfig,
+        DNSResolverCheckDeps,
+    )
+
+    dns_ok = deps.check_dns_resolver(
+        config=DNSResolverCheckConfig(
+            fix_mode=fix_mode,
+            full_container_runtime=full_container_runtime,
+        ),
+        deps=DNSResolverCheckDeps(
+            is_unbound_listening_local=deps.is_unbound_listening_local,
+            get_port_53_listeners_text=deps.get_port_53_listeners_text,
+            extract_process_names_from_ss=deps.extract_process_names_from_ss,
+            stop_dns_resolver_service_for_unbound=deps.stop_dns_resolver_service_for_unbound,
+            start_unbound_without_systemd=deps.start_unbound_without_systemd,
+            start_unbound_without_systemd_via_sudo=deps.start_unbound_without_systemd_via_sudo,
+            is_systemd_available=deps.is_systemd_available,
+            build_effective_user_env_for_command=deps.build_effective_user_env_for_command,
+            sudo_validate=deps.sudo_validate,
+            sudo_prefix_args=deps.sudo_prefix_args,
+            run_command=deps.run_command,
+            print_info=deps.print_info,
+            print_info_verbose=deps.print_info_verbose,
+            print_info_debug=deps.print_info_debug,
+            print_success=deps.print_success,
+            print_warning=deps.print_warning,
+            print_instruction=deps.print_instruction,
+            telemetry_capture_exception=deps.telemetry_capture_exception,
+        ),
+    )
+    if not dns_ok:
+        all_ok = False
+
+    # Check libreoffice specifically for PDF conversion capability
+    deps.print_info("Checking libreoffice for PDF conversion...")
+    libreoffice_available, libreoffice_info = deps.is_libreoffice_available()
+    if libreoffice_available:
+        deps.print_success(f"libreoffice is available: {libreoffice_info}")
+    else:
+        deps.print_warning(f"libreoffice is not available: {libreoffice_info}")
+        deps.print_info("libreoffice is required for PDF report generation")
+        deps.print_instruction("Install with: sudo apt-get install -y libreoffice")
+        # Don't set all_ok = False here as libreoffice is optional (only needed for PDF reports)
+
+    # 5. Check External Tools (delegated for non-Python tools)
+    from adscan_internal.cli.check import (
+        ExternalBinaryToolsCheckConfig,
+        ExternalBinaryToolsCheckDeps,
+    )
+    eb_ok, eb_missing = deps.check_external_binary_tools(
+        config=ExternalBinaryToolsCheckConfig(
+            external_tools_config=config.external_tools_config,
+            tools_install_dir=config.tools_install_dir,
+            venv_path=config.venv_path,
+            full_container_runtime=full_container_runtime,
+            fix_mode=fix_mode,
+        ),
+        deps=ExternalBinaryToolsCheckDeps(
+            expand_effective_user_path=deps.expand_effective_user_path,
+            preflight_install_dns=deps.preflight_install_dns,
+            setup_external_tool=deps.setup_external_tool,
+            print_info=deps.print_info,
+            print_success=deps.print_success,
+            print_warning=deps.print_warning,
+            print_error=deps.print_error,
+        ),
+    )
+    if not eb_ok:
+        all_ok = False
+
+    # 6. Check Wordlists (delegated to WordlistService)
+    deps.print_info("Checking for wordlists...")
+    wordlist_service = deps.WordlistService(wordlists_dir=config.wordlists_install_dir)
+    w_all_ok, w_details = wordlist_service.verify_all(fix=fix_mode)
+    for wl_name, status in w_details.items():
+        if status.startswith("found"):
+            deps.print_success(f"{wl_name} {status}")
+        elif "installed" in status:
+            deps.print_success(f"{wl_name} {status}")
+        else:
+            deps.print_error(f"{wl_name} {status}")
+    if not w_all_ok:
+        all_ok = False
+
+    # 7. Check Docker and Docker Compose (if BloodHound CE is used) - delegated helper
+    from adscan_internal.cli.check import (
+        DockerComposeCheckConfig,
+        DockerComposeCheckDeps,
+    )
+
+    docker_ok = deps.check_docker_compose(
+        config=DockerComposeCheckConfig(
+            bh_mode=bh_mode,
+            fix_mode=fix_mode,
+            full_container_runtime=full_container_runtime,
+            bloodhound_ce_dir=config.bloodhound_ce_dir,
+        ),
+        deps=DockerComposeCheckDeps(
+            is_docker_official_installed=deps.is_docker_official_installed,
+            is_docker_compose_plugin_available=deps.is_docker_compose_plugin_available,
+            check_bloodhound_ce_running=deps.check_bloodhound_ce_running,
+            start_bloodhound_ce=deps.start_bloodhound_ce,
+            get_bloodhound_cli_executable_path=deps.get_bloodhound_cli_executable_path,
+            is_docker_env=deps.is_docker_env,
+            expand_effective_user_path=deps.expand_effective_user_path,
+            path_exists=deps.os_path_exists,
+            path_access=deps.os_path_access,
+            print_info=deps.print_info,
+            print_info_verbose=deps.print_info_verbose,
+            print_success=deps.print_success,
+            print_success_verbose=deps.print_success_verbose,
+            print_warning=deps.print_warning,
+            print_error=deps.print_error,
+            print_instruction=deps.print_instruction,
+            print_exception=deps.print_exception,
+            telemetry_capture_exception=deps.telemetry_capture_exception,
+        ),
+    )
+    if not docker_ok:
+        all_ok = False
+
+    # 8. Check Rust tools (rusthound-ce) - delegated helper
+    from adscan_internal.cli.check import (
+        RustToolsCheckConfig,
+        RustToolsCheckDeps,
+    )
+
+    rust_ok = deps.check_rust_tools(
+        config=RustToolsCheckConfig(
+            full_container_runtime=full_container_runtime,
+            fix_mode=fix_mode,
+        ),
+        deps=RustToolsCheckDeps(
+            is_rustup_available=deps.is_rustup_available,
+            get_rusthound_verification_status=deps.get_rusthound_verification_status,
+            configure_cargo_path=deps.configure_cargo_path,
+            shutil_which=deps.shutil_which,
+            os_environ=deps.os_environ,
+            print_info=deps.print_info,
+            print_success=deps.print_success,
+            print_warning=deps.print_warning,
+            print_error=deps.print_error,
+        ),
+    )
+    if not rust_ok:
+        all_ok = False
+
+    # 9. Check Go toolchain (always) and htb-cli (CI-only) - delegated helper
+    from adscan_internal.cli.check import (
+        GoToolchainCheckConfig,
+        GoToolchainCheckDeps,
+    )
+
+    go_ok = deps.check_go_toolchain(
+        config=GoToolchainCheckConfig(
+            full_container_runtime=full_container_runtime,
+            fix_mode=fix_mode,
+            session_env=session_env,
+        ),
+        deps=GoToolchainCheckDeps(
+            configure_go_official_path=deps.configure_go_official_path,
+            configure_go_path=deps.configure_go_path,
+            is_go_available=deps.is_go_available,
+            is_go_bin_in_path=deps.is_go_bin_in_path,
+            is_htb_cli_installed=deps.is_htb_cli_installed,
+            is_htb_cli_accessible=deps.is_htb_cli_accessible,
+            os_environ=deps.os_environ,
+            subprocess_run=deps.subprocess_run,
+            print_info=deps.print_info,
+            print_info_verbose=deps.print_info_verbose,
+            print_success=deps.print_success,
+            print_warning=deps.print_warning,
+            print_error=deps.print_error,
+        ),
+    )
+    if not go_ok:
+        all_ok = False
+
+    # 10. Check pyenv and Python version management - delegated helper
+    from adscan_internal.cli.check import (
+        PyenvCheckConfig,
+        PyenvCheckDeps,
+        check_pyenv_status as check_pyenv_status_fn,
+    )
+
+    pyenv_ok = check_pyenv_status_fn(
+        config=PyenvCheckConfig(
+            full_container_runtime=full_container_runtime,
+            fix_mode=fix_mode,
+            python_version=config.python_version,
+            venv_path=config.venv_path,
+        ),
+        deps=PyenvCheckDeps(
+            check_and_ensure_pyenv_status=deps.check_and_ensure_pyenv_status,
+            install_pyenv_python_and_venv=deps.install_pyenv_python_and_venv,
+            expand_effective_user_path=deps.expand_effective_user_path,
+            regenerate_pyenv_shims=deps.regenerate_pyenv_shims,
+            fix_pyenv_shims_permissions=deps.fix_pyenv_shims_permissions,
+            mark_sensitive=deps.mark_sensitive,
+            print_info=deps.print_info,
+            print_info_verbose=deps.print_info_verbose,
+            print_success=deps.print_success,
+            print_warning=deps.print_warning,
+            print_error=deps.print_error,
+            print_instruction=deps.print_instruction,
+            print_exception=deps.print_exception,
+            telemetry_capture_exception=deps.telemetry_capture_exception,
+        ),
+    )
+    if not pyenv_ok:
+        all_ok = False
+
+    if all_ok:
+        deps.print_success("All checks passed! adscan installation appears to be complete.")
+        deps.print_instruction("Now you can start the tool with adscan start")
+
+        # Final consolidated summary table
+        deps.print_check_summary(all_ok)
+        deps.set_last_check_session_extra(
+            {
+                "fix_mode": fix_mode,
+                "fix_trigger": fix_trigger or ("flag" if fix_mode else None),
+                "pre_fix_failed": pre_fix_failed if fix_mode else None,
+                "missing_tools_count": len(missing_tools),
+                "tool_version_issues_count": len(tool_version_issues),
+                "missing_system_packages_count": missing_system_packages_count,
+                "dnsmasq_occupies_53": dnsmasq_occupies_53_for_check,
+                "unbound_ok": unbound_ok_for_check,
+            }
+        )
+
+        if fix_mode:
+            deps.telemetry_capture(
+                "check_fix_completed",
+                properties={
+                    "trigger": fix_trigger or "flag",
+                    "success": True,
+                    "pre_fix_failed": pre_fix_failed,
+                    "missing_tools_count": len(missing_tools),
+                    "tool_version_issues_count": len(tool_version_issues),
+                    "missing_system_packages_count": missing_system_packages_count,
+                    "dnsmasq_occupies_53": dnsmasq_occupies_53_for_check,
+                    "unbound_ok": unbound_ok_for_check,
+                },
+            )
+        else:
+            deps.telemetry_capture(
+                "check_completed",
+                properties={
+                    "success": True,
+                    "missing_tools_count": len(missing_tools),
+                    "tool_version_issues_count": len(tool_version_issues),
+                    "missing_system_packages_count": missing_system_packages_count,
+                    "dnsmasq_occupies_53": dnsmasq_occupies_53_for_check,
+                    "unbound_ok": unbound_ok_for_check,
+                },
+            )
+        return all_ok
+    else:
+        deps.print_error("Some checks failed. Please review the messages above.")
+        deps.print_instruction("Try: adscan check --fix")
+        docs_url = "https://www.adscanpro.com/docs/guides/troubleshooting?utm_source=cli&utm_medium=check_failed"
+        deps.print_info(
+            f"💡 Troubleshooting guide: [link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
+        )
+        deps.track_docs_link_shown("check_failed", docs_url)
+        deps.print_check_summary(False)
+        deps.set_last_check_session_extra(
+            {
+                "fix_mode": fix_mode,
+                "fix_trigger": fix_trigger or ("flag" if fix_mode else None),
+                "pre_fix_failed": pre_fix_failed if fix_mode else None,
+                "missing_tools_count": len(missing_tools),
+                "tool_version_issues_count": len(tool_version_issues),
+                "missing_system_packages_count": missing_system_packages_count,
+                "dnsmasq_occupies_53": dnsmasq_occupies_53_for_check,
+                "unbound_ok": unbound_ok_for_check,
+            }
+        )
+
+        if fix_mode:
+            deps.telemetry_capture(
+                "check_fix_completed",
+                properties={
+                    "trigger": fix_trigger or "flag",
+                    "success": False,
+                    "pre_fix_failed": pre_fix_failed,
+                    "missing_tools_count": len(missing_tools),
+                    "tool_version_issues_count": len(tool_version_issues),
+                    "missing_system_packages_count": missing_system_packages_count,
+                    "dnsmasq_occupies_53": dnsmasq_occupies_53_for_check,
+                    "unbound_ok": unbound_ok_for_check,
+                },
+            )
+            return False
+
+        deps.telemetry_capture(
+            "check_completed",
+            properties={
+                "success": False,
+                "missing_tools_count": len(missing_tools),
+                "tool_version_issues_count": len(tool_version_issues),
+                "missing_system_packages_count": missing_system_packages_count,
+                "dnsmasq_occupies_53": dnsmasq_occupies_53_for_check,
+                "unbound_ok": unbound_ok_for_check,
+            },
+        )
+
+        # Offer to run `--fix` interactively when possible.
+        offer_fix = (
+            config.args is not None
+            and getattr(config.args, "command", None) == "check"
+            and not deps.os_getenv("CI")
+            and deps.sys_stdin_isatty()
+        )
+        if offer_fix:
+            deps.telemetry_capture(
+                "check_fix_prompt_shown",
+                properties={
+                    "missing_tools_count": len(missing_tools),
+                    "tool_version_issues_count": len(tool_version_issues),
+                    "missing_system_packages_count": missing_system_packages_count,
+                },
+            )
+            deps.print_warning("Some issues can often be fixed automatically.")
+            proceed = deps.confirm_ask(
+                "Try to fix automatically now (runs `adscan check --fix`)?",
+                default=True,
+            )
+            if proceed:
+                deps.telemetry_capture("check_fix_prompt_accepted")
+                deps.print_info("Running check with --fix...")
+                fix_args = deps.argparse_namespace(**vars(config.args))
+                fix_args.fix = True
+                fix_args.fix_trigger = "prompt"
+                fix_args.pre_fix_failed = True
+                fix_success = deps.handle_check(fix_args)
+                deps.telemetry_capture(
+                    "check_fix_prompt_result",
+                    properties={"success": bool(fix_success)},
+                )
+                deps.telemetry_capture(
+                    "check_recovery",
+                    properties={"method": "prompt", "recovered": bool(fix_success)},
+                )
+                return bool(fix_success)
+
+            deps.telemetry_capture("check_fix_prompt_declined")
+            deps.telemetry_capture(
+                "check_recovery",
+                properties={"method": "prompt_declined", "recovered": False},
+            )
+
+        return False
+
+
+def build_check_config_deps(
+    *,
+    args: Any | None,
+    adscan_base_dir: str,
+    tools_install_dir: str,
+    wordlists_install_dir: str,
+    tool_venvs_base_dir: str,
+    venv_path: str,
+    bloodhound_ce_dir: str,
+    core_requirements: List[str],
+    pip_tools_config: Dict[str, Any],
+    external_tools_config: Dict[str, Any],
+    system_packages_config: Dict[str, str],
+    python_version: str,
+    # All the dependency functions
+    is_full_adscan_container_runtime: Callable[[], bool],
+    determine_session_environment: Callable[[], str],
+    get_bloodhound_mode: Callable[[], str],
+    ensure_dir_writable: Callable[..., bool],
+    check_virtual_environment_fn: Callable[..., tuple[bool, bool]],
+    check_core_dependencies_fn: Callable[..., bool],
+    check_external_tools_fn: Callable[..., bool],
+    check_system_packages_fn: Callable[..., tuple[bool, List[str]]],
+    check_dns_resolver_fn: Callable[..., bool],
+    check_external_binary_tools_fn: Callable[..., tuple[bool, List[str]]],
+    check_docker_compose_fn: Callable[..., bool],
+    check_rust_tools_fn: Callable[..., bool],
+    check_go_toolchain_fn: Callable[..., bool],
+    check_pyenv_status_fn: Callable[..., bool],
+    is_libreoffice_available: Callable[[], tuple[bool, str]],
+    print_check_summary: Callable[[bool], None],
+    WordlistService: type,
+    run_command: Callable[..., object],
+    get_clean_env_for_compilation: Callable[[], Dict[str, str]],
+    parse_requirement_spec: Callable[[str], Any],
+    get_python_package_version: Callable[..., str | None],
+    assess_version_compliance: Callable[..., bool],
+    get_installed_vcs_reference: Callable[..., str | None],
+    get_installed_vcs_reference_by_url: Callable[..., str | None],
+    normalize_vcs_repo_url: Callable[[str], str],
+    vcs_reference_matches: Callable[..., bool],
+    build_venv_exec_env: Callable[..., Dict[str, str]],
+    check_executable_help_works: Callable[..., bool],
+    fix_isolated_python_tool_venv: Callable[..., bool],
+    diagnose_manspider_help_failure: Callable[..., None],
+    ensure_isolated_tool_extra_specs_installed: Callable[..., bool],
+    verify_system_packages: Callable[..., tuple[bool, List[str]]],
+    apply_effective_user_home_to_env: Callable[..., Dict[str, str]],
+    sudo_validate: Callable[..., bool],
+    is_unbound_listening_local: Callable[[], bool],
+    get_port_53_listeners_text: Callable[[], str],
+    extract_process_names_from_ss: Callable[[str], List[str]],
+    stop_dns_resolver_service_for_unbound: Callable[[], bool],
+    start_unbound_without_systemd: Callable[[], bool],
+    start_unbound_without_systemd_via_sudo: Callable[[], bool],
+    is_systemd_available: Callable[[], bool],
+    build_effective_user_env_for_command: Callable[..., Dict[str, str]],
+    sudo_prefix_args: Callable[..., List[str]],
+    expand_effective_user_path: Callable[[str], str],
+    preflight_install_dns: Callable[[], bool],
+    setup_external_tool: Callable[..., bool],
+    is_docker_official_installed: Callable[[], tuple[bool, str]],
+    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]],
+    check_bloodhound_ce_running: Callable[[], bool],
+    start_bloodhound_ce: Callable[[], bool],
+    get_bloodhound_cli_executable_path: Callable[[], str],
+    is_docker_env: Callable[[], bool],
+    is_rustup_available: Callable[[], tuple[bool, str]],
+    get_rusthound_verification_status: Callable[[], Dict[str, Any]],
+    configure_cargo_path: Callable[[], bool],
+    configure_go_official_path: Callable[[], bool],
+    configure_go_path: Callable[[], bool],
+    is_go_available: Callable[[], tuple[bool, str]],
+    is_go_bin_in_path: Callable[[], tuple[bool, str]],
+    is_htb_cli_installed: Callable[[], tuple[bool, str]],
+    is_htb_cli_accessible: Callable[[], tuple[bool, str]],
+    check_and_ensure_pyenv_status: Callable[..., Dict[str, Any]],
+    install_pyenv_python_and_venv: Callable[..., tuple[bool, List[str], str]],
+    regenerate_pyenv_shims: Callable[[], bool],
+    fix_pyenv_shims_permissions: Callable[[], bool],
+    telemetry_capture: Callable[[str, Dict[str, Any]], None],
+    telemetry_capture_exception: Callable[[BaseException], None],
+    print_info: Callable[[str], None],
+    print_info_verbose: Callable[[str], None],
+    print_info_debug: Callable[[str], None],
+    print_success: Callable[[str], None],
+    print_success_verbose: Callable[[str], None],
+    print_warning: Callable[[str], None],
+    print_error: Callable[[str], None],
+    print_instruction: Callable[[str], None],
+    print_exception: Callable[..., None],
+    confirm_ask: Callable[..., bool],
+    track_docs_link_shown: Callable[[str, str], None],
+    os_getenv: Callable[[str, str | None], str | None],
+    os_path_exists: Callable[[str], bool],
+    os_path_access: Callable[[str, int], bool],
+    sys_stdin_isatty: Callable[[], bool],
+    argparse_namespace: type,
+    shutil_which: Callable[[str], str | None],
+    os_environ: Dict[str, str],
+    subprocess_run: Callable[..., Any],
+    mark_sensitive: Callable[..., Any],
+    set_last_check_session_extra: Callable[[Dict[str, Any] | None], None],
+    handle_check: Callable[[Any], bool],
+) -> tuple[CheckConfig, CheckDeps]:
+    """Build CheckConfig and CheckDeps from provided dependencies.
+
+    This helper function constructs the configuration and dependency bundles
+    needed for run_check, allowing handle_check in adscan.py to be a minimal wrapper.
+
+    Returns:
+        Tuple of (CheckConfig, CheckDeps) ready to pass to run_check.
+    """
+    config = CheckConfig(
+        args=args,
+        adscan_base_dir=adscan_base_dir,
+        tools_install_dir=tools_install_dir,
+        wordlists_install_dir=wordlists_install_dir,
+        tool_venvs_base_dir=tool_venvs_base_dir,
+        venv_path=venv_path,
+        bloodhound_ce_dir=bloodhound_ce_dir,
+        core_requirements=core_requirements,
+        pip_tools_config=pip_tools_config,
+        external_tools_config=external_tools_config,
+        system_packages_config=system_packages_config,
+        python_version=python_version,
+    )
+
+    deps = CheckDeps(
+        is_full_adscan_container_runtime=is_full_adscan_container_runtime,
+        determine_session_environment=determine_session_environment,
+        get_bloodhound_mode=get_bloodhound_mode,
+        ensure_dir_writable=ensure_dir_writable,
+        check_virtual_environment=check_virtual_environment_fn,
+        check_core_dependencies=check_core_dependencies_fn,
+        check_external_tools=check_external_tools_fn,
+        check_system_packages=check_system_packages_fn,
+        check_dns_resolver=check_dns_resolver_fn,
+        check_external_binary_tools=check_external_binary_tools_fn,
+        check_docker_compose=check_docker_compose_fn,
+        check_rust_tools=check_rust_tools_fn,
+        check_go_toolchain=check_go_toolchain_fn,
+        check_pyenv_status=check_pyenv_status_fn,
+        is_libreoffice_available=is_libreoffice_available,
+        print_check_summary=print_check_summary,
+        WordlistService=WordlistService,
+        run_command=run_command,
+        get_clean_env_for_compilation=get_clean_env_for_compilation,
+        parse_requirement_spec=parse_requirement_spec,
+        get_python_package_version=get_python_package_version,
+        assess_version_compliance=assess_version_compliance,
+        get_installed_vcs_reference=get_installed_vcs_reference,
+        get_installed_vcs_reference_by_url=get_installed_vcs_reference_by_url,
+        normalize_vcs_repo_url=normalize_vcs_repo_url,
+        vcs_reference_matches=vcs_reference_matches,
+        build_venv_exec_env=build_venv_exec_env,
+        check_executable_help_works=check_executable_help_works,
+        fix_isolated_python_tool_venv=fix_isolated_python_tool_venv,
+        diagnose_manspider_help_failure=diagnose_manspider_help_failure,
+        ensure_isolated_tool_extra_specs_installed=ensure_isolated_tool_extra_specs_installed,
+        verify_system_packages=verify_system_packages,
+        apply_effective_user_home_to_env=apply_effective_user_home_to_env,
+        sudo_validate=sudo_validate,
+        is_unbound_listening_local=is_unbound_listening_local,
+        get_port_53_listeners_text=get_port_53_listeners_text,
+        extract_process_names_from_ss=extract_process_names_from_ss,
+        stop_dns_resolver_service_for_unbound=stop_dns_resolver_service_for_unbound,
+        start_unbound_without_systemd=start_unbound_without_systemd,
+        start_unbound_without_systemd_via_sudo=start_unbound_without_systemd_via_sudo,
+        is_systemd_available=is_systemd_available,
+        build_effective_user_env_for_command=build_effective_user_env_for_command,
+        sudo_prefix_args=sudo_prefix_args,
+        expand_effective_user_path=expand_effective_user_path,
+        preflight_install_dns=preflight_install_dns,
+        setup_external_tool=setup_external_tool,
+        is_docker_official_installed=is_docker_official_installed,
+        is_docker_compose_plugin_available=is_docker_compose_plugin_available,
+        check_bloodhound_ce_running=check_bloodhound_ce_running,
+        start_bloodhound_ce=start_bloodhound_ce,
+        get_bloodhound_cli_executable_path=get_bloodhound_cli_executable_path,
+        is_docker_env=is_docker_env,
+        is_rustup_available=is_rustup_available,
+        get_rusthound_verification_status=get_rusthound_verification_status,
+        configure_cargo_path=configure_cargo_path,
+        configure_go_official_path=configure_go_official_path,
+        configure_go_path=configure_go_path,
+        is_go_available=is_go_available,
+        is_go_bin_in_path=is_go_bin_in_path,
+        is_htb_cli_installed=is_htb_cli_installed,
+        is_htb_cli_accessible=is_htb_cli_accessible,
+        check_and_ensure_pyenv_status=check_and_ensure_pyenv_status,
+        install_pyenv_python_and_venv=install_pyenv_python_and_venv,
+        regenerate_pyenv_shims=regenerate_pyenv_shims,
+        fix_pyenv_shims_permissions=fix_pyenv_shims_permissions,
+        telemetry_capture=telemetry_capture,
+        telemetry_capture_exception=telemetry_capture_exception,
+        print_info=print_info,
+        print_info_verbose=print_info_verbose,
+        print_info_debug=print_info_debug,
+        print_success=print_success,
+        print_success_verbose=print_success_verbose,
+        print_warning=print_warning,
+        print_error=print_error,
+        print_instruction=print_instruction,
+        print_exception=print_exception,
+        confirm_ask=confirm_ask,
+        track_docs_link_shown=track_docs_link_shown,
+        os_getenv=os_getenv,
+        os_path_exists=os_path_exists,
+        os_path_access=os_path_access,
+        sys_stdin_isatty=sys_stdin_isatty,
+        argparse_namespace=argparse_namespace,
+        shutil_which=shutil_which,
+        os_environ=os_environ,
+        subprocess_run=subprocess_run,
+        mark_sensitive=mark_sensitive,
+        set_last_check_session_extra=set_last_check_session_extra,
+        handle_check=handle_check,
+    )
+
+    return config, deps
+
+
+@dataclass
+class AdscanCheckContext:
+    """Context object containing all references from adscan.py needed for check.
+
+    This allows handle_check to be a minimal wrapper by bundling all adscan.py
+    references into a single object.
+    """
+
+    # Configuration values
+    adscan_base_dir: str
+    tools_install_dir: str
+    wordlists_install_dir: str
+    tool_venvs_base_dir: str
+    venv_path: str
+    bloodhound_ce_dir: str
+    core_requirements: List[str]
+    pip_tools_config: Dict[str, Any]
+    external_tools_config: Dict[str, Any]
+    system_packages_config: Dict[str, str]
+    python_version: str
+
+    # Functions from adscan.py
+    is_full_adscan_container_runtime: Callable[[], bool]
+    determine_session_environment: Callable[[], str]
+    get_bloodhound_mode: Callable[[], str]
+    ensure_dir_writable: Callable[..., bool]
+    check_virtual_environment_fn: Callable[..., tuple[bool, bool]]
+    check_core_dependencies_fn: Callable[..., bool]
+    check_external_tools_fn: Callable[..., bool]
+    check_system_packages_fn: Callable[..., tuple[bool, List[str]]]
+    check_dns_resolver_fn: Callable[..., bool]
+    check_external_binary_tools_fn: Callable[..., tuple[bool, List[str]]]
+    check_docker_compose_fn: Callable[..., bool]
+    check_rust_tools_fn: Callable[..., bool]
+    check_go_toolchain_fn: Callable[..., bool]
+    check_pyenv_status_fn: Callable[..., bool]
+    is_libreoffice_available: Callable[[], tuple[bool, str]]
+    print_check_summary: Callable[[bool], None]
+    WordlistService: type
+    run_command: Callable[..., object]
+    get_clean_env_for_compilation: Callable[[], Dict[str, str]]
+    parse_requirement_spec: Callable[[str], Any]
+    get_python_package_version: Callable[..., str | None]
+    assess_version_compliance: Callable[..., bool]
+    get_installed_vcs_reference: Callable[..., str | None]
+    get_installed_vcs_reference_by_url: Callable[..., str | None]
+    normalize_vcs_repo_url: Callable[[str], str]
+    vcs_reference_matches: Callable[..., bool]
+    build_venv_exec_env: Callable[..., Dict[str, str]]
+    check_executable_help_works: Callable[..., bool]
+    fix_isolated_python_tool_venv: Callable[..., bool]
+    diagnose_manspider_help_failure: Callable[..., None]
+    ensure_isolated_tool_extra_specs_installed: Callable[..., bool]
+    verify_system_packages: Callable[..., tuple[bool, List[str]]]
+    apply_effective_user_home_to_env: Callable[..., Dict[str, str]]
+    sudo_validate: Callable[..., bool]
+    is_unbound_listening_local: Callable[[], bool]
+    get_port_53_listeners_text: Callable[[], str]
+    extract_process_names_from_ss: Callable[[str], List[str]]
+    stop_dns_resolver_service_for_unbound: Callable[[], bool]
+    start_unbound_without_systemd: Callable[[], bool]
+    start_unbound_without_systemd_via_sudo: Callable[[], bool]
+    is_systemd_available: Callable[[], bool]
+    build_effective_user_env_for_command: Callable[..., Dict[str, str]]
+    sudo_prefix_args: Callable[..., List[str]]
+    expand_effective_user_path: Callable[[str], str]
+    preflight_install_dns: Callable[[], bool]
+    setup_external_tool: Callable[..., bool]
+    is_docker_official_installed: Callable[[], tuple[bool, str]]
+    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]]
+    check_bloodhound_ce_running: Callable[[], bool]
+    start_bloodhound_ce: Callable[[], bool]
+    get_bloodhound_cli_executable_path: Callable[[], str]
+    is_docker_env: Callable[[], bool]
+    is_rustup_available: Callable[[], tuple[bool, str]]
+    get_rusthound_verification_status: Callable[[], Dict[str, Any]]
+    configure_cargo_path: Callable[[], bool]
+    configure_go_official_path: Callable[[], bool]
+    configure_go_path: Callable[[], bool]
+    is_go_available: Callable[[], tuple[bool, str]]
+    is_go_bin_in_path: Callable[[], tuple[bool, str]]
+    is_htb_cli_installed: Callable[[], tuple[bool, str]]
+    is_htb_cli_accessible: Callable[[], tuple[bool, str]]
+    check_and_ensure_pyenv_status: Callable[..., Dict[str, Any]]
+    install_pyenv_python_and_venv: Callable[..., tuple[bool, List[str], str]]
+    regenerate_pyenv_shims: Callable[[], bool]
+    fix_pyenv_shims_permissions: Callable[[], bool]
+    telemetry_capture: Callable[[str, Dict[str, Any]], None]
+    telemetry_capture_exception: Callable[[BaseException], None]
+    print_info: Callable[[str], None]
+    print_info_verbose: Callable[[str], None]
+    print_info_debug: Callable[[str], None]
+    print_success: Callable[[str], None]
+    print_success_verbose: Callable[[str], None]
+    print_warning: Callable[[str], None]
+    print_error: Callable[[str], None]
+    print_instruction: Callable[[str], None]
+    print_exception: Callable[..., None]
+    confirm_ask: Callable[..., bool]
+    track_docs_link_shown: Callable[[str, str], None]
+    os_getenv: Callable[[str, str | None], str | None]
+    os_path_exists: Callable[[str], bool]
+    os_path_access: Callable[[str, int], bool]
+    sys_stdin_isatty: Callable[[], bool]
+    argparse_namespace: type
+    shutil_which: Callable[[str], str | None]
+    os_environ: Dict[str, str]
+    subprocess_run: Callable[..., Any]
+    mark_sensitive: Callable[..., Any]
+    set_last_check_session_extra: Callable[[Dict[str, Any] | None], None]
+    handle_check: Callable[[Any], bool]
+
+
+def build_adscan_check_context(
+    *,
+    adscan_base_dir: str,
+    tools_install_dir: str,
+    wordlists_install_dir: str,
+    tool_venvs_base_dir: str,
+    venv_path: str,
+    bloodhound_ce_dir: str,
+    core_requirements: List[str],
+    pip_tools_config: Dict[str, Any],
+    external_tools_config: Dict[str, Any],
+    system_packages_config: Dict[str, str],
+    python_version: str,
+    is_full_adscan_container_runtime: Callable[[], bool],
+    determine_session_environment: Callable[[], str],
+    get_bloodhound_mode: Callable[[], str],
+    ensure_dir_writable: Callable[..., bool],
+    check_virtual_environment_fn: Callable[..., tuple[bool, bool]],
+    check_core_dependencies_fn: Callable[..., bool],
+    check_external_tools_fn: Callable[..., bool],
+    check_system_packages_fn: Callable[..., tuple[bool, List[str]]],
+    check_dns_resolver_fn: Callable[..., bool],
+    check_external_binary_tools_fn: Callable[..., tuple[bool, List[str]]],
+    check_docker_compose_fn: Callable[..., bool],
+    check_rust_tools_fn: Callable[..., bool],
+    check_go_toolchain_fn: Callable[..., bool],
+    check_pyenv_status_fn: Callable[..., bool],
+    is_libreoffice_available: Callable[[], tuple[bool, str]],
+    print_check_summary: Callable[[bool], None],
+    WordlistService: type,
+    run_command: Callable[..., object],
+    get_clean_env_for_compilation: Callable[[], Dict[str, str]],
+    parse_requirement_spec: Callable[[str], Any],
+    get_python_package_version: Callable[..., str | None],
+    assess_version_compliance: Callable[..., bool],
+    get_installed_vcs_reference: Callable[..., str | None],
+    get_installed_vcs_reference_by_url: Callable[..., str | None],
+    normalize_vcs_repo_url: Callable[[str], str],
+    vcs_reference_matches: Callable[..., bool],
+    build_venv_exec_env: Callable[..., Dict[str, str]],
+    check_executable_help_works: Callable[..., bool],
+    fix_isolated_python_tool_venv: Callable[..., bool],
+    diagnose_manspider_help_failure: Callable[..., None],
+    ensure_isolated_tool_extra_specs_installed: Callable[..., bool],
+    verify_system_packages: Callable[..., tuple[bool, List[str]]],
+    apply_effective_user_home_to_env: Callable[..., Dict[str, str]],
+    sudo_validate: Callable[..., bool],
+    is_unbound_listening_local: Callable[[], bool],
+    get_port_53_listeners_text: Callable[[], str],
+    extract_process_names_from_ss: Callable[[str], List[str]],
+    stop_dns_resolver_service_for_unbound: Callable[[], bool],
+    start_unbound_without_systemd: Callable[[], bool],
+    start_unbound_without_systemd_via_sudo: Callable[[], bool],
+    is_systemd_available: Callable[[], bool],
+    build_effective_user_env_for_command: Callable[..., Dict[str, str]],
+    sudo_prefix_args: Callable[..., List[str]],
+    expand_effective_user_path: Callable[[str], str],
+    preflight_install_dns: Callable[[], bool],
+    setup_external_tool: Callable[..., bool],
+    is_docker_official_installed: Callable[[], tuple[bool, str]],
+    is_docker_compose_plugin_available: Callable[[], tuple[bool, str]],
+    check_bloodhound_ce_running: Callable[[], bool],
+    start_bloodhound_ce: Callable[[], bool],
+    get_bloodhound_cli_executable_path: Callable[[], str],
+    is_docker_env: Callable[[], bool],
+    is_rustup_available: Callable[[], tuple[bool, str]],
+    get_rusthound_verification_status: Callable[[], Dict[str, Any]],
+    configure_cargo_path: Callable[[], bool],
+    configure_go_official_path: Callable[[], bool],
+    configure_go_path: Callable[[], bool],
+    is_go_available: Callable[[], tuple[bool, str]],
+    is_go_bin_in_path: Callable[[], tuple[bool, str]],
+    is_htb_cli_installed: Callable[[], tuple[bool, str]],
+    is_htb_cli_accessible: Callable[[], tuple[bool, str]],
+    check_and_ensure_pyenv_status: Callable[..., Dict[str, Any]],
+    install_pyenv_python_and_venv: Callable[..., tuple[bool, List[str], str]],
+    regenerate_pyenv_shims: Callable[[], bool],
+    fix_pyenv_shims_permissions: Callable[[], bool],
+    telemetry_capture: Callable[[str, Dict[str, Any]], None],
+    telemetry_capture_exception: Callable[[BaseException], None],
+    print_info: Callable[[str], None],
+    print_info_verbose: Callable[[str], None],
+    print_info_debug: Callable[[str], None],
+    print_success: Callable[[str], None],
+    print_success_verbose: Callable[[str], None],
+    print_warning: Callable[[str], None],
+    print_error: Callable[[str], None],
+    print_instruction: Callable[[str], None],
+    print_exception: Callable[..., None],
+    confirm_ask: Callable[..., bool],
+    track_docs_link_shown: Callable[[str, str], None],
+    os_getenv: Callable[[str, str | None], str | None],
+    os_path_exists: Callable[[str], bool],
+    os_path_access: Callable[[str, int], bool],
+    sys_stdin_isatty: Callable[[], bool],
+    argparse_namespace: type,
+    shutil_which: Callable[[str], str | None],
+    os_environ: Dict[str, str],
+    subprocess_run: Callable[..., Any],
+    mark_sensitive: Callable[..., Any],
+    set_last_check_session_extra: Callable[[Dict[str, Any] | None], None],
+    handle_check: Callable[[Any], bool],
+) -> AdscanCheckContext:
+    """Build AdscanCheckContext from individual parameters.
+
+    This function constructs the context object from all the references passed
+    from adscan.py, allowing handle_check to be a minimal wrapper.
+
+    Returns:
+        AdscanCheckContext ready to pass to build_check_from_adscan_context.
+    """
+    return AdscanCheckContext(
+        adscan_base_dir=adscan_base_dir,
+        tools_install_dir=tools_install_dir,
+        wordlists_install_dir=wordlists_install_dir,
+        tool_venvs_base_dir=tool_venvs_base_dir,
+        venv_path=venv_path,
+        bloodhound_ce_dir=bloodhound_ce_dir,
+        core_requirements=core_requirements,
+        pip_tools_config=pip_tools_config,
+        external_tools_config=external_tools_config,
+        system_packages_config=system_packages_config,
+        python_version=python_version,
+        is_full_adscan_container_runtime=is_full_adscan_container_runtime,
+        determine_session_environment=determine_session_environment,
+        get_bloodhound_mode=get_bloodhound_mode,
+        ensure_dir_writable=ensure_dir_writable,
+        check_virtual_environment_fn=check_virtual_environment_fn,
+        check_core_dependencies_fn=check_core_dependencies_fn,
+        check_external_tools_fn=check_external_tools_fn,
+        check_system_packages_fn=check_system_packages_fn,
+        check_dns_resolver_fn=check_dns_resolver_fn,
+        check_external_binary_tools_fn=check_external_binary_tools_fn,
+        check_docker_compose_fn=check_docker_compose_fn,
+        check_rust_tools_fn=check_rust_tools_fn,
+        check_go_toolchain_fn=check_go_toolchain_fn,
+        check_pyenv_status_fn=check_pyenv_status_fn,
+        is_libreoffice_available=is_libreoffice_available,
+        print_check_summary=print_check_summary,
+        WordlistService=WordlistService,
+        run_command=run_command,
+        get_clean_env_for_compilation=get_clean_env_for_compilation,
+        parse_requirement_spec=parse_requirement_spec,
+        get_python_package_version=get_python_package_version,
+        assess_version_compliance=assess_version_compliance,
+        get_installed_vcs_reference=get_installed_vcs_reference,
+        get_installed_vcs_reference_by_url=get_installed_vcs_reference_by_url,
+        normalize_vcs_repo_url=normalize_vcs_repo_url,
+        vcs_reference_matches=vcs_reference_matches,
+        build_venv_exec_env=build_venv_exec_env,
+        check_executable_help_works=check_executable_help_works,
+        fix_isolated_python_tool_venv=fix_isolated_python_tool_venv,
+        diagnose_manspider_help_failure=diagnose_manspider_help_failure,
+        ensure_isolated_tool_extra_specs_installed=ensure_isolated_tool_extra_specs_installed,
+        verify_system_packages=verify_system_packages,
+        apply_effective_user_home_to_env=apply_effective_user_home_to_env,
+        sudo_validate=sudo_validate,
+        is_unbound_listening_local=is_unbound_listening_local,
+        get_port_53_listeners_text=get_port_53_listeners_text,
+        extract_process_names_from_ss=extract_process_names_from_ss,
+        stop_dns_resolver_service_for_unbound=stop_dns_resolver_service_for_unbound,
+        start_unbound_without_systemd=start_unbound_without_systemd,
+        start_unbound_without_systemd_via_sudo=start_unbound_without_systemd_via_sudo,
+        is_systemd_available=is_systemd_available,
+        build_effective_user_env_for_command=build_effective_user_env_for_command,
+        sudo_prefix_args=sudo_prefix_args,
+        expand_effective_user_path=expand_effective_user_path,
+        preflight_install_dns=preflight_install_dns,
+        setup_external_tool=setup_external_tool,
+        is_docker_official_installed=is_docker_official_installed,
+        is_docker_compose_plugin_available=is_docker_compose_plugin_available,
+        check_bloodhound_ce_running=check_bloodhound_ce_running,
+        start_bloodhound_ce=start_bloodhound_ce,
+        get_bloodhound_cli_executable_path=get_bloodhound_cli_executable_path,
+        is_docker_env=is_docker_env,
+        is_rustup_available=is_rustup_available,
+        get_rusthound_verification_status=get_rusthound_verification_status,
+        configure_cargo_path=configure_cargo_path,
+        configure_go_official_path=configure_go_official_path,
+        configure_go_path=configure_go_path,
+        is_go_available=is_go_available,
+        is_go_bin_in_path=is_go_bin_in_path,
+        is_htb_cli_installed=is_htb_cli_installed,
+        is_htb_cli_accessible=is_htb_cli_accessible,
+        check_and_ensure_pyenv_status=check_and_ensure_pyenv_status,
+        install_pyenv_python_and_venv=install_pyenv_python_and_venv,
+        regenerate_pyenv_shims=regenerate_pyenv_shims,
+        fix_pyenv_shims_permissions=fix_pyenv_shims_permissions,
+        telemetry_capture=telemetry_capture,
+        telemetry_capture_exception=telemetry_capture_exception,
+        print_info=print_info,
+        print_info_verbose=print_info_verbose,
+        print_info_debug=print_info_debug,
+        print_success=print_success,
+        print_success_verbose=print_success_verbose,
+        print_warning=print_warning,
+        print_error=print_error,
+        print_instruction=print_instruction,
+        print_exception=print_exception,
+        confirm_ask=confirm_ask,
+        track_docs_link_shown=track_docs_link_shown,
+        os_getenv=os_getenv,
+        os_path_exists=os_path_exists,
+        os_path_access=os_path_access,
+        sys_stdin_isatty=sys_stdin_isatty,
+        argparse_namespace=argparse_namespace,
+        shutil_which=shutil_which,
+        os_environ=os_environ,
+        subprocess_run=subprocess_run,
+        mark_sensitive=mark_sensitive,
+        set_last_check_session_extra=set_last_check_session_extra,
+        handle_check=handle_check,
+    )
+
+
+def build_check_from_adscan_context(
+    *,
+    args: Any | None,
+    context: AdscanCheckContext,
+) -> tuple[CheckConfig, CheckDeps]:
+    """Build CheckConfig and CheckDeps from AdscanCheckContext.
+
+    This is a convenience wrapper around build_check_config_deps that accepts
+    a context object instead of individual parameters, allowing handle_check
+    in adscan.py to be a minimal wrapper.
+
+    Args:
+        args: Optional argparse.Namespace with check arguments.
+        context: AdscanCheckContext containing all references from adscan.py.
+
+    Returns:
+        Tuple of (CheckConfig, CheckDeps) ready to pass to run_check.
+    """
+    return build_check_config_deps(
+        args=args,
+        adscan_base_dir=context.adscan_base_dir,
+        tools_install_dir=context.tools_install_dir,
+        wordlists_install_dir=context.wordlists_install_dir,
+        tool_venvs_base_dir=context.tool_venvs_base_dir,
+        venv_path=context.venv_path,
+        bloodhound_ce_dir=context.bloodhound_ce_dir,
+        core_requirements=context.core_requirements,
+        pip_tools_config=context.pip_tools_config,
+        external_tools_config=context.external_tools_config,
+        system_packages_config=context.system_packages_config,
+        python_version=context.python_version,
+        is_full_adscan_container_runtime=context.is_full_adscan_container_runtime,
+        determine_session_environment=context.determine_session_environment,
+        get_bloodhound_mode=context.get_bloodhound_mode,
+        ensure_dir_writable=context.ensure_dir_writable,
+        check_virtual_environment_fn=context.check_virtual_environment_fn,
+        check_core_dependencies_fn=context.check_core_dependencies_fn,
+        check_external_tools_fn=context.check_external_tools_fn,
+        check_system_packages_fn=context.check_system_packages_fn,
+        check_dns_resolver_fn=context.check_dns_resolver_fn,
+        check_external_binary_tools_fn=context.check_external_binary_tools_fn,
+        check_docker_compose_fn=context.check_docker_compose_fn,
+        check_rust_tools_fn=context.check_rust_tools_fn,
+        check_go_toolchain_fn=context.check_go_toolchain_fn,
+        check_pyenv_status_fn=context.check_pyenv_status_fn,
+        is_libreoffice_available=context.is_libreoffice_available,
+        print_check_summary=context.print_check_summary,
+        WordlistService=context.WordlistService,
+        run_command=context.run_command,
+        get_clean_env_for_compilation=context.get_clean_env_for_compilation,
+        parse_requirement_spec=context.parse_requirement_spec,
+        get_python_package_version=context.get_python_package_version,
+        assess_version_compliance=context.assess_version_compliance,
+        get_installed_vcs_reference=context.get_installed_vcs_reference,
+        get_installed_vcs_reference_by_url=context.get_installed_vcs_reference_by_url,
+        normalize_vcs_repo_url=context.normalize_vcs_repo_url,
+        vcs_reference_matches=context.vcs_reference_matches,
+        build_venv_exec_env=context.build_venv_exec_env,
+        check_executable_help_works=context.check_executable_help_works,
+        fix_isolated_python_tool_venv=context.fix_isolated_python_tool_venv,
+        diagnose_manspider_help_failure=context.diagnose_manspider_help_failure,
+        ensure_isolated_tool_extra_specs_installed=context.ensure_isolated_tool_extra_specs_installed,
+        verify_system_packages=context.verify_system_packages,
+        apply_effective_user_home_to_env=context.apply_effective_user_home_to_env,
+        sudo_validate=context.sudo_validate,
+        is_unbound_listening_local=context.is_unbound_listening_local,
+        get_port_53_listeners_text=context.get_port_53_listeners_text,
+        extract_process_names_from_ss=context.extract_process_names_from_ss,
+        stop_dns_resolver_service_for_unbound=context.stop_dns_resolver_service_for_unbound,
+        start_unbound_without_systemd=context.start_unbound_without_systemd,
+        start_unbound_without_systemd_via_sudo=context.start_unbound_without_systemd_via_sudo,
+        is_systemd_available=context.is_systemd_available,
+        build_effective_user_env_for_command=context.build_effective_user_env_for_command,
+        sudo_prefix_args=context.sudo_prefix_args,
+        expand_effective_user_path=context.expand_effective_user_path,
+        preflight_install_dns=context.preflight_install_dns,
+        setup_external_tool=context.setup_external_tool,
+        is_docker_official_installed=context.is_docker_official_installed,
+        is_docker_compose_plugin_available=context.is_docker_compose_plugin_available,
+        check_bloodhound_ce_running=context.check_bloodhound_ce_running,
+        start_bloodhound_ce=context.start_bloodhound_ce,
+        get_bloodhound_cli_executable_path=context.get_bloodhound_cli_executable_path,
+        is_docker_env=context.is_docker_env,
+        is_rustup_available=context.is_rustup_available,
+        get_rusthound_verification_status=context.get_rusthound_verification_status,
+        configure_cargo_path=context.configure_cargo_path,
+        configure_go_official_path=context.configure_go_official_path,
+        configure_go_path=context.configure_go_path,
+        is_go_available=context.is_go_available,
+        is_go_bin_in_path=context.is_go_bin_in_path,
+        is_htb_cli_installed=context.is_htb_cli_installed,
+        is_htb_cli_accessible=context.is_htb_cli_accessible,
+        check_and_ensure_pyenv_status=context.check_and_ensure_pyenv_status,
+        install_pyenv_python_and_venv=context.install_pyenv_python_and_venv,
+        regenerate_pyenv_shims=context.regenerate_pyenv_shims,
+        fix_pyenv_shims_permissions=context.fix_pyenv_shims_permissions,
+        telemetry_capture=context.telemetry_capture,
+        telemetry_capture_exception=context.telemetry_capture_exception,
+        print_info=context.print_info,
+        print_info_verbose=context.print_info_verbose,
+        print_info_debug=context.print_info_debug,
+        print_success=context.print_success,
+        print_success_verbose=context.print_success_verbose,
+        print_warning=context.print_warning,
+        print_error=context.print_error,
+        print_instruction=context.print_instruction,
+        print_exception=context.print_exception,
+        confirm_ask=context.confirm_ask,
+        track_docs_link_shown=context.track_docs_link_shown,
+        os_getenv=context.os_getenv,
+        os_path_exists=context.os_path_exists,
+        os_path_access=context.os_path_access,
+        sys_stdin_isatty=context.sys_stdin_isatty,
+        argparse_namespace=context.argparse_namespace,
+        shutil_which=context.shutil_which,
+        os_environ=context.os_environ,
+        subprocess_run=context.subprocess_run,
+        mark_sensitive=context.mark_sensitive,
+        set_last_check_session_extra=context.set_last_check_session_extra,
+        handle_check=context.handle_check,
+    )

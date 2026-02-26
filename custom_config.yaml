@@ -1,0 +1,15 @@
+- name: CMD Net Use
+  severity: high
+  confidence: moderate
+  type: pattern
+  values:
+    - (?i:net\s+use)(?:\s+\S+){2,}\s+(?P<value>\S{4,80})(?:\s*$)
+  filter_type: GeneralKeyword
+  use_ml: true
+  required_substrings:
+    - net
+    - use
+  min_line_len: 20
+  target:
+    - code
+    - doc

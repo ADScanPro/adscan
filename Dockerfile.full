@@ -1,0 +1,263 @@
+###############################################################################
+# ADscan FULL runtime image (Debian-based, Docker-first distribution)
+#
+# This image bundles:
+# - `adscan` onefile binary (built via build_adscan.sh -> dist/adscan)
+# - system packages required by ADscan runtime/tooling
+# - isolated Python tool environments (PipToolsConfig)
+# - external tools (EXTERNAL_TOOLS_CONFIG) + wordlists
+#
+# Notes:
+# - Host-only components (e.g. unbound/dhcpcd DNS rewrites, SYS_TIME) are not
+#   expected to work inside containers without extra privileges.
+# - The host wrapper runs this container with `--network host` and mounts only
+#   the workspaces directory.
+###############################################################################
+
+###############################################################################
+# RustHound-CE build stage (Kerberos/GSSAPI enabled)
+#
+# We compile RustHound-CE with the system GSSAPI/SASL/KRB5 libraries available.
+# Some prebuilt upstream binaries are compiled without GSSAPI support and will
+# refuse `-k` (Kerberos) with:
+#   "Kerberos auth and GSSAPI not compatible with current os!"
+###############################################################################
+
+FROM rust:1-bookworm AS rusthound_builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      clang \
+      pkg-config \
+      libsasl2-dev \
+      libkrb5-dev \
+      libssl-dev \
+      libldap2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin RustHound-CE version (must match ADscan expectations)
+RUN cargo install --locked --version 2.4.1 rusthound-ce
+
+FROM debian:trixie-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+ENV ADSCAN_HOME=/opt/adscan \
+    HOME=/opt/adscan \
+    XDG_CONFIG_HOME=/opt/adscan/.config \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    PATH="/opt/adscan/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      jq \
+      bat \
+      gosu \
+      sudo \
+      net-tools \
+      iputils-ping \
+      iproute2 \
+      procps \
+      unzip \
+      wget \
+      xz-utils \
+      bzip2 \
+      python3 \
+      python3-pip \
+      python3-venv \
+      python3-dev \
+      nodejs \
+      npm \
+      build-essential \
+      pkg-config \
+      make \
+      clang \
+      llvm \
+      libclang-dev \
+      libffi-dev \
+      libssl-dev \
+      zlib1g-dev \
+      libbz2-dev \
+      libreadline-dev \
+      libsqlite3-dev \
+      libncurses-dev \
+      libncursesw5-dev \
+      tk-dev \
+      liblzma-dev \
+      libkrb5-dev \
+      libgssapi-krb5-2 \
+      libsasl2-2 \
+      libsasl2-modules-gssapi-mit \
+      krb5-user \
+      libssl3t64 \
+      libldap2 \
+      libldns-dev \
+      bind9-dnsutils \
+      nmap \
+      hydra \
+      john \
+      hashcat \
+      samba \
+      samba-common-bin \
+      mono-devel \
+      mingw-w64 \
+      gcc-mingw-w64-x86-64 \
+      musl-tools \
+      tesseract-ocr \
+      antiword \
+      moreutils \
+      libreoffice \
+      graphviz \
+      fontconfig \
+      fonts-crosextra-carlito \
+      fonts-crosextra-caladea \
+      fonts-liberation \
+      libmagic1 \
+      freerdp3-x11 \
+      ntpsec-ntpdate \
+      unbound \
+      unbound-anchor \
+      dns-root-data \
+    && rm -rf /var/lib/apt/lists/*
+
+# Codex CLI (official ChatGPT plan sign-in path for Plus/Pro subscriptions).
+# Installed globally so `ask login codex` and `ask` can use `codex` directly.
+RUN set -eux; \
+  npm install --global @openai/codex; \
+  codex --version
+
+# Base runtime layout
+RUN mkdir -p /opt/adscan/{bin,tools,tool_venvs,wordlists,logs,fonts} /workspaces \
+  && fc-cache -f \
+  && chmod -R 0777 /opt/adscan /workspaces
+
+# Install Python tool environments (mirrors `PipToolsConfig` from adscan.py)
+# Keep each tool in its own venv to avoid dependency conflicts.
+#
+# NOTE: Debian uses an "externally managed" system Python (PEP 668) which
+# blocks system-wide `pip install`. We only use pip inside dedicated venvs.
+
+RUN set -eux; \
+  python3 -m venv /opt/adscan/tool_venvs/impacket/venv; \
+  /opt/adscan/tool_venvs/impacket/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/impacket/venv/bin/python -m pip install --no-cache-dir "impacket==0.13.0" "pycryptodome==3.23.0"; \
+  \
+  python3 -m venv /opt/adscan/tool_venvs/netexec/venv; \
+  /opt/adscan/tool_venvs/netexec/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/netexec/venv/bin/python -m pip install --no-cache-dir "git+https://github.com/Pennyw0rth/NetExec.git@f187717"; \
+  \
+  python3 -m venv /opt/adscan/tool_venvs/certipy/venv; \
+  /opt/adscan/tool_venvs/certipy/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/certipy/venv/bin/python -m pip install --no-cache-dir "certipy-ad==5.0.4"; \
+  \
+  python3 -m venv /opt/adscan/tool_venvs/bloodyad/venv; \
+  /opt/adscan/tool_venvs/bloodyad/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/bloodyad/venv/bin/python -m pip install --no-cache-dir "bloodyAD==2.5.1" "minikerberos==0.4.9"; \
+  \
+  python3 -m venv /opt/adscan/tool_venvs/bloodhound-ce-py/venv; \
+  /opt/adscan/tool_venvs/bloodhound-ce-py/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/bloodhound-ce-py/venv/bin/python -m pip install --no-cache-dir "bloodhound-ce==1.9.1"; \
+  \
+  python3 -m venv /opt/adscan/tool_venvs/weakpass/venv; \
+  /opt/adscan/tool_venvs/weakpass/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/weakpass/venv/bin/python -m pip install --no-cache-dir "weakpass-lookup"; \
+  \
+  python3 -m venv /opt/adscan/tool_venvs/enum-trusts/venv; \
+  /opt/adscan/tool_venvs/enum-trusts/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/enum-trusts/venv/bin/python -m pip install --no-cache-dir "git+https://github.com/ADScanPro/enum-trusts.git@f7eae14"; \
+  \
+  python3 -m venv /opt/adscan/tool_venvs/manspider/venv; \
+  /opt/adscan/tool_venvs/manspider/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/manspider/venv/bin/python -m pip install --no-cache-dir "git+https://github.com/ADScanPro/MANSPIDER@cedb138"; \
+  \
+  python3 -m venv /opt/adscan/tool_venvs/credsweeper/venv; \
+  /opt/adscan/tool_venvs/credsweeper/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/credsweeper/venv/bin/python -m pip install --no-cache-dir "credsweeper==1.14.1"; \
+  \
+  python3 -m venv /opt/adscan/tool_venvs/pypykatz/venv; \
+  /opt/adscan/tool_venvs/pypykatz/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/pypykatz/venv/bin/python -m pip install --no-cache-dir "pypykatz==0.6.13"; \
+  \
+  chmod -R 0777 /opt/adscan/tool_venvs
+
+# External tools (git/curl) - best-effort provisioning for FULL image.
+RUN set -eux; \
+  mkdir -p /opt/adscan/tools; \
+  git clone --depth 1 https://github.com/Greenwolf/ntlm_theft.git /opt/adscan/tools/ntlm_theft; \
+  mkdir -p /opt/adscan/tools/firepwd; \
+  curl -fsSL https://raw.githubusercontent.com/lclevy/firepwd/refs/heads/master/firepwd.py -o /opt/adscan/tools/firepwd/firepwd.py; \
+  curl -fsSL https://raw.githubusercontent.com/lclevy/firepwd/refs/heads/master/requirements.txt -o /opt/adscan/tools/firepwd/requirements.txt; \
+  python3 -m venv /opt/adscan/tool_venvs/firepwd/venv; \
+  /opt/adscan/tool_venvs/firepwd/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/firepwd/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/firepwd/requirements.txt; \
+  \
+  git clone --depth 1 https://github.com/spextat0r/LSA-Reaper.git /opt/adscan/tools/LSA-Reaper; \
+  python3 -m venv /opt/adscan/tool_venvs/LSA-Reaper/venv; \
+  /opt/adscan/tool_venvs/LSA-Reaper/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/LSA-Reaper/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/LSA-Reaper/requirements.txt; \
+  \
+  mkdir -p /opt/adscan/tools/PKINITtools; \
+  curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/gettgtpkinit.py -o /opt/adscan/tools/PKINITtools/gettgtpkinit.py; \
+  curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/getnthash.py -o /opt/adscan/tools/PKINITtools/getnthash.py; \
+  curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/requirements.txt -o /opt/adscan/tools/PKINITtools/requirements.txt; \
+  python3 -m venv /opt/adscan/tool_venvs/PKINITtools/venv; \
+  /opt/adscan/tool_venvs/PKINITtools/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/PKINITtools/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/PKINITtools/requirements.txt; \
+  \
+  mkdir -p /opt/adscan/tools/kerbrute; \
+  curl -fsSL https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_amd64 -o /opt/adscan/tools/kerbrute/kerbrute; \
+  chmod +x /opt/adscan/tools/kerbrute/kerbrute; \
+  \
+  git clone --depth 1 https://github.com/lgandx/Responder.git /opt/adscan/tools/responder; \
+  python3 -m venv /opt/adscan/tool_venvs/responder/venv; \
+  /opt/adscan/tool_venvs/responder/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/responder/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/responder/requirements.txt; \
+  \
+  git clone --depth 1 https://github.com/blechschmidt/massdns.git /opt/adscan/tools/massdns; \
+  make -C /opt/adscan/tools/massdns; \
+  chmod +x /opt/adscan/tools/massdns/bin/massdns; \
+  ln -sf /opt/adscan/tools/massdns/bin/massdns /opt/adscan/bin/massdns; \
+  \
+  chmod -R 0777 /opt/adscan/tools /opt/adscan/tool_venvs
+
+# Wordlists
+RUN set -eux; \
+  mkdir -p /opt/adscan/wordlists; \
+  curl -fsSL https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt -o /opt/adscan/wordlists/rockyou.txt; \
+  curl -fsSL https://gist.github.com/The-Viper-One/a1ee60d8b3607807cc387d794e809f0b/raw/b7d83af6a8bbb43013e04f78328687d19d0cf9a7/kerberoast_pws.xz -o /opt/adscan/wordlists/kerberoast_pws.xz; \
+  xz -d -c /opt/adscan/wordlists/kerberoast_pws.xz > /opt/adscan/wordlists/kerberoast_pws; \
+  rm -f /opt/adscan/wordlists/kerberoast_pws.xz; \
+  chmod -R 0777 /opt/adscan/wordlists
+
+# RustHound-CE (Kerberos-capable build)
+COPY --from=rusthound_builder /usr/local/cargo/bin/rusthound-ce /usr/local/bin/rusthound-ce
+RUN rusthound-ce --version
+
+# Enable Unbound remote-control for container runtime so ADscan can trigger a reload
+# without relying on systemd or sudo.
+#
+# Debian's default Unbound configuration enables chroot + DNSSEC trust anchor
+# management which is fragile in minimal container environments. Use a
+# container-friendly base config that delegates the listen interface and
+# forwarders to our generated snippets in `/etc/unbound/unbound.conf.d/`.
+COPY docker/unbound_container_base.conf /etc/unbound/unbound.conf
+COPY docker/unbound_adscan_control.conf /etc/unbound/unbound.conf.d/00-adscan-control.conf
+
+# Copy the compiled onefile binary into the image.
+# Keep this near the end so that changes to dist/adscan do not invalidate the
+# cache for the heavy dependency/tool installation layers above.
+#
+# It must exist before building this image (run: ./build_adscan.sh).
+COPY dist/adscan /usr/local/bin/adscan
+RUN chmod +x /usr/local/bin/adscan
+
+COPY docker/adscan_entrypoint.sh /usr/local/bin/adscan-entrypoint
+RUN chmod +x /usr/local/bin/adscan-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]

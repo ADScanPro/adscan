@@ -34,6 +34,24 @@ adscan start
 
 > **Full installation guide & docs** at [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=install_cta)
 
+## 🧪 Developer Setup (uv)
+
+For local development in this repository:
+
+```bash
+uv sync --extra dev
+uv run adscan --help
+uv run adscan version
+```
+
+Quality checks:
+
+```bash
+uv run ruff check adscan_core adscan_launcher adscan_internal
+uv run pytest -m unit
+uv run python -m build
+```
+
 ---
 
 ## ✨ Features

@@ -1,0 +1,2221 @@
+"""Start command orchestration helpers.
+
+This module contains small, dependency-light helpers used by `handle_start`
+to keep `adscan.py` slimmer while preserving the exact runtime behaviour.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Literal
+import ipaddress
+import time
+import os
+import re
+import sys
+
+from adscan_internal import (
+    print_error,
+    print_info,
+    print_info_verbose,
+    print_warning,
+    print_instruction,
+    telemetry,
+    print_exception,
+    print_panel,
+    print_success,
+)
+from adscan_internal.rich_output import mark_sensitive
+from rich.prompt import Confirm, Prompt
+from rich.text import Text
+from adscan_internal.workspaces.subpaths import domain_relpath
+from adscan_internal.cli.dns import (
+    confirm_domain_pdc_mapping,
+    finalize_domain_context,
+    infer_domain_from_fqdn,
+    offer_a_record_fallback,
+    preflight_domain_pdc,
+    prompt_known_domain_and_pdc_interactive,
+)
+from adscan_internal.services.network_preflight_service import (
+    assess_target_reachability,
+    get_interface_ipv4_addresses,
+)
+
+
+@dataclass(frozen=True)
+class _NetworkPreflightCheck:
+    """One network preflight validation result row."""
+
+    name: str
+    status: Literal["ok", "warn", "fail"]
+    detail: str
+    suggestion: str | None = None
+
+
+def _workspace_has_domain_data(shell: Any) -> bool:
+    """Return True when the workspace has domain data worth cleaning.
+
+    We only prompt the user to clean the workspace when there is existing domain
+    state (e.g. previous scans) to avoid a noisy prompt on first run.
+    """
+
+    try:
+        domains_data = getattr(shell, "domains_data", None)
+    except Exception:
+        return False
+    return bool(domains_data)
+
+
+_WORKSPACE_CLEAN_CONFIRMATION = "I want to delete the workspace"
+
+
+def _prompt_workspace_cleanup(shell: Any) -> None:
+    """Prompt to clean the workspace with a strong confirmation."""
+    if not _workspace_has_domain_data(shell):
+        return
+
+    print_panel(
+        "[bold]Workspace Cleanup[/bold]\n\n"
+        "Before starting a new scan, you can clean the workspace to ensure a fresh start.\n\n"
+        "[bold yellow]⚠️  When to clean:[/bold yellow]\n"
+        "• If you're experiencing scan issues or errors\n"
+        "• If previous scan data might be causing conflicts\n"
+        "• If domain information seems corrupted or outdated\n"
+        "• If you want to start completely fresh\n\n"
+        "[bold green]✓ Safe to skip:[/bold green]\n"
+        "• If your previous scans completed successfully\n"
+        "• If you want to continue building on existing data\n"
+        "• If you're resuming a scan or adding new domains\n\n"
+        "[bold cyan]💡 Alternative options:[/bold cyan]\n"
+        "• You can clean manually later with: [yellow]clear_all[/yellow]\n"
+        "• Or create a new workspace with: [yellow]workspace create[/yellow]\n\n"
+        "[dim]Note: Cleaning preserves variables.json, report.json, and command history[/dim]",
+        title="[bold]🧹 Workspace Preparation[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+
+    prompt_text = Text(
+        "Do you want to clean the workspace before starting the scan?", style="cyan"
+    )
+    if not Confirm.ask(
+        prompt_text,
+        default=False,
+    ):
+        return
+
+    print_panel(
+        "[bold yellow]Type this phrase exactly to confirm cleanup:[/bold yellow]\n\n"
+        f"[bold]{_WORKSPACE_CLEAN_CONFIRMATION}[/bold]\n\n"
+        "[dim]Tip: this is case-sensitive. Type `exit` to cancel.[/dim]",
+        title="[bold]⚠️ Confirmation Required[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+
+    for _ in range(5):
+        confirmation_prompt = Text("Type exactly: ", style="cyan")
+        confirmation_prompt.append(_WORKSPACE_CLEAN_CONFIRMATION, style="bold yellow")
+        confirmation_prompt.append(" (or 'exit' to cancel)")
+        confirmation = Prompt.ask(
+            confirmation_prompt,
+            default="",
+            show_default=False,
+        )
+        confirmation_clean = confirmation.strip()
+        if confirmation_clean == "exit":
+            print_warning("Workspace cleanup cancelled by operator.")
+            return
+        if confirmation_clean == _WORKSPACE_CLEAN_CONFIRMATION:
+            break
+        print_warning("Confirmation phrase did not match.")
+    else:
+        print_warning("Workspace cleanup cancelled; confirmation failed.")
+        return
+
+    print_info("[dim]Cleaning workspace...[/dim]")
+    shell.do_clear_all("")
+    print_success("[bold]✓[/bold] Workspace cleaned successfully!")
+    time.sleep(0.5)  # Small delay for better UX
+
+
+def _select_option_interactive(
+    shell: Any,
+    *,
+    message: str,
+    options: list[str],
+    default_index: int = 0,
+) -> int | None:
+    """Select an option interactively with a best-effort UX.
+
+    Prefers the shell's `*_questionary_select` UI when available, otherwise falls
+    back to a numbered Prompt.
+    """
+    try:
+        selector = getattr(shell, "_questionary_select", None)
+        if callable(selector):
+            try:
+                idx = selector(message, options, default_index)
+            except TypeError:
+                idx = selector(message, options)
+            if idx is None:
+                return None
+            if isinstance(idx, int) and 0 <= idx < len(options):
+                return idx
+    except Exception:
+        pass
+
+    from rich.prompt import Prompt
+    from rich.text import Text
+
+    numbered = [f"{i + 1}. {opt}" for i, opt in enumerate(options)]
+    print_panel(
+        "[bold]Choose one option:[/bold]\n\n" + "\n".join(numbered),
+        title="[bold]🧭 Selection[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+    choices = [str(i + 1) for i in range(len(options))]
+    selected = Prompt.ask(
+        Text(message, style="cyan"),
+        choices=choices,
+        default=str(default_index + 1),
+    )
+    try:
+        idx = int(selected) - 1
+    except ValueError:
+        return None
+    if 0 <= idx < len(options):
+        return idx
+    return None
+
+
+def _warn_if_single_discovery_target(hosts_expression: str | None) -> None:
+    """Warn when discovery scope is a single host and may miss domain context."""
+    target = str(hosts_expression or "").strip()
+    if not target:
+        return
+    try:
+        ipaddress.ip_address(target)
+    except ValueError:
+        return
+
+    print_warning(
+        "[bold]Very narrow discovery scope detected:[/bold] single target host.",
+        panel=True,
+        items=[
+            "Domain discovery may fail if this host is not AD-connected.",
+            "Prefer a CIDR that includes likely DCs and AD members (e.g., /24).",
+            "If possible, use a known DC/DNS IP via the domain context wizard.",
+        ],
+    )
+
+
+def _extract_probe_ip_from_hosts_expression(hosts_expression: str | None) -> str | None:
+    """Return a representative IPv4 from a hosts expression for route checks."""
+    target = str(hosts_expression or "").strip()
+    if not target:
+        return None
+
+    first_token = next((part.strip() for part in target.split(",") if part.strip()), "")
+    if not first_token:
+        return None
+
+    try:
+        return str(ipaddress.ip_address(first_token))
+    except ValueError:
+        pass
+
+    try:
+        network = ipaddress.ip_network(first_token, strict=False)
+    except ValueError:
+        network = None
+    if network is not None:
+        host_iter = network.hosts()
+        first_host = next(host_iter, None)
+        return str(first_host) if first_host else str(network.network_address)
+
+    range_match = re.match(
+        r"^(?P<prefix>\d{1,3}(?:\.\d{1,3}){2}\.)(?P<start>\d{1,3})-(?P<end>\d{1,3})$",
+        first_token,
+    )
+    if range_match:
+        candidate = f"{range_match.group('prefix')}{range_match.group('start')}"
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            return None
+
+    if "-" in first_token:
+        left, _sep, _right = first_token.partition("-")
+        left = left.strip()
+        try:
+            return str(ipaddress.ip_address(left))
+        except ValueError:
+            return None
+
+    return None
+
+
+def _build_network_preflight_panel_body(
+    *,
+    mode_label: str,
+    interface: str,
+    checks: list[_NetworkPreflightCheck],
+    target_ip: str | None = None,
+    hosts_expression: str | None = None,
+) -> str:
+    """Build a consistent, professional panel body for network preflight results."""
+    lines = [
+        "[bold]Pre-scan network validation detected issues.[/bold]",
+        "",
+        f"Mode: {mode_label}",
+        f"Interface: {interface}",
+    ]
+    if target_ip:
+        lines.append(f"Target: {mark_sensitive(target_ip, 'ip')}")
+    elif hosts_expression:
+        lines.append(f"Scope: {mark_sensitive(hosts_expression, 'host')}")
+    lines.append("")
+
+    status_icon = {"ok": "[green]✓[/green]", "warn": "[yellow]⚠[/yellow]", "fail": "[red]✗[/red]"}
+    for check in checks:
+        lines.append(f"{status_icon[check.status]} {check.name}: {check.detail}")
+
+    suggestions = [check.suggestion for check in checks if check.suggestion]
+    if suggestions:
+        lines.append("")
+        lines.append("[bold]Recommended actions:[/bold]")
+        for suggestion in suggestions:
+            lines.append(f"• {suggestion}")
+
+    return "\n".join(lines)
+
+
+def _run_start_network_preflight(
+    shell: Any,
+    *,
+    mode_label: str,
+    interface: str | None,
+    interactive: bool,
+    target_ip: str | None = None,
+    hosts_expression: str | None = None,
+    require_dc_ports: bool = False,
+) -> bool:
+    """Validate local interface/routing reachability before starting scans."""
+    checks: list[_NetworkPreflightCheck] = []
+    iface = (interface or "").strip()
+    if not iface:
+        checks.append(
+            _NetworkPreflightCheck(
+                name="Interface",
+                status="fail",
+                detail="No network interface configured.",
+                suggestion="Set an interface before scanning (e.g., `set interface tun0`).",
+            )
+        )
+    else:
+        ipv4_addrs = get_interface_ipv4_addresses(iface)
+        if not ipv4_addrs:
+            checks.append(
+                _NetworkPreflightCheck(
+                    name="Interface",
+                    status="fail",
+                    detail=f"Interface '{iface}' has no IPv4 address assigned.",
+                    suggestion="Reconnect VPN/tunnel and confirm interface has an IPv4 address.",
+                )
+            )
+        else:
+            marked_ip = mark_sensitive(ipv4_addrs[0], "ip")
+            checks.append(
+                _NetworkPreflightCheck(
+                    name="Interface",
+                    status="ok",
+                    detail=f"Interface '{iface}' is up with IPv4 {marked_ip}.",
+                )
+            )
+
+    probe_target = target_ip or _extract_probe_ip_from_hosts_expression(hosts_expression)
+    if probe_target:
+        route_assessment = assess_target_reachability(
+            shell,
+            target_ip=probe_target,
+            expected_interface=iface or None,
+            tcp_ports=(),
+        ).route
+        marked_probe = mark_sensitive(probe_target, "ip")
+        if not route_assessment.ok:
+            checks.append(
+                _NetworkPreflightCheck(
+                    name="Route check",
+                    status="fail",
+                    detail=f"No usable route to {marked_probe}.",
+                    suggestion="Confirm VPN routing to the target subnet before scanning.",
+                )
+            )
+        elif route_assessment.reason == "route_interface_mismatch":
+            marked_src = (
+                mark_sensitive(route_assessment.source_ip, "ip")
+                if route_assessment.source_ip
+                else "[unknown]"
+            )
+            checks.append(
+                _NetworkPreflightCheck(
+                    name="Route check",
+                    status="warn",
+                    detail=(
+                        f"Route to {marked_probe} uses interface '{route_assessment.route_interface}' "
+                        f"(source {marked_src}), not '{iface}'."
+                    ),
+                    suggestion="If this is unexpected, verify active VPN interface and policy routing.",
+                )
+            )
+        else:
+            marked_src = (
+                mark_sensitive(route_assessment.source_ip, "ip")
+                if route_assessment.source_ip
+                else "[unknown]"
+            )
+            route_summary = (
+                f"Route to {marked_probe} via interface '{route_assessment.route_interface}' (source {marked_src})."
+                if route_assessment.route_interface
+                else f"Route to {marked_probe} is present."
+            )
+            checks.append(
+                _NetworkPreflightCheck(
+                    name="Route check",
+                    status="ok",
+                    detail=route_summary,
+                )
+            )
+
+    if require_dc_ports and target_ip:
+        reachability = assess_target_reachability(
+            shell,
+            target_ip=target_ip,
+            expected_interface=iface or None,
+            tcp_ports=(53, 389, 445),
+        )
+        open_ports = list(reachability.open_ports)
+        marked_target = mark_sensitive(target_ip, "ip")
+        if not open_ports:
+            checks.append(
+                _NetworkPreflightCheck(
+                    name="DC service reachability",
+                    status="fail",
+                    detail=f"Could not connect to TCP 53/389/445 on {marked_target}.",
+                    suggestion="Verify routing/firewall rules and confirm the target is a DC/PDC.",
+                )
+            )
+        else:
+            checks.append(
+                _NetworkPreflightCheck(
+                    name="DC service reachability",
+                    status="ok",
+                    detail=f"Reachable ports on {marked_target}: {', '.join(str(p) for p in open_ports)}.",
+                )
+            )
+            if 53 not in open_ports:
+                checks.append(
+                    _NetworkPreflightCheck(
+                        name="DNS reachability",
+                        status="warn",
+                        detail=f"TCP 53 is not reachable on {marked_target}. DNS validation may fail.",
+                        suggestion="Ensure DNS service on the selected DC/PDC is reachable from this host.",
+                    )
+                )
+
+    failures = [check for check in checks if check.status == "fail"]
+    warnings = [check for check in checks if check.status == "warn"]
+
+    if not failures and not warnings:
+        print_info_verbose(
+            f"Network preflight passed for {mode_label} using interface '{iface}'."
+        )
+        return True
+
+    panel_body = _build_network_preflight_panel_body(
+        mode_label=mode_label,
+        interface=iface or "[unset]",
+        checks=checks,
+        target_ip=target_ip,
+        hosts_expression=hosts_expression,
+    )
+    panel_style = "red" if failures else "yellow"
+    panel_title = "[bold]🛡️ Network Preflight[/bold]"
+    print_panel(
+        panel_body,
+        title=panel_title,
+        border_style=panel_style,
+        padding=(1, 2),
+    )
+
+    telemetry.capture(
+        "start_network_preflight_result",
+        properties={
+            "mode": mode_label,
+            "has_failures": bool(failures),
+            "warning_count": len(warnings),
+            "target_provided": bool(target_ip),
+            "hosts_expression_provided": bool(hosts_expression),
+        },
+    )
+
+    if not failures:
+        return True
+
+    if interactive:
+        continue_anyway = Confirm.ask(
+            Text(
+                "Continue scan anyway despite failed network preflight checks?",
+                style="cyan",
+            ),
+            default=False,
+        )
+        if continue_anyway:
+            print_warning("Continuing scan despite failed network preflight checks.")
+            return True
+        print_error("Scan aborted due to network preflight failures.")
+        return False
+
+    print_error(
+        "Aborting scan due to network preflight failures "
+        "(non-interactive mode)."
+    )
+    return False
+
+
+def _ensure_unauth_target_list(
+    shell: Any,
+    *,
+    domain: str,
+    pdc_ip: str | None,
+) -> bool:
+    """Ensure we have a target list for unauthenticated SMB guest enumeration."""
+    enabled_computers = domain_relpath(
+        shell.domains_dir, domain, "enabled_computers_ips.txt"
+    )
+    smb_ips = domain_relpath(shell.domains_dir, domain, "smb", "ips.txt")
+
+    for candidate in (enabled_computers, smb_ips):
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            return True
+
+    if not sys.stdin.isatty():
+        if pdc_ip:
+            os.makedirs(os.path.dirname(smb_ips), exist_ok=True)
+            with open(smb_ips, "w", encoding="utf-8") as handle:
+                handle.write(f"{pdc_ip}\n")
+            print_info(
+                "No host list detected; defaulting guest SMB enumeration to the validated PDC only."
+            )
+            return True
+        return False
+
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_pdc = mark_sensitive(pdc_ip, "ip") if pdc_ip else "[unknown]"
+    print_panel(
+        "[bold]We need a target list for guest SMB enumeration.[/bold]\n\n"
+        f"Domain: {marked_domain}\n"
+        f"PDC/DC: {marked_pdc}\n\n"
+        "Guest share enumeration expects a list of target hosts. "
+        "You can scan a range to build that list, supply your own file, "
+        "or use only the validated PDC for a quick check.\n",
+        title="[bold]🧭 SMB Targets Required[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+
+    options: list[str] = []
+    if pdc_ip:
+        options.append("Use only the validated PDC/DC (fast)")
+    options.extend(
+        [
+            "Provide a host range and discover SMB targets",
+            "Provide a file with target IPs",
+            "Cancel and return",
+        ]
+    )
+    choice = _select_option_interactive(
+        shell,
+        message="Select how you want to provide SMB targets:",
+        options=options,
+        default_index=0,
+    )
+    if choice is None:
+        return False
+
+    selected = options[choice]
+    if selected.startswith("Use only") and pdc_ip:
+        os.makedirs(os.path.dirname(smb_ips), exist_ok=True)
+        with open(smb_ips, "w", encoding="utf-8") as handle:
+            handle.write(f"{pdc_ip}\n")
+        print_info(
+            "Target list created with the validated PDC/DC only "
+            f"({mark_sensitive(pdc_ip, 'ip')})."
+        )
+        return True
+
+    if selected.startswith("Provide a host range"):
+        print_instruction(
+            "We will run a lightweight SMB discovery to build the target list. "
+            "This may take a moment depending on the range."
+        )
+        if not shell._prompt_hosts_if_missing():
+            return False
+        shell.scan_service("smb", shell.hosts, domain)
+        if os.path.exists(enabled_computers) and os.path.getsize(enabled_computers) > 0:
+            return True
+        if os.path.exists(smb_ips) and os.path.getsize(smb_ips) > 0:
+            return True
+        if pdc_ip:
+            print_warning(
+                "No SMB targets were discovered. Falling back to the validated PDC only."
+            )
+            os.makedirs(os.path.dirname(smb_ips), exist_ok=True)
+            with open(smb_ips, "w", encoding="utf-8") as handle:
+                handle.write(f"{pdc_ip}\n")
+            return True
+        print_warning(
+            "No SMB targets were discovered. Provide a smaller range or a file with targets."
+        )
+        return False
+
+    if selected.startswith("Provide a file"):
+        from rich.prompt import Prompt
+        from rich.text import Text
+
+        while True:
+            file_path = Prompt.ask(
+                Text("Enter path to file with IPs/targets", style="cyan")
+            ).strip()
+            if not file_path:
+                return False
+            if not os.path.exists(file_path):
+                print_warning("File not found. Please enter a valid path.")
+                continue
+            with open(file_path, encoding="utf-8") as handle:
+                lines = [line.strip() for line in handle if line.strip()]
+            if not lines:
+                print_warning("The file is empty. Provide a file with targets.")
+                continue
+            os.makedirs(os.path.dirname(smb_ips), exist_ok=True)
+            with open(smb_ips, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+            print_info(f"Loaded {len(lines)} target(s) into {smb_ips}.")
+            return True
+
+    return False
+
+
+def _domain_context_wizard_for_unauth(shell: Any) -> tuple[str, str] | None:
+    """Collect domain context for unauthenticated scans (includes blind discovery option)."""
+    return _domain_context_wizard(shell, allow_blind=True, mode_label="unauth")
+
+
+def _domain_context_wizard_for_auth(shell: Any) -> tuple[str, str] | None:
+    """Collect domain context for authenticated scans (no blind discovery option)."""
+    return _domain_context_wizard(shell, allow_blind=False, mode_label="auth")
+
+
+def _domain_context_wizard(
+    shell: Any,
+    *,
+    allow_blind: bool,
+    mode_label: Literal["unauth", "auth"],
+) -> tuple[str, str] | None:
+    """Collect the best available (domain, dc_ip) context from partial user inputs.
+
+    Args:
+        shell: Interactive shell.
+        allow_blind: When True, include a "I know nothing" option and return None.
+        mode_label: Telemetry label describing which start flow is using the wizard.
+
+    Returns:
+        (domain, dc_ip) if enough information is confirmed to run direct enumeration,
+        or None when the user opts out (or selects blind discovery).
+    """
+    import ipaddress
+
+    from rich.prompt import Confirm, Prompt
+    from rich.text import Text
+
+    options = [
+        "🌐 I know the domain (FQDN) and a DC/DNS IP (recommended)",
+        "🌐 I know only the domain (FQDN)",
+        "🧭 I know only a DC/DNS IP",
+        "🧭 I know only a DC hostname (FQDN)",
+    ]
+    if allow_blind:
+        options.append("🕳️ I know nothing (use host-range discovery)")
+
+    selection = _select_option_interactive(
+        shell,
+        message="What do you know about the target?",
+        options=options,
+        default_index=2 if (os.getenv("CI") or not sys.stdin.isatty()) else 0,
+    )
+    if selection is None:
+        return None
+    if allow_blind and selection == 4:
+        return None
+
+    service = shell._get_dns_discovery_service()
+    from adscan_internal.services.network_discovery import infer_domain_from_smb_banner
+
+    fallback_hint = (
+        "use host-range discovery"
+        if allow_blind
+        else "re-enter values (or use start_unauth)"
+    )
+
+    def _prompt_domain() -> str | None:
+        while True:
+            domain_input = (
+                Prompt.ask(
+                    Text("Enter the domain name (e.g., contoso.local)", style="cyan")
+                )
+                .strip()
+                .lower()
+            )
+            if not domain_input:
+                return None
+            if "." not in domain_input:
+                print_warning(
+                    f"[bold]⚠️  Invalid domain format:[/bold] {mark_sensitive(domain_input, 'domain')}\n"
+                    "Domain must be a FQDN (e.g., [yellow]contoso.local[/yellow])"
+                )
+                continue
+            return domain_input
+
+    def _prompt_ip() -> str | None:
+        while True:
+            ip_input = Prompt.ask(
+                Text("Enter a DC/DNS IP address (e.g., 10.10.10.100)", style="cyan"),
+                default="",
+            ).strip()
+            if not ip_input:
+                return None
+            try:
+                ipaddress.ip_address(ip_input)
+            except ValueError:
+                print_warning(
+                    f"[bold]⚠️  Invalid IP address format:[/bold] {mark_sensitive(ip_input, 'ip')}\n"
+                    "Please enter a valid IPv4 address (e.g., [yellow]10.10.10.100[/yellow])"
+                )
+                continue
+            return ip_input
+
+    def _confirm_and_preflight(domain: str, ip: str) -> tuple[str, str] | None:
+        return confirm_domain_pdc_mapping(
+            shell,
+            domain=domain,
+            candidate_ip=ip,
+            interactive=True,
+            mode_label=mode_label,
+            on_reenter=lambda: prompt_known_domain_and_pdc_interactive(
+                shell, mode_label=mode_label
+            ),
+        )
+
+    # 0) domain + IP
+    if selection == 0:
+        return prompt_known_domain_and_pdc_interactive(shell, mode_label=mode_label)
+
+    # 1) domain only
+    if selection == 1:
+        domain = _prompt_domain()
+        if not domain:
+            return None
+        pdc_ip, pdc_hostname = service.discover_pdc(domain=domain)
+        if pdc_ip:
+            marked_domain = mark_sensitive(domain, "domain")
+            marked_pdc = mark_sensitive(pdc_ip, "ip")
+            marked_hostname = (
+                mark_sensitive(pdc_hostname, "hostname") if pdc_hostname else None
+            )
+            discovered_line = (
+                f"{marked_pdc} ({marked_hostname})" if marked_hostname else marked_pdc
+            )
+            print_panel(
+                "[bold]PDC discovered via DNS SRV.[/bold]\n\n"
+                f"Domain: {marked_domain}\n"
+                f"PDC (DNS SRV): {discovered_line}\n\n"
+                "[bold]Next:[/bold] Validate and use this DC/PDC.",
+                title="[bold]🧭 PDC Discovery[/bold]",
+                border_style="green",
+                padding=(1, 2),
+            )
+            if Confirm.ask(
+                Text(f"Validate and use {marked_pdc} for this scan?", style="cyan"),
+                default=True,
+            ):
+                return _confirm_and_preflight(domain, pdc_ip)
+
+        print_info(
+            "No PDC found via SRV; trying A/hosts lookup for a DC/DNS candidate..."
+        )
+        fallback_ip = offer_a_record_fallback(
+            shell=shell,
+            service=service,
+            domain=domain,
+            fallback_hint=fallback_hint,
+            confirm=False,
+        )
+        if fallback_ip:
+            return _confirm_and_preflight(domain, fallback_ip)
+
+        print_panel(
+            "[bold]We couldn't discover the PDC from the domain name.[/bold]\n\n"
+            f"Domain: {mark_sensitive(domain, 'domain')}\n\n"
+            f"Provide a DC/DNS IP to continue, or {fallback_hint}.",
+            title="[bold]🧭 Need More Information[/bold]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        if Confirm.ask(
+            Text("Do you know a DC/DNS IP for this domain?", style="cyan"),
+            default=True,
+        ):
+            ip = _prompt_ip()
+            if not ip:
+                return None
+            return _confirm_and_preflight(domain, ip)
+        return None
+
+    # 2) IP only
+    if selection == 2:
+        ip = _prompt_ip()
+        if not ip:
+            return None
+        reverse_getent = getattr(service, "_reverse_resolve_via_getent", None)
+        if callable(reverse_getent):
+            fqdn = reverse_getent(ip)
+            inferred_domain = infer_domain_from_fqdn(fqdn or "") if fqdn else None
+            if inferred_domain and fqdn:
+                marked_fqdn = mark_sensitive(fqdn, "host")
+                marked_domain = mark_sensitive(inferred_domain, "domain")
+                marked_ip = mark_sensitive(ip, "ip")
+                print_panel(
+                    "[bold]Domain inferred from /etc/hosts.[/bold]\n\n"
+                    f"IP: {marked_ip}\n"
+                    f"Host: {marked_fqdn}\n"
+                    f"Domain: {marked_domain}\n\n"
+                    "[bold]Next:[/bold] Validate the domain/PDC via DNS SRV.",
+                    title="[bold]🧩 Domain Inference[/bold]",
+                    border_style="green",
+                    padding=(1, 2),
+                )
+                return _confirm_and_preflight(inferred_domain, ip)
+
+        print_info("Trying SMB fingerprinting to infer the domain...")
+        smb_domain, smb_hostname = infer_domain_from_smb_banner(shell, target_ip=ip)
+        if smb_domain:
+            marked_ip = mark_sensitive(ip, "ip")
+            marked_domain = mark_sensitive(smb_domain, "domain")
+            marked_hostname = (
+                mark_sensitive(smb_hostname, "hostname") if smb_hostname else None
+            )
+            smb_line = (
+                f"{marked_domain} (host: {marked_hostname})"
+                if marked_hostname
+                else marked_domain
+            )
+            print_panel(
+                "[bold]Domain inferred from SMB fingerprinting.[/bold]\n\n"
+                f"IP: {marked_ip}\n"
+                f"SMB result: {smb_line}\n\n"
+                "[bold]Next:[/bold] Validate the domain/PDC via DNS SRV.",
+                title="[bold]🧩 Domain Inference (SMB)[/bold]",
+                border_style="green",
+                padding=(1, 2),
+            )
+            telemetry.capture(
+                "domain_inference",
+                properties={"mode": mode_label, "method": "smb", "result": "success"},
+            )
+            return _confirm_and_preflight(smb_domain, ip)
+
+        print_info("SMB inference failed; trying reverse DNS (PTR) as a last resort...")
+        print_info(
+            "[dim]This may take a moment while we try available DNS resolvers.[/dim]"
+        )
+        fqdn = service.reverse_resolve_fqdn_robust(ip, preferred_resolvers=[ip])
+        inferred_domain = infer_domain_from_fqdn(fqdn or "") if fqdn else None
+        if inferred_domain and fqdn:
+            marked_fqdn = mark_sensitive(fqdn, "host")
+            marked_domain = mark_sensitive(inferred_domain, "domain")
+            marked_ip = mark_sensitive(ip, "ip")
+            print_panel(
+                "[bold]Domain inferred from reverse DNS (PTR).[/bold]\n\n"
+                f"IP: {marked_ip}\n"
+                f"PTR hostname: {marked_fqdn}\n"
+                f"Domain: {marked_domain}\n\n"
+                "[bold]Next:[/bold] Validate the domain/PDC via DNS SRV.",
+                title="[bold]🧩 Domain Inference[/bold]",
+                border_style="green",
+                padding=(1, 2),
+            )
+            return _confirm_and_preflight(inferred_domain, ip)
+
+        print_info("Could not infer the domain automatically; requesting input.")
+        print_panel(
+            "[bold]We couldn't infer the domain from this IP.[/bold]\n\n"
+            f"IP: {mark_sensitive(ip, 'ip')}\n\n"
+            f"Enter the domain name now, or {fallback_hint}.",
+            title="[bold]🧩 Domain Inference Failed[/bold]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        domain = _prompt_domain()
+        if not domain:
+            return None
+        return _confirm_and_preflight(domain, ip)
+
+    # 3) hostname only
+    hostname = (
+        Prompt.ask(
+            Text(
+                "Enter the DC hostname (FQDN) (e.g., dc01.contoso.local)", style="cyan"
+            )
+        )
+        .strip()
+        .lower()
+    )
+    if not hostname or "." not in hostname:
+        print_warning("A DC hostname must be a FQDN (e.g., dc01.contoso.local).")
+        return None
+    inferred_domain = infer_domain_from_fqdn(hostname)
+    if not inferred_domain:
+        print_warning("Could not infer a domain from the provided hostname.")
+        return None
+
+    ip_candidates = service.resolve_ipv4_addresses_robust(hostname)
+    if not ip_candidates:
+        print_panel(
+            "[bold]We couldn't resolve the DC hostname to an IP.[/bold]\n\n"
+            f"Hostname: {mark_sensitive(hostname, 'host')}\n\n"
+            f"If you know a DC/DNS IP, provide it to use as a resolver; otherwise {fallback_hint}.",
+            title="[bold]🧭 Hostname Resolution Failed[/bold]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        resolver_ip = _prompt_ip()
+        if not resolver_ip:
+            return None
+        ip_candidates = service.resolve_ipv4_addresses_robust(
+            hostname, resolver=resolver_ip
+        )
+        if not ip_candidates:
+            return None
+
+    chosen_ip = ip_candidates[0]
+    if len(ip_candidates) > 1:
+        opt = [f"{ip}" for ip in ip_candidates]
+        idx = _select_option_interactive(
+            shell,
+            message="Multiple IPs found for that hostname. Choose one:",
+            options=opt,
+            default_index=0,
+        )
+        if idx is None:
+            return None
+        chosen_ip = ip_candidates[idx]
+
+    marked_domain = mark_sensitive(inferred_domain, "domain")
+    marked_ip = mark_sensitive(chosen_ip, "ip")
+    marked_host = mark_sensitive(hostname, "host")
+    print_panel(
+        "[bold]We derived domain and IP from the DC hostname.[/bold]\n\n"
+        f"Hostname: {marked_host}\n"
+        f"Resolved IP: {marked_ip}\n"
+        f"Inferred domain: {marked_domain}\n",
+        title="[bold]🧩 Hostname Context[/bold]",
+        border_style="green",
+        padding=(1, 2),
+    )
+    if not Confirm.ask(
+        Text("Validate and proceed with these values?", style="cyan"),
+        default=True,
+    ):
+        return None
+    return _confirm_and_preflight(inferred_domain, chosen_ip)
+
+
+def maybe_relaunch_into_venv(
+    *,
+    is_frozen: bool,
+    is_venv: Callable[[], bool],
+    venv_path: str,
+    tools_install_dir: str,
+    argv: list[str],
+    script_path: str,
+    track_docs_link_shown: Callable[[str, str], None],
+) -> None:
+    """Relaunch `adscan start` inside the venv when running as a script.
+
+    Behaviour matches the original `handle_start` logic:
+    - If not in venv and not frozen, execve into `<VENV_PATH>/bin/python`.
+    - If venv python missing, print guidance and exit(1).
+    - If execve fails, capture telemetry and exit(1).
+    """
+    if is_venv() or is_frozen:
+        return
+
+    print_info_verbose("Not in venv and running as script. Relaunching...")
+    venv_python = os.path.join(venv_path, "bin", "python")
+    if not os.path.exists(venv_python):
+        print_error(f"Virtual environment Python not found at {venv_python}.")
+        print_instruction("Please run: adscan install")
+        docs_url = (
+            "https://www.adscanpro.com/docs/troubleshooting"
+            "?utm_source=cli&utm_medium=install_error#virtualenv-setup"
+        )
+        print_info(f"💡 [link={docs_url}]Troubleshooting installation errors[/link]")
+        track_docs_link_shown("install_error", docs_url)
+        sys.exit(1)
+
+    try:
+        current_env = os.environ.copy()
+        tool_paths = [os.path.join(venv_path, "bin")]
+        if os.path.isdir(tools_install_dir):
+            tool_paths.append(tools_install_dir)
+            for item in os.listdir(tools_install_dir):
+                item_path = os.path.join(tools_install_dir, item)
+                if os.path.isdir(item_path):
+                    tool_paths.append(item_path)
+        current_env["PATH"] = (
+            os.pathsep.join(tool_paths) + os.pathsep + current_env.get("PATH", "")
+        )
+
+        original_args = argv[1:]
+        if original_args and original_args[0] == "start":
+            exec_args = [venv_python, script_path] + original_args
+        else:
+            exec_args = [venv_python, script_path, "start"] + original_args
+
+        print_info_verbose(f"Relaunching with: {' '.join(exec_args)}")
+        os.execve(venv_python, exec_args, current_env)
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_error("Failed to relaunch in virtual environment.")
+        print_exception(show_locals=False, exception=exc)
+        sys.exit(1)
+
+
+def prepend_tools_to_path(*, tools_install_dir: str) -> None:
+    """Prepend tool directories under `tools_install_dir` to PATH.
+
+    This mirrors the original `handle_start` behaviour and is intentionally
+    conservative (only adds tool subdirectories, not venv/bin).
+    """
+    current_env_path = os.environ.get("PATH", "")
+    tool_bin_paths_to_add: list[str] = []
+    if os.path.isdir(tools_install_dir):
+        for tool_name_dir_item in os.listdir(tools_install_dir):
+            tool_dir_path_item = os.path.join(tools_install_dir, tool_name_dir_item)
+            if os.path.isdir(tool_dir_path_item):
+                tool_bin_paths_to_add.append(tool_dir_path_item)
+    if tool_bin_paths_to_add:
+        os.environ["PATH"] = (
+            os.pathsep.join(tool_bin_paths_to_add) + os.pathsep + current_env_path
+        )
+
+
+@dataclass(frozen=True)
+class StartSessionConfig:
+    """Configuration for the legacy `adscan start` flow."""
+
+    venv_path: str
+    tools_install_dir: str
+    requested_pro: bool
+    verbose_mode: bool
+    debug_mode: bool
+
+
+@dataclass(frozen=True)
+class StartSessionDeps:
+    """Dependency bundle for starting an interactive session."""
+
+    is_frozen: bool
+    is_venv: Callable[[], bool]
+    argv: list[str]
+    script_path: str
+    track_docs_link_shown: Callable[[str, str], None]
+    build_preflight_args: Callable[[], object]
+    handle_check: Callable[[object], bool]
+    get_last_check_extra: Callable[[], dict[str, object]]
+    resolve_license_mode: Callable[[bool], object]
+    create_shell: Callable[[object, object], object]
+    console: object
+    is_first_run: Callable[[], bool]
+    show_first_run_helper: Callable[[Any | None], None]
+    mark_first_run_complete: Callable[[], None]
+    confirm_ask: Callable[[str, bool], bool]
+    exit: Callable[[int], None]
+    stdin_isatty: Callable[[], bool] = lambda: sys.stdin.isatty()
+    get_env: Callable[[str], str | None] = staticmethod(os.getenv)
+    monotonic: Callable[[], float] = staticmethod(time.monotonic)
+
+
+def run_start_session(*, config: StartSessionConfig, deps: StartSessionDeps) -> None:
+    """Run the legacy interactive start flow.
+
+    This wraps the original `handle_start` implementation in `adscan.py` while
+    avoiding direct imports of `PentestShell` to prevent circular dependencies.
+    """
+    maybe_relaunch_into_venv(
+        is_frozen=deps.is_frozen,
+        is_venv=deps.is_venv,
+        venv_path=config.venv_path,
+        tools_install_dir=config.tools_install_dir,
+        argv=deps.argv,
+        script_path=deps.script_path,
+        track_docs_link_shown=deps.track_docs_link_shown,
+    )
+
+    if deps.is_frozen:
+        print_info_verbose(
+            "Running as a compiled application. Skipping venv relaunch check."
+        )
+
+    preflight_check_args = deps.build_preflight_args()
+    preflight_ok = deps.handle_check(preflight_check_args)
+    last_check = deps.get_last_check_extra() or {}
+    preflight_fix_attempted = bool(last_check.get("fix_mode"))
+    preflight_overridden = False
+
+    if not preflight_ok:
+        telemetry.capture(
+            "session_start_check_failed",
+            properties={
+                "$set": {"installation_status": "failed"},
+                "fix_attempted": preflight_fix_attempted,
+            },
+        )
+
+        can_prompt_override = (
+            preflight_fix_attempted and deps.stdin_isatty() and not deps.get_env("CI")
+        )
+        if can_prompt_override:
+            telemetry.capture(
+                "session_start_override_prompt_shown",
+                properties={
+                    "fix_attempted": True,
+                    "missing_tools_count": int(
+                        last_check.get("missing_tools_count") or 0
+                    ),
+                    "tool_version_issues_count": int(
+                        last_check.get("tool_version_issues_count") or 0
+                    ),
+                    "missing_system_packages_count": int(
+                        last_check.get("missing_system_packages_count") or 0
+                    ),
+                },
+            )
+            print_warning(
+                "Some issues remain even after attempting automatic fixes. "
+                "Starting anyway is not recommended and may be unsafe (results may be unreliable)."
+            )
+            docs_url = (
+                "https://www.adscanpro.com/docs/guides/troubleshooting"
+                "?utm_source=cli&utm_medium=start_preflight_failed"
+            )
+            print_info(
+                "💡 Troubleshooting guide: "
+                f"[link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
+            )
+            deps.track_docs_link_shown("start_preflight_failed", docs_url)
+            print_info(
+                "Need help? Open an issue: https://github.com/ADscanPro/adscan/issues"
+            )
+            print_info("Or ask in Discord: https://discord.com/invite/fXBR3P8H74")
+
+            proceed_anyway = deps.confirm_ask(
+                "Start ADscan anyway (NOT recommended / potentially unsafe)?",
+                False,
+            )
+            if not proceed_anyway:
+                telemetry.capture(
+                    "session_start_override_declined",
+                    properties={
+                        "fix_attempted": True,
+                        "missing_tools_count": int(
+                            last_check.get("missing_tools_count") or 0
+                        ),
+                        "tool_version_issues_count": int(
+                            last_check.get("tool_version_issues_count") or 0
+                        ),
+                        "missing_system_packages_count": int(
+                            last_check.get("missing_system_packages_count") or 0
+                        ),
+                        "unsafe_override": False,
+                    },
+                )
+                deps.exit(1)
+            telemetry.capture(
+                "session_start_override_accepted",
+                properties={
+                    "fix_attempted": True,
+                    "missing_tools_count": int(
+                        last_check.get("missing_tools_count") or 0
+                    ),
+                    "tool_version_issues_count": int(
+                        last_check.get("tool_version_issues_count") or 0
+                    ),
+                    "missing_system_packages_count": int(
+                        last_check.get("missing_system_packages_count") or 0
+                    ),
+                    "unsafe_override": True,
+                },
+            )
+            preflight_overridden = True
+        else:
+            print_error("ADscan preflight checks failed.")
+            print_info("Run: adscan check --fix")
+            docs_url = (
+                "https://www.adscanpro.com/docs/guides/troubleshooting"
+                "?utm_source=cli&utm_medium=start_preflight_failed"
+            )
+            print_info(
+                "💡 Troubleshooting guide: "
+                f"[link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
+            )
+            deps.track_docs_link_shown("start_preflight_failed", docs_url)
+            print_info(
+                "Need help? Open an issue: https://github.com/ADscanPro/adscan/issues"
+            )
+            print_info("Or ask in Discord: https://discord.com/invite/fXBR3P8H74")
+            deps.exit(1)
+    else:
+        telemetry.capture(
+            "session_start_check_passed",
+            properties={
+                "$set": {"installation_status": "success"},
+                "fix_attempted": preflight_fix_attempted,
+            },
+        )
+
+    try:
+        prepend_tools_to_path(tools_install_dir=config.tools_install_dir)
+
+        from rich.text import Text
+        from adscan_internal.rich_output import BRAND_COLORS, print_panel
+
+        welcome_text = Text(
+            "\nWelcome to ADscan!\nYour Advanced Active Directory Scanner.\n",
+            justify="center",
+        )
+        print_panel(
+            welcome_text,
+            title=f"[bold {BRAND_COLORS['info']}]ADscan[/bold {BRAND_COLORS['info']}]",
+            subtitle="[dim]Loading...[/dim]",
+            border_style=BRAND_COLORS["info"],
+            padding=(1, 2),
+        )
+
+        license_mode = deps.resolve_license_mode(config.requested_pro)
+        shell = deps.create_shell(deps.console, license_mode)
+        setattr(shell, "session_command_type", "start")
+        shell.ensure_workspaces_dir()
+        if not getattr(shell, "current_workspace", None):
+            shell.workspace_select()
+        if not getattr(shell, "current_workspace", None):
+            shell.workspace_select()
+
+        shell.preflight_check_passed = bool(preflight_ok)
+        shell.preflight_check_fix_attempted = bool(preflight_fix_attempted)
+        shell.preflight_check_overridden = bool(preflight_overridden)
+
+        from adscan_internal.cli.common import build_telemetry_context
+
+        telemetry_context = build_telemetry_context(
+            shell=shell, trigger="session_start"
+        )
+
+        telemetry.set_cli_telemetry(shell.telemetry, context=telemetry_context)
+
+        session_properties: dict[str, object] = {
+            "$set": {"installation_status": "installed"}
+        }
+        if getattr(shell, "lab_provider", None):
+            session_properties["lab_provider"] = shell.lab_provider
+        if getattr(shell, "lab_name", None) and shell.lab_name_whitelisted is True:
+            session_properties["lab_name"] = shell.lab_name
+        if getattr(shell, "lab_name", None) is not None:
+            session_properties["lab_name_whitelisted"] = (
+                shell.lab_name_whitelisted is True
+            )
+        session_properties["verbose_mode"] = config.verbose_mode
+        session_properties["debug_mode"] = config.debug_mode
+        session_properties["preflight_check_passed"] = bool(preflight_ok)
+        session_properties["preflight_check_fix_attempted"] = bool(
+            preflight_fix_attempted
+        )
+        session_properties["preflight_check_overridden"] = bool(preflight_overridden)
+        telemetry.capture("session_start", properties=session_properties)
+
+        shell._session_start_time = deps.monotonic()
+
+        if deps.is_first_run():
+            deps.show_first_run_helper(deps.track_docs_link_shown)
+            deps.mark_first_run_complete()
+
+        shell.run()
+    except Exception as exc:  # noqa: BLE001 - preserve legacy catch-all behaviour
+        telemetry.capture_exception(exc)
+        print_error("An error occurred while running the shell.")
+        print_exception(show_locals=False, exception=exc)
+        raise
+
+
+def run_start_unauth(shell, args: str | None) -> None:
+    """Start unauthenticated scan using the legacy PentestShell implementation.
+
+    This helper mirrors :meth:`PentestShell.do_start_unauth` while keeping the
+    orchestration logic in this module so that `adscan.py` can be slimmer.
+    """
+    # Interactive configuration prompts
+    if not shell._prompt_type_if_missing():
+        return
+
+    if not shell._prompt_interface_if_missing():
+        return
+
+    if not shell._prompt_auto_if_missing():
+        return
+
+    # Ask if user wants to clean workspace before starting scan (only if needed)
+    _prompt_workspace_cleanup(shell)
+
+    # Always show scan-type guidance (even in args mode) to steer credentialed users
+    # towards start_auth. Only prompt when interactive so automation doesn't block.
+    print_panel(
+        "[bold]Scan Type Selection[/bold]\n\n"
+        "• [bold cyan]Authenticated Scan[/bold cyan]: Recommended if you already have domain credentials\n"
+        "  - Covers all unauthenticated checks plus authenticated enumeration\n"
+        "  - More comprehensive results with better coverage\n"
+        "  - Requires: domain name, PDC IP, username, and password/hash\n\n"
+        "• [bold yellow]Unauthenticated Scan[/bold yellow]: For black-box scenarios without credentials\n"
+        "  - Useful for discovering domains and obtaining initial access\n"
+        "  - Limited to anonymous/guest access enumeration\n"
+        "  - May require domain discovery if not known",
+        title="[bold]🔐 Choose Scan Type[/bold]",
+        border_style="cyan",
+        padding=(1, 2),
+    )
+
+    if sys.stdin.isatty():
+        cred_prompt = Text.assemble(
+            ("Do you have domain credentials? ", "cyan"),
+            ("(If yes, we recommend using ", ""),
+            ("start_auth", "bold"),
+            (" instead)", ""),
+        )
+        if Confirm.ask(cred_prompt, default=False):
+            print_panel(
+                "[bold]Switching to authenticated scan...[/bold]\n\n"
+                "We'll guide you through:\n"
+                "• Credentials (username + password/hash)\n"
+                "• Target context (domain/DC) with validation\n\n"
+                "[dim]Tip: If you don't have credentials after all, you can come back to start_unauth.[/dim]",
+                title="[bold]🔐 Start Authenticated Scan[/bold]",
+                border_style="green",
+                padding=(1, 2),
+            )
+            run_start_auth(shell, None)
+            return
+
+        print_info("Continuing with unauthenticated scan")
+    else:
+        print_info(
+            "[dim]Tip: If you have credentials, use `start_auth` for full coverage.[/dim]"
+        )
+
+    # Collect domain context: allow partial inputs (domain only, IP only, hostname only).
+    known_domain: str | None = None
+    known_pdc_ip: str | None = None
+    skip_domain_discovery = False
+
+    if not args:  # Only ask if domain not provided as argument
+        print_panel(
+            "Provide what you know to skip discovery:\n\n"
+            "• Domain FQDN (e.g., contoso.local)\n"
+            "• DC/DNS IP\n"
+            "• DC hostname (FQDN)\n\n"
+            "No info? Choose discovery and enter a host range.",
+            title="[bold]🎯 Domain Context[/bold]",
+            border_style="blue",
+            padding=(1, 2),
+        )
+
+        if Confirm.ask(
+            Text(
+                "Do you know any domain information (domain/IP/hostname)?", style="cyan"
+            ),
+            default=True,
+        ):
+            context = _domain_context_wizard_for_unauth(shell)
+            if context is not None:
+                known_domain, known_pdc_ip = context
+                skip_domain_discovery = True
+                shell.hosts = known_pdc_ip
+                shell.domains_data.setdefault(known_domain, {})["pdc"] = known_pdc_ip
+                finalize_domain_context(
+                    shell,
+                    domain=known_domain,
+                    pdc_ip=known_pdc_ip,
+                    interactive=bool(sys.stdin.isatty()),
+                )
+                print_info(
+                    f"Domain set to: {mark_sensitive(known_domain, 'domain')}\n"
+                    f"DC/PDC set to: {mark_sensitive(known_pdc_ip, 'ip')}\n"
+                    "[dim]Skipping host-range discovery, proceeding with direct enumeration...[/dim]"
+                )
+
+        if not skip_domain_discovery:
+            from adscan_internal import print_warning
+
+            print_info(
+                "Host-range discovery mode enabled\n"
+                "[dim]We'll scan the specified host range to discover domains first[/dim]"
+            )
+            print_warning(
+                "[bold]Important:[/bold] Provide a range that actually contains DCs",
+                panel=True,
+                items=[
+                    "Include AD members (workstations/servers)",
+                    "SMB (445) must be reachable",
+                    "Single IP or CIDR (e.g., 10.10.10.100 or 10.10.10.0/24)",
+                ],
+            )
+
+    # Args mode supports a few "shortcuts" for power users:
+    # - `start_unauth <domain>` (attempt DNS-based PDC discovery)
+    # - `start_unauth <domain> <dc_ip>` (validate and optionally correct to PDC)
+    # - `start_unauth <dc_ip>` (attempt PTR-based domain inference, then validate)
+    if args:
+        import ipaddress
+
+        parts = args.strip().split()
+        if len(parts) not in {1, 2}:
+            print_error("Usage: start_unauth <domain|dc_ip> [dc_ip]")
+            return
+
+        service = shell._get_dns_discovery_service()
+        from adscan_internal.services.network_discovery import (
+            infer_domain_from_smb_banner,
+        )
+
+        first = parts[0].strip()
+        inferred_domain: str | None = None
+        domain: str | None = None
+        candidate_ip: str | None = None
+
+        # Case: `start_unauth <dc_ip>`
+        is_first_ip = False
+        try:
+            ipaddress.ip_address(first)
+            is_first_ip = True
+        except ValueError:
+            is_first_ip = False
+
+        if is_first_ip and len(parts) == 1:
+            candidate_ip = first
+            print_info(
+                "Attempting to infer the domain from the DC/DNS IP via reverse DNS (PTR)..."
+            )
+            print_info(
+                "[dim]This may take a moment while we try available DNS resolvers.[/dim]"
+            )
+            fqdn = service.reverse_resolve_fqdn_robust(
+                candidate_ip, preferred_resolvers=[candidate_ip]
+            )
+            inferred_domain = infer_domain_from_fqdn(fqdn or "") if fqdn else None
+            if inferred_domain and fqdn:
+                print_panel(
+                    "[bold]Domain inferred from reverse DNS (PTR).[/bold]\n\n"
+                    f"IP: {mark_sensitive(candidate_ip, 'ip')}\n"
+                    f"PTR hostname: {mark_sensitive(fqdn, 'host')}\n"
+                    f"Domain: {mark_sensitive(inferred_domain, 'domain')}\n",
+                    title="[bold]🧩 Domain Inference[/bold]",
+                    border_style="green",
+                    padding=(1, 2),
+                )
+                if sys.stdin.isatty():
+                    if Confirm.ask(
+                        Text(
+                            f"Use {mark_sensitive(inferred_domain, 'domain')} and validate?",
+                            style="cyan",
+                        ),
+                        default=True,
+                    ):
+                        domain = inferred_domain
+                else:
+                    domain = inferred_domain
+
+            if not domain:
+                smb_domain, smb_hostname = infer_domain_from_smb_banner(
+                    shell, target_ip=candidate_ip, timeout_seconds=60
+                )
+                if smb_domain:
+                    marked_ip = mark_sensitive(candidate_ip, "ip")
+                    marked_domain = mark_sensitive(smb_domain, "domain")
+                    marked_hostname = (
+                        mark_sensitive(smb_hostname, "hostname")
+                        if smb_hostname
+                        else None
+                    )
+                    smb_line = (
+                        f"{marked_domain} (host: {marked_hostname})"
+                        if marked_hostname
+                        else marked_domain
+                    )
+                    print_panel(
+                        "[bold]Domain inferred from SMB fingerprinting.[/bold]\n\n"
+                        f"IP: {marked_ip}\n"
+                        f"SMB result: {smb_line}\n\n"
+                        "[bold]Next:[/bold] Validate the domain/PDC via DNS SRV.",
+                        title="[bold]🧩 Domain Inference (SMB)[/bold]",
+                        border_style="green",
+                        padding=(1, 2),
+                    )
+                    telemetry.capture(
+                        "domain_inference",
+                        properties={
+                            "mode": "unauth",
+                            "method": "smb",
+                            "result": "success",
+                            "interactive": bool(sys.stdin.isatty()),
+                        },
+                    )
+                    if sys.stdin.isatty():
+                        if Confirm.ask(
+                            Text(f"Use {marked_domain} and validate?", style="cyan"),
+                            default=True,
+                        ):
+                            domain = smb_domain
+                    else:
+                        domain = smb_domain
+
+            if not domain:
+                if not sys.stdin.isatty():
+                    print_error(
+                        "Domain inference failed and interactive input is not available. "
+                        "Provide the domain explicitly: `start_unauth <domain> <dc_ip>`."
+                    )
+                    return
+                print_info(
+                    "Could not infer the domain automatically; requesting input."
+                )
+                domain = (
+                    Prompt.ask(
+                        Text(
+                            "Enter the domain name (e.g., contoso.local)", style="cyan"
+                        )
+                    )
+                    .strip()
+                    .lower()
+                )
+            if not domain or "." not in domain:
+                print_error(
+                    "Domain must be a FQDN (e.g., contoso.local), not a NetBIOS name."
+                )
+                return
+
+        # Case: `start_unauth <domain> [dc_ip]`
+        if not is_first_ip:
+            domain = first.strip().lower()
+            if "." not in domain:
+                print_error(
+                    "Domain must be a FQDN (e.g., contoso.local), not a NetBIOS name."
+                )
+                return
+
+            candidate_ip = parts[1].strip() if len(parts) == 2 else None
+            if candidate_ip:
+                try:
+                    ipaddress.ip_address(candidate_ip)
+                except ValueError:
+                    print_error(
+                        f"Invalid DC/PDC IP address: {mark_sensitive(candidate_ip, 'ip')}"
+                    )
+                    return
+            else:
+                # Domain-only args: attempt to discover PDC via system DNS first.
+                pdc_ip, pdc_hostname = service.discover_pdc(domain=domain)
+                if pdc_ip:
+                    marked_pdc = mark_sensitive(pdc_ip, "ip")
+                    marked_domain = mark_sensitive(domain, "domain")
+                    marked_hostname = (
+                        mark_sensitive(pdc_hostname, "hostname")
+                        if pdc_hostname
+                        else None
+                    )
+                    discovered_line = (
+                        f"{marked_pdc} ({marked_hostname})"
+                        if marked_hostname
+                        else marked_pdc
+                    )
+                    print_panel(
+                        "[bold]PDC discovered via DNS SRV.[/bold]\n\n"
+                        f"Domain: {marked_domain}\n"
+                        f"PDC (DNS SRV): {discovered_line}\n",
+                        title="[bold]🧭 PDC Discovery[/bold]",
+                        border_style="green",
+                        padding=(1, 2),
+                    )
+                    if sys.stdin.isatty():
+                        if Confirm.ask(
+                            Text(
+                                f"Validate and use {marked_pdc} for this scan?",
+                                style="cyan",
+                            ),
+                            default=True,
+                        ):
+                            candidate_ip = pdc_ip
+                    else:
+                        candidate_ip = pdc_ip
+                if not candidate_ip:
+                    fallback_ip = offer_a_record_fallback(
+                        shell=shell,
+                        service=service,
+                        domain=domain,
+                        fallback_hint="use host-range discovery",
+                        confirm=False,
+                    )
+                    if fallback_ip:
+                        candidate_ip = fallback_ip
+
+            if not candidate_ip:
+                if not sys.stdin.isatty():
+                    print_error(
+                        "No DC/DNS IP provided and PDC discovery failed. Provide a DC IP: "
+                        "`start_unauth <domain> <dc_ip>`."
+                    )
+                    return
+                print_info("PDC discovery failed; please provide a DC/DNS IP.")
+                candidate_ip = Prompt.ask(
+                    Text(
+                        "Enter a DC/DNS IP address for this domain (e.g., 10.10.10.100)",
+                        style="cyan",
+                    )
+                ).strip()
+                try:
+                    ipaddress.ip_address(candidate_ip)
+                except ValueError:
+                    print_error(
+                        f"Invalid DC/DNS IP address: {mark_sensitive(candidate_ip, 'ip')}"
+                    )
+                    return
+
+        decision = preflight_domain_pdc(
+            shell,
+            domain=domain,
+            candidate_ip=candidate_ip,
+            interactive=bool(sys.stdin.isatty()),
+            mode_label="unauth",
+        )
+        if decision.action == "reenter":
+            validated = prompt_known_domain_and_pdc_interactive(
+                shell, mode_label="unauth"
+            )
+            if validated is None:
+                # Fall back to discovery flow.
+                args = None
+                known_domain = None
+                known_pdc_ip = None
+                skip_domain_discovery = False
+            else:
+                known_domain, known_pdc_ip = validated
+                skip_domain_discovery = True
+                shell.hosts = known_pdc_ip
+                shell.domains_data.setdefault(known_domain, {})["pdc"] = known_pdc_ip
+                if known_domain and known_pdc_ip:
+                    finalize_domain_context(
+                        shell,
+                        domain=known_domain,
+                        pdc_ip=known_pdc_ip,
+                        interactive=bool(sys.stdin.isatty()),
+                    )
+        elif decision.action == "fallback":
+            args = None
+            known_domain = None
+            known_pdc_ip = None
+            skip_domain_discovery = False
+        else:
+            known_domain, known_pdc_ip = decision.domain, decision.pdc_ip
+            skip_domain_discovery = True
+            if known_pdc_ip:
+                shell.hosts = known_pdc_ip
+                shell.domains_data.setdefault(known_domain, {})["pdc"] = known_pdc_ip
+                finalize_domain_context(
+                    shell,
+                    domain=known_domain,
+                    pdc_ip=known_pdc_ip,
+                    interactive=bool(sys.stdin.isatty()),
+                )
+
+        if not skip_domain_discovery:
+            # User opted to fall back to discovery mode, ignore the domain arg.
+            if not shell._prompt_hosts_if_missing():
+                return
+            _warn_if_single_discovery_target(shell.hosts)
+            target = shell.hosts
+            domain = None
+            known_domain = None
+            known_pdc_ip = None
+        else:
+            computers_file = os.path.join(
+                "domains",
+                known_domain or domain,
+                "enabled_computers_ips.txt",
+            )
+            if os.path.exists(computers_file) and os.path.getsize(computers_file) > 0:
+                target = computers_file
+            elif known_pdc_ip:
+                target = known_pdc_ip
+            else:
+                print_error(
+                    "Domain provided but no DC target is available. Provide a DC IP: "
+                    "`start_unauth <domain> <pdc_ip>` or use domain discovery mode."
+                )
+                return
+
+    else:
+        # Original behavior using shell.hosts
+        if skip_domain_discovery and known_domain:
+            if not known_pdc_ip:
+                print_error(
+                    "Direct domain enumeration requires a DC IP. Choose domain discovery "
+                    "or provide the PDC/DC IP when prompted."
+                )
+                return
+            target = known_pdc_ip
+            domain = known_domain
+        else:
+            if not shell._prompt_hosts_if_missing():
+                return
+            _warn_if_single_discovery_target(shell.hosts)
+
+            target = shell.hosts
+            domain = known_domain
+
+    interactive_mode = bool(sys.stdin.isatty())
+    if skip_domain_discovery and known_domain and known_pdc_ip:
+        if not _run_start_network_preflight(
+            shell,
+            mode_label="start_unauth (known domain)",
+            interface=getattr(shell, "interface", None),
+            interactive=interactive_mode,
+            target_ip=known_pdc_ip,
+            require_dc_ports=True,
+        ):
+            return
+    else:
+        if not _run_start_network_preflight(
+            shell,
+            mode_label="start_unauth (discovery)",
+            interface=getattr(shell, "interface", None),
+            interactive=interactive_mode,
+            hosts_expression=str(target),
+        ):
+            return
+
+    # Professional scan initialization header
+    from adscan_internal import print_operation_header
+
+    scan_details = {
+        "Scan Type": "Unauthenticated",
+        "Workspace Type": shell.type.upper() if shell.type else "N/A",
+        "Target": domain if domain else target,
+        "Auto Mode": "Enabled" if shell.auto else "Disabled",
+        "Interface": shell.interface,
+    }
+
+    if skip_domain_discovery and known_domain:
+        scan_details["Mode"] = "Direct Enumeration (Domain Known)"
+        if known_pdc_ip:
+            scan_details["PDC/DC"] = known_pdc_ip
+
+    print_operation_header(
+        "Starting Unauthenticated Scan", details=scan_details, icon="🚀"
+    )
+
+    # Mark scan mode for telemetry
+    shell.scan_mode = "unauth"
+    shell.domain_validated_cred_counts = {}
+    # Use a monotonic clock for scan timing so duration metrics are not
+    # affected if the system clock is adjusted during the scan.
+    shell.scan_start_time = time.monotonic()
+
+    # Reset scan-level metrics for case studies
+    # Note: Attack path metrics are computed from attack_graph.json at scan completion
+    shell._scan_first_credential_time = None
+    shell._scan_compromise_time = None
+
+    # If domain is known, skip service discovery and proceed directly
+    if skip_domain_discovery and known_domain:
+        # Add domain to shell.domains if not already there
+        if not hasattr(shell, "domains"):
+            shell.domains = []
+        if known_domain not in shell.domains:
+            shell.domains.append(known_domain)
+            shell.create_sub_workspace_for_domain(known_domain, known_pdc_ip)
+
+        # Check DNS for the known domain
+        if known_pdc_ip:
+            dns_ok = shell.do_check_dns(known_domain, known_pdc_ip)
+        else:
+            dns_ok = shell.do_check_dns(known_domain)
+        if not dns_ok:
+            from adscan_internal import print_warning
+
+            print_warning(
+                f"[bold]⚠️  DNS resolution issue for domain[/bold] {mark_sensitive(known_domain, 'domain')}\n"
+                "The scan will continue, but some enumeration may fail without proper DNS resolution."
+            )
+
+        if not _ensure_unauth_target_list(
+            shell,
+            domain=known_domain,
+            pdc_ip=known_pdc_ip,
+        ):
+            return
+
+        # Skip to enumeration for this domain
+        shell.workspace_save()
+        if not shell._is_ctf_domain_pwned(known_domain):
+            shell.ask_for_unauth_scan(known_domain)
+    else:
+        # Original flow: scan services to discover domains
+        # List of services to scan
+        # services = ['smb', 'rdp', 'winrm', 'mssql']
+        services = ["smb"]
+        # Telemetry: track unauthenticated scan start
+        lab_slug = shell._get_lab_slug()
+        properties = {
+            "type": shell.type,
+            "interface": shell.interface,
+            "auto": shell.auto,
+            "lab_slug": lab_slug,
+        }
+        properties["preflight_check_passed"] = bool(shell.preflight_check_passed)
+        properties["preflight_check_fix_attempted"] = bool(
+            shell.preflight_check_fix_attempted
+        )
+        properties["preflight_check_overridden"] = bool(
+            shell.preflight_check_overridden
+        )
+        # Add lab_provider and lab_name (if whitelisted) like in other events
+        if shell.lab_provider:
+            properties["lab_provider"] = shell.lab_provider
+        if shell.lab_name and shell.lab_name_whitelisted is True:
+            # Only send lab_name if it's explicitly whitelisted
+            properties["lab_name"] = shell.lab_name
+        # Add workspace_id_hash to count unique workspaces per user
+        # Hash combines TELEMETRY_ID + workspace_name for uniqueness across users
+        if shell.current_workspace:
+            import hashlib
+            from adscan_internal.telemetry import TELEMETRY_ID
+
+            workspace_unique_id = f"{TELEMETRY_ID}:{shell.current_workspace}"
+            properties["workspace_id_hash"] = hashlib.sha256(
+                workspace_unique_id.encode()
+            ).hexdigest()[:12]
+        telemetry.capture("start_unauth", properties)
+
+        # Scan each service sequentially
+        for service in services:
+            if service == "smb" and not domain:
+                from adscan_internal.cli.dns import (
+                    select_domain_from_rows,
+                    discover_domains_from_candidate_ips,
+                    preflight_domain_pdc_from_candidates,
+                )
+                from adscan_internal.cli.nmap import discover_dc_candidates_with_nmap
+
+                candidates = discover_dc_candidates_with_nmap(
+                    shell, hosts=target, ports=[88, 389, 53]
+                )
+                if not candidates:
+                    marked_target = mark_sensitive(str(target), "host")
+                    print_panel(
+                        "[bold]No Domain Controllers Found[/bold]\n\n"
+                        f"Scanned {marked_target} for AD core ports "
+                        "(Kerberos 88, LDAP 389, DNS 53) and found no likely DCs.\n\n"
+                        "[bold]Recommended next step:[/bold]\n"
+                        "• Try a broader or different range that includes DCs\n\n"
+                        "[bold]If you already know the domain + DC IP:[/bold]\n"
+                        "• Run [bold]start_unauth <domain> <dc_ip>[/bold]\n",
+                        title="[bold]⚠️  Domain Discovery[/bold]",
+                        border_style="yellow",
+                        padding=(1, 2),
+                    )
+                    continue
+
+                summaries = discover_domains_from_candidate_ips(
+                    shell, candidate_ips=candidates
+                )
+                if not summaries:
+                    print_warning(
+                        "No domains inferred from candidate DC/DNS IPs. "
+                        "Try a broader range or provide domain + DC IP."
+                    )
+                    continue
+
+                rows = [
+                    (summary.domain, len(summary.candidate_ips), summary.methods)
+                    for summary in summaries
+                ]
+                selected_domain = select_domain_from_rows(
+                    shell,
+                    rows=rows,
+                    prompt="Multiple domains discovered. Select one to proceed:",
+                    title="[bold]🧩 Domains Inferred[/bold]",
+                )
+                if not selected_domain:
+                    return
+                selected_summary = next(
+                    summary
+                    for summary in summaries
+                    if summary.domain == selected_domain
+                )
+
+                decision = preflight_domain_pdc_from_candidates(
+                    shell,
+                    domain=selected_summary.domain,
+                    candidate_ips=selected_summary.candidate_ips,
+                    interactive=bool(sys.stdin.isatty()),
+                    mode_label="unauth",
+                )
+                if decision.action != "use" or not decision.pdc_ip:
+                    if decision.action == "reenter":
+                        context = prompt_known_domain_and_pdc_interactive(
+                            shell, mode_label="unauth"
+                        )
+                        if context is None:
+                            return
+                        known_domain, known_pdc_ip = context
+                    else:
+                        return
+                else:
+                    known_domain, known_pdc_ip = decision.domain, decision.pdc_ip
+
+                if not hasattr(shell, "domains"):
+                    shell.domains = []
+                if known_domain not in shell.domains:
+                    shell.domains.append(known_domain)
+                    shell.create_sub_workspace_for_domain(known_domain, known_pdc_ip)
+
+                finalize_domain_context(
+                    shell,
+                    domain=known_domain,
+                    pdc_ip=known_pdc_ip,
+                    interactive=bool(sys.stdin.isatty()),
+                )
+                print_panel(
+                    "[bold]Discovery Summary[/bold]\n\n"
+                    f"Domain: {mark_sensitive(known_domain, 'domain')}\n"
+                    f"PDC/DC: {mark_sensitive(known_pdc_ip, 'ip')}\n"
+                    f"Candidates scanned: {len(selected_summary.candidate_ips)}\n\n"
+                    "[dim]Proceeding with unauthenticated enumeration.[/dim]",
+                    title="[bold]✅ Ready to Enumerate[/bold]",
+                    border_style="green",
+                    padding=(1, 2),
+                )
+
+                if not _ensure_unauth_target_list(
+                    shell,
+                    domain=known_domain,
+                    pdc_ip=known_pdc_ip,
+                ):
+                    return
+
+                shell.workspace_save()
+                if not shell._is_ctf_domain_pwned(known_domain):
+                    shell.ask_for_unauth_scan(known_domain)
+                continue
+
+            shell.scan_service(service, target, domain)
+
+
+def _prompt_auth_credentials_interactive(shell: Any) -> tuple[str, str] | None:
+    """Prompt for username + password/hash for an authenticated scan.
+
+    The user must provide both fields; otherwise, they should use `start_unauth`.
+
+    Returns:
+        (username, password_or_hash) or None if cancelled.
+    """
+    from rich.prompt import Confirm, Prompt
+    from rich.text import Text
+
+    while True:
+        print_panel(
+            "[bold]Credentials Required[/bold]\n\n"
+            "Authenticated scanning requires valid domain credentials.\n"
+            "If you don't have credentials, use [bold]start_unauth[/bold] instead.\n\n"
+            "[dim]Tip: you can paste an NTLM hash (LM:NT) as the credential value.[/dim]",
+            title="[bold]🔐 Credentials[/bold]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+
+        username = Prompt.ask(
+            Text("Enter the username (e.g., alice)", style="cyan"), default=""
+        ).strip()
+        if not username:
+            print_warning("Username cannot be empty. Please try again.")
+            continue
+
+        password = Prompt.ask(
+            Text("Enter the password or NTLM hash (visible input)", style="cyan"),
+            default="",
+        ).strip()
+        if not password:
+            print_warning("Password/hash cannot be empty. Please try again.")
+            continue
+
+        cred_type = "Hash" if shell.is_hash(password) else "Password"
+        print_panel(
+            "[bold]Credential Summary[/bold]\n\n"
+            f"Username: {mark_sensitive(username, 'user')}\n"
+            f"Credential Type: {cred_type}\n\n"
+            "[dim]Credentials will be verified against the target domain.[/dim]",
+            title="[bold]✅ Confirm Credentials[/bold]",
+            border_style="green",
+            padding=(1, 2),
+        )
+
+        if Confirm.ask(
+            Text("Proceed with these credentials?", style="cyan"), default=True
+        ):
+            return username, password
+
+        if not Confirm.ask(Text("Re-enter credentials?", style="cyan"), default=True):
+            return None
+
+
+def _start_auth_with_params(
+    shell: Any,
+    *,
+    domain: str,
+    pdc_ip: str,
+    username: str,
+    password: str,
+) -> None:
+    """Run the authenticated scan flow for validated parameters."""
+    interactive_mode = bool(sys.stdin.isatty())
+    if not _run_start_network_preflight(
+        shell,
+        mode_label="start_auth",
+        interface=getattr(shell, "interface", None),
+        interactive=interactive_mode,
+        target_ip=pdc_ip,
+        require_dc_ports=True,
+    ):
+        return
+
+    # Professional scan initialization header
+    from adscan_internal import print_operation_header
+
+    cred_type = "Hash" if shell.is_hash(password) else "Password"
+    print_operation_header(
+        "Starting Authenticated Scan",
+        details={
+            "Scan Type": "Authenticated",
+            "Workspace Type": shell.type.upper() if shell.type else "N/A",
+            "Domain": domain,
+            "PDC IP": pdc_ip,
+            "Username": username,
+            "Credential Type": cred_type,
+            "Auto Mode": "Enabled" if shell.auto else "Disabled",
+            "Interface": shell.interface,
+        },
+        icon="🔐",
+    )
+
+    if not shell.do_check_dns(domain, pdc_ip):
+        return
+
+    shell.scan_mode = "auth"
+    shell.domain_validated_cred_counts = {}
+    shell.scan_start_time = time.monotonic()
+
+    # Reset scan-level metrics for case studies
+    # Note: Attack path metrics are computed from attack_graph.json at scan completion
+    shell._scan_first_credential_time = None
+    shell._scan_compromise_time = None
+
+    lab_slug = shell._get_lab_slug()
+    properties = {
+        "type": shell.type,
+        "interface": shell.interface,
+        "auto": shell.auto,
+        "lab_slug": lab_slug,
+    }
+    properties["preflight_check_passed"] = bool(shell.preflight_check_passed)
+    properties["preflight_check_fix_attempted"] = bool(
+        shell.preflight_check_fix_attempted
+    )
+    properties["preflight_check_overridden"] = bool(shell.preflight_check_overridden)
+
+    if shell.lab_provider:
+        properties["lab_provider"] = shell.lab_provider
+    if shell.lab_name and shell.lab_name_whitelisted is True:
+        properties["lab_name"] = shell.lab_name
+
+    if shell.current_workspace:
+        import hashlib
+        from adscan_internal.telemetry import TELEMETRY_ID
+
+        workspace_unique_id = f"{TELEMETRY_ID}:{shell.current_workspace}"
+        properties["workspace_id_hash"] = hashlib.sha256(
+            workspace_unique_id.encode()
+        ).hexdigest()[:12]
+
+    telemetry.capture("start_auth", properties)
+    print_info_verbose(
+        f"Adding credential for domain {mark_sensitive(domain, 'domain')} "
+        f"with PDC IP {mark_sensitive(pdc_ip, 'ip')}"
+    )
+    shell.add_credential(domain, username, password, pdc_ip=pdc_ip)
+
+
+def run_start_auth(shell, args: str | None) -> None:
+    """Start authenticated scan using the legacy PentestShell implementation.
+
+    This helper mirrors :meth:`PentestShell.do_start_auth` while also supporting
+    a guided interactive mode when the user runs `start_auth` without arguments.
+    """
+    # Interactive configuration prompts
+    if not shell._prompt_type_if_missing():
+        return
+
+    if not shell._prompt_interface_if_missing():
+        return
+
+    if not shell._prompt_auto_if_missing():
+        return
+
+    # Ask if user wants to clean workspace before starting scan (only if needed)
+    _prompt_workspace_cleanup(shell)
+
+    args_list = (args or "").strip().split() if args else []
+    if args_list:
+        if len(args_list) != 4:
+            if not sys.stdin.isatty():
+                print_error(
+                    "You must provide: <domain> <pdc_ip> <username> <password_or_hash>."
+                )
+                print_info(
+                    "Usage: start_auth <domain> <pdc_ip> <username> <password_or_hash>"
+                )
+                return
+            # Interactive recovery for partial/mistyped args.
+            print_warning(
+                "Arguments were incomplete/invalid. Switching to guided setup..."
+            )
+        else:
+            domain, pdc_ip, username, password = args_list
+            decision = preflight_domain_pdc(
+                shell,
+                domain=domain,
+                candidate_ip=pdc_ip,
+                interactive=bool(sys.stdin.isatty()),
+                mode_label="auth",
+            )
+            if decision.action == "use" and decision.pdc_ip:
+                pdc_ip = decision.pdc_ip
+            elif decision.action in {"reenter", "fallback"} and sys.stdin.isatty():
+                print_panel(
+                    "[bold]The provided domain/DC target could not be validated.[/bold]\n\n"
+                    "We'll switch to guided target selection to ensure we use the correct DC/PDC.\n",
+                    title="[bold]🧭 Target Validation[/bold]",
+                    border_style="yellow",
+                    padding=(1, 2),
+                )
+                context = _domain_context_wizard_for_auth(shell)
+                if context is None:
+                    print_error(
+                        "A valid DC/PDC target is required for authenticated scanning."
+                    )
+                    return
+                domain, pdc_ip = context
+            finalize_domain_context(
+                shell,
+                domain=domain,
+                pdc_ip=pdc_ip,
+                interactive=bool(sys.stdin.isatty()),
+            )
+            _start_auth_with_params(
+                shell,
+                domain=domain,
+                pdc_ip=pdc_ip,
+                username=username,
+                password=password,
+            )
+            return
+
+    if not sys.stdin.isatty():
+        print_error("Interactive input is not available.")
+        print_info("Usage: start_auth <domain> <pdc_ip> <username> <password_or_hash>")
+        return
+
+    creds = _prompt_auth_credentials_interactive(shell)
+    if creds is None:
+        return
+    username, password = creds
+
+    print_panel(
+        "[bold]Domain Context[/bold]\n\n"
+        "To verify and use the credentials, we need the target domain and a reachable DC/PDC IP.\n"
+        "Provide whatever you know (domain, IP, or DC hostname) and we'll validate it.\n",
+        title="[bold]🎯 Target Context[/bold]",
+        border_style="blue",
+        padding=(1, 2),
+    )
+
+    from rich.prompt import Confirm
+    from rich.text import Text
+
+    while True:
+        context = _domain_context_wizard_for_auth(shell)
+        if context is not None:
+            domain, pdc_ip = context
+            finalize_domain_context(
+                shell,
+                domain=domain,
+                pdc_ip=pdc_ip,
+                interactive=True,
+            )
+            _start_auth_with_params(
+                shell,
+                domain=domain,
+                pdc_ip=pdc_ip,
+                username=username,
+                password=password,
+            )
+            return
+
+        print_panel(
+            "[bold]A DC/PDC target is required for authenticated scanning.[/bold]\n\n"
+            "If you don't know the domain and a reachable DC IP, you can switch to\n"
+            "[bold]start_unauth[/bold] to discover the domain first.\n",
+            title="[bold]🧭 Missing Target Information[/bold]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        if Confirm.ask(
+            Text("Switch to start_unauth instead?", style="cyan"),
+            default=False,
+        ):
+            run_start_unauth(shell, None)
+            return
+        if not Confirm.ask(
+            Text("Try entering the target context again?", style="cyan"), default=True
+        ):
+            return
