@@ -25,6 +25,7 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.rich_output import (
     print_exception,
 )
@@ -144,25 +145,24 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
 
                 # Telemetry: track when no delegations found
                 try:
-                    lab_slug = shell._get_lab_slug()
-                    telemetry.capture(
-                        "delegations_enumerated",
-                        {
-                            "total_delegations": 0,
-                            "unconstrained_count": 0,
-                            "constrained_count": 0,
-                            "constrained_protocol_transition_count": 0,
-                            "resource_based_constrained_count": 0,
-                            "unknown_count": 0,
-                            "scan_mode": getattr(shell, "scan_mode", None),
-                            "auth_type": shell.domains_data[domain].get(
-                                "auth", "unknown"
-                            ),
-                            "workspace_type": shell.type,
-                            "auto_mode": shell.auto,
-                            "lab_slug": lab_slug,
-                        },
+                    properties = {
+                        "total_delegations": 0,
+                        "unconstrained_count": 0,
+                        "constrained_count": 0,
+                        "constrained_protocol_transition_count": 0,
+                        "resource_based_constrained_count": 0,
+                        "unknown_count": 0,
+                        "scan_mode": getattr(shell, "scan_mode", None),
+                        "auth_type": shell.domains_data[domain].get(
+                            "auth", "unknown"
+                        ),
+                        "workspace_type": shell.type,
+                        "auto_mode": shell.auto,
+                    }
+                    properties.update(
+                        build_lab_event_fields(shell=shell, include_slug=True)
                     )
+                    telemetry.capture("delegations_enumerated", properties)
                 except Exception as e:
                     telemetry.capture_exception(e)
                 return
@@ -319,31 +319,28 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
 
                 # Telemetry: track delegation enumeration results
                 try:
-                    lab_slug = shell._get_lab_slug()
-                    telemetry.capture(
-                        "delegations_enumerated",
-                        {
-                            "total_delegations": total_delegations,
-                            "unconstrained_count": delegation_type_counts[
-                                "unconstrained"
-                            ],
-                            "constrained_count": delegation_type_counts["constrained"],
-                            "constrained_protocol_transition_count": delegation_type_counts[
-                                "constrained_protocol_transition"
-                            ],
-                            "resource_based_constrained_count": delegation_type_counts[
-                                "resource_based_constrained"
-                            ],
-                            "unknown_count": delegation_type_counts["unknown"],
-                            "scan_mode": getattr(shell, "scan_mode", None),
-                            "auth_type": shell.domains_data[domain].get(
-                                "auth", "unknown"
-                            ),
-                            "workspace_type": shell.type,
-                            "auto_mode": shell.auto,
-                            "lab_slug": lab_slug,
-                        },
+                    properties = {
+                        "total_delegations": total_delegations,
+                        "unconstrained_count": delegation_type_counts["unconstrained"],
+                        "constrained_count": delegation_type_counts["constrained"],
+                        "constrained_protocol_transition_count": delegation_type_counts[
+                            "constrained_protocol_transition"
+                        ],
+                        "resource_based_constrained_count": delegation_type_counts[
+                            "resource_based_constrained"
+                        ],
+                        "unknown_count": delegation_type_counts["unknown"],
+                        "scan_mode": getattr(shell, "scan_mode", None),
+                        "auth_type": shell.domains_data[domain].get(
+                            "auth", "unknown"
+                        ),
+                        "workspace_type": shell.type,
+                        "auto_mode": shell.auto,
+                    }
+                    properties.update(
+                        build_lab_event_fields(shell=shell, include_slug=True)
                     )
+                    telemetry.capture("delegations_enumerated", properties)
                 except Exception as e:
                     telemetry.capture_exception(e)
 
@@ -361,26 +358,25 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
 
                 # Telemetry: track when no delegations structure found
                 try:
-                    lab_slug = shell._get_lab_slug()
-                    telemetry.capture(
-                        "delegations_enumerated",
-                        {
-                            "total_delegations": 0,
-                            "unconstrained_count": 0,
-                            "constrained_count": 0,
-                            "constrained_protocol_transition_count": 0,
-                            "resource_based_constrained_count": 0,
-                            "unknown_count": 0,
-                            "error": "structure_not_found",
-                            "scan_mode": getattr(shell, "scan_mode", None),
-                            "auth_type": shell.domains_data[domain].get(
-                                "auth", "unknown"
-                            ),
-                            "workspace_type": shell.type,
-                            "auto_mode": shell.auto,
-                            "lab_slug": lab_slug,
-                        },
+                    properties = {
+                        "total_delegations": 0,
+                        "unconstrained_count": 0,
+                        "constrained_count": 0,
+                        "constrained_protocol_transition_count": 0,
+                        "resource_based_constrained_count": 0,
+                        "unknown_count": 0,
+                        "error": "structure_not_found",
+                        "scan_mode": getattr(shell, "scan_mode", None),
+                        "auth_type": shell.domains_data[domain].get(
+                            "auth", "unknown"
+                        ),
+                        "workspace_type": shell.type,
+                        "auto_mode": shell.auto,
+                    }
+                    properties.update(
+                        build_lab_event_fields(shell=shell, include_slug=True)
                     )
+                    telemetry.capture("delegations_enumerated", properties)
                 except Exception as exc:
                     telemetry.capture_exception(exc)
         else:
@@ -529,18 +525,15 @@ def exploit_delegation_constrained(
 
         # Telemetry: track delegation exploitation attempt
         try:
-            lab_slug = shell._get_lab_slug()
-            telemetry.capture(
-                "delegation_exploitation_started",
-                {
-                    "delegation_type": "constrained_protocol_transition",
-                    "scan_mode": getattr(shell, "scan_mode", None),
-                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                    "workspace_type": shell.type,
-                    "auto_mode": shell.auto,
-                    "lab_slug": lab_slug,
-                },
-            )
+            properties = {
+                "delegation_type": "constrained_protocol_transition",
+                "scan_mode": getattr(shell, "scan_mode", None),
+                "auth_type": shell.domains_data[domain].get("auth", "unknown"),
+                "workspace_type": shell.type,
+                "auto_mode": shell.auto,
+            }
+            properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+            telemetry.capture("delegation_exploitation_started", properties)
         except Exception as e:
             telemetry.capture_exception(e)
 
@@ -600,20 +593,17 @@ def execute_constrained(
 
             # Telemetry: track successful delegation exploitation
             try:
-                lab_slug = shell._get_lab_slug()
-                telemetry.capture(
-                    "delegation_exploitation_success",
-                    {
-                        "delegation_type": "constrained_protocol_transition",
-                        "ticket_obtained": ccache_file is not None,
-                        "target_is_dc": shell.is_computer_dc(domain, target_host),
-                        "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                        "workspace_type": shell.type,
-                        "auto_mode": shell.auto,
-                        "lab_slug": lab_slug,
-                    },
-                )
+                properties = {
+                    "delegation_type": "constrained_protocol_transition",
+                    "ticket_obtained": ccache_file is not None,
+                    "target_is_dc": shell.is_computer_dc(domain, target_host),
+                    "scan_mode": getattr(shell, "scan_mode", None),
+                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
+                    "workspace_type": shell.type,
+                    "auto_mode": shell.auto,
+                }
+                properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+                telemetry.capture("delegation_exploitation_success", properties)
             except Exception as e:
                 telemetry.capture_exception(e)
 
@@ -648,18 +638,15 @@ def execute_constrained(
 
             # Telemetry: track failed delegation exploitation
             try:
-                lab_slug = shell._get_lab_slug()
-                telemetry.capture(
-                    "delegation_exploitation_failed",
-                    {
-                        "delegation_type": "constrained_protocol_transition",
-                        "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                        "workspace_type": shell.type,
-                        "auto_mode": shell.auto,
-                        "lab_slug": lab_slug,
-                    },
-                )
+                properties = {
+                    "delegation_type": "constrained_protocol_transition",
+                    "scan_mode": getattr(shell, "scan_mode", None),
+                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
+                    "workspace_type": shell.type,
+                    "auto_mode": shell.auto,
+                }
+                properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+                telemetry.capture("delegation_exploitation_failed", properties)
             except Exception as e:
                 telemetry.capture_exception(e)
 
@@ -688,18 +675,15 @@ def exploit_delegation_rbcd(
     try:
         # Telemetry: track delegation exploitation attempt
         try:
-            lab_slug = shell._get_lab_slug()
-            telemetry.capture(
-                "delegation_exploitation_started",
-                {
-                    "delegation_type": "resource_based_constrained",
-                    "scan_mode": getattr(shell, "scan_mode", None),
-                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                    "workspace_type": shell.type,
-                    "auto_mode": shell.auto,
-                    "lab_slug": lab_slug,
-                },
-            )
+            properties = {
+                "delegation_type": "resource_based_constrained",
+                "scan_mode": getattr(shell, "scan_mode", None),
+                "auth_type": shell.domains_data[domain].get("auth", "unknown"),
+                "workspace_type": shell.type,
+                "auto_mode": shell.auto,
+            }
+            properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+            telemetry.capture("delegation_exploitation_started", properties)
         except Exception as e:
             telemetry.capture_exception(e)
 
@@ -754,33 +738,32 @@ def exploit_delegation_rbcd(
 
         # Telemetry: track exploitation result
         try:
-            lab_slug = shell._get_lab_slug()
             if success:
-                telemetry.capture(
-                    "delegation_exploitation_success",
-                    {
-                        "delegation_type": "resource_based_constrained",
-                        "used_new_computer": maq > 0,
-                        "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                        "workspace_type": shell.type,
-                        "auto_mode": shell.auto,
-                        "lab_slug": lab_slug,
-                    },
+                properties = {
+                    "delegation_type": "resource_based_constrained",
+                    "used_new_computer": maq > 0,
+                    "scan_mode": getattr(shell, "scan_mode", None),
+                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
+                    "workspace_type": shell.type,
+                    "auto_mode": shell.auto,
+                }
+                properties.update(
+                    build_lab_event_fields(shell=shell, include_slug=True)
                 )
+                telemetry.capture("delegation_exploitation_success", properties)
             else:
-                telemetry.capture(
-                    "delegation_exploitation_failed",
-                    {
-                        "delegation_type": "resource_based_constrained",
-                        "maq_available": maq > 0,
-                        "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                        "workspace_type": shell.type,
-                        "auto_mode": shell.auto,
-                        "lab_slug": lab_slug,
-                    },
+                properties = {
+                    "delegation_type": "resource_based_constrained",
+                    "maq_available": maq > 0,
+                    "scan_mode": getattr(shell, "scan_mode", None),
+                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
+                    "workspace_type": shell.type,
+                    "auto_mode": shell.auto,
+                }
+                properties.update(
+                    build_lab_event_fields(shell=shell, include_slug=True)
                 )
+                telemetry.capture("delegation_exploitation_failed", properties)
         except Exception as e:
             telemetry.capture_exception(e)
 
@@ -791,19 +774,16 @@ def exploit_delegation_rbcd(
 
         # Telemetry: track exception during exploitation
         try:
-            lab_slug = shell._get_lab_slug()
-            telemetry.capture(
-                "delegation_exploitation_failed",
-                {
-                    "delegation_type": "resource_based_constrained",
-                    "error": True,
-                    "scan_mode": getattr(shell, "scan_mode", None),
-                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                    "workspace_type": shell.type,
-                    "auto_mode": shell.auto,
-                    "lab_slug": lab_slug,
-                },
-            )
+            properties = {
+                "delegation_type": "resource_based_constrained",
+                "error": True,
+                "scan_mode": getattr(shell, "scan_mode", None),
+                "auth_type": shell.domains_data[domain].get("auth", "unknown"),
+                "workspace_type": shell.type,
+                "auto_mode": shell.auto,
+            }
+            properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+            telemetry.capture("delegation_exploitation_failed", properties)
         except Exception as e2:
             telemetry.capture_exception(e2)
 

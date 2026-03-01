@@ -31,7 +31,11 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import BRAND_COLORS, mark_sensitive, print_panel
-from adscan_internal.cli.cracking import handle_hash_cracking
+from adscan_internal.cli.common import build_lab_event_fields
+from adscan_internal.cli.cracking import (
+    handle_hash_cracking,
+    handle_hash_cracking_batch,
+)
 
 
 def show_creds(shell: Any) -> None:
@@ -504,6 +508,7 @@ def add_credential(
     credential_verified = False
     credential_source_verified = False
     credential_persisted = False
+    store_update_skipped = False
 
     import os
     import time
@@ -663,6 +668,7 @@ def add_credential(
                     "Current credential is the same as the new credential. Reusing existing."
                 )
                 skip_store_update = True
+        store_update_skipped = skip_store_update
         if is_hash and not user.endswith("$") and not skip_hash_cracking:
             cred, is_hash = handle_hash_cracking(shell, domain, user, cred)
 
@@ -748,24 +754,23 @@ def add_credential(
                         if host and service:
                             cred_source_hint = f"local_{service}"
 
-                        lab_slug = shell._get_lab_slug()
-                        telemetry.capture(
-                            "first_cred_found",
-                            {
-                                "scan_mode": shell.scan_mode,
-                                "duration_minutes": round((duration / 60.0), 2)
-                                if isinstance(duration, (int, float))
-                                else None,
-                                "type": getattr(shell, "type", None),
-                                "auto": getattr(shell, "auto", False),
-                                "is_hash": is_hash,
-                                "source_hint": cred_source_hint,
-                                "auth_type": shell.domains_data.get(domain, {}).get(
-                                    "auth", "unknown"
-                                ),
-                                "lab_slug": lab_slug,
-                            },
+                        properties = {
+                            "scan_mode": shell.scan_mode,
+                            "duration_minutes": round((duration / 60.0), 2)
+                            if isinstance(duration, (int, float))
+                            else None,
+                            "type": getattr(shell, "type", None),
+                            "auto": getattr(shell, "auto", False),
+                            "is_hash": is_hash,
+                            "source_hint": cred_source_hint,
+                            "auth_type": shell.domains_data.get(domain, {}).get(
+                                "auth", "unknown"
+                            ),
+                        }
+                        properties.update(
+                            build_lab_event_fields(shell=shell, include_slug=True)
                         )
+                        telemetry.capture("first_cred_found", properties)
                         # Track victory for session summary (Hormozi: Give:Ask ratio)
                         if hasattr(shell, "_session_victories"):
                             shell._session_victories.append("first_cred_found")
@@ -959,19 +964,97 @@ def add_credential(
                 prompt_for_user_privs_after=prompt_for_user_privs_after,
             )
 
-        elif not credential_persisted and not ui_silent:
+        elif not credential_persisted and not store_update_skipped and not ui_silent:
             # Handle empty or invalid credential (matches old behavior)
             marked_user = mark_sensitive(user, "user")
             marked_domain = mark_sensitive(domain, "domain")
             print_error(
                 f"Empty or invalid credential for '{marked_user}' in domain {marked_domain}"
             )
-        elif not credential_persisted:
+        elif not credential_persisted and not store_update_skipped:
             marked_user = mark_sensitive(user, "user")
             marked_domain = mark_sensitive(domain, "domain")
             print_info_verbose(
                 f"[ui_silent] Empty or invalid credential for '{marked_user}' in domain {marked_domain}"
             )
+
+
+def add_credentials_batch(
+    shell: Any,
+    *,
+    domain: str,
+    credentials: list[tuple[str, str]],
+    skip_hash_cracking: bool = False,
+    pdc_ip: str | None = None,
+    source_steps: list[object] | None = None,
+    prompt_for_user_privs_after: bool = True,
+    verify_credential: bool = True,
+    ui_silent: bool = False,
+    ensure_fresh_kerberos_ticket: bool = True,
+) -> list[tuple[str, str]]:
+    """Persist multiple domain credentials with optional batch hash cracking.
+
+    Args:
+        shell: The PentestShell instance with domains_data and related helpers.
+        domain: Target domain where credentials will be stored.
+        credentials: ``[(username, credential), ...]`` raw candidates.
+        skip_hash_cracking: When True, do not attempt weakpass cracking.
+        pdc_ip: Optional PDC IP used when creating domain sub-workspace.
+        source_steps: Optional provenance steps to attach to each credential.
+        prompt_for_user_privs_after: Forwarded to add_credential.
+        verify_credential: Forwarded to add_credential.
+        ui_silent: Forwarded to add_credential.
+        ensure_fresh_kerberos_ticket: Forwarded to add_credential.
+
+    Returns:
+        List of persisted candidates ``[(username, resolved_credential), ...]``.
+        The credential is a cracked plaintext when batch cracking succeeds.
+    """
+    prepared: list[tuple[str, str]] = []
+    for username, credential in credentials:
+        normalized_user = str(username or "").strip()
+        normalized_credential = str(credential or "").strip()
+        if not normalized_user or not normalized_credential:
+            continue
+        prepared.append((normalized_user, normalized_credential))
+
+    if not prepared:
+        return []
+
+    cracked_by_hash: dict[str, str] = {}
+    if not skip_hash_cracking:
+        hash_candidates = [
+            cred
+            for user, cred in prepared
+            if shell.is_hash(cred) and not str(user).strip().endswith("$")
+        ]
+        cracked_by_hash = handle_hash_cracking_batch(shell, hash_candidates)
+
+    resolved_credentials: list[tuple[str, str]] = []
+    for username, credential in prepared:
+        resolved_credential = credential
+        if not skip_hash_cracking and shell.is_hash(credential):
+            cracked_password = cracked_by_hash.get(credential.lower())
+            if cracked_password:
+                resolved_credential = cracked_password
+        resolved_credentials.append((username, resolved_credential))
+
+    for username, resolved_credential in resolved_credentials:
+        add_credential(
+            shell=shell,
+            domain=domain,
+            user=username,
+            cred=resolved_credential,
+            skip_hash_cracking=True,
+            pdc_ip=pdc_ip,
+            source_steps=source_steps,
+            prompt_for_user_privs_after=prompt_for_user_privs_after,
+            verify_credential=verify_credential,
+            ui_silent=ui_silent,
+            ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
+        )
+
+    return resolved_credentials
 
 
 def _verify_domain_credentials(

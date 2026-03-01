@@ -30,6 +30,7 @@ from adscan_internal.rich_output import mark_sensitive
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
 from adscan_internal.workspaces.subpaths import domain_relpath
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.cli.dns import (
     confirm_domain_pdc_mapping,
     finalize_domain_context,
@@ -1240,14 +1241,7 @@ def run_start_session(*, config: StartSessionConfig, deps: StartSessionDeps) -> 
         session_properties: dict[str, object] = {
             "$set": {"installation_status": "installed"}
         }
-        if getattr(shell, "lab_provider", None):
-            session_properties["lab_provider"] = shell.lab_provider
-        if getattr(shell, "lab_name", None) and shell.lab_name_whitelisted is True:
-            session_properties["lab_name"] = shell.lab_name
-        if getattr(shell, "lab_name", None) is not None:
-            session_properties["lab_name_whitelisted"] = (
-                shell.lab_name_whitelisted is True
-            )
+        session_properties.update(build_lab_event_fields(shell=shell, include_slug=False))
         session_properties["verbose_mode"] = config.verbose_mode
         session_properties["debug_mode"] = config.debug_mode
         session_properties["preflight_check_passed"] = bool(preflight_ok)
@@ -1795,13 +1789,12 @@ def run_start_unauth(shell, args: str | None) -> None:
         # services = ['smb', 'rdp', 'winrm', 'mssql']
         services = ["smb"]
         # Telemetry: track unauthenticated scan start
-        lab_slug = shell._get_lab_slug()
         properties = {
             "type": shell.type,
             "interface": shell.interface,
             "auto": shell.auto,
-            "lab_slug": lab_slug,
         }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
         properties["preflight_check_passed"] = bool(shell.preflight_check_passed)
         properties["preflight_check_fix_attempted"] = bool(
             shell.preflight_check_fix_attempted
@@ -1809,12 +1802,6 @@ def run_start_unauth(shell, args: str | None) -> None:
         properties["preflight_check_overridden"] = bool(
             shell.preflight_check_overridden
         )
-        # Add lab_provider and lab_name (if whitelisted) like in other events
-        if shell.lab_provider:
-            properties["lab_provider"] = shell.lab_provider
-        if shell.lab_name and shell.lab_name_whitelisted is True:
-            # Only send lab_name if it's explicitly whitelisted
-            properties["lab_name"] = shell.lab_name
         # Add workspace_id_hash to count unique workspaces per user
         # Hash combines TELEMETRY_ID + workspace_name for uniqueness across users
         if shell.current_workspace:
@@ -2050,23 +2037,17 @@ def _start_auth_with_params(
     shell._scan_first_credential_time = None
     shell._scan_compromise_time = None
 
-    lab_slug = shell._get_lab_slug()
     properties = {
         "type": shell.type,
         "interface": shell.interface,
         "auto": shell.auto,
-        "lab_slug": lab_slug,
     }
+    properties.update(build_lab_event_fields(shell=shell, include_slug=True))
     properties["preflight_check_passed"] = bool(shell.preflight_check_passed)
     properties["preflight_check_fix_attempted"] = bool(
         shell.preflight_check_fix_attempted
     )
     properties["preflight_check_overridden"] = bool(shell.preflight_check_overridden)
-
-    if shell.lab_provider:
-        properties["lab_provider"] = shell.lab_provider
-    if shell.lab_name and shell.lab_name_whitelisted is True:
-        properties["lab_name"] = shell.lab_name
 
     if shell.current_workspace:
         import hashlib

@@ -1240,27 +1240,25 @@ class BloodHoundCEClient(BloodHoundClient):
         try:
             depth = max(1, min(max_depth, 8))
             domain_value = domain.replace("'", "\\'")
+            source_domain_filter = self._build_domain_filter(
+                alias="u",
+                domain_value=domain_value,
+            )
+            source_enabled_filter = self._build_enabled_filter(
+                alias="u", default_true=True
+            )
+            source_high_value_filter = self._build_high_value_filter(alias="u")
+            target_high_value_filter = self._build_high_value_filter(alias="h")
+            intermediate_high_value_filter = self._build_high_value_filter(alias="n")
 
             cypher_query = f"""
             MATCH p=(u:User)-[*1..{depth}]->(h)
-            WHERE toLower(u.domain) = toLower('{domain_value}')
-              AND (u.enabled = true OR u.enabled IS NULL)
-              AND NOT (
-                coalesce(u.highvalue, false) = true
-                OR "admin_tier_0" IN coalesce(u.system_tags, [])
-                OR coalesce(u.isTierZero, false) = true
-              )
-              AND (
-                coalesce(h.highvalue, false) = true
-                OR "admin_tier_0" IN coalesce(h.system_tags, [])
-                OR coalesce(h.isTierZero, false) = true
-              )
+            WHERE {source_domain_filter}
+              AND {source_enabled_filter}
+              AND NOT {source_high_value_filter}
+              AND {target_high_value_filter}
             WITH p, nodes(p) AS ns, last(nodes(p)) AS lastNode
-            WHERE NONE(n IN ns WHERE n <> lastNode AND (
-              coalesce(n.highvalue, false) = true
-              OR "admin_tier_0" IN coalesce(n.system_tags, [])
-              OR coalesce(n.isTierZero, false) = true
-            ))
+            WHERE NONE(n IN ns WHERE n <> lastNode AND {intermediate_high_value_filter})
             RETURN p
             """
 
@@ -1270,6 +1268,66 @@ class BloodHoundCEClient(BloodHoundClient):
             return self._extract_paths_from_graph(graph_data, max_depth=depth)
         except Exception:
             return []
+
+    def _build_domain_filter(
+        self,
+        *,
+        alias: str,
+        domain_value: str,
+        match_domain_by_name_suffix: bool = False,
+    ) -> str:
+        """Return a Cypher domain predicate for the provided alias."""
+        if match_domain_by_name_suffix:
+            return (
+                f"toLower(coalesce({alias}.name, \"\")) "
+                f"ends with toLower('@{domain_value}')"
+            )
+        return f"toLower(coalesce({alias}.domain, \"\")) = toLower('{domain_value}')"
+
+    def _build_enabled_filter(self, *, alias: str, default_true: bool = True) -> str:
+        """Return a Cypher predicate for enabled principals."""
+        default_flag = "true" if default_true else "false"
+        return f"coalesce({alias}.enabled, {default_flag}) = true"
+
+    def _build_high_value_filter(self, *, alias: str) -> str:
+        """Return a Cypher predicate that identifies Tier Zero/high-value nodes."""
+        return (
+            "("
+            f"coalesce({alias}.highvalue, false) = true "
+            f'OR "admin_tier_0" IN coalesce({alias}.system_tags, []) '
+            f"OR coalesce({alias}.isTierZero, false) = true"
+            ")"
+        )
+
+    def _build_low_priv_source_filter(
+        self,
+        *,
+        source_alias: str,
+        domain_value: str,
+        match_domain_by_name_suffix: bool = False,
+    ) -> str:
+        """Return a reusable Cypher predicate for low-priv source principals.
+
+        This keeps low-priv filtering consistent across User/Group/Computer
+        sources so Tier Zero/high-value principals are excluded regardless of
+        source kind.
+        """
+        domain_predicate = self._build_domain_filter(
+            alias=source_alias,
+            domain_value=domain_value,
+            match_domain_by_name_suffix=match_domain_by_name_suffix,
+        )
+        enabled_predicate = self._build_enabled_filter(
+            alias=source_alias, default_true=True
+        )
+        high_value_predicate = self._build_high_value_filter(alias=source_alias)
+
+        return f"""
+              AND ({source_alias}:User OR {source_alias}:Group OR {source_alias}:Computer)
+              AND {domain_predicate}
+              AND {enabled_predicate}
+              AND NOT {high_value_predicate}
+        """
 
     def get_low_priv_acl_paths(
         self, domain: str, *, max_results: int = 1000
@@ -1302,17 +1360,16 @@ class BloodHoundCEClient(BloodHoundClient):
             }
             domain_value = domain.replace("'", "\\'")
             limit_value = max(1, min(int(max_results), 5000))
+            source_filter = self._build_low_priv_source_filter(
+                source_alias="s",
+                domain_value=domain_value,
+                match_domain_by_name_suffix=True,
+            )
 
             cypher_query = f"""
             MATCH p=(s)-[r]->(t)
-            WHERE (s:User OR s:Group OR s:Computer)
-              AND toLower(coalesce(s.name, "")) ends with toLower('@{domain_value}')
-              AND (coalesce(s.enabled, true) = true)
-              AND NOT (
-                coalesce(s.highvalue, false) = true
-                OR "admin_tier_0" IN coalesce(s.system_tags, [])
-                OR coalesce(s.isTierZero, false) = true
-              )
+            WHERE 1=1
+              {source_filter}
               AND type(r) IN {sorted(allowed_relations)!r}
             RETURN p
             LIMIT {limit_value}
@@ -1356,24 +1413,16 @@ class BloodHoundCEClient(BloodHoundClient):
             }
             domain_value = domain.replace("'", "\\'")
             limit_value = max(1, min(int(max_results), 5000))
+            source_filter = self._build_low_priv_source_filter(
+                source_alias="s",
+                domain_value=domain_value,
+            )
 
             cypher_query = f"""
             MATCH p=(s)-[r]->(t)
-            WHERE (s:User OR s:Group OR s:Computer)
-              AND toLower(coalesce(s.domain, "")) = toLower('{domain_value}')
+            WHERE 1=1
+              {source_filter}
               AND type(r) IN {sorted(allowed_relations)!r}
-              AND (
-                (s:Computer AND coalesce(s.enabled, true) = true)
-                OR (
-                  (s:User OR s:Group)
-                  AND (coalesce(s.enabled, true) = true)
-                  AND NOT (
-                    coalesce(s.highvalue, false) = true
-                    OR "admin_tier_0" IN coalesce(s.system_tags, [])
-                    OR coalesce(s.isTierZero, false) = true
-                  )
-                )
-              )
             RETURN p
             LIMIT {limit_value}
             """
@@ -1409,24 +1458,16 @@ class BloodHoundCEClient(BloodHoundClient):
             }
             domain_value = domain.replace("'", "\\'")
             limit_value = max(1, min(int(max_results), 5000))
+            source_filter = self._build_low_priv_source_filter(
+                source_alias="s",
+                domain_value=domain_value,
+            )
 
             cypher_query = f"""
             MATCH p=(s)-[r]->(t)
-            WHERE (s:User OR s:Group OR s:Computer)
-              AND toLower(coalesce(s.domain, "")) = toLower('{domain_value}')
+            WHERE 1=1
+              {source_filter}
               AND type(r) IN {sorted(allowed_relations)!r}
-              AND (
-                (s:Computer AND coalesce(s.enabled, true) = true)
-                OR (
-                  (s:User OR s:Group)
-                  AND (coalesce(s.enabled, true) = true)
-                  AND NOT (
-                    coalesce(s.highvalue, false) = true
-                    OR "admin_tier_0" IN coalesce(s.system_tags, [])
-                    OR coalesce(s.isTierZero, false) = true
-                  )
-                )
-              )
             RETURN p
             LIMIT {limit_value}
             """
@@ -1458,25 +1499,17 @@ class BloodHoundCEClient(BloodHoundClient):
             allowed_relations = {"AllowedToDelegate", "CoerceToTGT"}
             domain_value = domain.replace("'", "\\'")
             limit_value = max(1, min(int(max_results), 5000))
+            source_filter = self._build_low_priv_source_filter(
+                source_alias="s",
+                domain_value=domain_value,
+            )
 
             cypher_query = f"""
             MATCH p=(s)-[r]->(t)
-            WHERE (s:User OR s:Group OR s:Computer)
-              AND toLower(coalesce(s.domain, "")) = toLower('{domain_value}')
+            WHERE 1=1
+              {source_filter}
               AND type(r) IN {sorted(allowed_relations)!r}
               AND (t.enabled = true)
-              AND (
-                (s:Computer AND coalesce(s.enabled, true) = true)
-                OR (
-                  (s:User OR s:Group)
-                  AND (coalesce(s.enabled, true) = true)
-                  AND NOT (
-                    coalesce(s.highvalue, false) = true
-                    OR "admin_tier_0" IN coalesce(s.system_tags, [])
-                    OR coalesce(s.isTierZero, false) = true
-                  )
-                )
-              )
             RETURN p
             LIMIT {limit_value}
             """

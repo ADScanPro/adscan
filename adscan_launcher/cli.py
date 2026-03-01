@@ -17,11 +17,18 @@ Any other arguments are passed through to the container.
 from __future__ import annotations
 
 import argparse
+import re
+from io import StringIO
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
+from rich.console import Console
+
+from adscan_core.interrupts import emit_interrupt_debug
+from adscan_core.theme import ADSCAN_THEME
 from adscan_launcher import __version__
 from adscan_launcher.docker_commands import (
     DEFAULT_BLOODHOUND_ADMIN_PASSWORD,
@@ -50,7 +57,11 @@ from adscan_launcher.output import (
     set_output_config,
 )
 from adscan_launcher.paths import get_state_dir
-from adscan_launcher.telemetry import capture_exception
+from adscan_launcher.telemetry import (
+    HOST_SESSION_CAPTURE_COMMANDS,
+    capture_command_session,
+    capture_exception,
+)
 from adscan_launcher.update_manager import (
     UpdateContext,
     offer_updates_for_command,
@@ -59,6 +70,7 @@ from adscan_launcher.update_manager import (
 
 
 ADSCAN_SUDO_ALIAS_MARKER = "# ADscan auto-sudo alias"
+_SESSION_CAPTURE_FINALIZED = False
 
 
 def _remove_legacy_adscan_sudo_alias(rcfile: str) -> bool:
@@ -133,7 +145,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--channel",
         choices=["stable", "dev"],
         default=None,
-        help="Shortcut to select the stable/dev image channel (overrides env ADSCAN_DOCKER_CHANNEL).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--verbose",
@@ -148,7 +160,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dev",
         action="store_true",
-        help="Use the development Docker image channel.",
+        help=argparse.SUPPRESS,
     )
 
     sub = parser.add_subparsers(dest="command", required=False)
@@ -315,6 +327,71 @@ def _should_print_debug_enabled_banner(command: str | None) -> bool:
     return command in (None, "start", "ci", "install", "check")
 
 
+def _build_launcher_telemetry_console() -> Console:
+    """Create a dedicated in-memory Rich console for session recording export."""
+    return Console(record=True, theme=ADSCAN_THEME, file=StringIO())
+
+
+def _capture_launcher_command_session(
+    *,
+    command_type: str,
+    telemetry_console: Console,
+    success: bool | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Capture host-side command session exactly once for launcher-owned commands."""
+    global _SESSION_CAPTURE_FINALIZED
+    if _SESSION_CAPTURE_FINALIZED:
+        return
+
+    capture_command_session(
+        console=telemetry_console,
+        command_type=command_type,
+        success=success,
+        extra=extra,
+        allowed_commands=set(HOST_SESSION_CAPTURE_COMMANDS),
+    )
+    _SESSION_CAPTURE_FINALIZED = True
+
+
+def _run_host_command_with_session_capture(
+    *,
+    command_type: str,
+    telemetry_console: Console,
+    runner: Callable[[], bool],
+    extra: dict[str, Any] | None = None,
+) -> int:
+    """Execute a launcher-owned command and always finalize its session capture."""
+    success = False
+    try:
+        success = bool(runner())
+        return 0 if success else 1
+    except KeyboardInterrupt:
+        _log_launcher_interrupt(
+            kind="keyboard_interrupt",
+            source=f"launcher.host_command:{command_type}",
+        )
+        return 130
+    except EOFError:
+        _log_launcher_interrupt(
+            kind="eof",
+            source=f"launcher.host_command:{command_type}",
+        )
+        return 130
+    finally:
+        _capture_launcher_command_session(
+            command_type=command_type,
+            telemetry_console=telemetry_console,
+            success=success,
+            extra=extra,
+        )
+
+
+def _log_launcher_interrupt(*, kind: str, source: str) -> None:
+    """Emit a standardized debug line for launcher interrupt events."""
+    emit_interrupt_debug(kind=kind, source=source, print_debug=print_info_debug)
+
+
 def _detect_installer_for_launcher() -> str:
     """Best-effort detection for whether `adscan` is installed via pipx or pip."""
     try:
@@ -343,6 +420,16 @@ def _run_pip_install_with_break_system_packages_retry(
     prefer_break_system_packages: bool,
 ) -> None:
     """Run pip install and retry with --break-system-packages when needed."""
+    def _requires_break_system_packages(output: str) -> bool:
+        """Return True when pip output indicates a PEP 668 managed env error."""
+        normalized = (output or "").lower()
+        # pip errors vary across distros/versions:
+        # - "externally managed environment"
+        # - "externally-managed-environment"
+        return bool(
+            re.search(r"externally[-\\s]+managed[-\\s]+environment", normalized)
+        )
+
     base_cmd = [python_executable, "-m", "pip", "install"] + list(args)
     proc = subprocess.run(  # noqa: S603
         base_cmd, check=False, capture_output=True, text=True, env=env
@@ -351,7 +438,7 @@ def _run_pip_install_with_break_system_packages_retry(
         return
 
     combined = (proc.stderr or "") + "\n" + (proc.stdout or "")
-    needs_break = "externally managed environment" in combined.lower()
+    needs_break = _requires_break_system_packages(combined)
     if prefer_break_system_packages and needs_break:
         retry_cmd = base_cmd + ["--break-system-packages"]
         proc2 = subprocess.run(  # noqa: S603
@@ -396,6 +483,8 @@ def _build_update_context_for_launcher(
 
 
 def main(argv: list[str] | None = None) -> None:
+    global _SESSION_CAPTURE_FINALIZED
+    _SESSION_CAPTURE_FINALIZED = False
     _cleanup_legacy_sudo_alias()
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
@@ -417,9 +506,11 @@ def main(argv: list[str] | None = None) -> None:
         parser.print_help()
         raise SystemExit(0)
 
+    telemetry_console = _build_launcher_telemetry_console()
     set_output_config(
         verbose=bool(getattr(ns, "verbose", False)),
         debug=bool(getattr(ns, "debug", False)),
+        telemetry_console=telemetry_console,
     )
     if bool(getattr(ns, "debug", False)) and _should_print_debug_enabled_banner(
         "version" if show_version else cmd
@@ -446,42 +537,86 @@ def main(argv: list[str] | None = None) -> None:
     cmd_for_update_offer = cmd or "start"
     pull_timeout_raw = getattr(ns, "pull_timeout", 3600)
     pull_timeout_norm = normalize_pull_timeout_seconds(int(pull_timeout_raw))
-    offer_updates_for_command(
-        _build_update_context_for_launcher(
-            docker_pull_timeout_seconds=pull_timeout_norm
-        ),
-        cmd_for_update_offer,
-    )
+    try:
+        offer_updates_for_command(
+            _build_update_context_for_launcher(
+                docker_pull_timeout_seconds=pull_timeout_norm
+            ),
+            cmd_for_update_offer,
+        )
+    except KeyboardInterrupt:
+        _log_launcher_interrupt(
+            kind="keyboard_interrupt",
+            source="launcher.offer_updates",
+        )
+        raise SystemExit(130)
+    except EOFError:
+        _log_launcher_interrupt(
+            kind="eof",
+            source="launcher.offer_updates",
+        )
+        raise SystemExit(130)
 
     if cmd == "start":
         pull_timeout = getattr(ns, "pull_timeout", 3600)
-        rc = handle_start_docker(
-            verbose=bool(getattr(ns, "verbose", False)),
-            debug=bool(getattr(ns, "debug", False)),
-            pull_timeout_seconds=int(pull_timeout),
-        )
+        try:
+            rc = handle_start_docker(
+                verbose=bool(getattr(ns, "verbose", False)),
+                debug=bool(getattr(ns, "debug", False)),
+                pull_timeout_seconds=int(pull_timeout),
+            )
+        except KeyboardInterrupt:
+            _log_launcher_interrupt(
+                kind="keyboard_interrupt",
+                source="launcher.start",
+            )
+            rc = 130
+        except EOFError:
+            _log_launcher_interrupt(
+                kind="eof",
+                source="launcher.start",
+            )
+            rc = 130
         raise SystemExit(rc)
 
     if cmd == "install":
-        ok = handle_install_docker(
-            bloodhound_admin_password=str(ns.bloodhound_admin_password),
-            suppress_bloodhound_browser=bool(ns.no_browser),
-            pull_timeout_seconds=int(ns.pull_timeout),
+        raise SystemExit(
+            _run_host_command_with_session_capture(
+                command_type="install",
+                telemetry_console=telemetry_console,
+                runner=lambda: handle_install_docker(
+                    bloodhound_admin_password=str(ns.bloodhound_admin_password),
+                    suppress_bloodhound_browser=bool(ns.no_browser),
+                    pull_timeout_seconds=int(ns.pull_timeout),
+                ),
+                extra={"mode": "docker"},
+            )
         )
-        raise SystemExit(0 if ok else 1)
 
     if cmd == "check":
-        ok = handle_check_docker()
-        raise SystemExit(0 if ok else 1)
+        raise SystemExit(
+            _run_host_command_with_session_capture(
+                command_type="check",
+                telemetry_console=telemetry_console,
+                runner=handle_check_docker,
+                extra={"mode": "docker"},
+            )
+        )
 
     if cmd in ("update", "upgrade"):
         pull_timeout_norm = normalize_pull_timeout_seconds(int(ns.pull_timeout))
-        ok = run_update_command(
-            _build_update_context_for_launcher(
-                docker_pull_timeout_seconds=pull_timeout_norm
+        raise SystemExit(
+            _run_host_command_with_session_capture(
+                command_type=str(cmd),
+                telemetry_console=telemetry_console,
+                runner=lambda: run_update_command(
+                    _build_update_context_for_launcher(
+                        docker_pull_timeout_seconds=pull_timeout_norm
+                    )
+                ),
+                extra={"mode": "docker"},
             )
         )
-        raise SystemExit(0 if ok else 1)
 
     if cmd == "ci":
         # Pass-through execution inside the container, but still do Docker-mode preflight.
@@ -489,12 +624,25 @@ def main(argv: list[str] | None = None) -> None:
         # argparse.REMAINDER keeps leading --, but may start with a "--" separator.
         if passthrough and passthrough[0] == "--":
             passthrough = passthrough[1:]
-        rc = run_adscan_passthrough_docker(
-            adscan_args=["ci"] + passthrough,
-            verbose=bool(getattr(ns, "verbose", False)),
-            debug=bool(getattr(ns, "debug", False)),
-            pull_timeout_seconds=int(ns.pull_timeout),
-        )
+        try:
+            rc = run_adscan_passthrough_docker(
+                adscan_args=["ci"] + passthrough,
+                verbose=bool(getattr(ns, "verbose", False)),
+                debug=bool(getattr(ns, "debug", False)),
+                pull_timeout_seconds=int(ns.pull_timeout),
+            )
+        except KeyboardInterrupt:
+            _log_launcher_interrupt(
+                kind="keyboard_interrupt",
+                source="launcher.ci_passthrough",
+            )
+            rc = 130
+        except EOFError:
+            _log_launcher_interrupt(
+                kind="eof",
+                source="launcher.ci_passthrough",
+            )
+            rc = 130
         raise SystemExit(rc)
 
     # Anything else: pass through to the container.
@@ -508,10 +656,23 @@ def main(argv: list[str] | None = None) -> None:
         print_instruction("Try: adscan --help")
         raise SystemExit(2)
 
-    rc = run_adscan_passthrough_docker(
-        adscan_args=adscan_args,
-        verbose=bool(getattr(ns, "verbose", False)),
-        debug=bool(getattr(ns, "debug", False)),
-        pull_timeout_seconds=3600,
-    )
+    try:
+        rc = run_adscan_passthrough_docker(
+            adscan_args=adscan_args,
+            verbose=bool(getattr(ns, "verbose", False)),
+            debug=bool(getattr(ns, "debug", False)),
+            pull_timeout_seconds=3600,
+        )
+    except KeyboardInterrupt:
+        _log_launcher_interrupt(
+            kind="keyboard_interrupt",
+            source="launcher.generic_passthrough",
+        )
+        rc = 130
+    except EOFError:
+        _log_launcher_interrupt(
+            kind="eof",
+            source="launcher.generic_passthrough",
+        )
+        rc = 130
     raise SystemExit(rc)

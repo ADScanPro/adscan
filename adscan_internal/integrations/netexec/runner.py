@@ -32,6 +32,12 @@ from adscan_internal.text_utils import normalize_cli_output
 ExecutionResult = subprocess.CompletedProcess[str]
 
 
+def _is_netexec_autoquote_enabled() -> bool:
+    """Return whether NetExec path-like argument auto-quoting is enabled."""
+    value = os.getenv("ADSCAN_NETEXEC_AUTOQUOTE", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def _quote_path_like_netexec_args(command: str) -> str:
     """Quote known NetExec file path args when they arrive unquoted.
 
@@ -45,7 +51,7 @@ def _quote_path_like_netexec_args(command: str) -> str:
         pattern = re.compile(
             rf"({re.escape(flag)}\s+)"
             r"(?P<value>(?:\"[^\"]*\"|'[^']*'|[^|]+?))"
-            r"(?=(?:\s--[A-Za-z0-9][A-Za-z0-9-]*|\s\||$))"
+            r"(?=(?:\s--[A-Za-z0-9][A-Za-z0-9-]*|\s-[A-Za-z0-9](?=\s|$)|\s\|\||\s&&|\s[|;]|\s\d?>>?|\s>>?|\s\||$))"
         )
 
         def _replace(match: re.Match[str]) -> str:
@@ -119,7 +125,12 @@ class NetExecRunner:
         """
         # Never pass invisible sensitive markers to external binaries.
         command = strip_sensitive_markers(command)
-        command = _quote_path_like_netexec_args(command)
+        if _is_netexec_autoquote_enabled():
+            command = _quote_path_like_netexec_args(command)
+        else:
+            print_info_debug(
+                "[netexec] Auto-quoting disabled by ADSCAN_NETEXEC_AUTOQUOTE."
+            )
 
         # Log the NetExec command about to be executed (sanitized).
         try:

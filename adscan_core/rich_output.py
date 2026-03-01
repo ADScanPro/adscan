@@ -61,7 +61,7 @@ Examples:
     )
 """
 
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Callable
 import logging
 import os
 import sys
@@ -538,7 +538,9 @@ def get_console() -> Console:
     return _get_console()
 
 
-def set_output_config(*, verbose: bool, debug: bool) -> None:
+def set_output_config(
+    *, verbose: bool, debug: bool, telemetry_console: Optional[Console] = None
+) -> None:
     """Configure shared Rich output + logging modes.
 
     This is the canonical setup path for both launcher and runtime callers.
@@ -557,6 +559,7 @@ def set_output_config(*, verbose: bool, debug: bool) -> None:
         verbose_mode=verbose,
         debug_mode=debug,
         secret_mode=secret_mode,
+        telemetry_console=telemetry_console,
     )
     init_rich_output(
         console,
@@ -565,6 +568,8 @@ def set_output_config(*, verbose: bool, debug: bool) -> None:
         secret_mode=secret_mode,
         logger=logger,
     )
+    if telemetry_console is not None:
+        set_telemetry_console(telemetry_console)
     update_modes(verbose_mode=verbose, debug_mode=debug, secret_mode=secret_mode)
 
 
@@ -4274,13 +4279,9 @@ def print_attack_paths_summary(
     table.add_column("Affected", style="white", no_wrap=False, width=10)
     table.add_column("Status", style="magenta", no_wrap=False, width=10)
     table.add_column("Len", justify="right", width=4)
+    format_node_label, format_relation_label = _get_attack_path_narrative_formatters()
 
     def _format_inline_chain(nodes: list[object], rels: list[object]) -> Text:
-        from adscan_internal.reporting.attack_path_narratives import (
-            format_node_label,
-            format_relation_label,
-        )
-
         if not nodes:
             return Text("N/A")
         chain = Text()
@@ -4344,6 +4345,68 @@ def print_attack_paths_summary(
         table.add_row(*row)
 
     print_table(table, spacing="both")
+
+
+_ATTACK_PATH_NARRATIVE_FALLBACK_LOGGED = False
+
+
+def _fallback_format_attack_path_node_label(label: str, domain: str) -> str:
+    """Best-effort node label formatter when reporting narratives are unavailable."""
+    value = str(label or "").strip()
+    if not value:
+        return "N/A"
+
+    if "\\" in value:
+        value = value.split("\\", 1)[1].strip()
+
+    if "@" in value:
+        left, _, right = value.partition("@")
+        if right and right.strip().lower() == str(domain or "").strip().lower():
+            return left.strip() or value
+
+    return value
+
+
+def _fallback_format_attack_path_relation_label(relation: str) -> str:
+    """Best-effort relation formatter when reporting narratives are unavailable."""
+    import re
+
+    value = str(relation or "").strip()
+    if not value:
+        return "N/A"
+    value = value.replace("_", " ")
+    value = re.sub(r"([a-z])([A-Z])", r"\1 \2", value)
+    return value
+
+
+def _get_attack_path_narrative_formatters(
+) -> tuple[Callable[[str, str], str], Callable[[str], str]]:
+    """Resolve attack-path label formatters with a LITE-safe fallback."""
+    global _ATTACK_PATH_NARRATIVE_FALLBACK_LOGGED
+    try:
+        import importlib
+
+        module = importlib.import_module(
+            "adscan_internal.reporting.attack_path_narratives"
+        )
+        format_node_label = getattr(module, "format_node_label", None)
+        format_relation_label = getattr(module, "format_relation_label", None)
+        if callable(format_node_label) and callable(format_relation_label):
+            return format_node_label, format_relation_label
+        raise AttributeError(
+            "attack_path_narratives module missing required formatter callables"
+        )
+    except Exception as exc:  # pragma: no cover - depends on runtime packaging
+        if not _ATTACK_PATH_NARRATIVE_FALLBACK_LOGGED:
+            _ATTACK_PATH_NARRATIVE_FALLBACK_LOGGED = True
+            print_info_debug(
+                "Attack-path narrative formatter unavailable; using built-in fallback "
+                f"(reason: {exc})"
+            )
+        return (
+            _fallback_format_attack_path_node_label,
+            _fallback_format_attack_path_relation_label,
+        )
 
 
 def print_attack_path_detail(

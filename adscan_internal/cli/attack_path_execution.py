@@ -81,6 +81,189 @@ def _normalize_account(value: str) -> str:
     return name.strip().lower()
 
 
+def _env_flag_enabled(name: str) -> bool:
+    """Return True when an environment flag is enabled."""
+    return str(os.getenv(name, "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _choose_custom_attack_path_start_step(
+    shell: Any,
+    *,
+    steps: list[dict[str, Any]],
+    executable_indices: list[int],
+    default_step_idx: int,
+) -> int | None:
+    """Let the operator choose a custom executable step index."""
+    if not hasattr(shell, "_questionary_select"):
+        return default_step_idx
+
+    options: list[str] = []
+    default_option_idx = 0
+    for option_idx, step_idx in enumerate(executable_indices):
+        step_item = steps[step_idx - 1] if step_idx - 1 < len(steps) else {}
+        action = str(step_item.get("action") or "N/A").strip() or "N/A"
+        status = str(step_item.get("status") or "discovered").strip().lower()
+        from_label = (
+            str(
+                (step_item.get("details") or {}).get("from")
+                if isinstance(step_item.get("details"), dict)
+                else ""
+            ).strip()
+            or "?"
+        )
+        to_label = (
+            str(
+                (step_item.get("details") or {}).get("to")
+                if isinstance(step_item.get("details"), dict)
+                else ""
+            ).strip()
+            or "?"
+        )
+        options.append(
+            f"Step #{step_idx}: {action} [{status}] {from_label} -> {to_label}"
+        )
+        if step_idx == default_step_idx:
+            default_option_idx = option_idx
+    options.append("Cancel execution")
+
+    selection = shell._questionary_select(
+        "Choose a custom start step:",
+        options,
+        default_idx=default_option_idx,
+    )
+    if selection is None:
+        return None
+    if selection >= len(executable_indices):
+        return None
+    return executable_indices[selection]
+
+
+def _resolve_attack_path_start_step(
+    shell: Any,
+    *,
+    steps: list[dict[str, Any]],
+    executable_indices: list[int],
+    non_executable_actions: set[str],
+    dangerous_actions: set[str],
+) -> int | None:
+    """Return selected start step index for attack path execution."""
+    if not executable_indices:
+        return None
+
+    first_executable_idx = executable_indices[0]
+    rerun_success_steps = _env_flag_enabled("ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS")
+    if rerun_success_steps:
+        print_info_verbose(
+            "ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS enabled: re-running from step #1."
+        )
+        return first_executable_idx
+
+    first_pending_idx: int | None = None
+    completed_steps = 0
+    for step_idx, step_item in enumerate(steps, start=1):
+        if not isinstance(step_item, dict):
+            continue
+        step_action = str(step_item.get("action") or "").strip().lower()
+        if step_action in non_executable_actions:
+            continue
+        if step_action in dangerous_actions:
+            continue
+        step_status = str(step_item.get("status") or "discovered").strip().lower()
+        if step_status == "success":
+            completed_steps += 1
+            continue
+        first_pending_idx = step_idx
+        break
+
+    default_start_idx = first_pending_idx or first_executable_idx
+    non_interactive = is_non_interactive(shell)
+
+    # If no pending steps, default to not re-execute unless explicitly requested.
+    if first_pending_idx is None:
+        if non_interactive:
+            return None
+        if not hasattr(shell, "_questionary_select"):
+            print_info(
+                "All executable steps in this attack path are already marked as success."
+            )
+            print_info_verbose(
+                "Set ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS=1 to force re-execution "
+                "from the first step."
+            )
+            return None
+
+        options = [
+            "Skip execution (Recommended)",
+            f"Re-run from step #{first_executable_idx}",
+            "Choose custom start step",
+        ]
+        choice = shell._questionary_select(
+            "All executable steps are already successful. What do you want to do?",
+            options,
+            default_idx=0,
+        )
+        if choice is None or choice == 0:
+            return None
+        if choice == 1:
+            return first_executable_idx
+        if choice == 2:
+            return _choose_custom_attack_path_start_step(
+                shell,
+                steps=steps,
+                executable_indices=executable_indices,
+                default_step_idx=first_executable_idx,
+            )
+        return None
+
+    if completed_steps <= 0:
+        return default_start_idx
+    if non_interactive:
+        return default_start_idx
+
+    if not hasattr(shell, "_questionary_select"):
+        print_info(
+            f"Resuming from step #{default_start_idx} (first non-success step)."
+        )
+        print_info_verbose(
+            f"Skipping {completed_steps} previously successful step(s)."
+        )
+        return default_start_idx
+
+    options = [
+        f"Resume from step #{default_start_idx} (Recommended)",
+        f"Re-run from step #{first_executable_idx}",
+        "Choose custom start step",
+        "Cancel execution",
+    ]
+    choice = shell._questionary_select(
+        "This path is partially executed. Choose how to continue:",
+        options,
+        default_idx=0,
+    )
+    if choice is None or choice >= len(options) - 1:
+        return None
+    if choice == 0:
+        print_info(
+            f"Resuming from step #{default_start_idx} (first non-success step)."
+        )
+        return default_start_idx
+    if choice == 1:
+        return first_executable_idx
+    if choice == 2:
+        return _choose_custom_attack_path_start_step(
+            shell,
+            steps=steps,
+            executable_indices=executable_indices,
+            default_step_idx=default_start_idx,
+        )
+    return None
+
+
 def _extract_cert_template_name_from_label(
     *,
     domain: str,
@@ -452,6 +635,69 @@ def _resolve_execution_user(
     return None
 
 
+def _resolve_golden_cert_execution_user(
+    shell: Any,
+    *,
+    domain: str,
+    context_username: str | None,
+    summary: dict[str, object],
+    from_label: str | None,
+) -> str | None:
+    """Resolve execution user for GoldenCert, preferring CA machine account creds."""
+    domains_data = getattr(shell, "domains_data", None)
+    domain_data = (
+        domains_data.get(domain)
+        if isinstance(domains_data, dict) and isinstance(domains_data.get(domain), dict)
+        else {}
+    )
+    creds = domain_data.get("credentials") if isinstance(domain_data, dict) else {}
+    if isinstance(creds, dict) and creds:
+        from_user = _normalize_account(from_label or "")
+        cred_keys = {str(k).lower(): str(k) for k in creds.keys()}
+        if from_user.endswith("$") and from_user in cred_keys:
+            selected = cred_keys[from_user]
+            print_info_debug(
+                "[goldencert] Using CA machine credential from step source: "
+                f"{mark_sensitive(selected, 'user')}"
+            )
+            return selected
+
+    return _resolve_execution_user(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+    )
+
+
+def _resolve_golden_cert_target_host(
+    shell: Any,
+    *,
+    domain: str,
+    from_label: str | None,
+    domain_data: dict[str, Any],
+) -> str | None:
+    """Resolve target CA host for GoldenCert."""
+    if from_label:
+        resolved = resolve_netexec_target_for_node_label(
+            shell,
+            domain,
+            node_label=from_label,
+        )
+        if isinstance(resolved, str) and resolved.strip():
+            return resolved.strip()
+
+    adcs_host = domain_data.get("adcs")
+    if isinstance(adcs_host, str) and adcs_host.strip():
+        return adcs_host.strip()
+
+    pdc_host = domain_data.get("pdc_hostname")
+    if isinstance(pdc_host, str) and pdc_host.strip():
+        return pdc_host.strip()
+    return None
+
+
 def _sorted_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
     status_order = {
         "theoretical": 0,
@@ -501,6 +747,144 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     if not isinstance(value, str) or not value:
         return None
     return value
+
+
+def _find_next_step_by_action(
+    steps: list[dict[str, Any]],
+    *,
+    start_index: int,
+    action_key: str,
+) -> tuple[int, dict[str, Any]] | None:
+    """Return the next step matching ``action_key`` after ``start_index``."""
+    needle = str(action_key or "").strip().lower()
+    if not needle:
+        return None
+    for idx in range(start_index + 1, len(steps)):
+        step = steps[idx]
+        if not isinstance(step, dict):
+            continue
+        step_action = str(step.get("action") or "").strip().lower()
+        if step_action != needle:
+            continue
+        return idx, step
+    return None
+
+
+def _attempt_post_adminto_credential_harvest(
+    shell: Any,
+    *,
+    domain: str,
+    steps: list[dict[str, Any]],
+    current_step_index: int,
+    compromised_host_label: str,
+    exec_username: str,
+    exec_password: str,
+    resolved_target_host: str,
+) -> None:
+    """Try to harvest host creds after AdminTo when a later GoldenCert needs them.
+
+    This is a best-effort optimization for mixed paths such as:
+    ``... -> AdminTo -> COMPUTER$ -> GoldenCert -> Domain``.
+    """
+    if str(os.getenv("ADSCAN_ATTACK_PATH_POST_ADMINTO_HARVEST", "1")).strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+
+    next_goldencert = _find_next_step_by_action(
+        steps, start_index=current_step_index, action_key="goldencert"
+    )
+    if not next_goldencert:
+        return
+
+    _, golden_step = next_goldencert
+    golden_status = str(golden_step.get("status") or "discovered").strip().lower()
+    if golden_status == "success":
+        return
+
+    details = golden_step.get("details") if isinstance(golden_step.get("details"), dict) else {}
+    golden_from_label = str(details.get("from") or "").strip()
+    if not golden_from_label:
+        return
+
+    golden_exec_user = _normalize_account(golden_from_label)
+    if not golden_exec_user.endswith("$"):
+        return
+
+    if _resolve_domain_password(shell, domain, golden_exec_user):
+        return
+
+    host_target = resolved_target_host.strip()
+    if not host_target:
+        host_target = (
+            resolve_netexec_target_for_node_label(
+                shell, domain, node_label=compromised_host_label
+            )
+            or ""
+        ).strip()
+    if not host_target:
+        return
+
+    marked_host = mark_sensitive(host_target, "hostname")
+    marked_user = mark_sensitive(golden_exec_user, "user")
+    print_info(
+        "AdminTo verified. Trying opportunistic host credential collection "
+        f"on {marked_host} for upcoming GoldenCert ({marked_user})."
+    )
+
+    dump_lsa = getattr(shell, "dump_lsa", None)
+    if callable(dump_lsa):
+        try:
+            try:
+                dump_lsa(
+                    domain,
+                    exec_username,
+                    exec_password,
+                    host_target,
+                    "false",
+                    include_machine_accounts=True,
+                )
+            except TypeError:
+                # Backward compatibility for test doubles/older shell shims.
+                dump_lsa(domain, exec_username, exec_password, host_target, "false")
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[attack_path] Post-AdminTo LSA harvest failed: {exc}"
+            )
+
+    if _resolve_domain_password(shell, domain, golden_exec_user):
+        marked_user = mark_sensitive(golden_exec_user, "user")
+        print_info(
+            f"Recovered credential for {marked_user} after AdminTo host collection."
+        )
+        return
+
+    dump_dpapi = getattr(shell, "dump_dpapi", None)
+    if callable(dump_dpapi):
+        try:
+            dump_dpapi(domain, exec_username, exec_password, host_target, "false")
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[attack_path] Post-AdminTo DPAPI harvest failed: {exc}"
+            )
+
+    if _resolve_domain_password(shell, domain, golden_exec_user):
+        marked_user = mark_sensitive(golden_exec_user, "user")
+        print_info(
+            f"Recovered credential for {marked_user} after AdminTo host collection."
+        )
+        return
+
+    marked_user = mark_sensitive(golden_exec_user, "user")
+    print_warning(
+        "AdminTo was successful, but no credential was recovered for "
+        f"{marked_user}. GoldenCert may fail."
+    )
 
 
 def execute_selected_attack_path(
@@ -796,9 +1180,20 @@ def execute_selected_attack_path(
                 continue
             executable_indices.append(step_idx)
         last_executable_idx = executable_indices[-1] if executable_indices else 0
+        resume_from_step_idx = _resolve_attack_path_start_step(
+            shell,
+            steps=steps,
+            executable_indices=executable_indices,
+            non_executable_actions=non_executable_actions,
+            dangerous_actions=dangerous_actions,
+        )
+        if resume_from_step_idx is None:
+            return False
 
         for idx, step in enumerate(steps, start=1):
             if not isinstance(step, dict):
+                continue
+            if idx < resume_from_step_idx:
                 continue
             action = str(step.get("action") or "").strip()
             key = action.lower()
@@ -848,12 +1243,22 @@ def execute_selected_attack_path(
                     return execution_started
 
                 # Resolve a usable NetExec target (FQDN), falling back when needed.
-                target_host = (
-                    resolve_netexec_target_for_node_label(
-                        shell, domain, node_label=to_label
-                    )
-                    or to_label
+                target_host = resolve_netexec_target_for_node_label(
+                    shell, domain, node_label=to_label
                 )
+                if not isinstance(target_host, str) or not target_host.strip():
+                    print_warning(
+                        f"Cannot execute {action}: target node is not a resolvable host."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Target node is not a resolvable host",
+                    )
+                    return execution_started
+                target_host = target_host.strip()
 
                 service_map: dict[str, str] = {
                     "adminto": "smb",
@@ -932,6 +1337,18 @@ def execute_selected_attack_path(
                         status="success",
                         notes={"username": exec_username, "target": target_host},
                     )
+
+                    if key == "adminto":
+                        _attempt_post_adminto_credential_harvest(
+                            shell,
+                            domain=domain,
+                            steps=steps,
+                            current_step_index=idx - 1,
+                            compromised_host_label=to_label,
+                            exec_username=exec_username,
+                            exec_password=password,
+                            resolved_target_host=target_host,
+                        )
 
                     followup = getattr(shell, f"ask_for_{service}_access", None)
                     if callable(followup):
@@ -1725,6 +2142,120 @@ def execute_selected_attack_path(
                         )
                 continue
 
+            if key == "goldencert":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute GoldenCert: missing from/to details.")
+                    return execution_started
+
+                domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+                if not isinstance(domain_data, dict):
+                    domain_data = {}
+                if not domain_data.get("pdc") or not domain_data.get("ca"):
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_warning(
+                        f"Cannot execute GoldenCert for {marked_domain}: missing PDC/CA info."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing PDC/CA info in domain data",
+                    )
+                    return execution_started
+
+                exec_username = _resolve_golden_cert_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not exec_username or not password:
+                    marked_user = mark_sensitive(exec_username or from_label, "user")
+                    print_warning(
+                        "Cannot execute GoldenCert: no stored credential found for "
+                        f"{marked_user}."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing stored credential for execution user",
+                    )
+                    return execution_started
+
+                ca_target_host = _resolve_golden_cert_target_host(
+                    shell,
+                    domain=domain,
+                    from_label=from_label,
+                    domain_data=domain_data,
+                )
+                if not ca_target_host:
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_warning(
+                        f"Cannot execute GoldenCert for {marked_domain}: CA host is not resolvable."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="CA host is not resolvable",
+                    )
+                    return execution_started
+
+                execution_started = True
+                with _active_step_context(
+                    action="GoldenCert",
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "ca_host": ca_target_host,
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation="GoldenCert",
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "username": exec_username,
+                                "ca_host": ca_target_host,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    if hasattr(shell, "adcs_golden_cert"):
+                        shell.adcs_golden_cert(  # type: ignore[attr-defined]
+                            domain,
+                            exec_username,
+                            password,
+                            ca_target_host,
+                        )
+                    else:
+                        from adscan_internal.cli.adcs_exploitation import (
+                            adcs_golden_cert,
+                        )
+
+                        adcs_golden_cert(
+                            shell,
+                            domain=domain,
+                            username=exec_username,
+                            password=password,
+                            ca_target_host=ca_target_host,
+                        )
+                continue
+
             if key == "allowedtodelegate":
                 if not from_label or not to_label:
                     print_warning(
@@ -1793,6 +2324,122 @@ def execute_selected_attack_path(
                         telemetry.capture_exception(exc)
 
                     shell.enum_delegations_user(domain, exec_username, password)
+                continue
+
+            if key in {"dumplsa", "dumpdpapi"}:
+                if not from_label:
+                    print_warning(
+                        f"Cannot execute {action}: missing source host details."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing source host details",
+                    )
+                    return execution_started
+
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not exec_username or not password:
+                    marked_user = mark_sensitive(exec_username or from_label, "user")
+                    print_warning(
+                        f"Cannot execute this step: no stored domain credential found for {marked_user}."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing stored credential for execution user",
+                    )
+                    return execution_started
+
+                source_host = (
+                    resolve_netexec_target_for_node_label(
+                        shell, domain, node_label=from_label
+                    )
+                    or ""
+                )
+                if not source_host:
+                    print_warning(
+                        f"Cannot execute {action}: source node is not a resolvable host."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Source node is not a resolvable host",
+                    )
+                    return execution_started
+
+                if key == "dumplsa":
+                    dump_handler = getattr(shell, "dump_lsa", None)
+                else:
+                    dump_handler = getattr(shell, "dump_dpapi", None)
+                if not callable(dump_handler):
+                    print_warning(
+                        f"Cannot execute {action}: dump executor is unavailable."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Dump executor unavailable",
+                    )
+                    return execution_started
+
+                execution_started = True
+                with _active_step_context(
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={"username": exec_username, "target_host": source_host},
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "username": exec_username,
+                                "target_host": source_host,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    dump_handler(
+                        domain,
+                        exec_username,
+                        password,
+                        source_host,
+                        "false",
+                    )
+
+                target_user = _normalize_account(to_label)
+                if target_user and not _resolve_domain_password(
+                    shell, domain, target_user
+                ):
+                    marked_user = mark_sensitive(target_user, "user")
+                    print_warning(
+                        f"{action} did not recover a credential for {marked_user}. Stopping this path."
+                    )
+                    return True
                 continue
 
             # Unknown supported key shouldn't happen due to pre-check, but keep safe.
@@ -2074,8 +2721,7 @@ def offer_attack_paths_for_execution_summaries(
                         != "exploited"
                     )
                     and _status_allowed_by_filter(
-                        str(summary.get("status") or "theoretical").strip().lower()
-                        ,
+                        str(summary.get("status") or "theoretical").strip().lower(),
                         desired_statuses_set,
                     )
                 )

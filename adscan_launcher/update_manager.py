@@ -334,7 +334,11 @@ def offer_updates_for_command(ctx: UpdateContext, command: str) -> None:
     # Maintainer dev channel should not show update checks/prompts.
     docker_channel = str(ctx.os_getenv("ADSCAN_DOCKER_CHANNEL", "") or "").strip().lower()
     docker_image = str(ctx.get_docker_image_name() or "").strip().lower()
-    if docker_channel == "dev" or "adscan-dev" in docker_image:
+    image_no_digest = docker_image.split("@", 1)[0]
+    image_repo = image_no_digest.split(":", 1)[0]
+    image_tag = image_no_digest.split(":", 1)[1] if ":" in image_no_digest else ""
+    is_dev_image = image_repo.endswith("-dev") or image_tag == "edge"
+    if docker_channel == "dev" or is_dev_image:
         ctx.print_info_debug(
             "[update] Dev channel detected; skipping launcher/docker update checks."
         )

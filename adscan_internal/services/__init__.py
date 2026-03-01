@@ -46,6 +46,8 @@ from .credential_store_service import (
     LocalCredentialUpdateResult,
 )
 from .share_mapping_service import ShareMappingService
+from .cifs_share_mapping_service import CIFSShareMappingService
+from .rclone_share_mapping_service import RcloneShareMappingService
 from .share_map_ai_triage_service import ShareMapAITriageService
 from .impacket_smb_byte_reader_service import (
     ImpacketSMBByteReaderService,
@@ -112,6 +114,8 @@ __all__ = [
     "DomainCredentialUpdateResult",
     "LocalCredentialUpdateResult",
     "ShareMappingService",
+    "CIFSShareMappingService",
+    "RcloneShareMappingService",
     "ShareMapAITriageService",
     "ImpacketSMBByteReaderService",
     "SMBByteReadResult",

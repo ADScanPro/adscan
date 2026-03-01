@@ -27,6 +27,7 @@ class WordlistDefinition:
     url: str
     dest: str
     extract_xz: bool = False
+    extract_7z: bool = False
 
 
 class WordlistService(BaseService):
@@ -72,6 +73,16 @@ class WordlistService(BaseService):
                 "dest": "kerberoast_pws.xz",
                 "extract_xz": True,
             },
+            "hashmob_medium_2025": {
+                "url": "https://weakpass.com/download/2073/hashmob.net_2025.medium.found.7z",
+                "dest": "hashmob.net_2025.medium.found.7z",
+                "extract_7z": True,
+            },
+            "kaonashi14M": {
+                "url": "https://weakpass.com/download/1938/kaonashi14M.txt.7z",
+                "dest": "kaonashi14M.txt.7z",
+                "extract_7z": True,
+            },
         }
 
         for name, cfg in raw_defs.items():
@@ -80,6 +91,7 @@ class WordlistService(BaseService):
                 url=cfg["url"],
                 dest=cfg["dest"],
                 extract_xz=bool(cfg.get("extract_xz", False)),
+                extract_7z=bool(cfg.get("extract_7z", False)),
             )
 
     @property
@@ -91,7 +103,7 @@ class WordlistService(BaseService):
     def _final_path_for(self, definition: WordlistDefinition) -> str:
         """Return the final on-disk path for a wordlist."""
 
-        final_name = definition.dest.replace(".xz", "")
+        final_name = definition.dest.replace(".xz", "").replace(".7z", "")
         return os.path.join(self.wordlists_dir, final_name)
 
     def ensure_wordlist_installed(self, name: str, *, fix: bool) -> bool:
@@ -152,6 +164,18 @@ class WordlistService(BaseService):
                     text=True,
                     check=False,
                 )
+            if definition.extract_7z:
+                subprocess.run(
+                    ["7z", "x", "-y", f"-o{self.wordlists_dir}", dl_wl_path],
+                    env=clean_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                try:
+                    os.remove(dl_wl_path)
+                except OSError:
+                    pass
             return os.path.exists(final_wl_path)
         except Exception as exc:  # pragma: no cover - network/env dependent
             telemetry.capture_exception(exc)

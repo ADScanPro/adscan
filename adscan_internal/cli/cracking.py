@@ -19,6 +19,7 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 
 from adscan_internal import (
     print_error,
@@ -32,12 +33,14 @@ from adscan_internal import (
     print_operation_header,
     telemetry,
 )
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.cli.host_file_picker import (
     is_full_container_runtime as _shared_is_full_container_runtime,
     maybe_import_host_file_to_workspace as _shared_import_host_file_to_workspace,
     select_host_file_via_gui as _shared_select_host_file_via_gui,
 )
 from adscan_internal.path_utils import get_adscan_home
+from adscan_internal.questionary_prompts import prompt_questionary_select
 from adscan_internal.rich_output import mark_sensitive, print_exception, print_panel
 from adscan_internal.text_utils import strip_ansi_codes
 
@@ -54,8 +57,8 @@ from adscan_internal.services.hashcat_service import HashcatCrackingService
 import rich.box
 from rich.table import Table
 from rich.panel import Panel
-from rich.prompt import Confirm
-import questionary
+from rich.prompt import Confirm, Prompt
+from adscan_internal.interaction import is_non_interactive
 
 
 class CrackingShell(Protocol):
@@ -127,14 +130,53 @@ def choose_cracking_wordlist(
     """Interactive wordlist selector for cracking operations."""
     from adscan_internal import print_instruction
 
-    print_instruction(
-        f"Select the cracking wordlist for {hash_type}:\n"
-        "1) rockyou ($ADSCAN_HOME/wordlists/rockyou.txt)\n"
-        "2) kerberoast_pwd ($ADSCAN_HOME/wordlists/kerberoast_pws)\n"
-        "3) Other (Select custom wordlist file)\n"
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    default_wordlist = (
+        os.path.join(wordlists_dir, "hashmob.net_2025.medium.found")
+        if workspace_type == "audit"
+        else os.path.join(wordlists_dir, "rockyou.txt")
     )
 
-    options = ["rockyou (default)", "kerberoast_pwd", "Other (custom path)"]
+    option_rows: list[tuple[str, str]]
+    if workspace_type == "audit":
+        option_rows = [
+            (
+                "hashmob_medium",
+                "hashmob.net_2025.medium.found (Recommended for audit - ES environments)",
+            ),
+            (
+                "kaonashi14M",
+                "kaonashi14M.txt (Recommended for audit - ES environments)",
+            ),
+            ("rockyou", "rockyou.txt (Fast baseline)"),
+            ("kerberoast_pws", "kerberoast_pws (AD service accounts)"),
+            ("other", "Other (custom path)"),
+        ]
+    else:
+        option_rows = [
+            ("rockyou", "rockyou.txt (Recommended for CTF)"),
+            ("kerberoast_pws", "kerberoast_pws (AD service accounts)"),
+            ("hashmob_medium", "hashmob.net_2025.medium.found"),
+            ("kaonashi14M", "kaonashi14M.txt"),
+            ("other", "Other (custom path)"),
+        ]
+    options = [label for _, label in option_rows]
+    key_by_label = {label: key for key, label in option_rows}
+    recommended_key = option_rows[0][0] if option_rows else "rockyou"
+
+    message_lines = [f"Select the cracking wordlist for {hash_type}:"]
+    for idx, (key, label) in enumerate(option_rows, start=1):
+        suffix = " [recommended]" if key == recommended_key else ""
+        message_lines.append(f"{idx}) {label}{suffix}")
+    print_instruction("\n".join(message_lines) + "\n")
+
+    if bool(getattr(shell, "auto", False)) or is_non_interactive(shell=shell):
+        print_info_debug(
+            "[cracking] Non-interactive/auto mode detected; using default wordlist: "
+            f"{os.path.basename(default_wordlist)}."
+        )
+        return default_wordlist
+
     selection: str | None = None
 
     if hasattr(shell, "_questionary_select"):
@@ -143,32 +185,44 @@ def choose_cracking_wordlist(
         )
         if idx is None:
             selection = None
-        elif idx == 0:
-            selection = "rockyou"
-        elif idx == 1:
-            selection = "kerberoast_pws"
-        elif idx == 2:
-            selection = "other"
+        elif 0 <= idx < len(option_rows):
+            selection = option_rows[idx][0]
         else:
             selection = None
     else:
-        selection = questionary.select(
-            f"Select the cracking wordlist for {hash_type}",
-            choices=[
-                questionary.Choice(title="rockyou (default)", value="rockyou"),
-                questionary.Choice(title="kerberoast_pwd", value="kerberoast_pws"),
-                questionary.Choice(title="Other (custom path)", value="other"),
-            ],
-            default="rockyou",
-        ).ask()
+        selected_label = prompt_questionary_select(
+            title=f"Select the cracking wordlist for {hash_type}",
+            options=options,
+        )
+        selection = key_by_label.get(selected_label or "")
+        if not selection:
+            # Backward-compatible aliases for older wrappers/tests.
+            selected_lower = str(selected_label or "").strip().lower()
+            aliases = {
+                "rockyou": "rockyou",
+                "rockyou (default)": "rockyou",
+                "kerberoast_pwd": "kerberoast_pws",
+                "kerberoast_pws": "kerberoast_pws",
+                "other (custom path)": "other",
+                "other": "other",
+                "hashmob": "hashmob_medium",
+                "hashmob medium": "hashmob_medium",
+                "kaonashi": "kaonashi14M",
+                "kaonashi14m": "kaonashi14M",
+            }
+            selection = aliases.get(selected_lower)
     if selection is None:
-        # User aborted (Ctrl+C). Stay robust and default to rockyou.
-        return os.path.join(wordlists_dir, "rockyou.txt")
+        # User aborted (Ctrl+C). Stay robust and keep workspace-aware default.
+        return default_wordlist
 
     if selection == "rockyou":
         return os.path.join(wordlists_dir, "rockyou.txt")
     if selection == "kerberoast_pws":
         return os.path.join(wordlists_dir, "kerberoast_pws")
+    if selection == "hashmob_medium":
+        return os.path.join(wordlists_dir, "hashmob.net_2025.medium.found")
+    if selection == "kaonashi14M":
+        return os.path.join(wordlists_dir, "kaonashi14M.txt")
     if selection == "other":
         in_container_runtime = _is_full_container_runtime(shell)
 
@@ -192,12 +246,19 @@ def choose_cracking_wordlist(
             )
 
         if not custom_path:
-            custom_path = (
-                questionary.text("Enter the full path of the wordlist").ask() or ""
-            ).strip()
+            try:
+                custom_path = (
+                    Prompt.ask("Enter the full path of the wordlist", default="") or ""
+                ).strip()
+            except EOFError:
+                print_warning(
+                    "Input stream ended while requesting custom wordlist path. "
+                    "Using recommended default wordlist."
+                )
+                return default_wordlist
         if not custom_path:
-            print_warning("No path provided. Defaulting to rockyou.")
-            return os.path.join(wordlists_dir, "rockyou.txt")
+            print_warning("No path provided. Using recommended default wordlist.")
+            return default_wordlist
         # In Docker runtime, user-provided paths commonly refer to the host FS and
         # will be imported into the workspace later. Avoid emitting a false warning
         # before we get a chance to do that.
@@ -206,7 +267,7 @@ def choose_cracking_wordlist(
             print_warning(f"Wordlist not found at {marked_path}. Hashcat may fail.")
         return custom_path
 
-    return os.path.join(wordlists_dir, "rockyou.txt")
+    return default_wordlist
 
 
 def _is_full_container_runtime(shell: CrackingShell) -> bool:
@@ -362,8 +423,14 @@ def run_cracking(
     failed: bool = False,
 ) -> None:
     """High-level cracking entrypoint used by the CLI shell."""
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    should_prompt_wordlist_selector = failed or workspace_type == "audit"
 
-    if failed:
+    if should_prompt_wordlist_selector:
+        if workspace_type == "audit" and not failed:
+            print_info(
+                "Audit workspace detected: select a cracking wordlist (rockyou is not forced by default)."
+            )
         wordlist = choose_cracking_wordlist(shell, hash_type, wordlists_dir)
     else:
         print_info("Using rockyou as the default wordlist.")
@@ -435,19 +502,16 @@ def run_cracking(
     wordlist_name_for_telemetry = os.path.basename(wordlist) if wordlist else None
 
     try:
-        lab_slug = shell._get_lab_slug()
-        telemetry.capture(
-            "cracking_started",
-            {
-                "hash_type": hash_type,
-                "scan_mode": getattr(shell, "scan_mode", None),
-                "retry": failed,
-                "workspace_type": getattr(shell, "type", None),
-                "auto_mode": getattr(shell, "auto", False),
-                "lab_slug": lab_slug,
-                "wordlist": wordlist_name_for_telemetry,
-            },
-        )
+        properties = {
+            "hash_type": hash_type,
+            "scan_mode": getattr(shell, "scan_mode", None),
+            "retry": failed,
+            "workspace_type": getattr(shell, "type", None),
+            "auto_mode": getattr(shell, "auto", False),
+            "wordlist": wordlist_name_for_telemetry,
+        }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("cracking_started", properties)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
 
@@ -750,6 +814,132 @@ def handle_hash_cracking(
     return cred, True  # Return original hash if cracking fails
 
 
+def handle_hash_cracking_batch(
+    shell: HashCrackingShell, hashes: list[str]
+) -> dict[str, str]:
+    """Attempt to crack multiple NTLM hashes with a single weakpass call.
+
+    Args:
+        shell: Shell instance with weakpass_path and run_command.
+        hashes: Candidate NTLM hashes (32 hex chars). Duplicates are allowed.
+
+    Returns:
+        Mapping ``hash_lower -> cracked_password`` for successfully cracked
+        hashes. Missing entries indicate "not cracked".
+    """
+    if not hashes:
+        return {}
+    if not getattr(shell, "weakpass_path", None):
+        return {}
+
+    valid_hashes: list[str] = []
+    seen_hashes: set[str] = set()
+    for hash_value in hashes:
+        candidate = str(hash_value or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", candidate):
+            continue
+        if candidate in seen_hashes:
+            continue
+        seen_hashes.add(candidate)
+        valid_hashes.append(candidate)
+
+    if not valid_hashes:
+        return {}
+
+    temp_file_path = ""
+    cracked_by_hash: dict[str, str] = {}
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+            prefix="adscan-weakpass-",
+            suffix=".txt",
+        ) as temp_file:
+            temp_file.write("\n".join(valid_hashes))
+            temp_file.write("\n")
+            temp_file_path = temp_file.name
+
+        command = (
+            f"{shell.weakpass_path} -f {shlex.quote(temp_file_path)} "
+            f"-w {max(4, min(32, len(valid_hashes)))}"
+        )
+        masked_temp_file = mark_sensitive(temp_file_path, "path")
+        command_for_log = (
+            f"{shell.weakpass_path} -f {masked_temp_file} "
+            f"-w {max(4, min(32, len(valid_hashes)))}"
+        )
+        print_info_verbose(
+            f"Attempting batch NTLM crack for {len(valid_hashes)} hash(es)..."
+        )
+        print_info_debug(f"Command: {command_for_log}")
+        proc = shell.run_command(command)
+        stdout = proc.stdout if isinstance(proc, subprocess.CompletedProcess) else ""
+
+        for raw_line in str(stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = re.search(
+                r"Cracked hash:\s*([0-9a-fA-F]{32})\s*:(.*)$",
+                line,
+            )
+            if not match:
+                continue
+            hash_key = match.group(1).lower()
+            password = match.group(2).strip()
+            if password:
+                cracked_by_hash[hash_key] = password
+
+        # weakpass bulk mode usually writes cracked pairs to `<input>_cracked.txt`.
+        # Parse that file when stdout only contains summary lines.
+        cracked_output_file = f"{os.path.splitext(temp_file_path)[0]}_cracked.txt"
+        if os.path.exists(cracked_output_file):
+            try:
+                with open(cracked_output_file, "r", encoding="utf-8") as output_handle:
+                    for raw_line in output_handle:
+                        line = raw_line.strip()
+                        if not line or ":" not in line:
+                            continue
+                        hash_value, password = line.split(":", 1)
+                        hash_key = hash_value.strip().lower()
+                        plain_value = password.strip()
+                        if re.fullmatch(r"[0-9a-f]{32}", hash_key) and plain_value:
+                            cracked_by_hash[hash_key] = plain_value
+            except Exception as file_exc:  # pragma: no cover - best effort only
+                telemetry.capture_exception(file_exc)
+                print_warning_debug(
+                    "Failed to parse weakpass cracked output file; "
+                    "continuing with stdout-derived results."
+                )
+
+        print_info_verbose(
+            f"Batch NTLM crack finished: {len(cracked_by_hash)}/{len(valid_hashes)} hash(es) cracked."
+        )
+    except Exception as e:  # pragma: no cover - mirrors existing best-effort handling
+        telemetry.capture_exception(e)
+        print_error("An unexpected error occurred during batch hash cracking.")
+        print_exception(show_locals=False, exception=e)
+    finally:
+        if temp_file_path:
+            try:
+                os.unlink(temp_file_path)
+            except OSError:
+                pass
+            cracked_output_file = f"{os.path.splitext(temp_file_path)[0]}_cracked.txt"
+            uncracked_output_file = (
+                f"{os.path.splitext(temp_file_path)[0]}_uncracked.txt"
+            )
+            for auxiliary_file in (cracked_output_file, uncracked_output_file):
+                try:
+                    if os.path.exists(auxiliary_file):
+                        os.unlink(auxiliary_file)
+                except OSError:
+                    pass
+
+    return cracked_by_hash
+
+
 def do_cracking(shell: CrackingShell, args: str) -> None:
     """
     Command to crack Active Directory hashes.
@@ -895,24 +1085,42 @@ def execute_cracking(
                 creds = result.credentials
                 # Telemetry: track successful hash cracking
                 try:
-                    lab_slug = shell._get_lab_slug()
-                    telemetry.capture(
-                        "hash_cracked",
-                        {
-                            "hash_type": hash_type,
-                            "credentials_cracked": len(creds),
-                            "scan_mode": getattr(shell, "scan_mode", None),
-                            "workspace_type": shell.type,
-                            "auto_mode": shell.auto,
-                            "lab_slug": lab_slug,
-                            "wordlist": wordlist_name,
-                        },
+                    properties = {
+                        "hash_type": hash_type,
+                        "credentials_cracked": len(creds),
+                        "scan_mode": getattr(shell, "scan_mode", None),
+                        "workspace_type": shell.type,
+                        "auto_mode": shell.auto,
+                        "wordlist": wordlist_name,
+                    }
+                    properties.update(
+                        build_lab_event_fields(shell=shell, include_slug=True)
                     )
+                    telemetry.capture("hash_cracked", properties)
                     # Track victory for session summary (Hormozi: Give:Ask ratio)
                     if hasattr(shell, "_session_victories"):
                         shell._session_victories.append("hash_cracked")
                 except Exception as e:
                     telemetry.capture_exception(e)
+                try:
+                    if str(getattr(shell, "type", "") or "").strip().lower() == "audit":
+                        audit_properties = {
+                            "hash_type": hash_type,
+                            "wordlist": wordlist_name,
+                            "hashes_cracked": len(creds),
+                            "scan_mode": getattr(shell, "scan_mode", None),
+                            "workspace_type": getattr(shell, "type", None),
+                            "auto_mode": getattr(shell, "auto", False),
+                        }
+                        audit_properties.update(
+                            build_lab_event_fields(shell=shell, include_slug=True)
+                        )
+                        telemetry.capture(
+                            "audit_wordlist_cracked",
+                            audit_properties,
+                        )
+                except Exception as exc:  # pragma: no cover - telemetry best effort
+                    telemetry.capture_exception(exc)
 
                 table = Table(
                     title="[bold green]🔓 Cracked Credentials[/bold green]",
@@ -981,18 +1189,17 @@ def execute_cracking(
         else:
             # Telemetry: track failed hash cracking
             try:
-                lab_slug = shell._get_lab_slug()
-                telemetry.capture(
-                    "hash_not_cracked",
-                    {
-                        "hash_type": hash_type,
-                        "scan_mode": getattr(shell, "scan_mode", None),
-                        "workspace_type": shell.type,
-                        "auto_mode": shell.auto,
-                        "lab_slug": lab_slug,
-                        "wordlist": wordlist_name,
-                    },
+                properties = {
+                    "hash_type": hash_type,
+                    "scan_mode": getattr(shell, "scan_mode", None),
+                    "workspace_type": shell.type,
+                    "auto_mode": shell.auto,
+                    "wordlist": wordlist_name,
+                }
+                properties.update(
+                    build_lab_event_fields(shell=shell, include_slug=True)
                 )
+                telemetry.capture("hash_not_cracked", properties)
             except Exception as e:
                 telemetry.capture_exception(e)
 

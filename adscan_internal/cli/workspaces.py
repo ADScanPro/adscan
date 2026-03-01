@@ -15,6 +15,10 @@ from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
+from adscan_core.lab_catalog import (
+    CTF_LAB_PROVIDER_OPTIONS,
+    provider_display_to_canonical,
+)
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
     BRAND_COLORS,
@@ -205,16 +209,7 @@ def workspace_create(shell: WorkspaceShell, workspace_name: str | None = None) -
     lab_name_whitelisted: bool | None = None
 
     if workspace_type == "ctf":
-        lab_options = [
-            "HackTheBox",
-            "TryHackMe",
-            "DockerLabs",
-            "VulnHub",
-            "GOAD",
-            "Proving Grounds",
-            "Other lab environment",
-            "Local practice only",
-        ]
+        lab_options = list(CTF_LAB_PROVIDER_OPTIONS)
 
         provider_selection = shell._questionary_select(
             "Select lab environment:", lab_options
@@ -224,15 +219,7 @@ def workspace_create(shell: WorkspaceShell, workspace_name: str | None = None) -
             selected_provider_display = lab_options[provider_selection]
             lab_provider_display = selected_provider_display
 
-            provider_mapping = {
-                "Other lab environment": "other",
-                "Local practice only": "local_test",
-                "Proving Grounds": "proving_grounds",
-            }
-            lab_provider = provider_mapping.get(
-                selected_provider_display,
-                selected_provider_display.lower(),
-            )
+            lab_provider = provider_display_to_canonical(selected_provider_display)
             print_success_verbose(f"Lab provider set to: {lab_provider}")
 
         if lab_provider:

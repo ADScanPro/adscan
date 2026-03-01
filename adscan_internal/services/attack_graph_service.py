@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, cast
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -23,6 +23,9 @@ from adscan_internal.services import attack_paths_core
 from adscan_internal.services.attack_step_support_registry import (
     classify_relation_support,
 )
+from adscan_internal.services.attack_step_catalog import (
+    get_exploitation_relation_vuln_keys,
+)
 from adscan_internal.services.membership_snapshot import (
     load_membership_snapshot as _load_membership_snapshot_impl,
     snapshot_has_sid_metadata as _snapshot_has_sid_metadata,
@@ -31,45 +34,8 @@ from adscan_internal.services.membership_snapshot import (
 
 ATTACK_GRAPH_SCHEMA_VERSION = "1.1"
 
-# Edge classification for CTEM correlation.
-EXPLOITATION_EDGE_VULN_KEYS: dict[str, str] = {
-    # Kerberos Attacks
-    "kerberoasting": "kerberoast",
-    "asreproasting": "asreproast",
-    # Credential Access
-    "dcsync": "dcsync",
-    "readlapspassword": "laps_readable",
-    "synclapspassword": "laps_readable",
-    "readgmsapassword": "gmsa_readable",
-    # ADCS Vulnerabilities
-    "adcsesc1": "adcs_esc1",
-    "adcsesc2": "adcs_esc2",
-    "adcsesc3": "adcs_esc3",
-    "adcsesc4": "adcs_esc4",
-    "adcsesc5": "adcs_esc5",
-    "adcsesc6": "adcs_esc6",
-    "adcsesc7": "adcs_esc7",
-    "adcsesc8": "adcs_esc8",
-    "adcsesc9": "adcs_esc9",
-    "adcsesc10": "adcs_esc10",
-    "adcsesc11": "adcs_esc11",
-    "adcsesc13": "adcs_esc13",
-    # Delegation Attacks
-    "allowedtodelegate": "unconstrained_delegation",
-    "allowedtoact": "rbcd_exploitable",
-    "addallowedtoact": "rbcd_exploitable",
-    # Dangerous Permissions (when exploitable)
-    "forcechangepassword": "force_change_password",
-    "allextendedrights": "all_extended_rights",
-    # CVE-style / coercion edges
-    "nopac": "nopac",
-    "zerologon": "zerologon",
-    "printnightmare": "printnightmare",
-    "dfscoerce": "dfscoerce",
-    "mseven": "mseven",
-    "petitpotam": "petitpotam",
-    "printerbug": "printerbug",
-}
+# Edge classification for CTEM correlation (centralized in attack_step_catalog).
+EXPLOITATION_EDGE_VULN_KEYS: dict[str, str] = get_exploitation_relation_vuln_keys()
 logger = logging.getLogger(__name__)
 
 # Attack-path UX may need different trade-offs than privilege verification flows.
@@ -4056,36 +4022,105 @@ def resolve_netexec_target_for_node_label(
     label_clean = str(node_label or "").strip()
     if not label_clean:
         return None
+    domain_clean = str(domain or "").strip().lower()
 
     graph = load_attack_graph(shell, domain)
     node_id = _find_node_id_by_label(graph, label_clean)
     if not node_id:
-        return None
+        return _normalize_netexec_target_candidate(
+            label_clean, fallback_domain=domain_clean
+        )
 
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     node = nodes_map.get(node_id) if isinstance(nodes_map, dict) else None
     if not isinstance(node, dict):
-        return None
+        return _normalize_netexec_target_candidate(
+            label_clean, fallback_domain=domain_clean
+        )
 
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    name = str(props.get("name") or "").strip()
-    if name:
-        return name
+    for property_key in (
+        "dNSHostName",
+        "dnshostname",
+        "dnsHostName",
+        "hostname",
+        "name",
+        "samaccountname",
+    ):
+        value = props.get(property_key)
+        if not isinstance(value, str):
+            continue
+        resolved = _normalize_netexec_target_candidate(
+            value, fallback_domain=domain_clean
+        )
+        if resolved:
+            return resolved
 
-    sam = str(props.get("samaccountname") or "").strip()
-    base = sam.rstrip("$") if sam else str(node.get("label") or label_clean).strip()
-    base = base.rstrip("$")
-    if not base:
+    for node_key in ("label", "name", "samaccountname"):
+        value = node.get(node_key)
+        if not isinstance(value, str):
+            continue
+        resolved = _normalize_netexec_target_candidate(
+            value, fallback_domain=domain_clean
+        )
+        if resolved:
+            return resolved
+
+    host = _normalize_netexec_target_candidate(
+        str(node.get("label") or label_clean).strip(),
+        fallback_domain=domain_clean,
+    )
+    if not host:
         return None
-
-    domain_clean = str(domain or "").strip()
-    host = f"{base}.{domain_clean}".lower() if domain_clean else base.lower()
     marked_node = mark_sensitive(label_clean, "hostname")
     marked_host = mark_sensitive(host, "hostname")
     print_info_verbose(
         f"Resolved target for {marked_node} using fallback (samAccountName -> FQDN): {marked_host}"
     )
     return host
+
+
+def _normalize_netexec_target_candidate(
+    candidate: str,
+    *,
+    fallback_domain: str,
+) -> str | None:
+    """Normalize node labels/properties into NetExec host targets.
+
+    Handles common BloodHound representations such as:
+    - ``CASTELBLACK$@NORTH.SEVENKINGDOMS.LOCAL``
+    - ``NORTH\\CASTELBLACK$``
+    - ``CASTELBLACK$``
+    """
+    raw = str(candidate or "").strip().strip(".")
+    if not raw:
+        return None
+
+    if "\\" in raw:
+        raw = raw.split("\\", 1)[1]
+
+    lower = raw.lower()
+    if "@" in lower:
+        left, right = lower.split("@", 1)
+        left = left.strip().rstrip("$")
+        right = right.strip().strip(".")
+        if left and right:
+            return f"{left}.{right}"
+
+    lower = lower.rstrip("$")
+    if not lower:
+        return None
+
+    # Keep IPv4 targets as-is.
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", lower):
+        return lower
+
+    if "." in lower:
+        return lower
+
+    if fallback_domain:
+        return f"{lower}.{fallback_domain}"
+    return lower
 
 
 def _resolve_netexec_target_fqdn(
@@ -4305,6 +4340,142 @@ def upsert_netexec_privilege_edge(
             f"[netexec_edge] Failed to record NetExec-discovered step for {marked_domain}."
         )
         return False
+
+
+def upsert_local_admin_password_reuse_edges(
+    shell: object,
+    domain: str,
+    *,
+    local_admin_username: str,
+    targets: list[dict[str, str]],
+    status: str = "discovered",
+) -> int:
+    """Upsert bidirectional host-to-host edges for confirmed local admin password reuse."""
+    domain_clean = str(domain or "").strip()
+    user_clean = str(local_admin_username or "").strip()
+    if not domain_clean or not user_clean or not isinstance(targets, list):
+        return 0
+
+    try:
+        service = None
+        if hasattr(shell, "_get_bloodhound_service"):
+            service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
+        if not service or not hasattr(service, "get_computer_node_by_name"):
+            marked_domain = mark_sensitive(domain_clean, "domain")
+            print_info_verbose(
+                f"[local_reuse] BloodHound service unavailable for {marked_domain}; skipping attack-step creation."
+            )
+            return 0
+
+        graph = load_attack_graph(shell, domain_clean)
+        resolved: dict[str, dict[str, str]] = {}
+
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            ip_clean = str(target.get("ip") or "").strip()
+            host_hint = str(
+                target.get("hostname") or target.get("target") or ""
+            ).strip()
+            node_props: dict[str, Any] | None = None
+            fqdn: str | None = None
+
+            if ip_clean:
+                node_props, fqdn = _resolve_netexec_target_computer_node(
+                    shell,
+                    service=service,
+                    domain=domain_clean,
+                    target_ip=ip_clean,
+                    target_hostname=host_hint or None,
+                )
+
+            if not node_props and host_hint:
+                candidate_fqdn = (
+                    host_hint.strip().rstrip(".").lower()
+                    if "." in host_hint
+                    else f"{host_hint.strip().rstrip('.')}.{domain_clean}".lower()
+                )
+                resolver = getattr(service, "get_computer_node_by_name", None)
+                if callable(resolver):
+                    resolved_fn = cast(Callable[[str, str], Any], resolver)
+                    props = resolved_fn(  # pylint: disable=not-callable
+                        domain_clean, candidate_fqdn
+                    )
+                    if isinstance(props, dict):
+                        node_props = props
+                        fqdn = candidate_fqdn
+
+            if not isinstance(node_props, dict):
+                continue
+
+            comp_record = {
+                "name": str(node_props.get("name") or fqdn or host_hint or ip_clean),
+                "kind": ["Computer"],
+                "objectId": node_props.get("objectid") or node_props.get("objectId"),
+                "properties": node_props,
+            }
+            upsert_nodes(graph, [comp_record])
+            node_id = _node_id(comp_record)
+            if not node_id:
+                continue
+            resolved[node_id] = {
+                "label": str(comp_record.get("name") or node_id),
+                "ip": ip_clean,
+                "hostname": host_hint,
+            }
+
+        if len(resolved) < 2:
+            return 0
+
+        node_ids = sorted(resolved.keys())
+        total_hosts = len(node_ids)
+        host_labels = sorted(
+            {
+                str(data.get("label") or "").strip()
+                for data in resolved.values()
+                if str(data.get("label") or "").strip()
+            },
+            key=str.lower,
+        )
+
+        created = 0
+        for src_id in node_ids:
+            for dst_id in node_ids:
+                if src_id == dst_id:
+                    continue
+                edge = upsert_edge(
+                    graph,
+                    from_id=src_id,
+                    to_id=dst_id,
+                    relation="LocalAdminPassReuse",
+                    edge_type="local_cred_reuse",
+                    status=status,
+                    notes={
+                        "source": "netexec_local_cred_reuse",
+                        "local_admin_username": user_clean,
+                        "reuse_group_size": total_hosts,
+                        "bidirectional": True,
+                        "confirmed_hosts": host_labels,
+                    },
+                )
+                if edge:
+                    created += 1
+
+        if created:
+            save_attack_graph(shell, domain_clean, graph)
+            marked_domain = mark_sensitive(domain_clean, "domain")
+            marked_user = mark_sensitive(user_clean, "user")
+            print_info_debug(
+                f"[local_reuse] Recorded {created} LocalAdminPassReuse edge(s) for {marked_user} in {marked_domain}."
+            )
+        return created
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain_clean, "domain")
+        print_info_verbose(
+            f"[local_reuse] Failed to persist local admin reuse edges for {marked_domain}."
+        )
+        return 0
 
 
 def upsert_cve_host_edge(

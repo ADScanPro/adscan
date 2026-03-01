@@ -30,7 +30,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.core import AuthMode
-from adscan_internal.cli.common import SECRET_MODE
+from adscan_internal.cli.common import SECRET_MODE, build_lab_event_fields
 from adscan_internal.cli.tools_env import TOOLS_INSTALL_DIR
 from adscan_internal.cli.host_file_picker import (
     is_full_container_runtime,
@@ -362,16 +362,13 @@ def run_ldap_computers(shell: LdapShell, target_domain: str) -> list[str] | None
     shell._display_items(hostnames, "Computers")
 
     try:
-        lab_slug = shell._get_lab_slug()
-        telemetry.capture(
-            "ldap_computers_enumerated",
-            {
-                "count": len(hostnames),
-                "scan_mode": getattr(shell, "scan_mode", None),
-                "auth_type": shell.domains_data[target_domain].get("auth", "unknown"),
-                "lab_slug": lab_slug,
-            },
-        )
+        properties = {
+            "count": len(hostnames),
+            "scan_mode": getattr(shell, "scan_mode", None),
+            "auth_type": shell.domains_data[target_domain].get("auth", "unknown"),
+        }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("ldap_computers_enumerated", properties)
     except Exception as e:  # pragma: no cover
         telemetry.capture_exception(e)
 
@@ -463,27 +460,24 @@ def run_enum_delegations(shell: LdapShell, domain: str) -> None:
 
     # Telemetry
     try:
-        lab_slug = shell._get_lab_slug()
-        telemetry.capture(
-            "delegations_enumerated",
-            {
-                "total_delegations": len(delegations),
-                "unconstrained_count": delegation_type_counts.get("unconstrained", 0),
-                "constrained_count": delegation_type_counts.get("constrained", 0),
-                "constrained_protocol_transition_count": delegation_type_counts.get(
-                    "constrained_protocol_transition", 0
-                ),
-                "resource_based_constrained_count": delegation_type_counts.get(
-                    "resource_based_constrained", 0
-                ),
-                "unknown_count": delegation_type_counts.get("unknown", 0),
-                "scan_mode": getattr(shell, "scan_mode", None),
-                "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                "workspace_type": shell.type,
-                "auto_mode": shell.auto,
-                "lab_slug": lab_slug,
-            },
-        )
+        properties = {
+            "total_delegations": len(delegations),
+            "unconstrained_count": delegation_type_counts.get("unconstrained", 0),
+            "constrained_count": delegation_type_counts.get("constrained", 0),
+            "constrained_protocol_transition_count": delegation_type_counts.get(
+                "constrained_protocol_transition", 0
+            ),
+            "resource_based_constrained_count": delegation_type_counts.get(
+                "resource_based_constrained", 0
+            ),
+            "unknown_count": delegation_type_counts.get("unknown", 0),
+            "scan_mode": getattr(shell, "scan_mode", None),
+            "auth_type": shell.domains_data[domain].get("auth", "unknown"),
+            "workspace_type": shell.type,
+            "auto_mode": shell.auto,
+        }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("delegations_enumerated", properties)
     except Exception as exc:  # pragma: no cover
         telemetry.capture_exception(exc)
 
@@ -795,16 +789,13 @@ def run_ldap_active_users(shell: LdapShell, target_domain: str) -> list[str] | N
         print_warning(f"Failed to postprocess enabled users for {marked_domain}: {e}")
 
     try:
-        lab_slug = shell._get_lab_slug()
-        telemetry.capture(
-            "ldap_users_enumerated",
-            {
-                "count": len(usernames),
-                "scan_mode": getattr(shell, "scan_mode", None),
-                "auth_type": shell.domains_data[target_domain].get("auth", "unknown"),
-                "lab_slug": lab_slug,
-            },
-        )
+        properties = {
+            "count": len(usernames),
+            "scan_mode": getattr(shell, "scan_mode", None),
+            "auth_type": shell.domains_data[target_domain].get("auth", "unknown"),
+        }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("ldap_users_enumerated", properties)
     except Exception as e:  # pragma: no cover
         telemetry.capture_exception(e)
 
@@ -1647,12 +1638,8 @@ def check_maq(shell: LdapShell, domain: str, username: str, password: str) -> in
 def run_ldap_descriptions(shell: LdapShell, target_domain: str) -> None:
     """Enumerate user descriptions and analyze them for leaked credentials.
 
-    Preferred flow: use the LDAP enumeration service to fetch user objects and
-    their `description` attribute, then write a local `descriptions.log` file so
-    CredSweeper can analyze it consistently.
-
-    Fallback: if the service does not provide descriptions, run the NetExec
-    `user-desc` module and parse the generated `UserDesc-*.log`.
+    Primary flow: execute NetExec LDAP description-focused modules and parse the
+    generated ``UserDesc-*.log`` output artifact.
     """
     if target_domain not in shell.domains:
         marked_target_domain = mark_sensitive(target_domain, "domain")
@@ -1673,88 +1660,13 @@ def run_ldap_descriptions(shell: LdapShell, target_domain: str) -> None:
             "Domain": target_domain,
             "PDC": pdc_fqdn,
             "Authentication": "Kerberos" if use_kerberos else "Password",
-            "Modules": "user-desc, get-desc-users, get-unixUserPassword, get-userPassword",
+            "Modules": "user-desc, get-desc-users, get-unixUserPassword, get-userPassword, get-info-users",
             "Username": username,
         },
         icon="📝",
     )
 
-    # Preferred: enumerate via service and persist a local descriptions.log
-    users = None
-    try:
-        enum_service = EnumerationService()
-        executor = shell._get_service_executor()
-        auth_mode = AuthMode.AUTHENTICATED
-        users = enum_service.ldap.enumerate_users(
-            domain=target_domain,
-            pdc=shell.domains_data[target_domain]["pdc"],
-            auth_mode=auth_mode,
-            username=username,
-            password=password,
-            netexec_path=shell.netexec_path or "",
-            executor=executor,
-            scan_id=None,
-            timeout=120,
-        )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        users = None
-
-    user_descriptions: dict[str, str] = {}
-    if users:
-        try:
-            for user in users:
-                user_name = getattr(user, "username", None)
-                description = getattr(user, "description", None)
-                if isinstance(user_name, str) and isinstance(description, str):
-                    if user_name.strip() and description.strip():
-                        user_descriptions[user_name.strip()] = description.strip()
-        except Exception as exc:  # pragma: no cover
-            telemetry.capture_exception(exc)
-            user_descriptions = {}
-
-    if user_descriptions:
-        workspace_cwd = shell._get_workspace_cwd()
-        ldap_dir = domain_subpath(
-            workspace_cwd, shell.domains_dir, target_domain, shell.ldap_dir
-        )
-        os.makedirs(ldap_dir, exist_ok=True)
-        descriptions_file = os.path.join(ldap_dir, "descriptions.log")
-        try:
-            with open(descriptions_file, "w", encoding="utf-8") as handle:
-                handle.write("User:                     Description:\n")
-                for user_name, description in sorted(user_descriptions.items()):
-                    handle.write(f"{user_name:<25} {description}\n")
-        except OSError as exc:
-            telemetry.capture_exception(exc)
-            descriptions_file = ""
-
-        try:
-            _save_ldap_descriptions_json(shell, user_descriptions, target_domain)
-        except Exception as exc:  # pragma: no cover
-            telemetry.capture_exception(exc)
-
-        if hasattr(shell, "_display_ldap_descriptions_with_rich"):
-            shell._display_ldap_descriptions_with_rich(user_descriptions)  # type: ignore[attr-defined]
-        else:
-            _display_ldap_descriptions_with_rich(user_descriptions)
-
-        if descriptions_file:
-            if hasattr(shell, "_analyze_descriptions_for_passwords"):
-                shell._analyze_descriptions_for_passwords(  # type: ignore[attr-defined]
-                    descriptions_file, user_descriptions, target_domain
-                )
-            else:
-                _analyze_descriptions_for_passwords(
-                    shell, descriptions_file, user_descriptions, target_domain
-                )
-        return
-
-    print_info_debug(
-        "LDAP description enumeration service returned no descriptions; falling back to NetExec UserDesc module."
-    )
-
-    # Fallback: NetExec user-desc output parsing (legacy)
+    # Run the description-focused NetExec modules directly (no --users pre-pass).
     auth = shell.build_auth_nxc(
         username,
         password,
@@ -1764,7 +1676,7 @@ def run_ldap_descriptions(shell: LdapShell, target_domain: str) -> None:
     marked_pdc_fqdn = mark_sensitive(pdc_fqdn, "hostname")
     command = (
         f"{shell.netexec_path} ldap {marked_pdc_fqdn} {auth} "
-        "-M user-desc -M get-desc-users -M get-unixUserPassword -M get-userPassword"
+        "-M user-desc -M get-desc-users -M get-unixUserPassword -M get-userPassword -M get-info-users"
     )
     print_info_debug(f"Command: {command}")
     execute_netexec_ldap_descriptions(shell, command=command, domain=target_domain)
@@ -2461,19 +2373,18 @@ def execute_ldap_computers(
                 # Telemetry: track computer enumeration results
                 try:
                     comp_type = comp_file.replace(".txt", "").replace("_", "_")
-                    lab_slug = shell._get_lab_slug()
-                    telemetry.capture(
-                        "computers_enumerated",
-                        {
-                            "computer_type": comp_type,
-                            "count": len(computers),
-                            "scan_mode": getattr(shell, "scan_mode", None),
-                            "auth_type": shell.domains_data[domain].get(
-                                "auth", "unknown"
-                            ),
-                            "lab_slug": lab_slug,
-                        },
+                    properties = {
+                        "computer_type": comp_type,
+                        "count": len(computers),
+                        "scan_mode": getattr(shell, "scan_mode", None),
+                        "auth_type": shell.domains_data[domain].get(
+                            "auth", "unknown"
+                        ),
+                    }
+                    properties.update(
+                        build_lab_event_fields(shell=shell, include_slug=True)
                     )
+                    telemetry.capture("computers_enumerated", properties)
                 except Exception as e:
                     telemetry.capture_exception(e)
 

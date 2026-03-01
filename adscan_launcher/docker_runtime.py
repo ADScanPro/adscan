@@ -53,6 +53,9 @@ def docker_access_denied(diagnostic: str) -> bool:
 
 
 _HOST_TELEMETRY_ID_ENV = "ADSCAN_TELEMETRY_ID"
+_HOST_DISTRO_ID_ENV = "ADSCAN_HOST_DISTRO_ID"
+_HOST_DISTRO_VERSION_ENV = "ADSCAN_HOST_DISTRO_VERSION"
+_HOST_DISTRO_LIKE_ENV = "ADSCAN_HOST_DISTRO_LIKE"
 _DOCKER_GUI_ENV = "ADSCAN_DOCKER_GUI"
 _X11_SOCKET_DIR_ENV = "ADSCAN_X11_SOCKET_DIR"
 
@@ -561,6 +564,31 @@ def _compute_host_telemetry_id() -> str | None:
         return None
 
 
+def _collect_host_distro_context() -> dict[str, str]:
+    """Collect host distro metadata from /etc/os-release (best effort)."""
+    try:
+        os_release_path = Path("/etc/os-release")
+        if not os_release_path.is_file():
+            return {}
+        data: dict[str, str] = {}
+        for line in os_release_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            data[key] = value.strip().strip('"').strip("'")
+        context: dict[str, str] = {}
+        if data.get("ID"):
+            context["distro_id"] = str(data["ID"]).strip()
+        if data.get("VERSION_ID"):
+            context["distro_version"] = str(data["VERSION_ID"]).strip()
+        if data.get("ID_LIKE"):
+            context["distro_like"] = str(data["ID_LIKE"]).strip()
+        return {k: v for k, v in context.items() if v}
+    except Exception:
+        return {}
+
+
 def build_adscan_run_command(
     cfg: DockerRunConfig,
     *,
@@ -749,6 +777,21 @@ def build_adscan_run_command(
     for key in passthrough_keys:
         if key in os.environ and str(os.environ.get(key, "")).strip():
             cmd.extend(["-e", f"{key}={os.environ[key]}"])
+
+    # Forward host distro metadata so telemetry inside the container reports the
+    # real host distribution instead of the runtime image base distro.
+    host_distro = _collect_host_distro_context()
+    host_distro_env = (
+        (_HOST_DISTRO_ID_ENV, host_distro.get("distro_id", "")),
+        (_HOST_DISTRO_VERSION_ENV, host_distro.get("distro_version", "")),
+        (_HOST_DISTRO_LIKE_ENV, host_distro.get("distro_like", "")),
+    )
+    for env_key, env_value in host_distro_env:
+        if not env_value:
+            continue
+        if any(arg.startswith(f"{env_key}=") for arg in cmd):
+            continue
+        cmd.extend(["-e", f"{env_key}={env_value}"])
 
     if not any(arg.startswith(f"{_HOST_TELEMETRY_ID_ENV}=") for arg in cmd):
         host_id = _compute_host_telemetry_id()

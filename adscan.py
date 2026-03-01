@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pylint: disable=unexpected-keyword-arg
 from adscan_internal.rich_output import (
     mark_passthrough,
     mark_sensitive,
@@ -46,7 +47,6 @@ if TYPE_CHECKING:
 # Third-party imports
 import netifaces
 import psutil
-import questionary
 import requests
 import rich.box
 from packaging import version
@@ -144,6 +144,10 @@ from adscan_internal.docker_runtime import (
     run_docker_command,
     emit_entrypoint_logs_from_state,
 )
+from adscan_internal.questionary_prompts import (
+    prompt_questionary_checkbox,
+    prompt_questionary_select,
+)
 from adscan_internal.docker_status import (
     ensure_docker_daemon_running as _ensure_docker_daemon_running_internal,
     is_docker_compose_plugin_available as _is_docker_compose_plugin_available,
@@ -172,6 +176,11 @@ from adscan_internal.update_manager import (
     offer_updates_for_command,
     handle_update_command,
 )
+from adscan_core.lab_catalog import (
+    get_labs_for_provider as get_catalog_labs_for_provider,
+    is_lab_whitelisted as is_catalog_lab_whitelisted,
+)
+from adscan_core.lab_context import build_lab_telemetry_fields
 from adscan_internal.services.dns_discovery_service import (
     is_dns_resolution_error,
     preflight_install_dns,
@@ -669,7 +678,7 @@ def _build_command_metadata(shell=None, command_type: str | None = None, extra=N
     return metadata or None
 
 
-_ALLOWED_SESSION_COMMANDS = {"install", "ci", "start", "check", "update", "upgrade"}
+_ALLOWED_SESSION_COMMANDS = telemetry.SESSION_CAPTURE_ALLOWED_COMMANDS
 
 _LAST_CHECK_SESSION_EXTRA: dict[str, object] | None = None
 
@@ -689,7 +698,9 @@ def _resolve_command_type(shell=None, override: Optional[str] = None) -> Optiona
 
 def _is_session_capture_allowed(command_type: Optional[str]) -> bool:
     """Return True if the command should upload Rich session recordings."""
-    return bool(command_type and command_type in _ALLOWED_SESSION_COMMANDS)
+    return telemetry.is_session_capture_command(
+        command_type, allowed_commands=set(_ALLOWED_SESSION_COMMANDS)
+    )
 
 
 def _capture_command_session(
@@ -732,7 +743,12 @@ def _capture_command_session(
             message = f"{message} {detail}"
         print_info_debug(message)
 
-    telemetry.capture_session_end(console=TELEMETRY_CONSOLE, metadata=metadata)
+    telemetry.capture_command_session(
+        console=TELEMETRY_CONSOLE,
+        command_type=command_type,
+        base_metadata=metadata,
+        allowed_commands=set(_ALLOWED_SESSION_COMMANDS),
+    )
     _SESSION_CAPTURE_FINALIZED = True
 
 
@@ -891,6 +907,7 @@ def _logged_prompt_ask(*prompt_args, **kwargs):
     """
     prompt_message = prompt_args[0] if prompt_args else "?"
     password_mode = bool(kwargs.get("password", False))
+    default_value = kwargs.get("default")
 
     def _classify_prompt_answer(answer_text: str) -> str:
         if password_mode:
@@ -934,6 +951,15 @@ def _logged_prompt_ask(*prompt_args, **kwargs):
             f"{answer_tag} {prompt_message}: {mark_sensitive(answer_text, data_type)}"
         )
 
+    # Non-interactive runs must not block on prompt input; use default/empty.
+    if _should_disable_interactive_prompts():
+        fallback = "" if default_value is None else str(default_value)
+        print_info_debug(
+            f"[prompt] Non-interactive mode; using fallback for '{prompt_message}'."
+        )
+        _log_prompt_answer(fallback)
+        return fallback
+
     # In Docker runtime we sometimes get terminal/PTY quirks where backspace is
     # not interpreted correctly by Rich's Console.input(). Questionary uses
     # prompt_toolkit which is generally more resilient in containers.
@@ -944,7 +970,6 @@ def _logged_prompt_ask(*prompt_args, **kwargs):
             return _ORIGINAL_PROMPT_ASK(*prompt_args, **kwargs)
 
         prompt_text = str(prompt_message)
-        default_value = kwargs.get("default")
         try:
             if password_mode:
                 answer = questionary.password(
@@ -957,8 +982,14 @@ def _logged_prompt_ask(*prompt_args, **kwargs):
                     default=str(default_value) if default_value is not None else "",
                 ).ask()
         except EOFError:
-            raise
+            _log_interrupt_debug(kind="eof", source="rich_prompt.ask(container)")
+            fallback = "" if default_value is None else str(default_value)
+            _log_prompt_answer(fallback)
+            return fallback
         except KeyboardInterrupt:
+            _log_interrupt_debug(
+                kind="keyboard_interrupt", source="rich_prompt.ask(container)"
+            )
             return ""
 
         _log_prompt_answer(answer)
@@ -984,6 +1015,15 @@ def _logged_confirm_ask(*confirm_args, **kwargs):
         answer_text = "Yes" if answer else "No"
         print_telemetry_only(f"[confirm][answer] {prompt_message}: {answer_text}")
 
+    # Non-interactive runs must not block on confirmation prompts.
+    if _should_disable_interactive_prompts():
+        resolved = bool(kwargs.get("default", True))
+        print_info_debug(
+            f"[confirm] Non-interactive mode; using fallback for '{prompt_message}': {resolved}"
+        )
+        _log_confirm_answer(resolved)
+        return resolved
+
     # In Docker runtime we sometimes get terminal/PTY quirks where backspace
     # and cursor keys are not interpreted correctly by Rich's Console.input().
     # Questionary uses prompt_toolkit which is generally more resilient in
@@ -999,8 +1039,13 @@ def _logged_confirm_ask(*confirm_args, **kwargs):
         try:
             answer = questionary.confirm(prompt_text, default=default_value).ask()
         except EOFError:
-            raise
+            _log_interrupt_debug(kind="eof", source="rich_confirm.ask(container)")
+            _log_confirm_answer(default_value)
+            return default_value
         except KeyboardInterrupt:
+            _log_interrupt_debug(
+                kind="keyboard_interrupt", source="rich_confirm.ask(container)"
+            )
             return default_value
 
         resolved = default_value if answer is None else bool(answer)
@@ -1010,6 +1055,15 @@ def _logged_confirm_ask(*confirm_args, **kwargs):
     answer = _ORIGINAL_CONFIRM_ASK(*confirm_args, **kwargs)
     _log_confirm_answer(bool(answer))
     return answer
+
+
+def _log_interrupt_debug(*, kind: str, source: str) -> None:
+    """Emit a standardized debug line when an interactive interrupt is detected."""
+    try:
+        print_info_debug(f"[interrupt] kind={kind} source={source}")
+    except Exception:
+        # Best-effort only; interrupt logging must never alter control flow.
+        pass
 
 
 def enable_auto_mode():
@@ -1039,7 +1093,10 @@ Confirm.ask = _logged_confirm_ask  # type: ignore[assignment]
 
 # Secret mode runtime flag (internal traceback/detail visibility control).
 # Import from common module to avoid circular dependencies.
-from adscan_internal.cli.common import SECRET_MODE  # pylint: disable=invalid-name  # noqa: E402
+from adscan_internal.cli.common import (  # pylint: disable=invalid-name  # noqa: E402
+    SECRET_MODE,
+    build_lab_event_fields,
+)
 
 # Collected information to present at installation summary
 INSTALL_SUMMARY = {}
@@ -2200,6 +2257,7 @@ SYSTEM_PACKAGES_CONFIG = {
     "krb5-user": "kinit",
     "python3-pip": "pip3",
     "unzip": "unzip",
+    "p7zip-full": "7z",
     "hydra": "hydra",
     "freerdp3-x11": "xfreerdp3",
     "tesseract-ocr": "tesseract",
@@ -2324,6 +2382,16 @@ WORDLISTS_CONFIG = {
         "url": "https://gist.github.com/The-Viper-One/a1ee60d8b3607807cc387d794e809f0b/raw/b7d83af6a8bbb43013e04f78328687d19d0cf9a7/kerberoast_pws.xz",
         "dest": "kerberoast_pws.xz",
         "extract_xz": True,
+    },
+    "hashmob_medium_2025": {
+        "url": "https://weakpass.com/download/2073/hashmob.net_2025.medium.found.7z",
+        "dest": "hashmob.net_2025.medium.found.7z",
+        "extract_7z": True,
+    },
+    "kaonashi14M": {
+        "url": "https://weakpass.com/download/1938/kaonashi14M.txt.7z",
+        "dest": "kaonashi14M.txt.7z",
+        "extract_7z": True,
     },
 }
 
@@ -2665,7 +2733,7 @@ def _ensure_wordlist_installed(
     wl_name: str, config: Dict[str, Any], *, fix: bool
 ) -> bool:
     """Ensure a configured wordlist exists under `WORDLISTS_INSTALL_DIR`."""
-    final_wl_name = config["dest"].replace(".xz", "")
+    final_wl_name = config["dest"].replace(".xz", "").replace(".7z", "")
     final_wl_path = os.path.join(WORDLISTS_INSTALL_DIR, final_wl_name)
     if os.path.exists(final_wl_path):
         return True
@@ -2702,6 +2770,12 @@ def _ensure_wordlist_installed(
         run_command(["curl", "-L", "-o", dl_wl_path, config["url"]], env=clean_env)
         if config.get("extract_xz"):
             run_command(["xz", "-d", dl_wl_path], env=clean_env)
+        if config.get("extract_7z"):
+            run_command(
+                ["7z", "x", "-y", f"-o{WORDLISTS_INSTALL_DIR}", dl_wl_path],
+                env=clean_env,
+            )
+            run_command(["rm", "-f", dl_wl_path], check=False, env=clean_env)
         return os.path.exists(final_wl_path)
     except Exception as exc:  # pragma: no cover - network/environment dependent
         telemetry.capture_exception(exc)
@@ -9077,20 +9151,6 @@ class PentestShell:
 
         return get_domain_post_da_state(self, domain)
 
-    def _get_audit_post_da_bh_refresh_policy(self) -> str:
-        """Return post-DA BloodHound refresh policy for audit mode."""
-        from adscan_internal.cli.post_da import get_audit_post_da_bh_refresh_policy
-
-        return get_audit_post_da_bh_refresh_policy(self)
-
-    def _get_audit_post_da_bh_refresh_max_cycles(self) -> int:
-        """Return maximum post-DA refresh cycles for audit mode."""
-        from adscan_internal.cli.post_da import (
-            get_audit_post_da_bh_refresh_max_cycles,
-        )
-
-        return get_audit_post_da_bh_refresh_max_cycles(self)
-
     def _collect_tier0_path_counts(self, domain: str) -> tuple[int, int]:
         """Return (paths_to_tier0, paths_not_attempted) from attack graph metrics."""
         from adscan_internal.cli.post_da import collect_tier0_path_counts
@@ -9309,59 +9369,9 @@ class PentestShell:
             except Exception:
                 pass
 
-            # Questionary select returns the selected string value
-            # Note: We don't pass 'default' to avoid applying selected/highlighted style to the default option
-            # The cursor will start at the first option naturally
-            # Print a newline before the questionary prompt for better shell display
-            # (This ensures the "?" appears on the same line as the title)
+            # Print a newline before the questionary prompt for better shell display.
             print()
-            selected_value = questionary.select(
-                title,
-                choices=options,
-                # default=options[default_idx] if default_idx < len(options) else None,  # Removed to avoid styling differences
-                style=questionary.Style(
-                    [
-                        (
-                            "qmark",
-                            "fg:#00D4FF bold",
-                        ),  # token in front of the question (ADscan brand cyan)
-                        ("question", "bold white"),  # question text (white, bold)
-                        (
-                            "answer",
-                            "fg:#00D4FF bold",
-                        ),  # submitted answer text (ADscan brand cyan)
-                        (
-                            "pointer",
-                            "fg:#00D4FF bold",
-                        ),  # pointer used in select and checkbox prompts (ADscan brand cyan)
-                        (
-                            "highlighted",
-                            "fg:#00D4FF bold",
-                        ),  # pointed-at choice (ADscan brand cyan when highlighted/selected)
-                        (
-                            "selected",
-                            "fg:#00D4FF bold",
-                        ),  # style for a selected item (ADscan brand cyan)
-                        (
-                            "separator",
-                            "fg:#00D4FF",
-                        ),  # separator in lists (ADscan brand cyan)
-                        ("instruction", "fg:#cccccc"),  # user instructions (light gray)
-                        (
-                            "text",
-                            "white",
-                        ),  # plain text (white) - base color for all non-highlighted options
-                        (
-                            "choice",
-                            "white",
-                        ),  # choice text (white) - ensures all options same color when not highlighted
-                        (
-                            "disabled",
-                            "fg:#888888 italic",
-                        ),  # disabled choices (gray, italic)
-                    ]
-                ),
-            ).ask()
+            selected_value = prompt_questionary_select(title=title, options=options)
 
             # Convert selected value back to index for compatibility with _curses_select
             if selected_value is None:
@@ -9385,6 +9395,9 @@ class PentestShell:
 
         except KeyboardInterrupt:
             # User pressed Ctrl+C
+            _log_interrupt_debug(
+                kind="keyboard_interrupt", source="questionary.select"
+            )
             return None
         except Exception as e:
             # Fallback to a simple numeric selection (no curses).
@@ -9450,25 +9463,10 @@ class PentestShell:
                 pass
 
             print()
-            selected_values = questionary.checkbox(
-                title,
-                choices=options,
-                style=questionary.Style(
-                    [
-                        ("qmark", "fg:#00D4FF bold"),
-                        ("question", "bold white"),
-                        ("answer", "fg:#00D4FF bold"),
-                        ("pointer", "fg:#00D4FF bold"),
-                        ("highlighted", "fg:#00D4FF bold"),
-                        ("selected", "fg:#00D4FF bold"),
-                        ("separator", "fg:#00D4FF"),
-                        ("instruction", "fg:#cccccc"),
-                        ("text", "white"),
-                        ("choice", "white"),
-                        ("disabled", "fg:#888888 italic"),
-                    ]
-                ),
-            ).ask()
+            selected_values = prompt_questionary_checkbox(
+                title=title,
+                options=options,
+            )
 
             if selected_values is None:
                 return None
@@ -9481,9 +9479,12 @@ class PentestShell:
             except Exception:
                 pass
 
-            return [str(value) for value in selected_values if str(value).strip()]
+            return selected_values
 
         except KeyboardInterrupt:
+            _log_interrupt_debug(
+                kind="keyboard_interrupt", source="questionary.checkbox"
+            )
             return None
         except Exception as e:
             try:
@@ -9662,30 +9663,9 @@ class PentestShell:
         Returns:
             str | None: Lab slug if both provider and name exist, None otherwise
         """
-        if not self.lab_provider or not self.lab_name:
-            return None
+        from adscan_core.lab_context import build_lab_slug
 
-        # Map providers to short slugs
-        provider_slug_map = {
-            "hackthebox": "htb",
-            "tryhackme": "thm",
-            "dockerlabs": "dockerlabs",
-            "vulnhub": "vulnhub",
-            "goad": "goad",
-            "proving_grounds": "pg",
-            "other": "other",
-            "local_test": "local_test",
-        }
-
-        # Get provider slug (normalize to lowercase first)
-        provider_lower = self.lab_provider.lower()
-        provider_slug = provider_slug_map.get(provider_lower, provider_lower)
-
-        # Get lab name slug (normalize: lowercase, replace spaces with underscores)
-        lab_slug = self.lab_name.lower().replace(" ", "_")
-
-        # Combine: provider/lab (e.g., "htb/forest", "thm/attacktive_directory")
-        return f"{provider_slug}/{lab_slug}"
+        return build_lab_slug(self.lab_provider, self.lab_name)
 
     def _get_workspace_cwd(self) -> str:
         """Return the workspace directory to use for filesystem operations."""
@@ -9717,20 +9697,16 @@ class PentestShell:
         return _executor
 
     def _is_lab_whitelisted(self, lab_provider: str, lab_name: str) -> bool:
-        """Check if a lab name is in the whitelist for the given provider.
+        """Check whether a lab is whitelisted for telemetry.
 
         Args:
-            lab_provider (str): Lab provider (e.g., "HackTheBox" or "hackthebox" - both work, case-insensitive)
-            lab_name (str): Lab name to check (will be compared case-insensitively)
+            lab_provider (str): Provider display/canonical value.
+            lab_name (str): Lab name to validate.
 
         Returns:
-            bool: True if lab is in whitelist, False otherwise
+            bool: True when provider+lab exists in the shared catalog whitelist.
         """
-        # _get_labs_for_provider now handles case-insensitive lookup automatically
-        lab_list = self._get_labs_for_provider(lab_provider)
-
-        # Case-insensitive comparison for lab names
-        return lab_name.lower() in [lab.lower() for lab in lab_list]
+        return is_catalog_lab_whitelisted(lab_provider, lab_name)
 
     def _fuzzy_select_lab(
         self, prompt_text: str, lab_options: list, allow_custom: bool = True
@@ -9837,6 +9813,7 @@ class PentestShell:
                 return selected.strip()
             return None
         except KeyboardInterrupt:
+            _log_interrupt_debug(kind="keyboard_interrupt", source="fuzzy_select_lab")
             return None
         except Exception as e:
             telemetry.capture_exception(e)
@@ -9851,117 +9828,15 @@ class PentestShell:
 
     def _get_labs_for_provider(self, provider: str) -> list:
         """
-        Get list of available labs for a given provider.
-        Returns placeholder lists for now; can be extended with API calls in the future.
-        Case-insensitive lookup with fallback to exact match.
+        Return the AD-focused lab catalog for a provider.
 
         Args:
-            provider (str): Lab provider name (e.g., "HackTheBox", "hackthebox", "TryHackMe", etc.)
+            provider (str): Provider display/canonical value.
 
         Returns:
-            list: List of lab names for the provider
+            list: Lab names from the shared catalog (`adscan_core.lab_catalog`).
         """
-        # Active Directory focused labs only - all providers listed here are AD-related
-        lab_lists = {
-            "HackTheBox": [
-                # AD-focused HTB machines only
-                "Forest",
-                "Active",
-                "Sauna",
-                "Blackfield",
-                "Shibuya",
-                "Fluffy",
-                "Voleur",
-                "RustyKey",
-                "TombWatcher",
-                "Manager",
-                "Certified",
-                "Baby",
-                "Delegate",
-                "Retrotwo",
-                "Sendai",
-                "Phantom",
-                "Retro",
-                "Reel",
-                "Resolute",
-                "Support",
-                "Cascade",
-                "Intelligence",
-                "Search",
-                "Sizzle",
-                "Remote",
-                "Fuse",
-                "Monteverde",
-                "Mantis",
-                "BankRobber",
-                "Fries",
-                "Eighteen",
-                "DarkZero",
-                "Signed",
-                "Cicada",
-                "Rebound",
-                "Administrator",
-                "EscapeTwoAuthority",
-                "Scrambled",
-                "StreamIO",
-                "Reel2",
-                "Vintage",
-            ],
-            "TryHackMe": [
-                # AD-focused TryHackMe rooms only
-                "VulnNet_Roasted",
-                "Attacktive_Directory",
-                "Active_Directory_Basics",
-                "Post_Exploitation_Basics",
-                "Breaching_Active_Directory",
-                "Enumerating_Active_Directory",
-                "Attacking_Kerberos",
-                "Credentials_Harvesting",
-                "VulnNet_Active",
-                "Enterprise",
-                "Exploiting_Active_Directory",
-                "Persisting_Active_Directory",
-            ],
-            "DockerLabs": [
-                # DockerLabs AD scenarios only (these are all AD-focused)
-                "dc01",
-                "dc02",
-                "dc03",
-                "web",
-                "sql",
-                "exchange",
-            ],
-            "VulnHub": [
-                # VulnHub AD VMs only
-                "Zico2",
-                "FristiLeaks",
-                "Breach",
-                "HackLAB",
-                # Add more AD-focused VulnHub VMs as needed
-            ],
-            "GOAD": [],  # Empty - GOAD is a complete environment, lab_name equals provider
-            "Proving Grounds": [
-                # OffSec Proving Grounds AD-focused machines
-                # Note: This list may need updates as new AD machines are added to PG
-                # Common AD machines include: DC01, DC02, DC03 variations, etc.
-                # Users can also enter custom names if not in this list
-            ],
-            "Other lab environment": [],  # Empty - user will type custom name
-            "Local practice only": [],  # Empty - user will type custom name
-        }
-
-        # Try exact match first
-        if provider in lab_lists:
-            return lab_lists[provider]
-
-        # Case-insensitive lookup - find matching key regardless of case
-        provider_lower = provider.lower()
-        for key in lab_lists.keys():
-            if key.lower() == provider_lower:
-                return lab_lists[key]
-
-        # No match found
-        return []
+        return get_catalog_labs_for_provider(provider)
 
     def _open_fullscreen_editor(self, title: str, initial_text: str = ""):
         """Open a full-screen multiline editor using prompt_toolkit TextArea.
@@ -10699,15 +10574,6 @@ class PentestShell:
         )
         self.lab_name = None  # Specific lab/machine name for CTF workspaces (e.g., "Forest" for HTB)
         self.lab_name_whitelisted = None  # Whether lab_name is in whitelist (None if no lab_name, True/False if lab_name exists)
-        raw_refresh_policy = os.getenv("ADSCAN_AUDIT_POST_DA_BH_REFRESH_POLICY", "once")
-        self.audit_post_da_bh_refresh_policy = (
-            str(raw_refresh_policy or "once").strip().lower()
-        )
-        raw_max_cycles = os.getenv("ADSCAN_AUDIT_POST_DA_BH_MAX_CYCLES", "2")
-        try:
-            self.audit_post_da_bh_refresh_max_cycles = int(raw_max_cycles)
-        except (TypeError, ValueError):
-            self.audit_post_da_bh_refresh_max_cycles = 2
 
     def _extract_domain_from_netexec_command(self, command: str) -> str | None:
         """Extract domain name from a NetExec command string.
@@ -11385,6 +11251,15 @@ class PentestShell:
         if getattr(self, "_shutdown_in_progress", False):
             print_warning("Shutdown already in progress. Please wait...")
             return
+
+        signal_name = str(_signum)
+        try:
+            signal_name = signal.Signals(_signum).name
+        except Exception:
+            pass
+        _log_interrupt_debug(
+            kind="signal", source=f"pentestshell.signal_handler:{signal_name}"
+        )
 
         print("")
         print_warning("Ctrl+C detected. Attempting graceful shutdown...")
@@ -13357,10 +13232,14 @@ class PentestShell:
                     )
 
             except KeyboardInterrupt:
+                _log_interrupt_debug(
+                    kind="keyboard_interrupt", source="pentestshell.prompt_loop"
+                )
                 print_warning("\nKeyboardInterrupt. Type 'exit' or 'quit' to exit.")
                 # Optionally, add a small delay or a clear visual break
                 continue
             except EOFError:
+                _log_interrupt_debug(kind="eof", source="pentestshell.prompt_loop")
                 self.do_exit("")
                 break
 
@@ -13518,26 +13397,12 @@ class PentestShell:
                     print_error("Please set telemetry to on/true/1 or off/false/0")
                     return
                 print_success(f"Telemetry configured: {self.telemetry}")
-                telemetry_context: dict[str, object] = {}
-                if self.current_workspace:
-                    import hashlib
-                    from adscan_internal.telemetry import TELEMETRY_ID
+                from adscan_internal.cli.common import build_telemetry_context
 
-                    workspace_unique_id = f"{TELEMETRY_ID}:{self.current_workspace}"
-                    telemetry_context["workspace_id_hash"] = hashlib.sha256(
-                        workspace_unique_id.encode()
-                    ).hexdigest()[:12]
-                if self.type:
-                    telemetry_context["workspace_type"] = self.type
-                if self.lab_provider:
-                    telemetry_context["lab_provider"] = self.lab_provider
-                if self.lab_name and self.lab_name_whitelisted is True:
-                    telemetry_context["lab_name"] = self.lab_name
-                if self.lab_name is not None:
-                    telemetry_context["lab_name_whitelisted"] = (
-                        self.lab_name_whitelisted is True
-                    )
-                telemetry_context["telemetry_change_trigger"] = "set_telemetry"
+                telemetry_context = build_telemetry_context(
+                    shell=self,
+                    trigger="set_telemetry",
+                )
                 telemetry.set_cli_telemetry(self.telemetry, context=telemetry_context)
 
             elif variable == "username":
@@ -14224,6 +14089,35 @@ class PentestShell:
             cred=cred,
             host=host,
             service=service,
+            skip_hash_cracking=skip_hash_cracking,
+            pdc_ip=pdc_ip,
+            source_steps=source_steps,
+            prompt_for_user_privs_after=prompt_for_user_privs_after,
+            verify_credential=verify_credential,
+            ui_silent=ui_silent,
+            ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
+        )
+
+    def add_credentials_batch(
+        self,
+        *,
+        domain,
+        credentials,
+        skip_hash_cracking=False,
+        pdc_ip=None,
+        source_steps=None,
+        prompt_for_user_privs_after: bool = True,
+        verify_credential: bool = True,
+        ui_silent: bool = False,
+        ensure_fresh_kerberos_ticket: bool = True,
+    ):
+        """Add multiple domain credentials via the shared CLI batch helper."""
+        from adscan_internal.cli.creds import add_credentials_batch
+
+        return add_credentials_batch(
+            shell=self,
+            domain=domain,
+            credentials=credentials,
             skip_hash_cracking=skip_hash_cracking,
             pdc_ip=pdc_ip,
             source_steps=source_steps,
@@ -14973,19 +14867,16 @@ class PentestShell:
                 # Get DC count from domain data
                 dc_count = 1  # At minimum, we have the PDC
 
-                lab_slug = self._get_lab_slug()
-                telemetry.capture(
-                    "environment_enumerated",
-                    {
-                        "user_count": user_count,
-                        "computer_count": computer_count,
-                        "dc_count": dc_count,
-                        "adcs_present": adcs_present,
-                        "scan_mode": getattr(self, "scan_mode", None),
-                        "workspace_type": getattr(self, "type", None),
-                        "lab_slug": lab_slug,
-                    },
-                )
+                properties = {
+                    "user_count": user_count,
+                    "computer_count": computer_count,
+                    "dc_count": dc_count,
+                    "adcs_present": adcs_present,
+                    "scan_mode": getattr(self, "scan_mode", None),
+                    "workspace_type": getattr(self, "type", None),
+                }
+                properties.update(build_lab_event_fields(shell=self, include_slug=True))
+                telemetry.capture("environment_enumerated", properties)
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
 
@@ -15413,11 +15304,15 @@ class PentestShell:
                 "auto_mode": getattr(self, "auto", False),
                 "lab_slug": lab_slug,
             }
-
-            if self.lab_provider:
-                properties["lab_provider"] = self.lab_provider
-            if self.lab_name and self.lab_name_whitelisted is True:
-                properties["lab_name"] = self.lab_name
+            properties.update(
+                build_lab_telemetry_fields(
+                    lab_provider=self.lab_provider,
+                    lab_name=self.lab_name,
+                    lab_name_whitelisted=self.lab_name_whitelisted,
+                    include_slug=True,
+                    lab_slug=lab_slug,
+                )
+            )
 
             telemetry.capture("scan_complete", properties)
         except Exception as exc:
@@ -15708,6 +15603,105 @@ class PentestShell:
             password=password,
             hosts=hosts,
             share_map=share_map,
+        )
+
+    def do_smb_map_benchmark(self, args):
+        """Benchmark SMB share mapping backends and compare execution times.
+
+        Usage: smb_map_benchmark <domain> [credential_username]
+        """
+        import shlex
+
+        from adscan_internal import print_error
+        from adscan_internal.cli.smb import run_smb_map_benchmark
+
+        parts = shlex.split(str(args or ""))
+        if not parts or len(parts) > 2:
+            print_error("Usage: smb_map_benchmark <domain> [credential_username]")
+            return
+
+        domain = parts[0]
+        credential_username = parts[1] if len(parts) == 2 else None
+        return run_smb_map_benchmark(
+            self,
+            domain=domain,
+            credential_username=credential_username,
+        )
+
+    def do_smb_map_benchmark_history(self, args):
+        """Show historical SMB mapping benchmark comparison.
+
+        Usage:
+            smb_map_benchmark_history <domain>
+            smb_map_benchmark_history <domain> <recent_limit>
+            smb_map_benchmark_history <domain> [recent_limit] [--days <N>] [--csv [path]]
+        """
+        import shlex
+
+        from adscan_internal.cli.smb import run_smb_map_benchmark_history
+        from adscan_internal import print_error
+
+        parts = shlex.split(str(args or ""))
+        if not parts:
+            print_error(
+                "Usage: smb_map_benchmark_history <domain> [recent_limit] "
+                "[--days <N>] [--csv [path]]"
+            )
+            return
+        domain = parts[0]
+        recent_limit = 10
+        days: int | None = None
+        csv_output_path: str | None = None
+
+        idx = 1
+        if len(parts) >= 2 and not parts[1].startswith("--"):
+            try:
+                recent_limit = int(parts[1])
+            except Exception:
+                print_error(
+                    "Invalid recent_limit. Usage: smb_map_benchmark_history "
+                    "<domain> [recent_limit] [--days <N>] [--csv [path]]"
+                )
+                return
+            idx = 2
+
+        while idx < len(parts):
+            token = parts[idx]
+            if token == "--days":
+                if idx + 1 >= len(parts):
+                    print_error("Missing value for --days.")
+                    return
+                try:
+                    parsed_days = int(parts[idx + 1])
+                except Exception:
+                    print_error("Invalid value for --days. It must be an integer.")
+                    return
+                if parsed_days <= 0:
+                    print_error("Invalid value for --days. It must be > 0.")
+                    return
+                days = parsed_days
+                idx += 2
+                continue
+            if token == "--csv":
+                if idx + 1 < len(parts) and not parts[idx + 1].startswith("--"):
+                    csv_output_path = parts[idx + 1]
+                    idx += 2
+                else:
+                    csv_output_path = ""
+                    idx += 1
+                continue
+            print_error(
+                "Unknown argument. Usage: smb_map_benchmark_history "
+                "<domain> [recent_limit] [--days <N>] [--csv [path]]"
+            )
+            return
+
+        return run_smb_map_benchmark_history(
+            self,
+            domain=domain,
+            recent_limit=recent_limit,
+            days=days,
+            csv_output_path=csv_output_path,
         )
 
     def gpp_passwords(self, domain, username, password, share):
@@ -16833,7 +16827,36 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             password=password,
         )
 
-    def dump_lsa(self, domain, username, password, host, islocal):
+    def ask_for_dump_all_sam(self, domain, username, password):
+        from adscan_internal.cli.dumps import run_ask_for_dump_all_sam
+
+        return run_ask_for_dump_all_sam(
+            self,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+
+    def ask_for_post_da_host_dumps(self, domain, username, password):
+        from adscan_internal.cli.dumps import run_ask_for_post_da_host_dumps
+
+        return run_ask_for_post_da_host_dumps(
+            self,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+
+    def dump_lsa(
+        self,
+        domain,
+        username,
+        password,
+        host,
+        islocal,
+        *,
+        include_machine_accounts=False,
+    ):
         """Dump LSA secrets via SMB/NetExec."""
         from adscan_internal.cli.dumps import run_dump_lsa
 
@@ -16844,6 +16867,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             password=password,
             host=host,
             islocal=islocal,
+            include_machine_accounts=include_machine_accounts,
         )
 
     def do_dump_lsa(self, args):
@@ -16884,11 +16908,16 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
     def execute_local_cred_reuse(self, command, domain, user, cred):
         """
-        Execute the given command in a non-blocking way and parse its output log file for local admin IPs.
-        The function extracts IP addresses from lines containing "admin", ensuring there are no duplicate entries.
-        The unique IPs are saved to a file at: domains/<domain>/smb/<user>_local_admin_ips.txt
+        Execute a local credential reuse check and process confirmed admin hits.
+
+        The method parses NetExec log output for confirmed local admin sessions,
+        stores unique target IPs in:
+        domains/<domain>/smb/<user>_local_admin_ips.txt
+        and records bidirectional LocalAdminPassReuse attack steps when at least
+        two hosts are confirmed.
         """
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal import print_info_table
 
         try:
             # Execute the command and wait for its completion.
@@ -16908,21 +16937,24 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             print_warning(f"Log file '{marked_log_file_path}' not found.")
             return
 
-        # Initialize a set to store unique IP addresses
-        unique_ips = set()
+        try:
+            with open(log_file_path, "r", encoding="utf-8") as log_file:
+                log_content = log_file.read()
+        except Exception as e:
+            telemetry.capture_exception(e)
+            print_error("Error reading local credential reuse log.")
+            print_exception(show_locals=False, exception=e)
+            return
 
-        # Regular expression to match IPv4 addresses
-        ip_regex = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
+        from adscan_internal.cli.smb import parse_local_cred_reuse_targets
 
-        # Open and read the log file line by line
-        with open(log_file_path, "r", encoding="utf-8") as log_file:
-            for line in log_file:
-                # Check if the line contains the keyword "admin"
-                if "admin" in line:
-                    # Search for all IPv4 addresses in the line
-                    ip_matches = ip_regex.findall(line)
-                    for ip in ip_matches:
-                        unique_ips.add(ip)
+        reuse_targets = parse_local_cred_reuse_targets(log_content)
+        unique_ips = {
+            str(item.get("ip") or "").strip()
+            for item in reuse_targets
+            if isinstance(item, dict)
+        }
+        unique_ips = {ip for ip in unique_ips if ip}
 
         # Create the target directory if it doesn't exist: domains/<domain>/smb/
         target_directory = f"domains/{domain}/smb"
@@ -16936,9 +16968,109 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             for ip in sorted(unique_ips):
                 target_file.write(ip + "\n")
 
+        created_edges = 0
+        marked_target_file_path = mark_sensitive(target_file_path, "path")
         print_success(
-            f"Found and saved {len(unique_ips)} local admin IP addresses to {target_file_path}"
+            f"Found and saved {len(unique_ips)} local admin IP addresses to {marked_target_file_path}"
         )
+
+        if len(reuse_targets) >= 2:
+            try:
+                from adscan_internal.services.attack_graph_service import (
+                    upsert_local_admin_password_reuse_edges,
+                )
+
+                created_edges = upsert_local_admin_password_reuse_edges(
+                    self,
+                    domain,
+                    local_admin_username=user,
+                    targets=reuse_targets,
+                    status="discovered",
+                )
+                if created_edges > 0:
+                    print_info_debug(
+                        f"[local_reuse] Added {created_edges} LocalAdminPassReuse attack step(s)."
+                    )
+            except Exception as e:
+                telemetry.capture_exception(e)
+                print_info_debug(
+                    "[local_reuse] Failed to create LocalAdminPassReuse attack steps."
+                )
+
+        if reuse_targets:
+            marked_domain = mark_sensitive(domain, "domain")
+            marked_user = mark_sensitive(user, "user")
+            print_panel(
+                "\n".join(
+                    [
+                        "[bold]Local Administrator Reuse Confirmed[/bold]",
+                        f"Domain: {marked_domain}",
+                        f"Credential: {marked_user}",
+                        "",
+                        "The same local admin credential is valid on multiple hosts.",
+                        "This creates direct lateral movement paths between compromised hosts.",
+                        "",
+                        f"Confirmed hosts: {len(reuse_targets)}",
+                        f"Graph steps created (LocalAdminPassReuse): {created_edges}",
+                    ]
+                ),
+                title="[bold magenta]Credential Reuse Impact[/bold magenta]",
+                border_style="magenta",
+                expand=False,
+            )
+
+            seen_rows: set[tuple[str, str, str]] = set()
+            reuse_rows_with_key: list[tuple[str, dict[str, str]]] = []
+            for target in reuse_targets:
+                if not isinstance(target, dict):
+                    continue
+                target_raw = str(target.get("target") or "").strip()
+                host_raw = str(target.get("hostname") or target_raw or "").strip()
+                ip_raw = str(target.get("ip") or "").strip()
+                row_key = (host_raw.lower(), ip_raw.lower(), target_raw.lower())
+                if row_key in seen_rows:
+                    continue
+                seen_rows.add(row_key)
+                reuse_rows_with_key.append(
+                    (
+                        host_raw.lower(),
+                        {
+                            "Host": mark_sensitive(host_raw or "-", "hostname"),
+                            "IP": mark_sensitive(ip_raw or "-", "ip"),
+                            "Target": mark_sensitive(target_raw or "-", "hostname"),
+                            "Evidence": "Local admin session confirmed (Pwn3d)",
+                        },
+                    )
+                )
+
+            if reuse_rows_with_key:
+                reuse_rows = [
+                    row
+                    for _, row in sorted(
+                        reuse_rows_with_key,
+                        key=lambda item: item[0],
+                    )
+                ]
+                print_info_table(
+                    reuse_rows,
+                    ["Host", "IP", "Target", "Evidence"],
+                    title="Local Admin Password Reuse Targets",
+                )
+        else:
+            marked_domain = mark_sensitive(domain, "domain")
+            print_panel(
+                "\n".join(
+                    [
+                        "[bold]No Reuse Confirmed[/bold]",
+                        f"Domain: {marked_domain}",
+                        "",
+                        "No host returned a confirmed local admin session for this credential.",
+                    ]
+                ),
+                title="[bold green]Credential Reuse Result[/bold green]",
+                border_style="green",
+                expand=False,
+            )
 
         if len(unique_ips) > 0:
             self.ask_for_dump_host(domain, target_file_path, user, cred, "True")
@@ -18070,17 +18202,14 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 "enabled_users.txt": "enabled_users",
             }
             user_type = user_type_map.get(filename, filename.replace(".txt", ""))
-            lab_slug = self._get_lab_slug()
-            telemetry.capture(
-                "users_enumerated",
-                {
-                    "user_type": user_type,
-                    "count": count,
-                    "scan_mode": getattr(self, "scan_mode", None),
-                    "auth_type": self.domains_data[domain].get("auth", "unknown"),
-                    "lab_slug": lab_slug,
-                },
-            )
+            properties = {
+                "user_type": user_type,
+                "count": count,
+                "scan_mode": getattr(self, "scan_mode", None),
+                "auth_type": self.domains_data[domain].get("auth", "unknown"),
+            }
+            properties.update(build_lab_event_fields(shell=self, include_slug=True))
+            telemetry.capture("users_enumerated", properties)
         except Exception as e:
             telemetry.capture_exception(e)
 
@@ -18238,17 +18367,14 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
         try:
             comp_type = comp_file.replace(".txt", "")
-            lab_slug = self._get_lab_slug()
-            telemetry.capture(
-                "computers_enumerated",
-                {
-                    "computer_type": comp_type,
-                    "count": len(cleaned),
-                    "scan_mode": getattr(self, "scan_mode", None),
-                    "auth_type": self.domains_data[domain].get("auth", "unknown"),
-                    "lab_slug": lab_slug,
-                },
-            )
+            properties = {
+                "computer_type": comp_type,
+                "count": len(cleaned),
+                "scan_mode": getattr(self, "scan_mode", None),
+                "auth_type": self.domains_data[domain].get("auth", "unknown"),
+            }
+            properties.update(build_lab_event_fields(shell=self, include_slug=True))
+            telemetry.capture("computers_enumerated", properties)
         except Exception as e:
             telemetry.capture_exception(e)
 
@@ -20595,18 +20721,13 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                     if isinstance(duration_seconds, (int, float)):
                         duration_minutes = round(duration_seconds / 60.0, 2)
 
-                lab_slug = self._get_lab_slug()
                 properties = {
                     "scan_mode": getattr(self, "scan_mode", None),
                     "duration_minutes": duration_minutes,
                     "type": self.type,
                     "auto": self.auto,
-                    "lab_slug": lab_slug,
                 }
-                if self.lab_provider:
-                    properties["lab_provider"] = self.lab_provider
-                if self.lab_name and self.lab_name_whitelisted is True:
-                    properties["lab_name"] = self.lab_name
+                properties.update(build_lab_event_fields(shell=self, include_slug=True))
                 telemetry.capture("domain_compromise", properties)
 
                 # Track scan-level TTC for scan_complete event
@@ -20682,8 +20803,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                     username,
                     password,
                 )
-                self.ask_for_dump_all_lsa(domain, username, password)
-                self.ask_for_dump_all_dpapi(domain, username, password)
+                self.ask_for_post_da_host_dumps(domain, username, password)
             self.ask_for_raise_child(domain, username, password)
             return privileged_groups
 
@@ -21698,6 +21818,20 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             username=username,
             password=password,
             template=template,
+        )
+
+    def adcs_golden_cert(self, domain, username, password, ca_target_host=None):
+        """Wrapper for GoldenCert exploitation."""
+        from adscan_internal.cli.adcs_exploitation import (
+            adcs_golden_cert as _adcs_golden_cert,
+        )
+
+        _adcs_golden_cert(
+            shell=self,
+            domain=domain,
+            username=username,
+            password=password,
+            ca_target_host=ca_target_host,
         )
 
     def make_template_vulnerable(self, domain, username, password, command, template):
@@ -23996,9 +24130,18 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             )
 
             sync_technical_finding_from_legacy(self, domain, key, value)
+        except ImportError as exc:
+            # Expected in LITE/public builds where PRO reporting modules are absent.
+            print_info_debug(
+                "[report] Technical report sync unavailable in this build; "
+                f"skipping legacy sync ({type(exc).__name__})."
+            )
         except Exception as exc:
             telemetry.capture_exception(exc)
-            print_warning("Failed to sync technical report update.")
+            print_info_debug(
+                "[report] Failed to sync technical report update from legacy report "
+                f"field '{key}' ({type(exc).__name__}: {exc})"
+            )
 
     def add_report(self, domain, vuln_info):
         """
@@ -26935,12 +27078,12 @@ if __name__ == "__main__":
     install_parser.add_argument(
         "--legacy",
         action="store_true",
-        help="Use the legacy host-based installer (apt/pip/go/rust) instead of Docker mode.",
+        help=argparse.SUPPRESS,
     )
     install_parser.add_argument(
         "--dev",
         action="store_true",
-        help="Use adscan/adscan-dev image channel.",
+        help=argparse.SUPPRESS,
     )
     install_parser.add_argument(
         "--allow-low-disk",
@@ -26996,12 +27139,12 @@ if __name__ == "__main__":
     start_parser.add_argument(
         "--legacy",
         action="store_true",
-        help="Run the legacy host-based ADscan (instead of Docker mode).",
+        help=argparse.SUPPRESS,
     )
     start_parser.add_argument(
         "--dev",
         action="store_true",
-        help="Use adscan/adscan-dev image channel.",
+        help=argparse.SUPPRESS,
     )
     start_parser.add_argument(
         "-d",
@@ -27048,12 +27191,12 @@ if __name__ == "__main__":
     ci_parser.add_argument(
         "--legacy",
         action="store_true",
-        help="Run the legacy host-based ADscan (instead of Docker mode).",
+        help=argparse.SUPPRESS,
     )
     ci_parser.add_argument(
         "--dev",
         action="store_true",
-        help="Use adscan/adscan-dev image channel.",
+        help=argparse.SUPPRESS,
     )
     ci_parser.add_argument(
         "-d",
@@ -27101,12 +27244,12 @@ if __name__ == "__main__":
     check_parser.add_argument(
         "--legacy",
         action="store_true",
-        help="Run the legacy host-based checks (instead of Docker mode).",
+        help=argparse.SUPPRESS,
     )
     check_parser.add_argument(
         "--dev",
         action="store_true",
-        help="Use adscan/adscan-dev image channel.",
+        help=argparse.SUPPRESS,
     )
     update_parser = subparsers.add_parser(
         "update", help="Update ADscan launcher and Docker image."

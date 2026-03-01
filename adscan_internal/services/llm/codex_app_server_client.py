@@ -494,11 +494,13 @@ class CodexAppServerClient:
     def _write_message(self, payload: dict[str, Any]) -> None:
         """Write one JSON message to app-server stdin."""
         process = self._get_process()
-        if process.stdin is None:
+        # Pylint can infer a dummy process proxy for subprocess.Popen in some
+        # environments; runtime objects expose stdin as expected.
+        if process.stdin is None:  # pylint: disable=no-member
             raise CodexAppServerError("Codex app-server stdin is unavailable.")
         encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-        process.stdin.write(encoded)
-        process.stdin.flush()
+        process.stdin.write(encoded)  # pylint: disable=no-member
+        process.stdin.flush()  # pylint: disable=no-member
 
     def _read_message_until(self, *, deadline: float) -> dict[str, Any] | None:
         """Read one JSON message from stdout before deadline."""

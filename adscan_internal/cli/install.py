@@ -233,9 +233,8 @@ def install_system_packages(
                 error_output = getattr(exc, "stderr", None) or getattr(
                     exc, "stdout", ""
                 )
-                if (
-                    "hashcat-data" in (error_output or "")
-                    or "trying to overwrite" in (error_output or "")
+                if "hashcat-data" in (error_output or "") or "trying to overwrite" in (
+                    error_output or ""
                 ):
                     deps.print_warning(
                         "hashcat installation conflict detected, attempting to fix "
@@ -337,16 +336,13 @@ def install_system_packages(
                             getattr(ntp_proc, "stderr", "") or "",
                         ]
                     ).strip()
-                    tail = (
-                        "\n".join(combined.splitlines()[-40:]) if combined else ""
-                    )
+                    tail = "\n".join(combined.splitlines()[-40:]) if combined else ""
                     deps.print_warning(
                         "Failed to install ntpsec-ntpdate; attempting fallback "
                         "package 'ntpdate'..."
                     )
                     deps.print_info_debug(
-                        "[apt] ntpsec-ntpdate install failed "
-                        f"rc={rc}"
+                        f"[apt] ntpsec-ntpdate install failed rc={rc}"
                     )
                     if tail:
                         deps.print_info_debug(
@@ -382,8 +378,7 @@ def install_system_packages(
                             "Time sync features may be limited."
                         )
                         deps.print_info_debug(
-                            "[apt] ntpdate fallback failed "
-                            f"rc={fb_rc}"
+                            f"[apt] ntpdate fallback failed rc={fb_rc}"
                         )
                         if tail_fb:
                             deps.print_info_debug(
@@ -485,17 +480,13 @@ def install_system_packages(
                         if proc
                         else ""
                     )
-                    tail = (
-                        "\n".join(combined.splitlines()[-40:]) if combined else ""
-                    )
+                    tail = "\n".join(combined.splitlines()[-40:]) if combined else ""
                     deps.print_info_debug(
                         "[apt] package failed "
                         f"rc={getattr(proc, 'returncode', None)} pkg={pkg}"
                     )
                     if tail:
-                        deps.print_info_debug(
-                            f"[apt] {pkg} output tail:\n" + tail
-                        )
+                        deps.print_info_debug(f"[apt] {pkg} output tail:\n" + tail)
 
                 # Remove any packages that were successfully installed individually from the pending list
                 for ok_pkg in successfully_installed:
@@ -535,9 +526,7 @@ def install_system_packages(
         if deps.install_rustup():
             deps.print_success("Rust toolchain installation completed")
         else:
-            deps.print_warning(
-                "Rust toolchain installation failed, but continuing..."
-            )
+            deps.print_warning("Rust toolchain installation failed, but continuing...")
             deps.print_info("RustHound-CE will not be available without Rust")
     except subprocess.CalledProcessError as exc:  # noqa: BLE001
         deps.telemetry_capture_exception(exc)
@@ -550,7 +539,6 @@ def install_system_packages(
     except FileNotFoundError as exc:  # noqa: BLE001
         deps.telemetry_capture_exception(exc)
         deps.print_error("'apt-get' not found. Cannot install system packages.")
-
 
 
 @dataclass(frozen=True)
@@ -742,8 +730,7 @@ def install_external_python_tools(
                             "python",
                         )
                         deps.print_info(
-                            "Installing pip in "
-                            f"{tool_dir_name} virtual environment..."
+                            f"Installing pip in {tool_dir_name} virtual environment..."
                         )
                         get_pip_url = "https://bootstrap.pypa.io/get-pip.py"
                         get_pip_path = os.path.join(
@@ -775,8 +762,7 @@ def install_external_python_tools(
                                 pip_clean_env = deps.get_clean_env_for_compilation()
                                 pip_clean_env["VIRTUAL_ENV"] = tool_venv_dir
                                 pip_clean_env["PATH"] = (
-                                    f"{tool_venv_bin}:"
-                                    f"{pip_clean_env.get('PATH', '')}"
+                                    f"{tool_venv_bin}:{pip_clean_env.get('PATH', '')}"
                                 )
                                 pip_clean_env.pop("PYTHONHOME", None)
                                 pip_clean_env.pop("PYTHONPATH", None)
@@ -811,8 +797,7 @@ def install_external_python_tools(
                                 )
                         else:
                             deps.print_warning(
-                                "Failed to download get-pip.py for "
-                                f"{tool_dir_name}"
+                                f"Failed to download get-pip.py for {tool_dir_name}"
                             )
                     except Exception as venv_fallback_exc:  # noqa: BLE001
                         deps.telemetry_capture_exception(venv_fallback_exc)
@@ -832,15 +817,12 @@ def install_external_python_tools(
             except Exception as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
                 deps.print_error(
-                    "Failed to create virtual environment for "
-                    f"{tool_dir_name}: {exc}"
+                    f"Failed to create virtual environment for {tool_dir_name}: {exc}"
                 )
                 all_tools_successful = False
                 continue
         else:
-            deps.print_info(
-                f"Virtual environment for {tool_dir_name} already exists."
-            )
+            deps.print_info(f"Virtual environment for {tool_dir_name} already exists.")
 
         # Install the tool itself into its venv
         deps.print_info(f"Installing {tool_dir_name} into its environment...")
@@ -953,8 +935,7 @@ def install_external_python_tools(
 
     if not all_tools_successful:
         deps.print_warning(
-            "Some external Python tools failed to install. "
-            "Please check the logs above."
+            "Some external Python tools failed to install. Please check the logs above."
         )
 
     return all_tools_successful
@@ -995,9 +976,7 @@ def install_core_dependencies(
     """
     core_requirements = config.core_requirements
     if not core_requirements:
-        deps.print_info_verbose(
-            "No core dependencies configured for system Python."
-        )
+        deps.print_info_verbose("No core dependencies configured for system Python.")
         return True
 
     # Determine which Python to use for system-level installs.
@@ -1032,8 +1011,7 @@ def install_core_dependencies(
             suggestions=[
                 "Check your internet connection",
                 "Verify pip is working: python3 -m pip --version",
-                "Try manual install: pip install "
-                + " ".join(core_requirements[:3]),
+                "Try manual install: pip install " + " ".join(core_requirements[:3]),
                 "Run with verbose mode: adscan install --verbose",
             ],
             show_exception=True,
@@ -1047,16 +1025,13 @@ def install_core_dependencies(
             is_called_process_error and getattr(exc, "returncode", 0) < 0
         )
         if is_sigbus or has_negative_returncode:
-            deps.print_warning(
-                "Bulk installation failed, trying smaller batches..."
-            )
+            deps.print_warning("Bulk installation failed, trying smaller batches...")
             try:
                 batch_size = 3
                 for i in range(0, len(core_requirements), batch_size):
                     batch = core_requirements[i : i + batch_size]
                     deps.print_info(
-                        "Installing batch "
-                        f"{i // batch_size + 1}: {', '.join(batch)}"
+                        f"Installing batch {i // batch_size + 1}: {', '.join(batch)}"
                     )
                     deps.run_pip_with_break_flag(
                         python_executable=system_python,
@@ -1202,7 +1177,7 @@ def install_wordlists(
 
     deps.print_info("Setting up wordlists...")
     for wl_name, wl_config in config.wordlists_config.items():
-        final_wl_name = wl_config["dest"].replace(".xz", "")
+        final_wl_name = wl_config["dest"].replace(".xz", "").replace(".7z", "")
         final_wl_path = deps.os_path_join(config.wordlists_install_dir, final_wl_name)
         if deps.os_path_exists(final_wl_path):
             deps.print_info(f"{wl_name} already exists at {final_wl_path}.")
@@ -1299,7 +1274,9 @@ def install_bloodhound_ce(
         deps.print_info("  2. Install Docker and Docker Compose:")
         deps.print_info("     Ubuntu/Debian: sudo apt install docker.io docker-compose")
         deps.print_info("     Or visit: https://docs.docker.com/engine/install/")
-        deps.print_info("\nNote: ADscan will continue installation without BloodHound CE")
+        deps.print_info(
+            "\nNote: ADscan will continue installation without BloodHound CE"
+        )
     else:
         # Environment is suitable, proceed with installation
         try:
@@ -1374,7 +1351,9 @@ def install_rusthound_ce_helper(
                     deps.print_warning(
                         f"Cargo is installed but not from rustup: {cargo_binary_path}"
                     )
-                    deps.print_info("Installing rustup to replace apt-installed Rust...")
+                    deps.print_info(
+                        "Installing rustup to replace apt-installed Rust..."
+                    )
                     cargo_available = False  # Force reinstallation
 
         if not cargo_available:
@@ -1394,7 +1373,9 @@ def install_rusthound_ce_helper(
                     deps.run_command(
                         ["apt", "install", "cargo", "-y"], check=True, env=clean_env
                     )
-                    deps.print_success("cargo installed successfully via apt (fallback)")
+                    deps.print_success(
+                        "cargo installed successfully via apt (fallback)"
+                    )
 
                     # Verify installation
                     cargo_available, cargo_version = deps.is_cargo_available()
@@ -1403,7 +1384,9 @@ def install_rusthound_ce_helper(
                             "cargo still not available after apt installation, "
                             "skipping RustHound-CE"
                         )
-                        deps.print_info("You can install Rust manually: apt install cargo")
+                        deps.print_info(
+                            "You can install Rust manually: apt install cargo"
+                        )
                     else:
                         deps.print_success(f"cargo verified: {cargo_version}")
                 except Exception as exc:  # noqa: BLE001
@@ -1560,7 +1543,9 @@ def install_go_and_htb_cli(
                     go_available = False  # Force reinstallation
 
         if not go_available:
-            deps.print_info("Go not found, installing from official golang.org source...")
+            deps.print_info(
+                "Go not found, installing from official golang.org source..."
+            )
             deps.print_info(
                 "This ensures we get the latest version (similar to rustup for Rust)"
             )
@@ -1579,7 +1564,9 @@ def install_go_and_htb_cli(
                 except Exception as exc:  # noqa: BLE001
                     deps.telemetry_capture_exception(exc)
                     deps.print_warning(f"Failed to install Go via apt: {exc}")
-                    deps.print_info("You can install Go manually: apt install golang-go")
+                    deps.print_info(
+                        "You can install Go manually: apt install golang-go"
+                    )
 
         go_available, go_version = deps.is_go_available()
         if go_available:
@@ -1643,7 +1630,9 @@ def install_go_and_htb_cli(
                             check=True,
                             env=clean_env,
                         )
-                        deps.print_success("Go installed successfully via apt (fallback)")
+                        deps.print_success(
+                            "Go installed successfully via apt (fallback)"
+                        )
 
                         # Verify installation
                         go_available, go_version = deps.is_go_available()
@@ -1660,7 +1649,9 @@ def install_go_and_htb_cli(
                     except Exception as exc:  # noqa: BLE001
                         deps.telemetry_capture_exception(exc)
                         deps.print_warning(f"Failed to install Go via apt: {exc}")
-                        deps.print_info("You can install Go manually: apt install golang-go")
+                        deps.print_info(
+                            "You can install Go manually: apt install golang-go"
+                        )
                 else:
                     # Verify installation after official install
                     go_available, go_version = deps.is_go_available()
@@ -1692,7 +1683,9 @@ def install_go_and_htb_cli(
                         # Configure PATH if needed
                         go_bin_in_path, _ = deps.is_go_bin_in_path()
                         if not go_bin_in_path:
-                            deps.print_warning("~/go/bin not found in PATH, configuring...")
+                            deps.print_warning(
+                                "~/go/bin not found in PATH, configuring..."
+                            )
                             path_configured = deps.configure_go_path()
 
                             if path_configured:
@@ -1707,7 +1700,9 @@ def install_go_and_htb_cli(
 
                                 htb_cli_accessible, _ = deps.is_htb_cli_accessible()
                                 if htb_cli_accessible:
-                                    deps.print_success("htb-cli is now accessible in PATH!")
+                                    deps.print_success(
+                                        "htb-cli is now accessible in PATH!"
+                                    )
                                     deps.install_summary["htb_cli"] = {
                                         "installed": True,
                                         "accessible": True,
@@ -1914,7 +1909,9 @@ def install_unbound_resolver(
             )
     except Exception as exc:  # noqa: BLE001
         deps.telemetry_capture_exception(exc)
-        deps.print_warning(f"Failed to finalize Unbound installation/configuration: {exc}")
+        deps.print_warning(
+            f"Failed to finalize Unbound installation/configuration: {exc}"
+        )
 
 
 @dataclass(frozen=True)
@@ -2066,7 +2063,9 @@ def run_install(
         deps.print_error(
             f"Not enough free disk space to run a full installation ({free_gb:.2f} GB available)."
         )
-        deps.print_instruction("Free up disk space and retry (recommended minimum: 10 GB).")
+        deps.print_instruction(
+            "Free up disk space and retry (recommended minimum: 10 GB)."
+        )
         deps.print_instruction(
             "Override this check (not recommended): adscan install --allow-low-disk"
         )
@@ -2079,7 +2078,11 @@ def run_install(
 
     # Check if only specific components should be installed (for QA testing)
     only_components = []
-    if config.install_args and hasattr(config.install_args, "only") and config.install_args.only:
+    if (
+        config.install_args
+        and hasattr(config.install_args, "only")
+        and config.install_args.only
+    ):
         only_components = config.install_args.only
 
     if only_components:
@@ -2098,7 +2101,9 @@ def run_install(
         # Install BloodHound CE if requested
         if "bloodhound" in only_components:
             deps.print_info("Installing BloodHound CE...")
-            can_install_bloodhound = docker_installed and compose_available and not in_container
+            can_install_bloodhound = (
+                docker_installed and compose_available and not in_container
+            )
 
             if not can_install_bloodhound:
                 deps.print_error("Cannot install BloodHound CE:")
@@ -2112,7 +2117,9 @@ def run_install(
                     install_success = False
                 else:
                     if not docker_installed:
-                        deps.print_error(f"  - Docker not available or not official: {docker_version}")
+                        deps.print_error(
+                            f"  - Docker not available or not official: {docker_version}"
+                        )
                     if not compose_available:
                         deps.print_error(
                             f"  - Docker Compose plugin not available: {compose_version}"
@@ -2125,7 +2132,9 @@ def run_install(
                     deps.print_info(
                         "     Ubuntu/Debian: sudo apt install docker.io docker-compose"
                     )
-                    deps.print_info("     Or visit: https://docs.docker.com/engine/install/")
+                    deps.print_info(
+                        "     Or visit: https://docs.docker.com/engine/install/"
+                    )
                     install_success = False
 
                     if not deps.install_docker_prerequisites():
@@ -2166,11 +2175,15 @@ def run_install(
 
         # Install pyenv if requested
         if "pyenv" in only_components:
-            deps.print_info("Installing pyenv (with Python and venv setup for testing)...")
+            deps.print_info(
+                "Installing pyenv (with Python and venv setup for testing)..."
+            )
             deps.print_info("Installing Python build dependencies...")
             # Note: pyenv installation in selective mode requires
             # additional dependencies that are complex to inject
-            deps.print_warning("pyenv installation in selective mode requires full deps")
+            deps.print_warning(
+                "pyenv installation in selective mode requires full deps"
+            )
             install_success = False
 
         # Final status
@@ -2241,7 +2254,9 @@ def run_install(
             deps.print_error(
                 f"Failed to update package lists: {getattr(e, 'stderr', '') or getattr(e, 'stdout', '')}"
             )
-            deps.print_error("Cannot continue installation without a successful apt update.")
+            deps.print_error(
+                "Cannot continue installation without a successful apt update."
+            )
         deps.log_free_disk_space_debug("after installation (apt-get update failed)")
         return False
 
@@ -2355,7 +2370,9 @@ def run_install(
                 tool_config["condition"] == "legacy_only"
                 and deps.get_bloodhound_mode() != "legacy"
             ):
-                deps.print_info(f"Skipping {tool_name} (not needed for BloodHound CE mode)")
+                deps.print_info(
+                    f"Skipping {tool_name} (not needed for BloodHound CE mode)"
+                )
                 continue
         external_tools[tool_name] = tool_config
 
@@ -2365,7 +2382,9 @@ def run_install(
     for tool_name, tool_config in external_tools.items():
         deps.print_info(f"Processing {tool_name}...")
         try:
-            if not deps.setup_external_tool(tool_name, tool_config, github_dns_ok=github_dns_ok):
+            if not deps.setup_external_tool(
+                tool_name, tool_config, github_dns_ok=github_dns_ok
+            ):
                 return False
         except Exception as e:
             deps.telemetry_capture_installation_failed(e)
@@ -2400,7 +2419,8 @@ def run_install(
             is_docker_env=deps.is_docker_env,
             is_docker_official_installed=deps.is_docker_official_installed,
             is_docker_compose_plugin_available=deps.is_docker_compose_plugin_available,
-            install_bloodhound_ce=lambda *args, **kwargs: True,  # Placeholder - needs full deps
+            install_bloodhound_ce=lambda *args,
+            **kwargs: True,  # Placeholder - needs full deps
             telemetry_capture_exception=deps.telemetry_capture_exception,
             print_info=deps.print_info,
             print_info_verbose=deps.print_info_verbose,
@@ -2418,7 +2438,9 @@ def run_install(
             is_cargo_available=lambda: (True, "1.0"),  # Placeholder
             install_rustup=lambda: True,  # Placeholder
             install_rusthound_ce=lambda: (True, ""),  # Placeholder
-            get_rusthound_verification_status=lambda env: {"verification_results": {}},  # Placeholder
+            get_rusthound_verification_status=lambda env: {
+                "verification_results": {}
+            },  # Placeholder
             configure_cargo_path=lambda: True,  # Placeholder
             get_clean_env_for_compilation=deps.get_clean_env_for_compilation,
             run_command=deps.run_command,
@@ -2470,7 +2492,8 @@ def run_install(
                 sudo_validate=lambda: True,  # Placeholder
                 get_port_53_listeners_text=lambda use_sudo=False: "",  # Placeholder
                 extract_process_names_from_ss=lambda text: [],  # Placeholder
-                stop_dns_resolver_service_for_unbound=lambda *args, **kwargs: None,  # Placeholder
+                stop_dns_resolver_service_for_unbound=lambda *args,
+                **kwargs: None,  # Placeholder
                 run_systemctl_command=lambda *args, **kwargs: None,  # Placeholder
                 telemetry_capture_exception=deps.telemetry_capture_exception,
                 print_info=deps.print_info,
@@ -2486,7 +2509,9 @@ def run_install(
     # Post-install sanity check
     deps.print_info("")
     deps.print_info("Running post-installation check...")
-    post_install_check_args = type("Namespace", (), {"command": "check", "fix": False})()
+    post_install_check_args = type(
+        "Namespace", (), {"command": "check", "fix": False}
+    )()
     post_install_ok = deps.handle_check(post_install_check_args)
     deps.install_summary["post_install_check"] = {"success": bool(post_install_ok)}
 

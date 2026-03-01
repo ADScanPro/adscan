@@ -66,10 +66,13 @@ from adscan_launcher.paths import (
     get_state_dir,
     get_workspaces_dir,
 )
+from adscan_core.interrupts import emit_interrupt_debug
 
 
-DEFAULT_DOCKER_IMAGE = "adscan/adscan:latest"
-DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-dev:edge"
+DEFAULT_DOCKER_IMAGE = "adscan/adscan-lite:latest"
+DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-lite-dev:edge"
+LEGACY_DEFAULT_DOCKER_IMAGE = "adscan/adscan:latest"
+LEGACY_DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-dev:edge"
 DEFAULT_BLOODHOUND_ADMIN_PASSWORD = "Adscan4thewin!"
 DEFAULT_HOST_HELPER_SOCKET_NAME = "host-helper.sock"
 _DOCKER_RUN_HELP_HAS_GPUS_RE = re.compile(r"\\s--gpus\\b", re.IGNORECASE)
@@ -84,6 +87,7 @@ _LOCAL_RESOLVER_LOOPBACK_CANDIDATES = (
 _MIN_DOCKER_INSTALL_FREE_GB = 10
 _DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3600
 _EPHEMERAL_CONTAINER_SHARED_TOKEN: str | None = None
+_LEGACY_IMAGE_WARNING_SHOWN = False
 
 # Keep BloodHound CE config in the effective user's home (sudo-safe), matching
 # the default behavior of bloodhound-cli tooling.
@@ -203,16 +207,79 @@ def _get_docker_storage_path() -> Path:
     return get_adscan_home_dir()
 
 
-def _get_docker_image() -> str:
+def _get_docker_image_candidates() -> list[str]:
+    """Return Docker image candidates in priority order.
+
+    Order:
+    1. Explicit `ADSCAN_DOCKER_IMAGE` (single candidate, no fallback)
+    2. New default naming by channel (`*-lite` / `*-lite-dev`)
+    3. Legacy naming fallback (`adscan/adscan*`) for backward compatibility
+    """
     explicit = os.getenv("ADSCAN_DOCKER_IMAGE", "").strip()
     if explicit:
-        return explicit
+        return [explicit]
 
     channel = os.getenv("ADSCAN_DOCKER_CHANNEL", "").strip().lower()
     if channel == "dev":
-        return DEFAULT_DEV_DOCKER_IMAGE
+        return [DEFAULT_DEV_DOCKER_IMAGE, LEGACY_DEFAULT_DEV_DOCKER_IMAGE]
 
-    return DEFAULT_DOCKER_IMAGE
+    return [DEFAULT_DOCKER_IMAGE, LEGACY_DEFAULT_DOCKER_IMAGE]
+
+
+def _get_docker_image() -> str:
+    """Return the preferred Docker image for this environment."""
+    return _get_docker_image_candidates()[0]
+
+
+def _warn_using_legacy_image(*, selected_image: str, preferred_image: str) -> None:
+    """Emit a one-time warning when legacy image naming is selected."""
+    global _LEGACY_IMAGE_WARNING_SHOWN  # pylint: disable=global-statement
+    if _LEGACY_IMAGE_WARNING_SHOWN:
+        return
+    if selected_image == preferred_image:
+        return
+    print_warning(
+        "Using legacy Docker image naming for compatibility: "
+        f"{selected_image} (preferred: {preferred_image})."
+    )
+    _LEGACY_IMAGE_WARNING_SHOWN = True
+
+
+def _select_existing_or_preferred_image() -> str:
+    """Use an existing compatible image when available, else preferred image."""
+    candidates = _get_docker_image_candidates()
+    preferred = candidates[0]
+    for candidate in candidates:
+        if image_exists(candidate):
+            _warn_using_legacy_image(
+                selected_image=candidate,
+                preferred_image=preferred,
+            )
+            return candidate
+    return preferred
+
+
+def _ensure_image_pulled_with_legacy_fallback(
+    *,
+    pull_timeout: int | None,
+    stream_output: bool,
+) -> str | None:
+    """Pull preferred image, then fallback to legacy naming if needed."""
+    candidates = _get_docker_image_candidates()
+    preferred = candidates[0]
+    for idx, candidate in enumerate(candidates):
+        if idx > 0:
+            print_warning(
+                "Primary Docker image pull failed; trying legacy image naming: "
+                f"{candidate}"
+            )
+        if ensure_image_pulled(candidate, timeout=pull_timeout, stream_output=stream_output):
+            _warn_using_legacy_image(
+                selected_image=candidate,
+                preferred_image=preferred,
+            )
+            return candidate
+    return None
 
 
 def get_docker_image_name() -> str:
@@ -391,7 +458,17 @@ def _ensure_bloodhound_ce_auth_for_docker() -> bool:
                 new_password = getpass.getpass(
                     "BloodHound CE password (leave empty for Adscan4thewin!): "
                 )
-            except (EOFError, KeyboardInterrupt):
+            except (EOFError, KeyboardInterrupt) as exc:
+                interrupt_kind = (
+                    "keyboard_interrupt"
+                    if isinstance(exc, KeyboardInterrupt)
+                    else "eof"
+                )
+                emit_interrupt_debug(
+                    kind=interrupt_kind,
+                    source="launcher.bloodhound_ce_password_prompt_initial",
+                    print_debug=print_info_debug,
+                )
                 print_warning("Aborting: no credentials provided.")
                 return False
             if not new_password:
@@ -466,7 +543,15 @@ def _ensure_bloodhound_ce_auth_for_docker() -> bool:
         new_password = getpass.getpass(
             "BloodHound CE password (leave empty for Adscan4thewin!): "
         )
-    except (EOFError, KeyboardInterrupt):
+    except (EOFError, KeyboardInterrupt) as exc:
+        interrupt_kind = (
+            "keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "eof"
+        )
+        emit_interrupt_debug(
+            kind=interrupt_kind,
+            source="launcher.bloodhound_ce_password_prompt_refresh",
+            print_debug=print_info_debug,
+        )
         print_warning("Aborting: no credentials provided.")
         return False
     if not new_password:
@@ -1303,8 +1388,11 @@ def handle_install_docker(
         )
         print_warning("Installation cancelled before Docker image download.")
         return False
-    ok = ensure_image_pulled(image, timeout=pull_timeout, stream_output=True)
-    if not ok:
+    resolved_image = _ensure_image_pulled_with_legacy_fallback(
+        pull_timeout=pull_timeout,
+        stream_output=True,
+    )
+    if not resolved_image:
         telemetry.capture(
             "docker_install_pull_adscan_image_failed",
             {
@@ -1341,6 +1429,7 @@ def handle_install_docker(
         print_instruction("To disable the pull timeout entirely:")
         print_instruction("  adscan install --pull-timeout 0")
         return False
+    image = resolved_image
 
     telemetry.capture(
         "docker_install_pull_adscan_image_completed",
@@ -1471,7 +1560,7 @@ def handle_install_docker(
 
 def handle_check_docker() -> bool:
     """Check ADscan Docker-mode prerequisites."""
-    image = _get_docker_image()
+    image = _select_existing_or_preferred_image()
     all_ok = True
 
     print_info("Checking ADscan Docker mode...")
@@ -1565,7 +1654,7 @@ def handle_start_docker(
     pull_timeout_seconds: int | None = None,
 ) -> int:
     """Start ADscan inside Docker and return the docker exit code."""
-    image = _get_docker_image()
+    image = _select_existing_or_preferred_image()
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
         return 1
@@ -1601,9 +1690,14 @@ def handle_start_docker(
         print_warning(f"ADscan docker image not present: {image}")
         print_info("Pulling the image now...")
         pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
-        if not ensure_image_pulled(image, timeout=pull_timeout, stream_output=True):
+        resolved_image = _ensure_image_pulled_with_legacy_fallback(
+            pull_timeout=pull_timeout,
+            stream_output=True,
+        )
+        if not resolved_image:
             print_error("Failed to pull the ADscan Docker image.")
             return 1
+        image = resolved_image
 
     workspaces = _get_workspaces_dir()
     config_dir = _get_config_dir()
@@ -1718,7 +1812,7 @@ def handle_ci_docker(
     pull_timeout_seconds: int | None = None,
 ) -> int:
     """Run `adscan ci` inside Docker and return the docker exit code."""
-    image = _get_docker_image()
+    image = _select_existing_or_preferred_image()
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
         return 1
@@ -1738,9 +1832,14 @@ def handle_ci_docker(
         print_warning(f"ADscan docker image not present: {image}")
         print_info("Pulling the image now...")
         pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
-        if not ensure_image_pulled(image, timeout=pull_timeout, stream_output=True):
+        resolved_image = _ensure_image_pulled_with_legacy_fallback(
+            pull_timeout=pull_timeout,
+            stream_output=True,
+        )
+        if not resolved_image:
             print_error("Failed to pull the ADscan Docker image.")
             return 1
+        image = resolved_image
 
     workspaces_dir = _get_workspaces_dir()
     config_dir = _get_config_dir()
@@ -1859,10 +1958,14 @@ def update_docker_image(*, pull_timeout_seconds: int | None = None) -> int:
         return 1
     pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
     print_info(f"Pulling image: {image}")
-    ok = ensure_image_pulled(image, timeout=pull_timeout, stream_output=True)
-    if not ok:
+    resolved_image = _ensure_image_pulled_with_legacy_fallback(
+        pull_timeout=pull_timeout,
+        stream_output=True,
+    )
+    if not resolved_image:
         print_error("Failed to pull the ADscan Docker image.")
         return 1
+    image = resolved_image
     print_success("Docker image pulled successfully.")
     return 0
 
@@ -1879,7 +1982,7 @@ def run_adscan_passthrough_docker(
     This is used by the PyPI launcher to avoid duplicating the full internal
     CLI argument parsing while still keeping Docker-mode preflight consistent.
     """
-    image = _get_docker_image()
+    image = _select_existing_or_preferred_image()
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
         return 1
@@ -1899,9 +2002,14 @@ def run_adscan_passthrough_docker(
         print_warning(f"ADscan docker image not present: {image}")
         print_info("Pulling the image now...")
         pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
-        if not ensure_image_pulled(image, timeout=pull_timeout, stream_output=True):
+        resolved_image = _ensure_image_pulled_with_legacy_fallback(
+            pull_timeout=pull_timeout,
+            stream_output=True,
+        )
+        if not resolved_image:
             print_error("Failed to pull the ADscan Docker image.")
             return 1
+        image = resolved_image
 
     workspaces_dir = _get_workspaces_dir()
     config_dir = _get_config_dir()

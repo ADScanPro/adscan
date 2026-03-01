@@ -14,6 +14,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.integrations.netexec.parsers import parse_adcs_detection_output
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import CredentialStoreService
 from adscan_internal.workspaces import domain_relpath
@@ -593,23 +594,15 @@ def _capture_adcs_discovered(
     ca_name: str | None,
 ) -> None:
     try:
-        lab_slug = shell._get_lab_slug()
         properties: dict[str, object] = {
             "scan_mode": getattr(shell, "scan_mode", None),
             "auth_type": domain_data.get("auth", "unknown"),
             "workspace_type": shell.type,
             "auto_mode": shell.auto,
-            "lab_slug": lab_slug,
             "has_enrollment_server": enrollment_server is not None,
             "has_ca": ca_name is not None,
         }
-        if getattr(shell, "lab_provider", None):
-            properties["lab_provider"] = shell.lab_provider
-        if (
-            getattr(shell, "lab_name", None)
-            and getattr(shell, "lab_name_whitelisted", None) is True
-        ):
-            properties["lab_name"] = shell.lab_name
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
         telemetry.capture("adcs_discovered", properties)
     except Exception as telemetry_error:
         telemetry.capture_exception(telemetry_error)
@@ -617,22 +610,14 @@ def _capture_adcs_discovered(
 
 def _capture_adcs_not_discovered(shell: Any, domain_data: dict, *, error: bool) -> None:
     try:
-        lab_slug = shell._get_lab_slug()
         properties: dict[str, object] = {
             "scan_mode": getattr(shell, "scan_mode", None),
             "auth_type": domain_data.get("auth", "unknown"),
             "workspace_type": shell.type,
             "auto_mode": shell.auto,
-            "lab_slug": lab_slug,
             "error": error,
         }
-        if getattr(shell, "lab_provider", None):
-            properties["lab_provider"] = shell.lab_provider
-        if (
-            getattr(shell, "lab_name", None)
-            and getattr(shell, "lab_name_whitelisted", None) is True
-        ):
-            properties["lab_name"] = shell.lab_name
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
         telemetry.capture("adcs_not_discovered", properties)
     except Exception as telemetry_error:
         telemetry.capture_exception(telemetry_error)

@@ -32,6 +32,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from hashlib import sha256
@@ -48,6 +49,7 @@ _MAX_RDP_SECRET_LEN = 2048
 _SAFE_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,253}[A-Za-z0-9]$")
 _SAFE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,253}[A-Za-z0-9]$")
 _SAFE_USERNAME_RE = re.compile(r"^[A-Za-z0-9._$@-]{1,256}$")
+_SAFE_SHARE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9$._ -]{0,127}$")
 # Workspace creation currently allows names with spaces, so the helper must
 # accept them too to keep host-file imports consistent with CLI workspaces.
 _SAFE_WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$")
@@ -324,6 +326,90 @@ def _validate_bloodhound_compose_path(value: str) -> str:
     return str(resolved)
 
 
+def _validate_cifs_mount_root(value: str) -> Path:
+    """Validate CIFS mount root under invoking user's workspaces tree."""
+    if not isinstance(value, str) or not value.strip():
+        raise HostHelperError("Missing mount_root")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise HostHelperError("mount_root must be absolute")
+    resolved = path.resolve(strict=False)
+    workspaces_root = (_invoker_adscan_root_dir() / "workspaces").resolve(strict=False)
+    _safe_resolve_within(workspaces_root, resolved)
+    return resolved
+
+
+def _validate_cifs_share_name(value: str) -> str:
+    """Validate SMB share name for CIFS operations."""
+    text = str(value or "").strip()
+    if not text or not _SAFE_SHARE_RE.match(text):
+        raise HostHelperError("Invalid share")
+    return text
+
+
+def _validate_cifs_username(value: str) -> str:
+    """Validate username used for CIFS mount auth."""
+    text = str(value or "").strip()
+    if not text or len(text) > 256:
+        raise HostHelperError("Invalid username")
+    return text
+
+
+def _validate_cifs_password(value: str) -> str:
+    """Validate password used for CIFS mount auth."""
+    text = str(value or "")
+    if len(text) > 4096:
+        raise HostHelperError("Password too long")
+    return text
+
+
+def _validate_cifs_domain(value: str | None) -> str:
+    """Validate optional domain for CIFS mount auth."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not _SAFE_DOMAIN_RE.match(text):
+        raise HostHelperError("Invalid domain")
+    return text
+
+
+def _build_cifs_mount_args(
+    *,
+    host: str,
+    share: str,
+    mount_point: Path,
+    credentials_file: Path,
+    read_only: bool,
+) -> list[str]:
+    """Build argv for CIFS mount command."""
+    options = [
+        f"credentials={credentials_file}",
+        "vers=3.0",
+        "iocharset=utf8",
+        "noperm",
+    ]
+    if read_only:
+        options.append("ro")
+    else:
+        options.append("rw")
+    options_arg = ",".join(options)
+    mount_cifs_bin = shutil_which("mount.cifs")
+    if mount_cifs_bin:
+        return [mount_cifs_bin, f"//{host}/{share}", str(mount_point), "-o", options_arg]
+    mount_bin = shutil_which("mount")
+    if mount_bin:
+        return [
+            mount_bin,
+            "-t",
+            "cifs",
+            f"//{host}/{share}",
+            str(mount_point),
+            "-o",
+            options_arg,
+        ]
+    raise HostHelperError("mount/mount.cifs not found")
+
+
 def _docker_compose_invocation() -> list[str] | None:
     """Return the docker compose invocation prefix, or None if unavailable."""
     if shutil_which("docker"):
@@ -542,6 +628,185 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
             "/cert:ignore",
         ]
         return _run_detached_as_invoker(argv, env=_build_invoker_env())
+
+    if op == "cifs_mount_share":
+        host = req.get("host")
+        share = req.get("share")
+        mount_root = req.get("mount_root")
+        username = req.get("username")
+        password = req.get("password")
+        domain = req.get("domain")
+        read_only = req.get("read_only", True)
+        if (
+            not isinstance(host, str)
+            or not isinstance(share, str)
+            or not isinstance(mount_root, str)
+            or not isinstance(username, str)
+            or not isinstance(password, str)
+            or not isinstance(read_only, bool)
+        ):
+            return HostHelperResponse(
+                False, None, None, None, "Invalid cifs_mount_share payload"
+            )
+
+        try:
+            validated_host = _validate_host_or_ipv4(host)
+            validated_share = _validate_cifs_share_name(share)
+            validated_mount_root = _validate_cifs_mount_root(mount_root)
+            validated_username = _validate_cifs_username(username)
+            validated_password = _validate_cifs_password(password)
+            validated_domain = _validate_cifs_domain(domain if isinstance(domain, str) else "")
+        except HostHelperError as exc:
+            return HostHelperResponse(False, None, None, None, str(exc))
+
+        mount_point = (
+            validated_mount_root / validated_host / validated_share
+        ).resolve(strict=False)
+        try:
+            _safe_resolve_within(validated_mount_root, mount_point)
+        except HostHelperError as exc:
+            return HostHelperResponse(False, None, None, None, str(exc))
+
+        mount_point.mkdir(parents=True, exist_ok=True)
+        if os.path.ismount(mount_point):
+            stdout = json.dumps(
+                {
+                    "mount_point": str(mount_point),
+                    "already_mounted": True,
+                    "mounted_by_helper": False,
+                },
+                ensure_ascii=False,
+            )
+            return HostHelperResponse(
+                True,
+                0,
+                stdout,
+                None,
+                "CIFS share already mounted",
+            )
+
+        credentials_file: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(  # noqa: PTH123
+                mode="w",
+                prefix="adscan_cifs_",
+                suffix=".cred",
+                delete=False,
+                encoding="utf-8",
+            ) as handle:
+                credentials_file = Path(handle.name)
+                handle.write(f"username={validated_username}\n")
+                handle.write(f"password={validated_password}\n")
+                if validated_domain:
+                    handle.write(f"domain={validated_domain}\n")
+            os.chmod(credentials_file, 0o600)
+
+            argv = _build_cifs_mount_args(
+                host=validated_host,
+                share=validated_share,
+                mount_point=mount_point,
+                credentials_file=credentials_file,
+                read_only=read_only,
+            )
+            result = _run_cmd(argv, timeout=120)
+            if not result.ok:
+                return result
+
+            stdout = json.dumps(
+                {
+                    "mount_point": str(mount_point),
+                    "already_mounted": False,
+                    "mounted_by_helper": True,
+                },
+                ensure_ascii=False,
+            )
+            return HostHelperResponse(
+                True,
+                0,
+                stdout,
+                result.stderr,
+                "CIFS share mounted",
+            )
+        finally:
+            if credentials_file is not None:
+                try:
+                    credentials_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    if op == "cifs_unmount_share":
+        mount_point = req.get("mount_point")
+        lazy = req.get("lazy", False)
+        if not isinstance(mount_point, str) or not isinstance(lazy, bool):
+            return HostHelperResponse(
+                False, None, None, None, "Invalid cifs_unmount_share payload"
+            )
+        try:
+            validated_mount_point = Path(mount_point).expanduser().resolve(strict=False)
+            validated_root = _validate_cifs_mount_root(str(validated_mount_point.parent.parent))
+            _safe_resolve_within(validated_root, validated_mount_point)
+        except HostHelperError as exc:
+            return HostHelperResponse(False, None, None, None, str(exc))
+
+        if not validated_mount_point.exists():
+            stdout = json.dumps(
+                {
+                    "mount_point": str(validated_mount_point),
+                    "was_mounted": False,
+                    "unmounted": False,
+                },
+                ensure_ascii=False,
+            )
+            return HostHelperResponse(
+                True,
+                0,
+                stdout,
+                None,
+                "Mount path does not exist",
+            )
+
+        if not os.path.ismount(validated_mount_point):
+            stdout = json.dumps(
+                {
+                    "mount_point": str(validated_mount_point),
+                    "was_mounted": False,
+                    "unmounted": False,
+                },
+                ensure_ascii=False,
+            )
+            return HostHelperResponse(
+                True,
+                0,
+                stdout,
+                None,
+                "Path is not a mountpoint",
+            )
+
+        umount_bin = shutil_which("umount")
+        if not umount_bin:
+            return HostHelperResponse(False, 127, None, None, "umount not found")
+        argv = [umount_bin]
+        if lazy:
+            argv.append("-l")
+        argv.append(str(validated_mount_point))
+        result = _run_cmd(argv, timeout=60)
+        if not result.ok:
+            return result
+        stdout = json.dumps(
+            {
+                "mount_point": str(validated_mount_point),
+                "was_mounted": True,
+                "unmounted": True,
+            },
+            ensure_ascii=False,
+        )
+        return HostHelperResponse(
+            True,
+            0,
+            stdout,
+            result.stderr,
+            "CIFS share unmounted",
+        )
 
     if op == "import_file_to_workspace":
         workspace = req.get("workspace")

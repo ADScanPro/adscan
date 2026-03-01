@@ -47,6 +47,7 @@ from adscan_internal.rich_output import (
     print_warning_debug,
     print_warning_verbose,
 )
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.services import CredentialService, EnumerationService
 from adscan_internal.integrations.impacket import ImpacketContext, ImpacketRunner
 from adscan_internal.workspaces import (
@@ -449,17 +450,14 @@ def finalize_roast_results(
         print_error(f"No {roast_type}able users found in domain {marked_domain}")
 
         try:
-            lab_slug = shell._get_lab_slug()
-            telemetry.capture(
-                f"{roast_type}_no_users_found",
-                {
-                    "scan_mode": getattr(shell, "scan_mode", None),
-                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                    "workspace_type": getattr(shell, "type", None),
-                    "auto_mode": getattr(shell, "auto", False),
-                    "lab_slug": lab_slug,
-                },
-            )
+            properties = {
+                "scan_mode": getattr(shell, "scan_mode", None),
+                "auth_type": shell.domains_data[domain].get("auth", "unknown"),
+                "workspace_type": getattr(shell, "type", None),
+                "auto_mode": getattr(shell, "auto", False),
+            }
+            properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+            telemetry.capture(f"{roast_type}_no_users_found", properties)
         except Exception as e:  # pragma: no cover - best effort
             telemetry.capture_exception(e)
 
@@ -579,19 +577,16 @@ def finalize_roast_results(
     try:
         total_users = len(all_users)
         admin_count = len(admin_users) if domain_data.get("auth") == "auth" else 0
-        lab_slug = shell._get_lab_slug()
-        telemetry.capture(
-            f"{roast_type}_users_found",
-            {
-                "total_users": total_users,
-                "admin_users": admin_count,
-                "scan_mode": getattr(shell, "scan_mode", None),
-                "auth_type": domain_data.get("auth", "unknown"),
-                "workspace_type": getattr(shell, "type", None),
-                "auto_mode": getattr(shell, "auto", False),
-                "lab_slug": lab_slug,
-            },
-        )
+        base_properties = {
+            "total_users": total_users,
+            "admin_users": admin_count,
+            "scan_mode": getattr(shell, "scan_mode", None),
+            "auth_type": domain_data.get("auth", "unknown"),
+            "workspace_type": getattr(shell, "type", None),
+            "auto_mode": getattr(shell, "auto", False),
+        }
+        base_properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture(f"{roast_type}_users_found", base_properties)
 
         # Track TTFH (Time To First Hash) for case study metrics
         # Use scan_start_time (not session_start_time) for accurate timing
@@ -609,17 +604,15 @@ def finalize_roast_results(
             ttfh_seconds = max(
                 0.0, shell._session_first_hash_time - shell.scan_start_time
             )
-            telemetry.capture(
-                "metric_ttfh",
-                {
-                    "ttfh_seconds": round(ttfh_seconds, 2),
-                    "ttfh_minutes": round(ttfh_seconds / 60.0, 2),
-                    "hash_type": roast_type,
-                    "hash_count": total_users,
-                    "scan_mode": getattr(shell, "scan_mode", None),
-                    "lab_slug": lab_slug,
-                },
-            )
+            ttfh_properties = {
+                "ttfh_seconds": round(ttfh_seconds, 2),
+                "ttfh_minutes": round(ttfh_seconds / 60.0, 2),
+                "hash_type": roast_type,
+                "hash_count": total_users,
+                "scan_mode": getattr(shell, "scan_mode", None),
+            }
+            ttfh_properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+            telemetry.capture("metric_ttfh", ttfh_properties)
 
         # Track hash count for case study metrics
         if hasattr(shell, "_session_hashes_count"):
@@ -884,17 +877,14 @@ def run_kerberoast(
     result_users = [h.username for h in hashes]
 
     try:
-        lab_slug = shell._get_lab_slug()
-        telemetry.capture(
-            "kerberoast_started",
-            {
-                "scan_mode": getattr(shell, "scan_mode", None),
-                "auth_type": shell.domains_data[target_domain].get("auth", "unknown"),
-                "workspace_type": getattr(shell, "type", None),
-                "auto_mode": getattr(shell, "auto", False),
-                "lab_slug": lab_slug,
-            },
-        )
+        properties = {
+            "scan_mode": getattr(shell, "scan_mode", None),
+            "auth_type": shell.domains_data[target_domain].get("auth", "unknown"),
+            "workspace_type": getattr(shell, "type", None),
+            "auto_mode": getattr(shell, "auto", False),
+        }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("kerberoast_started", properties)
     except Exception as e:  # pragma: no cover - best effort
         telemetry.capture_exception(e)
 
@@ -1050,17 +1040,14 @@ def run_asreproast(
         )
 
     try:
-        lab_slug = shell._get_lab_slug()
-        telemetry.capture(
-            "asreproast_started",
-            {
-                "scan_mode": getattr(shell, "scan_mode", None),
-                "auth_type": shell.domains_data[target_domain].get("auth", "unknown"),
-                "workspace_type": getattr(shell, "type", None),
-                "auto_mode": getattr(shell, "auto", False),
-                "lab_slug": lab_slug,
-            },
-        )
+        properties = {
+            "scan_mode": getattr(shell, "scan_mode", None),
+            "auth_type": shell.domains_data[target_domain].get("auth", "unknown"),
+            "workspace_type": getattr(shell, "type", None),
+            "auto_mode": getattr(shell, "auto", False),
+        }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("asreproast_started", properties)
     except Exception as e:  # pragma: no cover - best effort
         telemetry.capture_exception(e)
 
@@ -1614,10 +1601,13 @@ def run_dcsync(shell: KerberosShell, domain: str, username: str, password: str) 
     domain = resolved_domain
 
     admins = shell.get_domain_admins(domain)
-    if admins:
-        default_user = admins[0]
+    if shell.domains_data[domain]["auth"] in ["pwned"]:
+        default_user = "All"
     else:
-        default_user = "Administrator"
+        if admins:
+            default_user = admins[0]
+        else:
+            default_user = "Administrator"
     target_user_raw = Prompt.ask(
         "Specify the user to extract NTLM hashes from (type 'All' for all users)",
         default=default_user,

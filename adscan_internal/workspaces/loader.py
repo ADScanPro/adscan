@@ -6,7 +6,6 @@ them to the CLI shell instance, including DNS reconfiguration and telemetry upda
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import time
@@ -31,6 +30,7 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.workspaces.io import read_json_file
 from adscan_internal.workspaces.state import apply_workspace_variables_to_shell
+from adscan_internal.cli.common import build_telemetry_context
 
 
 class WorkspaceLoaderShell(Protocol):
@@ -103,25 +103,10 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
             apply_workspace_variables_to_shell(shell, variables)
 
             # Update telemetry context
-            telemetry_context: dict[str, object] = {}
-            if shell.current_workspace:
-                from adscan_internal.telemetry import TELEMETRY_ID
-
-                workspace_unique_id = f"{TELEMETRY_ID}:{shell.current_workspace}"
-                telemetry_context["workspace_id_hash"] = hashlib.sha256(
-                    workspace_unique_id.encode()
-                ).hexdigest()[:12]
-            if shell.type:
-                telemetry_context["workspace_type"] = shell.type
-            if shell.lab_provider:
-                telemetry_context["lab_provider"] = shell.lab_provider
-            if shell.lab_name and shell.lab_name_whitelisted is True:
-                telemetry_context["lab_name"] = shell.lab_name
-            if shell.lab_name is not None:
-                telemetry_context["lab_name_whitelisted"] = (
-                    shell.lab_name_whitelisted is True
-                )
-            telemetry_context["telemetry_change_trigger"] = "workspace_load"
+            telemetry_context = build_telemetry_context(
+                shell=shell,
+                trigger="workspace_load",
+            )
             telemetry.set_cli_telemetry(
                 shell.telemetry, context=telemetry_context
             )  # CLI override set; no identify here

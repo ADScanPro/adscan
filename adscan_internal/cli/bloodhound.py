@@ -29,6 +29,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.bloodhound_ce_compose import BLOODHOUND_CE_DEFAULT_WEB_PORT
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.rich_output import mark_passthrough, mark_sensitive, print_panel
 from adscan_internal.workspaces import domain_subpath
 
@@ -1833,17 +1834,14 @@ def run_bloodhound_attack_paths(
                 ttfap_seconds = max(
                     0.0, shell._session_first_attack_path_time - shell.scan_start_time
                 )
-                lab_slug = shell._get_lab_slug()
-                telemetry.capture(
-                    "metric_ttfap",
-                    {
-                        "ttfap_seconds": round(ttfap_seconds, 2),
-                        "ttfap_minutes": round(ttfap_seconds / 60.0, 2),
-                        "paths_count": unique_paths,
-                        "scan_mode": getattr(shell, "scan_mode", None),
-                        "lab_slug": lab_slug,
-                    },
-                )
+                properties = {
+                    "ttfap_seconds": round(ttfap_seconds, 2),
+                    "ttfap_minutes": round(ttfap_seconds / 60.0, 2),
+                    "paths_count": unique_paths,
+                    "scan_mode": getattr(shell, "scan_mode", None),
+                }
+                properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+                telemetry.capture("metric_ttfap", properties)
     except Exception as exc:  # pragma: no cover - best effort
         telemetry.capture_exception(exc)
 
@@ -3447,72 +3445,121 @@ def execute_bloodhound_laps(
             count_dc = len(dc_list)
             count_non_dc = len(non_dc_list)
 
+            def _write_host_list(path: str, hosts: list[str]) -> None:
+                with open(path, "w", encoding="utf-8") as file_handle:
+                    for host in hosts:
+                        file_handle.write(host + "\n")
+
+            def _render_laps_inventory_panel(
+                *,
+                laps_state_label: str,
+                border_style: str,
+                dc_file: str | None,
+                non_dc_file: str | None,
+            ) -> None:
+                marked_domain_local = mark_sensitive(domain, "domain")
+                marked_main_file = mark_sensitive(
+                    os.path.join(shell.domains_dir, domain, comp_file), "path"
+                )
+                marked_dc_file = mark_sensitive(dc_file, "path") if dc_file else "N/A"
+                marked_non_dc_file = (
+                    mark_sensitive(non_dc_file, "path") if non_dc_file else "N/A"
+                )
+                dc_ratio = (count_dc / count * 100.0) if count > 0 else 0.0
+                non_dc_ratio = (count_non_dc / count * 100.0) if count > 0 else 0.0
+                print_panel(
+                    "\n".join(
+                        [
+                            f"Domain: {marked_domain_local}",
+                            f"LAPS state: {laps_state_label}",
+                            f"Total enabled computers: {count}",
+                            f"Domain Controllers: {count_dc} ({dc_ratio:.1f}%)",
+                            f"Non-DC computers: {count_non_dc} ({non_dc_ratio:.1f}%)",
+                            "",
+                            "Artifacts",
+                            f"- Full inventory: {marked_main_file}",
+                            f"- DC subset: {marked_dc_file}",
+                            f"- Non-DC subset: {marked_non_dc_file}",
+                        ]
+                    ),
+                    title="LAPS Inventory Summary",
+                    border_style=border_style,
+                    fit=True,
+                )
+
+                dc_preview = [mark_sensitive(host, "hostname") for host in dc_list[:5]]
+                non_dc_preview = [
+                    mark_sensitive(host, "hostname") for host in non_dc_list[:5]
+                ]
+                if dc_preview:
+                    print_info_list(
+                        dc_preview,
+                        title=f"DC sample ({len(dc_list)} total)",
+                        icon="🖥️",
+                    )
+                if non_dc_preview:
+                    print_info_list(
+                        non_dc_preview,
+                        title=f"Non-DC sample ({len(non_dc_list)} total)",
+                        icon="💻",
+                    )
+
             # Depending on the file (with or without LAPS), print and generate the corresponding files
             if comp_file == "enabled_computers_with_laps.txt":
                 marked_domain = mark_sensitive(domain, "domain")
                 print_success(
-                    f"Found {count} computers enabled with LAPS in domain {marked_domain}."
+                    f"LAPS-enabled inventory generated for domain {marked_domain} ({count} hosts)."
                 )
-                print_success(f"   - {count_dc} of them are DCs.")
-                print_success(f"   - {count_non_dc} of them are NOT DCs.")
-
-                # Generate file for DCs with LAPS (if any exist)
+                dc_file = None
+                non_dc_file = None
                 if dc_list:
                     dc_file = os.path.join(
                         shell.domains_dir,
                         domain,
                         "enabled_computers_with_laps_dcs.txt",
                     )
-                    with open(dc_file, "w", encoding="utf-8") as f:
-                        for host in dc_list:
-                            f.write(host + "\n")
-                    print_success(f"DC list with LAPS generated: {dc_file}")
-
-                # Generate file for non-DCs with LAPS (if any exist)
+                    _write_host_list(dc_file, dc_list)
                 if non_dc_list:
                     non_dc_file = os.path.join(
                         shell.domains_dir,
                         domain,
                         "enabled_computers_with_laps_non_dcs.txt",
                     )
-                    with open(non_dc_file, "w", encoding="utf-8") as f:
-                        for host in non_dc_list:
-                            f.write(host + "\n")
-                    print_success(f"Non-DC list with LAPS generated: {non_dc_file}")
+                    _write_host_list(non_dc_file, non_dc_list)
+                _render_laps_inventory_panel(
+                    laps_state_label="Enabled",
+                    border_style="green",
+                    dc_file=dc_file,
+                    non_dc_file=non_dc_file,
+                )
 
             elif comp_file == "enabled_computers_without_laps.txt":
                 marked_domain = mark_sensitive(domain, "domain")
                 print_success(
-                    f"Found {count} computers enabled without LAPS in domain {marked_domain}."
+                    f"LAPS-missing inventory generated for domain {marked_domain} ({count} hosts)."
                 )
-                print_success(f"   - {count_dc} of them are DCs.")
-                print_success(f"   - {count_non_dc} of them are NOT DCs.")
-
-                # Generate file for DCs without LAPS (if any exist)
+                dc_file = None
+                non_dc_file = None
                 if dc_list:
                     dc_file = os.path.join(
                         shell.domains_dir,
                         domain,
                         "enabled_computers_without_laps_dcs.txt",
                     )
-                    with open(dc_file, "w", encoding="utf-8") as f:
-                        for host in dc_list:
-                            f.write(host + "\n")
-                    print_info_verbose(f"DC list without LAPS generated: {dc_file}")
-
-                # Generate file for non-DCs without LAPS (if any exist)
+                    _write_host_list(dc_file, dc_list)
                 if non_dc_list:
                     non_dc_file = os.path.join(
                         shell.domains_dir,
                         domain,
                         "enabled_computers_without_laps_non_dcs.txt",
                     )
-                    with open(non_dc_file, "w", encoding="utf-8") as f:
-                        for host in non_dc_list:
-                            f.write(host + "\n")
-                    print_info_verbose(
-                        f"Non-DC list without LAPS generated: {non_dc_file}"
-                    )
+                    _write_host_list(non_dc_file, non_dc_list)
+                _render_laps_inventory_panel(
+                    laps_state_label="Not enabled",
+                    border_style="yellow",
+                    dc_file=dc_file,
+                    non_dc_file=non_dc_file,
+                )
 
                 value = {
                     "all_computers": computers if computers else None,

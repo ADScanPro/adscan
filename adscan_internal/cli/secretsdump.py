@@ -17,6 +17,7 @@ to the existing methods on the interactive shell.
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
+import os
 import re
 
 from adscan_internal import (
@@ -32,6 +33,60 @@ from adscan_internal import (
 )
 from adscan_internal.rich_output import mark_sensitive, print_panel
 from rich.prompt import Confirm
+
+# DCSync All UX thresholds (compact output in large environments).
+_DCSYNC_ALL_LARGE_THRESHOLD = 250
+_DCSYNC_ALL_HUGE_THRESHOLD = 1000
+_DCSYNC_ALL_CRACKED_PREVIEW_DEFAULT = 15
+_DCSYNC_ALL_CRACKED_PREVIEW_LARGE = 8
+_DCSYNC_ALL_UNCRACKED_TABLE_MAX = 10
+
+
+def _get_positive_int_env(name: str, default: int) -> int:
+    """Return a positive integer env value or the provided default."""
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _resolve_dcsync_all_ui_thresholds() -> dict[str, int]:
+    """Resolve DCSync-All UX thresholds from environment variables."""
+    large_threshold = _get_positive_int_env(
+        "ADSCAN_DCSYNC_ALL_LARGE_THRESHOLD",
+        _DCSYNC_ALL_LARGE_THRESHOLD,
+    )
+    huge_threshold = _get_positive_int_env(
+        "ADSCAN_DCSYNC_ALL_HUGE_THRESHOLD",
+        _DCSYNC_ALL_HUGE_THRESHOLD,
+    )
+    if huge_threshold < large_threshold:
+        huge_threshold = large_threshold
+
+    cracked_preview_default = _get_positive_int_env(
+        "ADSCAN_DCSYNC_ALL_CRACKED_PREVIEW_DEFAULT",
+        _DCSYNC_ALL_CRACKED_PREVIEW_DEFAULT,
+    )
+    cracked_preview_large = _get_positive_int_env(
+        "ADSCAN_DCSYNC_ALL_CRACKED_PREVIEW_LARGE",
+        _DCSYNC_ALL_CRACKED_PREVIEW_LARGE,
+    )
+    uncracked_table_max = _get_positive_int_env(
+        "ADSCAN_DCSYNC_ALL_UNCRACKED_TABLE_MAX",
+        _DCSYNC_ALL_UNCRACKED_TABLE_MAX,
+    )
+
+    return {
+        "large_threshold": large_threshold,
+        "huge_threshold": huge_threshold,
+        "cracked_preview_default": cracked_preview_default,
+        "cracked_preview_large": cracked_preview_large,
+        "uncracked_table_max": uncracked_table_max,
+    }
 
 
 def execute_secretsdump_with_domain(shell: Any, command: str, domain: str) -> None:
@@ -244,7 +299,7 @@ def execute_secretsdump(shell: Any, command: str, domain: str) -> None:
         # ------------------------------------------------------------------ #
         # 3. Store every credential, removing DOMAIN\\ prefix from username
         # ------------------------------------------------------------------ #
-        extracted_creds: List[Tuple[str, str]] = []
+        raw_credentials: List[Tuple[str, str]] = []
         creds_to_persist: List[Tuple[str, str]] = []
         display_rows: List[Dict[str, str]] = []
         context = getattr(shell, "_current_dcsync_context", None)
@@ -293,27 +348,49 @@ def execute_secretsdump(shell: Any, command: str, domain: str) -> None:
             # ---------------------------------------------------------------- #
 
             # Persist the credential using the *provided* domain argument
-            marked_domain = mark_sensitive(domain, "domain")
-            marked_username = mark_sensitive(username, "user")
-            marked_nt_hash = mark_sensitive(nt_hash, "password")
-            print_success(
-                f"Found credential: {marked_domain}/{marked_username} with hash {marked_nt_hash}"
+            if verify_credential:
+                marked_domain = mark_sensitive(domain, "domain")
+                marked_username = mark_sensitive(username, "user")
+                marked_nt_hash = mark_sensitive(nt_hash, "password")
+                print_success(
+                    f"Found credential: {marked_domain}/{marked_username} with hash {marked_nt_hash}"
+                )
+
+            raw_credentials.append((username, nt_hash))
+
+        if verify_credential:
+            # Single-user DCSync keeps per-credential cracking/verify behaviour.
+            for username, nt_hash in raw_credentials:
+                cred_to_store = nt_hash
+                try:
+                    cred_to_store, _ = shell._handle_hash_cracking(
+                        domain, username, nt_hash
+                    )
+                except Exception:
+                    # _handle_hash_cracking already logs/telemeters; keep going.
+                    cred_to_store = nt_hash
+                creds_to_persist.append((username, cred_to_store))
+        else:
+            # DCSync "All": process as batch for better performance.
+            from adscan_internal.cli.creds import add_credentials_batch
+
+            creds_to_persist = add_credentials_batch(
+                shell=shell,
+                domain=domain,
+                credentials=raw_credentials,
+                skip_hash_cracking=False,
+                verify_credential=False,
+                prompt_for_user_privs_after=False,
+                ensure_fresh_kerberos_ticket=False,
+                ui_silent=False,
+            )
+            _render_dcsync_batch_cracking_summary(
+                domain=domain,
+                credentials=creds_to_persist,
             )
 
-            # Optionally attempt to crack the hash early so previews are available
-            cred_to_store = nt_hash
-            try:
-                cred_to_store, _ = shell._handle_hash_cracking(
-                    domain, username, nt_hash
-                )
-            except Exception:
-                # _handle_hash_cracking already logs/telemeters; keep going with raw hash
-                cred_to_store = nt_hash
-
-            extracted_creds.append((username, nt_hash))
-            creds_to_persist.append((username, cred_to_store))
-
-            display_rows.append({"User": username, "Credential": cred_to_store})
+        for username, cred_value in creds_to_persist:
+            display_rows.append({"User": username, "Credential": cred_value})
 
         # Final DCSync summary
         print_success("DCSync completed successfully.")
@@ -323,22 +400,23 @@ def execute_secretsdump(shell: Any, command: str, domain: str) -> None:
             print_info("No credentials were stored for this DCSync run.")
         else:
             print_info(f"Extracted {count} domain credentials.")
-            if count <= 10:
+            if verify_credential and count <= 10:
                 print_info_table(
                     display_rows,
                     ["User", "Credential"],
                     title=f"Extracted credentials for domain {domain}",
                 )
 
-            # Persist credentials after showing summary/table to keep output grouped
-            for username, cred_value in creds_to_persist:
-                shell.add_credential(
-                    domain,
-                    username,
-                    cred_value,
-                    skip_hash_cracking=True,
-                    verify_credential=verify_credential,
-                )
+            if verify_credential:
+                # Persist after showing summary/table to keep output grouped.
+                for username, cred_value in creds_to_persist:
+                    shell.add_credential(
+                        domain,
+                        username,
+                        cred_value,
+                        skip_hash_cracking=True,
+                        verify_credential=True,
+                    )
 
     except Exception as exc:
         telemetry.capture_exception(exc)
@@ -421,3 +499,92 @@ def _offer_machine_account_dump_fallback(shell: Any, domain: str) -> None:
         host=str(pdc_host),
         islocal="false",
     )
+
+
+def _render_dcsync_batch_cracking_summary(
+    *,
+    domain: str,
+    credentials: list[tuple[str, str]],
+) -> None:
+    """Render compact cracking summary for DCSync All batch processing."""
+    if not credentials:
+        return
+
+    cracked_rows: list[dict[str, str]] = []
+    uncracked_rows: list[dict[str, str]] = []
+    for username, credential in credentials:
+        normalized_user = str(username or "").strip()
+        normalized_credential = str(credential or "").strip()
+        if not normalized_user or not normalized_credential:
+            continue
+        if re.fullmatch(r"[0-9a-fA-F]{32}", normalized_credential):
+            uncracked_rows.append(
+                {
+                    "User": mark_sensitive(normalized_user, "user"),
+                    "Hash": mark_sensitive(normalized_credential, "password"),
+                }
+            )
+        else:
+            cracked_rows.append(
+                {
+                    "User": mark_sensitive(normalized_user, "user"),
+                    "Password": mark_sensitive(normalized_credential, "password"),
+                }
+            )
+
+    total = len(cracked_rows) + len(uncracked_rows)
+    summary_rows = [
+        {"Metric": "Credentials Extracted", "Count": str(total)},
+        {"Metric": "Hashes Cracked", "Count": str(len(cracked_rows))},
+        {"Metric": "Hashes Uncracked", "Count": str(len(uncracked_rows))},
+    ]
+    print_info_table(
+        summary_rows,
+        ["Metric", "Count"],
+        title=f"DCSync Cracking Summary ({mark_sensitive(domain, 'domain')})",
+    )
+
+    thresholds = _resolve_dcsync_all_ui_thresholds()
+    large_threshold = thresholds["large_threshold"]
+    huge_threshold = thresholds["huge_threshold"]
+    cracked_preview_default = thresholds["cracked_preview_default"]
+    cracked_preview_large = thresholds["cracked_preview_large"]
+    uncracked_table_max = thresholds["uncracked_table_max"]
+
+    if total >= huge_threshold:
+        print_info(
+            "Large environment detected. Showing aggregate results only to keep output concise."
+        )
+        return
+
+    if total >= large_threshold:
+        cracked_preview_limit = cracked_preview_large
+    else:
+        cracked_preview_limit = cracked_preview_default
+
+    if cracked_rows:
+        print_info_table(
+            cracked_rows[:cracked_preview_limit],
+            ["User", "Password"],
+            title="Cracked Credentials",
+        )
+        if len(cracked_rows) > cracked_preview_limit:
+            print_info(
+                "Showing first "
+                f"{cracked_preview_limit} cracked credentials out of {len(cracked_rows)}."
+            )
+
+    if (
+        uncracked_rows
+        and total < large_threshold
+        and len(uncracked_rows) <= uncracked_table_max
+    ):
+        print_info_table(
+            uncracked_rows,
+            ["User", "Hash"],
+            title="Uncracked Hashes",
+        )
+    elif uncracked_rows:
+        print_info(
+            f"Uncracked hashes retained for {len(uncracked_rows)} account(s)."
+        )

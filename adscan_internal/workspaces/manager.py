@@ -5,6 +5,7 @@ import shutil
 from dataclasses import dataclass
 from typing import Any
 
+from adscan_core.lab_context import normalize_lab_name, normalize_lab_provider
 from adscan_internal.workspaces.io import write_json_file
 from adscan_internal.workspaces.paths import workspace_variables_path
 
@@ -96,8 +97,8 @@ def write_initial_workspace_variables(
         "auto": False,
         "telemetry": True,
         "type": workspace_type,
-        "lab_provider": lab_provider.lower() if lab_provider else None,
-        "lab_name": lab_name.lower() if lab_name else None,
+        "lab_provider": normalize_lab_provider(lab_provider),
+        "lab_name": normalize_lab_name(lab_name),
         "lab_name_whitelisted": lab_name_whitelisted,
     }
 

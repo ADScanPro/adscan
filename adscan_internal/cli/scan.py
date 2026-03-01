@@ -40,6 +40,7 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.workspaces import domain_subpath
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.cli.dns import finalize_domain_context
 from adscan_internal.cli.nmap import _read_text_file_best_effort
 
@@ -302,19 +303,12 @@ def run_scan_service(
 
         # Telemetry: track service scan start
         try:
-            lab_slug = shell._get_lab_slug()
             properties = {
                 "scan_mode": getattr(shell, "scan_mode", None),
                 "workspace_type": shell.type,
                 "auto_mode": shell.auto,
-                "lab_slug": lab_slug,
             }
-            # Add lab_provider and lab_name (if whitelisted) like in other events
-            if shell.lab_provider:
-                properties["lab_provider"] = shell.lab_provider
-            if shell.lab_name and shell.lab_name_whitelisted is True:
-                # Only send lab_name if it's explicitly whitelisted
-                properties["lab_name"] = shell.lab_name
+            properties.update(build_lab_event_fields(shell=shell, include_slug=True))
             # Use service name in event name (e.g., smb_scan_started, ldap_scan_started)
             telemetry.capture(f"{service}_scan_started", properties)
         except Exception as e:
@@ -389,20 +383,13 @@ def run_scan_service(
         # Telemetry: track if no domain was found in this service scan (only for unauthenticated scans without domain parameter)
         if not domain and completed_process.returncode == 0 and not domain_found:
             try:
-                lab_slug = shell._get_lab_slug()
                 properties = {
                     "service": service,
                     "scan_mode": getattr(shell, "scan_mode", None),
                     "workspace_type": shell.type,
                     "auto_mode": shell.auto,
-                    "lab_slug": lab_slug,
                 }
-                # Add lab_provider and lab_name (if whitelisted) like in other events
-                if shell.lab_provider:
-                    properties["lab_provider"] = shell.lab_provider
-                if shell.lab_name and shell.lab_name_whitelisted is True:
-                    # Only send lab_name if it's explicitly whitelisted
-                    properties["lab_name"] = shell.lab_name
+                properties.update(build_lab_event_fields(shell=shell, include_slug=True))
                 telemetry.capture("domain_not_discovered", properties)
             except Exception as e:
                 telemetry.capture_exception(e)
@@ -707,20 +694,13 @@ def process_service_output_line(
 
             # Telemetry: track domain discovery
             try:
-                lab_slug = shell._get_lab_slug()
                 properties = {
                     "service": service,
                     "scan_mode": getattr(shell, "scan_mode", None),
                     "workspace_type": shell.type,
                     "auto_mode": shell.auto,
-                    "lab_slug": lab_slug,
                 }
-                # Add lab_provider and lab_name (if whitelisted) like in other events
-                if shell.lab_provider:
-                    properties["lab_provider"] = shell.lab_provider
-                if shell.lab_name and shell.lab_name_whitelisted is True:
-                    # Only send lab_name if it's explicitly whitelisted
-                    properties["lab_name"] = shell.lab_name
+                properties.update(build_lab_event_fields(shell=shell, include_slug=True))
                 telemetry.capture("domain_discovered", properties)
             except Exception as e:
                 telemetry.capture_exception(e)

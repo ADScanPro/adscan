@@ -22,6 +22,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.integrations.mssql import MSSQLContext
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.exploitation import ExploitationService
@@ -112,14 +113,9 @@ def run_mssql_check_impersonate(
     )
 
     try:
-        lab_slug = shell._get_lab_slug()
-        telemetry.capture(
-            "mssql_seimpersonate_checked",
-            {
-                "has_privilege": bool(result.has_privilege),
-                "lab_slug": lab_slug,
-            },
-        )
+        properties = {"has_privilege": bool(result.has_privilege)}
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("mssql_seimpersonate_checked", properties)
     except Exception as e:  # pragma: no cover
         telemetry.capture_exception(e)
 

@@ -29,6 +29,12 @@ import requests
 import sentry_sdk
 
 from .ssl_certificates import configure_ssl_certificates_for_requests
+from adscan_core.lab_context import (
+    build_lab_slug,
+    build_lab_telemetry_fields,
+    build_workspace_telemetry_fields,
+    normalize_workspace_type,
+)
 from adscan_core.embedded_telemetry_config import (
     get_cli_shared_token,
     get_posthog_proxy_url_dev,
@@ -283,7 +289,9 @@ class _SentryN8nTransport:
         try:
             token = get_cli_shared_token()
             if not token:
-                print_error_debug("Telemetry ingest token not configured; cannot send Sentry event")
+                print_error_debug(
+                    "Telemetry ingest token not configured; cannot send Sentry event"
+                )
                 return
 
             # Serialize envelope
@@ -360,7 +368,7 @@ except ImportError:
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
 # Tool version for telemetry; update per release
-VERSION = "4.1.2"
+VERSION = "5.0.2"
 
 
 @functools.lru_cache(maxsize=1)
@@ -758,6 +766,139 @@ def _is_session_capture_enabled() -> bool:
     return True
 
 
+SESSION_CAPTURE_ALLOWED_COMMANDS = frozenset(
+    {"install", "ci", "start", "check", "update", "upgrade"}
+)
+HOST_SESSION_CAPTURE_COMMANDS = frozenset({"install", "check", "update", "upgrade"})
+CONTAINER_SESSION_CAPTURE_COMMANDS = frozenset({"start", "ci"})
+SESSION_WORKSPACE_CONTEXT_COMMANDS = frozenset({"start", "ci"})
+_SESSION_WORKSPACE_CONTEXT_FIELDS = frozenset(
+    {"workspace_type", "lab_provider", "lab_name", "lab_slug", "lab_name_whitelisted"}
+)
+
+
+def is_session_capture_command(
+    command_type: Optional[str], *, allowed_commands: Optional[set[str]] = None
+) -> bool:
+    """Return whether the given command should upload a Rich session recording.
+
+    Args:
+        command_type: Command identifier (e.g. ``install``, ``start``).
+        allowed_commands: Optional override set; defaults to
+            ``SESSION_CAPTURE_ALLOWED_COMMANDS``.
+
+    Returns:
+        True when command capture is allowed, False otherwise.
+    """
+    if not command_type:
+        return False
+    commands = allowed_commands or set(SESSION_CAPTURE_ALLOWED_COMMANDS)
+    return str(command_type) in commands
+
+
+def is_workspace_context_command(command_type: Optional[str]) -> bool:
+    """Return whether workspace/lab metadata should be included for this command."""
+    if not command_type:
+        return False
+    return str(command_type).strip().lower() in SESSION_WORKSPACE_CONTEXT_COMMANDS
+
+
+def _filter_workspace_context_metadata(
+    metadata: dict[str, Any], command_type: Optional[str]
+) -> dict[str, Any]:
+    """Drop workspace/lab metadata for commands where it is not relevant."""
+    if is_workspace_context_command(command_type):
+        filtered = dict(metadata)
+        workspace_type = normalize_workspace_type(filtered.get("workspace_type"))
+        if workspace_type:
+            filtered["workspace_type"] = workspace_type
+            return filtered
+
+        # If workspace type is missing, infer a best-effort value so session
+        # analytics can distinguish "audit/ctf known" from "unknown".
+        if filtered.get("lab_provider"):
+            filtered["workspace_type"] = "ctf"
+        else:
+            filtered["workspace_type"] = "unknown"
+        return filtered
+    filtered = dict(metadata)
+    for key in _SESSION_WORKSPACE_CONTEXT_FIELDS:
+        filtered.pop(key, None)
+    return filtered
+
+
+def build_command_session_metadata(
+    *,
+    command_type: Optional[str],
+    base_metadata: Optional[dict[str, Any]] = None,
+    extra: Optional[dict[str, Any]] = None,
+    success: Optional[bool] = None,
+) -> Optional[dict[str, Any]]:
+    """Build normalized metadata payload for command-scoped session capture.
+
+    Args:
+        command_type: Command identifier to attach.
+        base_metadata: Optional pre-computed metadata.
+        extra: Optional extra metadata fields.
+        success: Optional command success state.
+
+    Returns:
+        Metadata dictionary or None when no metadata is available.
+    """
+    metadata: dict[str, Any] = {}
+    if base_metadata:
+        metadata.update(base_metadata)
+    if command_type:
+        metadata["command_type"] = str(command_type)
+    if extra:
+        for key, value in extra.items():
+            if value is not None:
+                metadata[key] = value
+    if success is not None:
+        metadata["command_success"] = bool(success)
+    if "environment" not in metadata:
+        metadata["environment"] = _determine_session_environment()
+    metadata = _filter_workspace_context_metadata(
+        metadata, command_type=metadata.get("command_type")
+    )
+    return metadata or None
+
+
+def capture_command_session(
+    *,
+    console: Any = None,
+    command_type: Optional[str],
+    base_metadata: Optional[dict[str, Any]] = None,
+    extra: Optional[dict[str, Any]] = None,
+    success: Optional[bool] = None,
+    allowed_commands: Optional[set[str]] = None,
+) -> bool:
+    """Capture and upload a command session recording when allowed.
+
+    Args:
+        console: Rich console with recording enabled. When omitted, only metadata
+            event capture is attempted by ``capture_session_end``.
+        command_type: Command identifier.
+        base_metadata: Optional pre-computed metadata.
+        extra: Optional metadata fields to merge.
+        success: Optional command success state.
+        allowed_commands: Optional override set of allowed commands.
+
+    Returns:
+        True when capture was attempted, False when command is not eligible.
+    """
+    if not is_session_capture_command(command_type, allowed_commands=allowed_commands):
+        return False
+    metadata = build_command_session_metadata(
+        command_type=command_type,
+        base_metadata=base_metadata,
+        extra=extra,
+        success=success,
+    )
+    capture_session_end(console=console, metadata=metadata)
+    return True
+
+
 DEV_MACHINE_IDS = [
     "aa8b2369c8374f788c337132b3a3fa02",
     "c63544afac294af18f329c9b36e6e1df",
@@ -868,6 +1009,23 @@ def collect_system_context() -> dict[str, Any]:
     except OSError:
         # Best-effort only; missing / unreadable os-release is fine.
         pass
+
+    # In container runtime mode we want distro metadata from the host launcher,
+    # not from the container image base (e.g. Debian). If host metadata is not
+    # available, omit distro fields rather than reporting container distro.
+    if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
+        distro_id = None
+        distro_version = None
+        distro_like = None
+        host_distro_id = (os.getenv("ADSCAN_HOST_DISTRO_ID") or "").strip()
+        host_distro_version = (os.getenv("ADSCAN_HOST_DISTRO_VERSION") or "").strip()
+        host_distro_like = (os.getenv("ADSCAN_HOST_DISTRO_LIKE") or "").strip()
+        if host_distro_id:
+            distro_id = host_distro_id
+        if host_distro_version:
+            distro_version = host_distro_version
+        if host_distro_like:
+            distro_like = host_distro_like
 
     env = _determine_environment()
 
@@ -1476,7 +1634,9 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
 
             token = get_cli_shared_token()
             if not token:
-                print_error_debug("Telemetry ingest token not configured; cannot send telemetry")
+                print_error_debug(
+                    "Telemetry ingest token not configured; cannot send telemetry"
+                )
                 return
 
             # Prepare properties and merge user-provided $set with defaults
@@ -3475,19 +3635,31 @@ def _vercel_metadata_fields(metadata: Optional[dict[str, Any]]) -> dict[str, Any
     """Return payload updates derived from optional metadata."""
     if not metadata:
         return {}
+    command_type = metadata.get("command_type")
+    metadata = _filter_workspace_context_metadata(metadata, command_type=command_type)
     updates: dict[str, Any] = {}
     lab_provider = metadata.get("lab_provider")
     lab_name = metadata.get("lab_name")
     lab_slug = metadata.get("lab_slug")
     lab_name_whitelisted = metadata.get("lab_name_whitelisted")
+    workspace_type = normalize_workspace_type(metadata.get("workspace_type"))
     environment = metadata.get("environment")
     command_type = metadata.get("command_type")
+    command_success = metadata.get("command_success")
     if environment:
         updates["environment"] = environment.lower()
     if command_type:
         updates["command_type"] = command_type.lower()
+    if workspace_type:
+        updates["workspace_type"] = workspace_type
+    if command_success is not None:
+        updates["command_success"] = bool(command_success)
     if lab_provider:
         updates["target_type"] = lab_provider.lower()
+    elif workspace_type:
+        # Keep legacy target_type populated even when no lab provider exists
+        # (e.g., audit workspaces), so downstream filters remain explicit.
+        updates["target_type"] = workspace_type
     if lab_name:
         updates["target_name"] = lab_name.lower()
     if lab_slug:
@@ -3524,6 +3696,31 @@ def _vercel_session_url(api_url: str, session_id: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}/sessions/{session_id}"
 
 
+def _summarize_vercel_payload_context(payload: dict[str, Any]) -> str:
+    """Return a compact debug summary of the Vercel session payload context."""
+    field_order = (
+        "environment",
+        "command_type",
+        "workspace_type",
+        "target_type",
+        "target_name",
+        "target_slug",
+        "target_whitelisted",
+        "adscan_version",
+        "started_at",
+        "finished_at",
+    )
+    parts: list[str] = []
+    for field in field_order:
+        value = payload.get(field)
+        if value is None or value == "":
+            continue
+        parts.append(f"{field}={value!r}")
+    if not parts:
+        return "no-context-fields"
+    return ", ".join(parts)
+
+
 def _send_session_to_vercel(
     session_id: str,
     html_content: str,
@@ -3554,6 +3751,9 @@ def _send_session_to_vercel(
         )
         print_info_debug(f"Vercel proxy URL: {vercel_proxy_url}")
         print_info_debug(f"Payload size: HTML={len(html_content)} bytes")
+        print_info_debug(
+            f"Vercel payload context: {_summarize_vercel_payload_context(payload)}",
+        )
 
         # Configure SSL certificates before making request
         _configure_ssl_certificates_for_requests()
@@ -3622,37 +3822,34 @@ def _build_session_metadata(shell=None) -> Optional[dict]:
     if not shell:
         return None
 
-    metadata = {}
-
-    # Add lab_provider if available
-    if hasattr(shell, "lab_provider") and shell.lab_provider:
-        metadata["lab_provider"] = (
-            shell.lab_provider.lower() if shell.lab_provider else None
+    metadata = build_workspace_telemetry_fields(
+        workspace_type=getattr(shell, "type", None),
+    )
+    metadata.update(
+        build_lab_telemetry_fields(
+            lab_provider=getattr(shell, "lab_provider", None),
+            lab_name=getattr(shell, "lab_name", None),
+            lab_name_whitelisted=getattr(shell, "lab_name_whitelisted", None),
+            include_slug=False,
         )
-
-    # Add lab_name if available (always, even if not whitelisted)
-    # Labs are public CTF environments (HTB, TryHackMe, etc.), so it's safe to store the real name
-    if hasattr(shell, "lab_name") and shell.lab_name:
-        metadata["lab_name"] = shell.lab_name.lower() if shell.lab_name else None
-
-    # Add lab_name_whitelisted if available (for filtering in UI)
-    if (
-        hasattr(shell, "lab_name_whitelisted")
-        and shell.lab_name_whitelisted is not None
-    ):
-        metadata["lab_name_whitelisted"] = bool(shell.lab_name_whitelisted)
+    )
 
     # Build lab_slug using shell helper method (reuses existing logic)
     lab_slug_getter = getattr(shell, "_get_lab_slug", None)
+    lab_slug: str | None = None
     if callable(lab_slug_getter):
         # pylint: disable=not-callable
         lab_slug = lab_slug_getter()
-        if lab_slug:
-            metadata["lab_slug"] = lab_slug
+    if not lab_slug:
+        lab_slug = build_lab_slug(
+            getattr(shell, "lab_provider", None),
+            getattr(shell, "lab_name", None),
+        )
+    if lab_slug:
+        metadata["lab_slug"] = str(lab_slug).lower()
 
     # Note: workspace_name is intentionally NOT included to avoid revealing internal information
-
-    return metadata if metadata else None
+    return metadata or None
 
 
 def capture_session_end(console=None, metadata: Optional[dict] = None):
@@ -3666,6 +3863,7 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
         console: Optional Rich Console instance with recording enabled.
                  If None, only captures session end metadata.
         metadata: Optional metadata dictionary with keys:
+            - workspace_type: Workspace type ("ctf" or "audit")
             - lab_name: Lab name (e.g., "Forest") - will be hashed for privacy
             - lab_slug: Lab slug (e.g., "htb/forest")
             - lab_provider: Lab provider (e.g., "hackthebox") - maps to target_type
@@ -3714,6 +3912,10 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
         # session backends default to PROD if this field is missing.
         metadata_with_env["environment"] = session_env
 
+        metadata_with_env = _filter_workspace_context_metadata(
+            metadata_with_env, command_type=metadata_with_env.get("command_type")
+        )
+
         print_info_debug(
             "[DEBUG] capture_session_end environment selection: "
             f"explicit_env={explicit_env!r}, ci_detected={ci_detected}, "
@@ -3724,6 +3926,15 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
         if metadata_with_env:
             command_type = metadata_with_env.get("command_type")
         sanitize_session = command_type not in {"install", "check"}
+        print_info_debug(
+            "[DEBUG] capture_session_end metadata summary: "
+            f"command_type={metadata_with_env.get('command_type')!r}, "
+            f"workspace_type={metadata_with_env.get('workspace_type')!r}, "
+            f"lab_provider={metadata_with_env.get('lab_provider')!r}, "
+            f"lab_name={metadata_with_env.get('lab_name')!r}, "
+            f"lab_slug={metadata_with_env.get('lab_slug')!r}, "
+            f"lab_name_whitelisted={metadata_with_env.get('lab_name_whitelisted')!r}",
+        )
 
         # Export and send Rich recording if console is provided
         session_url = None
@@ -3840,7 +4051,9 @@ def identify_user(properties: dict):
 
             token = get_cli_shared_token()
             if not token:
-                print_error_debug("Telemetry ingest token not configured; cannot identify user")
+                print_error_debug(
+                    "Telemetry ingest token not configured; cannot identify user"
+                )
                 return
 
             # Send identify request to n8n proxy (mimics PostHog identify API)
@@ -3928,7 +4141,9 @@ def capture_exception(e: Exception, properties: Optional[dict[str, Any]] = None)
 
             token = get_cli_shared_token()
             if not token:
-                print_error_debug("Telemetry ingest token not configured; cannot capture exception")
+                print_error_debug(
+                    "Telemetry ingest token not configured; cannot capture exception"
+                )
                 return
 
             exc_type = type(e).__name__

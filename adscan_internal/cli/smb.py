@@ -11,11 +11,14 @@ extraction operations (dumps), see `dumps.py`.
 from __future__ import annotations
 
 from typing import Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import csv
+import json
 import os
 import re
 import shlex
 import threading
+import time
 import traceback
 import rich
 from rich.panel import Panel
@@ -29,6 +32,7 @@ from adscan_internal import (
     print_exception,
     print_info,
     print_info_debug,
+    print_instruction,
     print_info_verbose,
     print_panel,
     print_operation_header,
@@ -50,6 +54,72 @@ from adscan_internal.rich_output import (
     print_panel_with_table,
 )
 from adscan_internal.workspaces.subpaths import domain_path, domain_relpath
+
+
+GLOBAL_SMB_MAPPING_EXCLUDED_SHARES: tuple[str, ...] = (
+    "print$",
+    "ipc$",
+    "admin$",
+)
+GLOBAL_SMB_MAPPING_EXCLUDED_DRIVE_SHARES: tuple[str, ...] = tuple(
+    f"{letter}$" for letter in "abcdefghijklmnopqrstuvwxyz"
+)
+GLOBAL_SMB_MAPPING_EXCLUDE_FILTER_TOKENS: tuple[str, ...] = (
+    GLOBAL_SMB_MAPPING_EXCLUDED_SHARES + GLOBAL_SMB_MAPPING_EXCLUDED_DRIVE_SHARES
+)
+GLOBAL_SMB_MAPPING_EXCLUDED_EXTENSIONS: tuple[str, ...] = ("ico", "lnk")
+GLOBAL_SMB_MAPPING_EXCLUDED_SHARES_CASEFOLD: set[str] = {
+    name.casefold() for name in GLOBAL_SMB_MAPPING_EXCLUDE_FILTER_TOKENS
+}
+
+
+def _is_globally_excluded_mapping_share(share_name: str) -> bool:
+    """Return True when share is excluded by global SMB mapping policy."""
+    return (
+        str(share_name or "").strip().casefold()
+        in GLOBAL_SMB_MAPPING_EXCLUDED_SHARES_CASEFOLD
+    )
+
+
+def _filter_shares_by_global_mapping_exclusions(shares: list[str]) -> list[str]:
+    """Filter share names according to global SMB mapping exclusions."""
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for share in shares:
+        share_name = str(share or "").strip()
+        if not share_name:
+            continue
+        key = share_name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if _is_globally_excluded_mapping_share(share_name):
+            continue
+        filtered.append(share_name)
+    return filtered
+
+
+def _filter_share_map_by_global_mapping_exclusions(
+    share_map: dict[str, dict[str, str]] | None,
+) -> dict[str, dict[str, str]] | None:
+    """Filter host/share permissions map according to global mapping exclusions."""
+    if not isinstance(share_map, dict):
+        return share_map
+    filtered: dict[str, dict[str, str]] = {}
+    for host, host_shares in share_map.items():
+        if not isinstance(host_shares, dict):
+            continue
+        filtered_host_shares: dict[str, str] = {}
+        for share_name, perms in host_shares.items():
+            normalized_share = str(share_name or "").strip()
+            if not normalized_share or _is_globally_excluded_mapping_share(
+                normalized_share
+            ):
+                continue
+            filtered_host_shares[normalized_share] = str(perms or "")
+        if filtered_host_shares:
+            filtered[str(host or "").strip()] = filtered_host_shares
+    return filtered
 
 
 def execute_netexec_shares(
@@ -1124,6 +1194,53 @@ def run_local_cred_reuse(
     shell.execute_local_cred_reuse(command, domain, username, credential)
 
 
+_LOCAL_REUSE_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_LOCAL_REUSE_SMB_LINE_RE = re.compile(
+    r"^\s*SMB\s+(?P<target>\S+)\s+\d+\s+(?P<host>[A-Za-z0-9_.-]+)\s+\[(?P<status>[^\]]+)\]\s+(?P<rest>.*)$"
+)
+
+
+def parse_local_cred_reuse_targets(log_text: str) -> list[dict[str, str]]:
+    """Parse NetExec local-auth output and return successful local-admin targets."""
+    if not log_text:
+        return []
+
+    seen: set[tuple[str, str, str]] = set()
+    targets: list[dict[str, str]] = []
+
+    for raw_line in log_text.splitlines():
+        line = strip_ansi_codes(raw_line)
+        parsed = _LOCAL_REUSE_SMB_LINE_RE.match(line)
+        if not parsed:
+            continue
+        rest = str(parsed.group("rest") or "")
+        # Keep only confirmed local admin sessions.
+        if "(pwn3d" not in rest.lower():
+            continue
+
+        target = str(parsed.group("target") or "").strip()
+        hostname = str(parsed.group("host") or "").strip()
+        ip_match = _LOCAL_REUSE_IPV4_RE.search(target)
+        ip = ip_match.group(0) if ip_match else ""
+        if not ip:
+            ip_match = _LOCAL_REUSE_IPV4_RE.search(rest)
+            ip = ip_match.group(0) if ip_match else ""
+
+        dedupe_key = (target.lower(), hostname.lower(), ip.lower())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        targets.append(
+            {
+                "target": target,
+                "hostname": hostname,
+                "ip": ip,
+            }
+        )
+
+    return targets
+
+
 def run_smb_relay_targets(shell: Any, *, domain: str) -> None:
     """Enumerate SMB relay targets (hosts with unsigned SMB) using NetExec."""
     from adscan_internal.rich_output import mark_sensitive
@@ -1592,7 +1709,7 @@ def ask_for_smb_shares_read(
     hosts: list[str],
     share_map: dict[str, dict[str, str]] | None = None,
 ) -> None:
-    """Prompt user to map readable SMB shares via NetExec spider_plus.
+    """Prompt user to analyze readable SMB shares with deterministic or AI flows.
 
     Args:
         shell: Shell instance with domain data and helper methods.
@@ -1600,12 +1717,32 @@ def ask_for_smb_shares_read(
         shares: List of share names discovered as readable.
         username: Username for authentication.
         password: Password for authentication.
-        hosts: List of hostnames/IPs to map.
+        hosts: List of hostnames/IPs to map/analyze.
         share_map: Optional host->share->permission mapping from share enum.
     """
+    from adscan_internal.services.ai_backend_availability_service import (
+        AIBackendAvailabilityService,
+    )
     from adscan_internal.rich_output import confirm_operation
 
     if shell.domains_data[domain]["auth"] == "pwned" and shell.type == "ctf":
+        return
+
+    original_shares_count = len(shares)
+    shares = _filter_shares_by_global_mapping_exclusions(shares)
+    share_map = _filter_share_map_by_global_mapping_exclusions(share_map)
+    if original_shares_count != len(shares):
+        print_info_debug(
+            "SMB share list filtered by global mapping exclusions: "
+            f"before={original_shares_count} after={len(shares)} "
+            "excluded=print$,ipc$,admin$,[A-Z]$"
+        )
+    if not shares:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            "No readable SMB shares remain after applying global exclusions for "
+            f"{marked_domain}."
+        )
         return
 
     pdc = shell.domains_data.get(domain, {}).get("pdc", "N/A")
@@ -1619,38 +1756,76 @@ def ask_for_smb_shares_read(
         "share_tree_map.json",
     )
     marked_output_rel = mark_sensitive(output_rel, "path")
+    cifs_output_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "cifs",
+        "share_tree_map.json",
+    )
+    marked_cifs_output_rel = mark_sensitive(cifs_output_rel, "path")
+    rclone_output_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "rclone",
+        "share_tree_map.json",
+    )
+    marked_rclone_output_rel = mark_sensitive(rclone_output_rel, "path")
+
+    availability = AIBackendAvailabilityService().get_availability()
+    selected_method = _select_post_mapping_sensitive_data_method(
+        shell=shell,
+        ai_configured=availability.configured,
+    )
+    if selected_method is None:
+        print_info("SMB sensitive-data analysis skipped by user.")
+        return
 
     if shell.auto:
-        run_smb_share_tree_mapping_with_spider_plus(
+        selected_method = "deterministic"
+
+    if selected_method == "deterministic":
+        _run_post_mapping_sensitive_data_workflow(
             shell,
             domain=domain,
+            aggregate_map_abs=domain_path(
+                shell.domains_dir,
+                domain,
+                shell.smb_dir,
+                "spider_plus",
+                "share_tree_map.json",
+            ),
+            aggregate_map_rel=output_rel,
             shares=shares,
-            username=username,
-            password=password,
             hosts=hosts,
-            share_map=share_map,
+            triage_username=username,
+            triage_password=password,
+            selected_method="deterministic",
         )
         return
 
-    if confirm_operation(
-        operation_name="SMB Share Tree Mapping",
-        description=(
-            "Builds a reusable SMB share tree map using NetExec spider_plus "
-            "(metadata only, no file download)."
-        ),
-        context={
-            "Domain": domain,
-            "PDC": pdc,
-            "Username": username,
-            "Readable Shares": str(num_shares),
-            "Hosts": str(num_hosts),
-            "Output": marked_output_rel,
-            "Download Files": "No (DOWNLOAD_FLAG=False)",
-        },
-        default=True,
-        icon="🗺️",
-        show_panel=True,
-    ):
+    if selected_method == "ai":
+        if not confirm_operation(
+            operation_name="SMB Share Tree Mapping (spider_plus + AI)",
+            description=(
+                "Builds a reusable SMB share tree map using NetExec spider_plus "
+                "(metadata only, no file download), then runs AI triage."
+            ),
+            context={
+                "Domain": domain,
+                "PDC": pdc,
+                "Username": username,
+                "Readable Shares": str(num_shares),
+                "Hosts": str(num_hosts),
+                "Output": marked_output_rel,
+                "Download Files": "No (DOWNLOAD_FLAG=False)",
+            },
+            default=True,
+            icon="🗺️",
+            show_panel=True,
+        ):
+            return
         run_smb_share_tree_mapping_with_spider_plus(
             shell,
             domain=domain,
@@ -1659,7 +1834,883 @@ def ask_for_smb_shares_read(
             password=password,
             hosts=hosts,
             share_map=share_map,
+            selected_method="ai",
         )
+        return
+
+    if selected_method == "ai_cifs":
+        mount_root = _resolve_cifs_mount_root(shell=shell, domain=domain)
+        marked_mount_root = mark_sensitive(mount_root, "path")
+        if not confirm_operation(
+            operation_name="SMB Share Tree Mapping (CIFS + AI)",
+            description=(
+                "Builds SMB share tree metadata from local CIFS mounts, then runs "
+                "AI triage over the consolidated mapping."
+            ),
+            context={
+                "Domain": domain,
+                "PDC": pdc,
+                "Username": username,
+                "Readable Shares": str(num_shares),
+                "Hosts": str(num_hosts),
+                "CIFS Mount Root": marked_mount_root,
+                "Output": marked_cifs_output_rel,
+            },
+            default=True,
+            icon="🗺️",
+            show_panel=True,
+        ):
+            return
+        run_smb_share_tree_mapping_with_cifs(
+            shell,
+            domain=domain,
+            shares=shares,
+            username=username,
+            password=password,
+            hosts=hosts,
+            share_map=share_map,
+            cifs_mount_root=mount_root,
+            selected_method="ai_cifs",
+        )
+        return
+
+    if selected_method == "ai_rclone":
+        if not confirm_operation(
+            operation_name="SMB Share Tree Mapping (rclone + AI)",
+            description=(
+                "Builds SMB share tree metadata with rclone lsjson over SMB, then "
+                "runs AI triage over the consolidated mapping."
+            ),
+            context={
+                "Domain": domain,
+                "PDC": pdc,
+                "Username": username,
+                "Readable Shares": str(num_shares),
+                "Hosts": str(num_hosts),
+                "Output": marked_rclone_output_rel,
+            },
+            default=True,
+            icon="🗺️",
+            show_panel=True,
+        ):
+            return
+        run_smb_share_tree_mapping_with_rclone(
+            shell,
+            domain=domain,
+            shares=shares,
+            username=username,
+            password=password,
+            hosts=hosts,
+            share_map=share_map,
+            selected_method="ai_rclone",
+        )
+        return
+
+
+def _enumerate_readable_share_context_for_mapping(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+) -> tuple[list[str], list[str], dict[str, dict[str, str]]]:
+    """Enumerate readable SMB shares and hosts for mapping workflows."""
+    if not shell.netexec_path:
+        return [], [], {}
+
+    auth_args = _build_spider_plus_auth(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+    )
+    enabled_computers = domain_relpath(
+        shell.domains_dir,
+        domain,
+        "enabled_computers_ips.txt",
+    )
+    smb_ips = domain_relpath(shell.domains_dir, domain, "smb", "ips.txt")
+    target_path = enabled_computers if os.path.exists(enabled_computers) else smb_ips
+    command = (
+        f"{shell.netexec_path} smb {target_path} {auth_args} "
+        "--smb-timeout 30 --shares"
+    )
+    completed_process = shell._run_netexec(
+        command,
+        domain=domain,
+        timeout=1200,
+        pre_sync=False,
+    )
+    if completed_process is None:
+        return [], [], {}
+
+    output_text = str(getattr(completed_process, "stdout", "") or "")
+    share_map = parse_smb_share_map(output_text)
+    read_shares, _write_shares, read_hosts, _write_hosts = summarize_share_map(share_map)
+    read_shares = _filter_shares_by_global_mapping_exclusions(read_shares)
+    share_map = _filter_share_map_by_global_mapping_exclusions(share_map) or {}
+    ordered_hosts = sorted(read_hosts)
+    return read_shares, ordered_hosts, share_map
+
+
+def _resolve_smb_map_benchmark_credential(
+    *,
+    shell: Any,
+    domain: str,
+    credential_username: str | None,
+) -> tuple[str, str] | None:
+    """Resolve benchmark credential from active domain state or stored credentials."""
+    domain_data = shell.domains_data.get(domain, {}) or {}
+    active_username = str(domain_data.get("username", "") or "").strip()
+    active_password = str(domain_data.get("password", "") or "").strip()
+    requested_user = str(credential_username or "").strip()
+    marked_domain = mark_sensitive(domain, "domain")
+
+    if requested_user:
+        requested_casefold = requested_user.casefold()
+        credentials = domain_data.get("credentials", {})
+        if isinstance(credentials, dict):
+            for stored_username, stored_secret in credentials.items():
+                candidate_username = str(stored_username or "").strip()
+                candidate_secret = str(stored_secret or "").strip()
+                if not candidate_username:
+                    continue
+                if candidate_username.casefold() != requested_casefold:
+                    continue
+                if not candidate_secret:
+                    break
+                print_info_debug(
+                    "SMB benchmark credential override selected: "
+                    f"domain={marked_domain} "
+                    f"user={mark_sensitive(candidate_username, 'user')}"
+                )
+                return candidate_username, candidate_secret
+
+        if (
+            active_username
+            and active_password
+            and active_username.casefold() == requested_casefold
+        ):
+            print_info_debug(
+                "SMB benchmark credential override matched active credential: "
+                f"domain={marked_domain} "
+                f"user={mark_sensitive(active_username, 'user')}"
+            )
+            return active_username, active_password
+
+        marked_requested = mark_sensitive(requested_user, "user")
+        print_error(
+            "Requested benchmark credential user "
+            f"{marked_requested} was not found for domain {marked_domain}."
+        )
+        print_instruction(
+            "Use `creds show` to list stored credentials, "
+            "or run without credential_username to use the active credential."
+        )
+        return None
+
+    if active_username and active_password:
+        return active_username, active_password
+
+    print_error(
+        f"No active credentials found for domain {marked_domain}. "
+        "Set credentials first and retry."
+    )
+    return None
+
+
+def run_smb_map_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    credential_username: str | None = None,
+) -> None:
+    """Benchmark SMB mapping backends (spider_plus, rclone, and CIFS)."""
+    if domain not in getattr(shell, "domains_data", {}):
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"Domain {marked_domain} is not configured in the current workspace."
+        )
+        return
+
+    resolved_credential = _resolve_smb_map_benchmark_credential(
+        shell=shell,
+        domain=domain,
+        credential_username=credential_username,
+    )
+    if resolved_credential is None:
+        return
+    username, password = resolved_credential
+
+    shares, hosts, share_map = _enumerate_readable_share_context_for_mapping(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+    )
+    if not shares or not hosts:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            "Benchmark aborted: no readable SMB shares/hosts were discovered for "
+            f"{marked_domain}."
+        )
+        return
+
+    options = [
+        "NetExec spider_plus mapping",
+        "rclone SMB mapping",
+        "CIFS local mapping",
+    ]
+    selected_labels: list[str] | None
+    checkbox = getattr(shell, "_questionary_checkbox", None)
+    if callable(checkbox):
+        selected_labels = checkbox(
+            "Select SMB mapping methods to benchmark:",
+            options,
+        )
+    else:
+        selected_labels = options
+
+    if selected_labels is None:
+        print_info("SMB mapping benchmark cancelled by user.")
+        return
+
+    selected_methods: list[str] = []
+    if "NetExec spider_plus mapping" in selected_labels:
+        selected_methods.append("spider_plus")
+    if "rclone SMB mapping" in selected_labels:
+        selected_methods.append("rclone")
+    if "CIFS local mapping" in selected_labels:
+        selected_methods.append("cifs")
+    if not selected_methods:
+        print_info("No SMB mapping method selected for benchmark.")
+        return
+
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_user = mark_sensitive(username, "user")
+    print_operation_header(
+        "SMB Mapping Benchmark",
+        details={
+            "Domain": marked_domain,
+            "Principal": marked_user,
+            "Hosts": str(len(hosts)),
+            "Readable Shares": str(len(shares)),
+            "Selected Methods": str(len(selected_methods)),
+        },
+        icon="⏱️",
+    )
+
+    results: list[dict[str, Any]] = []
+    for method in selected_methods:
+        started = time.perf_counter()
+        try:
+            if method == "spider_plus":
+                success = run_smb_share_tree_mapping_with_spider_plus(
+                    shell,
+                    domain=domain,
+                    shares=shares,
+                    username=username,
+                    password=password,
+                    hosts=hosts,
+                    share_map=share_map,
+                    selected_method="deterministic",
+                    run_post_mapping_workflow=False,
+                )
+                label = "NetExec spider_plus"
+            elif method == "rclone":
+                success = run_smb_share_tree_mapping_with_rclone(
+                    shell,
+                    domain=domain,
+                    shares=shares,
+                    username=username,
+                    password=password,
+                    hosts=hosts,
+                    share_map=share_map,
+                    selected_method="deterministic",
+                    run_post_mapping_workflow=False,
+                )
+                label = "rclone SMB"
+            elif method == "cifs":
+                success = run_smb_share_tree_mapping_with_cifs(
+                    shell,
+                    domain=domain,
+                    shares=shares,
+                    username=username,
+                    password=password,
+                    hosts=hosts,
+                    share_map=share_map,
+                    cifs_mount_root=_resolve_cifs_mount_root(shell=shell, domain=domain),
+                    selected_method="deterministic",
+                    run_post_mapping_workflow=False,
+                )
+                label = "CIFS local"
+            else:
+                continue
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            success = False
+            label = method
+
+        elapsed_seconds = max(0.0, time.perf_counter() - started)
+        results.append(
+            {
+                "method": label,
+                "success": bool(success),
+                "duration_seconds": elapsed_seconds,
+            }
+        )
+
+    if not results:
+        print_warning("SMB mapping benchmark completed with no executed methods.")
+        return
+
+    table = Table(
+        title="[bold cyan]SMB Mapping Benchmark Results[/bold cyan]",
+        header_style="bold magenta",
+        box=rich.box.SIMPLE_HEAVY,
+    )
+    table.add_column("Method", style="cyan")
+    table.add_column("Status", style="magenta")
+    table.add_column("Duration (s)", style="green", justify="right")
+    for result in results:
+        status = "ok" if result["success"] else "failed"
+        table.add_row(
+            str(result["method"]),
+            status,
+            f"{float(result['duration_seconds']):.3f}",
+        )
+
+    print_panel_with_table(table, border_style=BRAND_COLORS["info"])
+    _persist_smb_mapping_benchmark_results(
+        shell=shell,
+        domain=domain,
+        username=username,
+        shares_count=len(shares),
+        hosts_count=len(hosts),
+        selected_methods=selected_methods,
+        results=results,
+    )
+
+
+def _persist_smb_mapping_benchmark_results(
+    *,
+    shell: Any,
+    domain: str,
+    username: str,
+    shares_count: int,
+    hosts_count: int,
+    selected_methods: list[str],
+    results: list[dict[str, Any]],
+) -> None:
+    """Persist SMB mapping benchmark results as run + cumulative history JSON."""
+    from adscan_internal.workspaces import read_json_file, write_json_file
+
+    workspace_cwd = shell._get_workspace_cwd()
+    benchmark_root_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "mapping_benchmark",
+    )
+    runs_dir_abs = os.path.join(benchmark_root_abs, "runs")
+    os.makedirs(runs_dir_abs, exist_ok=True)
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_basename = f"{run_id}_{_slugify_token(username)}.json"
+    run_file_abs = os.path.join(runs_dir_abs, run_basename)
+    run_file_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "mapping_benchmark",
+        "runs",
+        run_basename,
+    )
+    history_abs = os.path.join(benchmark_root_abs, "history.json")
+    history_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "mapping_benchmark",
+        "history.json",
+    )
+
+    created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    successful = [item for item in results if bool(item.get("success"))]
+    fastest_success = (
+        min(
+            successful,
+            key=lambda item: float(item.get("duration_seconds", 0.0)),
+        )
+        if successful
+        else None
+    )
+    run_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "created_at": created_at,
+        "domain": domain,
+        "principal": f"{domain}\\{username}",
+        "hosts_count": int(hosts_count),
+        "shares_count": int(shares_count),
+        "selected_methods": list(selected_methods),
+        "results": list(results),
+        "fastest_successful_method": (
+            str(fastest_success.get("method", "")) if fastest_success else ""
+        ),
+        "fastest_successful_duration_seconds": (
+            float(fastest_success.get("duration_seconds", 0.0))
+            if fastest_success
+            else None
+        ),
+    }
+    normalized_method_results = _normalize_benchmark_method_results(results)
+
+    history_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "domain": domain,
+        "updated_at": created_at,
+        "runs": [],
+    }
+    if os.path.exists(history_abs):
+        existing = read_json_file(history_abs)
+        if isinstance(existing, dict):
+            history_payload = existing
+            history_payload.setdefault("schema_version", 1)
+            history_payload.setdefault("domain", domain)
+            history_payload.setdefault("runs", [])
+
+    history_entry: dict[str, Any] = {
+        "run_id": run_id,
+        "created_at": created_at,
+        "principal": f"{domain}\\{username}",
+        "hosts_count": int(hosts_count),
+        "shares_count": int(shares_count),
+        "selected_methods": list(selected_methods),
+        "results_count": len(results),
+        "success_count": len(successful),
+        "fastest_successful_method": (
+            str(fastest_success.get("method", "")) if fastest_success else ""
+        ),
+        "fastest_successful_duration_seconds": (
+            float(fastest_success.get("duration_seconds", 0.0))
+            if fastest_success
+            else None
+        ),
+        "run_file": run_file_rel,
+        "method_results": normalized_method_results,
+    }
+    history_runs = history_payload.get("runs")
+    if not isinstance(history_runs, list):
+        history_runs = []
+    history_runs.append(history_entry)
+    history_payload["runs"] = history_runs[-500:]
+    history_payload["updated_at"] = created_at
+
+    try:
+        write_json_file(run_file_abs, run_payload)
+        write_json_file(history_abs, history_payload)
+        marked_run_rel = mark_sensitive(run_file_rel, "path")
+        marked_history_rel = mark_sensitive(history_rel, "path")
+        print_info(
+            "SMB mapping benchmark results saved to "
+            f"{marked_run_rel} (history: {marked_history_rel})."
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning("SMB mapping benchmark completed, but persistence failed.")
+        print_warning_debug(
+            "SMB mapping benchmark persistence error: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _normalize_benchmark_method_results(
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Normalize benchmark method results for stable history persistence."""
+    normalized: list[dict[str, Any]] = []
+    for item in results:
+        method = str(item.get("method", "") or "").strip()
+        if not method:
+            continue
+        try:
+            duration = float(item.get("duration_seconds", 0.0) or 0.0)
+        except Exception:
+            duration = 0.0
+        normalized.append(
+            {
+                "method": method,
+                "success": bool(item.get("success")),
+                "duration_seconds": max(0.0, duration),
+            }
+        )
+    return normalized
+
+
+def run_smb_map_benchmark_history(
+    shell: Any,
+    *,
+    domain: str,
+    recent_limit: int = 10,
+    days: int | None = None,
+    csv_output_path: str | None = None,
+) -> None:
+    """Render historical SMB mapping benchmark comparison from persisted JSON."""
+    from adscan_internal.workspaces import read_json_file
+
+    workspace_cwd = shell._get_workspace_cwd()
+    history_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "mapping_benchmark",
+        "history.json",
+    )
+    history_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "mapping_benchmark",
+        "history.json",
+    )
+    if not os.path.exists(history_abs):
+        marked_history_rel = mark_sensitive(history_rel, "path")
+        print_warning(
+            "No SMB mapping benchmark history found yet. "
+            f"Expected file: {marked_history_rel}"
+        )
+        return
+
+    payload = read_json_file(history_abs)
+    runs = payload.get("runs", [])
+    if not isinstance(runs, list) or not runs:
+        marked_history_rel = mark_sensitive(history_rel, "path")
+        print_info(
+            "SMB mapping benchmark history is empty in "
+            f"{marked_history_rel}."
+        )
+        return
+
+    safe_limit = max(1, min(int(recent_limit), 100))
+    sorted_runs_all = sorted(
+        (item for item in runs if isinstance(item, dict)),
+        key=lambda item: str(item.get("created_at", "")),
+        reverse=True,
+    )
+    filtered_runs = sorted_runs_all
+    if days is not None:
+        safe_days = max(1, int(days))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=safe_days)
+        day_filtered_runs: list[dict[str, Any]] = []
+        for entry in sorted_runs_all:
+            created_at = _parse_history_created_at(entry)
+            if created_at is None:
+                continue
+            if created_at >= cutoff:
+                day_filtered_runs.append(entry)
+        filtered_runs = day_filtered_runs
+        print_info_debug(
+            "SMB benchmark history day filter applied: "
+            f"days={safe_days} runs_before={len(sorted_runs_all)} "
+            f"runs_after={len(filtered_runs)}"
+        )
+
+    if not filtered_runs:
+        print_warning(
+            "No SMB mapping benchmark runs match the selected filter criteria."
+        )
+        return
+
+    recent_runs = filtered_runs[:safe_limit]
+
+    history_table = Table(
+        title="[bold cyan]SMB Mapping Benchmark History[/bold cyan]",
+        header_style="bold magenta",
+        box=rich.box.SIMPLE_HEAVY,
+    )
+    history_table.add_column("#", style="cyan", justify="right")
+    history_table.add_column("Run ID", style="cyan")
+    history_table.add_column("When (UTC)", style="magenta")
+    history_table.add_column("Methods", style="yellow")
+    history_table.add_column("Fastest", style="green")
+    history_table.add_column("Duration (s)", style="green", justify="right")
+    history_table.add_column("Success", style="blue", justify="right")
+
+    for idx, entry in enumerate(recent_runs, start=1):
+        run_id = str(entry.get("run_id", "") or "-")
+        created_at = str(entry.get("created_at", "") or "-")
+        selected_methods = entry.get("selected_methods", [])
+        if isinstance(selected_methods, list):
+            rendered_methods = ", ".join(str(method) for method in selected_methods[:4])
+            if len(selected_methods) > 4:
+                rendered_methods += ", ..."
+            rendered_methods = rendered_methods or "-"
+        else:
+            rendered_methods = "-"
+        fastest_method = str(entry.get("fastest_successful_method", "") or "-")
+        fastest_duration = entry.get("fastest_successful_duration_seconds")
+        duration_text = (
+            f"{float(fastest_duration):.3f}"
+            if isinstance(fastest_duration, (int, float))
+            else "-"
+        )
+        success_count = int(entry.get("success_count", 0) or 0)
+        results_count = int(entry.get("results_count", 0) or 0)
+        history_table.add_row(
+            str(idx),
+            run_id,
+            created_at,
+            rendered_methods,
+            fastest_method,
+            duration_text,
+            f"{success_count}/{results_count}",
+        )
+
+    print_panel_with_table(history_table, border_style=BRAND_COLORS["info"])
+
+    method_stats = _summarize_benchmark_method_stats(
+        shell=shell,
+        runs=filtered_runs,
+        workspace_cwd=workspace_cwd,
+    )
+    if not method_stats:
+        print_warning(
+            "No per-method benchmark statistics could be derived from history."
+        )
+        return
+
+    stats_table = Table(
+        title="[bold cyan]SMB Mapping Benchmark Method Summary[/bold cyan]",
+        header_style="bold magenta",
+        box=rich.box.SIMPLE_HEAVY,
+    )
+    stats_table.add_column("Method", style="cyan")
+    stats_table.add_column("Runs", style="magenta", justify="right")
+    stats_table.add_column("Success", style="blue", justify="right")
+    stats_table.add_column("Success %", style="yellow", justify="right")
+    stats_table.add_column("Avg Success (s)", style="green", justify="right")
+    stats_table.add_column("Best Success (s)", style="green", justify="right")
+
+    for method, stats in sorted(
+        method_stats.items(),
+        key=lambda item: item[1]["avg_success_seconds"]
+        if item[1]["avg_success_seconds"] is not None
+        else 10_000_000.0,
+    ):
+        success_rate = (
+            (stats["successes"] / stats["runs"]) * 100.0 if stats["runs"] > 0 else 0.0
+        )
+        avg_text = (
+            f"{float(stats['avg_success_seconds']):.3f}"
+            if isinstance(stats["avg_success_seconds"], (int, float))
+            else "-"
+        )
+        best_text = (
+            f"{float(stats['best_success_seconds']):.3f}"
+            if isinstance(stats["best_success_seconds"], (int, float))
+            else "-"
+        )
+        stats_table.add_row(
+            method,
+            str(int(stats["runs"])),
+            str(int(stats["successes"])),
+            f"{success_rate:.1f}",
+            avg_text,
+            best_text,
+        )
+
+    print_panel_with_table(stats_table, border_style=BRAND_COLORS["info"])
+    if csv_output_path is not None:
+        _export_smb_mapping_benchmark_history_csv(
+            shell=shell,
+            domain=domain,
+            runs=filtered_runs,
+            workspace_cwd=workspace_cwd,
+            csv_output_path=csv_output_path,
+        )
+
+
+def _summarize_benchmark_method_stats(
+    *,
+    shell: Any,
+    runs: list[dict[str, Any]],
+    workspace_cwd: str,
+) -> dict[str, dict[str, Any]]:
+    """Compute per-method benchmark stats across persisted run history."""
+    method_durations: dict[str, list[float]] = {}
+    method_successes: dict[str, int] = {}
+    method_runs: dict[str, int] = {}
+
+    for entry in runs:
+        method_results = _resolve_history_method_results(
+            entry=entry,
+            workspace_cwd=workspace_cwd,
+        )
+
+        for result in method_results:
+            method = str(result.get("method", "") or "").strip()
+            if not method:
+                continue
+            success = bool(result.get("success"))
+            duration = float(result.get("duration_seconds", 0.0) or 0.0)
+            method_runs[method] = int(method_runs.get(method, 0)) + 1
+            if success:
+                method_successes[method] = int(method_successes.get(method, 0)) + 1
+                method_durations.setdefault(method, []).append(max(0.0, duration))
+
+    stats: dict[str, dict[str, Any]] = {}
+    for method, runs_count in method_runs.items():
+        durations = method_durations.get(method, [])
+        avg_success = (
+            (sum(durations) / len(durations)) if durations else None
+        )
+        best_success = min(durations) if durations else None
+        stats[method] = {
+            "runs": int(runs_count),
+            "successes": int(method_successes.get(method, 0)),
+            "avg_success_seconds": avg_success,
+            "best_success_seconds": best_success,
+        }
+    return stats
+
+
+def _resolve_history_method_results(
+    *,
+    entry: dict[str, Any],
+    workspace_cwd: str,
+) -> list[dict[str, Any]]:
+    """Resolve normalized per-method results for one history entry."""
+    from adscan_internal.workspaces import read_json_file
+
+    method_results = entry.get("method_results", [])
+    if isinstance(method_results, list) and method_results:
+        return _normalize_benchmark_method_results(method_results)
+
+    run_file_rel = str(entry.get("run_file", "") or "").strip()
+    if not run_file_rel:
+        return []
+    run_file_abs = os.path.join(workspace_cwd, run_file_rel)
+    if not os.path.exists(run_file_abs):
+        return []
+    run_payload = read_json_file(run_file_abs)
+    raw_results = run_payload.get("results", [])
+    if not isinstance(raw_results, list):
+        return []
+    return _normalize_benchmark_method_results(raw_results)
+
+
+def _parse_history_created_at(entry: dict[str, Any]) -> datetime | None:
+    """Parse one history entry ``created_at`` into timezone-aware datetime."""
+    created_at_text = str(entry.get("created_at", "") or "").strip()
+    if not created_at_text:
+        return None
+    normalized = created_at_text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _export_smb_mapping_benchmark_history_csv(
+    *,
+    shell: Any,
+    domain: str,
+    runs: list[dict[str, Any]],
+    workspace_cwd: str,
+    csv_output_path: str | None,
+) -> None:
+    """Export filtered benchmark history into CSV (one row per method result)."""
+    output_rel, output_abs = _resolve_benchmark_csv_output_path(
+        shell=shell,
+        domain=domain,
+        workspace_cwd=workspace_cwd,
+        csv_output_path=csv_output_path,
+    )
+    rows: list[dict[str, Any]] = []
+    for entry in runs:
+        method_results = _resolve_history_method_results(
+            entry=entry,
+            workspace_cwd=workspace_cwd,
+        )
+        for result in method_results:
+            rows.append(
+                {
+                    "run_id": str(entry.get("run_id", "") or ""),
+                    "created_at": str(entry.get("created_at", "") or ""),
+                    "principal": str(entry.get("principal", "") or ""),
+                    "hosts_count": int(entry.get("hosts_count", 0) or 0),
+                    "shares_count": int(entry.get("shares_count", 0) or 0),
+                    "method": str(result.get("method", "") or ""),
+                    "success": bool(result.get("success")),
+                    "duration_seconds": float(result.get("duration_seconds", 0.0) or 0.0),
+                }
+            )
+
+    fieldnames = [
+        "run_id",
+        "created_at",
+        "principal",
+        "hosts_count",
+        "shares_count",
+        "method",
+        "success",
+        "duration_seconds",
+    ]
+    try:
+        os.makedirs(os.path.dirname(output_abs), exist_ok=True)
+        with open(output_abs, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        marked_output = mark_sensitive(output_rel, "path")
+        print_info(
+            f"SMB benchmark history CSV exported to {marked_output}."
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning("SMB benchmark history CSV export failed.")
+        print_warning_debug(
+            "SMB benchmark history CSV export error: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _resolve_benchmark_csv_output_path(
+    *,
+    shell: Any,
+    domain: str,
+    workspace_cwd: str,
+    csv_output_path: str | None,
+) -> tuple[str, str]:
+    """Resolve benchmark CSV output as (workspace-relative, absolute)."""
+    if csv_output_path:
+        candidate = str(csv_output_path).strip()
+        if os.path.isabs(candidate):
+            output_abs = candidate
+            output_rel = os.path.relpath(candidate, workspace_cwd)
+        else:
+            output_rel = candidate
+            output_abs = os.path.join(workspace_cwd, candidate)
+        return output_rel, output_abs
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"history_{timestamp}.csv"
+    output_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "mapping_benchmark",
+        "exports",
+        filename,
+    )
+    output_abs = os.path.join(workspace_cwd, output_rel)
+    return output_rel, output_abs
 
 
 def _build_spider_plus_auth(
@@ -1684,6 +2735,406 @@ def _slugify_token(token: str) -> str:
     return slug or "unknown"
 
 
+def _resolve_cifs_mount_root(
+    *,
+    shell: Any,
+    domain: str,
+) -> str:
+    """Resolve CIFS mount root path from shell/env/default workspace path."""
+    configured_root = str(getattr(shell, "smb_cifs_mount_root", "") or "").strip()
+    env_root = os.getenv("ADSCAN_SMB_CIFS_MOUNT_ROOT", "").strip()
+    default_root = domain_path(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "cifs",
+        "mounts",
+    )
+
+    for candidate in [configured_root, env_root, default_root]:
+        if not candidate:
+            continue
+        if os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+    return os.path.abspath(configured_root or env_root or default_root)
+
+
+def _resolve_cifs_host_share_targets(
+    *,
+    hosts: list[str],
+    shares: list[str],
+    share_map: dict[str, dict[str, str]] | None,
+) -> list[tuple[str, str]]:
+    """Resolve host/share targets for CIFS mount attempts."""
+    targets: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    if isinstance(share_map, dict):
+        for host, host_shares in share_map.items():
+            host_name = str(host or "").strip()
+            if not host_name or not isinstance(host_shares, dict):
+                continue
+            for share, perms in host_shares.items():
+                share_name = str(share or "").strip()
+                perms_text = str(perms or "").strip().lower()
+                if (
+                    not share_name
+                    or _is_globally_excluded_mapping_share(share_name)
+                    or "read" not in perms_text
+                ):
+                    continue
+                key = (host_name.lower(), share_name.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                targets.append((host_name, share_name))
+
+    if targets:
+        return targets
+
+    for host in hosts:
+        host_name = str(host or "").strip()
+        if not host_name:
+            continue
+        for share in shares:
+            share_name = str(share or "").strip()
+            if not share_name or _is_globally_excluded_mapping_share(share_name):
+                continue
+            key = (host_name.lower(), share_name.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append((host_name, share_name))
+    return targets
+
+
+def _mount_cifs_targets_via_host_helper(
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    mount_root: str,
+    targets: list[tuple[str, str]],
+) -> list[str]:
+    """Best-effort CIFS share mounts via host-helper; returns mountpoints to cleanup."""
+    helper_sock = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
+    if not helper_sock or not os.path.exists(helper_sock):
+        marked_sock = mark_sensitive(helper_sock or "<unset>", "path")
+        print_info_debug(
+            "CIFS host-helper mount skipped: missing helper socket "
+            f"({marked_sock})."
+        )
+        return []
+
+    try:
+        from adscan_internal.host_privileged_helper import host_helper_client_request
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            "CIFS host-helper mount skipped: could not import host helper client."
+        )
+        return []
+
+    mounted_points: list[str] = []
+    mounted_count = 0
+    already_mounted_count = 0
+    failed_count = 0
+
+    for host, share in targets:
+        marked_host = mark_sensitive(host, "hostname")
+        marked_share = mark_sensitive(share, "service")
+        try:
+            resp = host_helper_client_request(
+                helper_sock,
+                op="cifs_mount_share",
+                payload={
+                    "host": host,
+                    "share": share,
+                    "mount_root": mount_root,
+                    "username": username,
+                    "password": password,
+                    "domain": domain,
+                    "read_only": True,
+                },
+                timeout_seconds=180,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            failed_count += 1
+            print_warning_debug(
+                "CIFS host-helper mount request failed: "
+                f"host={marked_host} share={marked_share} "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            continue
+        if not resp.ok:
+            failed_count += 1
+            print_warning_debug(
+                "CIFS host-helper mount failed: "
+                f"host={marked_host} share={marked_share} "
+                f"message={resp.message or '-'} rc={resp.returncode}"
+            )
+            continue
+
+        mount_point = ""
+        mounted_by_helper = False
+        try:
+            payload = json.loads(resp.stdout or "{}")
+            mount_point = str(payload.get("mount_point", "")).strip()
+            mounted_by_helper = bool(payload.get("mounted_by_helper", False))
+        except Exception:
+            mount_point = ""
+            mounted_by_helper = False
+
+        if mounted_by_helper and mount_point:
+            mounted_count += 1
+            mounted_points.append(mount_point)
+        else:
+            already_mounted_count += 1
+
+    marked_root = mark_sensitive(mount_root, "path")
+    print_info_debug(
+        "CIFS host-helper mount summary: "
+        f"mount_root={marked_root} targets={len(targets)} "
+        f"mounted={mounted_count} already_mounted={already_mounted_count} "
+        f"failed={failed_count}"
+    )
+    return mounted_points
+
+
+def _unmount_cifs_targets_via_host_helper(
+    *,
+    mount_points: list[str],
+) -> None:
+    """Best-effort unmount of CIFS targets previously mounted by host-helper."""
+    if not mount_points:
+        return
+
+    helper_sock = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
+    if not helper_sock or not os.path.exists(helper_sock):
+        marked_sock = mark_sensitive(helper_sock or "<unset>", "path")
+        print_warning_debug(
+            "CIFS unmount skipped: host helper socket unavailable "
+            f"({marked_sock})."
+        )
+        return
+
+    try:
+        from adscan_internal.host_privileged_helper import host_helper_client_request
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug("CIFS unmount skipped: cannot import host helper client.")
+        return
+
+    unmounted = 0
+    failed = 0
+    for mount_point in mount_points:
+        try:
+            resp = host_helper_client_request(
+                helper_sock,
+                op="cifs_unmount_share",
+                payload={"mount_point": mount_point, "lazy": True},
+                timeout_seconds=90,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            failed += 1
+            marked_mount = mark_sensitive(mount_point, "path")
+            print_warning_debug(
+                "CIFS unmount request raised exception: "
+                f"mount_point={marked_mount} error={type(exc).__name__}: {exc}"
+            )
+            continue
+        if resp.ok:
+            unmounted += 1
+        else:
+            failed += 1
+            marked_mount = mark_sensitive(mount_point, "path")
+            print_warning_debug(
+                "CIFS unmount failed: "
+                f"mount_point={marked_mount} message={resp.message or '-'} "
+                f"rc={resp.returncode}"
+            )
+
+    print_info_debug(
+        "CIFS unmount summary: "
+        f"requested={len(mount_points)} unmounted={unmounted} failed={failed}"
+    )
+
+
+def run_smb_share_tree_mapping_with_cifs(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    username: str,
+    password: str,
+    hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
+    cifs_mount_root: str | None = None,
+    selected_method: str | None = None,
+    run_post_mapping_workflow: bool = True,
+) -> bool:
+    """Map SMB share trees from CIFS mount paths and run post-mapping workflow."""
+    from adscan_internal.services.cifs_share_mapping_service import (
+        CIFSShareMappingService,
+    )
+    from adscan_internal.services.share_mapping_service import ShareMappingService
+
+    shares = _filter_shares_by_global_mapping_exclusions(shares)
+    share_map = _filter_share_map_by_global_mapping_exclusions(share_map)
+
+    if not hosts:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            f"No SMB hosts available for CIFS mapping in domain {marked_domain}."
+        )
+        return False
+    if not shares:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            "No SMB shares eligible for CIFS mapping after applying global "
+            f"exclusions in {marked_domain}."
+        )
+        return False
+
+    effective_mount_root = str(cifs_mount_root or "").strip() or _resolve_cifs_mount_root(
+        shell=shell,
+        domain=domain,
+    )
+    marked_mount_root = mark_sensitive(effective_mount_root, "path")
+    mount_targets = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+    )
+    mounted_points: list[str] = []
+    try:
+        mounted_points = _mount_cifs_targets_via_host_helper(
+            domain=domain,
+            username=username,
+            password=password,
+            mount_root=effective_mount_root,
+            targets=mount_targets,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            "CIFS host-helper mount orchestration failed unexpectedly; continuing "
+            "with pre-existing mount state."
+        )
+
+    if not os.path.isdir(effective_mount_root):
+        print_warning(
+            "CIFS mapping root is not accessible. "
+            f"Expected mounted content at {marked_mount_root}."
+        )
+        print_warning(
+            "Fallback recommendation: use spider_plus + AI or deterministic mode."
+        )
+        _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        return False
+
+    cifs_root_abs = domain_path(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "cifs",
+    )
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = f"cifs_{timestamp}_{_slugify_token(username)}"
+    run_folder = f"{timestamp}_{_slugify_token(username)}"
+    run_output_abs = os.path.join(cifs_root_abs, "runs", run_folder)
+    os.makedirs(run_output_abs, exist_ok=True)
+    aggregate_map_abs = os.path.join(cifs_root_abs, "share_tree_map.json")
+    aggregate_map_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "cifs",
+        "share_tree_map.json",
+    )
+    marked_aggregate_rel = mark_sensitive(aggregate_map_rel, "path")
+
+    try:
+        print_operation_header(
+            "SMB Share Tree Mapping (CIFS)",
+            [
+                ("Domain", mark_sensitive(domain, "domain")),
+                ("Principal", mark_sensitive(username, "user")),
+                ("Hosts", str(len(hosts))),
+                ("Readable Shares", str(len(shares))),
+                ("CIFS Root", marked_mount_root),
+                ("Run Output", mark_sensitive(run_output_abs, "path")),
+                ("Aggregate JSON", marked_aggregate_rel),
+            ],
+            icon="🗺️",
+        )
+        cifs_service = CIFSShareMappingService()
+        mapping_result = cifs_service.generate_host_metadata_json(
+            mount_root=effective_mount_root,
+            run_output_dir=run_output_abs,
+            hosts=hosts,
+            shares=shares,
+        )
+
+        service = ShareMappingService()
+        principal_label = f"{domain}\\{username}"
+        summary = service.merge_spider_plus_run(
+            domain=domain,
+            principal=principal_label,
+            run_id=run_id,
+            run_output_dir=run_output_abs,
+            aggregate_map_path=aggregate_map_abs,
+            requested_hosts=hosts,
+            requested_shares=shares,
+            host_share_permissions=share_map,
+        )
+
+        host_json_count = int(summary.get("host_json_files", 0))
+        merged_files = int(summary.get("merged_file_entries", 0))
+        mapped_shares = int(mapping_result.get("mapped_shares", 0))
+        if host_json_count == 0:
+            print_warning(
+                "CIFS mapping found no host metadata files to consolidate. "
+                "Verify mount structure host/share/path."
+            )
+        else:
+            print_success(
+                f"CIFS share mapping updated with {host_json_count} host file(s), "
+                f"{mapped_shares} mapped share(s), and {merged_files} file metadata entries."
+            )
+        print_info(f"Consolidated SMB share tree map saved to {marked_aggregate_rel}.")
+        if run_post_mapping_workflow:
+            _run_post_mapping_sensitive_data_workflow(
+                shell,
+                domain=domain,
+                aggregate_map_abs=aggregate_map_abs,
+                aggregate_map_rel=aggregate_map_rel,
+                shares=shares,
+                hosts=hosts,
+                triage_username=username,
+                triage_password=password,
+                selected_method=selected_method,
+                cifs_mount_root=effective_mount_root,
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error("Error while executing CIFS SMB share mapping.")
+        print_exception(show_locals=False, exception=exc)
+        print_error_debug(traceback.format_exc())
+        return False
+    finally:
+        try:
+            _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                "CIFS unmount cleanup failed unexpectedly after mapping workflow."
+            )
+
+
 def run_smb_share_tree_mapping_with_spider_plus(
     shell: Any,
     *,
@@ -1693,22 +3144,34 @@ def run_smb_share_tree_mapping_with_spider_plus(
     password: str,
     hosts: list[str],
     share_map: dict[str, dict[str, str]] | None = None,
-) -> None:
+    selected_method: str | None = None,
+    run_post_mapping_workflow: bool = True,
+) -> bool:
     """Run NetExec spider_plus and consolidate results into one domain map JSON."""
     from adscan_internal.services.share_mapping_service import ShareMappingService
+
+    shares = _filter_shares_by_global_mapping_exclusions(shares)
+    share_map = _filter_share_map_by_global_mapping_exclusions(share_map)
 
     if not shell.netexec_path:
         print_error(
             "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
         )
-        return
+        return False
 
     if not hosts:
         marked_domain = mark_sensitive(domain, "domain")
         print_warning(
             f"No SMB hosts available for spider_plus mapping in domain {marked_domain}."
         )
-        return
+        return False
+    if not shares:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            "No SMB shares eligible for spider_plus mapping after applying global "
+            f"exclusions in {marked_domain}."
+        )
+        return False
 
     workspace_cwd = shell._get_workspace_cwd()
     spider_plus_root_abs = domain_path(
@@ -1747,8 +3210,8 @@ def run_smb_share_tree_mapping_with_spider_plus(
     )
     hosts_arg = " ".join(shlex.quote(str(host)) for host in hosts)
     module_options = [
-        "EXCLUDE_EXTS=ico,lnk",
-        "EXCLUDE_FILTER=print$,ipc$,admin$,netlogon,c$",
+        f"EXCLUDE_EXTS={','.join(GLOBAL_SMB_MAPPING_EXCLUDED_EXTENSIONS)}",
+        f"EXCLUDE_FILTER={','.join(GLOBAL_SMB_MAPPING_EXCLUDE_FILTER_TOKENS)}",
         f"OUTPUT_FOLDER={run_output_abs}",
     ]
     module_options_arg = " ".join(shlex.quote(option) for option in module_options)
@@ -1788,7 +3251,7 @@ def run_smb_share_tree_mapping_with_spider_plus(
             print_error(
                 "NetExec spider_plus mapping failed before returning any output."
             )
-            return
+            return False
 
         if completed_process.returncode != 0:
             error_message = (
@@ -1827,7 +3290,202 @@ def run_smb_share_tree_mapping_with_spider_plus(
                 f"{merged_files} file metadata entries."
             )
         print_info(f"Consolidated SMB share tree map saved to {marked_aggregate_rel}.")
-        try:
+        if run_post_mapping_workflow:
+            try:
+                _run_post_mapping_sensitive_data_workflow(
+                    shell,
+                    domain=domain,
+                    aggregate_map_abs=aggregate_map_abs,
+                    aggregate_map_rel=aggregate_map_rel,
+                    shares=shares,
+                    hosts=hosts,
+                    triage_username=username,
+                    triage_password=password,
+                    selected_method=selected_method,
+                )
+            except Exception as triage_exc:  # noqa: BLE001
+                telemetry.capture_exception(triage_exc)
+                print_warning(
+                    "SMB share mapping completed, but post-mapping sensitive-data analysis "
+                    "failed and was skipped."
+                )
+                print_warning_debug(
+                    "Post-mapping sensitive-data analysis failure: "
+                    f"{type(triage_exc).__name__}: {triage_exc}"
+                )
+                print_warning_debug(traceback.format_exc())
+        return True
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error("Error while executing spider_plus SMB share mapping.")
+        print_exception(show_locals=False, exception=exc)
+        print_error_debug(traceback.format_exc())
+        return False
+
+
+def _resolve_rclone_path(shell: Any) -> str:
+    """Resolve rclone executable path from shell attributes or PATH fallback."""
+    configured_path = str(getattr(shell, "rclone_path", "") or "").strip()
+    return configured_path or "rclone"
+
+
+def run_smb_share_tree_mapping_with_rclone(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    username: str,
+    password: str,
+    hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
+    selected_method: str | None = None,
+    run_post_mapping_workflow: bool = True,
+) -> bool:
+    """Run rclone SMB metadata mapping and consolidate into one domain map JSON."""
+    from adscan_internal.services.rclone_share_mapping_service import (
+        RcloneShareMappingService,
+    )
+    from adscan_internal.services.share_mapping_service import ShareMappingService
+
+    shares = _filter_shares_by_global_mapping_exclusions(shares)
+    share_map = _filter_share_map_by_global_mapping_exclusions(share_map)
+
+    if not hosts:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            f"No SMB hosts available for rclone mapping in domain {marked_domain}."
+        )
+        return False
+    if not shares:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            "No SMB shares eligible for rclone mapping after applying global "
+            f"exclusions in {marked_domain}."
+        )
+        return False
+
+    rclone_path = _resolve_rclone_path(shell)
+    rclone_version_cmd = f"{shlex.quote(rclone_path)} version"
+    version_result = shell.run_command(
+        rclone_version_cmd,
+        timeout=30,
+        ignore_errors=True,
+    )
+    if version_result is None or int(getattr(version_result, "returncode", 1)) != 0:
+        print_error(
+            "rclone is not available. Install it and ensure it is in PATH "
+            "to use rclone SMB mapping."
+        )
+        return False
+
+    workspace_cwd = shell._get_workspace_cwd()
+    rclone_root_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "rclone",
+    )
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_folder = f"{run_id}_{_slugify_token(username)}"
+    run_output_abs = os.path.join(rclone_root_abs, "runs", run_folder)
+    os.makedirs(run_output_abs, exist_ok=True)
+    run_output_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "rclone",
+        "runs",
+        run_folder,
+    )
+    aggregate_map_abs = os.path.join(rclone_root_abs, "share_tree_map.json")
+    aggregate_map_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "rclone",
+        "share_tree_map.json",
+    )
+
+    target_pairs = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+    )
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_username = mark_sensitive(username, "user")
+    marked_output_rel = mark_sensitive(run_output_rel, "path")
+    marked_aggregate_rel = mark_sensitive(aggregate_map_rel, "path")
+    marked_rclone = mark_sensitive(rclone_path, "path")
+
+    print_operation_header(
+        "SMB Share Tree Mapping (rclone)",
+        details={
+            "Domain": marked_domain,
+            "Principal": marked_username,
+            "Hosts": str(len(hosts)),
+            "Readable Shares": str(len(shares)),
+            "Targets": str(len(target_pairs)),
+            "Run Output": marked_output_rel,
+            "Aggregate JSON": marked_aggregate_rel,
+            "rclone": marked_rclone,
+        },
+        icon="🧭",
+    )
+
+    try:
+        rclone_service = RcloneShareMappingService()
+        mapping_result = rclone_service.generate_host_metadata_json(
+            run_output_dir=run_output_abs,
+            host_share_targets=target_pairs,
+            username=username,
+            password=password,
+            domain=domain,
+            command_executor=shell.run_command,
+            rclone_path=rclone_path,
+            timeout_seconds=1200,
+        )
+
+        service = ShareMappingService()
+        principal_label = f"{domain}\\{username}"
+        summary = service.merge_spider_plus_run(
+            domain=domain,
+            principal=principal_label,
+            run_id=run_id,
+            run_output_dir=run_output_abs,
+            aggregate_map_path=aggregate_map_abs,
+            requested_hosts=hosts,
+            requested_shares=shares,
+            host_share_permissions=share_map,
+        )
+        host_json_count = int(summary.get("host_json_files", 0))
+        merged_files = int(summary.get("merged_file_entries", 0))
+        mapped_shares = int(mapping_result.get("mapped_shares", 0))
+        partial_targets = int(mapping_result.get("partial_targets", 0))
+        failed_targets = int(mapping_result.get("failed_targets", 0))
+
+        if host_json_count == 0:
+            print_warning(
+                "rclone mapping found no host metadata files to consolidate. "
+                "Verify SMB permissions and target paths."
+            )
+        else:
+            print_success(
+                f"rclone share mapping updated with {host_json_count} host file(s), "
+                f"{mapped_shares} mapped share(s), and {merged_files} file metadata entries."
+            )
+        if partial_targets > 0:
+            print_warning_debug(
+                "rclone mapping accepted partial targets with non-zero exit code: "
+                f"partial_targets={partial_targets} total_targets={len(target_pairs)}"
+            )
+        if failed_targets > 0:
+            print_warning_debug(
+                "rclone mapping targets failed: "
+                f"failed_targets={failed_targets} total_targets={len(target_pairs)}"
+            )
+        print_info(f"Consolidated SMB share tree map saved to {marked_aggregate_rel}.")
+        if run_post_mapping_workflow:
             _run_post_mapping_sensitive_data_workflow(
                 shell,
                 domain=domain,
@@ -1837,23 +3495,15 @@ def run_smb_share_tree_mapping_with_spider_plus(
                 hosts=hosts,
                 triage_username=username,
                 triage_password=password,
+                selected_method=selected_method,
             )
-        except Exception as triage_exc:  # noqa: BLE001
-            telemetry.capture_exception(triage_exc)
-            print_warning(
-                "SMB share mapping completed, but post-mapping sensitive-data analysis "
-                "failed and was skipped."
-            )
-            print_warning_debug(
-                "Post-mapping sensitive-data analysis failure: "
-                f"{type(triage_exc).__name__}: {triage_exc}"
-            )
-            print_warning_debug(traceback.format_exc())
+        return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_error("Error while executing spider_plus SMB share mapping.")
+        print_error("Error while executing rclone SMB share mapping.")
         print_exception(show_locals=False, exception=exc)
         print_error_debug(traceback.format_exc())
+        return False
 
 
 def _run_post_mapping_sensitive_data_workflow(
@@ -1866,6 +3516,8 @@ def _run_post_mapping_sensitive_data_workflow(
     hosts: list[str],
     triage_username: str | None = None,
     triage_password: str | None = None,
+    selected_method: str | None = None,
+    cifs_mount_root: str | None = None,
 ) -> None:
     """Run post-mapping sensitive-data search using deterministic and/or AI flow."""
     from adscan_internal.services.ai_backend_availability_service import (
@@ -1881,10 +3533,11 @@ def _run_post_mapping_sensitive_data_workflow(
         f"provider={availability.provider} reason={availability.reason}"
     )
 
-    selected_method = _select_post_mapping_sensitive_data_method(
-        shell=shell,
-        ai_configured=availability.configured,
-    )
+    if selected_method is None:
+        selected_method = _select_post_mapping_sensitive_data_method(
+            shell=shell,
+            ai_configured=availability.configured,
+        )
     _capture_post_mapping_sensitive_data_telemetry(
         shell=shell,
         stage="selected",
@@ -1900,6 +3553,13 @@ def _run_post_mapping_sensitive_data_workflow(
         print_info("Post-mapping sensitive-data analysis skipped by user.")
         return
 
+    if selected_method not in {"deterministic", "ai", "ai_cifs", "ai_rclone"}:
+        marked_method = mark_sensitive(selected_method, "text")
+        print_warning(
+            f"Unsupported sensitive-data analysis method selected: {marked_method}."
+        )
+        return
+
     marked_method = mark_sensitive(selected_method, "text")
     print_info_debug(f"Post-mapping sensitive-data method selected: {marked_method}")
     deterministic_executed = False
@@ -1907,7 +3567,7 @@ def _run_post_mapping_sensitive_data_workflow(
     ai_success: bool | None = None
     fallback_used = False
 
-    if selected_method in {"deterministic", "both"}:
+    if selected_method == "deterministic":
         deterministic_executed = True
         _run_post_mapping_deterministic_share_scan(
             shell=shell,
@@ -1917,8 +3577,11 @@ def _run_post_mapping_sensitive_data_workflow(
             username=triage_username or "",
             password=triage_password or "",
         )
-    if selected_method in {"ai", "both"}:
+    if selected_method in {"ai", "ai_cifs", "ai_rclone"}:
         ai_attempted = True
+        read_backend = (
+            "cifs_local" if selected_method == "ai_cifs" else "smb_impacket"
+        )
         try:
             ai_ok = _run_post_mapping_ai_triage(
                 shell,
@@ -1927,6 +3590,8 @@ def _run_post_mapping_sensitive_data_workflow(
                 aggregate_map_rel=aggregate_map_rel,
                 triage_username=triage_username,
                 triage_password=triage_password,
+                read_backend=read_backend,
+                cifs_mount_root=cifs_mount_root,
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -1941,7 +3606,7 @@ def _run_post_mapping_sensitive_data_workflow(
             print_warning_debug(traceback.format_exc())
         ai_success = ai_ok
 
-        if selected_method == "ai" and not ai_ok:
+        if selected_method in {"ai", "ai_cifs", "ai_rclone"} and not ai_ok:
             fallback_used = True
             print_warning(
                 "AI analysis did not complete successfully. "
@@ -1959,13 +3624,23 @@ def _run_post_mapping_sensitive_data_workflow(
 
     if selected_method == "deterministic":
         outcome = "deterministic_completed"
-    elif selected_method == "both":
-        outcome = "both_completed" if ai_success is not False else "both_completed_ai_failed"
+    elif selected_method == "ai_cifs":
+        outcome = (
+            "ai_cifs_completed"
+            if ai_success
+            else "ai_cifs_failed_fallback_deterministic_attempted"
+        )
     elif selected_method == "ai":
         outcome = (
             "ai_completed"
             if ai_success
             else "ai_failed_fallback_deterministic_attempted"
+        )
+    elif selected_method == "ai_rclone":
+        outcome = (
+            "ai_rclone_completed"
+            if ai_success
+            else "ai_rclone_failed_fallback_deterministic_attempted"
         )
     else:
         outcome = "unknown"
@@ -2057,7 +3732,12 @@ def _select_post_mapping_sensitive_data_method(
     shell: Any,
     ai_configured: bool,
 ) -> str | None:
-    """Select post-mapping sensitive-data analysis mode."""
+    """Select sensitive-data analysis mode for SMB share workflows.
+
+    UX is intentionally two-step when AI is available:
+    1) Choose analysis mode (deterministic or AI).
+    2) If AI selected, choose mapping backend (spider_plus, CIFS, rclone).
+    """
     if getattr(shell, "auto", False):
         return "deterministic"
 
@@ -2067,28 +3747,46 @@ def _select_post_mapping_sensitive_data_method(
         )
         return "deterministic"
 
-    options = [
+    selector = getattr(shell, "_questionary_select", None)
+    if not callable(selector):
+        return "deterministic"
+
+    primary_options = [
         "Deterministic only (manspider + credsweeper) [Recommended]",
-        "AI only (triage + prioritized byte-stream inspection)",
-        "Both (deterministic first, then AI)",
+        "AI-assisted share analysis",
         "Skip sensitive-data analysis",
     ]
-    selector = getattr(shell, "_questionary_select", None)
-    if callable(selector):
-        selected_idx = selector(
-            "Select SMB sensitive-data search method:",
-            options,
-            default_idx=0,
-        )
-    else:
-        selected_idx = 0
-
-    if selected_idx == 1:
-        return "ai"
-    if selected_idx == 2:
-        return "both"
-    if selected_idx == 3:
+    primary_idx = selector(
+        "Select SMB sensitive-data analysis mode:",
+        primary_options,
+        default_idx=0,
+    )
+    if primary_idx == 0:
+        return "deterministic"
+    if primary_idx == 2:
         return None
+    if primary_idx != 1:
+        return "deterministic"
+
+    mapping_options = [
+        "spider_plus (NetExec) [Recommended]",
+        "CIFS mounted shares",
+        "rclone SMB mapping",
+        "Back",
+    ]
+    mapping_idx = selector(
+        "Select AI share mapping backend:",
+        mapping_options,
+        default_idx=0,
+    )
+    if mapping_idx == 0:
+        return "ai"
+    if mapping_idx == 1:
+        return "ai_cifs"
+    if mapping_idx == 2:
+        return "ai_rclone"
+    if mapping_idx == 3:
+        return "deterministic"
     return "deterministic"
 
 
@@ -2100,6 +3798,8 @@ def _run_post_mapping_ai_triage(
     aggregate_map_rel: str,
     triage_username: str | None = None,
     triage_password: str | None = None,
+    read_backend: str = "smb_impacket",
+    cifs_mount_root: str | None = None,
 ) -> bool:
     """Run AI triage on consolidated share mapping JSON after spider_plus."""
     from adscan_internal.services.share_map_ai_triage_service import (
@@ -2192,6 +3892,16 @@ def _run_post_mapping_ai_triage(
             "AI triage byte-read auth source: "
             f"user={marked_user} domain={marked_domain} source=active_domain_context"
         )
+    if read_backend == "cifs_local":
+        resolved_root = str(cifs_mount_root or "").strip() or _resolve_cifs_mount_root(
+            shell=shell,
+            domain=domain,
+        )
+        marked_root = mark_sensitive(resolved_root, "path")
+        print_info_debug(
+            "AI triage read backend selected: backend=cifs_local "
+            f"mount_root={marked_root}"
+        )
 
     print_info_debug(
         "AI triage share-map context loaded: "
@@ -2269,8 +3979,13 @@ def _run_post_mapping_ai_triage(
         )
         return False
 
+    read_mode_label = (
+        "local CIFS reads"
+        if read_backend == "cifs_local"
+        else "Impacket byte-stream reads"
+    )
     if not Confirm.ask(
-        "Do you want AI to inspect these prioritized files using Impacket byte-stream reads?",
+        f"Do you want AI to inspect these prioritized files using {read_mode_label}?",
         default=True,
     ):
         print_info("AI prioritized file inspection cancelled by user.")
@@ -2287,6 +4002,8 @@ def _run_post_mapping_ai_triage(
         read_username=effective_username or None,
         read_password=effective_password or None,
         read_domain=domain if effective_username and effective_password else None,
+        read_backend=read_backend,
+        cifs_mount_root=cifs_mount_root,
     )
     return True
 
@@ -2341,9 +4058,15 @@ def _run_ai_prioritized_file_analysis(
     read_username: str | None = None,
     read_password: str | None = None,
     read_domain: str | None = None,
+    read_backend: str = "smb_impacket",
+    cifs_mount_root: str | None = None,
 ) -> None:
-    """Analyze prioritized SMB files with AI using in-memory Impacket reads."""
+    """Analyze prioritized SMB files with AI using configured file-read backend."""
+    from adscan_internal.services.cifs_share_mapping_service import (
+        CIFSShareMappingService,
+    )
     from adscan_internal.services.file_byte_reader_service import (
+        LocalFileByteReaderService,
         SMBFileByteReaderService,
     )
     from adscan_internal.services.share_file_analysis_pipeline_service import (
@@ -2360,6 +4083,8 @@ def _run_ai_prioritized_file_analysis(
     )
 
     reader_service = SMBFileByteReaderService()
+    local_reader_service = LocalFileByteReaderService()
+    cifs_mapping_service = CIFSShareMappingService()
     provenance_service = ShareCredentialProvenanceService()
     pipeline_service = ShareFileAnalysisPipelineService(
         analyzer_service=ShareFileAnalyzerService(
@@ -2379,6 +4104,8 @@ def _run_ai_prioritized_file_analysis(
     forced_oversized = 0
     oversized_rows: list[tuple[str, str, str, str, str]] = []
     continue_after_findings: bool | None = None
+    local_reads = 0
+    local_to_smb_fallbacks = 0
 
     for idx, candidate in enumerate(prioritized_files, start=1):
         host = str(getattr(candidate, "host", "")).strip()
@@ -2493,29 +4220,69 @@ def _run_ai_prioritized_file_analysis(
             f"on {marked_host}/{marked_share}"
         )
 
-        read_result = reader_service.read_file_bytes(
-            shell=shell,
-            domain=domain,
-            host=host,
-            share=share,
-            source_path=path,
-            max_bytes=per_file_max_bytes,
-            timeout_seconds=120 if per_file_max_bytes > max_bytes else 30,
-            auth_username=read_username,
-            auth_password=read_password,
-            auth_domain=read_domain,
-        )
+        per_file_backend = read_backend
+        local_source_path = ""
+        read_result: Any | None = None
+        if read_backend == "cifs_local":
+            resolved_mount_root = str(cifs_mount_root or "").strip() or _resolve_cifs_mount_root(
+                shell=shell,
+                domain=domain,
+            )
+            local_source_path = (
+                cifs_mapping_service.resolve_candidate_local_path(
+                    mount_root=resolved_mount_root,
+                    host=host,
+                    share=share,
+                    remote_path=path,
+                    allow_share_root_fallback=len(prioritized_files) <= 1,
+                )
+                or ""
+            )
+            if local_source_path:
+                local_reads += 1
+                read_result = local_reader_service.read_file_bytes(
+                    source_path=local_source_path,
+                    max_bytes=per_file_max_bytes,
+                )
+            else:
+                local_to_smb_fallbacks += 1
+                per_file_backend = "smb_impacket"
+                marked_root = mark_sensitive(resolved_mount_root, "path")
+                print_warning_debug(
+                    "CIFS local path resolution failed; falling back to SMB byte-stream: "
+                    f"host={marked_host} share={marked_share} path={marked_path} "
+                    f"mount_root={marked_root}"
+                )
+        if per_file_backend != "cifs_local":
+            read_result = reader_service.read_file_bytes(
+                shell=shell,
+                domain=domain,
+                host=host,
+                share=share,
+                source_path=path,
+                max_bytes=per_file_max_bytes,
+                timeout_seconds=120 if per_file_max_bytes > max_bytes else 30,
+                auth_username=read_username,
+                auth_password=read_password,
+                auth_domain=read_domain,
+            )
+        if read_result is None:
+            continue
         print_info_debug(
             "AI file read result: "
             f"host={marked_host} share={marked_share} path={marked_path} "
+            f"backend={per_file_backend} "
             f"requested_max_bytes={per_file_max_bytes} "
             f"received_bytes={len(read_result.data)} "
             f"truncated={read_result.truncated} success={read_result.success}"
         )
         if not read_result.success:
             read_failures += 1
+            read_label = (
+                "local CIFS read" if per_file_backend == "cifs_local" else "Impacket byte-stream"
+            )
             print_warning(
-                f"Could not read {marked_path} via Impacket byte-stream."
+                f"Could not read {marked_path} via {read_label}."
             )
             auth_user_marked = mark_sensitive(
                 read_result.auth_username or "unknown",
@@ -2529,15 +4296,23 @@ def _run_ai_prioritized_file_analysis(
                 read_result.normalized_path or path,
                 "path",
             )
-            print_warning_debug(
-                "SMB byte read failure: "
-                f"host={marked_host} share={marked_share} path={marked_path} "
-                f"normalized_path={normalized_path_marked} "
-                f"auth_user={auth_user_marked} auth_domain={auth_domain_marked} "
-                f"auth_mode={read_result.auth_mode or 'unknown'} "
-                f"status={read_result.status_code or '-'} "
-                f"error={read_result.error_message or 'unknown'}"
-            )
+            if per_file_backend == "cifs_local":
+                print_warning_debug(
+                    "CIFS local read failure: "
+                    f"host={marked_host} share={marked_share} path={marked_path} "
+                    f"local_path={normalized_path_marked} "
+                    f"error={read_result.error_message or 'unknown'}"
+                )
+            else:
+                print_warning_debug(
+                    "SMB byte read failure: "
+                    f"host={marked_host} share={marked_share} path={marked_path} "
+                    f"normalized_path={normalized_path_marked} "
+                    f"auth_user={auth_user_marked} auth_domain={auth_domain_marked} "
+                    f"auth_mode={read_result.auth_mode or 'unknown'} "
+                    f"status={read_result.status_code or '-'} "
+                    f"error={read_result.error_message or 'unknown'}"
+                )
             continue
 
         if read_result.truncated:
@@ -2676,11 +4451,14 @@ def _run_ai_prioritized_file_analysis(
     print_panel(
         (
             f"AI prioritized analysis completed.\n"
+            f"- read_backend={read_backend}\n"
             f"- prioritized_files={len(prioritized_files)}\n"
             f"- analyzed={analyzed}\n"
             f"- deterministic_handled={deterministic_handled}\n"
             f"- deterministic_findings={deterministic_findings}\n"
             f"- read_failures={read_failures}\n"
+            f"- local_reads={local_reads}\n"
+            f"- local_to_smb_fallbacks={local_to_smb_fallbacks}\n"
             f"- files_with_findings={flagged_files}\n"
             f"- credential_like_findings={flagged_credentials}\n"
             f"- skipped_oversized={skipped_oversized}\n"

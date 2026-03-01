@@ -1,28 +1,17 @@
 ###############################################################################
-# ADscan FULL runtime image (Debian-based, Docker-first distribution)
+# ADscan runtime image (single source of truth)
 #
-# This image bundles:
-# - `adscan` onefile binary (built via build_adscan.sh -> dist/adscan)
-# - system packages required by ADscan runtime/tooling
-# - isolated Python tool environments (PipToolsConfig)
-# - external tools (EXTERNAL_TOOLS_CONFIG) + wordlists
+# Build targets:
+# - runtime-pro: uses compiled binary from dist/adscan (PyArmor/PyInstaller flow)
+# - runtime-lite: uses open-source Python sources (no PyArmor/PyInstaller)
 #
-# Notes:
-# - Host-only components (e.g. unbound/dhcpcd DNS rewrites, SYS_TIME) are not
-#   expected to work inside containers without extra privileges.
-# - The host wrapper runs this container with `--network host` and mounts only
-#   the workspaces directory.
+# This file centralizes all shared runtime dependencies/tools so LITE and PRO
+# never drift when adding system packages or tooling.
 ###############################################################################
 
 ###############################################################################
 # RustHound-CE build stage (Kerberos/GSSAPI enabled)
-#
-# We compile RustHound-CE with the system GSSAPI/SASL/KRB5 libraries available.
-# Some prebuilt upstream binaries are compiled without GSSAPI support and will
-# refuse `-k` (Kerberos) with:
-#   "Kerberos auth and GSSAPI not compatible with current os!"
 ###############################################################################
-
 FROM rust:1-bookworm AS rusthound_builder
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -41,7 +30,10 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 # Pin RustHound-CE version (must match ADscan expectations)
 RUN cargo install --locked --version 2.4.1 rusthound-ce
 
-FROM debian:trixie-slim
+###############################################################################
+# Shared runtime base for both PRO and LITE images
+###############################################################################
+FROM debian:trixie-slim AS runtime-common
 
 ARG DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
@@ -65,7 +57,9 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       iproute2 \
       procps \
       unzip \
+      p7zip-full \
       wget \
+      rclone \
       xz-utils \
       bzip2 \
       python3 \
@@ -138,11 +132,6 @@ RUN mkdir -p /opt/adscan/{bin,tools,tool_venvs,wordlists,logs,fonts} /workspaces
   && chmod -R 0777 /opt/adscan /workspaces
 
 # Install Python tool environments (mirrors `PipToolsConfig` from adscan.py)
-# Keep each tool in its own venv to avoid dependency conflicts.
-#
-# NOTE: Debian uses an "externally managed" system Python (PEP 668) which
-# blocks system-wide `pip install`. We only use pip inside dedicated venvs.
-
 RUN set -eux; \
   python3 -m venv /opt/adscan/tool_venvs/impacket/venv; \
   /opt/adscan/tool_venvs/impacket/venv/bin/python -m pip install --no-cache-dir -U pip; \
@@ -186,7 +175,7 @@ RUN set -eux; \
   \
   chmod -R 0777 /opt/adscan/tool_venvs
 
-# External tools (git/curl) - best-effort provisioning for FULL image.
+# External tools (git/curl)
 RUN set -eux; \
   mkdir -p /opt/adscan/tools; \
   git clone --depth 1 https://github.com/Greenwolf/ntlm_theft.git /opt/adscan/tools/ntlm_theft; \
@@ -232,32 +221,96 @@ RUN set -eux; \
   curl -fsSL https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt -o /opt/adscan/wordlists/rockyou.txt; \
   curl -fsSL https://gist.github.com/The-Viper-One/a1ee60d8b3607807cc387d794e809f0b/raw/b7d83af6a8bbb43013e04f78328687d19d0cf9a7/kerberoast_pws.xz -o /opt/adscan/wordlists/kerberoast_pws.xz; \
   xz -d -c /opt/adscan/wordlists/kerberoast_pws.xz > /opt/adscan/wordlists/kerberoast_pws; \
+  curl -fsSL https://weakpass.com/download/2073/hashmob.net_2025.medium.found.7z -o /opt/adscan/wordlists/hashmob.net_2025.medium.found.7z; \
+  7z x -y -o/opt/adscan/wordlists /opt/adscan/wordlists/hashmob.net_2025.medium.found.7z; \
+  curl -fsSL https://weakpass.com/download/1938/kaonashi14M.txt.7z -o /opt/adscan/wordlists/kaonashi14M.txt.7z; \
+  7z x -y -o/opt/adscan/wordlists /opt/adscan/wordlists/kaonashi14M.txt.7z; \
   rm -f /opt/adscan/wordlists/kerberoast_pws.xz; \
+  rm -f /opt/adscan/wordlists/hashmob.net_2025.medium.found.7z; \
+  rm -f /opt/adscan/wordlists/kaonashi14M.txt.7z; \
   chmod -R 0777 /opt/adscan/wordlists
 
 # RustHound-CE (Kerberos-capable build)
 COPY --from=rusthound_builder /usr/local/cargo/bin/rusthound-ce /usr/local/bin/rusthound-ce
 RUN rusthound-ce --version
 
-# Enable Unbound remote-control for container runtime so ADscan can trigger a reload
-# without relying on systemd or sudo.
-#
-# Debian's default Unbound configuration enables chroot + DNSSEC trust anchor
-# management which is fragile in minimal container environments. Use a
-# container-friendly base config that delegates the listen interface and
-# forwarders to our generated snippets in `/etc/unbound/unbound.conf.d/`.
+# Unbound container configuration
 COPY docker/unbound_container_base.conf /etc/unbound/unbound.conf
 COPY docker/unbound_adscan_control.conf /etc/unbound/unbound.conf.d/00-adscan-control.conf
 
-# Copy the compiled onefile binary into the image.
-# Keep this near the end so that changes to dist/adscan do not invalidate the
-# cache for the heavy dependency/tool installation layers above.
-#
-# It must exist before building this image (run: ./build_adscan.sh).
+COPY docker/adscan_entrypoint.sh /usr/local/bin/adscan-entrypoint
+RUN chmod +x /usr/local/bin/adscan-entrypoint
+
+###############################################################################
+# PRO target: compiled binary runtime
+###############################################################################
+FROM runtime-common AS runtime-pro
+
 COPY dist/adscan /usr/local/bin/adscan
 RUN chmod +x /usr/local/bin/adscan
 
-COPY docker/adscan_entrypoint.sh /usr/local/bin/adscan-entrypoint
-RUN chmod +x /usr/local/bin/adscan-entrypoint
+ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]
+
+###############################################################################
+# LITE target: source runtime (open-source)
+###############################################################################
+FROM runtime-common AS runtime-lite
+
+# Runtime Python dependencies for source-mode ADscan CLI.
+RUN set -eux; \
+  python3 -m venv /opt/adscan/venv; \
+  /opt/adscan/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/venv/bin/python -m pip install --no-cache-dir \
+    prompt_toolkit==3.0.52 \
+    psutil==7.2.2 \
+    rich==13.9.4 \
+    python-docx==1.2.0 \
+    netifaces==0.11.0 \
+    neo4j==6.1.0 \
+    posthog==7.9.3 \
+    certifi==2026.1.4 \
+    ipaddress==1.0.23 \
+    python-dotenv==1.2.1 \
+    sentry-sdk==2.52.0 \
+    packaging==25.0 \
+    questionary==2.1.1 \
+    pypsrp==0.9.0 \
+    structlog==25.5.0 \
+    pydantic-settings==2.13.1 \
+    pydantic-ai==1.62.0 \
+    python-magic==0.4.27 \
+    markitdown==0.1.5 \
+    gpp-decrypt==2.0.0 \
+    requests==2.32.5 \
+    matplotlib==3.10.8 \
+    graphviz==0.21
+
+COPY adscan.py /opt/adscan-src/adscan.py
+COPY adscan_core /opt/adscan-src/adscan_core
+COPY adscan_internal /opt/adscan-src/adscan_internal
+COPY adscan_launcher /opt/adscan-src/adscan_launcher
+COPY config.yaml /opt/adscan-src/config.yaml
+COPY custom_config.yaml /opt/adscan-src/custom_config.yaml
+COPY pyproject.toml /opt/adscan-src/pyproject.toml
+
+# Normalize source permissions to avoid host-side restrictive modes leaking into
+# the image (e.g. 0700 dirs), which can break imports when running as the
+# non-root `adscan` user.
+RUN chmod -R a+rX /opt/adscan-src
+
+# Safety assertions: LITE image must not contain private modules.
+RUN test ! -d /opt/adscan-src/adscan_internal/pro
+RUN test ! -d /opt/adscan-src/adscan_internal/reporting
+RUN test ! -f /opt/adscan-src/adscan_internal/services/report_service.py
+RUN test ! -f /opt/adscan-src/adscan_internal/report_generator.py
+
+ENV PYTHONPATH=/opt/adscan-src
+
+RUN printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'exec /opt/adscan/venv/bin/python /opt/adscan-src/adscan.py "$@"' \
+  > /usr/local/bin/adscan \
+  && chmod +x /usr/local/bin/adscan
 
 ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]

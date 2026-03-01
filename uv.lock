@@ -15,7 +15,7 @@ resolution-markers = [
 
 [[package]]
 name = "adscan"
-version = "5.0.0"
+version = "5.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
