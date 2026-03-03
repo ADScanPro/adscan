@@ -684,6 +684,8 @@ def build_adscan_run_command(
             "-e",
             "ADSCAN_CONTAINER_RUNTIME=1",
             "-e",
+            f"ADSCAN_RUNTIME_IMAGE={cfg.image}",
+            "-e",
             "ADSCAN_HOST_HELPER_SOCK=/run/adscan/host-helper.sock",
         ]
     )
@@ -773,6 +775,8 @@ def build_adscan_run_command(
         "CLI_SHARED_TOKEN",
         # Used by the host privileged helper (Docker clock sync).
         "CONTAINER_SHARED_TOKEN",
+        # Distinguish host launcher version from in-container runtime version.
+        "ADSCAN_LAUNCHER_VERSION",
     )
     for key in passthrough_keys:
         if key in os.environ and str(os.environ.get(key, "")).strip():

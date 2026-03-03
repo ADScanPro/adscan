@@ -14,7 +14,6 @@ import secrets
 import time
 from datetime import datetime, timezone, timedelta
 from html import unescape
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator, Optional, TYPE_CHECKING
@@ -52,7 +51,12 @@ from adscan_core.sensitive import (
 from adscan_core.path_utils import (
     get_adscan_home,
     get_adscan_state_dir,
-    get_effective_user_home,
+)
+from adscan_core.version_context import (
+    detect_installer,
+    get_installed_version,
+    get_telemetry_version_fields,
+    resolve_installed_version_info,
 )
 
 if TYPE_CHECKING:
@@ -367,60 +371,9 @@ except ImportError:
 # --- Forzar uso del bundle de certifi para TLS dentro del binario ---
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
-# Tool version for telemetry; update per release
-VERSION = "5.0.2"
-
-
-@functools.lru_cache(maxsize=1)
-def get_installed_version() -> str:
-    """Return installed version from pipx metadata, package metadata, or fallback."""
-    ver_file = get_adscan_home() / "version"
-    # 1. If running under pipx, prefer pipx metadata
-    if detect_installer() == "pipx":
-        pipx_home = os.environ.get(
-            "PIPX_HOME", str(get_effective_user_home() / ".local" / "pipx")
-        )
-        pipx_meta = Path(pipx_home) / "venvs" / "adscan" / "pipx_metadata.json"
-        if pipx_meta.is_file():
-            try:
-                data = json.loads(pipx_meta.read_text(encoding="utf-8"))
-                ver = data.get("main_package", {}).get("package_version")
-                if ver:
-                    ver_file.parent.mkdir(parents=True, exist_ok=True)
-                    ver_file.write_text(ver, encoding="utf-8")
-                    return ver
-            except (OSError, json.JSONDecodeError):
-                pass
-    # 2. Try package metadata
-    try:
-        pkg_ver = version("adscan")
-        ver_file.parent.mkdir(parents=True, exist_ok=True)
-        ver_file.write_text(pkg_ver, encoding="utf-8")
-        return pkg_ver
-    except PackageNotFoundError:
-        pass
-    # 3. Fallback to version file if exists
-    if ver_file.is_file():
-        return ver_file.read_text(encoding="utf-8").strip()
-    # 4. Last resort: default constant
-    return VERSION
-
-
-def detect_installer():
-    """Detect installation method: pip or pipx (checks pipx venv directory)."""
-    # 1. Check if running inside a pipx-managed venv
-    pipx_home = Path(
-        os.environ.get("PIPX_HOME", get_effective_user_home() / ".local" / "pipx")
-    )
-    pipx_venvs = pipx_home / "venvs"
-    exe_path = Path(sys.executable).resolve()
-    if pipx_venvs in exe_path.parents:
-        return "pipx"
-    # 2. Fallback: check for 'pipx' in executable path
-    if "pipx" in str(exe_path).lower():
-        return "pipx"
-    # Default to pip
-    return "pip"
+def _resolve_installed_version_info() -> dict[str, str]:
+    """Compatibility wrapper around centralized version context resolver."""
+    return resolve_installed_version_info()
 
 
 # Detect installation method (binary vs pypi vs source)
@@ -616,6 +569,13 @@ def _send_telemetry_state_event(
         "telemetry_source": source,
         "telemetry_enabled_effective": enabled,
     }
+    version_fields = get_telemetry_version_fields()
+    for key, value in version_fields.items():
+        if key == "adscan_version":
+            continue
+        if value is None or value == "":
+            continue
+        props[key] = value
     if previous:
         props["telemetry_prev_enabled_effective"] = bool(
             previous.get("enabled_effective")
@@ -640,6 +600,12 @@ def _send_telemetry_state_event(
         "version": get_installed_version(),
         "downloaded_source": DOWNLOAD_SOURCE,
     }
+    for key, value in version_fields.items():
+        if key == "adscan_version":
+            continue
+        if value is None or value == "":
+            continue
+        props["$set"][key] = value
 
     payload = {"event": event, "distinct_id": TELEMETRY_ID, "properties": props}
     try:
@@ -1645,7 +1611,16 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
 
             # Add environment to event properties (for event-level filtering)
             current_environment = _determine_environment()
-            props["version"] = get_installed_version()
+            version_fields = get_telemetry_version_fields()
+            props["version"] = str(
+                version_fields.get("adscan_version") or get_installed_version()
+            )
+            for key, value in version_fields.items():
+                if key == "adscan_version":
+                    continue
+                if value is None or value == "":
+                    continue
+                props[key] = value
             props["environment"] = current_environment
 
             # Add environment to person properties (for user-level filtering).
@@ -1653,10 +1628,18 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
             # and analysis don't need to handle multiple variants.
             default_set: dict[str, Any] = {
                 "telemetry_enabled": _is_telemetry_enabled(),
-                "version": get_installed_version(),
+                "version": str(
+                    version_fields.get("adscan_version") or get_installed_version()
+                ),
                 "downloaded_source": DOWNLOAD_SOURCE,
                 "environment": current_environment,
             }
+            for key, value in version_fields.items():
+                if key == "adscan_version":
+                    continue
+                if value is None or value == "":
+                    continue
+                default_set[key] = value
             # Enrich person-level properties with non-sensitive system context
             # (OS, distro, Python version, etc.) so they are always linked to
             # the same distinct_id across events.
@@ -3683,11 +3666,30 @@ def _vercel_timestamp_fields(
 
 
 def _vercel_version_field() -> dict:
-    """Return payload entry describing the installed version if available."""
-    installed_version = get_installed_version()
-    if installed_version:
-        return {"adscan_version": installed_version}
-    return {}
+    """Return normalized version context fields for Vercel session payloads."""
+    version_fields = get_telemetry_version_fields()
+    payload: dict[str, Any] = {}
+
+    adscan_version = str(version_fields.get("adscan_version") or "").strip()
+    if adscan_version:
+        payload["adscan_version"] = adscan_version
+
+    forward_keys = (
+        "adscan_version_source",
+        "launcher_version",
+        "launcher_version_source",
+        "runtime_version",
+        "runtime_version_source",
+        "runtime_image",
+        "adscan_detected_installer",
+        "version_context_mode",
+    )
+    for key in forward_keys:
+        value = version_fields.get(key)
+        if value is None or value == "":
+            continue
+        payload[key] = value
+    return payload
 
 
 def _vercel_session_url(api_url: str, session_id: str) -> str:
@@ -3707,6 +3709,14 @@ def _summarize_vercel_payload_context(payload: dict[str, Any]) -> str:
         "target_slug",
         "target_whitelisted",
         "adscan_version",
+        "adscan_version_source",
+        "launcher_version",
+        "launcher_version_source",
+        "runtime_version",
+        "runtime_version_source",
+        "runtime_image",
+        "adscan_detected_installer",
+        "version_context_mode",
         "started_at",
         "finished_at",
     )
@@ -4039,8 +4049,17 @@ def identify_user(properties: dict):
     if not _is_telemetry_enabled():
         return
 
-    # Include tool version
-    properties["version"] = get_installed_version()
+    # Include normalized version context for downstream segmentation.
+    version_fields = get_telemetry_version_fields()
+    properties["version"] = str(
+        version_fields.get("adscan_version") or get_installed_version()
+    )
+    for key, value in version_fields.items():
+        if key == "adscan_version":
+            continue
+        if value is None or value == "":
+            continue
+        properties.setdefault(key, value)
     if _telemetry_client:
         try:
             # Get appropriate proxy URL for current environment
@@ -4158,7 +4177,10 @@ def capture_exception(e: Exception, properties: Optional[dict[str, Any]] = None)
             # using the special `$exception` event name. Populate it with a
             # minimal, non-sensitive description of the exception.
             capture_props = {
-                "version": get_installed_version(),
+                "version": str(
+                    get_telemetry_version_fields().get("adscan_version")
+                    or get_installed_version()
+                ),
                 "downloaded_source": DOWNLOAD_SOURCE,
                 "exception_type": exc_type,
                 "exception_message": exc_message[:200],
@@ -4172,6 +4194,12 @@ def capture_exception(e: Exception, properties: Optional[dict[str, Any]] = None)
                     }
                 ],
             }
+            for key, value in get_telemetry_version_fields().items():
+                if key == "adscan_version":
+                    continue
+                if value is None or value == "":
+                    continue
+                capture_props[key] = value
             if properties:
                 capture_props.update(properties)
 

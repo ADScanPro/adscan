@@ -1279,7 +1279,7 @@ class BloodHoundCEClient(BloodHoundClient):
         """Return a Cypher domain predicate for the provided alias."""
         if match_domain_by_name_suffix:
             return (
-                f"toLower(coalesce({alias}.name, \"\")) "
+                f'toLower(coalesce({alias}.name, "")) '
                 f"ends with toLower('@{domain_value}')"
             )
         return f"toLower(coalesce({alias}.domain, \"\")) = toLower('{domain_value}')"
@@ -1467,6 +1467,63 @@ class BloodHoundCEClient(BloodHoundClient):
             MATCH p=(s)-[r]->(t)
             WHERE 1=1
               {source_filter}
+              AND type(r) IN {sorted(allowed_relations)!r}
+            RETURN p
+            LIMIT {limit_value}
+            """
+
+            graph_data = self.execute_query_with_relationships(cypher_query)
+            if not graph_data:
+                return []
+            return self._extract_direct_allowed_edges_from_graph(
+                graph_data, allowed_relations=allowed_relations
+            )
+        except Exception:
+            return []
+
+    def get_high_value_session_paths(
+        self, domain: str, *, max_results: int = 1000
+    ) -> List[Dict]:
+        """Return computer->high-value-user session edges for Phase 2.
+
+        This query focuses on active user sessions where the session owner is
+        high value / Tier 0. It complements low-priv attack-step discovery by
+        exposing host pivots that may allow credential theft or token abuse.
+
+        Returned entries are normalized to:
+
+            {"nodes": [<computer_node>, <user_node>], "rels": ["HasSession"]}
+        """
+        try:
+            allowed_relations = {"HasSession"}
+            domain_value = domain.replace("'", "\\'")
+            limit_value = max(1, min(int(max_results), 5000))
+            computer_domain_filter = self._build_domain_filter(
+                alias="c",
+                domain_value=domain_value,
+            )
+            user_domain_filter = self._build_domain_filter(
+                alias="u",
+                domain_value=domain_value,
+            )
+            computer_enabled_filter = self._build_enabled_filter(
+                alias="c", default_true=True
+            )
+            user_enabled_filter = self._build_enabled_filter(
+                alias="u", default_true=True
+            )
+            user_high_value_filter = self._build_high_value_filter(alias="u")
+            computer_high_value_filter = self._build_high_value_filter(alias="c")
+
+            cypher_query = f"""
+            MATCH p=(c:Computer)-[r]->(u:User)
+            WHERE 1=1
+              AND {computer_domain_filter}
+              AND {computer_enabled_filter}
+              AND NOT ({computer_high_value_filter})
+              AND {user_domain_filter}
+              AND {user_enabled_filter}
+              AND {user_high_value_filter}
               AND type(r) IN {sorted(allowed_relations)!r}
             RETURN p
             LIMIT {limit_value}

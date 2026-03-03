@@ -280,6 +280,8 @@ RUN set -eux; \
     pydantic-ai==1.62.0 \
     python-magic==0.4.27 \
     markitdown==0.1.5 \
+    impacket==0.13.0 \
+    pycryptodome==3.23.0 \
     gpp-decrypt==2.0.0 \
     requests==2.32.5 \
     matplotlib==3.10.8 \

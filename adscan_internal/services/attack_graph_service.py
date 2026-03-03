@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, cast
@@ -21,6 +23,7 @@ from adscan_internal.workspaces import domain_subpath, read_json_file, write_jso
 
 from adscan_internal.services import attack_paths_core
 from adscan_internal.services.attack_step_support_registry import (
+    CONTEXT_ONLY_RELATIONS,
     classify_relation_support,
 )
 from adscan_internal.services.attack_step_catalog import (
@@ -28,11 +31,21 @@ from adscan_internal.services.attack_step_catalog import (
 )
 from adscan_internal.services.membership_snapshot import (
     load_membership_snapshot as _load_membership_snapshot_impl,
+    membership_snapshot_path as _membership_snapshot_path,
     snapshot_has_sid_metadata as _snapshot_has_sid_metadata,
+)
+from adscan_internal.services.cache_metrics import (
+    copy_stats,
+    increment_scoped_stats,
+    reset_stats,
 )
 
 
 ATTACK_GRAPH_SCHEMA_VERSION = "1.1"
+_ATTACK_GRAPH_MAINTENANCE_VERSION = 1
+_CONTEXT_RELATIONS_LOWER = {
+    str(relation).strip().lower() for relation in CONTEXT_ONLY_RELATIONS.keys()
+}
 
 # Edge classification for CTEM correlation (centralized in attack_step_catalog).
 EXPLOITATION_EDGE_VULN_KEYS: dict[str, str] = get_exploitation_relation_vuln_keys()
@@ -58,6 +71,93 @@ ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 _CERTIPY_TEMPLATE_CACHE: dict[str, dict[str, Any]] = {}
+_REPORT_SYNC_FN: Callable[[object, str, dict[str, Any]], None] | None | bool = None
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    """Read an integer env var with fallback and floor."""
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float = 0.0,
+    maximum: float = 1.0,
+) -> float:
+    """Read a float env var with fallback and clamped bounds."""
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+_ATTACK_PATHS_CACHE_ENABLED = os.getenv(
+    "ADSCAN_ATTACK_PATHS_CACHE_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+_ATTACK_PATHS_CACHE_MAX_ENTRIES = _env_int(
+    "ADSCAN_ATTACK_PATHS_CACHE_MAX_ENTRIES", 64
+)
+_ATTACK_PATHS_CACHE_MAX_RECORDS = _env_int(
+    "ADSCAN_ATTACK_PATHS_CACHE_MAX_RECORDS", 2000
+)
+_ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH = os.getenv(
+    "ADSCAN_ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_ATTACK_PATH_PRINCIPAL_BH_RESOLVE_MAX = _env_int(
+    "ADSCAN_ATTACK_PATH_PRINCIPAL_BH_RESOLVE_MAX",
+    64,
+)
+_ATTACK_PATH_PRINCIPAL_SYNTHETIC_MIN_SNAPSHOT_COVERAGE = _env_float(
+    "ADSCAN_ATTACK_PATH_PRINCIPAL_SYNTHETIC_MIN_SNAPSHOT_COVERAGE",
+    0.85,
+)
+_ATTACK_PATHS_COMPUTE_CACHE: "OrderedDict[tuple[Any, ...], list[dict[str, Any]]]" = (
+    OrderedDict()
+)
+_ATTACK_PATHS_CACHE_STATS: dict[str, int] = {
+    "hits": 0,
+    "misses": 0,
+    "stores": 0,
+    "skips": 0,
+    "evictions": 0,
+    "invalidations": 0,
+}
+_ATTACK_PATHS_CACHE_DOMAIN_STATS: dict[str, dict[str, int]] = {}
+
+
+def _cache_stats_inc(domain: str, key: str, by: int = 1) -> None:
+    """Increment global + per-domain attack-path cache counters."""
+    domain_key = str(domain or "").strip().lower()
+    increment_scoped_stats(
+        global_stats=_ATTACK_PATHS_CACHE_STATS,
+        scoped_stats=_ATTACK_PATHS_CACHE_DOMAIN_STATS,
+        scope_key=domain_key,
+        key=key,
+        by=by,
+    )
+
+
+def _get_attack_graph_maintenance_state(graph: dict[str, Any]) -> dict[str, Any]:
+    """Return mutable maintenance-state metadata for an attack graph."""
+    state = graph.get("maintenance")
+    if not isinstance(state, dict):
+        state = {}
+        graph["maintenance"] = state
+    return state
+
+
+def _maintenance_key(version: int) -> str:
+    """Return the maintenance marker key for the current code version."""
+    return f"v{version}"
 
 
 def _load_enabled_users(shell: object, domain: str) -> set[str] | None:
@@ -226,6 +326,30 @@ ATTACK_GRAPH_PERSIST_MEMBERSHIPS = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 _DOMAIN_SID_VALIDATION_CACHE: set[str] = set()
+
+
+def _resolve_local_reuse_topology(total_hosts: int) -> str:
+    """Return edge-topology mode for LocalAdminPassReuse materialization.
+
+    Modes:
+        - star: compressed bidirectional star (2 * (N-1) edges) [default]
+        - mesh: full directed graph (N * (N-1) edges), debug/compat mode only
+        - auto: legacy threshold behavior (mesh up to ADSCAN_LOCAL_REUSE_MESH_MAX_HOSTS)
+    """
+    mode = os.getenv("ADSCAN_LOCAL_REUSE_EDGE_TOPOLOGY", "star").strip().lower()
+    if mode in {"mesh", "full", "clique"}:
+        return "mesh"
+    if mode == "star":
+        return "star"
+    if mode != "auto":
+        return "star"
+
+    threshold_raw = os.getenv("ADSCAN_LOCAL_REUSE_MESH_MAX_HOSTS", "8").strip()
+    try:
+        threshold = max(2, int(threshold_raw))
+    except ValueError:
+        threshold = 8
+    return "mesh" if max(0, int(total_hosts)) <= threshold else "star"
 
 
 def _augment_snapshot_with_attack_graph(
@@ -1001,6 +1125,246 @@ def get_users_in_group_rid_from_snapshot(
     return sorted(set(members), key=str.lower)
 
 
+def resolve_group_name_by_rid(
+    shell: object,
+    domain: str,
+    rid: int,
+) -> str | None:
+    """Resolve a domain group name by RID using snapshot first, then BloodHound.
+
+    Args:
+        shell: Shell-like object with workspace and optional BloodHound access.
+        domain: Target AD domain.
+        rid: Relative identifier of the target group.
+
+    Returns:
+        Group name (without ``@DOMAIN`` suffix) when resolvable, otherwise ``None``.
+    """
+    marked_domain = mark_sensitive(domain, "domain")
+    snapshot = _load_membership_snapshot(shell, domain)
+    if snapshot:
+        domain_sid = _resolve_domain_sid(shell, domain, snapshot)
+        if domain_sid:
+            target_sid = f"{domain_sid}-{rid}"
+            group_label = _resolve_group_label_for_sid(snapshot, domain, target_sid)
+            if group_label:
+                group_name = _membership_label_to_name(group_label).strip()
+                if group_name:
+                    print_info_debug(
+                        f"[membership] RID {rid} group resolved from snapshot for "
+                        f"{marked_domain}: {mark_sensitive(group_name, 'group')}"
+                    )
+                    return group_name
+
+    service = getattr(shell, "_get_bloodhound_service", None)
+    if service:
+        try:
+            bh_service = service()
+            client = getattr(bh_service, "client", None)
+            if client and hasattr(client, "execute_query"):
+                escaped_domain = str(domain or "").replace("\\", "\\\\").replace(
+                    '"', '\\"'
+                )
+                query = f"""
+                MATCH (g:Group)
+                WHERE toLower(coalesce(g.domain, "")) = toLower("{escaped_domain}")
+                  AND (
+                    coalesce(g.objectid, g.objectId, "") =
+                    coalesce(g.domainsid, g.domainSid, "") + "-{rid}"
+                  )
+                RETURN g
+                LIMIT 1
+                """
+                rows = client.execute_query(query)
+                if isinstance(rows, list) and rows:
+                    row = rows[0]
+                    if isinstance(row, dict):
+                        node = row.get("g")
+                        if isinstance(node, dict):
+                            props = (
+                                node.get("properties")
+                                if isinstance(node.get("properties"), dict)
+                                else {}
+                            )
+                            raw_name = (
+                                props.get("samaccountname")
+                                or props.get("samAccountName")
+                                or node.get("samaccountname")
+                                or node.get("samAccountName")
+                                or props.get("name")
+                                or node.get("name")
+                            )
+                            if isinstance(raw_name, str) and raw_name.strip():
+                                group_name = raw_name.strip()
+                                if "@" in group_name:
+                                    group_name = group_name.split("@", 1)[0].strip()
+                                if group_name:
+                                    print_info_debug(
+                                        f"[membership] RID {rid} group resolved from BloodHound for "
+                                        f"{marked_domain}: {mark_sensitive(group_name, 'group')}"
+                                    )
+                                    return group_name
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[membership] BloodHound group RID {rid} lookup failed for {marked_domain}: {exc}"
+            )
+
+    print_info_debug(
+        f"[membership] RID {rid} group unresolved for {marked_domain}."
+    )
+    return None
+
+
+def resolve_group_user_members(
+    shell: object,
+    domain: str,
+    group_name: str,
+    *,
+    enabled_only: bool = True,
+    max_results: int = 500,
+) -> list[str] | None:
+    """Resolve recursive user members of a group by name.
+
+    Resolution order:
+        1) memberships.json snapshot
+        2) BloodHound recursive membership query
+
+    Args:
+        shell: Shell-like object with workspace and optional BloodHound access.
+        domain: Target AD domain.
+        group_name: Group samAccountName/label (with or without ``@DOMAIN``).
+        enabled_only: When True, keep enabled users only.
+        max_results: Hard cap to avoid huge result sets.
+
+    Returns:
+        Sorted usernames (lowercase), ``[]`` when resolvable but no members, or
+        ``None`` when no resolver backend is available.
+    """
+    marked_domain = mark_sensitive(domain, "domain")
+    canonical_group = _canonical_membership_label(domain, group_name)
+    if not canonical_group:
+        return []
+
+    enabled_users = _load_enabled_users(shell, domain) if enabled_only else None
+    if enabled_only and enabled_users is None:
+        print_info_debug(
+            f"[membership] enabled users list missing for {marked_domain}; "
+            "falling back to snapshot/BloodHound enabled flags."
+        )
+
+    snapshot = _load_membership_snapshot(shell, domain)
+    if isinstance(snapshot, dict):
+        group_members, has_users = attack_paths_core.build_group_member_index(
+            snapshot,
+            domain,
+            exclude_tier0=False,
+        )
+        if has_users:
+            members_labels = group_members.get(canonical_group, set()) or set()
+            members = [
+                _membership_label_to_name(label).strip().lower()
+                for label in members_labels
+                if isinstance(label, str) and _membership_label_to_name(label).strip()
+            ]
+            if enabled_users is not None:
+                members = [user for user in members if user in enabled_users]
+            elif enabled_only:
+                enabled_map = snapshot.get("user_enabled")
+                if isinstance(enabled_map, dict):
+                    members = [user for user in members if enabled_map.get(user, True)]
+            unique_members = sorted(set(members), key=str.lower)[:max_results]
+            marked_group = mark_sensitive(
+                _membership_label_to_name(canonical_group), "group"
+            )
+            print_info_debug(
+                f"[membership] group members resolved from memberships.json for "
+                f"{marked_group}@{marked_domain}: {len(unique_members)} member(s)."
+            )
+            return unique_members
+
+    service = getattr(shell, "_get_bloodhound_service", None)
+    if service:
+        try:
+            bh_service = service()
+            client = getattr(bh_service, "client", None)
+            if client and hasattr(client, "execute_query"):
+                group_base = _membership_label_to_name(canonical_group)
+                group_with_domain = canonical_group
+                escaped_domain = str(domain or "").replace("\\", "\\\\").replace(
+                    '"', '\\"'
+                )
+                escaped_group = str(group_base).replace("\\", "\\\\").replace(
+                    '"', '\\"'
+                )
+                escaped_group_with_domain = str(group_with_domain).replace(
+                    "\\", "\\\\"
+                ).replace('"', '\\"')
+                query = f"""
+                MATCH (g:Group)
+                WHERE toLower(coalesce(g.domain, "")) = toLower("{escaped_domain}")
+                  AND (
+                    toLower(coalesce(g.samaccountname, g.samAccountName, "")) = toLower("{escaped_group}")
+                    OR toLower(coalesce(g.name, "")) = toLower("{escaped_group_with_domain}")
+                  )
+                WITH g
+                MATCH (m:User)-[:MemberOf*1..]->(g)
+                RETURN DISTINCT m
+                """
+                rows = client.execute_query(query)
+                members: list[str] = []
+                if isinstance(rows, list):
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        node = row.get("m")
+                        if not isinstance(node, dict):
+                            continue
+                        props = (
+                            node.get("properties")
+                            if isinstance(node.get("properties"), dict)
+                            else {}
+                        )
+                        enabled = node.get("enabled")
+                        if enabled_only and enabled_users is None:
+                            if enabled is False or props.get("enabled") is False:
+                                continue
+                        name = (
+                            props.get("samaccountname")
+                            or props.get("samAccountName")
+                            or node.get("samaccountname")
+                            or node.get("samAccountName")
+                            or props.get("name")
+                            or node.get("name")
+                        )
+                        if isinstance(name, str) and name.strip():
+                            members.append(name.strip().lower())
+                if enabled_users is not None:
+                    members = [user for user in members if user in enabled_users]
+                unique_members = sorted(set(members), key=str.lower)[:max_results]
+                marked_group = mark_sensitive(group_base, "group")
+                print_info_debug(
+                    f"[membership] group members resolved from BloodHound for "
+                    f"{marked_group}@{marked_domain}: {len(unique_members)} member(s)."
+                )
+                return unique_members
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            marked_group = mark_sensitive(
+                _membership_label_to_name(canonical_group), "group"
+            )
+            print_info_debug(
+                f"[membership] BloodHound group member lookup failed for "
+                f"{marked_group}@{marked_domain}: {exc}"
+            )
+
+    print_info_debug(
+        f"[membership] group member resolvers unavailable for {marked_domain}: "
+        f"group={mark_sensitive(_membership_label_to_name(canonical_group), 'group')}"
+    )
+    return None
+
+
 def get_recursive_principal_groups_from_snapshot(
     shell: object, domain: str, principal: str
 ) -> list[str] | None:
@@ -1117,10 +1481,140 @@ def _log_attack_path_compute_timing(
         )
 
 
+def _file_mtime_token(path: str) -> float | None:
+    """Return file mtime token for cache invalidation."""
+    try:
+        if not path or not os.path.exists(path):
+            return None
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _attack_paths_cache_base_key(
+    shell: object,
+    domain: str,
+    *,
+    scope: str,
+    params: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    """Build cache key bound to graph/snapshot mtimes plus query params."""
+    graph_path = _graph_path(shell, domain)
+    snapshot_path = _membership_snapshot_path(shell, domain)
+    return (
+        str(domain or "").strip().lower(),
+        str(scope or "").strip().lower(),
+        _file_mtime_token(graph_path),
+        _file_mtime_token(snapshot_path),
+        params,
+    )
+
+
+def _attack_paths_cache_get(
+    key: tuple[Any, ...], *, domain: str, scope: str
+) -> list[dict[str, Any]] | None:
+    """Return cached attack-path records when available."""
+    if not _ATTACK_PATHS_CACHE_ENABLED:
+        return None
+    cached = _ATTACK_PATHS_COMPUTE_CACHE.get(key)
+    if cached is None:
+        _cache_stats_inc(domain, "misses")
+        return None
+    _cache_stats_inc(domain, "hits")
+    # LRU touch.
+    _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
+    print_info_debug(
+        f"[attack_paths] cache hit: domain={mark_sensitive(domain, 'domain')} "
+        f"scope={scope} records={len(cached)}"
+    )
+    return copy.deepcopy(cached)
+
+
+def _attack_paths_cache_put(
+    key: tuple[Any, ...],
+    records: list[dict[str, Any]],
+    *,
+    domain: str,
+    scope: str,
+) -> None:
+    """Store attack-path records in bounded LRU cache."""
+    if not _ATTACK_PATHS_CACHE_ENABLED:
+        return
+    if len(records) > _ATTACK_PATHS_CACHE_MAX_RECORDS:
+        _cache_stats_inc(domain, "skips")
+        print_info_debug(
+            f"[attack_paths] cache skip: domain={mark_sensitive(domain, 'domain')} "
+            f"scope={scope} records={len(records)} reason=too_many"
+        )
+        return
+    _ATTACK_PATHS_COMPUTE_CACHE[key] = copy.deepcopy(records)
+    _cache_stats_inc(domain, "stores")
+    _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
+    evicted = 0
+    while len(_ATTACK_PATHS_COMPUTE_CACHE) > _ATTACK_PATHS_CACHE_MAX_ENTRIES:
+        _ATTACK_PATHS_COMPUTE_CACHE.popitem(last=False)
+        evicted += 1
+    if evicted:
+        _cache_stats_inc(domain, "evictions", by=evicted)
+    print_info_debug(
+        f"[attack_paths] cache store: domain={mark_sensitive(domain, 'domain')} "
+        f"scope={scope} records={len(records)} entries={len(_ATTACK_PATHS_COMPUTE_CACHE)}"
+    )
+
+
+def _invalidate_attack_paths_cache(domain: str, *, reason: str) -> None:
+    """Invalidate in-memory attack-path cache entries for a domain."""
+    if not _ATTACK_PATHS_CACHE_ENABLED:
+        return
+    domain_key = str(domain or "").strip().lower()
+    removed = 0
+    keys = list(_ATTACK_PATHS_COMPUTE_CACHE.keys())
+    for key in keys:
+        if not isinstance(key, tuple) or not key:
+            continue
+        if str(key[0] or "").strip().lower() != domain_key:
+            continue
+        _ATTACK_PATHS_COMPUTE_CACHE.pop(key, None)
+        removed += 1
+    if removed:
+        _cache_stats_inc(domain, "invalidations", by=1)
+        print_info_debug(
+            f"[attack_paths] cache invalidated: domain={mark_sensitive(domain, 'domain')} "
+            f"entries={removed} reason={reason}"
+        )
+
+
+def get_attack_paths_cache_stats(
+    *,
+    domain: str | None = None,
+    reset: bool = False,
+) -> dict[str, int]:
+    """Return attack-path cache counters (global or per-domain).
+
+    Args:
+        domain: Optional domain filter.
+        reset: When True, reset returned counters to zero after reading.
+    """
+    if domain:
+        domain_key = str(domain or "").strip().lower()
+        stats = copy_stats(_ATTACK_PATHS_CACHE_DOMAIN_STATS.get(domain_key, {}))
+        if reset:
+            _ATTACK_PATHS_CACHE_DOMAIN_STATS[domain_key] = {}
+        return stats
+
+    stats = copy_stats(_ATTACK_PATHS_CACHE_STATS)
+    if reset:
+        reset_stats(_ATTACK_PATHS_CACHE_STATS)
+        _ATTACK_PATHS_CACHE_DOMAIN_STATS.clear()
+    return stats
+
+
 __all__ = [
     "get_recursive_principal_groups_from_snapshot",
     "is_principal_member_of_rid_from_snapshot",
     "get_users_in_group_rid_from_snapshot",
+    "resolve_group_name_by_rid",
+    "resolve_group_user_members",
     "resolve_group_members_by_rid",
     "resolve_principal_groups",
     "resolve_user_sid",
@@ -1963,7 +2457,8 @@ def _attack_path_get_recursive_groups(
         return []
 
     snapshot_groups = _snapshot_get_recursive_groups(shell, domain_clean, sam_clean)
-    if snapshot_groups is not None:
+    snapshot_empty = snapshot_groups is not None and not snapshot_groups
+    if snapshot_groups:
         return snapshot_groups
 
     primary = (force_source or ATTACK_PATH_GROUP_MEMBERSHIP_PRIMARY).strip().lower()
@@ -2004,6 +2499,17 @@ def _attack_path_get_recursive_groups(
 
     primary_fn = _from_bloodhound if primary == "bloodhound" else _from_ldap
     secondary_fn = _from_ldap if primary == "bloodhound" else _from_bloodhound
+
+    if snapshot_empty:
+        try:
+            marked_domain = mark_sensitive(domain_clean, "domain")
+            marked_sam = mark_sensitive(sam_clean, "user")
+            print_info_debug(
+                f"[attack_paths] Snapshot groups empty for {marked_sam}@{marked_domain}; "
+                f"trying {primary} lookup."
+            )
+        except Exception:
+            pass
 
     groups = primary_fn()
     if groups:
@@ -2177,7 +2683,8 @@ def _attack_path_get_direct_groups(
         return []
 
     snapshot_groups = _snapshot_get_direct_groups(shell, domain_clean, sam_clean)
-    if snapshot_groups is not None:
+    snapshot_empty = snapshot_groups is not None and not snapshot_groups
+    if snapshot_groups:
         return snapshot_groups
 
     primary = (force_source or ATTACK_PATH_GROUP_MEMBERSHIP_PRIMARY).strip().lower()
@@ -2210,6 +2717,17 @@ def _attack_path_get_direct_groups(
 
     primary_fn = _from_bloodhound if primary == "bloodhound" else _from_ldap
     secondary_fn = _from_ldap if primary == "bloodhound" else _from_bloodhound
+
+    if snapshot_empty:
+        try:
+            marked_domain = mark_sensitive(domain_clean, "domain")
+            marked_sam = mark_sensitive(sam_clean, "user")
+            print_info_debug(
+                f"[attack_paths] Snapshot direct groups empty for {marked_sam}@{marked_domain}; "
+                f"trying {primary} lookup."
+            )
+        except Exception:
+            pass
 
     groups = primary_fn()
     if groups:
@@ -2594,18 +3112,45 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
         data = read_json_file(path)
         schema_version = str(data.get("schema_version") or "")
         if schema_version == ATTACK_GRAPH_SCHEMA_VERSION:
-            # Historical graphs may contain duplicate nodes (same label, different IDs).
-            # Repair them early so path computations stay consistent and self-loop
-            # avoidance works as intended.
-            repaired = _repair_duplicate_nodes_by_label(data)
-            normalized = _normalize_user_computer_labels(data)
-            snapshot = _load_membership_snapshot(shell, domain)
-            kind_normalized = _normalize_principal_kinds_from_snapshot(data, snapshot)
-            metadata_updated = _refresh_attack_graph_edge_metadata(data)
-            if repaired or normalized or kind_normalized or metadata_updated:
+            maintenance = _get_attack_graph_maintenance_state(data)
+            maintenance_target = _maintenance_key(_ATTACK_GRAPH_MAINTENANCE_VERSION)
+            maintenance_version = str(maintenance.get("normalization") or "").strip()
+
+            repaired = False
+            normalized = False
+            kind_normalized = False
+            metadata_updated = 0
+            reuse_notes_compacted = 0
+
+            # These maintenance passes are expensive on large graphs and should
+            # run only once per maintenance version.
+            if maintenance_version != maintenance_target:
+                # Historical graphs may contain duplicate nodes (same label, different IDs).
+                # Repair them early so path computations stay consistent and self-loop
+                # avoidance works as intended.
+                repaired = _repair_duplicate_nodes_by_label(data)
+                normalized = _normalize_user_computer_labels(data)
+                snapshot = _load_membership_snapshot(shell, domain)
+                kind_normalized = _normalize_principal_kinds_from_snapshot(
+                    data, snapshot
+                )
+                metadata_updated = _refresh_attack_graph_edge_metadata(data)
+                reuse_notes_compacted = _compact_local_reuse_edge_notes(data)
+                maintenance["normalization"] = maintenance_target
+
+            if (
+                maintenance_version != maintenance_target
+                or repaired
+                or normalized
+                or kind_normalized
+                or metadata_updated
+                or reuse_notes_compacted
+            ):
                 try:
                     marked_domain = mark_sensitive(domain, "domain")
                     parts: list[str] = []
+                    if maintenance_version != maintenance_target:
+                        parts.append("applied graph maintenance")
                     if repaired:
                         parts.append("repaired duplicate nodes")
                     if normalized:
@@ -2614,6 +3159,8 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                         parts.append("normalized principal kinds")
                     if metadata_updated:
                         parts.append("classified edge metadata")
+                    if reuse_notes_compacted:
+                        parts.append("compacted local reuse notes")
                     action = ", ".join(parts) if parts else "updated"
                     print_info_debug(
                         f"[attack_graph] {action} in {marked_domain} attack graph."
@@ -2629,12 +3176,21 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                 _normalize_user_computer_labels(migrated)
                 snapshot = _load_membership_snapshot(shell, domain)
                 _normalize_principal_kinds_from_snapshot(migrated, snapshot)
+                _refresh_attack_graph_edge_metadata(migrated)
+                _compact_local_reuse_edge_notes(migrated)
+                maintenance = _get_attack_graph_maintenance_state(migrated)
+                maintenance["normalization"] = _maintenance_key(
+                    _ATTACK_GRAPH_MAINTENANCE_VERSION
+                )
                 save_attack_graph(shell, domain, migrated)
                 return migrated
     return {
         "schema_version": ATTACK_GRAPH_SCHEMA_VERSION,
         "domain": domain,
         "generated_at": _utc_now_iso(),
+        "maintenance": {
+            "normalization": _maintenance_key(_ATTACK_GRAPH_MAINTENANCE_VERSION),
+        },
         "nodes": {},
         "edges": [],
     }
@@ -2745,6 +3301,35 @@ def _refresh_attack_graph_edge_metadata(graph: dict[str, Any]) -> int:
     return changed
 
 
+def _compact_local_reuse_edge_notes(graph: dict[str, Any]) -> int:
+    """Drop bulky duplicated LocalAdminPassReuse note payloads.
+
+    Legacy runs may store full host/node arrays in every edge note. This
+    dramatically increases attack_graph.json size in large environments.
+    """
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        return 0
+    changed = 0
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "").strip().lower() != "localadminpassreuse":
+            continue
+        notes = edge.get("notes")
+        if not isinstance(notes, dict):
+            continue
+        removed = False
+        for key in ("confirmed_hosts", "confirmed_node_ids"):
+            if key in notes:
+                notes.pop(key, None)
+                removed = True
+        if removed:
+            edge["notes"] = notes
+            changed += 1
+    return changed
+
+
 def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None:
     """Persist the attack graph to disk with stable formatting."""
     graph["schema_version"] = ATTACK_GRAPH_SCHEMA_VERSION
@@ -2767,16 +3352,47 @@ def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None
         )
 
     write_json_file(path, graph)
+    _invalidate_attack_paths_cache(domain, reason="graph_saved")
     try:
         domains_data = getattr(shell, "domains_data", None)
         if isinstance(domains_data, dict):
             domains_data.setdefault(domain, {})["attack_graph_file"] = path
     except Exception:
         pass
-    try:
-        from adscan_internal.services.report_service import sync_attack_graph_findings
+    _sync_attack_graph_findings_best_effort(shell, domain, graph)
 
-        sync_attack_graph_findings(shell, domain, graph)
+
+def _sync_attack_graph_findings_best_effort(
+    shell: object, domain: str, graph: dict[str, Any]
+) -> None:
+    """Sync findings when report service is available.
+
+    Lite/private runtime images may omit report_service. Cache that availability
+    so we avoid repeated import failures on every graph save.
+    """
+    global _REPORT_SYNC_FN  # noqa: PLW0603
+
+    if _REPORT_SYNC_FN is False:
+        return
+
+    if _REPORT_SYNC_FN is None:
+        try:
+            from adscan_internal.services.report_service import (
+                sync_attack_graph_findings,
+            )
+
+            _REPORT_SYNC_FN = sync_attack_graph_findings
+        except Exception as exc:  # pragma: no cover - best effort
+            _REPORT_SYNC_FN = False
+            print_info_debug(
+                "[attack_graph] Technical findings sync unavailable "
+                f"(report_service missing): {type(exc).__name__}: {exc}"
+            )
+            return
+
+    try:
+        assert callable(_REPORT_SYNC_FN)
+        _REPORT_SYNC_FN(shell, domain, graph)
     except Exception as exc:  # pragma: no cover - best effort
         print_info_debug(
             f"[attack_graph] Failed to sync technical findings: {type(exc).__name__}: {exc}"
@@ -3601,7 +4217,7 @@ def get_node_by_label(
 def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str, Any]:
     """Convert an AttackPath to an existing UI-friendly dict shape."""
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-    context_relations = {"memberof"}
+    context_relations = _CONTEXT_RELATIONS_LOWER
 
     def label(node_id: str) -> str:
         node = nodes_map.get(node_id)
@@ -4350,7 +4966,12 @@ def upsert_local_admin_password_reuse_edges(
     targets: list[dict[str, str]],
     status: str = "discovered",
 ) -> int:
-    """Upsert bidirectional host-to-host edges for confirmed local admin password reuse."""
+    """Upsert host-to-host reuse edges with topology compression for scale.
+
+    For small host sets, ADscan keeps a full directed mesh. For larger sets it
+    switches to a compressed bidirectional star topology to avoid edge
+    explosion and attack-path combinatorial blow-ups.
+    """
     domain_clean = str(domain or "").strip()
     user_clean = str(local_admin_username or "").strip()
     if not domain_clean or not user_clean or not isinstance(targets, list):
@@ -4429,44 +5050,121 @@ def upsert_local_admin_password_reuse_edges(
 
         node_ids = sorted(resolved.keys())
         total_hosts = len(node_ids)
-        host_labels = sorted(
-            {
-                str(data.get("label") or "").strip()
-                for data in resolved.values()
-                if str(data.get("label") or "").strip()
-            },
-            key=str.lower,
+        reuse_cluster_seed = (
+            f"{user_clean.lower()}|"
+            + "|".join(sorted(node_ids, key=str.lower))
         )
+        reuse_cluster_id = hashlib.md5(
+            reuse_cluster_seed.encode("utf-8")
+        ).hexdigest()
+
+        topology = _resolve_local_reuse_topology(total_hosts)
+        anchor_id: str | None = None
+        if topology == "star":
+            anchor_id = min(
+                node_ids,
+                key=lambda node_id: (
+                    str(resolved.get(node_id, {}).get("label") or "").lower(),
+                    node_id,
+                ),
+            )
+
+        edge_pairs: set[tuple[str, str]] = set()
+        if topology == "star" and anchor_id:
+            for node_id in node_ids:
+                if node_id == anchor_id:
+                    continue
+                edge_pairs.add((anchor_id, node_id))
+                edge_pairs.add((node_id, anchor_id))
+        else:
+            for src_id in node_ids:
+                for dst_id in node_ids:
+                    if src_id == dst_id:
+                        continue
+                    edge_pairs.add((src_id, dst_id))
+
+        # Compact stale LocalAdminPassReuse edges for the same reuse cluster:
+        # when topology choice changes (mesh -> star), prune obsolete edges.
+        desired_pairs = set(edge_pairs)
+        edges_list = graph.get("edges")
+        if isinstance(edges_list, list):
+            compacted_edges: list[dict[str, Any]] = []
+            for edge in edges_list:
+                if not isinstance(edge, dict):
+                    compacted_edges.append(edge)
+                    continue
+                if str(edge.get("relation") or "").strip().lower() != "localadminpassreuse":
+                    compacted_edges.append(edge)
+                    continue
+                notes = edge.get("notes")
+                if not isinstance(notes, dict):
+                    compacted_edges.append(edge)
+                    continue
+                note_user = str(notes.get("local_admin_username") or "").strip()
+                if note_user.lower() != user_clean.lower():
+                    compacted_edges.append(edge)
+                    continue
+                note_cluster_id = str(notes.get("reuse_cluster_id") or "").strip()
+                if note_cluster_id != reuse_cluster_id:
+                    compacted_edges.append(edge)
+                    continue
+                from_key = str(edge.get("from") or "").strip()
+                to_key = str(edge.get("to") or "").strip()
+                if not from_key or not to_key:
+                    compacted_edges.append(edge)
+                    continue
+                if (from_key, to_key) in desired_pairs:
+                    compacted_edges.append(edge)
+            graph["edges"] = compacted_edges
+
+        # Count only newly-created edges (not updates) for UX summaries.
+        existing_keys: set[tuple[str, str, str]] = set()
+        for edge in graph.get("edges", []):
+            if not isinstance(edge, dict):
+                continue
+            if str(edge.get("relation") or "").strip().lower() != "localadminpassreuse":
+                continue
+            from_key = str(edge.get("from") or "").strip()
+            to_key = str(edge.get("to") or "").strip()
+            if from_key and to_key:
+                existing_keys.add((from_key, "localadminpassreuse", to_key))
 
         created = 0
-        for src_id in node_ids:
-            for dst_id in node_ids:
-                if src_id == dst_id:
-                    continue
-                edge = upsert_edge(
-                    graph,
-                    from_id=src_id,
-                    to_id=dst_id,
-                    relation="LocalAdminPassReuse",
-                    edge_type="local_cred_reuse",
-                    status=status,
-                    notes={
-                        "source": "netexec_local_cred_reuse",
-                        "local_admin_username": user_clean,
-                        "reuse_group_size": total_hosts,
-                        "bidirectional": True,
-                        "confirmed_hosts": host_labels,
-                    },
-                )
-                if edge:
+        upserted = 0
+        for src_id, dst_id in sorted(edge_pairs):
+            key = (src_id, "localadminpassreuse", dst_id)
+            edge = upsert_edge(
+                graph,
+                from_id=src_id,
+                to_id=dst_id,
+                relation="LocalAdminPassReuse",
+                edge_type="local_cred_reuse",
+                status=status,
+                notes={
+                    "source": "netexec_local_cred_reuse",
+                    "local_admin_username": user_clean,
+                    "reuse_cluster_id": reuse_cluster_id,
+                    "reuse_group_size": total_hosts,
+                    "bidirectional": True,
+                    "topology": topology,
+                    "anchor_host": resolved.get(anchor_id, {}).get("label")
+                    if anchor_id
+                    else None,
+                },
+            )
+            if edge:
+                upserted += 1
+                if key not in existing_keys:
                     created += 1
 
-        if created:
+        if upserted:
             save_attack_graph(shell, domain_clean, graph)
             marked_domain = mark_sensitive(domain_clean, "domain")
             marked_user = mark_sensitive(user_clean, "user")
             print_info_debug(
-                f"[local_reuse] Recorded {created} LocalAdminPassReuse edge(s) for {marked_user} in {marked_domain}."
+                f"[local_reuse] Upserted {upserted} LocalAdminPassReuse edge(s) "
+                f"(new={created}, topology={topology}, hosts={total_hosts}) "
+                f"for {marked_user} in {marked_domain}."
             )
         return created
     except Exception as exc:  # noqa: BLE001
@@ -4639,7 +5337,8 @@ def ensure_user_node_for_domain(
     Returns:
         Node id for the ensured user node.
     """
-    user_clean = (username or "").strip()
+    raw_username = str(username or "").strip()
+    user_clean = _normalize_account(raw_username) or raw_username
     if not user_clean:
         return ensure_user_node(graph, username=user_clean)
 
@@ -4707,6 +5406,41 @@ def ensure_user_node_for_domain(
         },
     }
     _mark_synthetic_node_record(node_record, domain=domain, source="fallback_user_node")
+    upsert_nodes(graph, [node_record])
+    return _node_id(node_record)
+
+
+def _ensure_user_node_for_domain_synthetic(
+    domain: str,
+    graph: dict[str, Any],
+    *,
+    username: str,
+) -> str:
+    """Ensure a synthetic domain user node without querying external resolvers."""
+    raw_username = str(username or "").strip()
+    user_clean = _normalize_account(raw_username) or raw_username
+    if not user_clean:
+        return ensure_user_node(graph, username=user_clean)
+    canonical_domain = str(domain or "").strip().upper()
+    canonical_name = (
+        f"{user_clean.upper()}@{canonical_domain}"
+        if canonical_domain
+        else user_clean.upper()
+    )
+    node_record = {
+        "name": canonical_name,
+        "kind": ["User"],
+        "properties": {
+            "samaccountname": user_clean,
+            "domain": canonical_domain,
+            "name": canonical_name,
+        },
+    }
+    _mark_synthetic_node_record(
+        node_record,
+        domain=str(domain or "").strip(),
+        source="principal_batch_synthetic_node",
+    )
     upsert_nodes(graph, [node_record])
     return _node_id(node_record)
 
@@ -5533,12 +6267,87 @@ def _sort_display_paths(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def _node_ids_without_memberof_edges(
+    graph: dict[str, Any], *, node_ids: set[str]
+) -> set[str]:
+    """Return node IDs that do not currently have outgoing MemberOf edges."""
+    pending = {str(node_id) for node_id in node_ids if str(node_id).strip()}
+    if not pending:
+        return set()
+
+    edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+    if not isinstance(edges, list):
+        return pending
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "").strip() != "MemberOf":
+            continue
+        from_id = str(edge.get("from") or "").strip()
+        if from_id in pending:
+            pending.discard(from_id)
+            if not pending:
+                break
+    return pending
+
+
+def _stitch_principal_memberships_for_runtime_paths(
+    shell: object,
+    *,
+    domain: str,
+    runtime_graph: dict[str, Any],
+    principal_node_ids: set[str],
+    snapshot: dict[str, Any] | None,
+    scope: str,
+) -> tuple[int, int]:
+    """Ensure principals have outgoing membership edges in runtime graph.
+
+    Returns:
+        Tuple ``(snapshot_injected, runtime_injected)``.
+    """
+    missing = _node_ids_without_memberof_edges(runtime_graph, node_ids=principal_node_ids)
+    if not missing:
+        return 0, 0
+
+    snapshot_injected = 0
+    if snapshot:
+        snapshot_injected = attack_paths_core._inject_memberof_edges_from_snapshot(  # noqa: SLF001
+            runtime_graph,
+            domain,
+            snapshot,
+            principal_node_ids=missing,
+            recursive=True,
+        )
+        missing = _node_ids_without_memberof_edges(runtime_graph, node_ids=missing)
+
+    runtime_injected = 0
+    if missing:
+        runtime_injected = _inject_runtime_recursive_memberof_edges(
+            shell,
+            domain=domain,
+            runtime_graph=runtime_graph,
+            principal_node_ids=missing,
+            skip_tier0_principals=False,
+        )
+
+    if snapshot_injected or runtime_injected:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            f"[attack_paths] membership stitch scope={scope} domain={marked_domain} "
+            f"principals={len(principal_node_ids)} snapshot_injected={snapshot_injected} "
+            f"runtime_injected={runtime_injected}"
+        )
+    return snapshot_injected, runtime_injected
+
+
 def compute_display_paths_for_user(
     shell: object,
     domain: str,
     *,
     username: str,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     target_mode: str = "tier0",
 ) -> list[dict[str, Any]]:
@@ -5559,6 +6368,33 @@ def compute_display_paths_for_user(
              because our DFS only returns simple paths (no repeated nodes).
     """
     started_at = time.monotonic()
+    user_norm = str(username or "").strip().lower()
+    cache_key = _attack_paths_cache_base_key(
+        shell,
+        domain,
+        scope="user",
+        params=(
+            user_norm,
+            int(max_depth),
+            max_paths,
+            bool(require_high_value_target),
+            str(target_mode or "tier0").strip().lower(),
+            bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
+        ),
+    )
+    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="user")
+    if cached is not None:
+        _log_attack_path_compute_timing(
+            domain=domain,
+            scope="user",
+            elapsed_seconds=max(0.0, time.monotonic() - started_at),
+            path_count=len(cached),
+            max_depth=max_depth,
+            require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
+        )
+        return cached
+
     base_graph = load_attack_graph(shell, domain)
     runtime_graph: dict[str, Any] = dict(base_graph)
     runtime_graph["nodes"] = dict(
@@ -5575,6 +6411,14 @@ def compute_display_paths_for_user(
         )
 
     snapshot = _load_membership_snapshot(shell, domain)
+    _stitch_principal_memberships_for_runtime_paths(
+        shell,
+        domain=domain,
+        runtime_graph=runtime_graph,
+        principal_node_ids={start_node_id} if start_node_id else set(),
+        snapshot=snapshot,
+        scope="user",
+    )
     if (
         not snapshot
         and start_node_id
@@ -5608,6 +6452,7 @@ def compute_display_paths_for_user(
             snapshot=snapshot,
             start_node_id=start_node_id,
             max_depth=max_depth,
+            max_paths=max_paths,
             require_high_value_target=require_high_value_target,
             target_mode=target_mode,
             expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
@@ -5623,6 +6468,7 @@ def compute_display_paths_for_user(
         require_high_value_target=require_high_value_target,
         target_mode=target_mode,
     )
+    _attack_paths_cache_put(cache_key, records, domain=domain, scope="user")
     return records
 
 
@@ -5631,6 +6477,7 @@ def compute_display_paths_for_domain(
     domain: str,
     *,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     target_mode: str = "tier0",
 ) -> list[dict[str, Any]]:
@@ -5646,6 +6493,31 @@ def compute_display_paths_for_domain(
     surfaced.
     """
     started_at = time.monotonic()
+    cache_key = _attack_paths_cache_base_key(
+        shell,
+        domain,
+        scope="domain",
+        params=(
+            int(max_depth),
+            max_paths,
+            bool(require_high_value_target),
+            str(target_mode or "tier0").strip().lower(),
+            bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
+        ),
+    )
+    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="domain")
+    if cached is not None:
+        _log_attack_path_compute_timing(
+            domain=domain,
+            scope="domain",
+            elapsed_seconds=max(0.0, time.monotonic() - started_at),
+            path_count=len(cached),
+            max_depth=max_depth,
+            require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
+        )
+        return cached
+
     base_graph = load_attack_graph(shell, domain)
     runtime_graph: dict[str, Any] = dict(base_graph)
     runtime_graph["nodes"] = dict(
@@ -5682,6 +6554,7 @@ def compute_display_paths_for_domain(
             domain=domain,
             snapshot=snapshot,
             max_depth=max_depth,
+            max_paths=max_paths,
             require_high_value_target=require_high_value_target,
             target_mode=target_mode,
             expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
@@ -5696,6 +6569,7 @@ def compute_display_paths_for_domain(
         require_high_value_target=require_high_value_target,
         target_mode=target_mode,
     )
+    _attack_paths_cache_put(cache_key, records, domain=domain, scope="domain")
     return records
 
 
@@ -5808,6 +6682,7 @@ def compute_display_paths_for_owned_users(
     domain: str,
     *,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     target_mode: str = "tier0",
 ) -> list[dict[str, Any]]:
@@ -5833,6 +6708,7 @@ def compute_display_paths_for_owned_users(
         domain,
         principals=owned,
         max_depth=max_depth,
+        max_paths=max_paths,
         require_high_value_target=require_high_value_target,
         target_mode=target_mode,
     )
@@ -5844,7 +6720,7 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         if not isinstance(step, dict):
             continue
         action = str(step.get("action") or "").strip().lower()
-        if action == "memberof":
+        if action in _CONTEXT_RELATIONS_LOWER:
             continue
         value = step.get("status")
         if isinstance(value, str) and value:
@@ -5865,7 +6741,8 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         == "policy_blocked"
         for step in steps
         if isinstance(step, dict)
-        and str(step.get("action") or "").strip().lower() != "memberof"
+        and str(step.get("action") or "").strip().lower()
+        not in _CONTEXT_RELATIONS_LOWER
     ):
         # Policy-blocked steps should surface as blocked even before any execution attempt.
         return "blocked"
@@ -5913,7 +6790,9 @@ def _strip_leading_relations(
     new_record["nodes"] = new_nodes
     new_record["relations"] = new_rels
     new_record["length"] = sum(
-        1 for rel in new_rels if str(rel or "").strip().lower() != "memberof"
+        1
+        for rel in new_rels
+        if str(rel or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
     )
     new_record["source"] = new_nodes[0] if new_nodes else ""
     new_record["target"] = new_nodes[-1] if new_nodes else ""
@@ -5928,6 +6807,7 @@ def compute_display_paths_for_principals(
     *,
     principals: list[str],
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     membership_sample_max: int = 3,
     target_mode: str = "tier0",
@@ -5952,6 +6832,61 @@ def compute_display_paths_for_principals(
         )
         return []
 
+    unique_principals = sorted(set(normalized_principals))
+    principals_key = tuple(unique_principals)
+    cache_key = _attack_paths_cache_base_key(
+        shell,
+        domain,
+        scope="principals",
+        params=(
+            principals_key,
+            int(max_depth),
+            max_paths,
+            bool(require_high_value_target),
+            int(membership_sample_max),
+            str(target_mode or "tier0").strip().lower(),
+        ),
+    )
+    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="principals")
+    if cached is not None:
+        _log_attack_path_compute_timing(
+            domain=domain,
+            scope="principals",
+            elapsed_seconds=max(0.0, time.monotonic() - started_at),
+            path_count=len(cached),
+            max_depth=max_depth,
+            require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
+        )
+        return cached
+
+    snapshot = _load_membership_snapshot(shell, domain)
+    snapshot_user_to_groups = (
+        snapshot.get("user_to_groups") if isinstance(snapshot, dict) else None
+    )
+    snapshot_user_keys: set[str] = set()
+    if isinstance(snapshot_user_to_groups, dict):
+        for principal_label in snapshot_user_to_groups.keys():
+            normalized = _normalize_account(str(principal_label or ""))
+            if normalized:
+                snapshot_user_keys.add(normalized)
+
+    principal_coverage_keys = [
+        _normalize_account(principal) or principal for principal in unique_principals
+    ]
+    covered_by_snapshot = (
+        sum(
+            1
+            for principal_key in principal_coverage_keys
+            if principal_key in snapshot_user_keys
+        )
+        if snapshot_user_keys
+        else 0
+    )
+    snapshot_coverage_ratio = (
+        covered_by_snapshot / len(unique_principals) if unique_principals else 0.0
+    )
+
     base_graph = load_attack_graph(shell, domain)
     runtime_graph: dict[str, Any] = dict(base_graph)
     runtime_graph["nodes"] = dict(
@@ -5960,20 +6895,75 @@ def compute_display_paths_for_principals(
     runtime_graph["edges"] = list(
         base_graph.get("edges") if isinstance(base_graph.get("edges"), list) else []
     )
-    for username in normalized_principals:
-        if not _find_node_id_by_label(runtime_graph, username):
-            ensure_user_node_for_domain(
-                shell, domain, runtime_graph, username=str(username or "").strip()
+    # Coverage-first default: keep BloodHound resolution unless an operator
+    # explicitly enables synthetic batch mode for performance experiments.
+    resolve_via_bloodhound = True
+    if _ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH and (
+        _ATTACK_PATH_PRINCIPAL_BH_RESOLVE_MAX > 0
+        and len(unique_principals) > _ATTACK_PATH_PRINCIPAL_BH_RESOLVE_MAX
+    ):
+        if (
+            snapshot_user_keys
+            and snapshot_coverage_ratio
+            >= _ATTACK_PATH_PRINCIPAL_SYNTHETIC_MIN_SNAPSHOT_COVERAGE
+        ):
+            resolve_via_bloodhound = False
+            marked_domain = mark_sensitive(domain, "domain")
+            print_info_debug(
+                "[attack_paths] synthetic batch mode enabled for principal resolution: "
+                f"domain={marked_domain} principals={len(unique_principals)} "
+                f"threshold={_ATTACK_PATH_PRINCIPAL_BH_RESOLVE_MAX} "
+                f"snapshot_coverage={snapshot_coverage_ratio:.2%}"
             )
+        else:
+            marked_domain = mark_sensitive(domain, "domain")
+            print_info_debug(
+                "[attack_paths] synthetic batch mode requested but not used "
+                "(coverage guard): "
+                f"domain={marked_domain} principals={len(unique_principals)} "
+                f"threshold={_ATTACK_PATH_PRINCIPAL_BH_RESOLVE_MAX} "
+                f"snapshot_coverage={snapshot_coverage_ratio:.2%} "
+                f"required={_ATTACK_PATH_PRINCIPAL_SYNTHETIC_MIN_SNAPSHOT_COVERAGE:.2%}"
+            )
+    elif not _ATTACK_PATH_ENABLE_SYNTHETIC_PRINCIPAL_BATCH:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            "[attack_paths] coverage-first mode active: "
+            f"domain={marked_domain} principal resolution via BloodHound"
+        )
+    principal_node_ids: set[str] = set()
+    for username in unique_principals:
+        if not _find_node_id_by_label(runtime_graph, username):
+            if resolve_via_bloodhound:
+                ensure_user_node_for_domain(
+                    shell, domain, runtime_graph, username=str(username or "").strip()
+                )
+            else:
+                _ensure_user_node_for_domain_synthetic(
+                    domain,
+                    runtime_graph,
+                    username=str(username or "").strip(),
+                )
+        principal_id = _find_node_id_by_label(runtime_graph, username)
+        if principal_id:
+            principal_node_ids.add(principal_id)
 
-    snapshot = _load_membership_snapshot(shell, domain)
+    _stitch_principal_memberships_for_runtime_paths(
+        shell,
+        domain=domain,
+        runtime_graph=runtime_graph,
+        principal_node_ids=principal_node_ids,
+        snapshot=snapshot,
+        scope="principals",
+    )
     records = _sort_display_paths(
         attack_paths_core.compute_display_paths_for_principals(
             runtime_graph,
             domain=domain,
             snapshot=snapshot,
-            principals=normalized_principals,
+            principals=unique_principals,
             max_depth=max_depth,
+            max_paths=max_paths,
             require_high_value_target=require_high_value_target,
             membership_sample_max=membership_sample_max,
             target_mode=target_mode,
@@ -5989,6 +6979,7 @@ def compute_display_paths_for_principals(
         require_high_value_target=require_high_value_target,
         target_mode=target_mode,
     )
+    _attack_paths_cache_put(cache_key, records, domain=domain, scope="principals")
     return records
 
 
@@ -6039,7 +7030,7 @@ def compute_attack_path_metrics(
         paths_by_type: dict[str, dict[str, int]] = {}
 
         # Context relations that don't count as executable steps
-        context_relations = {"memberof"}
+        context_relations = _CONTEXT_RELATIONS_LOWER
 
         for path in paths:
             # Get executable steps (exclude context relations like MemberOf)

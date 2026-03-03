@@ -763,9 +763,15 @@ class CredentialService(BaseService):
         )
 
         credential_type = "hash" if self._is_ntlm_hash(credential) else "password"
+        local_timeout_arg = (
+            " --smb-timeout 10"
+            if str(service or "").strip().lower() == "smb"
+            else ""
+        )
         command = (
             f"{shlex.quote(netexec_path)} {shlex.quote(service)} "
-            f"{shlex.quote(host)} {auth_string} --log {shlex.quote(log_file_path)} "
+            f"{shlex.quote(host)} {auth_string}{local_timeout_arg} "
+            f"--log {shlex.quote(log_file_path)} "
         )
 
         self.logger.info(

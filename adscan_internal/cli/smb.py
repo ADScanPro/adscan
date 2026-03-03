@@ -11,6 +11,7 @@ extraction operations (dumps), see `dumps.py`.
 from __future__ import annotations
 
 from typing import Any
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 import csv
 import json
@@ -22,7 +23,7 @@ import time
 import traceback
 import rich
 from rich.panel import Panel
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -48,10 +49,15 @@ from adscan_internal.integrations.netexec.parsers import (
     summarize_share_map,
 )
 from adscan_internal.text_utils import strip_ansi_codes
+from adscan_internal.interaction import is_non_interactive
 from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
     print_panel_with_table,
+)
+from adscan_internal.services.smb_guest_auth_service import (
+    is_guest_alias,
+    resolve_smb_guest_username,
 )
 from adscan_internal.workspaces.subpaths import domain_path, domain_relpath
 
@@ -71,6 +77,14 @@ GLOBAL_SMB_MAPPING_EXCLUDED_EXTENSIONS: tuple[str, ...] = ("ico", "lnk")
 GLOBAL_SMB_MAPPING_EXCLUDED_SHARES_CASEFOLD: set[str] = {
     name.casefold() for name in GLOBAL_SMB_MAPPING_EXCLUDE_FILTER_TOKENS
 }
+_SMB_HOST_IDENTITY_RE = re.compile(
+    r"^\s*SMB\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+(?P<hostname>\S+)\s+"
+)
+_SMB_GUEST_SESSION_RE = re.compile(
+    r"^\s*SMB\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+(?P<hostname>\S+)\s+"
+    r"\[\+\].*\(\s*Guest\s*\)",
+    re.IGNORECASE,
+)
 
 
 def _is_globally_excluded_mapping_share(share_name: str) -> bool:
@@ -139,6 +153,18 @@ def execute_netexec_shares(
         username: Session username label (e.g., "null", "guest", actual user).
         password: Session password/hash (for follow-up actions).
     """
+
+    def _extract_log_path(cmd: str) -> str | None:
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            return None
+        if "--log" in parts:
+            idx = parts.index("--log")
+            if idx + 1 < len(parts):
+                return str(parts[idx + 1])
+        return None
+
     try:
         completed_process = shell._run_netexec(command, domain=domain, pre_sync=False)
         output = completed_process.stdout if completed_process else ""
@@ -176,10 +202,11 @@ def execute_netexec_shares(
                 )
                 return
 
-            if (
+            has_auth_failures = (
                 "STATUS_LOGON_FAILURE" in output_str
                 or "STATUS_ACCESS_DENIED" in output_str
-            ):
+            )
+            if has_auth_failures and not _has_any_accepted_share_session(output_str):
                 marked_username = mark_sensitive(username, "user")
                 marked_domain = mark_sensitive(domain, "domain")
                 print_error(
@@ -187,7 +214,9 @@ def execute_netexec_shares(
                 )
                 return
 
+            host_identity = _extract_smb_host_identity_map(output_str)
             share_map = parse_smb_share_map(output_str)
+            guest_session_hosts = _extract_guest_session_hosts(output_str)
             read_shares, write_shares, read_hosts, _write_hosts = summarize_share_map(
                 share_map
             )
@@ -201,7 +230,8 @@ def execute_netexec_shares(
                     header_style="bold magenta",
                     box=rich.box.SIMPLE_HEAVY,
                 )
-                ip_table.add_column("Host", style="cyan")
+                ip_table.add_column("Hostname", style="cyan")
+                ip_table.add_column("IP", style="bright_cyan")
                 ip_table.add_column("Share", style="cyan")
                 ip_table.add_column("Permission", style="green")
 
@@ -215,7 +245,9 @@ def execute_netexec_shares(
                     for share_name in ordered:
                         perm = shares_dict[share_name]
                         col = "magenta" if "WRITE" in perm else "cyan"
+                        host_name = host_identity.get(host, host)
                         ip_table.add_row(
+                            host_name if first else "",
                             host if first else "",
                             share_name,
                             f"[{col}]{perm}[/{col}]",
@@ -232,11 +264,87 @@ def execute_netexec_shares(
                         border_style="yellow",
                     )
                 )
+                if (
+                    guest_session_hosts
+                    and str(username or "").strip().lower() == "guest"
+                ):
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_info(
+                        "Guest sessions were accepted on one or more hosts in "
+                        f"{marked_domain}, but no share with READ/WRITE permissions was found."
+                    )
 
             if (read_shares or write_shares) and shell.domains_data[domain][
                 "auth"
             ] != "auth":
                 shell.domains_data[domain]["auth"] = username
+
+            if (share_map or guest_session_hosts) and str(
+                username or ""
+            ).strip().lower() == "guest":
+                log_path = _extract_log_path(command)
+                if guest_session_hosts:
+                    guest_hosts = sorted(guest_session_hosts.keys())
+                else:
+                    guest_hosts = sorted(share_map.keys())
+                guest_host_labels = []
+                for host_ip in guest_hosts:
+                    host_name = guest_session_hosts.get(
+                        host_ip, host_identity.get(host_ip, host_ip)
+                    )
+                    guest_host_labels.append(f"{host_name} ({host_ip})")
+                shell.update_report_field(domain, "smb_guest_shares", guest_host_labels)
+                try:
+                    from adscan_internal.services.report_service import (
+                        record_technical_finding,
+                    )
+
+                    host_samples: list[dict[str, Any]] = []
+                    for host_ip in guest_hosts[:50]:
+                        shares = share_map.get(host_ip, {})
+                        host_samples.append(
+                            {
+                                "ip": host_ip,
+                                "hostname": guest_session_hosts.get(
+                                    host_ip, host_identity.get(host_ip, host_ip)
+                                ),
+                                "share_count": len(shares),
+                                "shares": [
+                                    {"name": name, "permission": perm}
+                                    for name, perm in sorted(shares.items())[:50]
+                                ],
+                            }
+                        )
+
+                    record_technical_finding(
+                        shell,
+                        domain,
+                        key="smb_guest_shares",
+                        value=guest_host_labels,
+                        details={
+                            "hosts_with_guest_access": len(guest_hosts),
+                            "hosts_with_guest_share_permissions": sum(
+                                1 for host_ip in guest_hosts if share_map.get(host_ip)
+                            ),
+                            "shares_with_permissions": sum(
+                                len(share_map.get(host_ip, {}))
+                                for host_ip in guest_hosts
+                            ),
+                            "host_samples": host_samples,
+                            "truncated_hosts": len(guest_hosts) > 50,
+                        },
+                        evidence=[
+                            {
+                                "type": "log",
+                                "summary": "SMB guest session share enumeration output",
+                                "artifact_path": log_path,
+                            }
+                        ]
+                        if log_path
+                        else None,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    telemetry.capture_exception(exc)
 
             if read_shares:
                 shell.ask_for_smb_shares_read(
@@ -261,6 +369,81 @@ def execute_netexec_shares(
         telemetry.capture_exception(exc)
         print_error("An error occurred while executing the command.")
         print_exception(show_locals=False, exception=exc)
+
+
+def _has_any_accepted_share_session(output: str) -> bool:
+    """Return True when share enumeration shows at least one accepted session.
+
+    NetExec share scans can contain mixed outcomes across hosts in the same run.
+    We only want a global "sessions not accepted" error when every host fails.
+    """
+    if not output:
+        return False
+
+    for raw_line in output.splitlines():
+        line = strip_ansi_codes(raw_line or "").strip()
+        if not line:
+            continue
+        lowered = line.lower()
+
+        if "enumerated shares" in lowered:
+            return True
+
+        if "[+]" in line and (
+            "(guest)" in lowered
+            or "(pwn3d" in lowered
+            or " status_success" in lowered
+            or " no password" in lowered
+        ):
+            return True
+
+    return False
+
+
+def _extract_smb_host_identity_map(output: str) -> dict[str, str]:
+    """Extract SMB IP->hostname labels from NetExec output lines."""
+    identity: dict[str, str] = {}
+    if not output:
+        return identity
+    for raw_line in output.splitlines():
+        line = strip_ansi_codes(raw_line or "").strip()
+        if not line:
+            continue
+        match = _SMB_HOST_IDENTITY_RE.match(line)
+        if not match:
+            continue
+        ip = str(match.group("ip") or "").strip()
+        hostname = str(match.group("hostname") or "").strip()
+        if not ip or not hostname:
+            continue
+        identity[ip] = hostname
+    return identity
+
+
+def _extract_guest_session_hosts(output: str) -> dict[str, str]:
+    """Extract hosts where NetExec explicitly reports a successful guest session."""
+    hosts: dict[str, str] = {}
+    if not output:
+        return hosts
+    for raw_line in output.splitlines():
+        line = strip_ansi_codes(raw_line or "").strip()
+        if not line:
+            continue
+        match = _SMB_GUEST_SESSION_RE.match(line)
+        if not match:
+            continue
+        ip = str(match.group("ip") or "").strip()
+        hostname = str(match.group("hostname") or "").strip()
+        if not ip:
+            continue
+        hosts[ip] = hostname or ip
+    return hosts
+
+
+def _build_guest_auth_nxc(shell: Any, *, domain: str) -> str:
+    """Build NetExec auth args for guest-session transport using shared config."""
+    guest_username = resolve_smb_guest_username(shell=shell, domain=domain)
+    return shell.build_auth_nxc(guest_username, "", domain)
 
 
 def execute_smb_rid_cycling(shell: Any, *, command: str, domain: str) -> None:
@@ -294,7 +477,7 @@ def execute_smb_rid_cycling(shell: Any, *, command: str, domain: str) -> None:
 
         pdc = parts[pdc_index]
         max_rid = 2000
-        auth_args = "-u 'ADscan' -p ''"
+        auth_args = _build_guest_auth_nxc(shell, domain=domain)
 
         # Extract max_rid from command
         for i, part in enumerate(parts):
@@ -430,6 +613,196 @@ def run_null_shares(shell: Any, *, domain: str) -> None:
     )
 
 
+def _resolve_guest_smb_targets(shell: Any, *, domain: str) -> tuple[list[str], str]:
+    """Resolve target tokens for guest SMB enumeration.
+
+    Order of precedence:
+    1. Explicit `guest_smb_targets` configured by start_unauth.
+    2. Legacy files (`enabled_computers_ips.txt`, then `smb/ips.txt`).
+    3. Validated PDC/DC as a last fallback.
+    """
+    domain_data = (
+        shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+    )
+    configured = domain_data.get("guest_smb_targets")
+    tokens: list[str] = []
+
+    if isinstance(configured, list):
+        tokens = [str(value).strip() for value in configured if str(value).strip()]
+    elif isinstance(configured, str):
+        tokens = [
+            part.strip() for part in re.split(r"[,\s]+", configured) if part.strip()
+        ]
+
+    if tokens:
+        return tokens, "configured"
+
+    enabled_computers = domain_relpath(
+        shell.domains_dir, domain, "enabled_computers_ips.txt"
+    )
+    if os.path.exists(enabled_computers):
+        return [enabled_computers], "enabled_computers_file"
+
+    smb_ips = domain_relpath(shell.domains_dir, domain, "smb", "ips.txt")
+    if os.path.exists(smb_ips):
+        return [smb_ips], "smb_ips_file"
+
+    pdc_ip = str(domain_data.get("pdc", "")).strip()
+    if pdc_ip:
+        return [pdc_ip], "pdc_fallback"
+
+    return [], "none"
+
+
+def _normalize_smb_target_tokens(raw_value: Any) -> list[str]:
+    """Normalize SMB target tokens from comma/space-separated input."""
+    if isinstance(raw_value, (list, tuple, set)):
+        source_tokens = [str(item).strip() for item in raw_value if str(item).strip()]
+    else:
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return []
+        source_tokens = [
+            part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()
+        ]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for token in source_tokens:
+        key = token.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(token)
+    return normalized
+
+
+def _set_guest_smb_targets(shell: Any, *, domain: str, targets: list[str]) -> None:
+    """Persist guest SMB target tokens in domain runtime state."""
+    domain_data = shell.domains_data.setdefault(domain, {})
+    domain_data["guest_smb_targets"] = list(targets)
+
+
+def _resolve_guest_targets_default_input(
+    *,
+    shell: Any,
+    current_targets: list[str],
+    pdc_ip: str | None,
+) -> str:
+    """Resolve default text shown for custom guest target input prompt."""
+    path_like_current = any(
+        str(token).endswith(".txt") or "/" in str(token) for token in current_targets
+    )
+    if current_targets and not path_like_current:
+        return ", ".join(current_targets)
+    shell_hosts = str(getattr(shell, "hosts", "") or "").strip()
+    if shell_hosts:
+        return shell_hosts
+    return str(pdc_ip or "").strip()
+
+
+def _maybe_override_guest_smb_targets(
+    shell: Any,
+    *,
+    domain: str,
+    current_targets: list[str],
+    current_source: str,
+) -> tuple[list[str], str]:
+    """Offer an interactive target override for guest share enumeration."""
+    if getattr(shell, "auto", False):
+        return current_targets, current_source
+    if is_non_interactive(shell):
+        return current_targets, current_source
+
+    selector = getattr(shell, "_questionary_select", None)
+    if not callable(selector):
+        return current_targets, current_source
+
+    domain_data = (
+        shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+    )
+    pdc_ip = str(domain_data.get("pdc", "")).strip()
+    enabled_computers = domain_relpath(
+        shell.domains_dir, domain, "enabled_computers_ips.txt"
+    )
+    legacy_smb_ips = domain_relpath(shell.domains_dir, domain, "smb", "ips.txt")
+
+    option_labels: list[str] = []
+    option_actions: list[str] = []
+
+    if os.path.exists(enabled_computers):
+        option_labels.append("Use enabled domain computers file (Recommended)")
+        option_actions.append("enabled_file")
+
+    option_labels.append("Use current guest target set")
+    option_actions.append("keep_current")
+
+    option_labels.append("Enter custom ranges/IPs now")
+    option_actions.append("custom_input")
+
+    if pdc_ip:
+        option_labels.append("Use only validated PDC/DC")
+        option_actions.append("pdc_only")
+
+    if os.path.exists(legacy_smb_ips):
+        option_labels.append("Use legacy smb/ips.txt file")
+        option_actions.append("legacy_file")
+
+    default_idx = 0
+    selected_idx = selector(
+        "Guest SMB target scope:",
+        option_labels,
+        default_idx=default_idx,
+    )
+    if selected_idx is None:
+        return current_targets, current_source
+    if not isinstance(selected_idx, int) or not (
+        0 <= selected_idx < len(option_actions)
+    ):
+        return current_targets, current_source
+
+    action = option_actions[selected_idx]
+
+    if action == "keep_current":
+        return current_targets, current_source
+    if action == "enabled_file":
+        targets = [enabled_computers]
+        _set_guest_smb_targets(shell, domain=domain, targets=targets)
+        return targets, "enabled_computers_file"
+    if action == "legacy_file":
+        targets = [legacy_smb_ips]
+        _set_guest_smb_targets(shell, domain=domain, targets=targets)
+        return targets, "smb_ips_file"
+    if action == "pdc_only" and pdc_ip:
+        targets = [pdc_ip]
+        _set_guest_smb_targets(shell, domain=domain, targets=targets)
+        return targets, "pdc_fallback"
+    if action == "custom_input":
+        default_input = _resolve_guest_targets_default_input(
+            shell=shell,
+            current_targets=current_targets,
+            pdc_ip=pdc_ip or None,
+        )
+        raw_input = Prompt.ask(
+            Text(
+                "Enter SMB target ranges/IPs (comma/space-separated)",
+                style="cyan",
+            ),
+            default=default_input,
+        ).strip()
+        parsed_targets = _normalize_smb_target_tokens(raw_input)
+        if not parsed_targets:
+            print_warning(
+                "No valid SMB targets entered. Keeping the current guest target set."
+            )
+            return current_targets, current_source
+        _set_guest_smb_targets(shell, domain=domain, targets=parsed_targets)
+        shell.hosts = ", ".join(parsed_targets)
+        return parsed_targets, "configured_custom"
+
+    return current_targets, current_source
+
+
 def run_guest_shares(shell: Any, *, domain: str) -> None:
     """Run SMB share enumeration via guest session and render results."""
     if shell.type == "ctf" and shell.domains_data[domain]["auth"] in ["auth", "pwned"]:
@@ -440,22 +813,33 @@ def run_guest_shares(shell: Any, *, domain: str) -> None:
         )
         return
 
-    enabled_computers = domain_relpath(
-        shell.domains_dir, domain, "enabled_computers_ips.txt"
+    target_tokens, target_source = _resolve_guest_smb_targets(shell, domain=domain)
+    target_tokens, target_source = _maybe_override_guest_smb_targets(
+        shell,
+        domain=domain,
+        current_targets=target_tokens,
+        current_source=target_source,
     )
-    smb_ips = domain_relpath(shell.domains_dir, domain, "smb", "ips.txt")
-    if os.path.exists(enabled_computers):
-        target_path = enabled_computers
-    else:
-        target_path = smb_ips
+    if not target_tokens:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            "No guest SMB targets available for domain "
+            f"{marked_domain}. Configure targets first in start_unauth."
+        )
+        return
+    target_display = " ".join(target_tokens)
+    targets_arg = " ".join(shlex.quote(token) for token in target_tokens)
+    guest_transport_username = resolve_smb_guest_username(shell=shell, domain=domain)
+    guest_auth = _build_guest_auth_nxc(shell, domain=domain)
 
     print_operation_header(
         "Guest Session Share Enumeration",
         details={
             "Domain": domain,
-            "Target": target_path,
+            "Target": target_display,
+            "Target Source": target_source,
             "Type": "SMB Shares Enumeration",
-            "Authentication": "Guest Account (ADscan)",
+            "Authentication": f"Guest Account ({guest_transport_username})",
             "Threads": "16",
         },
         icon="👤",
@@ -463,7 +847,7 @@ def run_guest_shares(shell: Any, *, domain: str) -> None:
 
     log_path = domain_relpath(shell.domains_dir, domain, "smb", "smb_guest_shares.log")
     command = (
-        f'{shell.netexec_path} smb {target_path} -u "ADscan" -p "" '
+        f"{shell.netexec_path} smb {targets_arg} {guest_auth} "
         f"-t 10 --timeout 60 --smb-timeout 30 --shares --log "
         f"{log_path} "
     )
@@ -475,6 +859,461 @@ def run_guest_shares(shell: Any, *, domain: str) -> None:
         username="guest",
         password="",
     )
+
+
+def _run_guest_share_probe(
+    shell: Any,
+    *,
+    domain: str,
+    target_tokens: list[str],
+    log_path: str,
+    strategy_key: str,
+    strategy_label: str,
+    target_source: str,
+) -> dict[str, Any]:
+    """Run a guest ``--shares`` probe and return normalized metrics."""
+    targets_arg = " ".join(shlex.quote(token) for token in target_tokens)
+    guest_auth = _build_guest_auth_nxc(shell, domain=domain)
+    command = (
+        f"{shell.netexec_path} smb {targets_arg} {guest_auth} "
+        f"-t 10 --timeout 60 --smb-timeout 30 --shares --log {log_path} "
+    )
+    print_info_debug(f"[guest-benchmark] {strategy_key} shares command: {command}")
+    started = time.perf_counter()
+    completed_process = shell._run_netexec(
+        command,
+        domain=domain,
+        pre_sync=False,
+    )
+    elapsed = max(0.0, time.perf_counter() - started)
+
+    output = ""
+    return_code: int | None = None
+    success = False
+    if completed_process is not None:
+        return_code = int(getattr(completed_process, "returncode", 1))
+        success = return_code == 0
+        output = str(getattr(completed_process, "stdout", "") or "")
+
+    host_identity = _extract_smb_host_identity_map(output) if success else {}
+    guest_session_hosts = _extract_guest_session_hosts(output) if success else {}
+    share_map = parse_smb_share_map(output) if success else {}
+
+    return {
+        "strategy_key": strategy_key,
+        "strategy_label": strategy_label,
+        "target_source": target_source,
+        "target_tokens": list(target_tokens),
+        "log_path": log_path,
+        "command": command,
+        "success": success,
+        "return_code": return_code,
+        "duration_seconds_total": elapsed,
+        "duration_seconds_discovery": 0.0,
+        "duration_seconds_shares": elapsed,
+        "host_identity": host_identity,
+        "guest_session_hosts": guest_session_hosts,
+        "share_map": share_map,
+        "hosts_with_guest_access": len(guest_session_hosts),
+        "hosts_with_share_permissions": len(share_map),
+        "hosts_with_guest_share_permissions": sum(
+            1 for ip in guest_session_hosts if share_map.get(ip)
+        ),
+        "shares_with_permissions": sum(len(shares) for shares in share_map.values()),
+    }
+
+
+def _run_guest_host_discovery_probe(
+    shell: Any,
+    *,
+    domain: str,
+    target_tokens: list[str],
+    log_path: str,
+) -> dict[str, Any]:
+    """Run SMB host discovery (without ``--shares``) and return discovered hosts."""
+    targets_arg = " ".join(shlex.quote(token) for token in target_tokens)
+    command = (
+        f"{shell.netexec_path} smb {targets_arg} "
+        f"-t 10 --timeout 60 --smb-timeout 30 --log {log_path} "
+    )
+    print_info_debug(f"[guest-benchmark] discovery command: {command}")
+    started = time.perf_counter()
+    completed_process = shell._run_netexec(
+        command,
+        domain=domain,
+        pre_sync=False,
+    )
+    elapsed = max(0.0, time.perf_counter() - started)
+
+    output = ""
+    return_code: int | None = None
+    success = False
+    if completed_process is not None:
+        return_code = int(getattr(completed_process, "returncode", 1))
+        success = return_code == 0
+        output = str(getattr(completed_process, "stdout", "") or "")
+
+    discovered_hosts = _extract_smb_host_identity_map(output) if success else {}
+    return {
+        "command": command,
+        "log_path": log_path,
+        "success": success,
+        "return_code": return_code,
+        "duration_seconds": elapsed,
+        "discovered_hosts": discovered_hosts,
+        "discovered_hosts_count": len(discovered_hosts),
+    }
+
+
+def run_smb_guest_strategy_benchmark(shell: Any, *, domain: str) -> None:
+    """Benchmark guest SMB share strategies (range-direct vs discovery+IPs)."""
+    if domain not in getattr(shell, "domains_data", {}):
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"Domain {marked_domain} is not configured in the current workspace."
+        )
+        return
+    if not shell.netexec_path:
+        print_error(
+            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
+        )
+        return
+
+    target_tokens, target_source = _resolve_guest_smb_targets(shell, domain=domain)
+    target_tokens, target_source = _maybe_override_guest_smb_targets(
+        shell,
+        domain=domain,
+        current_targets=target_tokens,
+        current_source=target_source,
+    )
+    if not target_tokens:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"No guest SMB targets available for benchmark in domain {marked_domain}."
+        )
+        return
+
+    selected_run_mode = "compare_both"
+    if not getattr(shell, "auto", False) and not is_non_interactive(shell):
+        selector = getattr(shell, "_questionary_select", None)
+        if callable(selector):
+            labels = [
+                "Compare both strategies (Recommended)",
+                "Run strategy 1 only (Direct --shares on ranges)",
+                "Run strategy 2 only (Discovery -> IP file -> --shares)",
+            ]
+            actions = [
+                "compare_both",
+                "direct_ranges",
+                "discovery_then_ips",
+            ]
+            selected_idx = selector(
+                "Select guest SMB benchmark mode:",
+                labels,
+                default_idx=0,
+            )
+            if selected_idx is None:
+                print_info("SMB guest benchmark cancelled by user.")
+                return
+            if isinstance(selected_idx, int) and 0 <= selected_idx < len(actions):
+                selected_run_mode = actions[selected_idx]
+
+    run_direct = selected_run_mode in {"compare_both", "direct_ranges"}
+    run_discovery_then_ips = selected_run_mode in {
+        "compare_both",
+        "discovery_then_ips",
+    }
+    if not run_direct and not run_discovery_then_ips:
+        print_info("No guest SMB benchmark strategy selected.")
+        return
+
+    print_operation_header(
+        "Guest SMB Strategy Benchmark",
+        details={
+            "Domain": domain,
+            "Targets": " ".join(target_tokens),
+            "Target Source": target_source,
+            "Run Mode": selected_run_mode,
+        },
+        icon="⏱️",
+    )
+
+    workspace_cwd = shell._get_workspace_cwd()
+    benchmark_root_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        "smb",
+        "guest_strategy_benchmark",
+    )
+    os.makedirs(benchmark_root_abs, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    results: list[dict[str, Any]] = []
+    result_by_key: dict[str, dict[str, Any]] = {}
+
+    if run_direct:
+        direct_log_path = domain_relpath(
+            shell.domains_dir,
+            domain,
+            "smb",
+            "guest_strategy_benchmark",
+            f"{timestamp}_direct_ranges_shares.log",
+        )
+        direct_result = _run_guest_share_probe(
+            shell,
+            domain=domain,
+            target_tokens=target_tokens,
+            log_path=direct_log_path,
+            strategy_key="direct_ranges",
+            strategy_label="1) Direct --shares on ranges",
+            target_source=target_source,
+        )
+        results.append(direct_result)
+        result_by_key["direct_ranges"] = direct_result
+
+    if run_discovery_then_ips:
+        discovery_log_path = domain_relpath(
+            shell.domains_dir,
+            domain,
+            "smb",
+            "guest_strategy_benchmark",
+            f"{timestamp}_discovery.log",
+        )
+        discovery_result = _run_guest_host_discovery_probe(
+            shell,
+            domain=domain,
+            target_tokens=target_tokens,
+            log_path=discovery_log_path,
+        )
+
+        discovery_ips_rel = domain_relpath(
+            shell.domains_dir,
+            domain,
+            "smb",
+            "guest_strategy_benchmark",
+            f"{timestamp}_discovered_ips.txt",
+        )
+        discovery_ips_abs = os.path.join(workspace_cwd, discovery_ips_rel)
+        discovered_ips = sorted(discovery_result.get("discovered_hosts", {}).keys())
+        discovery_error: str | None = None
+        if discovery_result.get("success") and discovered_ips:
+            try:
+                with open(discovery_ips_abs, "w", encoding="utf-8") as ips_file:
+                    ips_file.write("\n".join(discovered_ips) + "\n")
+                print_info_debug(
+                    "Guest benchmark discovery targets saved to "
+                    f"{mark_sensitive(discovery_ips_rel, 'path')}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                discovery_error = (
+                    f"failed_to_write_discovery_targets:{type(exc).__name__}"
+                )
+        elif discovery_result.get("success") and not discovered_ips:
+            discovery_error = "discovery_found_no_hosts"
+        else:
+            discovery_error = "discovery_command_failed"
+
+        if discovery_error is None:
+            shares_log_path = domain_relpath(
+                shell.domains_dir,
+                domain,
+                "smb",
+                "guest_strategy_benchmark",
+                f"{timestamp}_discovered_ips_shares.log",
+            )
+            discovery_strategy_result = _run_guest_share_probe(
+                shell,
+                domain=domain,
+                target_tokens=[discovery_ips_rel],
+                log_path=shares_log_path,
+                strategy_key="discovery_then_ips",
+                strategy_label="2) Discovery -> IP file -> --shares",
+                target_source="discovery_generated_ip_file",
+            )
+        else:
+            discovery_strategy_result = {
+                "strategy_key": "discovery_then_ips",
+                "strategy_label": "2) Discovery -> IP file -> --shares",
+                "target_source": "discovery_generated_ip_file",
+                "target_tokens": [discovery_ips_rel],
+                "log_path": None,
+                "command": "",
+                "success": False,
+                "return_code": None,
+                "duration_seconds_total": max(
+                    0.0, float(discovery_result.get("duration_seconds", 0.0))
+                ),
+                "duration_seconds_discovery": max(
+                    0.0, float(discovery_result.get("duration_seconds", 0.0))
+                ),
+                "duration_seconds_shares": 0.0,
+                "host_identity": {},
+                "guest_session_hosts": {},
+                "share_map": {},
+                "hosts_with_guest_access": 0,
+                "hosts_with_share_permissions": 0,
+                "hosts_with_guest_share_permissions": 0,
+                "shares_with_permissions": 0,
+            }
+
+        discovery_strategy_result["duration_seconds_discovery"] = max(
+            0.0,
+            float(discovery_result.get("duration_seconds", 0.0)),
+        )
+        discovery_strategy_result["duration_seconds_shares"] = max(
+            0.0,
+            float(discovery_strategy_result.get("duration_seconds_shares", 0.0)),
+        )
+        discovery_strategy_result["duration_seconds_total"] = (
+            discovery_strategy_result["duration_seconds_discovery"]
+            + discovery_strategy_result["duration_seconds_shares"]
+        )
+        discovery_strategy_result["discovery"] = discovery_result
+        discovery_strategy_result["discovery_targets_file"] = discovery_ips_rel
+        discovery_strategy_result["discovery_error"] = discovery_error
+
+        results.append(discovery_strategy_result)
+        result_by_key["discovery_then_ips"] = discovery_strategy_result
+
+    if not results:
+        print_warning("Guest SMB benchmark completed with no strategy results.")
+        return
+
+    table = Table(
+        title="[bold cyan]Guest SMB Strategy Benchmark Results[/bold cyan]",
+        header_style="bold magenta",
+        box=rich.box.SIMPLE_HEAVY,
+    )
+    table.add_column("Strategy", style="cyan")
+    table.add_column("Status", style="magenta")
+    table.add_column("Total (s)", style="green", justify="right")
+    table.add_column("Discovery (s)", style="green", justify="right")
+    table.add_column("Shares (s)", style="green", justify="right")
+    table.add_column("Guest Hosts", style="cyan", justify="right")
+    table.add_column("RW Hosts", style="cyan", justify="right")
+    table.add_column("RW Shares", style="cyan", justify="right")
+    for result in results:
+        table.add_row(
+            str(result.get("strategy_label", "")),
+            "ok" if bool(result.get("success")) else "failed",
+            f"{float(result.get('duration_seconds_total', 0.0)):.3f}",
+            f"{float(result.get('duration_seconds_discovery', 0.0)):.3f}",
+            f"{float(result.get('duration_seconds_shares', 0.0)):.3f}",
+            str(int(result.get("hosts_with_guest_access", 0))),
+            str(int(result.get("hosts_with_share_permissions", 0))),
+            str(int(result.get("shares_with_permissions", 0))),
+        )
+    print_panel_with_table(table, border_style=BRAND_COLORS["info"])
+
+    comparison: dict[str, Any] = {}
+    direct_result = result_by_key.get("direct_ranges")
+    discovery_result = result_by_key.get("discovery_then_ips")
+    if isinstance(direct_result, dict) and isinstance(discovery_result, dict):
+        direct_guest_hosts = set(direct_result.get("guest_session_hosts", {}).keys())
+        discovery_guest_hosts = set(
+            discovery_result.get("guest_session_hosts", {}).keys()
+        )
+        direct_rw_hosts = set(direct_result.get("share_map", {}).keys())
+        discovery_rw_hosts = set(discovery_result.get("share_map", {}).keys())
+
+        comparison = {
+            "fastest_strategy": (
+                "direct_ranges"
+                if float(direct_result.get("duration_seconds_total", 0.0))
+                <= float(discovery_result.get("duration_seconds_total", 0.0))
+                else "discovery_then_ips"
+            ),
+            "guest_hosts_only_in_direct_ranges": sorted(
+                direct_guest_hosts - discovery_guest_hosts
+            ),
+            "guest_hosts_only_in_discovery_then_ips": sorted(
+                discovery_guest_hosts - direct_guest_hosts
+            ),
+            "rw_hosts_only_in_direct_ranges": sorted(
+                direct_rw_hosts - discovery_rw_hosts
+            ),
+            "rw_hosts_only_in_discovery_then_ips": sorted(
+                discovery_rw_hosts - direct_rw_hosts
+            ),
+        }
+
+        comparison_table = Table(
+            title="[bold cyan]Guest SMB Strategy Comparison[/bold cyan]",
+            header_style="bold magenta",
+            box=rich.box.SIMPLE_HEAVY,
+        )
+        comparison_table.add_column("Metric", style="cyan")
+        comparison_table.add_column("Value", style="green", justify="right")
+        comparison_table.add_row(
+            "Fastest Strategy",
+            str(comparison["fastest_strategy"]),
+        )
+        comparison_table.add_row(
+            "Guest Hosts only in Strategy 1",
+            str(len(comparison["guest_hosts_only_in_direct_ranges"])),
+        )
+        comparison_table.add_row(
+            "Guest Hosts only in Strategy 2",
+            str(len(comparison["guest_hosts_only_in_discovery_then_ips"])),
+        )
+        comparison_table.add_row(
+            "RW Hosts only in Strategy 1",
+            str(len(comparison["rw_hosts_only_in_direct_ranges"])),
+        )
+        comparison_table.add_row(
+            "RW Hosts only in Strategy 2",
+            str(len(comparison["rw_hosts_only_in_discovery_then_ips"])),
+        )
+        print_panel_with_table(comparison_table, border_style=BRAND_COLORS["info"])
+
+    results_payload: list[dict[str, Any]] = []
+    for result in results:
+        payload = {
+            k: v
+            for k, v in result.items()
+            if k not in {"host_identity", "guest_session_hosts", "share_map"}
+        }
+        payload["guest_session_hosts"] = result.get("guest_session_hosts", {})
+        payload["share_map"] = result.get("share_map", {})
+        if isinstance(result.get("discovery"), dict):
+            payload["discovery"] = dict(result["discovery"])
+        results_payload.append(payload)
+
+    benchmark_json_abs = os.path.join(
+        benchmark_root_abs,
+        f"{timestamp}_guest_strategy_benchmark.json",
+    )
+    benchmark_json_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        "smb",
+        "guest_strategy_benchmark",
+        f"{timestamp}_guest_strategy_benchmark.json",
+    )
+    benchmark_payload = {
+        "timestamp": timestamp,
+        "domain": domain,
+        "targets": list(target_tokens),
+        "target_source": target_source,
+        "selected_run_mode": selected_run_mode,
+        "results": results_payload,
+        "comparison": comparison,
+    }
+    try:
+        with open(benchmark_json_abs, "w", encoding="utf-8") as benchmark_file:
+            json.dump(benchmark_payload, benchmark_file, indent=2)
+        print_success(
+            "Guest SMB benchmark results saved to "
+            f"{mark_sensitive(benchmark_json_rel, 'path')}."
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning("Guest SMB benchmark completed, but persistence failed.")
+        print_warning_debug(
+            f"Guest SMB benchmark persistence error: {type(exc).__name__}: {exc}"
+        )
 
 
 def run_auth_shares(
@@ -538,9 +1377,10 @@ def run_rid_cycling(shell: Any, *, domain: str) -> None:
     )
 
     rid_log = domain_relpath(shell.domains_dir, domain, "smb", "smb_rid.log")
+    guest_auth = _build_guest_auth_nxc(shell, domain=domain)
     command = (
         f"{shell.netexec_path} smb {shell.domains_data[domain]['pdc']} "
-        f'-u "ADscan" -p "" --rid-brute 2000 --log '
+        f"{guest_auth} --rid-brute 2000 --log "
         f"{rid_log}"
     )
     print_info_debug(f"Command: {command}")
@@ -840,10 +1680,20 @@ def run_smb_null_enum_users(shell: Any, *, domain: str) -> None:
 
 def run_guest_shares_local(shell: Any, *, domain: str) -> None:
     """Enumerate SMB shares using guest session with --local-auth."""
-    ips_file = domain_relpath(shell.domains_dir, domain, "smb", "ips.txt")
+    target_tokens, _target_source = _resolve_guest_smb_targets(shell, domain=domain)
+    if not target_tokens:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            "No guest SMB targets available for local-auth enumeration in domain "
+            f"{marked_domain}."
+        )
+        return
+    targets_arg = " ".join(shlex.quote(token) for token in target_tokens)
     log_path = domain_relpath(shell.domains_dir, domain, "smb_guest_shares_local.log")
+    guest_auth = _build_guest_auth_nxc(shell, domain=domain)
     command = (
-        f'{shell.netexec_path} smb {ips_file} -u "ADscan" -p "" -t 10 --timeout 60 --smb-timeout 30 '
+        f"{shell.netexec_path} smb {targets_arg} {guest_auth} "
+        f"-t 10 --timeout 60 --smb-timeout 30 "
         f"--shares --local-auth --log {log_path}"
     )
     print_success("Executing guest session")
@@ -874,9 +1724,10 @@ def run_null_general_local(shell: Any, *, domain: str) -> None:
 def run_rid_cycling_local(shell: Any, *, domain: str) -> None:
     """Run RID cycling with --local-auth."""
     log_path = domain_relpath(shell.domains_dir, domain, "smb", "smb_rid_local.log")
+    guest_auth = _build_guest_auth_nxc(shell, domain=domain)
     command = (
         f"{shell.netexec_path} smb {shell.domains_data[domain]['pdc']} "
-        f'-u "ADscan" -p "" --local-auth --rid-brute 2000 --log {log_path}'
+        f"{guest_auth} --local-auth --rid-brute 2000 --log {log_path}"
     )
     print_info("Checking RID cycling for local session")
     print_info_debug(f"Command: {command}")
@@ -1055,9 +1906,10 @@ def run_gpp_autologin(shell: Any, *, target_domain: str) -> None:
             f"{auth} --log domains/{target_domain}/smb/gpp_autologin.log -M gpp_autologin"
         )
     elif auth_type == "guest":
+        guest_auth = _build_guest_auth_nxc(shell, domain=target_domain)
         command = (
             f"{shell.netexec_path} smb {shell.domains_data[target_domain]['pdc']} "
-            f"-u 'ADscan' -p '' "
+            f"{guest_auth} "
             f"--log domains/{target_domain}/smb/gpp_autologin.log -M gpp_autologin"
         )
     elif auth_type == "null":
@@ -1110,9 +1962,10 @@ def run_gpp_passwords(shell: Any, *, target_domain: str) -> None:
             f"{auth} --log domains/{target_domain}/smb/gpp_password.log -M gpp_password"
         )
     elif auth_type == "guest":
+        guest_auth = _build_guest_auth_nxc(shell, domain=target_domain)
         command = (
             f"{shell.netexec_path} smb {shell.domains_data[target_domain]['pdc']} "
-            f"-u 'ADscan' -p '' "
+            f"{guest_auth} "
             f"--log domains/{target_domain}/smb/gpp_password.log -M gpp_password"
         )
     elif auth_type == "null":
@@ -1161,10 +2014,10 @@ def run_local_cred_reuse(
     domain: str,
     username: str,
     credential: str,
-) -> None:
+    prompt_dump_after_reuse: bool = False,
+) -> dict[str, Any] | None:
     """Test local admin credential reuse across enabled computers."""
     from adscan_internal import print_operation_header
-    from adscan_internal.rich_output import mark_sensitive
 
     cred_type = "Hash" if shell.is_hash(credential) else "Password"
     print_operation_header(
@@ -1181,22 +2034,33 @@ def run_local_cred_reuse(
     )
 
     auth_str = shell.build_auth_nxc(username, credential)
-    marked_domain = mark_sensitive(domain, "domain")
-    marked_user = mark_sensitive(username, "user")
     command = (
         f"{shell.netexec_path} smb enabled_computers_ips.txt {auth_str} "
         f"-t 20 --timeout 30 --smb-timeout 10 --local-auth --log "
-        f"domains/{marked_domain}/smb/{marked_user}_cred_reuse.txt"
+        f"domains/{domain}/smb/{username}_cred_reuse.txt"
     )
     print_info(
         "Checking for local admin creds reuse (Please be patient, this might take a while on large domains)"
     )
-    shell.execute_local_cred_reuse(command, domain, username, credential)
+    try:
+        return shell.execute_local_cred_reuse(
+            command,
+            domain,
+            username,
+            credential,
+            prompt_dump_after_reuse=prompt_dump_after_reuse,
+        )
+    except TypeError:
+        # Backward compatibility for shells that still expose the legacy signature.
+        return shell.execute_local_cred_reuse(command, domain, username, credential)
 
 
 _LOCAL_REUSE_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _LOCAL_REUSE_SMB_LINE_RE = re.compile(
     r"^\s*SMB\s+(?P<target>\S+)\s+\d+\s+(?P<host>[A-Za-z0-9_.-]+)\s+\[(?P<status>[^\]]+)\]\s+(?P<rest>.*)$"
+)
+_LOCAL_REUSE_FAILURE_CODE_RE = re.compile(
+    r"\b(?P<code>(?:STATUS|NT_STATUS|KDC_ERR)_[A-Z0-9_]+)\b"
 )
 
 
@@ -1211,6 +2075,10 @@ def parse_local_cred_reuse_targets(log_text: str) -> list[dict[str, str]]:
     for raw_line in log_text.splitlines():
         line = strip_ansi_codes(raw_line)
         parsed = _LOCAL_REUSE_SMB_LINE_RE.match(line)
+        if not parsed and "SMB " in line:
+            smb_idx = line.find("SMB ")
+            if smb_idx > 0:
+                parsed = _LOCAL_REUSE_SMB_LINE_RE.match(line[smb_idx:])
         if not parsed:
             continue
         rest = str(parsed.group("rest") or "")
@@ -1239,6 +2107,46 @@ def parse_local_cred_reuse_targets(log_text: str) -> list[dict[str, str]]:
         )
 
     return targets
+
+
+def parse_local_cred_reuse_outcomes(log_text: str) -> dict[str, int]:
+    """Parse NetExec local-auth output and summarize non-Pwn3d outcomes.
+
+    The result helps explain why potential reuse candidates were filtered out
+    during active validation (for example `STATUS_ACCOUNT_DISABLED`,
+    `STATUS_LOGON_FAILURE`, `KDC_ERR_C_PRINCIPAL_UNKNOWN`).
+    """
+    if not log_text:
+        return {}
+
+    counts: Counter[str] = Counter()
+    for raw_line in log_text.splitlines():
+        line = strip_ansi_codes(raw_line)
+        parsed = _LOCAL_REUSE_SMB_LINE_RE.match(line)
+        if not parsed and "SMB " in line:
+            smb_idx = line.find("SMB ")
+            if smb_idx > 0:
+                parsed = _LOCAL_REUSE_SMB_LINE_RE.match(line[smb_idx:])
+        if not parsed:
+            continue
+
+        rest = str(parsed.group("rest") or "").strip()
+        if not rest:
+            continue
+        if "(pwn3d" in rest.lower():
+            counts["PWN3D"] += 1
+            continue
+
+        failure = _LOCAL_REUSE_FAILURE_CODE_RE.search(rest)
+        if failure:
+            counts[str(failure.group("code")).upper()] += 1
+            continue
+        if "Connection Error" in rest:
+            counts["CONNECTION_ERROR"] += 1
+            continue
+        counts["OTHER_FAILURE"] += 1
+
+    return dict(counts)
 
 
 def run_smb_relay_targets(shell: Any, *, domain: str) -> None:
@@ -1932,8 +2840,7 @@ def _enumerate_readable_share_context_for_mapping(
     smb_ips = domain_relpath(shell.domains_dir, domain, "smb", "ips.txt")
     target_path = enabled_computers if os.path.exists(enabled_computers) else smb_ips
     command = (
-        f"{shell.netexec_path} smb {target_path} {auth_args} "
-        "--smb-timeout 30 --shares"
+        f"{shell.netexec_path} smb {target_path} {auth_args} --smb-timeout 30 --shares"
     )
     completed_process = shell._run_netexec(
         command,
@@ -1946,7 +2853,9 @@ def _enumerate_readable_share_context_for_mapping(
 
     output_text = str(getattr(completed_process, "stdout", "") or "")
     share_map = parse_smb_share_map(output_text)
-    read_shares, _write_shares, read_hosts, _write_hosts = summarize_share_map(share_map)
+    read_shares, _write_shares, read_hosts, _write_hosts = summarize_share_map(
+        share_map
+    )
     read_shares = _filter_shares_by_global_mapping_exclusions(read_shares)
     share_map = _filter_share_map_by_global_mapping_exclusions(share_map) or {}
     ordered_hosts = sorted(read_hosts)
@@ -2139,7 +3048,9 @@ def run_smb_map_benchmark(
                     password=password,
                     hosts=hosts,
                     share_map=share_map,
-                    cifs_mount_root=_resolve_cifs_mount_root(shell=shell, domain=domain),
+                    cifs_mount_root=_resolve_cifs_mount_root(
+                        shell=shell, domain=domain
+                    ),
                     selected_method="deterministic",
                     run_post_mapping_workflow=False,
                 )
@@ -2321,8 +3232,7 @@ def _persist_smb_mapping_benchmark_results(
         telemetry.capture_exception(exc)
         print_warning("SMB mapping benchmark completed, but persistence failed.")
         print_warning_debug(
-            "SMB mapping benchmark persistence error: "
-            f"{type(exc).__name__}: {exc}"
+            f"SMB mapping benchmark persistence error: {type(exc).__name__}: {exc}"
         )
 
 
@@ -2388,10 +3298,7 @@ def run_smb_map_benchmark_history(
     runs = payload.get("runs", [])
     if not isinstance(runs, list) or not runs:
         marked_history_rel = mark_sensitive(history_rel, "path")
-        print_info(
-            "SMB mapping benchmark history is empty in "
-            f"{marked_history_rel}."
-        )
+        print_info(f"SMB mapping benchmark history is empty in {marked_history_rel}.")
         return
 
     safe_limit = max(1, min(int(recent_limit), 100))
@@ -2564,9 +3471,7 @@ def _summarize_benchmark_method_stats(
     stats: dict[str, dict[str, Any]] = {}
     for method, runs_count in method_runs.items():
         durations = method_durations.get(method, [])
-        avg_success = (
-            (sum(durations) / len(durations)) if durations else None
-        )
+        avg_success = (sum(durations) / len(durations)) if durations else None
         best_success = min(durations) if durations else None
         stats[method] = {
             "runs": int(runs_count),
@@ -2648,7 +3553,9 @@ def _export_smb_mapping_benchmark_history_csv(
                     "shares_count": int(entry.get("shares_count", 0) or 0),
                     "method": str(result.get("method", "") or ""),
                     "success": bool(result.get("success")),
-                    "duration_seconds": float(result.get("duration_seconds", 0.0) or 0.0),
+                    "duration_seconds": float(
+                        result.get("duration_seconds", 0.0) or 0.0
+                    ),
                 }
             )
 
@@ -2669,15 +3576,12 @@ def _export_smb_mapping_benchmark_history_csv(
             writer.writeheader()
             writer.writerows(rows)
         marked_output = mark_sensitive(output_rel, "path")
-        print_info(
-            f"SMB benchmark history CSV exported to {marked_output}."
-        )
+        print_info(f"SMB benchmark history CSV exported to {marked_output}.")
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_warning("SMB benchmark history CSV export failed.")
         print_warning_debug(
-            "SMB benchmark history CSV export error: "
-            f"{type(exc).__name__}: {exc}"
+            f"SMB benchmark history CSV export error: {type(exc).__name__}: {exc}"
         )
 
 
@@ -2724,8 +3628,8 @@ def _build_spider_plus_auth(
     lowered = username.strip().lower()
     if lowered == "null":
         return '-u "" -p ""'
-    if lowered == "guest" and password == "":
-        return shell.build_auth_nxc("ADscan", "", domain)
+    if is_guest_alias(lowered) and password == "":
+        return _build_guest_auth_nxc(shell, domain=domain)
     return shell.build_auth_nxc(username, password, domain)
 
 
@@ -2821,8 +3725,7 @@ def _mount_cifs_targets_via_host_helper(
     if not helper_sock or not os.path.exists(helper_sock):
         marked_sock = mark_sensitive(helper_sock or "<unset>", "path")
         print_info_debug(
-            "CIFS host-helper mount skipped: missing helper socket "
-            f"({marked_sock})."
+            f"CIFS host-helper mount skipped: missing helper socket ({marked_sock})."
         )
         return []
 
@@ -2914,8 +3817,7 @@ def _unmount_cifs_targets_via_host_helper(
     if not helper_sock or not os.path.exists(helper_sock):
         marked_sock = mark_sensitive(helper_sock or "<unset>", "path")
         print_warning_debug(
-            "CIFS unmount skipped: host helper socket unavailable "
-            f"({marked_sock})."
+            f"CIFS unmount skipped: host helper socket unavailable ({marked_sock})."
         )
         return
 
@@ -2998,7 +3900,9 @@ def run_smb_share_tree_mapping_with_cifs(
         )
         return False
 
-    effective_mount_root = str(cifs_mount_root or "").strip() or _resolve_cifs_mount_root(
+    effective_mount_root = str(
+        cifs_mount_root or ""
+    ).strip() or _resolve_cifs_mount_root(
         shell=shell,
         domain=domain,
     )
@@ -3579,9 +4483,7 @@ def _run_post_mapping_sensitive_data_workflow(
         )
     if selected_method in {"ai", "ai_cifs", "ai_rclone"}:
         ai_attempted = True
-        read_backend = (
-            "cifs_local" if selected_method == "ai_cifs" else "smb_impacket"
-        )
+        read_backend = "cifs_local" if selected_method == "ai_cifs" else "smb_impacket"
         try:
             ai_ok = _run_post_mapping_ai_triage(
                 shell,
@@ -3596,12 +4498,9 @@ def _run_post_mapping_sensitive_data_workflow(
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             ai_ok = False
-            print_warning(
-                "AI post-mapping analysis failed due to an unexpected error."
-            )
+            print_warning("AI post-mapping analysis failed due to an unexpected error.")
             print_warning_debug(
-                "AI post-mapping analysis exception: "
-                f"{type(exc).__name__}: {exc}"
+                f"AI post-mapping analysis exception: {type(exc).__name__}: {exc}"
             )
             print_warning_debug(traceback.format_exc())
         ai_success = ai_ok
@@ -3831,20 +4730,26 @@ def _run_post_mapping_ai_triage(
         return False
 
     active_username = ""
-    if (
-        hasattr(shell, "domains_data")
-        and isinstance(getattr(shell, "domains_data", None), dict)
+    if hasattr(shell, "domains_data") and isinstance(
+        getattr(shell, "domains_data", None), dict
     ):
         domain_data = shell.domains_data.get(domain, {})
         if isinstance(domain_data, dict):
             active_username = str(domain_data.get("username", "")).strip()
 
-    effective_username = str(triage_username or "").strip() or active_username
-    effective_password = str(triage_password or "").strip()
-    principal_key, allowed_share_pairs = triage_service.resolve_principal_allowed_shares(
-        mapping_json=mapping_json,
-        domain=domain,
-        username=effective_username,
+    explicit_username = str(triage_username or "").strip()
+    explicit_password = (
+        str(triage_password).strip() if triage_password is not None else None
+    )
+    effective_username = explicit_username or active_username
+    effective_password = explicit_password or ""
+    is_guest_user = effective_username.lower() in {"guest", "anonymous"}
+    principal_key, allowed_share_pairs = (
+        triage_service.resolve_principal_allowed_shares(
+            mapping_json=mapping_json,
+            domain=domain,
+            username=effective_username,
+        )
     )
     if principal_key and allowed_share_pairs:
         total_before_scope = triage_service.count_total_file_entries(
@@ -3878,12 +4783,28 @@ def _run_post_mapping_ai_triage(
             f"principal={requested_principal}"
         )
 
+    read_username = effective_username or None
+    if effective_username and is_guest_user:
+        read_username = resolve_smb_guest_username(shell=shell, domain=domain)
+
     if effective_username and effective_password:
         marked_user = mark_sensitive(effective_username, "user")
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(
             "AI triage byte-read auth source: "
             f"user={marked_user} domain={marked_domain} source=spider_plus_run"
+        )
+    elif effective_username and is_guest_user:
+        marked_user = mark_sensitive(effective_username, "user")
+        marked_transport_user = mark_sensitive(read_username or "", "user")
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            "AI triage byte-read auth source: "
+            f"user={marked_user} domain={marked_domain} source=guest_session"
+        )
+        print_info_debug(
+            "AI triage guest transport principal resolved: "
+            f"logical_user={marked_user} transport_user={marked_transport_user}"
         )
     elif active_username:
         marked_user = mark_sensitive(active_username, "user")
@@ -3904,8 +4825,7 @@ def _run_post_mapping_ai_triage(
         )
 
     print_info_debug(
-        "AI triage share-map context loaded: "
-        f"scope={scope} chars={len(mapping_json)}"
+        f"AI triage share-map context loaded: scope={scope} chars={len(mapping_json)}"
     )
     prompt = triage_service.build_triage_prompt(
         domain=domain,
@@ -3927,9 +4847,7 @@ def _run_post_mapping_ai_triage(
             )
     total_files = triage_service.count_total_file_entries(mapping_json=mapping_json)
     size_index = triage_service.build_file_size_index(mapping_json=mapping_json)
-    triage_parse = triage_service.parse_triage_response(
-        response_text=response
-    )
+    triage_parse = triage_service.parse_triage_response(response_text=response)
     prioritized_files = triage_parse.prioritized_files
     if allowed_share_pairs:
         before_count = len(prioritized_files)
@@ -3971,12 +4889,9 @@ def _run_post_mapping_ai_triage(
         if response_preview:
             marked_preview = mark_sensitive(response_preview[:1200], "text")
             print_info_debug(
-                "AI triage raw response preview (first 1200 chars): "
-                f"{marked_preview}"
+                f"AI triage raw response preview (first 1200 chars): {marked_preview}"
             )
-        print_info_debug(
-            f"AI triage raw response size: chars={len(response or '')}"
-        )
+        print_info_debug(f"AI triage raw response size: chars={len(response or '')}")
         return False
 
     read_mode_label = (
@@ -3999,9 +4914,9 @@ def _run_post_mapping_ai_triage(
         ai_service=ai_service,
         prioritized_files=prioritized_files,
         size_index=size_index,
-        read_username=effective_username or None,
-        read_password=effective_password or None,
-        read_domain=domain if effective_username and effective_password else None,
+        read_username=read_username,
+        read_password=explicit_password if effective_username else None,
+        read_domain=domain if effective_username else None,
         read_backend=read_backend,
         cifs_mount_root=cifs_mount_root,
     )
@@ -4224,7 +5139,9 @@ def _run_ai_prioritized_file_analysis(
         local_source_path = ""
         read_result: Any | None = None
         if read_backend == "cifs_local":
-            resolved_mount_root = str(cifs_mount_root or "").strip() or _resolve_cifs_mount_root(
+            resolved_mount_root = str(
+                cifs_mount_root or ""
+            ).strip() or _resolve_cifs_mount_root(
                 shell=shell,
                 domain=domain,
             )
@@ -4279,11 +5196,11 @@ def _run_ai_prioritized_file_analysis(
         if not read_result.success:
             read_failures += 1
             read_label = (
-                "local CIFS read" if per_file_backend == "cifs_local" else "Impacket byte-stream"
+                "local CIFS read"
+                if per_file_backend == "cifs_local"
+                else "Impacket byte-stream"
             )
-            print_warning(
-                f"Could not read {marked_path} via {read_label}."
-            )
+            print_warning(f"Could not read {marked_path} via {read_label}.")
             auth_user_marked = mark_sensitive(
                 read_result.auth_username or "unknown",
                 "user",
@@ -4406,7 +5323,9 @@ def _run_ai_prioritized_file_analysis(
                     f"{marked_host}/{marked_share}:{marked_path}: {note}"
                 )
             if pipeline_result.ai_summary:
-                print_info(f"AI summary for {marked_path}: {pipeline_result.ai_summary}")
+                print_info(
+                    f"AI summary for {marked_path}: {pipeline_result.ai_summary}"
+                )
 
             if pipeline_result.ai_findings:
                 flagged_files += 1
@@ -4961,11 +5880,28 @@ def ask_for_smb_access(
     respuesta = Confirm.ask(
         f"Do you want to dump credentials from host {marked_host} via SMB as user {marked_username}?"
     )
-    if respuesta:
+    if not respuesta:
+        return
+
+    if Confirm.ask(
+        f"Do you want to dump the SAM credentials from host {marked_host}?",
+        default=False,
+    ):
         shell.dump_sam(domain, username, password, host, "false")
+
+    if Confirm.ask(
+        f"Do you want to dump the LSA credentials from host {marked_host}?",
+        default=False,
+    ):
         shell.dump_lsa(domain, username, password, host, "false")
+
+    if Confirm.ask(
+        f"Do you want to dump the DPAPI credentials from host {marked_host}?",
+        default=False,
+    ):
         shell.dump_dpapi(domain, username, password, host, "false")
-        shell.ask_for_dump_lsass(domain, username, password, host, "false")
+
+    shell.ask_for_dump_lsass(domain, username, password, host, "false")
 
 
 def execute_manspider(

@@ -13,6 +13,8 @@ import shlex
 from datetime import datetime, timezone
 
 from rich.prompt import Confirm, Prompt
+from rich.table import Table
+from rich.box import ROUNDED
 
 from adscan_internal import (
     print_error,
@@ -23,6 +25,7 @@ from adscan_internal import (
     print_info_verbose,
     print_instruction,
     print_operation_header,
+    print_table,
     print_success,
     print_success_verbose,
     print_warning,
@@ -35,6 +38,9 @@ from adscan_internal.workspaces import domain_subpath
 
 
 _BLOODHOUND_COLLECTOR_TIMEOUT_SECONDS = 1200
+# Compute-time path cap for `attack_paths` UX.
+# Set to `None` (default) for unlimited path computation, or to a positive int.
+ATTACK_PATHS_COMPUTE_DEFAULT_MAX: int | None = None
 
 
 def _get_attack_paths_step_sample_limit() -> int:
@@ -51,6 +57,152 @@ def _get_attack_paths_step_show_samples() -> bool:
     """Return whether to show sampled steps (capped) to the user."""
     raw = os.getenv("ADSCAN_ATTACK_PATHS_STEP_SHOW_SAMPLES", "1").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _resolve_attack_paths_compute_cap(max_display: int) -> int | None:
+    """Return compute-time cap for attack-path enumeration.
+
+    Default behavior is controlled by `ATTACK_PATHS_COMPUTE_DEFAULT_MAX`.
+    `None` means unlimited (legacy behavior).
+
+    Env overrides:
+        ADSCAN_ATTACK_PATHS_COMPUTE_MAX:
+            - positive int => hard cap
+            - 0 / negative => unlimited
+    """
+    hard_cap_raw = os.getenv("ADSCAN_ATTACK_PATHS_COMPUTE_MAX", "").strip()
+    if hard_cap_raw:
+        try:
+            hard_cap = int(hard_cap_raw)
+            if hard_cap <= 0:
+                return None
+            return hard_cap
+        except ValueError:
+            pass
+
+    _ = max_display
+    if ATTACK_PATHS_COMPUTE_DEFAULT_MAX is None:
+        return None
+    return max(1, int(ATTACK_PATHS_COMPUTE_DEFAULT_MAX))
+
+
+def _summarize_high_value_session_paths(
+    paths: list[dict[str, Any]],
+) -> tuple[dict[str, set[str]], int]:
+    """Return host->users session map and valid edge count for HasSession paths."""
+    host_to_users: dict[str, set[str]] = {}
+    valid_edges = 0
+
+    for entry in paths:
+        if not isinstance(entry, dict):
+            continue
+        nodes = entry.get("nodes")
+        rels = entry.get("rels")
+        if (
+            not isinstance(nodes, list)
+            or len(nodes) < 2
+            or not isinstance(rels, list)
+            or not rels
+            or str(rels[0] or "").strip().lower() != "hassession"
+        ):
+            continue
+
+        host_node = nodes[0] if isinstance(nodes[0], dict) else None
+        user_node = nodes[1] if isinstance(nodes[1], dict) else None
+        if not isinstance(host_node, dict) or not isinstance(user_node, dict):
+            continue
+
+        host_name = str(
+            host_node.get("label")
+            or host_node.get("name")
+            or (
+                host_node.get("properties", {}).get("name")
+                if isinstance(host_node.get("properties"), dict)
+                else ""
+            )
+            or ""
+        ).strip()
+        user_name = str(
+            user_node.get("label")
+            or user_node.get("name")
+            or (
+                user_node.get("properties", {}).get("name")
+                if isinstance(user_node.get("properties"), dict)
+                else ""
+            )
+            or ""
+        ).strip()
+        if not host_name or not user_name:
+            continue
+
+        valid_edges += 1
+        host_to_users.setdefault(host_name, set()).add(user_name)
+
+    return host_to_users, valid_edges
+
+
+def _print_high_value_session_summary(
+    *,
+    domain: str,
+    paths: list[dict[str, Any]],
+    max_hosts: int = 20,
+    max_users_per_host: int = 4,
+) -> None:
+    """Render a focused UX summary for high-value session relationships."""
+    host_to_users, valid_edges = _summarize_high_value_session_paths(paths)
+    if not host_to_users or valid_edges <= 0:
+        return
+
+    marked_domain = mark_sensitive(domain, "domain")
+    total_hosts = len(host_to_users)
+    total_users = len({user for users in host_to_users.values() for user in users})
+
+    print_panel(
+        "\n".join(
+            [
+                f"Domain: {marked_domain}",
+                "Detected active sessions from Tier Zero / high-value users.",
+                f"Relationships discovered: {valid_edges}",
+                f"Affected hosts: {total_hosts}",
+                f"Unique high-value users in sessions: {total_users}",
+            ]
+        ),
+        title="Tier-Zero Session Exposure",
+        border_style="yellow",
+    )
+
+    table = Table(
+        title=f"High-Value Sessions by Host (showing up to {max_hosts})",
+        show_header=True,
+        header_style="bold yellow",
+        box=ROUNDED,
+    )
+    table.add_column("Host", style="cyan", overflow="fold")
+    table.add_column("Tier0 Users", justify="right", style="yellow")
+    table.add_column("Users", style="white", overflow="fold")
+
+    ordered = sorted(
+        host_to_users.items(),
+        key=lambda item: (-len(item[1]), item[0].lower()),
+    )
+    for host, users in ordered[:max_hosts]:
+        user_list = sorted(users, key=str.lower)
+        shown = user_list[:max_users_per_host]
+        users_text = ", ".join(mark_sensitive(u, "user") for u in shown)
+        extra = len(user_list) - len(shown)
+        if extra > 0:
+            users_text = f"{users_text} (+{extra} more)"
+        table.add_row(
+            mark_sensitive(host, "hostname"),
+            str(len(user_list)),
+            users_text,
+        )
+
+    print_table(table)
+    if total_hosts > max_hosts:
+        print_info(
+            f"Showing first {max_hosts} hosts only (total hosts with Tier0 sessions: {total_hosts})."
+        )
 
 
 def _print_collector_long_running_notice(tool_name: str, domain: str) -> None:
@@ -1073,6 +1225,13 @@ def run_bloodhound_attack_paths(
             lambda: service.get_low_priv_access_paths(target_domain, max_results=1000),
         ),  # type: ignore[attr-defined]
         (
+            "High-Value User Sessions",
+            "get_high_value_session_paths",
+            lambda: service.get_high_value_session_paths(
+                target_domain, max_results=1000
+            ),
+        ),  # type: ignore[attr-defined]
+        (
             "Delegations",
             "get_low_priv_delegation_paths",
             lambda: service.get_low_priv_delegation_paths(
@@ -1572,6 +1731,11 @@ def run_bloodhound_attack_paths(
         print_info(
             f"{title}: results={len(raw_paths)}; attack steps recorded={recorded_steps}."
         )
+        if method_name == "get_high_value_session_paths":
+            _print_high_value_session_summary(
+                domain=target_domain,
+                paths=[entry for entry in raw_paths if isinstance(entry, dict)],
+            )
         if show_samples and sampled_steps:
             title_text = f"{title} - discovered steps"
             if sample_limit > 0 and len(sampled_steps) >= sample_limit:
@@ -1840,7 +2004,9 @@ def run_bloodhound_attack_paths(
                     "paths_count": unique_paths,
                     "scan_mode": getattr(shell, "scan_mode", None),
                 }
-                properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+                properties.update(
+                    build_lab_event_fields(shell=shell, include_slug=True)
+                )
                 telemetry.capture("metric_ttfap", properties)
     except Exception as exc:  # pragma: no cover - best effort
         telemetry.capture_exception(exc)
@@ -1866,8 +2032,13 @@ def run_show_attack_paths(
         compute_display_paths_for_domain,
         compute_display_paths_for_owned_users,
         compute_display_paths_for_user,
+        get_attack_paths_cache_stats,
         get_owned_domain_usernames,
     )
+    from adscan_internal.services.membership_snapshot import (
+        get_membership_snapshot_cache_stats,
+    )
+    from adscan_internal.services.cache_metrics import diff_stats
     from adscan_internal.rich_output import (
         print_attack_path_detail,
         print_attack_paths_summary,
@@ -1965,8 +2136,12 @@ def run_show_attack_paths(
         )
         return
 
+    cache_before = get_attack_paths_cache_stats(domain=target_domain)
+    membership_cache_before = get_membership_snapshot_cache_stats()
+
     target_mode = "impact" if include_impact else "tier0"
     start_user_norm = (start_user or "").strip().lower()
+    max_paths_compute = _resolve_attack_paths_compute_cap(max_display)
 
     status_order = {
         "theoretical": 0,
@@ -2003,6 +2178,7 @@ def run_show_attack_paths(
                 shell,
                 target_domain,
                 max_depth=max_depth,
+                max_paths=max_paths_compute,
                 require_high_value_target=not include_all,
                 target_mode=target_mode,
             )
@@ -2022,6 +2198,7 @@ def run_show_attack_paths(
                 target_domain,
                 username=start_user,
                 max_depth=max_depth,
+                max_paths=max_paths_compute,
                 require_high_value_target=not include_all,
                 target_mode=target_mode,
             )
@@ -2030,12 +2207,37 @@ def run_show_attack_paths(
             shell,
             target_domain,
             max_depth=max_depth,
+            max_paths=max_paths_compute,
             require_high_value_target=not include_all,
             target_mode=target_mode,
         )
         return _sort_paths(domain_paths)
 
     path_refs = _compute_paths()
+    cache_after = get_attack_paths_cache_stats(domain=target_domain)
+    membership_cache_after = get_membership_snapshot_cache_stats()
+
+    cache_delta = diff_stats(
+        before=cache_before,
+        after=cache_after,
+        keys=("hits", "misses", "stores", "skips", "evictions", "invalidations"),
+    )
+    snapshot_delta = diff_stats(
+        before=membership_cache_before,
+        after=membership_cache_after,
+        keys=("hits", "misses", "reloads", "loaded"),
+    )
+
+    print_info_debug(
+        "[attack_paths] cache summary: "
+        f"domain={mark_sensitive(target_domain, 'domain')} "
+        f"paths_hits={cache_delta['hits']} paths_misses={cache_delta['misses']} "
+        f"paths_stores={cache_delta['stores']} paths_skips={cache_delta['skips']} "
+        f"paths_evictions={cache_delta['evictions']} paths_invalidations={cache_delta['invalidations']} "
+        f"membership_hits={snapshot_delta['hits']} membership_misses={snapshot_delta['misses']} "
+        f"membership_reloads={snapshot_delta['reloads']} membership_loaded={snapshot_delta['loaded']}"
+    )
+
     if not path_refs:
         print_warning("No attack paths recorded for this domain.")
         return
@@ -2356,8 +2558,7 @@ def enumerate_user_aces(
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_info_debug(
-            "ACE enumeration failure details: "
-            f"type={type(exc).__name__} message={exc}"
+            f"ACE enumeration failure details: type={type(exc).__name__} message={exc}"
         )
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"Error enumerating ACEs for domain {marked_domain}.")
@@ -3270,7 +3471,6 @@ def run_bloodhound_computers(shell: BloodHoundShell, target_domain: str) -> None
     if shell.auto:
         run_bloodhound_computers_with_laps(shell, target_domain)
         run_bloodhound_computers_without_laps(shell, target_domain)
-        run_bloodhound_sessions(shell, target_domain)
     else:
         marked_target_domain = mark_sensitive(target_domain, "domain")
         if Confirm.ask(
@@ -3279,10 +3479,6 @@ def run_bloodhound_computers(shell: BloodHoundShell, target_domain: str) -> None
             run_bloodhound_computers_with_laps(shell, target_domain)
             run_bloodhound_computers_without_laps(shell, target_domain)
         marked_target_domain = mark_sensitive(target_domain, "domain")
-        if Confirm.ask(
-            f"Do you want to search for Domain Admin sessions on the domain {marked_target_domain}?"
-        ):
-            run_bloodhound_sessions(shell, target_domain)
 
 
 def run_bloodhound_computers_all(shell: BloodHoundShell, target_domain: str) -> None:

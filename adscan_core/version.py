@@ -1,27 +1,41 @@
 """Centralized version helpers for ADscan.
 
-This module is shared by both:
-- the open-source launcher (PyPI)
-- the runtime CLI inside the Docker image
-
-It intentionally delegates version resolution to `adscan_core.telemetry` because
-that logic already handles:
-- pipx metadata
-- package metadata
-- fallback version file under `~/.adscan/`
-- fallback VERSION constant
+Canonical version discovery lives in ``adscan_core.telemetry`` (installer/runtime
+aware fallback chain + debug traces). This module provides a stable, low-noise
+API for UX/reporting code that needs version strings/tags.
 """
 
 from __future__ import annotations
 
-from adscan_core import telemetry
+from typing import Any
+
 from adscan_core.rich_output import print_info_debug
+from adscan_core.version_context import VERSION, get_telemetry_version_fields
+
+__all__ = [
+    "get_version",
+    "get_version_source",
+    "get_version_context",
+    "get_version_tag",
+]
+
+
+def get_version_context() -> dict[str, Any]:
+    """Return normalized version context for current process."""
+    return dict(get_telemetry_version_fields() or {})
+
+
+def get_version_source() -> str:
+    """Return the source used to resolve ``get_version()``."""
+    context = get_version_context()
+    return str(context.get("adscan_version_source") or "fallback_constant")
 
 
 def get_version() -> str:
     """Return the installed ADscan version."""
-    version = telemetry.get_installed_version()
-    if version == telemetry.VERSION:
+    context = get_version_context()
+    version = str(context.get("adscan_version") or VERSION)
+    if get_version_source() == "fallback_constant":
         print_info_debug("[version] Using fallback VERSION constant")
     return version
 

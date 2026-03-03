@@ -21,11 +21,13 @@ from adscan_internal import (
     print_info,
     print_info_debug,
     print_info_verbose,
+    print_instruction,
     print_warning,
     print_warning_debug,
     print_warning_verbose,
     telemetry,
 )
+from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_exception,
@@ -115,6 +117,120 @@ class SprayShell(Protocol):
     def ask_for_pass_policy(self, domain: str) -> None: ...
 
     def do_netexec_pass_policy(self, domain: str) -> None: ...
+
+
+_SPRAYING_UX_STATE_KEY = "_spraying_ux"
+_RECOMMENDED_SPRAY_CATEGORIES = {
+    "useraspass",
+    "useraspass_lower",
+    "useraspass_upper",
+    "computer_pre2k",
+}
+
+
+def _get_spraying_ux_state(shell: SprayShell, domain: str) -> dict[str, object]:
+    """Return mutable UX state for spraying prompts in the given domain."""
+    domain_state = shell.domains_data.get(domain)
+    if not isinstance(domain_state, dict):
+        domain_state = {}
+        shell.domains_data[domain] = domain_state
+    ux_state = domain_state.get(_SPRAYING_UX_STATE_KEY)
+    if not isinstance(ux_state, dict):
+        ux_state = {}
+        domain_state[_SPRAYING_UX_STATE_KEY] = ux_state
+    return ux_state
+
+
+def _capture_spraying_ux_event(
+    shell: SprayShell,
+    event: str,
+    domain: str,
+    *,
+    extra: dict[str, object] | None = None,
+) -> None:
+    """Best-effort telemetry capture for spraying UX events."""
+    try:
+        properties: dict[str, object] = {
+            "domain": domain,
+            "workspace_type": getattr(shell, "type", None),
+            "scan_mode": getattr(shell, "scan_mode", None),
+            "auto_mode": getattr(shell, "auto", False),
+        }
+        if extra:
+            properties.update(extra)
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture(event, properties)
+    except Exception as exc:  # pragma: no cover - telemetry must not break UX
+        telemetry.capture_exception(exc)
+
+
+def _mark_recommended_spraying_attempt(
+    shell: SprayShell, domain: str, category: str
+) -> None:
+    """Record that a recommended CTF spraying technique was attempted."""
+    ux_state = _get_spraying_ux_state(shell, domain)
+    attempted = ux_state.get("recommended_attempted_categories")
+    if not isinstance(attempted, list):
+        attempted = []
+        ux_state["recommended_attempted_categories"] = attempted
+    if category not in attempted:
+        attempted.append(category)
+
+
+def _has_recommended_spraying_attempt(shell: SprayShell, domain: str) -> bool:
+    """Return True when a recommended spray type was already attempted."""
+    ux_state = _get_spraying_ux_state(shell, domain)
+    attempted = ux_state.get("recommended_attempted_categories")
+    if not isinstance(attempted, list):
+        return False
+    return any(str(item) in _RECOMMENDED_SPRAY_CATEGORIES for item in attempted)
+
+
+def maybe_show_ctf_spraying_recommendation(
+    shell: SprayShell,
+    domain: str,
+    *,
+    reason: str,
+) -> None:
+    """Show one-time CTF recommendation when no recommended spraying was attempted."""
+    if str(getattr(shell, "type", "") or "").strip().lower() != "ctf":
+        return
+    if shell.domains_data.get(domain, {}).get("auth") == "pwned":
+        return
+    if _has_recommended_spraying_attempt(shell, domain):
+        return
+
+    ux_state = _get_spraying_ux_state(shell, domain)
+    if bool(ux_state.get("recommended_hint_shown", False)):
+        return
+
+    marked_domain = mark_sensitive(domain, "domain")
+    panel_lines = [
+        f"Domain: {marked_domain}",
+        "In many HTB/CTF environments, a first foothold comes from spraying.",
+        "",
+        "High-value quick checks:",
+        "1) Computer accounts (pre2k: hostname as password)",
+        "2) Username as password (normal/lower/upper variants)",
+        "",
+        f"Run now: spraying {domain}",
+    ]
+    print_panel(
+        "\n".join(panel_lines),
+        title="[bold yellow]Recommended CTF Next Step[/bold yellow]",
+        border_style="yellow",
+        expand=False,
+    )
+    print_instruction(
+        "If you skip spraying in CTF, you can miss the intended foothold path."
+    )
+    ux_state["recommended_hint_shown"] = True
+    _capture_spraying_ux_event(
+        shell,
+        "ctf_spraying_recommendation_shown",
+        domain,
+        extra={"reason": reason},
+    )
 
 
 def get_spraying_user_list_path(
@@ -743,15 +859,50 @@ def ask_for_spraying(shell: SprayShell, domain: str) -> None:
     if not os.path.exists(kerberos_path):
         os.makedirs(kerberos_path)
 
+    ux_state = _get_spraying_ux_state(shell, domain)
+    ux_state["prompted"] = True
+    _capture_spraying_ux_event(shell, "ctf_spraying_prompt_shown", domain)
+
     marked_domain = mark_sensitive(domain, "domain")
     marked_auth_1 = mark_sensitive(shell.domains_data[domain]["auth"], "domain")
-    if Confirm.ask(
+    wants_spraying = Confirm.ask(
         f"Do you want to perform password spraying on domain {marked_domain} using a {marked_auth_1} session?",
         default=True,
-    ):
+    )
+    if wants_spraying:
         if shell.domains_data[domain]["auth"] == "auth":
             shell.ask_for_pass_policy(domain)
         do_spraying(shell, domain)
+        return
+
+    if str(getattr(shell, "type", "") or "").strip().lower() == "ctf":
+        ux_state["initial_declined"] = True
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            f"You skipped spraying for {marked_domain}. In many CTF labs this is a key foothold step."
+        )
+        skip_confirmed = Confirm.ask(
+            "Skip CTF spraying checks for now?",
+            default=False,
+        )
+        if not skip_confirmed:
+            ux_state["decline_override"] = True
+            _capture_spraying_ux_event(
+                shell,
+                "ctf_spraying_decline_override",
+                domain,
+            )
+            if shell.domains_data[domain]["auth"] == "auth":
+                shell.ask_for_pass_policy(domain)
+            do_spraying(shell, domain)
+            return
+
+        _capture_spraying_ux_event(shell, "ctf_spraying_skipped", domain)
+        maybe_show_ctf_spraying_recommendation(
+            shell,
+            domain,
+            reason="ask_for_spraying_declined",
+        )
 
 
 def do_spraying(shell: SprayShell, domain: str) -> None:
@@ -817,14 +968,38 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     if has_enabled_computer_list(workspace_cwd, shell.domains_dir, domain):
         options.append("Computer accounts (pre2k: hostname as password)")
 
+    ctf_mode = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    default_idx = 0
+    if ctf_mode:
+        pre2k_idx = next(
+            (idx for idx, opt in enumerate(options) if "pre2k" in opt), None
+        )
+        if pre2k_idx is not None:
+            default_idx = pre2k_idx
+            print_info(
+                "CTF recommendation: try Computer accounts (pre2k) first when available."
+            )
+        else:
+            print_info(
+                "CTF recommendation: try Username-as-password spraying as an early foothold check."
+            )
+
     if not shell.do_sync_clock_with_pdc(domain, verbose=True):
         return
 
     current_row = shell._questionary_select(
-        f"Select a type of spraying from domain {domain}:", options
+        f"Select a type of spraying from domain {domain}:",
+        options,
+        default_idx=default_idx,
     )
     if current_row is None:
         print_warning("Spraying cancelled by user")
+        if ctf_mode:
+            maybe_show_ctf_spraying_recommendation(
+                shell,
+                domain,
+                reason="spraying_menu_cancelled",
+            )
         return
 
     is_auth = shell.domains_data[domain]["auth"] == "auth"
@@ -857,6 +1032,11 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         return
 
     if spray_category == "computer_pre2k":
+        _capture_spraying_ux_event(
+            shell,
+            "ctf_pre2k_selected" if ctf_mode else "spraying_pre2k_selected",
+            domain,
+        )
         do_computer_pre2k_spraying(shell, domain)
         return
 
@@ -966,6 +1146,16 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
             if spray_category == "useraspass_upper"
             else "Custom Password"
         )
+        if spray_category in _RECOMMENDED_SPRAY_CATEGORIES:
+            _mark_recommended_spraying_attempt(shell, domain, spray_category)
+            _capture_spraying_ux_event(
+                shell,
+                "ctf_recommended_spraying_started"
+                if ctf_mode
+                else "spraying_recommended_started",
+                domain,
+                extra={"category": spray_category, "spray_type": spray_type},
+            )
         spraying_command(shell, kerbrute_cmd, domain, spray_type=spray_type)
     finally:
         try:
@@ -1729,6 +1919,18 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
             dc_ip=pdc_ip,
             combos_file=combos_path,
             output_file=output_file,
+        )
+        _mark_recommended_spraying_attempt(shell, domain, "computer_pre2k")
+        _capture_spraying_ux_event(
+            shell,
+            "ctf_recommended_spraying_started"
+            if str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+            else "spraying_recommended_started",
+            domain,
+            extra={
+                "category": "computer_pre2k",
+                "spray_type": "Computer Pre2k",
+            },
         )
         spraying_command(
             shell,

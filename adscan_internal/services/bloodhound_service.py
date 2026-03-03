@@ -853,7 +853,6 @@ class BloodHoundService(BaseService):
                 details={"domain": domain, "username": username, "error": str(e)},
             ) from e
 
-
     def get_sessions(
         self,
         domain: str,
@@ -923,7 +922,6 @@ class BloodHoundService(BaseService):
                 "Failed to retrieve sessions from BloodHound",
                 details={"domain": domain, "error": str(e)},
             ) from e
-
 
     def get_critical_aces(
         self,
@@ -1081,7 +1079,6 @@ class BloodHoundService(BaseService):
                 details={"domain": domain, "error": str(e)},
             ) from e
 
-
     def get_low_priv_paths_to_high_value(
         self,
         domain: str,
@@ -1135,7 +1132,6 @@ class BloodHoundService(BaseService):
                 "Failed to retrieve low-privilege paths from BloodHound",
                 details={"domain": domain, "error": str(e)},
             ) from e
-
 
     def get_low_priv_acl_paths(
         self,
@@ -1193,7 +1189,6 @@ class BloodHoundService(BaseService):
                 details={"domain": domain, "error": str(e)},
             ) from e
 
-
     def get_low_priv_adcs_paths(
         self,
         domain: str,
@@ -1249,7 +1244,6 @@ class BloodHoundService(BaseService):
                 "Failed to retrieve ADCS paths from BloodHound",
                 details={"domain": domain, "error": str(e)},
             ) from e
-
 
     def get_low_priv_access_paths(
         self,
@@ -1309,6 +1303,63 @@ class BloodHoundService(BaseService):
                 details={"domain": domain, "error": str(e)},
             ) from e
 
+    def get_high_value_session_paths(
+        self,
+        domain: str,
+        *,
+        max_results: int = 1000,
+        scan_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get computer→high-value-user session paths (CE only)."""
+        self._emit_progress(
+            scan_id=scan_id,
+            phase="bloodhound_path_analysis",
+            progress=0.0,
+            message="Querying high-value user session relationships",
+        )
+
+        try:
+            if not hasattr(self.client, "get_high_value_session_paths"):
+                raise BloodHoundServiceError(
+                    "High-value session path queries are not supported by this BloodHound client",
+                    details={"edition": self.edition},
+                )
+
+            paths = self.client.get_high_value_session_paths(
+                domain, max_results=max_results
+            )
+
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_path_analysis",
+                progress=1.0,
+                message=f"Retrieved {len(paths)} high-value session path(s)",
+            )
+
+            self.logger.info(
+                f"Retrieved {len(paths)} high-value session path(s)",
+                extra={
+                    "domain": domain,
+                    "count": len(paths),
+                    "max_results": max_results,
+                },
+            )
+            return paths
+        except Exception as e:
+            self.logger.exception(
+                "Failed to retrieve high-value session paths",
+                extra={"domain": domain, "error": str(e), "max_results": max_results},
+            )
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_path_analysis",
+                progress=1.0,
+                message="High-value session path query failed",
+            )
+            raise BloodHoundServiceError(
+                "Failed to retrieve high-value session paths from BloodHound",
+                details={"domain": domain, "error": str(e)},
+            ) from e
 
     def get_low_priv_delegation_paths(
         self,
@@ -1368,7 +1419,6 @@ class BloodHoundService(BaseService):
                 details={"domain": domain, "error": str(e)},
             ) from e
 
-
     def get_roastable_asreproast_users(
         self,
         domain: str,
@@ -1426,7 +1476,6 @@ class BloodHoundService(BaseService):
                 "Failed to retrieve ASREPRoastable users from BloodHound",
                 details={"domain": domain, "error": str(e)},
             ) from e
-
 
     def get_roastable_kerberoast_users(
         self,
@@ -1492,7 +1541,6 @@ class BloodHoundService(BaseService):
         if client and hasattr(client, "get_last_error"):
             return client.get_last_error()
         return None
-
 
     def get_access_paths(
         self,

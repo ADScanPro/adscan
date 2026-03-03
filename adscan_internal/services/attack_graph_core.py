@@ -19,7 +19,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from adscan_internal.services.attack_step_support_registry import (
+    CONTEXT_ONLY_RELATIONS,
+)
 from adscan_internal.workspaces import read_json_file
+
+_LOCAL_REUSE_RELATION_KEY = "localadminpassreuse"
 
 
 @dataclass(frozen=True)
@@ -128,6 +133,7 @@ def compute_display_paths_for_domain_unfiltered(
     graph: dict[str, Any],
     *,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     target_mode: str = "tier0",
 ) -> list[dict[str, Any]]:
@@ -143,6 +149,7 @@ def compute_display_paths_for_domain_unfiltered(
     computed = compute_maximal_attack_paths(
         graph,
         max_depth=max_depth,
+        max_paths=max_paths,
         # Always compute all paths and apply filtering/promotion after.
         require_high_value_target=False,
         terminal_mode=mode,
@@ -228,6 +235,7 @@ def compute_display_paths_for_start_node(
     *,
     start_node_id: str,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     target_mode: str = "tier0",
 ) -> list[dict[str, Any]]:
@@ -240,6 +248,7 @@ def compute_display_paths_for_start_node(
         graph,
         start_node_id=start_node_id,
         max_depth=max_depth,
+        max_paths=max_paths,
         require_high_value_target=False,
         terminal_mode=mode,
     )
@@ -275,16 +284,243 @@ def compute_display_paths_for_start_node(
     return results
 
 
+def _build_local_reuse_virtual_state(
+    nodes_map: dict[str, Any],
+    edges: list[dict[str, Any]],
+) -> tuple[dict[str, list[dict[str, Any]]], set[tuple[str, str]]]:
+    """Build virtual-expansion state for compressed LocalAdminPassReuse groups.
+
+    When LocalAdminPassReuse is persisted in compressed topology (star), this
+    helper reconstructs group membership metadata so traversal can expand
+    missing host-to-host relations virtually (without materializing N^2 edges).
+    """
+    existing_pairs: set[tuple[str, str]] = set()
+    clusters: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation_key = str(edge.get("relation") or "").strip().lower()
+        if relation_key != _LOCAL_REUSE_RELATION_KEY:
+            continue
+
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        if from_id and to_id:
+            existing_pairs.add((from_id, to_id))
+
+        notes = edge.get("notes")
+        if not isinstance(notes, dict):
+            continue
+        topology = str(notes.get("topology") or "").strip().lower()
+        if topology != "star":
+            # Mesh already has all relations materialized.
+            continue
+
+        local_user = str(notes.get("local_admin_username") or "").strip().lower()
+        cluster_id = str(notes.get("reuse_cluster_id") or "").strip()
+        if not cluster_id:
+            # Backward-compatible fallback for legacy edges without cluster id.
+            cluster_id = f"legacy:{local_user or 'unknown'}"
+
+        cluster_key = (cluster_id, local_user)
+        if cluster_key not in clusters:
+            clusters[cluster_key] = {
+                "cluster_id": cluster_id,
+                "local_admin_username": notes.get("local_admin_username"),
+                "node_ids": set(),
+            }
+        cluster = clusters[cluster_key]
+        node_ids_set = cluster.get("node_ids")
+        if isinstance(node_ids_set, set):
+            if from_id in nodes_map:
+                node_ids_set.add(from_id)
+            if to_id in nodes_map:
+                node_ids_set.add(to_id)
+            raw_node_ids = notes.get("confirmed_node_ids")
+            if isinstance(raw_node_ids, list):
+                node_ids_set.update(
+                    {
+                        str(node_id).strip()
+                        for node_id in raw_node_ids
+                        if isinstance(node_id, str)
+                        and str(node_id).strip()
+                        and str(node_id).strip() in nodes_map
+                    }
+                )
+
+    by_node: dict[str, list[dict[str, Any]]] = {}
+    for cluster in clusters.values():
+        node_ids_set = cluster.get("node_ids")
+        if not isinstance(node_ids_set, set):
+            continue
+        node_ids = tuple(sorted({str(node_id) for node_id in node_ids_set}, key=str.lower))
+        if len(node_ids) < 2:
+            continue
+        cluster["node_ids"] = node_ids
+        for node_id in node_ids:
+            by_node.setdefault(node_id, []).append(cluster)
+
+    return by_node, existing_pairs
+
+
+def _build_local_reuse_useful_node_ids(
+    nodes_map: dict[str, Any],
+    edges: list[dict[str, Any]],
+) -> set[str]:
+    """Return nodes worth targeting via LocalAdminPassReuse hops.
+
+    We keep local-reuse transitions only when the destination node can produce
+    non-context progress (e.g. AdminTo/HasSession/ExecuteDCOM) or is already a
+    high-value node.
+    """
+    useful: set[str] = set()
+    context_relations = {
+        str(rel).strip().lower() for rel in CONTEXT_ONLY_RELATIONS.keys()
+    }
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation_key = str(edge.get("relation") or "").strip().lower()
+        if (
+            not relation_key
+            or relation_key == _LOCAL_REUSE_RELATION_KEY
+            or relation_key in context_relations
+        ):
+            continue
+        from_id = str(edge.get("from") or "").strip()
+        if from_id:
+            useful.add(from_id)
+
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        if _node_is_effectively_high_value(node):
+            useful.add(str(node_id))
+
+    return useful
+
+
+def _iter_outgoing_edges_with_virtual_local_reuse(
+    current: str,
+    *,
+    adjacency: dict[str, list[dict[str, Any]]],
+    acc_steps: list[AttackPathStep],
+    local_reuse_by_node: dict[str, list[dict[str, Any]]],
+    local_reuse_existing_pairs: set[tuple[str, str]],
+    local_reuse_useful_nodes: set[str],
+) -> list[dict[str, Any]]:
+    """Return real + virtual outgoing edges for traversal.
+
+    Virtual edges are only emitted for compressed (`topology=star`) local reuse
+    clusters, and only for missing direct pairs not already materialized.
+    """
+    next_edges: list[dict[str, Any]] = []
+    for edge in list(adjacency.get(current) or []):
+        if not isinstance(edge, dict):
+            continue
+        relation_key = str(edge.get("relation") or "").strip().lower()
+        if relation_key == _LOCAL_REUSE_RELATION_KEY:
+            dst = str(edge.get("to") or "").strip()
+            if not dst or dst not in local_reuse_useful_nodes:
+                continue
+        next_edges.append(edge)
+    clusters = local_reuse_by_node.get(current) or []
+    if not clusters:
+        return next_edges
+
+    last_step = acc_steps[-1] if acc_steps else None
+    last_relation = (
+        str(last_step.relation or "").strip().lower() if last_step else ""
+    )
+    last_cluster_id = (
+        str((last_step.notes or {}).get("reuse_cluster_id") or "").strip()
+        if last_step
+        else ""
+    )
+
+    emitted_virtual_pairs: set[tuple[str, str]] = set()
+    for cluster in clusters:
+        cluster_id = str(cluster.get("cluster_id") or "").strip()
+        # Avoid chaining the same local-reuse cluster repeatedly, which only
+        # adds redundant permutations and increases path-search pressure.
+        if (
+            last_relation == _LOCAL_REUSE_RELATION_KEY
+            and cluster_id
+            and cluster_id == last_cluster_id
+        ):
+            continue
+        for dst_id in cluster.get("node_ids") or []:
+            dst = str(dst_id).strip()
+            if not dst or dst == current:
+                continue
+            if dst not in local_reuse_useful_nodes:
+                continue
+            pair = (current, dst)
+            if pair in local_reuse_existing_pairs or pair in emitted_virtual_pairs:
+                continue
+            emitted_virtual_pairs.add(pair)
+            next_edges.append(
+                {
+                    "from": current,
+                    "to": dst,
+                    "relation": "LocalAdminPassReuse",
+                    "status": "discovered",
+                    "notes": {
+                        "source": "local_reuse_virtual_expansion",
+                        "virtual_expansion": True,
+                        "reuse_cluster_id": cluster_id,
+                        "local_admin_username": cluster.get(
+                            "local_admin_username"
+                        ),
+                    },
+                }
+            )
+    return next_edges
+
+
+def _is_same_local_reuse_cluster_chain(
+    previous_step: AttackPathStep | None,
+    next_edge: dict[str, Any],
+) -> bool:
+    """Return True when two consecutive LocalAdminPassReuse hops use same cluster."""
+    if previous_step is None:
+        return False
+    prev_relation = str(previous_step.relation or "").strip().lower()
+    if prev_relation != _LOCAL_REUSE_RELATION_KEY:
+        return False
+    next_relation = str(next_edge.get("relation") or "").strip().lower()
+    if next_relation != _LOCAL_REUSE_RELATION_KEY:
+        return False
+    prev_notes = previous_step.notes if isinstance(previous_step.notes, dict) else {}
+    next_notes = next_edge.get("notes")
+    next_notes = next_notes if isinstance(next_notes, dict) else {}
+    prev_cluster = str(prev_notes.get("reuse_cluster_id") or "").strip()
+    next_cluster = str(next_notes.get("reuse_cluster_id") or "").strip()
+    if not prev_cluster or not next_cluster:
+        return False
+    return prev_cluster == next_cluster
+
+
 def compute_maximal_attack_paths(
     graph: dict[str, Any],
     *,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     terminal_mode: str = "tier0",
 ) -> list[AttackPath]:
     """Compute maximal paths up to depth for a full-domain graph."""
     if max_depth <= 0:
         return []
+    max_paths_cap = (
+        None
+        if max_paths is None
+        else max(1, int(max_paths))
+        if int(max_paths) > 0
+        else None
+    )
 
     nodes_map = graph.get("nodes")
     edges = graph.get("edges")
@@ -310,6 +546,10 @@ def compute_maximal_attack_paths(
             incoming[to_id] = incoming.get(to_id, 0) + 1
         incoming.setdefault(from_id, incoming.get(from_id, 0))
         outgoing.setdefault(to_id, outgoing.get(to_id, 0))
+    local_reuse_by_node, local_reuse_existing_pairs = (
+        _build_local_reuse_virtual_state(nodes_map, edges)
+    )
+    local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
 
     mode = (terminal_mode or "tier0").strip().lower()
     if mode not in {"tier0", "impact"}:
@@ -331,6 +571,8 @@ def compute_maximal_attack_paths(
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
         if require_high_value_target and not is_terminal(acc_steps[-1].to_id):
             return
         signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
@@ -346,18 +588,30 @@ def compute_maximal_attack_paths(
         )
 
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
         depth = len(acc_steps)
         if depth >= max_depth or (depth > 0 and is_terminal(current)):
             emit(acc_steps)
             return
 
-        next_edges = adjacency.get(current) or []
+        next_edges = _iter_outgoing_edges_with_virtual_local_reuse(
+            current,
+            adjacency=adjacency,
+            acc_steps=acc_steps,
+            local_reuse_by_node=local_reuse_by_node,
+            local_reuse_existing_pairs=local_reuse_existing_pairs,
+            local_reuse_useful_nodes=local_reuse_useful_nodes,
+        )
         if not next_edges:
             emit(acc_steps)
             return
 
         extended = False
         for edge in next_edges:
+            last_step = acc_steps[-1] if acc_steps else None
+            if _is_same_local_reuse_cluster_chain(last_step, edge):
+                continue
             to_id = str(edge.get("to") or "")
             if not to_id or to_id in visited:
                 continue
@@ -379,6 +633,8 @@ def compute_maximal_attack_paths(
             emit(acc_steps)
 
     for source in sources:
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            break
         dfs(source, visited={source}, acc_steps=[])
 
     return paths
@@ -389,12 +645,20 @@ def compute_maximal_attack_paths_from_start(
     *,
     start_node_id: str,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     terminal_mode: str = "tier0",
 ) -> list[AttackPath]:
     """Compute maximal paths starting from a specific node."""
     if max_depth <= 0 or not start_node_id:
         return []
+    max_paths_cap = (
+        None
+        if max_paths is None
+        else max(1, int(max_paths))
+        if int(max_paths) > 0
+        else None
+    )
 
     nodes_map = graph.get("nodes")
     edges = graph.get("edges")
@@ -411,6 +675,10 @@ def compute_maximal_attack_paths_from_start(
         if not from_id or not to_id or not rel:
             continue
         adjacency.setdefault(from_id, []).append(edge)
+    local_reuse_by_node, local_reuse_existing_pairs = (
+        _build_local_reuse_virtual_state(nodes_map, edges)
+    )
+    local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
 
     mode = (terminal_mode or "tier0").strip().lower()
     if mode not in {"tier0", "impact"}:
@@ -430,6 +698,8 @@ def compute_maximal_attack_paths_from_start(
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
         if require_high_value_target and not is_terminal(acc_steps[-1].to_id):
             return
         signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
@@ -445,18 +715,30 @@ def compute_maximal_attack_paths_from_start(
         )
 
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
         depth = len(acc_steps)
         if depth >= max_depth or (depth > 0 and is_terminal(current)):
             emit(acc_steps)
             return
 
-        next_edges = adjacency.get(current) or []
+        next_edges = _iter_outgoing_edges_with_virtual_local_reuse(
+            current,
+            adjacency=adjacency,
+            acc_steps=acc_steps,
+            local_reuse_by_node=local_reuse_by_node,
+            local_reuse_existing_pairs=local_reuse_existing_pairs,
+            local_reuse_useful_nodes=local_reuse_useful_nodes,
+        )
         if not next_edges:
             emit(acc_steps)
             return
 
         extended = False
         for edge in next_edges:
+            last_step = acc_steps[-1] if acc_steps else None
+            if _is_same_local_reuse_cluster_chain(last_step, edge):
+                continue
             to_id = str(edge.get("to") or "")
             if not to_id or to_id in visited:
                 continue
@@ -488,7 +770,9 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
     )
 
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-    context_relations = {"memberof"}
+    context_relations = {
+        str(rel).strip().lower() for rel in CONTEXT_ONLY_RELATIONS.keys()
+    }
 
     def label(node_id: str) -> str:
         node = nodes_map.get(node_id)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "5.0.2"
+version = "5.1.0"
 description = "ADscan launcher (host-side) that orchestrates Docker to run the ADscan runtime."
 readme = "adscan_pypi_wrapper/README.md"
 authors = [{ name = "ADscan" }]

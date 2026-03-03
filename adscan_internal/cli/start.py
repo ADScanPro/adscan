@@ -495,6 +495,41 @@ def _ensure_unauth_target_list(
     pdc_ip: str | None,
 ) -> bool:
     """Ensure we have a target list for unauthenticated SMB guest enumeration."""
+
+    def _normalize_guest_target_tokens(raw_value: Any) -> list[str]:
+        """Normalize guest SMB targets from comma/space-separated user input."""
+        if isinstance(raw_value, (list, tuple, set)):
+            tokens = [str(item).strip() for item in raw_value if str(item).strip()]
+        else:
+            raw = str(raw_value or "").strip()
+            if not raw:
+                return []
+            tokens = re.split(r"[,\s]+", raw)
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            value = str(token).strip()
+            if not value:
+                continue
+            key = value.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(value)
+        return normalized
+
+    def _set_guest_targets(tokens: list[str]) -> None:
+        """Persist selected guest SMB targets in the domain runtime context."""
+        domain_data = shell.domains_data.setdefault(domain, {})
+        domain_data["guest_smb_targets"] = list(tokens)
+
+    existing_targets = _normalize_guest_target_tokens(
+        shell.domains_data.get(domain, {}).get("guest_smb_targets")
+    )
+    if existing_targets:
+        _set_guest_targets(existing_targets)
+        return True
+
     enabled_computers = domain_relpath(
         shell.domains_dir, domain, "enabled_computers_ips.txt"
     )
@@ -505,12 +540,17 @@ def _ensure_unauth_target_list(
             return True
 
     if not sys.stdin.isatty():
-        if pdc_ip:
-            os.makedirs(os.path.dirname(smb_ips), exist_ok=True)
-            with open(smb_ips, "w", encoding="utf-8") as handle:
-                handle.write(f"{pdc_ip}\n")
+        non_interactive_targets = _normalize_guest_target_tokens(
+            getattr(shell, "hosts", None)
+        )
+        if not non_interactive_targets and pdc_ip:
+            non_interactive_targets = [pdc_ip]
+        if non_interactive_targets:
+            _set_guest_targets(non_interactive_targets)
+            marked_targets = mark_sensitive(" ".join(non_interactive_targets), "host")
             print_info(
-                "No host list detected; defaulting guest SMB enumeration to the validated PDC only."
+                "No host list detected; defaulting guest SMB enumeration to "
+                f"{marked_targets}."
             )
             return True
         return False
@@ -522,7 +562,7 @@ def _ensure_unauth_target_list(
         f"Domain: {marked_domain}\n"
         f"PDC/DC: {marked_pdc}\n\n"
         "Guest share enumeration expects a list of target hosts. "
-        "You can scan a range to build that list, supply your own file, "
+        "You can provide one or multiple ranges/IPs directly, supply your own file, "
         "or use only the validated PDC for a quick check.\n",
         title="[bold]🧭 SMB Targets Required[/bold]",
         border_style="yellow",
@@ -534,7 +574,7 @@ def _ensure_unauth_target_list(
         options.append("Use only the validated PDC/DC (fast)")
     options.extend(
         [
-            "Provide a host range and discover SMB targets",
+            "Provide host ranges/IPs directly",
             "Provide a file with target IPs",
             "Cancel and return",
         ]
@@ -550,44 +590,40 @@ def _ensure_unauth_target_list(
 
     selected = options[choice]
     if selected.startswith("Use only") and pdc_ip:
-        os.makedirs(os.path.dirname(smb_ips), exist_ok=True)
-        with open(smb_ips, "w", encoding="utf-8") as handle:
-            handle.write(f"{pdc_ip}\n")
+        _set_guest_targets([pdc_ip])
         print_info(
             "Target list created with the validated PDC/DC only "
             f"({mark_sensitive(pdc_ip, 'ip')})."
         )
         return True
 
-    if selected.startswith("Provide a host range"):
-        print_instruction(
-            "We will run a lightweight SMB discovery to build the target list. "
-            "This may take a moment depending on the range."
-        )
-        if not shell._prompt_hosts_if_missing():
-            return False
-        shell.scan_service("smb", shell.hosts, domain)
-        if os.path.exists(enabled_computers) and os.path.getsize(enabled_computers) > 0:
-            return True
-        if os.path.exists(smb_ips) and os.path.getsize(smb_ips) > 0:
-            return True
-        if pdc_ip:
-            print_warning(
-                "No SMB targets were discovered. Falling back to the validated PDC only."
+    if selected.startswith("Provide host ranges"):
+        default_hosts = str(getattr(shell, "hosts", "") or pdc_ip or "").strip()
+        while True:
+            ranges_input = Prompt.ask(
+                Text(
+                    "Enter SMB target ranges/IPs "
+                    "(comma/space-separated, e.g., 192.168.10.0/24, 192.168.11.0/24)",
+                    style="cyan",
+                ),
+                default=default_hosts,
+            ).strip()
+            if not ranges_input:
+                return False
+            target_tokens = _normalize_guest_target_tokens(ranges_input)
+            if not target_tokens:
+                print_warning("No valid SMB targets were provided. Please try again.")
+                continue
+            _set_guest_targets(target_tokens)
+            shell.hosts = ", ".join(target_tokens)
+            marked_targets = mark_sensitive(" ".join(target_tokens), "host")
+            print_instruction(
+                f"Guest SMB targets configured: {marked_targets}. "
+                "Enumeration will run directly against these targets."
             )
-            os.makedirs(os.path.dirname(smb_ips), exist_ok=True)
-            with open(smb_ips, "w", encoding="utf-8") as handle:
-                handle.write(f"{pdc_ip}\n")
             return True
-        print_warning(
-            "No SMB targets were discovered. Provide a smaller range or a file with targets."
-        )
-        return False
 
     if selected.startswith("Provide a file"):
-        from rich.prompt import Prompt
-        from rich.text import Text
-
         while True:
             file_path = Prompt.ask(
                 Text("Enter path to file with IPs/targets", style="cyan")
@@ -602,9 +638,14 @@ def _ensure_unauth_target_list(
             if not lines:
                 print_warning("The file is empty. Provide a file with targets.")
                 continue
+            target_tokens = _normalize_guest_target_tokens(" ".join(lines))
+            if not target_tokens:
+                print_warning("No valid targets were found in the file.")
+                continue
             os.makedirs(os.path.dirname(smb_ips), exist_ok=True)
             with open(smb_ips, "w", encoding="utf-8") as handle:
                 handle.write("\n".join(lines) + "\n")
+            _set_guest_targets([smb_ips])
             print_info(f"Loaded {len(lines)} target(s) into {smb_ips}.")
             return True
 

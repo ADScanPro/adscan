@@ -30,6 +30,9 @@ from rich.console import Console
 from adscan_core.interrupts import emit_interrupt_debug
 from adscan_core.theme import ADSCAN_THEME
 from adscan_launcher import __version__
+from adscan_launcher.bloodhound_ce_password import (
+    validate_bloodhound_admin_password_policy,
+)
 from adscan_launcher.docker_commands import (
     DEFAULT_BLOODHOUND_ADMIN_PASSWORD,
     get_docker_image_name,
@@ -59,8 +62,10 @@ from adscan_launcher.output import (
 from adscan_launcher.paths import get_state_dir
 from adscan_launcher.telemetry import (
     HOST_SESSION_CAPTURE_COMMANDS,
+    capture,
     capture_command_session,
     capture_exception,
+    collect_system_context,
 )
 from adscan_launcher.update_manager import (
     UpdateContext,
@@ -71,6 +76,18 @@ from adscan_launcher.update_manager import (
 
 ADSCAN_SUDO_ALIAS_MARKER = "# ADscan auto-sudo alias"
 _SESSION_CAPTURE_FINALIZED = False
+
+
+def _parse_bloodhound_admin_password(value: str) -> str:
+    """argparse type validator for BloodHound CE admin password."""
+    candidate = str(value or "")
+    valid, error_message = validate_bloodhound_admin_password_policy(candidate)
+    if not valid:
+        raise argparse.ArgumentTypeError(
+            error_message
+            or "Invalid BloodHound CE admin password (minimum length is 12)."
+        )
+    return candidate
 
 
 def _remove_legacy_adscan_sudo_alias(rcfile: str) -> bool:
@@ -169,6 +186,7 @@ def _build_parser() -> argparse.ArgumentParser:
     install.add_argument(
         "--bloodhound-admin-password",
         default=DEFAULT_BLOODHOUND_ADMIN_PASSWORD,
+        type=_parse_bloodhound_admin_password,
         help="Desired BloodHound CE admin password used during install.",
     )
     install.add_argument(
@@ -327,6 +345,26 @@ def _should_print_debug_enabled_banner(command: str | None) -> bool:
     return command in (None, "start", "ci", "install", "check")
 
 
+def _should_emit_system_context(command: str | None) -> bool:
+    """Return whether launcher should emit system-context diagnostics."""
+    return command in {"install", "start", "ci", "update", "upgrade"}
+
+
+def _emit_launcher_system_context(command: str | None) -> None:
+    """Emit non-sensitive host system context for telemetry diagnostics."""
+    if not _should_emit_system_context(command):
+        return
+    try:
+        system_context = collect_system_context()
+        print_info_debug(f"System context: {system_context}")
+        event_payload = dict(system_context)
+        if command:
+            event_payload["command_type"] = str(command)
+        capture("telemetry_system_context", event_payload)
+    except Exception as exc:  # pragma: no cover - best effort only
+        capture_exception(exc)
+
+
 def _build_launcher_telemetry_console() -> Console:
     """Create a dedicated in-memory Rich console for session recording export."""
     return Console(record=True, theme=ADSCAN_THEME, file=StringIO())
@@ -420,6 +458,7 @@ def _run_pip_install_with_break_system_packages_retry(
     prefer_break_system_packages: bool,
 ) -> None:
     """Run pip install and retry with --break-system-packages when needed."""
+
     def _requires_break_system_packages(output: str) -> bool:
         """Return True when pip output indicates a PEP 668 managed env error."""
         normalized = (output or "").lower()
@@ -516,6 +555,11 @@ def main(argv: list[str] | None = None) -> None:
         "version" if show_version else cmd
     ):
         print_success("Debug mode enabled")
+
+    # Ensure runtime container telemetry can distinguish launcher vs runtime
+    # version contexts.
+    os.environ["ADSCAN_LAUNCHER_VERSION"] = str(__version__)
+
     _apply_image_overrides(ns)
 
     if show_version:
@@ -532,6 +576,8 @@ def main(argv: list[str] | None = None) -> None:
             print_error("Host helper is unavailable in this launcher build.")
             raise SystemExit(2) from exc
         raise SystemExit(run_host_helper_server(str(getattr(ns, "socket", ""))))
+
+    _emit_launcher_system_context(cmd)
 
     # Offer upgrades early for relevant subcommands (interactive only).
     cmd_for_update_offer = cmd or "start"

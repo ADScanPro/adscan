@@ -7,6 +7,10 @@ from typing import Any
 import re
 
 from adscan_internal.services.base_service import BaseService
+from adscan_internal.services.smb_guest_auth_service import (
+    is_guest_alias,
+    resolve_smb_guest_username,
+)
 
 
 class _ReadLimitReached(RuntimeError):
@@ -121,45 +125,66 @@ class ImpacketSMBByteReaderService(BaseService):
             or str(domain or "").strip()
             or active_domain
         )
-        username = str(auth_username or "").strip() or str(
-            domain_data.get("username", "")
-        ).strip()
-        password = str(auth_password or "").strip() or str(
-            domain_data.get("password", "")
-        ).strip()
-        auth_mode = (
-            "hash"
-            if bool(
-                callable(getattr(shell, "is_hash", None)) and shell.is_hash(password)
-            )
-            else "password"
+        username = (
+            str(auth_username).strip()
+            if auth_username is not None
+            else str(domain_data.get("username", "")).strip()
         )
+        password = (
+            str(auth_password).strip()
+            if auth_password is not None
+            else str(domain_data.get("password", "")).strip()
+        )
+        domain_auth_mode = str(domain_data.get("auth", "")).strip().lower()
+        has_hash_detector = callable(getattr(shell, "is_hash", None))
+        is_hash = bool(has_hash_detector and shell.is_hash(password))
+        is_guest_context = domain_auth_mode == "guest" or is_guest_alias(username)
+        if is_hash:
+            auth_mode = "hash"
+        elif password:
+            auth_mode = "password"
+        elif username and is_guest_context:
+            auth_mode = "guest"
+        else:
+            auth_mode = "missing"
+
+        if auth_mode == "guest" and (not username or is_guest_alias(username)):
+            username = resolve_smb_guest_username(shell=shell, domain=domain)
 
         self.logger.debug(
             (
                 "SMB byte read auth context: requested_domain=%s active_domain=%s "
-                "resolved_domain=%s username=%s auth_mode=%s host=%s share=%s path=%s max_bytes=%s "
-                "override_user=%s override_domain=%s"
+                "resolved_domain=%s username=%s auth_mode=%s has_password=%s host=%s share=%s path=%s max_bytes=%s "
+                "override_user=%s override_domain=%s domain_auth_mode=%s"
             ),
             domain,
             active_domain,
             resolved_auth_domain,
             username,
             auth_mode,
+            bool(password),
             host,
             share,
             effective_source_path,
             max_bytes,
-            bool(str(auth_username or "").strip()),
-            bool(str(auth_domain or "").strip()),
+            auth_username is not None,
+            auth_domain is not None,
+            domain_auth_mode or "-",
         )
 
-        if not username or not password:
+        if auth_mode == "missing":
+            if username:
+                error_message = (
+                    "Missing password for non-guest SMB byte read credentials "
+                    f"(domain {domain}, user {username})."
+                )
+            else:
+                error_message = f"Missing authenticated credentials for domain {domain}."
             return SMBByteReadResult(
                 success=False,
                 data=b"",
                 truncated=False,
-                error_message=f"Missing authenticated credentials for domain {domain}.",
+                error_message=error_message,
                 auth_username=username,
                 auth_domain=resolved_auth_domain,
                 auth_mode=auth_mode,
@@ -225,14 +250,19 @@ class ImpacketSMBByteReaderService(BaseService):
                 timeout=timeout_seconds,
             )
 
-            is_hash = auth_mode == "hash"
-            if is_hash:
+            if auth_mode == "hash":
                 connection.login(
                     user=username,
                     password="",
                     domain=resolved_auth_domain,
                     lmhash="aad3b435b51404eeaad3b435b51404ee",
                     nthash=password,
+                )
+            elif auth_mode == "guest":
+                connection.login(
+                    user=username,
+                    password="",
+                    domain=resolved_auth_domain,
                 )
             else:
                 connection.login(

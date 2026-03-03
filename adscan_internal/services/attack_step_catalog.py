@@ -45,12 +45,14 @@ class AttackStepCatalogEntry:
     category: str
     description: str
     vuln_key: str | None = None
-    remediation_complexity: str = "medium"      # low | medium | high | very_high
+    remediation_complexity: str = "medium"  # low | medium | high | very_high
     remediation_effort: str = ""
     can_fully_mitigate: bool = True
-    mitre_technique_id: str | None = None       # e.g. "T1558.003"
-    mitre_technique_name: str | None = None     # e.g. "Steal or Forge Kerberos Tickets: Kerberoasting"
-    detection_event_ids: tuple[str, ...] = ()   # Windows Event IDs for SOC detection
+    mitre_technique_id: str | None = None  # e.g. "T1558.003"
+    mitre_technique_name: str | None = (
+        None  # e.g. "Steal or Forge Kerberos Tickets: Kerberoasting"
+    )
+    detection_event_ids: tuple[str, ...] = ()  # Windows Event IDs for SOC detection
 
 
 def _entry(
@@ -114,7 +116,27 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="Valid Accounts: Local Accounts",
         detection_event_ids=("4624", "4648"),
     ),
-
+    _entry(
+        "hassession",
+        support_kind="supported",
+        support_reason="Executable via schtask_as session abuse workflow",
+        category="privilege",
+        description=(
+            "High-value user session observed on a non-Tier-0 computer that can be "
+            "abused for scheduled-task impersonation"
+        ),
+        vuln_key="da_sessions",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Restrict Domain Admin logons to Tier 0 assets only. "
+            "Use PAWs for privileged operations and prohibit DA logons on member servers/workstations. "
+            "Enforce ESAE/PAW model and monitor tier-zero session exposure."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1053.005",
+        mitre_technique_name="Scheduled Task/Job: Scheduled Task",
+        detection_event_ids=("4624", "4672"),
+    ),
     # ── Network exploitation / CVEs ─────────────────────────────────────────
     _entry(
         "zerologon",
@@ -203,7 +225,6 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="Forced Authentication",
         detection_event_ids=("4768",),
     ),
-
     # ── Kerberos ────────────────────────────────────────────────────────────
     _entry(
         "allowedtodelegate",
@@ -309,7 +330,6 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="Steal or Forge Kerberos Tickets: AS-REP Roasting",
         detection_event_ids=("4768",),
     ),
-
     # ── Lateral movement / execution ────────────────────────────────────────
     _entry(
         "adminto",
@@ -377,6 +397,23 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624",),
     ),
     _entry(
+        "guestsession",
+        support_kind="supported",
+        support_reason="Enumerate SMB guest-authenticated shares and permissions",
+        category="lateral_movement",
+        description="Guest SMB session accepted, enabling unauthenticated share access",
+        vuln_key="smb_guest_shares",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Disable guest SMB access and null sessions via GPO. "
+            "Require authenticated SMB access and remove anonymous share permissions."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1135",
+        mitre_technique_name="Network Share Discovery",
+        detection_event_ids=("4624", "5140"),
+    ),
+    _entry(
         "executedcom",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
@@ -392,7 +429,6 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="Remote Services: Distributed Component Object Model",
         detection_event_ids=("4624", "4688"),
     ),
-
     # ── ADCS / PKI ──────────────────────────────────────────────────────────
     _entry(
         "adcsesc1",
@@ -655,7 +691,6 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("5058", "5061"),
     ),
-
     # ── ACL / Object control ─────────────────────────────────────────────────
     _entry(
         "genericall",
@@ -885,7 +920,6 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="Account Manipulation",
         detection_event_ids=("4662",),
     ),
-
     # ── Credential access ───────────────────────────────────────────────────
     _entry(
         "dcsync",
@@ -984,7 +1018,6 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="OS Credential Dumping: LSASS Memory",
         detection_event_ids=("4656",),
     ),
-
     # ── Coercion ─────────────────────────────────────────────────────────────
     _entry(
         "dfscoerce",
@@ -1039,7 +1072,6 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="Forced Authentication",
         detection_event_ids=("4768",),
     ),
-
     # ── Entry vectors ────────────────────────────────────────────────────────
     _entry(
         "passwordspray",
@@ -1175,6 +1207,7 @@ def get_exploitation_relation_vuln_keys() -> dict[str, str]:
 
 
 # ── Remediation metadata helpers ──────────────────────────────────────────────
+
 
 def get_step_metadata(relation: str) -> dict[str, Any]:
     """Return remediation + MITRE metadata for a relation as a plain dict."""

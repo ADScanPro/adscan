@@ -12,6 +12,9 @@ import re
 from typing import Any, Callable, Iterable
 
 from adscan_internal.services import attack_graph_core
+from adscan_internal.services.attack_step_support_registry import (
+    CONTEXT_ONLY_RELATIONS,
+)
 
 
 _EMPTY_GROUP_WHITELIST = {
@@ -23,6 +26,9 @@ _EMPTY_GROUP_WHITELIST = {
 }
 
 _SID_PATTERN = re.compile(r"(S-1-\d+(?:-\d+)+)", re.IGNORECASE)
+_CONTEXT_RELATIONS_LOWER = {
+    str(relation).strip().lower() for relation in CONTEXT_ONLY_RELATIONS.keys()
+}
 
 
 def _extract_sid(value: str) -> str | None:
@@ -577,7 +583,9 @@ def _strip_leading_relations(
     new_record["nodes"] = new_nodes
     new_record["relations"] = new_rels
     new_record["length"] = sum(
-        1 for rel in new_rels if str(rel or "").strip().lower() != "memberof"
+        1
+        for rel in new_rels
+        if str(rel or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
     )
     new_record["source"] = new_nodes[0] if new_nodes else ""
     new_record["target"] = new_nodes[-1] if new_nodes else ""
@@ -592,7 +600,7 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         if not isinstance(step, dict):
             continue
         action = str(step.get("action") or "").strip().lower()
-        if action == "memberof":
+        if action in _CONTEXT_RELATIONS_LOWER:
             continue
         value = step.get("status")
         if isinstance(value, str) and value:
@@ -618,7 +626,8 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
         == "policy_blocked"
         for step in steps
         if isinstance(step, dict)
-        and str(step.get("action") or "").strip().lower() != "memberof"
+        and str(step.get("action") or "").strip().lower()
+        not in _CONTEXT_RELATIONS_LOWER
     ):
         return "blocked"
     return "theoretical"
@@ -651,7 +660,9 @@ def _strip_leading_steps(
     new_record["nodes"] = new_nodes
     new_record["relations"] = new_rels
     new_record["length"] = sum(
-        1 for rel in new_rels if str(rel or "").strip().lower() != "memberof"
+        1
+        for rel in new_rels
+        if str(rel or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
     )
     new_record["source"] = new_nodes[0] if new_nodes else ""
     new_record["target"] = new_nodes[-1] if new_nodes else ""
@@ -986,7 +997,9 @@ def _strip_display_record_prefix(
 
     # Recompute display length to match what is shown.
     new_record["length"] = sum(
-        1 for rel in new_rels if str(rel or "").strip().lower() != "memberof"
+        1
+        for rel in new_rels
+        if str(rel or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
     )
     new_record["status"] = _derive_display_status_from_steps(
         new_record.get("steps", [])
@@ -1111,7 +1124,7 @@ def filter_shortest_paths_for_principals(
         terminal_rel = ""
         terminal_idx = None
         for rel_idx in range(len(rels) - 1, -1, -1):
-            if str(rels[rel_idx] or "").strip().lower() == "memberof":
+            if str(rels[rel_idx] or "").strip().lower() in _CONTEXT_RELATIONS_LOWER:
                 continue
             terminal_rel = str(rels[rel_idx])
             terminal_idx = rel_idx
@@ -1125,7 +1138,9 @@ def filter_shortest_paths_for_principals(
         length = record.get("length")
         if not isinstance(length, int):
             length = sum(
-                1 for rel in rels if str(rel or "").strip().lower() != "memberof"
+                1
+                for rel in rels
+                if str(rel or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
             )
         key = (terminal_from, terminal_rel, terminal_to)
         existing = best_by_key.get(key)
@@ -1235,6 +1250,7 @@ def compute_display_paths_for_domain(
     domain: str,
     snapshot: dict[str, Any] | None,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     target_mode: str = "tier0",
     expand_terminal_memberships: bool = True,
@@ -1278,6 +1294,7 @@ def compute_display_paths_for_domain(
     unfiltered = attack_graph_core.compute_display_paths_for_domain_unfiltered(
         runtime_graph,
         max_depth=max_depth,
+        max_paths=max_paths,
         require_high_value_target=require_high_value_target,
         target_mode=mode,
     )
@@ -1308,6 +1325,7 @@ def compute_display_paths_for_start_node(
     snapshot: dict[str, Any] | None,
     start_node_id: str,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     target_mode: str = "tier0",
     expand_start_memberships: bool = True,
@@ -1387,6 +1405,7 @@ def compute_display_paths_for_start_node(
         runtime_graph,
         start_node_id=start_node_id,
         max_depth=max_depth,
+        max_paths=max_paths,
         require_high_value_target=require_high_value_target,
         target_mode=mode,
     )
@@ -1410,6 +1429,7 @@ def compute_display_paths_for_user(
     snapshot: dict[str, Any] | None,
     username: str,
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     target_mode: str = "tier0",
     filter_shortest_paths: bool = True,
@@ -1423,6 +1443,7 @@ def compute_display_paths_for_user(
         snapshot=snapshot,
         start_node_id=start_node_id,
         max_depth=max_depth,
+        max_paths=max_paths,
         require_high_value_target=require_high_value_target,
         target_mode=target_mode,
         filter_shortest_paths=filter_shortest_paths,
@@ -1436,6 +1457,7 @@ def compute_display_paths_for_principals(
     snapshot: dict[str, Any] | None,
     principals: list[str],
     max_depth: int,
+    max_paths: int | None = None,
     require_high_value_target: bool = True,
     membership_sample_max: int = 3,
     target_mode: str = "tier0",
@@ -1448,12 +1470,18 @@ def compute_display_paths_for_principals(
 
     all_records: list[dict[str, Any]] = []
     for username in normalized_principals:
+        remaining = None
+        if isinstance(max_paths, int) and max_paths > 0:
+            remaining = max_paths - len(all_records)
+            if remaining <= 0:
+                break
         records = compute_display_paths_for_user(
             graph,
             domain=domain,
             snapshot=snapshot,
             username=username,
             max_depth=max_depth,
+            max_paths=remaining,
             require_high_value_target=require_high_value_target,
             target_mode=target_mode,
             filter_shortest_paths=filter_shortest_paths,

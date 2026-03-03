@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional, Protocol, Tuple
 
@@ -984,6 +985,132 @@ def run_ldap_groupmembership_privileged(
     return None
 
 
+def _run_netexec_ldap_query_attribute_values(
+    shell: LdapShell,
+    *,
+    domain: str,
+    ldap_query: str,
+    attribute: str,
+    auth_username: str,
+    auth_password: str,
+    pdc: str,
+    timeout: int = 300,
+    retries: int = 1,
+    retry_delay_seconds: float = 1.0,
+    retry_backoff: float = 1.5,
+    require_non_empty: bool = False,
+    prefer_kerberos: bool = True,
+    allow_ntlm_fallback: bool = True,
+    debug_label: str = "ldap-query",
+) -> list[str] | None:
+    """Run a NetExec LDAP query and parse attribute values with retries.
+
+    This helper centralizes a robust execution policy used by runtime privilege
+    verification flows:
+    - Prefer Kerberos authentication for LDAP queries.
+    - Optionally fallback to NTLM if Kerberos does not return usable data.
+    - Retry transient failures and optional empty result-sets with backoff.
+    """
+    from adscan_internal.integrations.netexec.parsers import (
+        parse_netexec_ldap_query_attribute_values,
+    )
+
+    if domain not in shell.domains_data:
+        return None
+    if not getattr(shell, "netexec_path", None):
+        return None
+
+    netexec_runner = getattr(shell, "_run_netexec", None)
+    use_netexec_runner = callable(netexec_runner)
+
+    def _run(command: str) -> subprocess.CompletedProcess[str] | None:
+        if use_netexec_runner:
+            return netexec_runner(command, domain=domain, timeout=timeout)  # type: ignore[misc]
+        return shell.run_command(command, timeout=timeout)
+
+    attempts = max(1, int(retries))
+    delay = max(0.0, float(retry_delay_seconds))
+    backoff = max(1.0, float(retry_backoff))
+
+    marked_auth_user = mark_sensitive(str(auth_username), "user")
+    marked_auth_pass = mark_sensitive(str(auth_password), "password")
+    marked_domain = mark_sensitive(str(domain), "domain")
+    marked_pdc = mark_sensitive(
+        str(pdc), "ip" if str(pdc).replace(".", "").isdigit() else "hostname"
+    )
+
+    auth_modes: list[bool] = [bool(prefer_kerberos)]
+    if prefer_kerberos and allow_ntlm_fallback:
+        auth_modes.append(False)
+
+    saw_successful_query = False
+
+    for auth_mode in auth_modes:
+        auth_str = shell.build_auth_nxc(
+            str(auth_username),
+            str(auth_password),
+            domain,
+            kerberos=auth_mode,
+        )
+        auth_str = auth_str.replace(str(auth_username), str(marked_auth_user)).replace(
+            str(auth_password), str(marked_auth_pass)
+        )
+        auth_str = auth_str.replace(str(domain), str(marked_domain))
+
+        auth_label = "kerberos" if auth_mode else "ntlm"
+        for attempt in range(1, attempts + 1):
+            command = (
+                f"{shell.netexec_path} ldap {marked_pdc} {auth_str} "
+                f'--query "{ldap_query}" {attribute}'
+            )
+            print_info_debug(
+                f"[ldap-in-chain] {debug_label} command "
+                f"({auth_label}, attempt {attempt}/{attempts}): {command}"
+            )
+
+            completed_process = _run(command)
+            if not completed_process:
+                if attempt < attempts:
+                    time.sleep(delay * (backoff ** (attempt - 1)))
+                continue
+            if completed_process.returncode != 0:
+                output = str(completed_process.stderr or "").strip() or str(
+                    completed_process.stdout or ""
+                ).strip()
+                if output:
+                    print_info_debug(
+                        "[ldap-in-chain] "
+                        f"{debug_label} failed ({auth_label}, attempt {attempt}/{attempts}): "
+                        f"{mark_sensitive(output[:400], 'detail')}"
+                    )
+                if attempt < attempts:
+                    time.sleep(delay * (backoff ** (attempt - 1)))
+                continue
+
+            saw_successful_query = True
+            values = parse_netexec_ldap_query_attribute_values(
+                completed_process.stdout or "", attribute
+            )
+            values = [str(value).strip() for value in values if str(value).strip()]
+            if values:
+                return values
+
+            if not require_non_empty:
+                return []
+
+            if attempt < attempts:
+                print_info_debug(
+                    "[ldap-in-chain] "
+                    f"{debug_label} returned 0 {attribute} values "
+                    f"({auth_label}, attempt {attempt}/{attempts}); retrying."
+                )
+                time.sleep(delay * (backoff ** (attempt - 1)))
+
+    if saw_successful_query:
+        return []
+    return None
+
+
 def get_recursive_user_groups_in_chain(
     shell: LdapShell,
     *,
@@ -993,6 +1120,12 @@ def get_recursive_user_groups_in_chain(
     auth_password: str | None = None,
     pdc: str | None = None,
     timeout: int = 300,
+    retries: int = 3,
+    retry_delay_seconds: float = 1.0,
+    retry_backoff: float = 1.5,
+    retry_on_empty: bool = True,
+    prefer_kerberos: bool = True,
+    allow_ntlm_fallback: bool = True,
 ) -> list[str] | None:
     """Return recursive group memberships for a principal via LDAP_MATCHING_RULE_IN_CHAIN.
 
@@ -1020,10 +1153,6 @@ def get_recursive_user_groups_in_chain(
         List of group sAMAccountName values (may include spaces) on success,
         otherwise None when prerequisites are missing or lookup failed.
     """
-    from adscan_internal.integrations.netexec.parsers import (
-        parse_netexec_ldap_query_attribute_values,
-    )
-
     if domain not in shell.domains_data:
         return None
     if not getattr(shell, "netexec_path", None):
@@ -1034,15 +1163,6 @@ def get_recursive_user_groups_in_chain(
     pdc = pdc or shell.domains_data[domain].get("pdc")
     if not auth_username or not auth_password or not pdc:
         return None
-
-    # Prefer the shared NetExec runner for clock skew + transient errors.
-    netexec_runner = getattr(shell, "_run_netexec", None)
-    use_netexec_runner = callable(netexec_runner)
-
-    def _run(command: str) -> subprocess.CompletedProcess[str] | None:
-        if use_netexec_runner:
-            return netexec_runner(command, domain=domain, timeout=timeout)  # type: ignore[misc]
-        return shell.run_command(command, timeout=timeout)
 
     # Fast path: resolve the principal DN from BloodHound when available.
     # This avoids an extra LDAP query and stays aligned with the "prefer BH,
@@ -1070,37 +1190,29 @@ def get_recursive_user_groups_in_chain(
     except Exception:
         user_dn = ""
 
-    # Mark sensitive values in the *command string* so debug printing is safe.
-    marked_auth_user = mark_sensitive(str(auth_username), "user")
-    marked_auth_pass = mark_sensitive(str(auth_password), "password")
-    marked_domain = mark_sensitive(str(domain), "domain")
-    marked_pdc = mark_sensitive(
-        str(pdc), "ip" if str(pdc).replace(".", "").isdigit() else "hostname"
-    )
-
-    auth_str = shell.build_auth_nxc(str(auth_username), str(auth_password), domain)
-    # Use the marked credential in the auth string so we don't leak secrets in debug logs.
-    auth_str = auth_str.replace(str(auth_username), str(marked_auth_user)).replace(
-        str(auth_password), str(marked_auth_pass)
-    )
-    auth_str = auth_str.replace(str(domain), str(marked_domain))
-
     # 1) Resolve DN for the principal (fallback to NetExec query when BH is unavailable).
     if not user_dn:
         sanitized_target = str(target_username).replace("'", "\\'")
         dn_query = f"(&(|(objectClass=user)(objectClass=computer))(sAMAccountName={sanitized_target}))"
-        dn_command = (
-            f"{shell.netexec_path} ldap {marked_pdc} {auth_str} "
-            f'--query "{dn_query}" distinguishedName'
+        dn_values = _run_netexec_ldap_query_attribute_values(
+            shell,
+            domain=domain,
+            ldap_query=dn_query,
+            attribute="distinguishedName",
+            auth_username=str(auth_username),
+            auth_password=str(auth_password),
+            pdc=str(pdc),
+            timeout=timeout,
+            retries=max(1, retries),
+            retry_delay_seconds=retry_delay_seconds,
+            retry_backoff=retry_backoff,
+            require_non_empty=True,
+            prefer_kerberos=prefer_kerberos,
+            allow_ntlm_fallback=allow_ntlm_fallback,
+            debug_label="Resolve DN",
         )
-        print_info_debug(f"[ldap-in-chain] Resolve DN command: {dn_command}")
-        dn_proc = _run(dn_command)
-        if not dn_proc or dn_proc.returncode != 0:
+        if dn_values is None:
             return None
-
-        dn_values = parse_netexec_ldap_query_attribute_values(
-            dn_proc.stdout or "", "distinguishedName"
-        )
         user_dn = dn_values[0] if dn_values else ""
         if not user_dn:
             return None
@@ -1109,18 +1221,26 @@ def get_recursive_user_groups_in_chain(
     group_query = (
         f"(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:={user_dn}))"
     )
-    group_command = (
-        f"{shell.netexec_path} ldap {marked_pdc} {auth_str} "
-        f'--query "{group_query}" sAMAccountName'
+    groups = _run_netexec_ldap_query_attribute_values(
+        shell,
+        domain=domain,
+        ldap_query=group_query,
+        attribute="sAMAccountName",
+        auth_username=str(auth_username),
+        auth_password=str(auth_password),
+        pdc=str(pdc),
+        timeout=timeout,
+        retries=max(1, retries),
+        retry_delay_seconds=retry_delay_seconds,
+        retry_backoff=retry_backoff,
+        require_non_empty=retry_on_empty,
+        prefer_kerberos=prefer_kerberos,
+        allow_ntlm_fallback=allow_ntlm_fallback,
+        debug_label="Recursive groups",
     )
-    print_info_debug(f"[ldap-in-chain] Recursive groups command: {group_command}")
-    group_proc = _run(group_command)
-    if not group_proc or group_proc.returncode != 0:
+    if groups is None:
         return None
 
-    groups = parse_netexec_ldap_query_attribute_values(
-        group_proc.stdout or "", "sAMAccountName"
-    )
     # Normalise: keep stable display while avoiding duplicates.
     groups = [g.strip() for g in groups if str(g).strip()]
     if not groups:
@@ -1137,6 +1257,12 @@ def get_recursive_principal_group_sids_in_chain(
     auth_password: str | None = None,
     pdc: str | None = None,
     timeout: int = 300,
+    retries: int = 3,
+    retry_delay_seconds: float = 1.0,
+    retry_backoff: float = 1.5,
+    retry_on_empty: bool = True,
+    prefer_kerberos: bool = True,
+    allow_ntlm_fallback: bool = True,
 ) -> list[str] | None:
     """Return recursive group SIDs for a principal via LDAP_MATCHING_RULE_IN_CHAIN.
 
@@ -1154,10 +1280,6 @@ def get_recursive_principal_group_sids_in_chain(
     Returns:
         List of group objectSid strings on success, otherwise None.
     """
-    from adscan_internal.integrations.netexec.parsers import (
-        parse_netexec_ldap_query_attribute_values,
-    )
-
     if domain not in shell.domains_data:
         return None
     if not getattr(shell, "netexec_path", None):
@@ -1168,14 +1290,6 @@ def get_recursive_principal_group_sids_in_chain(
     pdc = pdc or shell.domains_data[domain].get("pdc")
     if not auth_username or not auth_password or not pdc:
         return None
-
-    netexec_runner = getattr(shell, "_run_netexec", None)
-    use_netexec_runner = callable(netexec_runner)
-
-    def _run(command: str) -> subprocess.CompletedProcess[str] | None:
-        if use_netexec_runner:
-            return netexec_runner(command, domain=domain, timeout=timeout)  # type: ignore[misc]
-        return shell.run_command(command, timeout=timeout)
 
     # Resolve principal DN (BH first, fallback NetExec query).
     user_dn = ""
@@ -1201,34 +1315,28 @@ def get_recursive_principal_group_sids_in_chain(
     except Exception:
         user_dn = ""
 
-    marked_auth_user = mark_sensitive(str(auth_username), "user")
-    marked_auth_pass = mark_sensitive(str(auth_password), "password")
-    marked_domain = mark_sensitive(str(domain), "domain")
-    marked_pdc = mark_sensitive(
-        str(pdc),
-        "ip" if str(pdc).replace(".", "").isdigit() else "hostname",
-    )
-
-    auth_str = shell.build_auth_nxc(str(auth_username), str(auth_password), domain)
-    auth_str = auth_str.replace(str(auth_username), str(marked_auth_user)).replace(
-        str(auth_password), str(marked_auth_pass)
-    )
-    auth_str = auth_str.replace(str(domain), str(marked_domain))
-
     if not user_dn:
         sanitized_target = str(target_samaccountname).replace("'", "\\'")
         dn_query = f"(&(|(objectClass=user)(objectClass=computer))(sAMAccountName={sanitized_target}))"
-        dn_command = (
-            f"{shell.netexec_path} ldap {marked_pdc} {auth_str} "
-            f'--query "{dn_query}" distinguishedName'
+        dn_values = _run_netexec_ldap_query_attribute_values(
+            shell,
+            domain=domain,
+            ldap_query=dn_query,
+            attribute="distinguishedName",
+            auth_username=str(auth_username),
+            auth_password=str(auth_password),
+            pdc=str(pdc),
+            timeout=timeout,
+            retries=max(1, retries),
+            retry_delay_seconds=retry_delay_seconds,
+            retry_backoff=retry_backoff,
+            require_non_empty=True,
+            prefer_kerberos=prefer_kerberos,
+            allow_ntlm_fallback=allow_ntlm_fallback,
+            debug_label="Resolve DN",
         )
-        print_info_debug(f"[ldap-in-chain] Resolve DN command: {dn_command}")
-        dn_proc = _run(dn_command)
-        if not dn_proc or dn_proc.returncode != 0:
+        if dn_values is None:
             return None
-        dn_values = parse_netexec_ldap_query_attribute_values(
-            dn_proc.stdout or "", "distinguishedName"
-        )
         user_dn = dn_values[0] if dn_values else ""
         if not user_dn:
             return None
@@ -1237,18 +1345,26 @@ def get_recursive_principal_group_sids_in_chain(
     group_query = (
         f"(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:={user_dn}))"
     )
-    group_command = (
-        f"{shell.netexec_path} ldap {marked_pdc} {auth_str} "
-        f'--query "{group_query}" objectSid'
+    sids = _run_netexec_ldap_query_attribute_values(
+        shell,
+        domain=domain,
+        ldap_query=group_query,
+        attribute="objectSid",
+        auth_username=str(auth_username),
+        auth_password=str(auth_password),
+        pdc=str(pdc),
+        timeout=timeout,
+        retries=max(1, retries),
+        retry_delay_seconds=retry_delay_seconds,
+        retry_backoff=retry_backoff,
+        require_non_empty=retry_on_empty,
+        prefer_kerberos=prefer_kerberos,
+        allow_ntlm_fallback=allow_ntlm_fallback,
+        debug_label="Recursive group SIDs",
     )
-    print_info_debug(f"[ldap-in-chain] Recursive group SIDs command: {group_command}")
-    group_proc = _run(group_command)
-    if not group_proc or group_proc.returncode != 0:
+    if sids is None:
         return None
 
-    sids = parse_netexec_ldap_query_attribute_values(
-        group_proc.stdout or "", "objectSid"
-    )
     sids = [sid.strip() for sid in sids if str(sid).strip()]
     if not sids:
         return []

@@ -77,6 +77,11 @@ from .share_file_analysis_pipeline_service import (
     ShareFilePipelineAnalysisResult,
 )
 from .share_credential_provenance_service import ShareCredentialProvenanceService
+from .smb_guest_auth_service import (
+    DEFAULT_SMB_GUEST_USERNAME,
+    is_guest_alias,
+    resolve_smb_guest_username,
+)
 
 __all__ = [
     "BaseService",
@@ -135,4 +140,7 @@ __all__ = [
     "ShareFileAnalysisPipelineService",
     "ShareFilePipelineAnalysisResult",
     "ShareCredentialProvenanceService",
+    "DEFAULT_SMB_GUEST_USERNAME",
+    "is_guest_alias",
+    "resolve_smb_guest_username",
 ]

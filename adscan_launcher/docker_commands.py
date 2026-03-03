@@ -35,10 +35,14 @@ from adscan_launcher.bloodhound_ce_compose import (
     ensure_bloodhound_compose_file,
     get_bloodhound_compose_path,
 )
-from adscan_launcher.bloodhound_ce_password import ensure_bloodhound_admin_password
+from adscan_launcher.bloodhound_ce_password import (
+    ensure_bloodhound_admin_password,
+    validate_bloodhound_admin_password_policy,
+)
 from adscan_launcher.docker_runtime import (
     DockerRunConfig,
     build_adscan_run_command,
+    docker_access_denied,
     docker_available,
     docker_needs_sudo,
     ensure_image_pulled,
@@ -47,8 +51,13 @@ from adscan_launcher.docker_runtime import (
     run_docker,
     shell_quote_cmd,
 )
+from adscan_launcher.docker_status import (
+    ensure_docker_daemon_running as _ensure_docker_daemon_running_internal,
+    is_docker_daemon_running as _is_docker_daemon_running_internal,
+)
 from adscan_launcher.output import (
     mark_sensitive,
+    print_exception,
     print_error,
     print_info,
     print_info_debug,
@@ -56,6 +65,7 @@ from adscan_launcher.output import (
     print_instruction,
     print_panel,
     print_success,
+    print_success_verbose,
     print_warning,
 )
 from adscan_launcher.path_utils import get_effective_user_home
@@ -265,6 +275,9 @@ def _ensure_image_pulled_with_legacy_fallback(
     stream_output: bool,
 ) -> str | None:
     """Pull preferred image, then fallback to legacy naming if needed."""
+    if not _ensure_docker_daemon_available_for_pull(stage="pre_pull"):
+        return None
+
     candidates = _get_docker_image_candidates()
     preferred = candidates[0]
     for idx, candidate in enumerate(candidates):
@@ -273,7 +286,38 @@ def _ensure_image_pulled_with_legacy_fallback(
                 "Primary Docker image pull failed; trying legacy image naming: "
                 f"{candidate}"
             )
-        if ensure_image_pulled(candidate, timeout=pull_timeout, stream_output=stream_output):
+        if ensure_image_pulled(
+            candidate, timeout=pull_timeout, stream_output=stream_output
+        ):
+            _warn_using_legacy_image(
+                selected_image=candidate,
+                preferred_image=preferred,
+            )
+            return candidate
+
+        daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
+            run_docker_command_func=_run_docker_status_command
+        )
+        if daemon_running:
+            continue
+
+        print_warning(
+            "Docker daemon became unavailable during image pull; "
+            "attempting recovery before retrying."
+        )
+        print_info_debug(
+            "[docker] daemon diagnostic after pull failure: "
+            f"{mark_sensitive(daemon_diagnostic, 'detail')}"
+        )
+        if not _ensure_docker_daemon_available_for_pull(stage="post_pull_failure"):
+            return None
+
+        print_info("Retrying image pull after Docker daemon recovery...")
+        if ensure_image_pulled(
+            candidate,
+            timeout=pull_timeout,
+            stream_output=stream_output,
+        ):
             _warn_using_legacy_image(
                 selected_image=candidate,
                 preferred_image=preferred,
@@ -422,7 +466,166 @@ def _validate_bloodhound_ce_config() -> bool:
     return True
 
 
-def _ensure_bloodhound_ce_auth_for_docker() -> bool:
+def _get_stored_bloodhound_ce_password() -> str | None:
+    """Return the stored BloodHound CE password from host config when available."""
+    if not BH_CONFIG_FILE.exists():
+        return None
+    try:
+        config = configparser.ConfigParser()
+        config.read(str(BH_CONFIG_FILE))
+        if "CE" not in config:
+            return None
+        value = config["CE"].get("password")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[bloodhound-ce] failed reading stored CE password from config: {exc}"
+        )
+    return None
+
+
+def _reset_bloodhound_ce_stack_for_password_recovery(compose_path: Path) -> bool:
+    """Reset BloodHound CE containers+volumes and start the pinned stack again."""
+    print_warning(
+        "Resetting BloodHound CE stack for password recovery. Existing BloodHound data will be deleted."
+    )
+    down_cmd = [
+        "docker",
+        "compose",
+        "-f",
+        str(compose_path),
+        "down",
+        "-v",
+        "--remove-orphans",
+    ]
+    print_info_debug(
+        f"[bloodhound-ce] password recovery reset down: {shell_quote_cmd(down_cmd)}"
+    )
+    try:
+        proc_down = run_docker(
+            down_cmd,
+            check=False,
+            capture_output=True,
+            timeout=180,
+        )
+        if proc_down.returncode != 0:
+            print_warning("Failed to stop/reset BloodHound CE stack for recovery.")
+            if proc_down.stderr:
+                print_info_debug(
+                    f"[bloodhound-ce] reset down stderr: {proc_down.stderr}"
+                )
+            return False
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning("Error while resetting BloodHound CE stack for recovery.")
+        print_info_debug(f"[bloodhound-ce] reset down exception: {exc}")
+        return False
+
+    return compose_up(compose_path)
+
+
+def _bootstrap_bloodhound_ce_auth(
+    *,
+    compose_path: Path,
+    desired_password: str,
+    suppress_browser: bool,
+) -> tuple[bool, bool, bool]:
+    """Resolve BloodHound CE auth after compose-up with first-run and reuse fallbacks.
+
+    Returns:
+        Tuple ``(auth_verified, desired_password_verified, password_automation_ok)``.
+    """
+    password_automation_ok = False
+    desired_password_verified = False
+    auth_verified = False
+
+    config_exists = BH_CONFIG_FILE.exists()
+    print_info_debug(
+        f"[bloodhound-ce] install auth bootstrap context: config_exists={config_exists}"
+    )
+
+    if config_exists:
+        # Reused installation: validate current config/token first.
+        auth_verified = _ensure_bloodhound_ce_auth_for_docker(
+            desired_password=desired_password
+        )
+        stored_password = _get_stored_bloodhound_ce_password()
+        desired_password_verified = bool(
+            stored_password and stored_password == desired_password
+        )
+        if auth_verified:
+            return auth_verified, desired_password_verified, password_automation_ok
+    else:
+        # Fresh installation path: try initial-password automation from logs.
+        print_info_debug(
+            "[bloodhound-ce] no existing config found; attempting first-run "
+            "initial-password extraction from container logs."
+        )
+        password_automation_ok = ensure_bloodhound_admin_password(
+            desired_password=desired_password,
+            suppress_browser=suppress_browser,
+        )
+        if not password_automation_ok:
+            print_info_debug(
+                "[bloodhound-ce] initial-password automation did not succeed; "
+                "trying desired-password fallback auth bootstrap."
+            )
+        marked_desired_password = mark_sensitive(desired_password, "password")
+        print_info_debug(
+            "[bloodhound-ce] desired-password fallback attempt: "
+            f"username=admin password={marked_desired_password}"
+        )
+        desired_password_verified = _persist_bloodhound_ce_config(
+            username="admin",
+            password=desired_password,
+        )
+        auth_verified = _ensure_bloodhound_ce_auth_for_docker(
+            desired_password=desired_password
+        )
+        if auth_verified:
+            stored_password = _get_stored_bloodhound_ce_password()
+            desired_password_verified = bool(
+                stored_password and stored_password == desired_password
+            )
+            return auth_verified, desired_password_verified, password_automation_ok
+
+    # Auth is still not verified. Offer destructive recovery only in interactive mode.
+    if not sys.stdin.isatty():
+        return auth_verified, desired_password_verified, password_automation_ok
+
+    should_reset = Confirm.ask(
+        "BloodHound CE password is unknown. Reset BloodHound CE data and regenerate initial password?",
+        default=False,
+    )
+    if not should_reset:
+        return auth_verified, desired_password_verified, password_automation_ok
+
+    if not _reset_bloodhound_ce_stack_for_password_recovery(compose_path):
+        return auth_verified, desired_password_verified, password_automation_ok
+
+    password_automation_ok = ensure_bloodhound_admin_password(
+        desired_password=desired_password,
+        suppress_browser=suppress_browser,
+    )
+    desired_password_verified = _persist_bloodhound_ce_config(
+        username="admin",
+        password=desired_password,
+    )
+    auth_verified = _ensure_bloodhound_ce_auth_for_docker(
+        desired_password=desired_password
+    )
+    stored_password = _get_stored_bloodhound_ce_password()
+    desired_password_verified = bool(
+        stored_password and stored_password == desired_password
+    )
+    return auth_verified, desired_password_verified, password_automation_ok
+
+
+def _ensure_bloodhound_ce_auth_for_docker(
+    *, desired_password: str | None = None
+) -> bool:
     """Ensure we can authenticate to BloodHound CE before starting Docker mode.
 
     This runs on the host, against the BloodHound CE stack managed by
@@ -437,15 +640,26 @@ def _ensure_bloodhound_ce_auth_for_docker() -> bool:
         be aborted and the user instructed to repair/reinstall BloodHound CE).
     """
     print_info("Verifying BloodHound CE authentication for Docker mode...")
-    desired_password = _get_bloodhound_admin_password()
+    resolved_desired_password = desired_password or _get_bloodhound_admin_password()
 
     if not BH_CONFIG_FILE.exists():
         print_info_verbose(
             "BloodHound CE config not found on host; attempting default auth."
         )
-        if _persist_bloodhound_ce_config(username="admin", password=desired_password):
+        marked_desired_password = mark_sensitive(resolved_desired_password, "password")
+        print_info_debug(
+            "[bloodhound-ce] config bootstrap attempt with desired password: "
+            f"username=admin password={marked_desired_password}"
+        )
+        if _persist_bloodhound_ce_config(
+            username="admin", password=resolved_desired_password
+        ):
             print_success("BloodHound CE config created on host.")
         else:
+            print_info_debug(
+                "[bloodhound-ce] desired-password bootstrap auth failed while "
+                "config file was missing."
+            )
             if not sys.stdin.isatty():
                 print_warning(
                     "Default BloodHound CE password failed and no TTY available for prompt."
@@ -456,7 +670,7 @@ def _ensure_bloodhound_ce_auth_for_docker() -> bool:
             )
             try:
                 new_password = getpass.getpass(
-                    "BloodHound CE password (leave empty for Adscan4thewin!): "
+                    f"BloodHound CE password (leave empty for {resolved_desired_password}): "
                 )
             except (EOFError, KeyboardInterrupt) as exc:
                 interrupt_kind = (
@@ -472,7 +686,7 @@ def _ensure_bloodhound_ce_auth_for_docker() -> bool:
                 print_warning("Aborting: no credentials provided.")
                 return False
             if not new_password:
-                new_password = desired_password
+                new_password = resolved_desired_password
             if not _persist_bloodhound_ce_config(
                 username="admin",
                 password=new_password,
@@ -541,7 +755,7 @@ def _ensure_bloodhound_ce_auth_for_docker() -> bool:
     print_warning("BloodHound CE credentials need to be refreshed.")
     try:
         new_password = getpass.getpass(
-            "BloodHound CE password (leave empty for Adscan4thewin!): "
+            f"BloodHound CE password (leave empty for {resolved_desired_password}): "
         )
     except (EOFError, KeyboardInterrupt) as exc:
         interrupt_kind = (
@@ -555,7 +769,7 @@ def _ensure_bloodhound_ce_auth_for_docker() -> bool:
         print_warning("Aborting: no credentials provided.")
         return False
     if not new_password:
-        new_password = desired_password
+        new_password = resolved_desired_password
     if not _persist_bloodhound_ce_config(
         username=stored_user,
         password=new_password,
@@ -742,6 +956,181 @@ def _ensure_sudo_ticket_if_needed() -> bool:
     from adscan_launcher.sudo_utils import sudo_validate
 
     return sudo_validate()
+
+
+def _run_docker_status_command(
+    command: list[str],
+    *,
+    shell: bool = False,
+    check: bool = False,
+    capture_output: bool = True,
+    text: bool = True,
+    timeout: int = 10,
+) -> subprocess.CompletedProcess:
+    """Run a Docker status command via launcher runtime wrapper.
+
+    This adapter keeps a `subprocess.run`-like signature so it can be passed to
+    the shared `docker_status` helpers.
+    """
+    del text
+    if shell:
+        raise ValueError("shell=True is not supported for docker status commands")
+    return run_docker(
+        command,
+        check=check,
+        capture_output=capture_output,
+        timeout=timeout,
+    )
+
+
+def _run_systemctl_command_for_docker_service(
+    args: list[str],
+    *,
+    check: bool = False,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess | None:
+    """Run a `systemctl` command (best effort), elevating with sudo when needed."""
+    if not shutil.which("systemctl"):
+        return None
+
+    cmd: list[str] = ["systemctl"] + args
+    if os.geteuid() != 0:
+        if not _ensure_sudo_ticket_if_needed():
+            raise RuntimeError("sudo validation failed for systemctl")
+        cmd = [
+            "sudo",
+            "--preserve-env=HOME,XDG_CONFIG_HOME,ADSCAN_HOME,ADSCAN_SESSION_ENV,CI,GITHUB_ACTIONS",
+        ] + cmd
+
+    return subprocess.run(  # noqa: S603
+        cmd,
+        check=check,
+        capture_output=False,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _is_interactive_launcher_session() -> bool:
+    """Return True when launcher can safely ask interactive recovery prompts."""
+    if os.getenv("ADSCAN_NONINTERACTIVE", "").strip() == "1":
+        return False
+    if _is_ci():
+        return False
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def _diagnostic_points_to_podman_socket(diagnostic: str) -> bool:
+    """Return True when docker CLI is configured to use Podman socket."""
+    lowered = (diagnostic or "").lower()
+    return "podman.sock" in lowered and (
+        "cannot connect" in lowered
+        or "connection refused" in lowered
+        or "is the docker daemon running" in lowered
+    )
+
+
+def _attempt_start_user_podman_socket() -> bool:
+    """Best-effort start of rootless Podman socket used as Docker API endpoint."""
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        proc = subprocess.run(  # noqa: S603
+            ["systemctl", "--user", "start", "podman.socket"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[docker] podman socket auto-start failed: {exc}")
+        return False
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        if stderr:
+            print_info_debug(
+                "[docker] systemctl --user start podman.socket stderr: "
+                f"{mark_sensitive(stderr, 'detail')}"
+            )
+        return False
+
+    running, diagnostic = _is_docker_daemon_running_internal(
+        run_docker_command_func=_run_docker_status_command
+    )
+    if running:
+        print_success_verbose(
+            "Podman user socket started successfully; Docker API endpoint is reachable."
+        )
+        return True
+
+    print_info_debug(
+        "[docker] podman socket started but docker endpoint still unavailable: "
+        f"{mark_sensitive(diagnostic, 'detail')}"
+    )
+    return False
+
+
+def _ensure_docker_daemon_available_for_pull(*, stage: str) -> bool:
+    """Ensure Docker daemon is reachable before/after image pull attempts."""
+    running, diagnostic = _is_docker_daemon_running_internal(
+        run_docker_command_func=_run_docker_status_command
+    )
+    if running:
+        return True
+
+    print_warning("Docker daemon is not reachable, so image pull cannot continue yet.")
+    print_info_debug(
+        f"[docker] daemon diagnostic ({stage}): {mark_sensitive(diagnostic, 'detail')}"
+    )
+
+    if _diagnostic_points_to_podman_socket(diagnostic):
+        print_warning(
+            "Detected Docker CLI endpoint pointing to a Podman socket that is not reachable."
+        )
+        if _is_interactive_launcher_session():
+            start_podman_socket = Confirm.ask(
+                "Try to start Podman user socket automatically now?",
+                default=True,
+            )
+            if start_podman_socket and _attempt_start_user_podman_socket():
+                return True
+        elif _attempt_start_user_podman_socket():
+            return True
+
+        print_instruction(
+            "If you use Podman as Docker API, start it manually: systemctl --user start podman.socket"
+        )
+        print_instruction(
+            "If you intended to use Docker Engine instead, unset DOCKER_HOST and retry."
+        )
+
+    if _is_interactive_launcher_session():
+        proceed = Confirm.ask(
+            "Try to start the Docker daemon automatically now?",
+            default=True,
+        )
+        if not proceed:
+            print_instruction(
+                "Start Docker manually (for example: sudo systemctl start docker) and retry."
+            )
+            return False
+
+    return _ensure_docker_daemon_running_internal(
+        docker_access_denied_func=docker_access_denied,
+        run_docker_command_func=_run_docker_status_command,
+        sudo_validate_func=_ensure_sudo_ticket_if_needed,
+        run_systemctl_command_func=_run_systemctl_command_for_docker_service,
+        print_warning_func=print_warning,
+        print_info_func=print_info,
+        print_info_debug_func=print_info_debug,
+        print_info_verbose_func=print_info_verbose,
+        print_success_verbose_func=print_success_verbose,
+        print_error_func=print_error,
+        print_exception_func=print_exception,
+        set_docker_use_sudo_func=None,
+    )
 
 
 def _is_ci() -> bool:
@@ -1171,6 +1560,8 @@ def _ensure_host_mount_dir_writable(path: Path, *, description: str) -> bool:
 def _print_docker_install_summary(
     *,
     bloodhound_admin_password: str,
+    bloodhound_auth_verified: bool = True,
+    bloodhound_desired_password_verified: bool = True,
 ) -> None:
     """Render a professional installation summary panel for Docker mode."""
     from rich.console import Group
@@ -1194,7 +1585,10 @@ def _print_docker_install_summary(
 
     bh_header = Text("BloodHound CE", style=f"bold {BRAND_COLORS['info']}")
     renderables.append(bh_header)
-    renderables.append(Text("  Ready ", style="bold white on green"))
+    if bloodhound_auth_verified:
+        renderables.append(Text("  Ready ", style="bold white on green"))
+    else:
+        renderables.append(Text("  Needs attention ", style="bold black on yellow"))
     renderables.append(Text(""))
 
     bh_table = Table.grid(padding=(0, 1))
@@ -1202,7 +1596,19 @@ def _print_docker_install_summary(
     bh_table.add_column(justify="left")
     bh_table.add_row("URL", login_url)
     bh_table.add_row("Username", "admin")
-    bh_table.add_row("Password", bloodhound_admin_password)
+    if bloodhound_desired_password_verified:
+        bh_table.add_row("Password", bloodhound_admin_password)
+    elif bloodhound_auth_verified:
+        bh_table.add_row(
+            "Password", "Configured manually/current value (see ~/.bloodhound_config)"
+        )
+    else:
+        bh_table.add_row("Password", "UNVERIFIED")
+    if not bloodhound_auth_verified:
+        bh_table.add_row(
+            "Action",
+            "Run `adscan start` and refresh BloodHound credentials when prompted.",
+        )
     renderables.append(bh_table)
 
     # ── Telemetry section ──
@@ -1215,16 +1621,12 @@ def _print_docker_install_summary(
     telemetry_enabled = _is_telemetry_enabled()
     if telemetry_enabled:
         tele_status = Text("  ON", style="bold green")
-        tele_status.append(
-            " — anonymous, sanitized usage analytics", style="dim"
-        )
+        tele_status.append(" — anonymous, sanitized usage analytics", style="dim")
         renderables.append(tele_status)
         renderables.append(Text(""))
 
         tele_detail = Table.grid(padding=(0, 1))
-        tele_detail.add_column(
-            justify="right", style="dim", no_wrap=True, min_width=12
-        )
+        tele_detail.add_column(justify="right", style="dim", no_wrap=True, min_width=12)
         tele_detail.add_column(justify="left", style="dim")
         tele_detail.add_row("What", "Commands run, feature usage, errors")
         tele_detail.add_row("Not sent", "IPs, domains, credentials, paths")
@@ -1283,6 +1685,30 @@ def handle_install_docker(
     pull_timeout_seconds: int | None = None,
 ) -> bool:
     """Install ADscan via Docker (pull image + bootstrap BloodHound CE)."""
+    password_len = len(str(bloodhound_admin_password or ""))
+    print_info_debug(
+        "[bloodhound-ce] install desired admin password metadata: "
+        f"length={password_len}, custom={bloodhound_admin_password != DEFAULT_BLOODHOUND_ADMIN_PASSWORD}"
+    )
+    policy_ok, policy_error = validate_bloodhound_admin_password_policy(
+        bloodhound_admin_password
+    )
+    if not policy_ok:
+        print_error(policy_error or "Invalid BloodHound CE admin password.")
+        print_instruction(
+            "Use --bloodhound-admin-password with at least 12 characters."
+        )
+        telemetry.capture(
+            "docker_install_failed",
+            {
+                "success": False,
+                "failure_stage": "bloodhound_password_validation",
+                "failure_reason": "password_policy",
+                "password_length": password_len,
+            },
+        )
+        return False
+
     # Track installation start
     telemetry.capture(
         "docker_install_started",
@@ -1530,15 +1956,28 @@ def handle_install_docker(
         },
     )
 
-    # Set password
-    ensure_bloodhound_admin_password(
+    # Resolve BloodHound CE auth with first-run + reuse + recovery fallbacks.
+    (
+        auth_verified,
+        desired_password_verified,
+        password_automation_ok,
+    ) = _bootstrap_bloodhound_ce_auth(
+        compose_path=compose_path,
         desired_password=bloodhound_admin_password,
         suppress_browser=suppress_bloodhound_browser,
     )
-    _persist_bloodhound_ce_config(
-        username="admin",
-        password=bloodhound_admin_password,
+    telemetry.capture(
+        "docker_install_bloodhound_auth_completed",
+        {
+            "password_automation_ok": bool(password_automation_ok),
+            "desired_password_verified": bool(desired_password_verified),
+            "auth_verified": bool(auth_verified),
+        },
     )
+    if not auth_verified:
+        print_warning(
+            "BloodHound CE is running, but authentication could not be verified automatically."
+        )
 
     # Installation completed successfully
     telemetry.capture(
@@ -1553,6 +1992,8 @@ def handle_install_docker(
 
     _print_docker_install_summary(
         bloodhound_admin_password=bloodhound_admin_password,
+        bloodhound_auth_verified=bool(auth_verified),
+        bloodhound_desired_password_verified=bool(desired_password_verified),
     )
 
     return True

@@ -18,19 +18,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
-import logging
+import ipaddress
 import os
 import shutil
 import subprocess
+import sys
 import time
 
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.core import EventBus, LicenseMode
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
 from adscan_internal.path_utils import get_adscan_home
-
-
-logger = logging.getLogger(__name__)
+from adscan_internal.rich_output import (
+    mark_sensitive,
+    print_error_debug,
+    print_info_debug,
+    print_warning_debug,
+)
 
 
 @dataclass
@@ -100,11 +104,106 @@ class KerberosEnvironmentStatus:
             self.issues = []
 
 
+class _RichOutputLoggerAdapter:
+    """Minimal logger-like adapter backed by Rich output debug helpers.
+
+    Kerberos service internals historically used ``self.logger`` (stdlib logging).
+    For CLI-centric observability we route those messages through the centralized
+    ``print_*_debug`` helpers so they are consistently visible/logged.
+    """
+
+    def __init__(self, component: str) -> None:
+        self._component = component
+
+    @staticmethod
+    def _infer_data_type(raw_value: str) -> str:
+        """Best-effort sensitive type inference for telemetry markers."""
+        value = (raw_value or "").strip()
+        if not value:
+            return "user"
+
+        try:
+            ipaddress.ip_address(value)
+            return "ip"
+        except ValueError:
+            pass
+
+        if value.startswith(("/", "./", "../", "~")) or "\\" in value:
+            return "path"
+
+        if ":" in value and "/" in value and " " not in value:
+            return "password"
+
+        if "." in value and " " not in value:
+            return "domain"
+
+        return "user"
+
+    @classmethod
+    def _sanitize(cls, value: Any) -> str:
+        """Return a debug-safe, marker-wrapped representation for output."""
+        if isinstance(value, Path):
+            return mark_sensitive(str(value), "path")
+        if isinstance(value, Mapping):
+            return ", ".join(f"{k}={cls._sanitize(v)}" for k, v in value.items())
+        if isinstance(value, (list, tuple, set)):
+            return "[" + ", ".join(cls._sanitize(v) for v in value) + "]"
+
+        text = str(value)
+        return mark_sensitive(text, cls._infer_data_type(text))
+
+    def _format(self, message: Any, *args: Any, **kwargs: Any) -> str:
+        """Format logging-style messages with `%s` placeholders."""
+        base = str(message)
+        if args:
+            sanitized_args = tuple(self._sanitize(arg) for arg in args)
+            try:
+                base = base % sanitized_args
+            except Exception:
+                base = f"{base} " + " ".join(sanitized_args)
+
+        extra = kwargs.get("extra")
+        if extra:
+            base = f"{base} | extra={self._sanitize(extra)}"
+
+        return f"[{self._component}] {base}"
+
+    def debug(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        print_info_debug(self._format(message, *args, **kwargs))
+
+    def info(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        print_info_debug(self._format(message, *args, **kwargs))
+
+    def warning(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        print_warning_debug(self._format(message, *args, **kwargs))
+
+    def error(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        print_error_debug(self._format(message, *args, **kwargs))
+
+    def exception(self, message: Any, *args: Any, **kwargs: Any) -> None:
+        exc_obj: BaseException | None = None
+        exc_info = kwargs.get("exc_info")
+        if isinstance(exc_info, BaseException):
+            exc_obj = exc_info
+        elif isinstance(exc_info, tuple) and len(exc_info) >= 2:
+            candidate = exc_info[1]
+            if isinstance(candidate, BaseException):
+                exc_obj = candidate
+        elif exc_info:
+            candidate = sys.exc_info()[1]
+            if isinstance(candidate, BaseException):
+                exc_obj = candidate
+
+        text = self._format(message, *args, **kwargs)
+        if exc_obj is not None:
+            text = f"{text} | exception={self._sanitize(exc_obj)}"
+        print_error_debug(text)
+
+
 class KerberosTicketService(BaseService):
     """Service responsible for generating Kerberos tickets (TGT).
 
-    This class does not print directly to the console nor use Rich; it
-    relies solely on the logging subsystem and returns
+    This class emits diagnostic output via centralized Rich debug helpers and returns
     :class:`KerberosTGTResult` / :class:`KerberosEnvironmentStatus`
     instances. The CLI (or any other frontend) is responsible for
     turning those results into user-facing messages.
@@ -123,6 +222,7 @@ class KerberosTicketService(BaseService):
                 restrictions are enforced for TGT generation.
         """
         super().__init__(event_bus=event_bus, license_mode=license_mode)
+        self.logger = _RichOutputLoggerAdapter(component="kerberos")
 
     # --------------------------------------------------------------------- #
     # Public API
@@ -474,15 +574,11 @@ class KerberosTicketService(BaseService):
             Path to krb5.conf if found, otherwise None.
         """
         root = Path(workspace_dir).expanduser().resolve()
-        krb5_conf_path = (
-            root / "domains" / domain / "krb5conf" / "krb5.conf"
-        )
+        krb5_conf_path = root / "domains" / domain / "krb5conf" / "krb5.conf"
 
         if krb5_conf_path.exists():
             os.environ["KRB5_CONFIG"] = str(krb5_conf_path)
-            self.logger.debug(
-                "Using domain-specific krb5.conf at %s", krb5_conf_path
-            )
+            self.logger.debug("Using domain-specific krb5.conf at %s", krb5_conf_path)
             return krb5_conf_path
 
         self.logger.debug(
@@ -915,7 +1011,6 @@ class KerberosTicketService(BaseService):
             success=True,
         )
 
-
     # ------------------------------------------------------------------ #
     # Service tickets / S4U helpers (getST.py)
     # ------------------------------------------------------------------ #
@@ -1026,8 +1121,7 @@ class KerberosTicketService(BaseService):
         if completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
             msg = (
-                stderr
-                or f"getST.py exited with non-zero status {completed.returncode}"
+                stderr or f"getST.py exited with non-zero status {completed.returncode}"
             )
             self.logger.warning(
                 "getST.py failed for forwardable ticket",
@@ -1098,10 +1192,15 @@ class KerberosTicketService(BaseService):
         )
 
         # Validate domain format
-        if not domain or "." not in domain or not domain.replace(".", "").replace("-", "").isalnum():
+        if (
+            not domain
+            or "." not in domain
+            or not domain.replace(".", "").replace("-", "").isalnum()
+        ):
             if verbose:
                 self.logger.warning(
-                    f"Invalid domain format: {domain}",
+                    "Invalid domain format: %s",
+                    domain,
                     extra={"domain": domain},
                 )
             self._emit_progress(
@@ -1265,7 +1364,9 @@ class KerberosTicketService(BaseService):
                     if process:
                         error_output = (getattr(process, "stderr", "") or "").strip()
                         if not error_output:
-                            error_output = (getattr(process, "stdout", "") or "").strip()
+                            error_output = (
+                                getattr(process, "stdout", "") or ""
+                            ).strip()
 
                     if "operation not permitted" in (error_output or "").lower():
                         break

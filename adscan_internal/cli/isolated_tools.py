@@ -14,6 +14,8 @@ from dataclasses import dataclass
 import os
 import re
 import shutil
+import subprocess
+import time
 from typing import Any, Dict
 
 
@@ -171,6 +173,51 @@ def check_executable_help_works(
         True if the tool seems runnable, False otherwise.
     """
 
+    def _run_probe_command(
+        cmd: list[str],
+        *,
+        probe_timeout_seconds: int,
+    ) -> tuple[bool, str, str, int | None, float]:
+        """Run a probe command and return (timed_out, stdout, stderr, rc, duration)."""
+        start = time.monotonic()
+        try:
+            completed = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=probe_timeout_seconds,
+            )
+            duration = time.monotonic() - start
+            return (
+                False,
+                completed.stdout or "",
+                completed.stderr or "",
+                completed.returncode,
+                duration,
+            )
+        except subprocess.TimeoutExpired as exc:
+            duration = time.monotonic() - start
+            stdout_text = (
+                exc.stdout.decode(errors="replace")
+                if isinstance(exc.stdout, bytes)
+                else str(exc.stdout or "")
+            )
+            stderr_text = (
+                exc.stderr.decode(errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else str(exc.stderr or "")
+            )
+            return True, stdout_text, stderr_text, None, duration
+        except Exception as exc:  # pragma: no cover - runtime/environment dependent
+            deps.telemetry_capture_exception(exc)
+            deps.print_error(
+                f"{tool_name}: failed to execute probe command ({cmd[-1]})"
+            )
+            deps.print_exception(exception=exc)
+            return True, "", str(exc), None, 0.0
+
     def _help_output_looks_valid(stdout_text: str, stderr_text: str) -> bool:
         """Return True when output strongly suggests help ran successfully.
 
@@ -231,7 +278,9 @@ def check_executable_help_works(
             return
 
         if "importerror" in lowered:
-            deps.print_warning(f"{tool_name} failed to start due to a Python import error.")
+            deps.print_warning(
+                f"{tool_name} failed to start due to a Python import error."
+            )
             marked_tool_venv = deps.mark_sensitive(
                 f"~/.adscan/tool_venvs/{tool_name}/venv",
                 "path",
@@ -285,27 +334,50 @@ def check_executable_help_works(
     attempted_nxc_fix = False
     attempted_manspider_fix = False
     for cmd in help_variants:
-        try:
-            result = deps.run_command(
-                cmd,
-                check=False,
-                capture_output=True,
-                env=env,
-                timeout=timeout_seconds,
+        timed_out, stdout_text, stderr_text, returncode, duration = _run_probe_command(
+            cmd,
+            probe_timeout_seconds=timeout_seconds,
+        )
+        if timed_out:
+            deps.telemetry_capture(
+                "tool_help_probe_timeout",
+                properties={
+                    "tool": tool_name,
+                    "flag": cmd[-1],
+                    "timeout_seconds": timeout_seconds,
+                    "duration_seconds": round(duration, 3),
+                },
             )
-        except Exception as e:  # pragma: no cover - depends on runtime environment
-            deps.telemetry_capture_exception(e)
-            deps.print_error(f"{tool_name}: failed to execute help command ({cmd[-1]})")
-            deps.print_exception(exception=e)
-            return False
+            deps.print_warning(
+                f"{tool_name} help probe timed out after {timeout_seconds}s ({cmd[-1]})."
+            )
+            deps.print_info_debug(
+                f"[check] {tool_name} probe timeout ({cmd[-1]}), duration={duration:.3f}s"
+            )
 
-        if result.returncode == 0:
+            extended_timeout = max(timeout_seconds * 3, 20)
+            deps.print_info_debug(
+                f"[check] {tool_name} retrying probe ({cmd[-1]}) with extended timeout={extended_timeout}s"
+            )
+            timed_out, stdout_text, stderr_text, returncode, duration = (
+                _run_probe_command(
+                    cmd,
+                    probe_timeout_seconds=extended_timeout,
+                )
+            )
+            if timed_out:
+                deps.print_error(
+                    f"{tool_name}: probe still timed out after {extended_timeout}s ({cmd[-1]})."
+                )
+                continue
+
+        if returncode == 0:
             return True
 
-        combined = f"{(result.stdout or '').strip()}\n{(result.stderr or '').strip()}"
-        if _help_output_looks_valid(result.stdout or "", result.stderr or ""):
+        combined = f"{(stdout_text or '').strip()}\n{(stderr_text or '').strip()}"
+        if _help_output_looks_valid(stdout_text or "", stderr_text or ""):
             deps.print_info_verbose(
-                f"[check] {tool_name} help probe ({cmd[-1]}) returned {result.returncode} but output looks like valid usage; accepting."
+                f"[check] {tool_name} help probe ({cmd[-1]}) returned {returncode} but output looks like valid usage; accepting."
             )
             return True
 
@@ -388,6 +460,9 @@ def check_executable_help_works(
                     )
                     return True
                 result = retry
+                returncode = retry.returncode
+                stdout_text = retry.stdout or ""
+                stderr_text = retry.stderr or ""
                 combined = (
                     f"{(result.stdout or '').strip()}\n{(result.stderr or '').strip()}"
                 )
@@ -468,6 +543,9 @@ def check_executable_help_works(
                     return True
                 # If retry failed, continue loop and log details below.
                 result = retry
+                returncode = retry.returncode
+                stdout_text = retry.stdout or ""
+                stderr_text = retry.stderr or ""
                 combined = (
                     f"{(result.stdout or '').strip()}\n{(result.stderr or '').strip()}"
                 )
@@ -478,12 +556,10 @@ def check_executable_help_works(
                 )
 
         output_preview = "\n".join(
-            s
-            for s in [(result.stdout or "").strip(), (result.stderr or "").strip()]
-            if s
+            s for s in [(stdout_text or "").strip(), (stderr_text or "").strip()] if s
         )[:800]
         deps.print_info_verbose(
-            f"[check] {tool_name} help probe ({cmd[-1]}) returned {result.returncode}. "
+            f"[check] {tool_name} help probe ({cmd[-1]}) returned {returncode}. "
             f"Output preview: {output_preview or '<no output>'}"
         )
 
@@ -717,4 +793,3 @@ def diagnose_manspider_help_failure(
     deps.print_info_verbose(
         "[check] manspider diagnosis: unknown failure while importing `magic` (output sanitized)."
     )
-

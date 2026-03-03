@@ -318,10 +318,16 @@ def handle_auth_and_optional_privs(
     print_info_debug(
         f"[creds] handle_auth_and_optional_privs post-enum: auth={updated_auth_status!r}"
     )
-    if updated_auth_status == "pwned" or not prompt_for_user_privs_after:
+    if not prompt_for_user_privs_after:
         print_info_debug(
             "[creds] skipping ask_for_user_privs "
             f"(auth={updated_auth_status!r}, prompt={prompt_for_user_privs_after})"
+        )
+        return
+    if updated_auth_status == "pwned":
+        print_info_debug(
+            "[creds] skipping ask_for_user_privs "
+            "(auth='pwned')"
         )
         return
 
@@ -443,6 +449,8 @@ def add_credential(
     source_steps: list[object] | None = None,
     prompt_for_user_privs_after: bool = True,
     verify_credential: bool = True,
+    verify_local_credential: bool = True,
+    prompt_local_reuse_after: bool = True,
     ui_silent: bool = False,
     ensure_fresh_kerberos_ticket: bool = True,
 ) -> None:
@@ -473,6 +481,10 @@ def add_credential(
         verify_credential: When True (default), verify domain credentials before
             storing them. Set to False for trusted bulk-import flows (for example
             DCSync dumps) where per-credential verification would be too costly.
+        verify_local_credential: When True (default), verify local credentials on
+            the target host before storing them.
+        prompt_local_reuse_after: When True (default), offer local credential
+            reuse checks after successfully adding local SMB credentials.
         ui_silent: When True, suppress user-facing Rich panels/messages from this
             flow while preserving internal logging and credential processing.
         ensure_fresh_kerberos_ticket: When True (default), refresh Kerberos tickets
@@ -572,9 +584,15 @@ def add_credential(
         shell.domains_data[domain] = {}
 
     if host and service:
-        # Verify local credentials before adding them
-        if shell.check_local_creds(domain, user, cred, host, service):
-            credential_source_verified = True
+        # Verify local credentials before adding them unless caller requested
+        # candidate-only persistence (for example: SAM single-host workflows).
+        local_verified = True
+        if verify_local_credential:
+            local_verified = bool(
+                shell.check_local_creds(domain, user, cred, host, service)
+            )
+        if local_verified:
+            credential_source_verified = bool(verify_local_credential)
             is_hash = shell.is_hash(cred)
             if is_hash and not user.endswith("$") and not skip_hash_cracking:
                 cred, is_hash = handle_hash_cracking(shell, domain, user, cred)
@@ -601,7 +619,7 @@ def add_credential(
 
             if service == "mssql":
                 shell.ask_for_mssql_steal(domain, host, user, cred, "false")
-            elif service == "smb":
+            elif service == "smb" and prompt_local_reuse_after:
                 shell.ask_for_local_cred_reuse(domain, user, cred)
 
             if source_steps and credential_source_verified:
@@ -1010,34 +1028,14 @@ def add_credentials_batch(
         List of persisted candidates ``[(username, resolved_credential), ...]``.
         The credential is a cracked plaintext when batch cracking succeeds.
     """
-    prepared: list[tuple[str, str]] = []
-    for username, credential in credentials:
-        normalized_user = str(username or "").strip()
-        normalized_credential = str(credential or "").strip()
-        if not normalized_user or not normalized_credential:
-            continue
-        prepared.append((normalized_user, normalized_credential))
-
-    if not prepared:
+    resolved_credentials = resolve_credential_pairs_for_batch(
+        shell,
+        credentials=credentials,
+        skip_hash_cracking=skip_hash_cracking,
+        skip_machine_accounts_cracking=True,
+    )
+    if not resolved_credentials:
         return []
-
-    cracked_by_hash: dict[str, str] = {}
-    if not skip_hash_cracking:
-        hash_candidates = [
-            cred
-            for user, cred in prepared
-            if shell.is_hash(cred) and not str(user).strip().endswith("$")
-        ]
-        cracked_by_hash = handle_hash_cracking_batch(shell, hash_candidates)
-
-    resolved_credentials: list[tuple[str, str]] = []
-    for username, credential in prepared:
-        resolved_credential = credential
-        if not skip_hash_cracking and shell.is_hash(credential):
-            cracked_password = cracked_by_hash.get(credential.lower())
-            if cracked_password:
-                resolved_credential = cracked_password
-        resolved_credentials.append((username, resolved_credential))
 
     for username, resolved_credential in resolved_credentials:
         add_credential(
@@ -1055,6 +1053,152 @@ def add_credentials_batch(
         )
 
     return resolved_credentials
+
+
+def resolve_credential_pairs_for_batch(
+    shell: Any,
+    *,
+    credentials: list[tuple[str, str]],
+    skip_hash_cracking: bool = False,
+    skip_machine_accounts_cracking: bool = True,
+) -> list[tuple[str, str]]:
+    """Normalize and optionally crack credential pairs for batch workflows.
+
+    Args:
+        shell: The active shell instance exposing ``is_hash`` and cracking helpers.
+        credentials: Candidate ``[(username, credential), ...]`` pairs.
+        skip_hash_cracking: When True, do not attempt weakpass batch cracking.
+        skip_machine_accounts_cracking: When True, skip cracking for usernames
+            ending with ``$``.
+
+    Returns:
+        Resolved ``[(username, credential), ...]`` pairs. Hash entries are replaced
+        by plaintext when cracking succeeds.
+    """
+
+    def _is_hash_value(value: str) -> bool:
+        is_hash_fn = getattr(shell, "is_hash", None)
+        if callable(is_hash_fn):
+            try:
+                return bool(is_hash_fn(value))
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+        return bool(re.fullmatch(r"[0-9a-fA-F]{32}", str(value or "").strip()))
+
+    prepared: list[tuple[str, str]] = []
+    for username, credential in credentials:
+        normalized_user = str(username or "").strip()
+        normalized_credential = str(credential or "").strip()
+        if not normalized_user or not normalized_credential:
+            continue
+        prepared.append((normalized_user, normalized_credential))
+
+    if not prepared:
+        return []
+
+    cracked_by_hash: dict[str, str] = {}
+    if not skip_hash_cracking:
+        hash_candidates = [
+            cred
+            for user, cred in prepared
+            if _is_hash_value(cred)
+            and not (skip_machine_accounts_cracking and str(user).endswith("$"))
+        ]
+        cracked_by_hash = handle_hash_cracking_batch(shell, hash_candidates)
+
+    resolved_credentials: list[tuple[str, str]] = []
+    for username, credential in prepared:
+        resolved_credential = credential
+        if not skip_hash_cracking and _is_hash_value(credential):
+            if not (skip_machine_accounts_cracking and str(username).endswith("$")):
+                cracked_password = cracked_by_hash.get(credential.lower())
+                if cracked_password:
+                    resolved_credential = cracked_password
+        resolved_credentials.append((username, resolved_credential))
+    return resolved_credentials
+
+
+def add_local_credentials_batch(
+    shell: Any,
+    *,
+    domain: str,
+    credentials: list[tuple[str, str, str, str]],
+    skip_hash_cracking: bool = False,
+    source_steps: list[object] | None = None,
+    verify_local_credential: bool = True,
+    prompt_local_reuse_after: bool = False,
+    ui_silent: bool = False,
+) -> list[tuple[str, str, str, str]]:
+    """Persist multiple local (host/service) credentials with shared batch logic.
+
+    Args:
+        shell: The active shell instance.
+        domain: Target domain context.
+        credentials: ``[(host, service, username, credential), ...]`` candidates.
+        skip_hash_cracking: When True, do not attempt weakpass batch cracking.
+        source_steps: Optional provenance steps attached to each persisted cred.
+        verify_local_credential: Forwarded to ``add_credential``.
+        prompt_local_reuse_after: Forwarded to ``add_credential``.
+        ui_silent: Forwarded to ``add_credential``.
+
+    Returns:
+        Persisted local credentials as ``[(host, service, username, resolved_cred)]``.
+    """
+
+    prepared_locals: list[tuple[str, str, str, str]] = []
+    for host, service, username, credential in credentials:
+        normalized_host = str(host or "").strip()
+        normalized_service = str(service or "").strip()
+        normalized_user = str(username or "").strip()
+        normalized_credential = str(credential or "").strip()
+        if not (
+            normalized_host
+            and normalized_service
+            and normalized_user
+            and normalized_credential
+        ):
+            continue
+        prepared_locals.append(
+            (
+                normalized_host,
+                normalized_service,
+                normalized_user,
+                normalized_credential,
+            )
+        )
+
+    if not prepared_locals:
+        return []
+
+    resolved_pairs = resolve_credential_pairs_for_batch(
+        shell,
+        credentials=[(user, credential) for _, _, user, credential in prepared_locals],
+        skip_hash_cracking=skip_hash_cracking,
+        skip_machine_accounts_cracking=True,
+    )
+
+    persisted: list[tuple[str, str, str, str]] = []
+    for local_entry, resolved_pair in zip(prepared_locals, resolved_pairs):
+        host, service, username, _raw_credential = local_entry
+        resolved_username, resolved_credential = resolved_pair
+        add_credential(
+            shell=shell,
+            domain=domain,
+            user=resolved_username,
+            cred=resolved_credential,
+            host=host,
+            service=service,
+            skip_hash_cracking=True,
+            source_steps=source_steps,
+            prompt_for_user_privs_after=False,
+            verify_local_credential=verify_local_credential,
+            prompt_local_reuse_after=prompt_local_reuse_after,
+            ui_silent=ui_silent,
+            ensure_fresh_kerberos_ticket=False,
+        )
+        persisted.append((host, service, resolved_username, resolved_credential))
+
+    return persisted
 
 
 def _verify_domain_credentials(
@@ -1141,9 +1285,12 @@ def check_local_creds(
     marked_host = mark_sensitive(host, "hostname")
     marked_log_file_path = mark_sensitive(log_file_path, "path")
     print_info_verbose("Executing host credential verification")
+    local_timeout_arg = (
+        " --smb-timeout 10" if str(service or "").strip().lower() == "smb" else ""
+    )
     print_info_debug(
         f"Command: {shell.netexec_path} {service} {marked_host} "
-        f'{auth_string} --log "{marked_log_file_path}"'
+        f'{auth_string}{local_timeout_arg} --log "{marked_log_file_path}"'
     )
 
     service_obj = shell._get_credential_service()

