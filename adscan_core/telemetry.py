@@ -762,6 +762,7 @@ SESSION_CAPTURE_ALLOWED_COMMANDS = frozenset(
 HOST_SESSION_CAPTURE_COMMANDS = frozenset({"install", "check", "update", "upgrade"})
 CONTAINER_SESSION_CAPTURE_COMMANDS = frozenset({"start", "ci"})
 SESSION_WORKSPACE_CONTEXT_COMMANDS = frozenset({"start", "ci"})
+_SESSION_TRACE_ID_ENV = "ADSCAN_SESSION_TRACE_ID"
 _SESSION_WORKSPACE_CONTEXT_FIELDS = frozenset(
     {"workspace_type", "lab_provider", "lab_name", "lab_slug", "lab_name_whitelisted"}
 )
@@ -817,6 +818,41 @@ def _filter_workspace_context_metadata(
     return filtered
 
 
+def _resolve_session_scope() -> str:
+    """Return session scope for telemetry correlation."""
+    if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
+        return "runtime"
+    return "launcher"
+
+
+def _resolve_session_trace_id() -> str | None:
+    """Return a sanitized session trace identifier from the environment."""
+    raw = str(os.getenv(_SESSION_TRACE_ID_ENV, "")).strip()
+    if not raw:
+        return None
+    sanitized = re.sub(r"[^a-zA-Z0-9._:-]+", "", raw)
+    if not sanitized:
+        return None
+    return sanitized[:128]
+
+
+def _enrich_session_metadata_context(
+    metadata: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return metadata enriched with session scope and trace correlation fields."""
+    enriched: dict[str, Any] = dict(metadata or {})
+
+    if not enriched.get("session_scope"):
+        enriched["session_scope"] = _resolve_session_scope()
+
+    if not enriched.get("session_trace_id"):
+        trace_id = _resolve_session_trace_id()
+        if trace_id:
+            enriched["session_trace_id"] = trace_id
+
+    return enriched
+
+
 def build_command_session_metadata(
     *,
     command_type: Optional[str],
@@ -835,9 +871,7 @@ def build_command_session_metadata(
     Returns:
         Metadata dictionary or None when no metadata is available.
     """
-    metadata: dict[str, Any] = {}
-    if base_metadata:
-        metadata.update(base_metadata)
+    metadata: dict[str, Any] = _enrich_session_metadata_context(base_metadata)
     if command_type:
         metadata["command_type"] = str(command_type)
     if extra:
@@ -3665,10 +3699,17 @@ def _vercel_metadata_fields(metadata: Optional[dict[str, Any]]) -> dict[str, Any
     environment = metadata.get("environment")
     command_type = metadata.get("command_type")
     command_success = metadata.get("command_success")
+    session_scope = metadata.get("session_scope")
+    session_trace_id = metadata.get("session_trace_id")
     if environment:
         updates["environment"] = environment.lower()
     if command_type:
         updates["command_type"] = command_type.lower()
+    if session_scope:
+        updates["session_scope"] = str(session_scope).lower()
+    if session_trace_id:
+        updates["session_trace_id"] = str(session_trace_id)
+        updates["trace_id"] = str(session_trace_id)
     if workspace_type:
         updates["workspace_type"] = workspace_type
     if command_success is not None:
@@ -3739,6 +3780,9 @@ def _summarize_vercel_payload_context(payload: dict[str, Any]) -> str:
     field_order = (
         "environment",
         "command_type",
+        "session_scope",
+        "session_trace_id",
+        "trace_id",
         "workspace_type",
         "target_type",
         "target_name",
@@ -3930,7 +3974,7 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
         # monotonic measurement even if the system clock changed.
         effective_started_at = finished_at - timedelta(seconds=duration_seconds)
         session_id = f"{TELEMETRY_ID}_{int(finished_at.timestamp())}"
-        metadata_with_env = dict(metadata or {})
+        metadata_with_env = _enrich_session_metadata_context(metadata)
 
         # Prefer an explicit environment passed by the caller (e.g., host launcher
         # passing its environment into the container). This prevents dev/ci runs
@@ -3975,6 +4019,8 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
         print_info_debug(
             "[DEBUG] capture_session_end metadata summary: "
             f"command_type={metadata_with_env.get('command_type')!r}, "
+            f"session_scope={metadata_with_env.get('session_scope')!r}, "
+            f"session_trace_id={metadata_with_env.get('session_trace_id')!r}, "
             f"workspace_type={metadata_with_env.get('workspace_type')!r}, "
             f"lab_provider={metadata_with_env.get('lab_provider')!r}, "
             f"lab_name={metadata_with_env.get('lab_name')!r}, "
@@ -4066,6 +4112,16 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
                 "session_id": session_id,
                 "environment": session_env,
             }
+            command_type = metadata_with_env.get("command_type")
+            if command_type:
+                properties["command_type"] = str(command_type).lower()
+            session_scope = metadata_with_env.get("session_scope")
+            if session_scope:
+                properties["session_scope"] = str(session_scope).lower()
+            session_trace_id = metadata_with_env.get("session_trace_id")
+            if session_trace_id:
+                properties["session_trace_id"] = str(session_trace_id)
+                properties["trace_id"] = str(session_trace_id)
             if session_url:
                 properties["session_url"] = session_url
                 # Keep legacy key for backward compatibility

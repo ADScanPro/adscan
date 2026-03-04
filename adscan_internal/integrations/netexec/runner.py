@@ -21,7 +21,12 @@ from adscan_internal import (
     print_warning_verbose,
     telemetry,
 )
-from adscan_internal.command_runner import CommandRunner, CommandSpec
+from adscan_internal.command_runner import (
+    CommandRunner,
+    CommandSpec,
+    build_execution_output_preview,
+    summarize_execution_result,
+)
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
@@ -556,46 +561,21 @@ class NetExecRunner:
                 if not has_clock_skew and not has_sched_error and not has_wrong_realm:
                     # Log a concise summary and truncated preview of the NetExec output.
                     try:
-                        stdout_lines = [
-                            line for line in stdout_clean.splitlines() if line.strip()
-                        ]
-                        stderr_lines = [
-                            line for line in stderr_clean.splitlines() if line.strip()
-                        ]
-                        elapsed_seconds = getattr(proc, "_adscan_elapsed_seconds", None)
-                        duration_text = (
-                            f"{float(elapsed_seconds):.3f}s"
-                            if isinstance(elapsed_seconds, (int, float))
-                            else "unknown"
+                        exit_code, stdout_count, stderr_count, duration_text = (
+                            summarize_execution_result(proc)
                         )
                         print_info_debug(
                             "[netexec] Result: "
-                            f"exit_code={proc.returncode}, "
-                            f"stdout_lines={len(stdout_lines)}, "
-                            f"stderr_lines={len(stderr_lines)}, "
+                            f"exit_code={exit_code}, "
+                            f"stdout_lines={stdout_count}, "
+                            f"stderr_lines={stderr_count}, "
                             f"duration={duration_text}"
                         )
 
-                        preview: list[str] = []
-                        head = stdout_lines[:10]
-                        tail = (
-                            stdout_lines[-10:]
-                            if len(stdout_lines) > 20
-                            else stdout_lines[10:]
-                        )
-                        if head:
-                            preview.append("STDOUT (head):")
-                            preview.extend(head)
-                        if tail:
-                            preview.append("STDOUT (tail):")
-                            preview.extend(tail)
-                        if stderr_lines:
-                            preview.append("STDERR (head):")
-                            preview.extend(stderr_lines[:10])
-
-                        if preview:
+                        preview_text = build_execution_output_preview(proc)
+                        if preview_text:
                             print_info_debug(
-                                "[netexec] Output preview:\n" + "\n".join(preview),
+                                "[netexec] Output preview:\n" + preview_text,
                                 panel=True,
                             )
                     except Exception:

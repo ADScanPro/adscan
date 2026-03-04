@@ -1425,6 +1425,18 @@ def start_bloodhound_ce(
                     telemetry_capture_exception_func(exc)
                 if print_error_func:
                     print_error_func("Failed to start BloodHound CE via host helper.")
+                if print_info_debug_func:
+                    marked_sock = mark_sensitive(sock_path, "path")
+                    marked_compose = mark_sensitive(compose_path, "path")
+                    print_info_debug_func(
+                        "[bloodhound-ce] host-helper startup failure context: "
+                        f"socket={marked_sock} socket_exists={Path(sock_path).exists()} "
+                        f"compose_path={marked_compose}"
+                    )
+                if print_info_func:
+                    print_info_func(
+                        "Check host-helper logs at ~/.adscan/logs/host-helper.log and retry."
+                    )
                 if print_exception_func:
                     print_exception_func(show_locals=False, exception=exc)
                 return False

@@ -1383,15 +1383,27 @@ def check_docker_compose(
             deps.print_instruction("Run: adscan install --only bloodhound")
             all_ok = False
 
-    # Check BloodHound CE configuration
-    bloodhound_config = deps.expand_effective_user_path(
+    # Check BloodHound CE configuration (managed path first, legacy fallback)
+    managed_compose_path = deps.expand_effective_user_path(
+        "~/.adscan/bloodhound/bloodhound-ce/docker-compose.yml"
+    )
+    legacy_compose_path = deps.expand_effective_user_path(
         "~/.config/bloodhound/docker-compose.yml"
     )
-    if deps.path_exists(bloodhound_config):
-        deps.print_success(f"BloodHound CE configuration found: {bloodhound_config}")
+    if deps.path_exists(managed_compose_path):
+        deps.print_success(
+            f"BloodHound CE managed configuration found: {managed_compose_path}"
+        )
+    elif deps.path_exists(legacy_compose_path):
+        deps.print_warning(
+            f"BloodHound CE legacy configuration found: {legacy_compose_path}"
+        )
+        deps.print_info(
+            "ADscan now uses the managed isolated BloodHound CE stack under ~/.adscan."
+        )
     else:
         deps.print_warning(
-            f"BloodHound CE configuration not found at {bloodhound_config}"
+            "BloodHound CE configuration not found in managed or legacy locations"
         )
         deps.print_info("This will be created automatically when needed.")
 

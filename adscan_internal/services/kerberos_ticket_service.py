@@ -20,11 +20,18 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 import ipaddress
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 
+from adscan_internal.command_runner import (
+    CommandRunner,
+    CommandSpec,
+    build_execution_output_preview,
+    summarize_execution_result,
+)
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.core import EventBus, LicenseMode
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
@@ -223,6 +230,7 @@ class KerberosTicketService(BaseService):
         """
         super().__init__(event_bus=event_bus, license_mode=license_mode)
         self.logger = _RichOutputLoggerAdapter(component="kerberos")
+        self._command_runner = CommandRunner()
 
     # --------------------------------------------------------------------- #
     # Public API
@@ -470,9 +478,6 @@ class KerberosTicketService(BaseService):
             - False: klist failed (missing/unreadable/expired)
             - None: unable to validate (klist not available or unexpected error)
         """
-        from pathlib import Path
-        import subprocess
-
         path = str(ticket_path or "").strip()
         if not path:
             return False
@@ -485,11 +490,11 @@ class KerberosTicketService(BaseService):
 
         try:
             clean_env = get_clean_env_for_compilation()
-            proc = subprocess.run(
-                ["klist", "-c", path],
-                capture_output=True,
-                text=True,
+            proc = self._run_command_logged(
+                label="klist -c",
+                command=["klist", "-c", path],
                 env=clean_env,
+                shell=False,
             )
             return proc.returncode == 0
         except FileNotFoundError:
@@ -553,6 +558,83 @@ class KerberosTicketService(BaseService):
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _safe_file_size(path: Path) -> int | None:
+        """Return file size in bytes when possible, otherwise ``None``."""
+        try:
+            return path.stat().st_size if path.exists() else None
+        except Exception:
+            return None
+
+    def _log_ticket_paths_state(
+        self,
+        *,
+        temp_path: Path,
+        final_path: Path,
+        default_path: Path,
+    ) -> None:
+        """Log ticket artifact state to debug missing/partial generation issues."""
+        self.logger.debug(
+            (
+                "Ticket artifact state: temp=%s (exists=%s,size=%s), "
+                "final=%s (exists=%s,size=%s), "
+                "default=%s (exists=%s,size=%s), cwd=%s"
+            ),
+            temp_path,
+            temp_path.exists(),
+            self._safe_file_size(temp_path),
+            final_path,
+            final_path.exists(),
+            self._safe_file_size(final_path),
+            default_path,
+            default_path.exists(),
+            self._safe_file_size(default_path),
+            Path.cwd(),
+        )
+
+    def _run_command_logged(
+        self,
+        *,
+        label: str,
+        command: str | list[str],
+        timeout: int | None = None,
+        env: Mapping[str, str] | None = None,
+        shell: bool = False,
+        cwd: str | None = None,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run command with centralized debug summary and output preview."""
+        self.logger.debug("%s command: %s", label, command)
+        result = self._command_runner.run(
+            CommandSpec(
+                command=command,
+                timeout=timeout,
+                shell=shell,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                cwd=cwd,
+                input=input_text,
+            )
+        )
+
+        exit_code, stdout_count, stderr_count, duration_text = summarize_execution_result(
+            result
+        )
+        self.logger.debug(
+            "%s result: exit_code=%s, stdout_lines=%s, stderr_lines=%s, duration=%s",
+            label,
+            exit_code,
+            stdout_count,
+            stderr_count,
+            duration_text,
+        )
+        preview = build_execution_output_preview(result)
+        if preview:
+            self.logger.debug("%s output preview:\n%s", label, preview)
+        return result
 
     def _setup_domain_krb5_config(
         self,
@@ -648,26 +730,17 @@ class KerberosTicketService(BaseService):
             username,
             domain,
         )
-        self.logger.debug("getTGT.py command: %s", cmd)
-
         try:
-            subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
+            get_tgt_result = self._run_command_logged(
+                label="getTGT.py",
+                command=cmd,
                 env=env,
+                shell=False,
             )
-        except subprocess.CalledProcessError as exc:
-            self.logger.warning(
-                "Impacket getTGT.py failed for %s@%s: %s",
-                username,
-                domain,
-                exc,
+        except Exception:  # pragma: no cover - error inesperado
+            self.logger.exception(
+                "Error running getTGT.py for %s@%s", username, domain, exc_info=True
             )
-            if exc.stderr:
-                self.logger.debug("getTGT.py stderr: %s", exc.stderr)
-            # Fallback a kinit
             return self._create_tgt_with_kinit(
                 username=username,
                 password=password,
@@ -675,10 +748,15 @@ class KerberosTicketService(BaseService):
                 workspace_dir=workspace_dir,
                 dc_ip=dc_ip,
             )
-        except Exception:  # pragma: no cover - error inesperado
-            self.logger.exception(
-                "Error running getTGT.py for %s@%s", username, domain, exc_info=True
+
+        if get_tgt_result.returncode != 0:
+            self.logger.warning(
+                "Impacket getTGT.py failed for %s@%s with exit code %s",
+                username,
+                domain,
+                get_tgt_result.returncode,
             )
+            # Fallback a kinit
             return self._create_tgt_with_kinit(
                 username=username,
                 password=password,
@@ -701,14 +779,30 @@ class KerberosTicketService(BaseService):
         if not self._finalize_ticket_file(
             temp_path=temp_ccache_path, final_path=final_ccache_path
         ):
-            return KerberosTGTResult(
-                username=username,
-                domain=domain,
-                ticket_path=None,
-                method="impacket_password",
-                success=False,
-                error_message="Ticket file was not created as expected",
+            self._log_ticket_paths_state(
+                temp_path=temp_ccache_path,
+                final_path=final_ccache_path,
+                default_path=default_ccache,
             )
+            self.logger.warning(
+                "Impacket getTGT.py returned success but ticket file was not created; "
+                "falling back to kinit for %s@%s",
+                username,
+                domain,
+            )
+            return self._create_tgt_with_kinit(
+                username=username,
+                password=password,
+                domain=domain,
+                workspace_dir=workspace_dir,
+                dc_ip=dc_ip,
+            )
+
+        self._log_ticket_paths_state(
+            temp_path=temp_ccache_path,
+            final_path=final_ccache_path,
+            default_path=default_ccache,
+        )
 
         os.environ["KRB5CCNAME"] = str(final_ccache_path)
 
@@ -743,11 +837,24 @@ class KerberosTicketService(BaseService):
             self.logger.info("Installing krb5-user for Kerberos authentication")
             clean_env = get_clean_env_for_compilation()
             try:
-                subprocess.run(
-                    ["apt-get", "install", "-y", "krb5-user"],
-                    check=True,
+                install_result = self._run_command_logged(
+                    label="apt-get install krb5-user",
+                    command=["apt-get", "install", "-y", "krb5-user"],
                     env=clean_env,
+                    shell=False,
                 )
+                if install_result.returncode != 0:
+                    return KerberosTGTResult(
+                        username=username,
+                        domain=domain,
+                        ticket_path=None,
+                        method="kinit",
+                        success=False,
+                        error_message=(
+                            (install_result.stderr or "").strip()
+                            or "Failed to install krb5-user"
+                        ),
+                    )
             except Exception as exc:  # pragma: no cover - dependencia de sistema
                 self.logger.exception(
                     "Failed to install krb5-user: %s", exc, exc_info=True
@@ -799,20 +906,24 @@ class KerberosTicketService(BaseService):
             # Preserve any KRB5_CONFIG set by _setup_domain_krb5_config.
             if os.environ.get("KRB5_CONFIG"):
                 env["KRB5_CONFIG"] = os.environ["KRB5_CONFIG"]
-            proc = subprocess.Popen(
-                kinit_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
-            stdout, stderr = proc.communicate(input=password)
 
-            if proc.returncode == 0:
+            result = self._run_command_logged(
+                label="kinit",
+                command=kinit_cmd,
+                env=env,
+                shell=False,
+                input_text=password,
+            )
+
+            if result.returncode == 0:
                 if not self._finalize_ticket_file(
                     temp_path=temp_ccache_path, final_path=final_ccache_path
                 ):
+                    self._log_ticket_paths_state(
+                        temp_path=temp_ccache_path,
+                        final_path=final_ccache_path,
+                        default_path=Path.cwd() / f"{username}.ccache",
+                    )
                     return KerberosTGTResult(
                         username=username,
                         domain=domain,
@@ -836,14 +947,20 @@ class KerberosTicketService(BaseService):
                     success=True,
                 )
 
-            self.logger.warning("kinit failed for %s@%s: %s", username, domain, stderr)
+            stderr_text = (result.stderr or "").strip()
+            self.logger.warning(
+                "kinit failed for %s@%s: %s",
+                username,
+                domain,
+                stderr_text,
+            )
             return KerberosTGTResult(
                 username=username,
                 domain=domain,
                 ticket_path=None,
                 method="kinit",
                 success=False,
-                error_message=stderr.strip() if stderr else "kinit failed",
+                error_message=stderr_text if stderr_text else "kinit failed",
             )
 
         finally:
@@ -932,30 +1049,12 @@ class KerberosTicketService(BaseService):
             username,
             domain,
         )
-        self.logger.debug("getTGT.py NTLM command: %s", cmd)
-
         try:
-            subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
+            get_tgt_result = self._run_command_logged(
+                label="getTGT.py NTLM",
+                command=cmd,
                 env=env,
-            )
-        except subprocess.CalledProcessError as exc:
-            self.logger.warning(
-                "Failed to create Kerberos TGT from NTLM hash with getTGT.py: %s",
-                exc,
-            )
-            if exc.stderr:
-                self.logger.debug("getTGT.py NTLM stderr: %s", exc.stderr)
-            return KerberosTGTResult(
-                username=username,
-                domain=domain,
-                ticket_path=None,
-                method="impacket_ntlm",
-                success=False,
-                error_message=exc.stderr.strip() if exc.stderr else str(exc),
+                shell=False,
             )
         except Exception as exc:  # pragma: no cover - error inesperado
             self.logger.exception(
@@ -973,6 +1072,24 @@ class KerberosTicketService(BaseService):
                 error_message=str(exc),
             )
 
+        if get_tgt_result.returncode != 0:
+            stderr_text = (get_tgt_result.stderr or "").strip()
+            self.logger.warning(
+                "Failed to create Kerberos TGT from NTLM hash with getTGT.py "
+                "for %s@%s (exit=%s)",
+                username,
+                domain,
+                get_tgt_result.returncode,
+            )
+            return KerberosTGTResult(
+                username=username,
+                domain=domain,
+                ticket_path=None,
+                method="impacket_ntlm",
+                success=False,
+                error_message=stderr_text or "getTGT.py failed",
+            )
+
         default_ccache = Path.cwd() / f"{username}.ccache"
         if default_ccache.exists():
             try:
@@ -986,6 +1103,11 @@ class KerberosTicketService(BaseService):
         if not self._finalize_ticket_file(
             temp_path=temp_ccache_path, final_path=final_ccache_path
         ):
+            self._log_ticket_paths_state(
+                temp_path=temp_ccache_path,
+                final_path=final_ccache_path,
+                default_path=default_ccache,
+            )
             return KerberosTGTResult(
                 username=username,
                 domain=domain,
@@ -994,6 +1116,12 @@ class KerberosTicketService(BaseService):
                 success=False,
                 error_message="Ticket file was not created as expected",
             )
+
+        self._log_ticket_paths_state(
+            temp_path=temp_ccache_path,
+            final_path=final_ccache_path,
+            default_path=default_ccache,
+        )
 
         os.environ["KRB5CCNAME"] = str(final_ccache_path)
 
@@ -1080,22 +1208,20 @@ class KerberosTicketService(BaseService):
             pdc_ip,
             f"{domain}/{s4u_account}:{s4u_password}",
         ]
-        command_str = " ".join(command_list)
+        command_str = shlex.join(command_list)
 
         self.logger.info(
             "Creating forwardable ticket via getST.py",
             extra={"target_user": target_user, "spn": spn},
         )
-        self.logger.debug("getST.py command: %s", command_str)
 
         try:
-            completed = subprocess.run(
-                command_list,
-                check=False,
-                capture_output=True,
-                text=True,
-                env=env,
+            completed = self._run_command_logged(
+                label="getST.py",
+                command=command_list,
                 timeout=timeout,
+                env=env,
+                shell=False,
             )
         except subprocess.TimeoutExpired as exc:
             msg = f"getST.py timed out after {timeout} seconds: {exc}"

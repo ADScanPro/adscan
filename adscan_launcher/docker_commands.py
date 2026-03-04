@@ -32,6 +32,7 @@ from adscan_launcher.bloodhound_ce_compose import (
     compose_list_images,
     compose_pull,
     compose_up,
+    docker_compose_available,
     ensure_bloodhound_compose_file,
     get_bloodhound_compose_project_name,
 )
@@ -92,6 +93,9 @@ _DOCKER_RUN_HELP_HAS_GPUS_RE = re.compile(r"\\s--gpus\\b", re.IGNORECASE)
 _DOCKER_INSTALL_DOCS_URL = "https://www.adscanpro.com/docs/getting-started/installation"
 _BLOODHOUND_TROUBLESHOOTING_DOCS_URL = (
     "https://www.adscanpro.com/docs/guides/troubleshooting"
+)
+_HOST_HELPER_TROUBLESHOOTING_DOCS_URL = (
+    "https://www.adscanpro.com/docs/guides/troubleshooting#host-helper-docker-mode"
 )
 _LOCAL_RESOLVER_LOOPBACK_CANDIDATES = (
     "127.0.0.2",
@@ -391,6 +395,49 @@ def _warn_using_legacy_image(*, selected_image: str, preferred_image: str) -> No
     _LEGACY_IMAGE_WARNING_SHOWN = True
 
 
+def _ensure_docker_compose_prerequisites(*, command_name: str) -> bool:
+    """Validate Docker + Docker Compose prerequisites with combined UX.
+
+    Returns ``True`` when both prerequisites are available. When they are not,
+    emits a single actionable guidance block so users can fix everything in one
+    pass instead of hitting sequential errors.
+    """
+    has_docker = docker_available()
+    has_compose = docker_compose_available() if has_docker else False
+    if has_docker and has_compose:
+        return True
+
+    print_error("Docker prerequisites are incomplete for this command.")
+    lines = [
+        f"Docker CLI/Engine: {'OK' if has_docker else 'MISSING'}",
+        f"Docker Compose: {'OK' if has_compose else 'MISSING'}",
+    ]
+    if has_docker and not has_compose:
+        lines.append("Detected Docker but Compose plugin is unavailable.")
+        lines.append(
+            "Install Compose plugin (for example on Debian/Ubuntu): "
+            "sudo apt install docker-compose-plugin"
+        )
+    elif not has_docker:
+        lines.append(
+            "Docker is not installed or not in PATH. Compose cannot work without Docker."
+        )
+    print_panel(
+        "\n".join(lines),
+        title="Docker Prerequisites Required",
+        border_style="yellow",
+    )
+    retry_hint = (
+        "adscan start (or rerun your original command)"
+        if command_name == "passthrough"
+        else f"adscan {command_name}"
+    )
+    print_instruction(
+        f"Install Docker + Docker Compose, then retry: {retry_hint}. Guide: {_DOCKER_INSTALL_DOCS_URL}"
+    )
+    return False
+
+
 def _select_existing_or_preferred_image() -> str:
     """Use an existing compatible image when available, else preferred image."""
     candidates = _get_docker_image_candidates()
@@ -460,6 +507,210 @@ def _ensure_image_pulled_with_legacy_fallback(
             )
             return candidate
     return None
+
+
+def _emit_docker_daemon_troubleshooting_snapshot(*, stage: str) -> None:
+    """Emit focused diagnostics when Docker daemon is unreachable.
+
+    The goal is to provide actionable debug context (service state, socket and
+    DOCKER_HOST hints) without requiring users to rerun extra commands first.
+    """
+    docker_host = os.getenv("DOCKER_HOST", "").strip()
+    if docker_host:
+        print_info_debug(
+            "[docker] DOCKER_HOST is set: "
+            f"{mark_sensitive(docker_host, 'detail')}"
+        )
+
+    sock_path = Path("/var/run/docker.sock")
+    sock_exists = sock_path.exists()
+    sock_readable = os.access(sock_path, os.R_OK | os.W_OK) if sock_exists else False
+    print_info_debug(
+        "[docker] socket probe: "
+        f"path={mark_sensitive(str(sock_path), 'path')} "
+        f"exists={sock_exists} readable_writable={sock_readable}"
+    )
+
+    if not shutil.which("systemctl"):
+        print_info_debug(
+            "[docker] systemctl is unavailable; skipping docker service diagnostics."
+        )
+        return
+
+    def _run_systemctl_capture(args: list[str]) -> None:
+        cmd: list[str] = ["systemctl"] + args
+        if os.geteuid() != 0:
+            if not _ensure_sudo_ticket_if_needed():
+                print_info_debug(
+                    "[docker] systemctl diagnostics skipped: sudo validation failed."
+                )
+                return
+            cmd = [
+                "sudo",
+                "--preserve-env=HOME,XDG_CONFIG_HOME,ADSCAN_HOME,ADSCAN_SESSION_ENV,CI,GITHUB_ACTIONS",
+            ] + cmd
+
+        try:
+            proc = subprocess.run(  # noqa: S603
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                "[docker] systemctl diagnostic command failed: "
+                f"stage={stage} cmd={shell_quote_cmd(cmd)} "
+                f"error={mark_sensitive(str(exc), 'error')}"
+            )
+            return
+
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        if stdout:
+            print_info_debug(
+                "[docker] systemctl diagnostic stdout: "
+                f"stage={stage} cmd={shell_quote_cmd(cmd)}\n"
+                f"{mark_sensitive(stdout, 'detail')}"
+            )
+        if stderr:
+            print_info_debug(
+                "[docker] systemctl diagnostic stderr: "
+                f"stage={stage} cmd={shell_quote_cmd(cmd)}\n"
+                f"{mark_sensitive(stderr, 'detail')}"
+            )
+
+    _run_systemctl_capture(["is-active", "docker"])
+    _run_systemctl_capture(["status", "docker", "--no-pager", "--full"])
+
+
+def _print_docker_image_pull_failure_guidance(
+    *,
+    image: str,
+    pull_timeout: int | None,
+    command_name: str,
+) -> None:
+    """Print targeted guidance for Docker image pull failures.
+
+    Distinguishes daemon/runtime failures from network/registry failures so users
+    get relevant troubleshooting steps.
+    """
+    daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
+        run_docker_command_func=_run_docker_status_command
+    )
+
+    print_error("Failed to pull the ADscan Docker image.")
+    if not daemon_running:
+        print_warning(
+            "Docker daemon is not reachable. ADscan cannot pull images until Docker API is available."
+        )
+        print_info_debug(
+            "[docker] daemon diagnostic (image_pull_failure): "
+            f"{mark_sensitive(daemon_diagnostic, 'detail')}"
+        )
+        _emit_docker_daemon_troubleshooting_snapshot(stage="image_pull_failure")
+        print_instruction("Start Docker and retry:")
+        print_instruction("  sudo systemctl start docker")
+        print_instruction("Check service state:")
+        print_instruction("  sudo systemctl status docker --no-pager")
+        print_instruction("Check daemon logs:")
+        print_instruction("  sudo journalctl -u docker -n 120 --no-pager")
+        if os.getenv("DOCKER_HOST", "").strip():
+            print_instruction(
+                "If DOCKER_HOST is misconfigured, unset it and retry:"
+            )
+            print_instruction("  unset DOCKER_HOST")
+        print_instruction(
+            f"Retry command: adscan {command_name}"
+        )
+        return
+
+    print_instruction("Retry the command, or pull manually and retry:")
+    pull_cmd_prefix = "sudo " if (docker_needs_sudo() and os.geteuid() != 0) else ""
+    print_instruction(f"  {pull_cmd_prefix}docker pull {image}")
+    suggested_timeout = 7200 if pull_timeout is None else max(pull_timeout, 7200)
+    print_instruction("If you are on a slow network, increase the pull timeout and retry:")
+    print_instruction(f"  adscan {command_name} --pull-timeout {suggested_timeout}")
+    print_instruction("To disable the pull timeout entirely:")
+    print_instruction(f"  adscan {command_name} --pull-timeout 0")
+
+
+def _run_bloodhound_compose_pull_with_daemon_recovery(
+    *,
+    compose_path: Path,
+    stream_output: bool,
+) -> bool:
+    """Run `docker compose pull` with daemon availability recovery.
+
+    This helper centralizes daemon checks/retries for BloodHound CE image pulls so
+    install/start/check/ci paths share the same resilient behavior.
+    """
+    if not _ensure_docker_daemon_available_for_pull(stage="pre_bloodhound_compose_pull"):
+        return False
+
+    if compose_pull(compose_path, stream_output=stream_output):
+        return True
+
+    daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
+        run_docker_command_func=_run_docker_status_command
+    )
+    if daemon_running:
+        return False
+
+    print_warning(
+        "Docker daemon became unavailable while pulling BloodHound CE images; "
+        "attempting recovery before retrying."
+    )
+    print_info_debug(
+        "[docker] daemon diagnostic after BloodHound CE pull failure: "
+        f"{mark_sensitive(daemon_diagnostic, 'detail')}"
+    )
+
+    if not _ensure_docker_daemon_available_for_pull(
+        stage="post_bloodhound_compose_pull_failure"
+    ):
+        return False
+
+    print_info("Retrying BloodHound CE image pull after Docker daemon recovery...")
+    return compose_pull(compose_path, stream_output=stream_output)
+
+
+def _run_bloodhound_compose_up_with_daemon_recovery(*, compose_path: Path) -> bool:
+    """Run `docker compose up -d` with daemon availability recovery.
+
+    This helper centralizes daemon checks/retries for BloodHound CE stack start so
+    install/start/check/ci paths share the same resilient behavior.
+    """
+    if not _ensure_docker_daemon_available_for_pull(stage="pre_bloodhound_compose_up"):
+        return False
+
+    if compose_up(compose_path):
+        return True
+
+    daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
+        run_docker_command_func=_run_docker_status_command
+    )
+    if daemon_running:
+        return False
+
+    print_warning(
+        "Docker daemon became unavailable while starting BloodHound CE containers; "
+        "attempting recovery before retrying."
+    )
+    print_info_debug(
+        "[docker] daemon diagnostic after BloodHound CE compose-up failure: "
+        f"{mark_sensitive(daemon_diagnostic, 'detail')}"
+    )
+
+    if not _ensure_docker_daemon_available_for_pull(
+        stage="post_bloodhound_compose_up_failure"
+    ):
+        return False
+
+    print_info("Retrying BloodHound CE container startup after Docker daemon recovery...")
+    return compose_up(compose_path)
 
 
 def get_docker_image_name() -> str:
@@ -662,9 +913,12 @@ def _reset_bloodhound_ce_stack_for_password_recovery(compose_path: Path) -> bool
     print_warning(
         "Resetting BloodHound CE stack for password recovery. Existing BloodHound data will be deleted."
     )
+    project_name = get_bloodhound_compose_project_name()
     down_cmd = [
         "docker",
         "compose",
+        "-p",
+        project_name,
         "-f",
         str(compose_path),
         "down",
@@ -718,6 +972,7 @@ def _bootstrap_bloodhound_ce_auth(
     print_info_debug(
         f"[bloodhound-ce] install auth bootstrap context: config_exists={config_exists}"
     )
+    managed_base_url = f"http://127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
 
     if config_exists:
         # Reused installation: validate current config/token first.
@@ -739,14 +994,27 @@ def _bootstrap_bloodhound_ce_auth(
             "[bloodhound-ce] no existing config found; attempting first-run "
             "initial-password extraction from container logs."
         )
-        if detect_existing_bloodhound_ce_state():
+        existing_ce_state = detect_existing_bloodhound_ce_state()
+        if existing_ce_state:
             print_info(
                 "Detected an existing BloodHound CE data state without local ADscan "
-                "credentials. Skipping first-run password extraction."
+                "credentials. Attempting password extraction from container logs anyway."
             )
             print_info_debug(
-                "[bloodhound-ce] first-run password extraction skipped: "
-                "container logs indicate an already initialized CE instance."
+                "[bloodhound-ce] existing CE state detected; continuing with "
+                "best-effort container-log password extraction."
+            )
+        runtime_stable = _wait_for_bloodhound_ce_api_ready(
+            base_url=managed_base_url,
+            timeout_seconds=120,
+            interval_seconds=2,
+            required_consecutive_successes=3,
+            require_managed_container_health=True,
+        )
+        if not runtime_stable:
+            print_warning(
+                "BloodHound CE runtime is not stable yet; skipping automatic initial-password "
+                "bootstrap for now."
             )
             password_automation_ok = False
         else:
@@ -754,11 +1022,11 @@ def _bootstrap_bloodhound_ce_auth(
                 desired_password=desired_password,
                 suppress_browser=suppress_browser,
             )
-            if not password_automation_ok:
-                print_info_debug(
-                    "[bloodhound-ce] initial-password automation did not succeed; "
-                    "trying desired-password fallback auth bootstrap."
-                )
+        if not password_automation_ok:
+            print_info_debug(
+                "[bloodhound-ce] initial-password automation did not succeed; "
+                "trying desired-password fallback auth bootstrap."
+            )
         marked_desired_password = mark_sensitive(desired_password, "password")
         print_info_debug(
             "[bloodhound-ce] desired-password fallback attempt: "
@@ -813,10 +1081,24 @@ def _bootstrap_bloodhound_ce_auth(
     if not _reset_bloodhound_ce_stack_for_password_recovery(compose_path):
         return auth_verified, desired_password_verified, password_automation_ok
 
-    password_automation_ok = ensure_bloodhound_admin_password(
-        desired_password=desired_password,
-        suppress_browser=suppress_browser,
+    runtime_stable = _wait_for_bloodhound_ce_api_ready(
+        base_url=managed_base_url,
+        timeout_seconds=120,
+        interval_seconds=2,
+        required_consecutive_successes=3,
+        require_managed_container_health=True,
     )
+    if not runtime_stable:
+        print_warning(
+            "BloodHound CE runtime is not stable after reset; skipping automatic "
+            "initial-password bootstrap."
+        )
+        password_automation_ok = False
+    else:
+        password_automation_ok = ensure_bloodhound_admin_password(
+            desired_password=desired_password,
+            suppress_browser=suppress_browser,
+        )
     desired_password_verified = _persist_bloodhound_ce_config(
         username="admin",
         password=desired_password,
@@ -858,6 +1140,21 @@ def _ensure_bloodhound_ce_auth_for_docker(
         base_url_override
     )
     resolved_username = _normalize_external_bloodhound_username(username_override)
+    resolved_base_url = (
+        resolved_base_url_override
+        or f"http://127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
+    )
+    if not _wait_for_bloodhound_ce_api_ready(
+        base_url=resolved_base_url,
+        timeout_seconds=120,
+        interval_seconds=2,
+        required_consecutive_successes=3,
+        require_managed_container_health=True,
+    ):
+        print_warning(
+            "BloodHound CE runtime is not stable enough yet to validate credentials."
+        )
+        return False
 
     if not BH_CONFIG_FILE.exists():
         print_info_verbose(
@@ -872,7 +1169,7 @@ def _ensure_bloodhound_ce_auth_for_docker(
         if _persist_bloodhound_ce_config(
             username=resolved_username,
             password=resolved_desired_password,
-            base_url=resolved_base_url_override,
+            base_url=resolved_base_url,
         ):
             print_success("BloodHound CE config created on host.")
         else:
@@ -887,7 +1184,7 @@ def _ensure_bloodhound_ce_auth_for_docker(
                 return False
             print_warning(
                 "Default BloodHound CE password failed. Please enter the current "
-                "admin password for your existing BloodHound CE installation."
+                "admin password for your current BloodHound CE installation."
             )
             try:
                 new_password = getpass.getpass(
@@ -911,7 +1208,7 @@ def _ensure_bloodhound_ce_auth_for_docker(
             if not _persist_bloodhound_ce_config(
                 username=resolved_username,
                 password=new_password,
-                base_url=resolved_base_url_override,
+                base_url=resolved_base_url,
             ):
                 print_warning(
                     "Could not create BloodHound CE config with the provided password."
@@ -1011,29 +1308,30 @@ def _ensure_bloodhound_ce_auth_for_docker(
             "[bloodhound-ce] managed auth verification failed with stored credentials; "
             "attempting first-run password recovery from container logs."
         )
-        if detect_existing_bloodhound_ce_state():
+        existing_ce_state = detect_existing_bloodhound_ce_state()
+        if existing_ce_state:
             print_info_debug(
-                "[bloodhound-ce] managed auth recovery skipped: existing CE data state detected."
+                "[bloodhound-ce] existing CE state detected during managed auth bootstrap; "
+                "attempting container-log recovery as best effort."
             )
-        else:
-            recovered = ensure_bloodhound_admin_password(
-                desired_password=resolved_desired_password,
-                suppress_browser=True,
-                base_url=base_url,
+        recovered = ensure_bloodhound_admin_password(
+            desired_password=resolved_desired_password,
+            suppress_browser=True,
+            base_url=base_url,
+        )
+        if recovered and _persist_bloodhound_ce_config(
+            username=resolved_username,
+            password=resolved_desired_password,
+            base_url=base_url,
+        ):
+            print_success(
+                "BloodHound CE authentication verified via managed password recovery."
             )
-            if recovered and _persist_bloodhound_ce_config(
-                username=resolved_username,
-                password=resolved_desired_password,
-                base_url=base_url,
-            ):
-                print_success(
-                    "BloodHound CE authentication verified via managed password recovery."
-                )
-                return True
-            if not recovered:
-                print_info_debug(
-                    "[bloodhound-ce] managed auth recovery could not extract/update initial password."
-                )
+            return True
+        if not recovered:
+            print_info_debug(
+                "[bloodhound-ce] managed auth recovery could not extract/update initial password."
+            )
 
     if not sys.stdin.isatty():
         print_warning(
@@ -1105,8 +1403,91 @@ def _ensure_bloodhound_config_mountable() -> bool:
         return False
 
 
+def _get_managed_bloodhound_container_statuses() -> dict[str, str] | None:
+    """Return managed BloodHound CE container statuses from docker ps.
+
+    Returns:
+        Mapping ``container_name -> status`` for expected managed containers.
+        Returns None when docker status cannot be collected.
+    """
+    project_name = get_bloodhound_compose_project_name()
+    expected_names = {
+        f"{project_name}-bloodhound-1",
+        f"{project_name}-app-db-1",
+        f"{project_name}-graph-db-1",
+    }
+    try:
+        proc = run_docker(
+            ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}"],
+            check=False,
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[bloodhound-ce] managed status probe exception: "
+            f"{mark_sensitive(str(exc), 'error')}"
+        )
+        return None
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        if stderr:
+            print_info_debug(
+                "[bloodhound-ce] managed status probe stderr: "
+                f"{mark_sensitive(stderr, 'detail')}"
+            )
+        return None
+
+    snapshot: dict[str, str] = {name: "" for name in expected_names}
+    for raw_line in (proc.stdout or "").splitlines():
+        line = str(raw_line or "").strip()
+        if not line or "\t" not in line:
+            continue
+        name, status = line.split("\t", 1)
+        if name in snapshot:
+            snapshot[name] = status.strip()
+    return snapshot
+
+
+def _evaluate_managed_bloodhound_container_readiness(
+    snapshot: dict[str, str] | None,
+) -> tuple[bool, str]:
+    """Evaluate whether managed BloodHound CE containers are stable enough for auth."""
+    if snapshot is None:
+        return False, "docker_ps_unavailable"
+
+    missing = sorted(name for name, status in snapshot.items() if not status)
+    if missing:
+        return False, f"missing={','.join(missing)}"
+
+    lowered = {name: status.lower() for name, status in snapshot.items()}
+    bloodhound_name = next(name for name in lowered if name.endswith("-bloodhound-1"))
+    app_db_name = next(name for name in lowered if name.endswith("-app-db-1"))
+    graph_db_name = next(name for name in lowered if name.endswith("-graph-db-1"))
+
+    if "up" not in lowered[bloodhound_name]:
+        return False, f"web_not_up={snapshot[bloodhound_name]!r}"
+    if "up" not in lowered[app_db_name]:
+        return False, f"app_db_not_up={snapshot[app_db_name]!r}"
+    if "healthy" not in lowered[app_db_name]:
+        return False, f"app_db_not_healthy={snapshot[app_db_name]!r}"
+    if "up" not in lowered[graph_db_name]:
+        return False, f"graph_db_not_up={snapshot[graph_db_name]!r}"
+    if "healthy" not in lowered[graph_db_name]:
+        return False, f"graph_db_not_healthy={snapshot[graph_db_name]!r}"
+
+    return True, "ok"
+
+
 def _wait_for_bloodhound_ce_api_ready(
-    *, base_url: str, timeout_seconds: int = 60, interval_seconds: int = 1
+    *,
+    base_url: str,
+    timeout_seconds: int = 60,
+    interval_seconds: int = 1,
+    required_consecutive_successes: int = 1,
+    require_managed_container_health: bool = False,
 ) -> bool:
     """Wait for the BloodHound CE API to become reachable.
 
@@ -1117,25 +1498,49 @@ def _wait_for_bloodhound_ce_api_ready(
     if not base_url:
         base_url = f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
 
-    print_info("Waiting for BloodHound CE API to be ready...")
+    if required_consecutive_successes < 1:
+        required_consecutive_successes = 1
+
+    if require_managed_container_health:
+        print_info("Waiting for BloodHound CE runtime to stabilize...")
+    else:
+        print_info("Waiting for BloodHound CE API to be ready...")
     start = time.monotonic()
     last_status: int | None = None
     last_error: Exception | None = None
+    last_container_reason = "not_checked"
+    consecutive_ok = 0
 
     while time.monotonic() - start < timeout_seconds:
+        containers_ready = True
+        if require_managed_container_health:
+            snapshot = _get_managed_bloodhound_container_statuses()
+            containers_ready, last_container_reason = (
+                _evaluate_managed_bloodhound_container_readiness(snapshot)
+            )
+            if not containers_ready:
+                consecutive_ok = 0
+                time.sleep(interval_seconds)
+                continue
+
         try:
             resp = requests.get(f"{base_url}/api/version", timeout=2)
             last_status = resp.status_code
             last_error = None
             if resp.status_code in (200, 401, 403):
-                return True
+                consecutive_ok += 1
+                if consecutive_ok >= required_consecutive_successes:
+                    return True
+            else:
+                consecutive_ok = 0
         except requests.exceptions.RequestException as exc:
             telemetry.capture_exception(exc)
             last_error = exc
+            consecutive_ok = 0
         time.sleep(interval_seconds)
 
     print_warning(
-        "BloodHound CE API did not become ready within "
+        "BloodHound CE runtime did not become stable within "
         f"{timeout_seconds} seconds. The containers may still be initializing."
     )
     print_instruction(
@@ -1151,6 +1556,11 @@ def _wait_for_bloodhound_ce_api_ready(
         print_info_debug(
             "[bloodhound-ce] readiness probe last status: "
             f"{mark_sensitive(str(last_status), 'status')}"
+        )
+    if require_managed_container_health:
+        print_info_debug(
+            "[bloodhound-ce] readiness probe container gate reason: "
+            f"{mark_sensitive(last_container_reason, 'detail')}"
         )
     _print_bloodhound_ce_readiness_diagnostics()
     return False
@@ -1194,7 +1604,15 @@ def _print_bloodhound_ce_readiness_diagnostics() -> None:
         print_info_debug("[bloodhound-ce] readiness diagnostics: no docker ps output.")
         return
 
-    lines = [line for line in ps_output.splitlines() if "bloodhound" in line.lower()]
+    managed_project = get_bloodhound_compose_project_name().lower()
+    lines = [
+        line
+        for line in ps_output.splitlines()
+        if (
+            "bloodhound" in line.lower()
+            or line.lower().startswith(f"{managed_project}-")
+        )
+    ]
     if not lines:
         print_info_debug(
             "[bloodhound-ce] readiness diagnostics: no bloodhound containers found in docker ps."
@@ -1670,20 +2088,117 @@ def _ensure_container_shared_token() -> str:
     return _EPHEMERAL_CONTAINER_SHARED_TOKEN
 
 
-def _start_host_helper(*, socket_path: Path) -> subprocess.Popen[str] | None:
-    """Start the privileged host helper via sudo (best effort)."""
-    _ensure_container_shared_token()
-
-    if not _ensure_sudo_ticket_if_needed():
-        print_warning(
-            "Unable to acquire sudo privileges; host clock sync will not be available "
-            "from inside the container."
+def _print_host_helper_log_tail(*, max_lines: int = 40) -> None:
+    """Emit the latest host-helper log lines for troubleshooting."""
+    log_path = _get_logs_dir() / "host-helper.log"
+    try:
+        if not log_path.is_file():
+            print_info_debug(
+                "[host-helper] log tail unavailable: "
+                f"path={mark_sensitive(str(log_path), 'path')} missing"
+            )
+            return
+        raw = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[host-helper] failed reading log tail: "
+            f"path={mark_sensitive(str(log_path), 'path')} "
+            f"error={mark_sensitive(str(exc), 'error')}"
         )
-        print_instruction(
-            "If Kerberos fails due to clock skew, run on host: sudo ntpdate <PDC_IP>"
-        )
-        return None
+        return
 
+    lines = raw.splitlines()
+    if not lines:
+        print_info_debug(
+            "[host-helper] log tail is empty: "
+            f"path={mark_sensitive(str(log_path), 'path')}"
+        )
+        return
+    tail = "\n".join(lines[-max_lines:])
+    print_info_debug(
+        "[host-helper] log tail:\n" + mark_sensitive(tail, "detail")
+    )
+
+
+def _wait_for_host_helper_ready(
+    *,
+    proc: subprocess.Popen[str],
+    socket_path: Path,
+    timeout_seconds: float = 8.0,
+) -> bool:
+    """Wait until the host helper socket responds to a ping request."""
+    from adscan_launcher.host_privileged_helper import (  # noqa: PLC0415
+        HostHelperError,
+        host_helper_client_request,
+    )
+
+    deadline = time.monotonic() + max(float(timeout_seconds), 1.0)
+    attempt = 0
+    last_error: Exception | None = None
+
+    while time.monotonic() < deadline:
+        attempt += 1
+
+        returncode = proc.poll()
+        if returncode is not None:
+            print_warning(
+                "Host helper exited before becoming ready."
+            )
+            print_info_debug(
+                "[host-helper] readiness failed: "
+                f"socket={mark_sensitive(str(socket_path), 'path')} "
+                f"attempt={attempt} exit_code={returncode}"
+            )
+            _print_host_helper_log_tail()
+            return False
+
+        if not socket_path.exists():
+            time.sleep(0.15)
+            continue
+
+        try:
+            resp = host_helper_client_request(
+                str(socket_path),
+                op="ping",
+                payload={},
+                timeout_seconds=1.5,
+            )
+            if resp.ok:
+                print_info_debug(
+                    "[host-helper] ready: "
+                    f"socket={mark_sensitive(str(socket_path), 'path')} "
+                    f"attempt={attempt}"
+                )
+                return True
+            last_error = HostHelperError(resp.message or "ping returned not-ok")
+        except (HostHelperError, OSError) as exc:
+            last_error = exc
+            print_info_debug(
+                "[host-helper] readiness probe failed: "
+                f"attempt={attempt} "
+                f"error={mark_sensitive(str(exc), 'error')}"
+            )
+        time.sleep(0.2)
+
+    print_warning(
+        "Host helper did not become ready within the expected time window."
+    )
+    if last_error is not None:
+        print_info_debug(
+            "[host-helper] readiness final error: "
+            f"{mark_sensitive(str(last_error), 'error')}"
+        )
+    print_info_debug(
+        "[host-helper] readiness timeout: "
+        f"socket={mark_sensitive(str(socket_path), 'path')}"
+    )
+    _print_host_helper_log_tail()
+    return False
+
+
+def _spawn_host_helper_process(*, socket_path: Path) -> subprocess.Popen[str]:
+    """Spawn the privileged host helper process."""
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         if socket_path.exists():
@@ -1727,6 +2242,187 @@ def _start_host_helper(*, socket_path: Path) -> subprocess.Popen[str] | None:
                 pass
 
     return proc
+
+
+def _start_host_helper(*, socket_path: Path) -> subprocess.Popen[str] | None:
+    """Start the privileged host helper via sudo (best effort)."""
+    _ensure_container_shared_token()
+
+    if not _ensure_sudo_ticket_if_needed():
+        print_warning(
+            "Sudo authorization is required to start the host helper in Docker mode."
+        )
+        print_info_debug("[host-helper] startup aborted: sudo validation failed")
+        return None
+
+    for launch_attempt in (1, 2):
+        proc = _spawn_host_helper_process(socket_path=socket_path)
+        if _wait_for_host_helper_ready(proc=proc, socket_path=socket_path):
+            return proc
+        _stop_host_helper(proc)
+        if launch_attempt == 1:
+            print_warning("Host helper readiness failed. Retrying once...")
+
+    print_info_debug("[host-helper] startup failed after retry attempts.")
+    return None
+
+
+def _probe_sudo_noninteractive_status() -> tuple[str, str]:
+    """Return best-effort sudo availability status for troubleshooting output."""
+    if os.geteuid() == 0:
+        return "root", ""
+    if not shutil.which("sudo"):
+        return "missing", ""
+    try:
+        proc = subprocess.run(  # noqa: S603
+            ["sudo", "-n", "true"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        telemetry.capture_exception(exc)
+        return "error", str(exc)
+
+    if proc.returncode == 0:
+        return "ok", ""
+    stderr = str(proc.stderr or "").strip()
+    if "a password is required" in stderr.lower():
+        return "needs_password", stderr
+    return "denied", stderr
+
+
+def _collect_host_helper_runtime_diagnostics(*, socket_path: Path) -> dict[str, str]:
+    """Collect concise host-helper diagnostics for operator-facing troubleshooting."""
+    diagnostics: dict[str, str] = {}
+
+    log_path = _get_logs_dir() / "host-helper.log"
+    diagnostics["socket_path"] = str(socket_path)
+    diagnostics["socket_exists"] = str(socket_path.exists()).lower()
+    diagnostics["log_path"] = str(log_path)
+    diagnostics["log_exists"] = str(log_path.exists()).lower()
+    if log_path.exists():
+        try:
+            diagnostics["log_size_bytes"] = str(log_path.stat().st_size)
+        except OSError as exc:
+            telemetry.capture_exception(exc)
+            diagnostics["log_size_bytes"] = f"error:{exc}"
+    else:
+        diagnostics["log_size_bytes"] = "0"
+
+    daemon_ok, daemon_diag = _is_docker_daemon_running_internal(
+        run_docker_command_func=_run_docker_status_command
+    )
+    diagnostics["docker_daemon_reachable"] = str(bool(daemon_ok)).lower()
+    if daemon_diag:
+        diagnostics["docker_daemon_diagnostic"] = str(daemon_diag).strip()
+
+    sudo_status, sudo_detail = _probe_sudo_noninteractive_status()
+    diagnostics["sudo_status"] = sudo_status
+    if sudo_detail:
+        diagnostics["sudo_detail"] = sudo_detail
+
+    return diagnostics
+
+
+def _print_host_helper_runtime_troubleshooting(
+    *,
+    command_name: str,
+    socket_path: Path,
+    failure_reason: str,
+    diagnostics: dict[str, str] | None = None,
+) -> None:
+    """Render actionable troubleshooting guidance for host-helper startup failures."""
+    diagnostics = diagnostics or _collect_host_helper_runtime_diagnostics(
+        socket_path=socket_path
+    )
+    log_path = _get_logs_dir() / "host-helper.log"
+    details = [
+        "ADscan Docker mode requires the host helper for privileged host operations.",
+        f"Command: {command_name}",
+        f"Failure: {failure_reason}",
+        f"Helper socket: {mark_sensitive(diagnostics.get('socket_path', 'UNKNOWN'), 'path')}",
+        (
+            "Socket present: "
+            f"{mark_sensitive(diagnostics.get('socket_exists', 'unknown'), 'detail')}"
+        ),
+        f"Helper log: {mark_sensitive(diagnostics.get('log_path', str(log_path)), 'path')}",
+        (
+            "Log size (bytes): "
+            f"{mark_sensitive(diagnostics.get('log_size_bytes', 'unknown'), 'detail')}"
+        ),
+        (
+            "Docker daemon reachable: "
+            f"{mark_sensitive(diagnostics.get('docker_daemon_reachable', 'unknown'), 'status')}"
+        ),
+        (
+            "Sudo status: "
+            f"{mark_sensitive(diagnostics.get('sudo_status', 'unknown'), 'status')}"
+        ),
+    ]
+
+    daemon_diag = diagnostics.get("docker_daemon_diagnostic", "").strip()
+    if daemon_diag:
+        details.append(
+            "Daemon diagnostic: "
+            f"{mark_sensitive(daemon_diag, 'detail')}"
+        )
+
+    sudo_detail = diagnostics.get("sudo_detail", "").strip()
+    if sudo_detail:
+        details.append(
+            "Sudo detail: "
+            f"{mark_sensitive(sudo_detail, 'detail')}"
+        )
+
+    print_panel(
+        "\n".join(details),
+        title="Host Helper Required",
+        border_style="yellow",
+    )
+    marked_log_path = mark_sensitive(str(log_path), "path")
+    print_instruction(f"Check host-helper logs: tail -n 200 {marked_log_path}")
+    print_instruction("Check daemon state: docker info || sudo docker info")
+    print_instruction("If needed, start daemon: sudo systemctl start docker")
+    print_instruction("If sudo is required, refresh credentials: sudo -v")
+    print_instruction(f"Retry: adscan {command_name}")
+    print_instruction(
+        f"Troubleshooting guide: {_HOST_HELPER_TROUBLESHOOTING_DOCS_URL}"
+    )
+
+
+def _ensure_host_helper_runtime_ready(
+    *,
+    command_name: str,
+    run_dir: Path,
+) -> tuple[subprocess.Popen[str] | None, Path]:
+    """Start and validate host-helper readiness for Docker-mode runtime commands."""
+    helper_socket = run_dir / DEFAULT_HOST_HELPER_SOCKET_NAME
+    helper_proc = _start_host_helper(socket_path=helper_socket)
+    if helper_proc is not None:
+        return helper_proc, helper_socket
+
+    diagnostics = _collect_host_helper_runtime_diagnostics(socket_path=helper_socket)
+    telemetry.capture(
+        "docker_host_helper_unavailable",
+        {
+            "command_name": command_name,
+            "socket_exists": diagnostics.get("socket_exists", "unknown"),
+            "docker_daemon_reachable": diagnostics.get(
+                "docker_daemon_reachable",
+                "unknown",
+            ),
+            "sudo_status": diagnostics.get("sudo_status", "unknown"),
+        },
+    )
+    _print_host_helper_runtime_troubleshooting(
+        command_name=command_name,
+        socket_path=helper_socket,
+        failure_reason="Host helper startup failed or did not become ready.",
+        diagnostics=diagnostics,
+    )
+    return None, helper_socket
 
 
 def _stop_host_helper(proc: subprocess.Popen[str] | None) -> None:
@@ -2066,7 +2762,10 @@ def _ensure_managed_bloodhound_runtime_ready(
         print_info_debug(f"[bloodhound-ce] missing images: {missing}")
         if pull_missing_images:
             print_info("Pulling missing BloodHound CE images...")
-            if not compose_pull(compose_path, stream_output=pull_stream_output):
+            if not _run_bloodhound_compose_pull_with_daemon_recovery(
+                compose_path=compose_path,
+                stream_output=pull_stream_output,
+            ):
                 _print_managed_bloodhound_runtime_troubleshooting(
                     command_name=command_name,
                     compose_path=compose_path,
@@ -2081,7 +2780,9 @@ def _ensure_managed_bloodhound_runtime_ready(
             )
             return False, compose_path
 
-    if start_stack and not compose_up(compose_path):
+    if start_stack and not _run_bloodhound_compose_up_with_daemon_recovery(
+        compose_path=compose_path
+    ):
         _print_managed_bloodhound_runtime_troubleshooting(
             command_name=command_name,
             compose_path=compose_path,
@@ -2188,6 +2889,18 @@ def handle_install_docker(
         )
         return False
 
+    if not _ensure_docker_compose_prerequisites(command_name="install"):
+        telemetry.capture(
+            "docker_install_failed",
+            {
+                "success": False,
+                "total_duration_seconds": time.monotonic() - start_time,
+                "failure_stage": "docker_prerequisites",
+                "failure_reason": "docker_or_compose_missing",
+            },
+        )
+        return False
+
     # Docker is available
     telemetry.capture(
         "docker_install_check_docker_availability",
@@ -2272,17 +2985,11 @@ def handle_install_docker(
             },
         )
 
-        print_error("Failed to pull the ADscan Docker image.")
-        print_instruction("Retry the install, or pull manually and retry:")
-        pull_cmd_prefix = "sudo " if (docker_needs_sudo() and os.geteuid() != 0) else ""
-        print_instruction(f"  {pull_cmd_prefix}docker pull {image}")
-        suggested_timeout = 7200 if pull_timeout is None else max(pull_timeout, 7200)
-        print_instruction(
-            "If you are on a slow network, increase the pull timeout and retry:"
+        _print_docker_image_pull_failure_guidance(
+            image=image,
+            pull_timeout=pull_timeout,
+            command_name="install",
         )
-        print_instruction(f"  adscan install --pull-timeout {suggested_timeout}")
-        print_instruction("To disable the pull timeout entirely:")
-        print_instruction("  adscan install --pull-timeout 0")
         return False
     image = resolved_image
 
@@ -2350,7 +3057,10 @@ def handle_install_docker(
         },
     )
 
-    if not compose_pull(compose_path, stream_output=True):
+    if not _run_bloodhound_compose_pull_with_daemon_recovery(
+        compose_path=compose_path,
+        stream_output=True,
+    ):
         telemetry.capture(
             "docker_failure_constraint",
             {
@@ -2382,7 +3092,7 @@ def handle_install_docker(
     )
 
     # BloodHound compose up
-    if not compose_up(compose_path):
+    if not _run_bloodhound_compose_up_with_daemon_recovery(compose_path=compose_path):
         telemetry.capture(
             "docker_install_failed",
             {
@@ -2517,27 +3227,37 @@ def handle_check_docker(
         if not _ensure_host_mount_dir_writable(state_dir, description="State"):
             return False
 
-        cfg = DockerRunConfig(
-            image=image, workspaces_host_dir=workspaces_dir, interactive=False
+        helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
+            command_name="check",
+            run_dir=run_dir,
         )
-        cmd = build_adscan_run_command(cfg, adscan_args=["--version"])
-        print_info_debug(f"[docker] probe: {shell_quote_cmd(cmd)}")
-        try:
-            proc = run_docker(cmd, check=False, capture_output=True, timeout=60)
-            if proc.returncode == 0:
-                print_success("Docker-mode execution probe succeeded.")
-            else:
-                all_ok = False
-                print_warning("Docker-mode execution probe failed.")
-                if proc.stderr:
-                    print_info_debug(f"[docker] probe stderr:\n{proc.stderr}")
-                if proc.stdout:
-                    print_info_debug(f"[docker] probe stdout:\n{proc.stdout}")
-        except Exception as exc:  # pragma: no cover
-            telemetry.capture_exception(exc)
-            print_warning("Docker-mode execution probe failed due to an exception.")
-            print_info_debug(f"[docker] probe exception: {exc}")
+        if helper_proc is None:
             all_ok = False
+        else:
+            _stop_host_helper(helper_proc)
+
+        if all_ok:
+            cfg = DockerRunConfig(
+                image=image, workspaces_host_dir=workspaces_dir, interactive=False
+            )
+            cmd = build_adscan_run_command(cfg, adscan_args=["--version"])
+            print_info_debug(f"[docker] probe: {shell_quote_cmd(cmd)}")
+            try:
+                proc = run_docker(cmd, check=False, capture_output=True, timeout=60)
+                if proc.returncode == 0:
+                    print_success("Docker-mode execution probe succeeded.")
+                else:
+                    all_ok = False
+                    print_warning("Docker-mode execution probe failed.")
+                    if proc.stderr:
+                        print_info_debug(f"[docker] probe stderr:\n{proc.stderr}")
+                    if proc.stdout:
+                        print_info_debug(f"[docker] probe stdout:\n{proc.stdout}")
+            except Exception as exc:  # pragma: no cover
+                telemetry.capture_exception(exc)
+                print_warning("Docker-mode execution probe failed due to an exception.")
+                print_info_debug(f"[docker] probe exception: {exc}")
+                all_ok = False
 
     return all_ok
 
@@ -2555,6 +3275,8 @@ def handle_start_docker(
     compose_path: Path | None = None
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
+        return 1
+    if not _ensure_docker_compose_prerequisites(command_name="start"):
         return 1
 
     managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
@@ -2584,7 +3306,11 @@ def handle_start_docker(
             stream_output=True,
         )
         if not resolved_image:
-            print_error("Failed to pull the ADscan Docker image.")
+            _print_docker_image_pull_failure_guidance(
+                image=image,
+                pull_timeout=pull_timeout,
+                command_name="start",
+            )
             return 1
         image = resolved_image
 
@@ -2609,82 +3335,86 @@ def handle_start_docker(
     if not _ensure_host_mount_dir_writable(state_dir, description="State"):
         return 1
 
-    helper_proc: subprocess.Popen[str] | None = None
-    helper_socket = run_dir / DEFAULT_HOST_HELPER_SOCKET_NAME
-    helper_proc = _start_host_helper(socket_path=helper_socket)
-    gpu_args = _detect_gpu_docker_run_args()
-    local_resolver_ip = _select_container_local_resolver_ip()
-    if local_resolver_ip is None:
+    helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
+        command_name="start",
+        run_dir=run_dir,
+    )
+    if helper_proc is None:
         return 1
-
-    # Build extra docker run args, including GPU flags and a bind mount for the
-    # shared BloodHound CE configuration so host and container always see the
-    # same ~/.bloodhound_config.
-    extra_run_args: list[str] = list(gpu_args)
     try:
-        if BH_CONFIG_FILE.exists():
-            print_info_debug(
-                "[bloodhound-ce] mounting host config into container: "
-                f"{mark_sensitive(str(BH_CONFIG_FILE), 'path')} -> "
-                "/opt/adscan/.bloodhound_config"
-            )
-            extra_run_args.extend(
-                [
-                    "-v",
-                    f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
+        gpu_args = _detect_gpu_docker_run_args()
+        local_resolver_ip = _select_container_local_resolver_ip()
+        if local_resolver_ip is None:
+            return 1
+
+        # Build extra docker run args, including GPU flags and a bind mount for the
+        # shared BloodHound CE configuration so host and container always see the
+        # same ~/.bloodhound_config.
+        extra_run_args: list[str] = list(gpu_args)
+        try:
+            if BH_CONFIG_FILE.exists():
+                print_info_debug(
+                    "[bloodhound-ce] mounting host config into container: "
+                    f"{mark_sensitive(str(BH_CONFIG_FILE), 'path')} -> "
+                    "/opt/adscan/.bloodhound_config"
+                )
+                extra_run_args.extend(
+                    [
+                        "-v",
+                        f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
+                    ]
+                )
+            else:
+                print_info_debug(
+                    "[bloodhound-ce] host config missing; no mount for ~/.bloodhound_config"
+                )
+        except Exception:
+            # Best-effort only; failure to mount the config should not break docker
+            # start, but may cause host/container configs to diverge.
+            pass
+
+        cfg = DockerRunConfig(
+            image=image,
+            workspaces_host_dir=workspaces,
+            interactive=True,
+            extra_run_args=tuple(extra_run_args),
+            extra_env=tuple(
+                [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+                + (
+                    [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
+                    if compose_path is not None
+                    else []
+                )
+                + [
+                    ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
+                    ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
                 ]
             )
-        else:
-            print_info_debug(
-                "[bloodhound-ce] host config missing; no mount for ~/.bloodhound_config"
-            )
-    except Exception:
-        # Best-effort only; failure to mount the config should not break docker
-        # start, but may cause host/container configs to diverge.
-        pass
+        )
 
-    cfg = DockerRunConfig(
-        image=image,
-        workspaces_host_dir=workspaces,
-        interactive=True,
-        extra_run_args=tuple(extra_run_args),
-        extra_env=tuple(
-            [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
-            + (
-                [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
-                if compose_path is not None
-                else []
-            )
-            + [
-                ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
-                ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
-            ]
-        ),
-    )
+        adscan_args: list[str] = []
+        if verbose:
+            # Subcommand-scoped flag.
+            pass
+        if debug:
+            # Subcommand-scoped flag.
+            pass
+        adscan_args.append("start")
+        if verbose:
+            adscan_args.append("--verbose")
+        if debug:
+            adscan_args.append("--debug")
 
-    adscan_args: list[str] = []
-    if verbose:
-        # Subcommand-scoped flag.
-        pass
-    if debug:
-        # Subcommand-scoped flag.
-        pass
-    adscan_args.append("start")
-    if verbose:
-        adscan_args.append("--verbose")
-    if debug:
-        adscan_args.append("--debug")
-
-    cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
-    print_info_debug(f"[docker] start: {shell_quote_cmd(cmd)}")
-    try:
-        proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
-        return int(proc.returncode)
-    except subprocess.SubprocessError as exc:
-        telemetry.capture_exception(exc)
-        print_error("Failed to start ADscan in Docker.")
-        print_info_debug(f"[docker] start exception: {exc}")
-        return 1
+        cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
+        print_info_debug(f"[docker] start: {shell_quote_cmd(cmd)}")
+        try:
+            proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
+            return int(proc.returncode)
+        except subprocess.SubprocessError as exc:
+            telemetry.capture_exception(exc)
+            print_error("Failed to start ADscan in Docker.")
+            print_info_debug(f"[docker] start exception: {exc}")
+            return 1
     finally:
         _stop_host_helper(helper_proc)
 
@@ -2715,6 +3445,8 @@ def handle_ci_docker(
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
         return 1
+    if not _ensure_docker_compose_prerequisites(command_name="ci"):
+        return 1
 
     managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
         command_name="ci",
@@ -2737,7 +3469,11 @@ def handle_ci_docker(
             stream_output=True,
         )
         if not resolved_image:
-            print_error("Failed to pull the ADscan Docker image.")
+            _print_docker_image_pull_failure_guidance(
+                image=image,
+                pull_timeout=pull_timeout,
+                command_name="ci",
+            )
             return 1
         image = resolved_image
 
@@ -2762,93 +3498,97 @@ def handle_ci_docker(
     if not _ensure_host_mount_dir_writable(state_dir, description="State"):
         return 1
 
-    helper_proc: subprocess.Popen[str] | None = None
-    helper_socket = run_dir / DEFAULT_HOST_HELPER_SOCKET_NAME
-    helper_proc = _start_host_helper(socket_path=helper_socket)
-
-    # Preserve Rich colors when running locally: allocate a TTY when the host has one.
-    # In CI (no TTY), we avoid `-t` to prevent "the input device is not a TTY" errors.
-    interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
-    local_resolver_ip = _select_container_local_resolver_ip()
-    if local_resolver_ip is None:
-        return 1
-    _ensure_bloodhound_config_mountable()
-    extra_run_args: list[str] = []
-    try:
-        if BH_CONFIG_FILE.exists():
-            print_info_debug(
-                "[bloodhound-ce] mounting host config into container: "
-                f"{mark_sensitive(str(BH_CONFIG_FILE), 'path')} -> "
-                "/opt/adscan/.bloodhound_config"
-            )
-            extra_run_args.extend(
-                [
-                    "-v",
-                    f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
-                ]
-            )
-        else:
-            print_info_debug(
-                "[bloodhound-ce] host config missing; no mount for ~/.bloodhound_config"
-            )
-    except Exception:
-        pass
-    cfg = DockerRunConfig(
-        image=image,
-        workspaces_host_dir=workspaces_dir,
-        interactive=interactive,
-        extra_run_args=tuple(extra_run_args),
-        extra_env=tuple(
-            [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
-            + (
-                [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
-                if compose_path is not None
-                else []
-            )
-            + [
-                ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
-                ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
-            ]
-        ),
+    helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
+        command_name="ci",
+        run_dir=run_dir,
     )
-
-    adscan_args: list[str] = []
-    adscan_args.append("ci")
-    adscan_args.append(mode)
-    if debug:
-        adscan_args.append("--debug")
-    if verbose:
-        adscan_args.append("--verbose")
-    adscan_args.extend(["--type", workspace_type, "--interface", interface])
-
-    if hosts:
-        adscan_args.extend(["--hosts", hosts])
-    if domain:
-        adscan_args.extend(["--domain", domain])
-    if dc_ip:
-        adscan_args.extend(["--dc-ip", dc_ip])
-    if username:
-        adscan_args.extend(["--username", username])
-    if password:
-        adscan_args.extend(["--password", password])
-    if workspace:
-        adscan_args.extend(["--workspace", workspace])
-    if keep_workspace:
-        adscan_args.append("--keep-workspace")
-    if generate_report:
-        adscan_args.append("--generate-report")
-        adscan_args.extend(["--report-format", report_format])
-
-    cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
-    print_info_debug(f"[docker] ci: {shell_quote_cmd(cmd)}")
-    try:
-        proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
-        return int(proc.returncode)
-    except subprocess.SubprocessError as exc:
-        telemetry.capture_exception(exc)
-        print_error("Failed to run ADscan CI in Docker.")
-        print_info_debug(f"[docker] ci exception: {exc}")
+    if helper_proc is None:
         return 1
+
+    try:
+        # Preserve Rich colors when running locally: allocate a TTY when the host has one.
+        # In CI (no TTY), we avoid `-t` to prevent "the input device is not a TTY" errors.
+        interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+        local_resolver_ip = _select_container_local_resolver_ip()
+        if local_resolver_ip is None:
+            return 1
+        _ensure_bloodhound_config_mountable()
+        extra_run_args: list[str] = []
+        try:
+            if BH_CONFIG_FILE.exists():
+                print_info_debug(
+                    "[bloodhound-ce] mounting host config into container: "
+                    f"{mark_sensitive(str(BH_CONFIG_FILE), 'path')} -> "
+                    "/opt/adscan/.bloodhound_config"
+                )
+                extra_run_args.extend(
+                    [
+                        "-v",
+                        f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
+                    ]
+                )
+            else:
+                print_info_debug(
+                    "[bloodhound-ce] host config missing; no mount for ~/.bloodhound_config"
+                )
+        except Exception:
+            pass
+        cfg = DockerRunConfig(
+            image=image,
+            workspaces_host_dir=workspaces_dir,
+            interactive=interactive,
+            extra_run_args=tuple(extra_run_args),
+            extra_env=tuple(
+                [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+                + (
+                    [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
+                    if compose_path is not None
+                    else []
+                )
+                + [
+                    ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
+                    ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+                ]
+            ),
+        )
+
+        adscan_args: list[str] = []
+        adscan_args.append("ci")
+        adscan_args.append(mode)
+        if debug:
+            adscan_args.append("--debug")
+        if verbose:
+            adscan_args.append("--verbose")
+        adscan_args.extend(["--type", workspace_type, "--interface", interface])
+
+        if hosts:
+            adscan_args.extend(["--hosts", hosts])
+        if domain:
+            adscan_args.extend(["--domain", domain])
+        if dc_ip:
+            adscan_args.extend(["--dc-ip", dc_ip])
+        if username:
+            adscan_args.extend(["--username", username])
+        if password:
+            adscan_args.extend(["--password", password])
+        if workspace:
+            adscan_args.extend(["--workspace", workspace])
+        if keep_workspace:
+            adscan_args.append("--keep-workspace")
+        if generate_report:
+            adscan_args.append("--generate-report")
+            adscan_args.extend(["--report-format", report_format])
+
+        cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
+        print_info_debug(f"[docker] ci: {shell_quote_cmd(cmd)}")
+        try:
+            proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
+            return int(proc.returncode)
+        except subprocess.SubprocessError as exc:
+            telemetry.capture_exception(exc)
+            print_error("Failed to run ADscan CI in Docker.")
+            print_info_debug(f"[docker] ci exception: {exc}")
+            return 1
     finally:
         _stop_host_helper(helper_proc)
 
@@ -2870,7 +3610,11 @@ def update_docker_image(*, pull_timeout_seconds: int | None = None) -> int:
         stream_output=True,
     )
     if not resolved_image:
-        print_error("Failed to pull the ADscan Docker image.")
+        _print_docker_image_pull_failure_guidance(
+            image=image,
+            pull_timeout=pull_timeout,
+            command_name="update",
+        )
         return 1
     image = resolved_image
     print_success("Docker image pulled successfully.")
@@ -2896,6 +3640,8 @@ def run_adscan_passthrough_docker(
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
         return 1
+    if not _ensure_docker_compose_prerequisites(command_name="passthrough"):
+        return 1
 
     managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
         command_name="passthrough",
@@ -2918,7 +3664,11 @@ def run_adscan_passthrough_docker(
             stream_output=True,
         )
         if not resolved_image:
-            print_error("Failed to pull the ADscan Docker image.")
+            _print_docker_image_pull_failure_guidance(
+                image=image,
+                pull_timeout=pull_timeout,
+                command_name="passthrough",
+            )
             return 1
         image = resolved_image
 
@@ -2943,9 +3693,12 @@ def run_adscan_passthrough_docker(
     if not _ensure_host_mount_dir_writable(state_dir, description="State"):
         return 1
 
-    helper_proc: subprocess.Popen[str] | None = None
-    helper_socket = run_dir / DEFAULT_HOST_HELPER_SOCKET_NAME
-    helper_proc = _start_host_helper(socket_path=helper_socket)
+    helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
+        command_name="passthrough",
+        run_dir=run_dir,
+    )
+    if helper_proc is None:
+        return 1
     try:
         # Preserve Rich colors when running locally: allocate a TTY when the host has one.
         interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())

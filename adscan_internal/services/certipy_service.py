@@ -18,6 +18,12 @@ import re
 import shlex
 
 from adscan_internal.core import EventBus, LicenseMode
+from adscan_internal.command_runner import (
+    CommandRunner,
+    CommandSpec,
+    build_execution_output_preview,
+    summarize_execution_result,
+)
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.base_service import BaseService
 from adscan_internal import print_error, print_info_debug
@@ -63,6 +69,7 @@ class CertipyService(BaseService):
     ):
         """Initialize CertipyService."""
         super().__init__(event_bus=event_bus, license_mode=license_mode)
+        self._command_runner = CommandRunner()
 
     def pass_the_certificate(
         self,
@@ -136,14 +143,16 @@ class CertipyService(BaseService):
                     if command_string_needs_clean_env(command)
                     else None
                 )
-                completed = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
-                    env=env,
+                completed = self._command_runner.run(
+                    CommandSpec(
+                        command=command,
+                        timeout=timeout,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        env=env,
+                    )
                 )
         except subprocess.TimeoutExpired as exc:
             output = (exc.stdout or "") + (exc.stderr or "")
@@ -189,6 +198,18 @@ class CertipyService(BaseService):
                 success=False,
                 error_message=err_msg,
             )
+
+        exit_code, stdout_count, stderr_count, duration_text = summarize_execution_result(
+            completed
+        )
+        print_info_debug(
+            "[certipy] Result: "
+            f"exit_code={exit_code}, stdout_lines={stdout_count}, "
+            f"stderr_lines={stderr_count}, duration={duration_text}"
+        )
+        preview = build_execution_output_preview(completed)
+        if preview:
+            print_info_debug(f"[certipy] Output preview:\n{preview}", panel=True)
 
         output = (completed.stdout or "") + (completed.stderr or "")
 

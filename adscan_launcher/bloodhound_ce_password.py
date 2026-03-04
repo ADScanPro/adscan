@@ -285,15 +285,23 @@ def _list_bloodhound_container_candidates(
         return candidates
 
     dynamic: list[str] = []
+    preferred_found = False
     for raw_line in (proc.stdout or "").splitlines():
         name = str(raw_line or "").strip()
         if not name:
+            continue
+        if preferred and name == preferred:
+            preferred_found = True
             continue
         lowered = name.lower()
         if "bloodhound" not in lowered:
             continue
         if re.search(r"(?:^|[-_])bloodhound(?:[-_])", lowered):
             dynamic.append(name)
+
+    # Managed mode should not mix stack candidates when the expected container exists.
+    if preferred and preferred_found:
+        return [preferred]
 
     for name in dynamic:
         if name not in candidates:
@@ -616,10 +624,17 @@ def detect_existing_bloodhound_ce_state(
 ) -> bool:
     """Return True when logs indicate CE is already initialized (not first run)."""
     if not docker_available():
+        print_info_debug(
+            "[bloodhound-ce] existing-state detector skipped: docker is not available."
+        )
         return False
 
     candidates = _list_bloodhound_container_candidates(
         preferred_container_name=container_name
+    )
+    print_info_debug(
+        "[bloodhound-ce] existing-state detector candidates: "
+        f"{mark_sensitive(', '.join(candidates) if candidates else '<none>', 'detail')}"
     )
     for candidate in candidates:
         try:
@@ -631,16 +646,48 @@ def detect_existing_bloodhound_ce_state(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_info_debug(
+                "[bloodhound-ce] existing-state detector logs exception "
+                f"(container={mark_sensitive(candidate, 'detail')}): {exc}"
+            )
             continue
 
         if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            if stderr:
+                print_info_debug(
+                    "[bloodhound-ce] existing-state detector logs stderr "
+                    f"(container={mark_sensitive(candidate, 'detail')}): "
+                    f"{mark_sensitive(stderr, 'detail')}"
+                )
             continue
         logs = str(proc.stdout or "")
         lowered = logs.lower()
         if _parse_initial_password_from_logs(logs):
+            print_info_debug(
+                "[bloodhound-ce] existing-state detector found initial-password marker "
+                f"in container logs; treating state as first-run "
+                f"(container={mark_sensitive(candidate, 'detail')})."
+            )
             return False
-        if any(marker in lowered for marker in _NON_FIRST_RUN_LOG_MARKERS):
+        matched_marker = next(
+            (marker for marker in _NON_FIRST_RUN_LOG_MARKERS if marker in lowered),
+            None,
+        )
+        if matched_marker:
+            print_info_debug(
+                "[bloodhound-ce] existing-state detector matched non-first-run marker "
+                f"(container={mark_sensitive(candidate, 'detail')}, "
+                f"marker={mark_sensitive(matched_marker, 'detail')})."
+            )
             return True
+        print_info_debug(
+            "[bloodhound-ce] existing-state detector found no definitive marker "
+            f"in container logs (container={mark_sensitive(candidate, 'detail')})."
+        )
+    print_info_debug(
+        "[bloodhound-ce] existing-state detector finished with no existing-state markers."
+    )
     return False
 
 
@@ -670,10 +717,14 @@ def _emit_password_probe_diagnostics(
             timeout=15,
         )
         if status_proc.returncode == 0:
+            managed_project = get_bloodhound_compose_project_name().lower()
             bh_lines = [
                 line
                 for line in (status_proc.stdout or "").splitlines()
-                if "bloodhound" in str(line).lower()
+                if (
+                    "bloodhound" in str(line).lower()
+                    or str(line).lower().startswith(f"{managed_project}-")
+                )
             ]
             if bh_lines:
                 print_info_debug(
@@ -806,6 +857,7 @@ def ensure_bloodhound_admin_password(
             base_url=base_url,
             password=default_password,
         )
+        login_failure_lower = str(login_failure or "").lower()
         state = _get_container_runtime_state(container_name)
         if state and state.get("status") and state.get("status") != "running":
             print_warning(
@@ -832,16 +884,33 @@ def ensure_bloodhound_admin_password(
                 f"started_at={mark_sensitive(state.get('started_at', ''), 'detail')}, "
                 f"finished_at={mark_sensitive(state.get('finished_at', ''), 'detail')}"
             )
-            if state.get("status") != "running":
-                _emit_container_log_tail(container_name, lines=100)
-                recovered_ok, recovered_session = _attempt_recover_from_auth_rate_limit(
-                    container_name=container_name,
-                    base_url=base_url,
-                    default_password=default_password,
-                )
-                if recovered_ok:
-                    ok = True
-                    session = recovered_session
+            _emit_container_log_tail(container_name, lines=100)
+        # Connection resets/timeouts can happen while CE is still stabilizing.
+        # Give it one additional grace retry window before falling back to
+        # manual flows.
+        if not ok and (
+            "request_exception=" in login_failure_lower
+            or "connection reset" in login_failure_lower
+        ):
+            print_info(
+                "Transient connection errors detected while validating the initial "
+                "BloodHound CE password. Retrying with an extended grace window..."
+            )
+            ok, session = _try_bloodhound_login(
+                base_url=base_url,
+                password=default_password,
+                max_attempts=18,
+                delay_seconds=5,
+            )
+        if not ok:
+            recovered_ok, recovered_session = _attempt_recover_from_auth_rate_limit(
+                container_name=container_name,
+                base_url=base_url,
+                default_password=default_password,
+            )
+            if recovered_ok:
+                ok = True
+                session = recovered_session
         print_info_debug(
             "[bloodhound-ce] detected initial password was rejected by API. "
             "Common causes: stale first-run password in logs, container crash before API readiness, "

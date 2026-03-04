@@ -307,9 +307,9 @@ def _unique_destination_path(dst: Path) -> Path:
 def _validate_bloodhound_compose_path(value: str) -> str:
     """Validate a BloodHound CE docker-compose.yml path.
 
-    The helper must never accept arbitrary filesystem paths. We only allow the
-    pinned compose file under the invoking user's config dir:
-    `~/.config/bloodhound/docker-compose.yml`.
+    The helper must never accept arbitrary filesystem paths. We allow:
+    - Managed ADscan path under ``~/.adscan/bloodhound/**/docker-compose.yml``
+    - Legacy compatibility path ``~/.config/bloodhound/docker-compose.yml``
     """
     if not value:
         raise HostHelperError("Missing compose_path")
@@ -317,9 +317,23 @@ def _validate_bloodhound_compose_path(value: str) -> str:
     if not path.is_absolute():
         raise HostHelperError("compose_path must be absolute")
     resolved = path.resolve(strict=False)
-    expected_root = _invoker_home_dir().resolve() / ".config" / "bloodhound"
-    expected = (expected_root / "docker-compose.yml").resolve(strict=False)
-    if resolved != expected:
+    legacy_expected = (
+        _invoker_home_dir().resolve() / ".config" / "bloodhound" / "docker-compose.yml"
+    ).resolve(strict=False)
+    managed_root = (_invoker_adscan_root_dir().resolve() / "bloodhound").resolve(
+        strict=False
+    )
+
+    allowed = False
+    if resolved == legacy_expected:
+        allowed = True
+    elif resolved.name == "docker-compose.yml":
+        try:
+            _safe_resolve_within(managed_root, resolved)
+            allowed = True
+        except HostHelperError:
+            allowed = False
+    if not allowed:
         raise HostHelperError(f"compose_path not allowed: {resolved}")
     if not resolved.is_file():
         raise HostHelperError(f"compose file not found: {resolved}")
@@ -481,6 +495,9 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
     op = str(req.get("op") or "").strip()
     if not op:
         return HostHelperResponse(False, None, None, None, "Missing op")
+
+    if op == "ping":
+        return HostHelperResponse(True, 0, "pong", None, None)
 
     if op == "timedatectl_set_ntp":
         value = req.get("value")
@@ -1090,6 +1107,16 @@ def host_helper_client_request(
     timeout_seconds: float = 5,
 ) -> HostHelperResponse:
     """Send a request to the host helper server and return response."""
+    path_str = str(socket_path or "").strip()
+    if not path_str:
+        raise HostHelperError("Invalid host helper socket path")
+    sock_path = Path(path_str).expanduser()
+    if not sock_path.exists():
+        raise HostHelperError(
+            f"Host helper socket not found: {sock_path}. "
+            "The host helper may not be running."
+        )
+
     token = _get_shared_token()
     req: dict[str, Any] = {"op": op, "ts": time.time()}
     req.update(payload)
@@ -1100,15 +1127,28 @@ def host_helper_client_request(
     sock = socket(AF_UNIX, SOCK_STREAM)
     sock.settimeout(timeout_seconds)
     try:
-        sock.connect(socket_path)
+        sock.connect(path_str)
         sock.sendall(data)
         resp_raw = sock.recv(_MAX_REQUEST_BYTES)
+    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, OSError) as exc:
+        raise HostHelperError(
+            f"Host helper request failed (socket={sock_path}, op={op}): {exc}"
+        ) from exc
     finally:
         try:
             sock.close()
         except Exception:
             pass
-    resp_obj = json.loads(resp_raw.decode(errors="replace"))
+    if not resp_raw:
+        raise HostHelperError(
+            f"Empty response from host helper (socket={sock_path}, op={op})"
+        )
+    try:
+        resp_obj = json.loads(resp_raw.decode(errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise HostHelperError(
+            f"Invalid JSON response from host helper (socket={sock_path}, op={op})"
+        ) from exc
     if not isinstance(resp_obj, dict):
         raise HostHelperError("Invalid response")
     return HostHelperResponse(

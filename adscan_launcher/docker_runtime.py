@@ -788,6 +788,8 @@ def build_adscan_run_command(
         "CONTAINER_SHARED_TOKEN",
         # Distinguish host launcher version from in-container runtime version.
         "ADSCAN_LAUNCHER_VERSION",
+        # Correlate launcher preflight + runtime sessions as one logical run.
+        "ADSCAN_SESSION_TRACE_ID",
     )
     for key in passthrough_keys:
         if key in os.environ and str(os.environ.get(key, "")).strip():

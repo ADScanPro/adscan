@@ -3950,6 +3950,8 @@ from adscan_internal.cli.common import (  # noqa: E402
     is_first_run,
     mark_first_run_complete,
     show_first_run_helper,
+    log_cli_command_context,
+    build_cli_runtime_snapshot,
 )
 
 
@@ -8750,6 +8752,17 @@ def _start_bloodhound_ce():
             except (HostHelperError, OSError) as exc:
                 telemetry.capture_exception(exc)
                 print_error("Failed to start BloodHound CE via host helper.")
+                marked_sock = mark_sensitive(sock_path, "path")
+                marked_compose = mark_sensitive(compose_path, "path")
+                print_info_debug(
+                    "[bloodhound-ce] host-helper startup failure context: "
+                    f"socket={marked_sock} socket_exists={Path(sock_path).exists()} "
+                    f"compose_path={marked_compose}"
+                )
+                print_instruction(
+                    "Inspect host-helper logs at ~/.adscan/logs/host-helper.log "
+                    "and retry `adscan start`."
+                )
                 print_exception(show_locals=False, exception=exc)
                 return False
 
@@ -9417,6 +9430,11 @@ class PentestShell:
 
             # Convert selected value back to index for compatibility with _curses_select
             if selected_value is None:
+                try:
+                    print_info_debug(f"[questionary] Cancelled: {title}")
+                    print_telemetry_only(f"[questionary][answer] {title}: [cancelled]")
+                except Exception:
+                    pass
                 return None
 
             # Log user selection for telemetry/debug
@@ -13217,6 +13235,9 @@ class PentestShell:
 
                 command_name = parts[0].lower()
                 args_list = parts[1:]
+                marked_user_input = mark_sensitive(user_input.strip(), "text")
+                print_info_debug(f"[cli] Execute command: {marked_user_input}")
+                log_cli_command_context(self, command_name, args_list, source="cli")
                 arg_string = " ".join(
                     args_list
                 )  # For compatibility with do_* methods expecting a string
@@ -13627,36 +13648,53 @@ class PentestShell:
         """
         from adscan_internal.rich_output import BRAND_COLORS
 
+        snapshot = build_cli_runtime_snapshot(shell=self)
+
         content = Text()
         content.append("Hosts: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.hosts) + "\n", style="white")
+        content.append(str(snapshot.get("hosts")) + "\n", style="white")
         content.append("Interface: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.interface) + "\n", style="white")
+        content.append(str(snapshot.get("interface")) + "\n", style="white")
         content.append("My IP: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.myip) + "\n", style="white")
+        content.append(str(snapshot.get("myip")) + "\n", style="white")
         content.append("Starting Domain: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.domain) + "\n", style="white")
+        content.append(str(snapshot.get("starting_domain")) + "\n", style="white")
+        content.append("Starting Domain Auth: ", style=f"bold {BRAND_COLORS['info']}")
+        content.append(str(snapshot.get("starting_domain_auth", "unknown")) + "\n", style="white")
         content.append("Configured Domains: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.domains) + "\n", style="white")
+        content.append(str(snapshot.get("configured_domains")) + "\n", style="white")
         content.append("Automatic Mode: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.auto) + "\n", style="white")
+        content.append(str(snapshot.get("automatic_mode")) + "\n", style="white")
         content.append("Pentest Type: ", style=f"bold {BRAND_COLORS['info']}")
         content.append(
-            str(self.type) + "\n" if self.type else "Not set\n", style="white"
+            (
+                str(snapshot.get("pentest_type")) + "\n"
+                if snapshot.get("pentest_type")
+                else "Not set\n"
+            ),
+            style="white",
         )
         content.append("Current Workspace: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.current_workspace_dir) + "\n", style="white")
-        content.append("Neo4j Server: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.neo4j_host) + "\n", style="white")
-        content.append("Neo4j Port: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.neo4j_port) + "\n", style="white")
-        content.append("Neo4j User: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(self.neo4j_db_user) + "\n", style="white")
-        # Neo4j password is intentionally omitted for security
+        content.append(str(snapshot.get("current_workspace")) + "\n", style="white")
+        content.append("BloodHound CE URL: ", style=f"bold {BRAND_COLORS['info']}")
+        content.append(
+            mark_sensitive(str(snapshot.get("bloodhound_ce_url")), "host") + "\n",
+            style="white",
+        )
+        content.append("BloodHound CE User: ", style=f"bold {BRAND_COLORS['info']}")
+        content.append(
+            mark_sensitive(str(snapshot.get("bloodhound_ce_user")), "user") + "\n",
+            style="white",
+        )
+        content.append("BloodHound CE Password: ", style=f"bold {BRAND_COLORS['info']}")
+        content.append(
+            mark_sensitive(str(snapshot.get("bloodhound_ce_password")), "password")
+            + "\n",
+            style="white",
+        )
         content.append("Telemetry: ", style=f"bold {BRAND_COLORS['info']}")
-        env_val = os.getenv("ADSCAN_TELEMETRY", None)
-        enabled = telemetry._is_telemetry_enabled()
-        suffix = " (session override)" if env_val is not None else " (persisted)"
+        enabled = bool(snapshot.get("telemetry_enabled"))
+        suffix = f" ({snapshot.get('telemetry_source', 'persisted')})"
         content.append(f"{'ON' if enabled else 'OFF'}{suffix}\n", style="white")
 
         content.append("\nDomain Information:\n", style="bold green")

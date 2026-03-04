@@ -233,6 +233,30 @@ def maybe_show_ctf_spraying_recommendation(
     )
 
 
+def _ensure_spraying_clock_sync(shell: SprayShell, domain: str, *, source: str) -> bool:
+    """Ensure clock sync before spraying and emit consistent diagnostics on failure."""
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info_debug(f"[spray] Clock sync requested ({source}) for {marked_domain}")
+    if shell.do_sync_clock_with_pdc(domain, verbose=True):
+        print_info_debug(f"[spray] Clock sync succeeded ({source}) for {marked_domain}")
+        return True
+
+    print_warning(
+        "Clock synchronization failed; skipping password spraying for this attempt."
+    )
+    print_instruction(
+        "Retry after fixing clock sync (or run `sync-clock <domain>`), then run spraying again."
+    )
+    print_info_debug(f"[spray] Clock sync failed ({source}) for {marked_domain}")
+    _capture_spraying_ux_event(
+        shell,
+        "spraying_aborted_clock_sync_failed",
+        domain,
+        extra={"source": source},
+    )
+    return False
+
+
 def get_spraying_user_list_path(
     shell: SprayShell, domain: str, requires_auth_users: bool
 ) -> str | None:
@@ -1012,7 +1036,7 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
                 "CTF recommendation: try Username-as-password spraying as an early foothold check."
             )
 
-    if not shell.do_sync_clock_with_pdc(domain, verbose=True):
+    if not _ensure_spraying_clock_sync(shell, domain, source="do_spraying"):
         return
 
     current_row = shell._questionary_select(
@@ -1241,10 +1265,7 @@ def spraying_with_password(
         )
         return
 
-    if not shell.do_sync_clock_with_pdc(domain, verbose=True):
-        print_info_debug(
-            f"[spray] Aborting spraying_with_password for {marked_domain}: clock sync failed"
-        )
+    if not _ensure_spraying_clock_sync(shell, domain, source="spraying_with_password"):
         return
 
     # Check for repeated spraying with the same password in this domain

@@ -1252,6 +1252,12 @@ def sync_clock_with_pdc(
     # Avoid spamming repeated clock-sync failures
     disabled_reasons = getattr(shell, "_clock_sync_disabled_reasons", None)
     if isinstance(disabled_reasons, dict) and disabled_reasons.get(domain):
+        reason = str(disabled_reasons.get(domain))
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            "[kerberos] Clock sync skipped due to prior disable reason: "
+            f"domain={marked_domain}, reason={reason}"
+        )
         return False
 
     pdc_ip = shell.domains_data[domain]["pdc"]

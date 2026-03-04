@@ -22,7 +22,12 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
-from adscan_internal.command_runner import CommandRunner, CommandSpec
+from adscan_internal.command_runner import (
+    CommandRunner,
+    CommandSpec,
+    build_execution_output_preview,
+    summarize_execution_result,
+)
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
@@ -109,36 +114,20 @@ class ImpacketRunner:
 
         # Always log a concise summary of the result for debugging.
         if isinstance(result, subprocess.CompletedProcess):
-            stdout = result.stdout or ""
-            stderr = result.stderr or ""
-            stdout_lines = [line for line in stdout.splitlines() if line.strip()]
-            stderr_lines = [line for line in stderr.splitlines() if line.strip()]
+            exit_code, stdout_count, stderr_count, duration_text = (
+                summarize_execution_result(result)
+            )
 
             print_info_debug(
                 f"[impacket] Result for {script_name}: "
-                f"exit_code={result.returncode}, "
-                f"stdout_lines={len(stdout_lines)}, "
-                f"stderr_lines={len(stderr_lines)}, "
-                f"duration="
-                f"{float(getattr(result, '_adscan_elapsed_seconds', 0.0)):.3f}s"
+                f"exit_code={exit_code}, "
+                f"stdout_lines={stdout_count}, "
+                f"stderr_lines={stderr_count}, "
+                f"duration={duration_text}"
             )
 
-            # Show a truncated preview of the output for quick diagnostics.
-            preview_lines: list[str] = []
-            head = stdout_lines[:10]
-            tail = stdout_lines[-10:] if len(stdout_lines) > 20 else stdout_lines[10:]
-            if head:
-                preview_lines.append("STDOUT (head):")
-                preview_lines.extend(head)
-            if tail:
-                preview_lines.append("STDOUT (tail):")
-                preview_lines.extend(tail)
-            if stderr_lines:
-                preview_lines.append("STDERR (head):")
-                preview_lines.extend(stderr_lines[:10])
-
-            if preview_lines:
-                preview_text = "\n".join(preview_lines)
+            preview_text = build_execution_output_preview(result)
+            if preview_text:
                 print_info_debug(
                     f"[impacket] Output preview for {script_name}:\n{preview_text}",
                     panel=True,

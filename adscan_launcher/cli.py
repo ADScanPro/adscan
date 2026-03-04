@@ -22,6 +22,7 @@ from io import StringIO
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -67,6 +68,7 @@ from adscan_launcher.output import (
 from adscan_launcher.paths import get_state_dir
 from adscan_launcher.telemetry import (
     HOST_SESSION_CAPTURE_COMMANDS,
+    SESSION_CAPTURE_ALLOWED_COMMANDS,
     capture,
     capture_command_session,
     capture_exception,
@@ -600,6 +602,18 @@ def _seed_session_environment_from_host() -> None:
         capture_exception(exc)
 
 
+def _seed_session_trace_id() -> None:
+    """Seed ADSCAN_SESSION_TRACE_ID once per launcher invocation."""
+    if os.getenv("ADSCAN_SESSION_TRACE_ID"):
+        return
+    try:
+        trace_id = uuid.uuid4().hex
+        os.environ["ADSCAN_SESSION_TRACE_ID"] = trace_id
+        print_info_debug(f"Seeded ADSCAN_SESSION_TRACE_ID: {trace_id!r}")
+    except Exception as exc:  # pragma: no cover - best effort only
+        capture_exception(exc)
+
+
 def _build_launcher_telemetry_console() -> Console:
     """Create a dedicated in-memory Rich console for session recording export."""
     return Console(record=True, theme=ADSCAN_THEME, file=StringIO())
@@ -611,6 +625,7 @@ def _capture_launcher_command_session(
     telemetry_console: Console,
     success: bool | None = None,
     extra: dict[str, Any] | None = None,
+    allowed_commands: set[str] | None = None,
 ) -> None:
     """Capture host-side command session exactly once for launcher-owned commands."""
     global _SESSION_CAPTURE_FINALIZED
@@ -622,7 +637,7 @@ def _capture_launcher_command_session(
         command_type=command_type,
         success=success,
         extra=extra,
-        allowed_commands=set(HOST_SESSION_CAPTURE_COMMANDS),
+        allowed_commands=allowed_commands or set(HOST_SESSION_CAPTURE_COMMANDS),
     )
     _SESSION_CAPTURE_FINALIZED = True
 
@@ -631,14 +646,20 @@ def _run_host_command_with_session_capture(
     *,
     command_type: str,
     telemetry_console: Console,
-    runner: Callable[[], bool],
+    runner: Callable[[], bool | int],
     extra: dict[str, Any] | None = None,
+    allowed_commands: set[str] | None = None,
 ) -> int:
-    """Execute a launcher-owned command and always finalize its session capture."""
+    """Execute a launcher-owned command and always finalize session capture."""
     success = False
     try:
-        success = bool(runner())
-        return 0 if success else 1
+        result = runner()
+        if isinstance(result, bool):
+            success = bool(result)
+            return 0 if success else 1
+        exit_code = int(result)
+        success = exit_code == 0
+        return exit_code
     except KeyboardInterrupt:
         _log_launcher_interrupt(
             kind="keyboard_interrupt",
@@ -657,6 +678,7 @@ def _run_host_command_with_session_capture(
             telemetry_console=telemetry_console,
             success=success,
             extra=extra,
+            allowed_commands=allowed_commands,
         )
 
 
@@ -827,6 +849,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(run_host_helper_server(str(getattr(ns, "socket", ""))))
 
     _seed_session_environment_from_host()
+    _seed_session_trace_id()
     _emit_launcher_system_context(cmd)
 
     # Offer upgrades early for relevant subcommands (interactive only).
@@ -855,26 +878,20 @@ def main(argv: list[str] | None = None) -> None:
 
     if cmd == "start":
         pull_timeout = getattr(ns, "pull_timeout", 3600)
-        try:
-            rc = handle_start_docker(
-                verbose=bool(getattr(ns, "verbose", False)),
-                debug=bool(getattr(ns, "debug", False)),
-                pull_timeout_seconds=int(pull_timeout),
-                bloodhound_stack_mode=resolved_stack_mode,
+        raise SystemExit(
+            _run_host_command_with_session_capture(
+                command_type="start",
+                telemetry_console=telemetry_console,
+                runner=lambda: handle_start_docker(
+                    verbose=bool(getattr(ns, "verbose", False)),
+                    debug=bool(getattr(ns, "debug", False)),
+                    pull_timeout_seconds=int(pull_timeout),
+                    bloodhound_stack_mode=resolved_stack_mode,
+                ),
+                extra={"mode": "docker", "session_scope": "launcher_preflight"},
+                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
             )
-        except KeyboardInterrupt:
-            _log_launcher_interrupt(
-                kind="keyboard_interrupt",
-                source="launcher.start",
-            )
-            rc = 130
-        except EOFError:
-            _log_launcher_interrupt(
-                kind="eof",
-                source="launcher.start",
-            )
-            rc = 130
-        raise SystemExit(rc)
+        )
 
     if cmd == "install":
         raise SystemExit(
@@ -924,27 +941,21 @@ def main(argv: list[str] | None = None) -> None:
         # argparse.REMAINDER keeps leading --, but may start with a "--" separator.
         if passthrough and passthrough[0] == "--":
             passthrough = passthrough[1:]
-        try:
-            rc = run_adscan_passthrough_docker(
-                adscan_args=["ci"] + passthrough,
-                verbose=bool(getattr(ns, "verbose", False)),
-                debug=bool(getattr(ns, "debug", False)),
-                pull_timeout_seconds=int(ns.pull_timeout),
-                bloodhound_stack_mode=resolved_stack_mode,
+        raise SystemExit(
+            _run_host_command_with_session_capture(
+                command_type="ci",
+                telemetry_console=telemetry_console,
+                runner=lambda: run_adscan_passthrough_docker(
+                    adscan_args=["ci"] + passthrough,
+                    verbose=bool(getattr(ns, "verbose", False)),
+                    debug=bool(getattr(ns, "debug", False)),
+                    pull_timeout_seconds=int(ns.pull_timeout),
+                    bloodhound_stack_mode=resolved_stack_mode,
+                ),
+                extra={"mode": "docker", "session_scope": "launcher_preflight"},
+                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
             )
-        except KeyboardInterrupt:
-            _log_launcher_interrupt(
-                kind="keyboard_interrupt",
-                source="launcher.ci_passthrough",
-            )
-            rc = 130
-        except EOFError:
-            _log_launcher_interrupt(
-                kind="eof",
-                source="launcher.ci_passthrough",
-            )
-            rc = 130
-        raise SystemExit(rc)
+        )
 
     # Anything else: pass through to the container.
     if cmd:
