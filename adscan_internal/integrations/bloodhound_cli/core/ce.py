@@ -18,7 +18,14 @@ from .settings import (
     write_ce_config,
     write_ce_config_skeleton,
 )
-from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_internal.rich_output import (
+    mark_sensitive,
+    print_error,
+    print_info,
+    print_info_debug,
+    print_success,
+    print_warning,
+)
 
 
 def _get_default_admin_password() -> str:
@@ -1925,29 +1932,37 @@ class BloodHoundCEClient(BloodHoundClient):
         )
 
         if create_response.status_code not in [200, 201]:
-            print(
-                f"Error creating upload job: {create_response.status_code} - {create_response.text}"
+            self._last_error = (
+                f"Upload job start failed: HTTP {create_response.status_code} - "
+                f"{(create_response.text or '').strip()[:300]}"
             )
+            print_error(self._last_error)
             return None
 
         job_data = create_response.json()
         job_id = job_data.get("data", {}).get("id")
         if not job_id:
-            print(f"Error: Failed to create upload job. Response: {job_data}")
+            self._last_error = (
+                "Upload job start failed: response did not include a valid job id."
+            )
+            print_error(self._last_error)
             return None
 
         try:
+            self._last_error = None
             return int(job_id)
         except Exception:
             # BloodHound sometimes returns ids as strings; be defensive.
-            print(f"Error: Invalid upload job id: {job_id!r}")
+            self._last_error = f"Upload job start failed: invalid job id {job_id!r}."
+            print_error(self._last_error)
             return None
 
     def _upload_file_to_job(self, job_id: int, *, file_path: str) -> bool:
         """Upload a file to an existing upload job."""
         fpath = Path(file_path)
         if not fpath.exists() or not fpath.is_file():
-            print(f"Error: File {file_path} not found")
+            self._last_error = f"Upload failed: file not found ({file_path})."
+            print_error(self._last_error)
             return False
 
         suffix = fpath.suffix.lower()
@@ -1970,11 +1985,14 @@ class BloodHoundCEClient(BloodHoundClient):
             )
 
         if upload_response.status_code >= 400:
-            print(
-                f"Error uploading file: HTTP {upload_response.status_code} - {upload_response.text}"
+            self._last_error = (
+                f"Upload failed: HTTP {upload_response.status_code} - "
+                f"{(upload_response.text or '').strip()[:300]}"
             )
+            print_error(self._last_error)
             return False
 
+        self._last_error = None
         return True
 
     def _end_file_upload_job(self, job_id: int) -> bool:
@@ -1984,10 +2002,13 @@ class BloodHoundCEClient(BloodHoundClient):
             headers=self._get_headers(),
         )
         if end_response.status_code >= 400:
-            print(
-                f"Error ending upload job: HTTP {end_response.status_code} - {end_response.text}"
+            self._last_error = (
+                f"Upload finalize failed: HTTP {end_response.status_code} - "
+                f"{(end_response.text or '').strip()[:300]}"
             )
+            print_error(self._last_error)
             return False
+        self._last_error = None
         return True
 
     def start_file_upload_job(self, file_path: str) -> int | None:
@@ -1997,10 +2018,14 @@ class BloodHoundCEClient(BloodHoundClient):
         to track ingestion for a specific job id.
         """
         try:
+            self._last_error = None
             # Ensure we have a valid token before attempting upload. This will try
             # to auto-renew and, if that fails, interactively prompt the user.
             if not self.ensure_authenticated_robust():
                 summary = self._config_summary()
+                self._last_error = (
+                    "Authentication failed before starting BloodHound upload job."
+                )
                 print_info_debug(
                     "[bloodhound-ce] upload aborted: authentication failed "
                     f"(config_exists={summary.get('config_exists')}, "
@@ -2024,8 +2049,9 @@ class BloodHoundCEClient(BloodHoundClient):
             return job_id
 
         except Exception as e:
+            self._last_error = f"Upload failed with exception: {e}"
             self.logger.error("upload error", error=str(e))
-            print(f"Error uploading file: {e}")
+            print_error(f"Error uploading file: {e}")
             return None
 
     def wait_for_file_upload_job(
@@ -2038,7 +2064,7 @@ class BloodHoundCEClient(BloodHoundClient):
             start_time = time.time()
             last_status = None
 
-            print("Waiting for ingestion to complete...")
+            print_info("Waiting for ingestion to complete...")
             self.logger.info("waiting for ingestion", file_upload_job_id=job_id)
 
             while True:
@@ -2048,7 +2074,10 @@ class BloodHoundCEClient(BloodHoundClient):
                         self.logger.warning(
                             "could not fetch job details", file_upload_job_id=job_id
                         )
-                        print("Timeout: Could not get job details")
+                        self._last_error = (
+                            f"Upload wait failed: timeout fetching job details (job_id={job_id})."
+                        )
+                        print_error("Timeout: Could not get job details")
                         return False
                 else:
                     status = job.get("status")
@@ -2061,14 +2090,15 @@ class BloodHoundCEClient(BloodHoundClient):
                             status=status,
                             message=status_message,
                         )
-                        print(f"Job status: {status} - {status_message}")
+                        print_info(f"Job status: {status} - {status_message}")
                         last_status = status
 
                     # Terminal statuses: -1 invalid, 2 complete, 3 canceled, 4 timed out,
                     # 5 failed, 8 partially complete
                     if status in [-1, 2, 3, 4, 5, 8]:
                         if status == 2:
-                            print("✅ Upload and processing completed successfully")
+                            self._last_error = None
+                            print_success("Upload and processing completed successfully")
                             self.logger.info(
                                 "upload complete",
                                 file_upload_job_id=job_id,
@@ -2082,8 +2112,12 @@ class BloodHoundCEClient(BloodHoundClient):
                                 status=status,
                                 message=status_message,
                             )
-                            print(
-                                "⚠️ Upload completed with warnings (partially complete)"
+                            self._last_error = (
+                                "Upload completed with warnings (partially complete). "
+                                f"status_message={status_message}"
+                            )
+                            print_warning(
+                                "Upload completed with warnings (partially complete)"
                             )
                             return True
 
@@ -2093,9 +2127,10 @@ class BloodHoundCEClient(BloodHoundClient):
                             status=status,
                             message=status_message,
                         )
-                        print(
-                            f"❌ Upload failed with status {status}: {status_message}"
+                        self._last_error = (
+                            f"Upload failed with status {status}: {status_message}"
                         )
+                        print_error(self._last_error)
                         return False
 
                 if time.time() - start_time > timeout_seconds:
@@ -2104,7 +2139,10 @@ class BloodHoundCEClient(BloodHoundClient):
                         file_upload_job_id=job_id,
                         timeout_seconds=timeout_seconds,
                     )
-                    print(f"❌ Timeout after {timeout_seconds} seconds")
+                    self._last_error = (
+                        f"Upload wait timed out after {timeout_seconds}s for job_id={job_id}."
+                    )
+                    print_error(f"Timeout after {timeout_seconds} seconds")
                     return False
 
                 time.sleep(max(1, poll_interval))
@@ -2113,7 +2151,8 @@ class BloodHoundCEClient(BloodHoundClient):
             self.logger.exception(
                 "upload wait error", file_upload_job_id=job_id, error=str(e)
             )
-            print(f"Error in upload wait: {e}")
+            self._last_error = f"Upload wait failed with exception: {e}"
+            print_error(f"Error in upload wait: {e}")
             return False
 
     def list_upload_jobs(self) -> List[Dict]:

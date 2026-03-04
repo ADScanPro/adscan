@@ -2,7 +2,7 @@
 
 <img width="740" height="198" alt="adscan_wordmark_horizontal_transparent_cropped" src="https://github.com/user-attachments/assets/4902f205-d9bc-453e-b2ac-8c7d7fa2f329" />
 
-[![Version](https://img.shields.io/badge/version-5.1.0--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
+[![Version](https://img.shields.io/badge/version-5.1.1--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
 [![downloads](https://static.pepy.tech/badge/adscan)](https://pepy.tech/projects/adscan)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](https://github.com/ADscanPro/adscan/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://github.com/ADscanPro/adscan)

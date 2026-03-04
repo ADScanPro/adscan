@@ -15,7 +15,7 @@ resolution-markers = [
 
 [[package]]
 name = "adscan"
-version = "5.1.0"
+version = "5.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
@@ -44,7 +44,6 @@ cli = [
     { name = "python-docx" },
     { name = "python-magic", marker = "sys_platform == 'linux'" },
     { name = "questionary" },
-    { name = "structlog" },
 ]
 dev = [
     { name = "build" },
@@ -83,7 +82,6 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0,<14.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9.0,<1.0" },
     { name = "sentry-sdk", specifier = ">=1.40.0,<3.0" },
-    { name = "structlog", marker = "extra == 'cli'", specifier = ">=24.1.0" },
     { name = "twine", marker = "extra == 'dev'", specifier = ">=6.0.0,<7.0" },
     { name = "types-requests", marker = "extra == 'dev'" },
 ]
@@ -5017,18 +5015,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c4/68/79977123bb7be889ad680d79a40f339082c1978b5cfcf62c2d8d196873ac/starlette-0.52.1.tar.gz", hash = "sha256:834edd1b0a23167694292e94f597773bc3f89f362be6effee198165a35d62933", size = 2653702, upload-time = "2026-01-18T13:34:11.062Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/81/0d/13d1d239a25cbfb19e740db83143e95c772a1fe10202dda4b76792b114dd/starlette-0.52.1-py3-none-any.whl", hash = "sha256:0029d43eb3d273bc4f83a08720b4912ea4b071087a3b48db01b7c839f7954d74", size = 74272, upload-time = "2026-01-18T13:34:09.188Z" },
-]
-
-[[package]]
-name = "structlog"
-version = "25.5.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ef/52/9ba0f43b686e7f3ddfeaa78ac3af750292662284b3661e91ad5494f21dbc/structlog-25.5.0.tar.gz", hash = "sha256:098522a3bebed9153d4570c6d0288abf80a031dfdb2048d59a49e9dc2190fc98", size = 1460830, upload-time = "2025-10-27T08:28:23.028Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/45/a132b9074aa18e799b891b91ad72133c98d8042c70f6240e4c5f9dabee2f/structlog-25.5.0-py3-none-any.whl", hash = "sha256:a8453e9b9e636ec59bd9e79bbd4a72f025981b3ba0f5837aebf48f02f37a7f9f", size = 72510, upload-time = "2025-10-27T08:28:21.535Z" },
 ]
 
 [[package]]

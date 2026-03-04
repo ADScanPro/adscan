@@ -237,49 +237,73 @@ def get_spraying_user_list_path(
     shell: SprayShell, domain: str, requires_auth_users: bool
 ) -> str | None:
     """Return the user list path required for spraying, ensuring it exists and is not empty."""
-    filename = "enabled_users.txt" if requires_auth_users else "users.txt"
-    relative_path = domain_relpath(shell.domains_dir, domain, filename)
+    primary_filename = "enabled_users.txt" if requires_auth_users else "users.txt"
+    fallback_filename = "users.txt" if requires_auth_users else "enabled_users.txt"
+    candidate_filenames = [primary_filename]
+    if fallback_filename != primary_filename:
+        candidate_filenames.append(fallback_filename)
+
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
-    absolute_path = domain_subpath(workspace_cwd, shell.domains_dir, domain, filename)
 
     try:
         marked_domain = mark_sensitive(domain, "domain")
-        marked_path = mark_sensitive(relative_path, "path")
         print_info_debug(
             f"[spray] Resolving user list for {marked_domain}: "
-            f"requires_auth_users={requires_auth_users}, file={marked_path}"
+            f"requires_auth_users={requires_auth_users}, "
+            f"primary={mark_sensitive(domain_relpath(shell.domains_dir, domain, primary_filename), 'path')}, "
+            f"fallback={mark_sensitive(domain_relpath(shell.domains_dir, domain, fallback_filename), 'path')}"
         )
-        if not os.path.exists(absolute_path):
-            print_warning(
-                f"Cannot perform password spraying: {relative_path} does not exist."
+        candidate_reasons: list[tuple[str, str]] = []
+        for idx, filename in enumerate(candidate_filenames):
+            relative_path = domain_relpath(shell.domains_dir, domain, filename)
+            absolute_path = domain_subpath(
+                workspace_cwd, shell.domains_dir, domain, filename
             )
-            print_info(
-                "Generate the user list first (e.g., run the corresponding enumeration command) "
-                "and try again."
-            )
-            print_info_debug(f"[spray] Missing user list file: {marked_path}")
-            return None
+            marked_path = mark_sensitive(relative_path, "path")
+            if not os.path.exists(absolute_path):
+                candidate_reasons.append((relative_path, "missing"))
+                print_info_debug(f"[spray] Missing user list file: {marked_path}")
+                continue
 
-        size = os.path.getsize(absolute_path)
-        if size == 0:
-            print_warning(
-                f"Cannot perform password spraying: {relative_path} is empty."
+            size = os.path.getsize(absolute_path)
+            if size == 0:
+                candidate_reasons.append((relative_path, "empty"))
+                print_info_debug(f"[spray] User list file is empty: {marked_path}")
+                continue
+
+            if idx > 0:
+                print_info_debug(
+                    f"[spray] Falling back to alternate user list file: {marked_path}"
+                )
+            print_info_debug(
+                f"[spray] User list file size: {size} bytes ({marked_path})"
             )
-            print_info(
-                "Regenerate the user list to ensure it contains accounts before spraying."
+            return relative_path
+
+        attempted_paths = ", ".join(
+            domain_relpath(shell.domains_dir, domain, f) for f in candidate_filenames
+        )
+        print_warning(
+            "Cannot perform password spraying: no valid user list file found "
+            f"({attempted_paths})."
+        )
+        print_info(
+            "Generate the user list first (e.g., run the corresponding enumeration command) "
+            "and try again."
+        )
+        for candidate_path, reason in candidate_reasons:
+            print_info_debug(
+                "[spray] Candidate user list rejected: "
+                f"path={mark_sensitive(candidate_path, 'path')} reason={reason}"
             )
-            print_info_debug(f"[spray] User list file is empty: {marked_path}")
-            return None
-        print_info_debug(f"[spray] User list file size: {size} bytes ({marked_path})")
+        return None
     except OSError as exc:
         telemetry.capture_exception(exc)
-        print_error(f"Unable to validate spraying user list at {relative_path}: {exc}")
+        print_error(f"Unable to validate spraying user list for domain {domain}: {exc}")
         print_info_debug(
             f"[spray] Exception while validating user list: {type(exc).__name__}: {exc}"
         )
         return None
-
-    return relative_path
 
 
 def get_password_spraying_history(shell: SprayShell) -> dict:
@@ -952,8 +976,12 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     # Ensure kerberos output directory exists for spray logs
     ensure_kerberos_output_dir(shell, domain)
 
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    requires_auth_users = auth_state in {"auth", "pwned"}
     user_list_file = get_spraying_user_list_path(
-        shell, domain, shell.domains_data[domain]["auth"] == "auth"
+        shell,
+        domain,
+        requires_auth_users=requires_auth_users,
     )
     if not user_list_file:
         return
@@ -1200,8 +1228,12 @@ def spraying_with_password(
         f"(auth={auth_mode!r}, kerbrute_path={shell.kerbrute_path})"
     )
 
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    requires_auth_users = auth_state in {"auth", "pwned"}
     user_list_file = get_spraying_user_list_path(
-        shell, domain, shell.domains_data[domain]["auth"] == "auth"
+        shell,
+        domain,
+        requires_auth_users=requires_auth_users,
     )
     if not user_list_file:
         print_info_debug(

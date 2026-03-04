@@ -558,13 +558,32 @@ def upload_bloodhound_ce_zip_files(
             f"Submitting BloodHound ZIP upload job ({collector_label}): {marked_zip_path}"
         )
         try:
-            job_id = shell._get_bloodhound_service().start_upload_job(zip_file_path)
+            service = shell._get_bloodhound_service()
+            job_id = service.start_upload_job(zip_file_path)
             uploads.append((zip_file_path, collector_label, job_id))
             if job_id is None:
                 overall_success = False
                 print_warning(
                     f"Failed to start upload job for ZIP ({collector_label})."
                 )
+                last_error = None
+                if hasattr(service, "get_last_client_error"):
+                    try:
+                        last_error = service.get_last_client_error()
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                if not last_error and hasattr(service, "get_last_query_error"):
+                    try:
+                        last_error = service.get_last_query_error()
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                if last_error:
+                    print_info_debug(
+                        "[bloodhound-ce] upload job start failure details: "
+                        f"collector={collector_label}, "
+                        f"file={marked_zip_path}, "
+                        f"error={mark_sensitive(str(last_error), 'error')}"
+                    )
             else:
                 print_info_verbose(
                     f"Upload job created for ({collector_label}): job_id={job_id}"

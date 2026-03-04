@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "5.1.0"
+version = "5.1.1"
 description = "ADscan launcher (host-side) that orchestrates Docker to run the ADscan runtime."
 readme = "adscan_pypi_wrapper/README.md"
 authors = [{ name = "ADscan" }]
@@ -44,7 +44,6 @@ cli = [
     "neo4j>=5.0.0",
     "posthog",
     "pypsrp",
-    "structlog>=24.1.0",
     "pydantic-settings>=2.4.0",
 ]
 
@@ -57,3 +56,6 @@ adscan = "adscan_launcher.cli:main"
 
 [tool.setuptools]
 packages = ["adscan_core", "adscan_launcher"]
+
+[tool.setuptools.package-data]
+adscan_launcher = ["assets/**/*.yml", "assets/**/*.yaml"]

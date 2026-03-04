@@ -8654,6 +8654,16 @@ def _check_bloodhound_ce_running() -> bool:
     This is a wrapper around the modularized check_bloodhound_ce_running function
     from adscan_internal.bloodhound_ce_compose that passes the necessary dependencies.
     """
+    stack_mode = str(os.getenv("ADSCAN_BLOODHOUND_STACK_MODE", "")).strip().lower()
+    if stack_mode and stack_mode != "managed":
+        print_warning(
+            "Only managed BloodHound stack mode is supported. "
+            "Continuing with managed checks."
+        )
+        print_info_debug(
+            f"[bloodhound-ce] unsupported stack mode requested in environment: {stack_mode}"
+        )
+
     from adscan_internal.bloodhound_ce_compose import check_bloodhound_ce_running
 
     return check_bloodhound_ce_running(
@@ -8697,6 +8707,16 @@ def _start_bloodhound_ce():
     Returns:
         bool: True if containers started successfully, False otherwise
     """
+    stack_mode = str(os.getenv("ADSCAN_BLOODHOUND_STACK_MODE", "")).strip().lower()
+    if stack_mode and stack_mode != "managed":
+        print_warning(
+            "Only managed BloodHound stack mode is supported. "
+            "Continuing with managed startup."
+        )
+        print_info_debug(
+            f"[bloodhound-ce] unsupported stack mode requested in environment: {stack_mode}"
+        )
+
     try:
         # Container runtime: delegate BloodHound CE startup to the host helper.
         if _is_full_adscan_container_runtime():
@@ -23437,26 +23457,161 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             )
             os.makedirs(bh_dir, exist_ok=True)
 
-            def _finalize_success() -> None:
+            def _list_zip_files_in_bh_dir() -> list[str]:
+                """Return absolute paths to ZIP files currently present in bh_dir."""
+                try:
+                    zip_files = [
+                        os.path.join(bh_dir, f)
+                        for f in os.listdir(bh_dir)
+                        if f.endswith(".zip")
+                        and os.path.isfile(os.path.join(bh_dir, f))
+                    ]
+                except OSError as exc:
+                    telemetry.capture_exception(exc)
+                    print_info_debug(
+                        f"[BloodHound] Failed to list ZIP files in BH dir: {type(exc).__name__}: {exc}"
+                    )
+                    return []
+                zip_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                return zip_files
+
+            def _mark_paths(paths: list[str]) -> str:
+                """Render a comma-separated list of sensitive-marked paths for debug logs."""
+                if not paths:
+                    return "(none)"
+                return ", ".join(mark_sensitive(path, "path") for path in paths)
+
+            def _infer_collector_zip_token() -> str | None:
+                """Infer collector token used to identify ZIP artifacts."""
+                value = f"{tool_name} {zip_filename or ''}".lower()
+                if "rusthound-ce" in value:
+                    return "rusthound-ce"
+                if "bloodhound-ce-python" in value:
+                    return "bloodhound-ce-python"
+                return None
+
+            def _pick_zip_source_for_success(
+                *,
+                pre_zip_paths: list[str],
+                command_started_at: float,
+                target_dest_path: str,
+            ) -> str | None:
+                """Select the best ZIP source path produced by the successful collector run."""
+                post_zip_paths = _list_zip_files_in_bh_dir()
+                pre_set = set(pre_zip_paths)
+                new_zip_paths = [p for p in post_zip_paths if p not in pre_set]
+
+                # Some collectors may rewrite an existing filename in place. Capture
+                # files touched during this attempt as a second-level fallback.
+                recent_zip_paths: list[str] = []
+                for path in post_zip_paths:
+                    try:
+                        if os.path.getmtime(path) >= (command_started_at - 1.5):
+                            recent_zip_paths.append(path)
+                    except OSError as exc:
+                        telemetry.capture_exception(exc)
+                        print_info_debug(
+                            f"[BloodHound] Could not read mtime for {mark_sensitive(path, 'path')}: {exc}"
+                        )
+
+                collector_token = _infer_collector_zip_token()
+                token_new = (
+                    [p for p in new_zip_paths if collector_token in os.path.basename(p)]
+                    if collector_token
+                    else []
+                )
+                token_recent = (
+                    [
+                        p
+                        for p in recent_zip_paths
+                        if collector_token in os.path.basename(p)
+                    ]
+                    if collector_token
+                    else []
+                )
+
+                print_info_debug(
+                    "[BloodHound] ZIP selection snapshot: "
+                    f"pre={_mark_paths(pre_zip_paths)} | "
+                    f"post={_mark_paths(post_zip_paths)} | "
+                    f"new={_mark_paths(new_zip_paths)} | "
+                    f"recent={_mark_paths(recent_zip_paths)} | "
+                    f"token={collector_token or 'none'} | "
+                    f"token_new={_mark_paths(token_new)} | "
+                    f"token_recent={_mark_paths(token_recent)}"
+                )
+
+                # Highest confidence: expected final name already exists.
+                if os.path.exists(target_dest_path):
+                    return target_dest_path
+
+                for candidates in (
+                    token_new,
+                    token_recent,
+                    new_zip_paths,
+                    recent_zip_paths,
+                ):
+                    if candidates:
+                        return candidates[0]
+
+                # Final conservative fallback: if only one ZIP exists, use it.
+                if len(post_zip_paths) == 1:
+                    return post_zip_paths[0]
+
+                return None
+
+            def _finalize_success(
+                *,
+                pre_zip_paths: list[str],
+                command_started_at: float,
+            ) -> None:
                 marked_domain = mark_sensitive(domain, "domain")
                 print_success(
                     f"BloodHound collector executed successfully on the domain {marked_domain}."
                 )
 
-                zip_files = [f for f in os.listdir(bh_dir) if f.endswith(".zip")]
-                if not zip_files:
-                    print_error("BloodHound ZIP file not found")
-                    return
-
-                latest_zip = max(
-                    zip_files, key=lambda x: os.path.getmtime(os.path.join(bh_dir, x))
-                )
-
                 new_filename = zip_filename or f"{domain}_bloodhound-collector.zip"
                 dest_path = os.path.join(bh_dir, new_filename)
-                source_path = os.path.join(bh_dir, latest_zip)
+                source_path = _pick_zip_source_for_success(
+                    pre_zip_paths=pre_zip_paths,
+                    command_started_at=command_started_at,
+                    target_dest_path=dest_path,
+                )
+                if not source_path:
+                    print_error(
+                        "BloodHound ZIP file not found after successful collector execution."
+                    )
+                    print_info_debug(
+                        "[BloodHound] Could not resolve ZIP source after success: "
+                        f"expected_dest={mark_sensitive(dest_path, 'path')}"
+                    )
+                    return
+
                 if os.path.abspath(source_path) != os.path.abspath(dest_path):
-                    shutil.move(source_path, dest_path)
+                    try:
+                        if os.path.exists(dest_path):
+                            os.remove(dest_path)
+                        shutil.move(source_path, dest_path)
+                        print_info_debug(
+                            "[BloodHound] ZIP artifact normalized: "
+                            f"source={mark_sensitive(source_path, 'path')} -> "
+                            f"dest={mark_sensitive(dest_path, 'path')}"
+                        )
+                    except OSError as exc:
+                        telemetry.capture_exception(exc)
+                        print_error("Failed to normalize BloodHound ZIP artifact path.")
+                        print_info_debug(
+                            "[BloodHound] ZIP normalization failure: "
+                            f"source={mark_sensitive(source_path, 'path')}, "
+                            f"dest={mark_sensitive(dest_path, 'path')}, "
+                            f"error={type(exc).__name__}: {exc}"
+                        )
+                        return
+                else:
+                    print_info_debug(
+                        "[BloodHound] ZIP artifact already in expected path: "
+                        f"{mark_sensitive(dest_path, 'path')}"
+                    )
 
                 bh_mode = get_bloodhound_mode()
                 if bh_mode == "ce":
@@ -23474,6 +23629,8 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 print_info_debug(
                     f"[BloodHound] Executing (attempt {attempt}/3): {sanitized_cmd}"
                 )
+                pre_zip_paths = _list_zip_files_in_bh_dir()
+                command_started_at = time.time()
                 completed_process = self.run_command(
                     current_command,
                     timeout=collector_timeout,
@@ -23493,7 +23650,10 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                         f"[BloodHound] Execution successful. "
                         f"Stdout len: {len(stdout or '')}, Stderr len: {len(stderr or '')}"
                     )
-                    _finalize_success()
+                    _finalize_success(
+                        pre_zip_paths=pre_zip_paths,
+                        command_started_at=command_started_at,
+                    )
                     return
 
                 time_error = None
@@ -23673,6 +23833,8 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 current_command = password_command
                 used_ldap_fallback = False
                 for attempt in range(1, 3):
+                    pre_zip_paths = _list_zip_files_in_bh_dir()
+                    command_started_at = time.time()
                     completed_process = self.run_command(
                         current_command,
                         timeout=collector_timeout,
@@ -23687,7 +23849,10 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                     stdout = completed_process.stdout
                     stderr = completed_process.stderr
                     if completed_process.returncode == 0:
-                        _finalize_success()
+                        _finalize_success(
+                            pre_zip_paths=pre_zip_paths,
+                            command_started_at=command_started_at,
+                        )
                         return
                     if (
                         _detect_ldaps_error(stdout, stderr)
@@ -27600,13 +27765,9 @@ if __name__ == "__main__":
         from adscan_internal.logging_config import update_logging_console_level
 
         update_logging_console_level(verbose_mode=VERBOSE_MODE, debug_mode=True)
-        # Default debug sessions to the dev telemetry environment, but never override
-        # CI detection (GitHub Actions does not always export `CI`, but does set other
-        # CI markers like `GITHUB_ACTIONS`).
-        if not os.getenv("ADSCAN_SESSION_ENV"):
-            detected_env = _determine_session_environment()
-            if detected_env != "ci":
-                os.environ["ADSCAN_SESSION_ENV"] = "dev"
+        # Debug mode must not rewrite telemetry environment labels.
+        # Environment routing is decided by telemetry host-detection and
+        # explicit ADSCAN_SESSION_ENV / ADSCAN_ENV overrides.
         print_success("Debug mode enabled")
 
     # Maintainer-only Docker dev channel (adscan/adscan-dev:*).

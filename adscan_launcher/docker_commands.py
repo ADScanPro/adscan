@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 import requests
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
 import configparser
 
 from adscan_launcher import telemetry
@@ -33,9 +33,10 @@ from adscan_launcher.bloodhound_ce_compose import (
     compose_pull,
     compose_up,
     ensure_bloodhound_compose_file,
-    get_bloodhound_compose_path,
+    get_bloodhound_compose_project_name,
 )
 from adscan_launcher.bloodhound_ce_password import (
+    detect_existing_bloodhound_ce_state,
     ensure_bloodhound_admin_password,
     validate_bloodhound_admin_password_policy,
 )
@@ -84,9 +85,14 @@ DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-lite-dev:edge"
 LEGACY_DEFAULT_DOCKER_IMAGE = "adscan/adscan:latest"
 LEGACY_DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-dev:edge"
 DEFAULT_BLOODHOUND_ADMIN_PASSWORD = "Adscan4thewin!"
+DEFAULT_BLOODHOUND_STACK_MODE = "managed"
+SUPPORTED_BLOODHOUND_STACK_MODES = ("managed",)
 DEFAULT_HOST_HELPER_SOCKET_NAME = "host-helper.sock"
 _DOCKER_RUN_HELP_HAS_GPUS_RE = re.compile(r"\\s--gpus\\b", re.IGNORECASE)
 _DOCKER_INSTALL_DOCS_URL = "https://www.adscanpro.com/docs/getting-started/installation"
+_BLOODHOUND_TROUBLESHOOTING_DOCS_URL = (
+    "https://www.adscanpro.com/docs/guides/troubleshooting"
+)
 _LOCAL_RESOLVER_LOOPBACK_CANDIDATES = (
     "127.0.0.2",
     "127.0.0.3",
@@ -102,6 +108,136 @@ _LEGACY_IMAGE_WARNING_SHOWN = False
 # Keep BloodHound CE config in the effective user's home (sudo-safe), matching
 # the default behavior of bloodhound-cli tooling.
 BH_CONFIG_FILE = get_effective_user_home() / ".bloodhound_config"
+
+
+def _emit_bloodhound_ce_config_diagnostics(
+    *, context: str, exception: Exception | None = None
+) -> None:
+    """Emit best-effort debug diagnostics for ~/.bloodhound_config parsing issues."""
+    marked_path = mark_sensitive(str(BH_CONFIG_FILE), "path")
+    diagnostics = [
+        f"context={context}",
+        f"path={marked_path}",
+        f"exists={BH_CONFIG_FILE.exists()}",
+    ]
+    if BH_CONFIG_FILE.exists():
+        try:
+            file_stats = BH_CONFIG_FILE.stat()
+            diagnostics.append(f"size_bytes={int(file_stats.st_size)}")
+            diagnostics.append(f"mode={oct(file_stats.st_mode & 0o777)}")
+        except OSError as stat_exc:
+            diagnostics.append(
+                f"stat_error={mark_sensitive(str(stat_exc), 'error')}"
+            )
+    if exception is not None:
+        diagnostics.append(f"exception={mark_sensitive(str(exception), 'error')}")
+    print_info_debug("[bloodhound-ce] config diagnostics: " + " ".join(diagnostics))
+
+
+def _load_bloodhound_ce_config(
+    *,
+    context: str,
+    emit_diagnostics: bool = True,
+) -> tuple[configparser.ConfigParser | None, bool]:
+    """Load ~/.bloodhound_config with robust parsing and diagnostics.
+
+    Returns:
+        Tuple ``(config, read_failed)`` where ``config`` is None when the file
+        is missing or unreadable, and ``read_failed`` indicates parser/IO errors.
+    """
+    if not BH_CONFIG_FILE.exists():
+        return None, False
+
+    config = configparser.ConfigParser()
+    try:
+        with open(BH_CONFIG_FILE, "r", encoding="utf-8") as fp:
+            config.read_file(fp)
+    except (
+        configparser.Error,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[bloodhound-ce] failed reading host config file: "
+            f"context={context} error={mark_sensitive(str(exc), 'error')}"
+        )
+        if emit_diagnostics:
+            _emit_bloodhound_ce_config_diagnostics(context=context, exception=exc)
+        return None, True
+    return config, False
+
+
+def _build_bloodhound_ce_config_backup_path() -> Path:
+    """Return a collision-safe backup path for ~/.bloodhound_config."""
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    candidate = BH_CONFIG_FILE.with_name(f"{BH_CONFIG_FILE.name}.bak.{timestamp}")
+    suffix_index = 1
+    while candidate.exists():
+        candidate = BH_CONFIG_FILE.with_name(
+            f"{BH_CONFIG_FILE.name}.bak.{timestamp}.{suffix_index}"
+        )
+        suffix_index += 1
+    return candidate
+
+
+def _backup_bloodhound_ce_config(
+    *,
+    reason: str,
+    warn_user: bool = False,
+) -> Path | None:
+    """Create a timestamped backup of ~/.bloodhound_config when it is unreadable."""
+    if not BH_CONFIG_FILE.exists():
+        return None
+    backup_path = _build_bloodhound_ce_config_backup_path()
+    try:
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(BH_CONFIG_FILE, backup_path)
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[bloodhound-ce] failed creating config backup: "
+            f"reason={reason} error={mark_sensitive(str(exc), 'error')}"
+        )
+        return None
+
+    if warn_user:
+        print_warning(
+            "Detected an invalid BloodHound CE config file. ADscan will recreate it."
+        )
+    print_info_verbose(
+        "BloodHound CE config backup created: "
+        f"{mark_sensitive(str(backup_path), 'path')}"
+    )
+    print_info_debug(
+        "[bloodhound-ce] config backup created: "
+        f"reason={reason} source={mark_sensitive(str(BH_CONFIG_FILE), 'path')} "
+        f"backup={mark_sensitive(str(backup_path), 'path')}"
+    )
+    return backup_path
+
+
+def _normalize_bloodhound_stack_mode(mode: str | None) -> str:
+    """Return normalized BloodHound stack mode."""
+    raw = str(mode or os.getenv("ADSCAN_BLOODHOUND_STACK_MODE", "")).strip().lower()
+    if raw in SUPPORTED_BLOODHOUND_STACK_MODES:
+        return raw
+    return DEFAULT_BLOODHOUND_STACK_MODE
+
+
+def _normalize_external_bloodhound_base_url(base_url: str | None) -> str | None:
+    """Normalize optional external BloodHound CE base URL."""
+    value = str(base_url or "").strip()
+    if not value:
+        return None
+    return value.rstrip("/")
+
+
+def _normalize_external_bloodhound_username(username: str | None) -> str:
+    """Normalize optional external BloodHound CE username."""
+    raw = str(username or "admin").strip()
+    return raw or "admin"
 
 
 def _maybe_warn_about_slow_network_before_pull(
@@ -410,7 +546,18 @@ def _persist_bloodhound_ce_config(
 
     config = configparser.ConfigParser()
     if BH_CONFIG_FILE.exists():
-        config.read(str(BH_CONFIG_FILE))
+        existing_config, read_failed = _load_bloodhound_ce_config(
+            context="persist_host_config",
+            emit_diagnostics=True,
+        )
+        if existing_config is not None:
+            config = existing_config
+        elif read_failed:
+            _backup_bloodhound_ce_config(
+                reason="persist_recreate_on_parse_error",
+                warn_user=False,
+            )
+            config = configparser.ConfigParser()
     config["CE"] = {
         "base_url": str(resolved_base_url),
         "api_token": str(token),
@@ -438,11 +585,15 @@ def _persist_bloodhound_ce_config(
 
 def _validate_bloodhound_ce_config() -> bool:
     """Check if ~/.bloodhound_config has the expected CE structure."""
-    if not BH_CONFIG_FILE.exists():
+    config, read_failed = _load_bloodhound_ce_config(
+        context="validate_host_config",
+        emit_diagnostics=True,
+    )
+    if config is None:
+        if read_failed:
+            print_info_debug("[bloodhound-ce] config validation failed: parse error.")
         return False
 
-    config = configparser.ConfigParser()
-    config.read(str(BH_CONFIG_FILE))
     if "CE" not in config:
         print_info_debug("[bloodhound-ce] config missing [CE] section")
         return False
@@ -468,21 +619,41 @@ def _validate_bloodhound_ce_config() -> bool:
 
 def _get_stored_bloodhound_ce_password() -> str | None:
     """Return the stored BloodHound CE password from host config when available."""
-    if not BH_CONFIG_FILE.exists():
+    config, read_failed = _load_bloodhound_ce_config(
+        context="get_stored_password",
+        emit_diagnostics=False,
+    )
+    if config is None:
+        if read_failed:
+            print_info_debug(
+                "[bloodhound-ce] failed reading stored CE password from config."
+            )
         return None
-    try:
-        config = configparser.ConfigParser()
-        config.read(str(BH_CONFIG_FILE))
-        if "CE" not in config:
-            return None
-        value = config["CE"].get("password")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_info_debug(
-            f"[bloodhound-ce] failed reading stored CE password from config: {exc}"
-        )
+    if "CE" not in config:
+        return None
+    value = config["CE"].get("password")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _get_stored_bloodhound_ce_base_url() -> str | None:
+    """Return stored BloodHound CE base_url from host config when available."""
+    config, read_failed = _load_bloodhound_ce_config(
+        context="get_stored_base_url",
+        emit_diagnostics=False,
+    )
+    if config is None:
+        if read_failed:
+            print_info_debug(
+                "[bloodhound-ce] failed reading stored CE base_url from config."
+            )
+        return None
+    if "CE" not in config:
+        return None
+    value = config["CE"].get("base_url")
+    if isinstance(value, str) and value.strip():
+        return value.strip().rstrip("/")
     return None
 
 
@@ -520,9 +691,11 @@ def _reset_bloodhound_ce_stack_for_password_recovery(compose_path: Path) -> bool
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_warning("Error while resetting BloodHound CE stack for recovery.")
-        print_info_debug(f"[bloodhound-ce] reset down exception: {exc}")
+        print_info_debug(
+            f"[bloodhound-ce] reset down exception: {mark_sensitive(str(exc), 'error')}"
+        )
         return False
-
+ 
     return compose_up(compose_path)
 
 
@@ -549,7 +722,10 @@ def _bootstrap_bloodhound_ce_auth(
     if config_exists:
         # Reused installation: validate current config/token first.
         auth_verified = _ensure_bloodhound_ce_auth_for_docker(
-            desired_password=desired_password
+            desired_password=desired_password,
+            # Even with an existing host config, the managed stack may be freshly
+            # created (or migrated) and require first-run recovery from logs.
+            allow_managed_password_bootstrap=True,
         )
         stored_password = _get_stored_bloodhound_ce_password()
         desired_password_verified = bool(
@@ -563,15 +739,26 @@ def _bootstrap_bloodhound_ce_auth(
             "[bloodhound-ce] no existing config found; attempting first-run "
             "initial-password extraction from container logs."
         )
-        password_automation_ok = ensure_bloodhound_admin_password(
-            desired_password=desired_password,
-            suppress_browser=suppress_browser,
-        )
-        if not password_automation_ok:
-            print_info_debug(
-                "[bloodhound-ce] initial-password automation did not succeed; "
-                "trying desired-password fallback auth bootstrap."
+        if detect_existing_bloodhound_ce_state():
+            print_info(
+                "Detected an existing BloodHound CE data state without local ADscan "
+                "credentials. Skipping first-run password extraction."
             )
+            print_info_debug(
+                "[bloodhound-ce] first-run password extraction skipped: "
+                "container logs indicate an already initialized CE instance."
+            )
+            password_automation_ok = False
+        else:
+            password_automation_ok = ensure_bloodhound_admin_password(
+                desired_password=desired_password,
+                suppress_browser=suppress_browser,
+            )
+            if not password_automation_ok:
+                print_info_debug(
+                    "[bloodhound-ce] initial-password automation did not succeed; "
+                    "trying desired-password fallback auth bootstrap."
+                )
         marked_desired_password = mark_sensitive(desired_password, "password")
         print_info_debug(
             "[bloodhound-ce] desired-password fallback attempt: "
@@ -582,7 +769,8 @@ def _bootstrap_bloodhound_ce_auth(
             password=desired_password,
         )
         auth_verified = _ensure_bloodhound_ce_auth_for_docker(
-            desired_password=desired_password
+            desired_password=desired_password,
+            allow_managed_password_bootstrap=True,
         )
         if auth_verified:
             stored_password = _get_stored_bloodhound_ce_password()
@@ -601,6 +789,26 @@ def _bootstrap_bloodhound_ce_auth(
     )
     if not should_reset:
         return auth_verified, desired_password_verified, password_automation_ok
+    try:
+        reset_confirmation = Prompt.ask(
+            "Type RESET to confirm destructive BloodHound CE data reset",
+            default="",
+        )
+    except (EOFError, KeyboardInterrupt) as exc:
+        interrupt_kind = (
+            "keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "eof"
+        )
+        emit_interrupt_debug(
+            kind=interrupt_kind,
+            source="launcher.bloodhound_ce_destructive_reset_confirmation",
+            print_debug=print_info_debug,
+        )
+        return auth_verified, desired_password_verified, password_automation_ok
+    if str(reset_confirmation or "").strip().upper() != "RESET":
+        print_warning(
+            "BloodHound CE reset cancelled. Destructive reset was not confirmed."
+        )
+        return auth_verified, desired_password_verified, password_automation_ok
 
     if not _reset_bloodhound_ce_stack_for_password_recovery(compose_path):
         return auth_verified, desired_password_verified, password_automation_ok
@@ -614,7 +822,8 @@ def _bootstrap_bloodhound_ce_auth(
         password=desired_password,
     )
     auth_verified = _ensure_bloodhound_ce_auth_for_docker(
-        desired_password=desired_password
+        desired_password=desired_password,
+        allow_managed_password_bootstrap=True,
     )
     stored_password = _get_stored_bloodhound_ce_password()
     desired_password_verified = bool(
@@ -624,7 +833,11 @@ def _bootstrap_bloodhound_ce_auth(
 
 
 def _ensure_bloodhound_ce_auth_for_docker(
-    *, desired_password: str | None = None
+    *,
+    desired_password: str | None = None,
+    base_url_override: str | None = None,
+    username_override: str | None = None,
+    allow_managed_password_bootstrap: bool = False,
 ) -> bool:
     """Ensure we can authenticate to BloodHound CE before starting Docker mode.
 
@@ -641,6 +854,10 @@ def _ensure_bloodhound_ce_auth_for_docker(
     """
     print_info("Verifying BloodHound CE authentication for Docker mode...")
     resolved_desired_password = desired_password or _get_bloodhound_admin_password()
+    resolved_base_url_override = _normalize_external_bloodhound_base_url(
+        base_url_override
+    )
+    resolved_username = _normalize_external_bloodhound_username(username_override)
 
     if not BH_CONFIG_FILE.exists():
         print_info_verbose(
@@ -649,10 +866,13 @@ def _ensure_bloodhound_ce_auth_for_docker(
         marked_desired_password = mark_sensitive(resolved_desired_password, "password")
         print_info_debug(
             "[bloodhound-ce] config bootstrap attempt with desired password: "
-            f"username=admin password={marked_desired_password}"
+            f"username={mark_sensitive(resolved_username, 'username')} "
+            f"password={marked_desired_password}"
         )
         if _persist_bloodhound_ce_config(
-            username="admin", password=resolved_desired_password
+            username=resolved_username,
+            password=resolved_desired_password,
+            base_url=resolved_base_url_override,
         ):
             print_success("BloodHound CE config created on host.")
         else:
@@ -666,7 +886,8 @@ def _ensure_bloodhound_ce_auth_for_docker(
                 )
                 return False
             print_warning(
-                "Default BloodHound CE password failed. Please enter the current password."
+                "Default BloodHound CE password failed. Please enter the current "
+                "admin password for your existing BloodHound CE installation."
             )
             try:
                 new_password = getpass.getpass(
@@ -688,8 +909,9 @@ def _ensure_bloodhound_ce_auth_for_docker(
             if not new_password:
                 new_password = resolved_desired_password
             if not _persist_bloodhound_ce_config(
-                username="admin",
+                username=resolved_username,
                 password=new_password,
+                base_url=resolved_base_url_override,
             ):
                 print_warning(
                     "Could not create BloodHound CE config with the provided password."
@@ -699,18 +921,29 @@ def _ensure_bloodhound_ce_auth_for_docker(
         if not _validate_bloodhound_ce_config():
             marked_path = mark_sensitive(str(BH_CONFIG_FILE), "path")
             print_warning(
-                "BloodHound CE config is missing required fields; refreshing it."
+                "BloodHound CE config is missing required fields or is unreadable; refreshing it."
             )
             print_info_verbose(f"Config path: {marked_path}")
-            config = configparser.ConfigParser()
-            config.read(str(BH_CONFIG_FILE))
-            stored_user = "admin"
+            config, read_failed = _load_bloodhound_ce_config(
+                context="refresh_invalid_config",
+                emit_diagnostics=True,
+            )
+            stored_user = resolved_username
             stored_password = None
-            stored_base_url = None
-            if "CE" in config:
+            stored_base_url = resolved_base_url_override
+            if config is not None and "CE" in config:
                 stored_user = config["CE"].get("username", "admin")
                 stored_password = config["CE"].get("password")
                 stored_base_url = config["CE"].get("base_url")
+            elif read_failed:
+                _backup_bloodhound_ce_config(
+                    reason="invalid_or_corrupt_config",
+                    warn_user=True,
+                )
+                print_instruction(
+                    "ADscan will recreate ~/.bloodhound_config once valid BloodHound "
+                    "credentials are confirmed."
+                )
             if stored_password:
                 if not _persist_bloodhound_ce_config(
                     username=stored_user,
@@ -726,25 +959,81 @@ def _ensure_bloodhound_ce_auth_for_docker(
                 )
 
     # Best-effort: re-authenticate using stored credentials to refresh the token.
-    base_url = f"http://127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
-    stored_user = "admin"
+    base_url = (
+        resolved_base_url_override
+        or f"http://127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
+    )
+    stored_user = resolved_username
     stored_password: str | None = None
-    if BH_CONFIG_FILE.exists():
-        try:
-            config = configparser.ConfigParser()
-            config.read(str(BH_CONFIG_FILE))
-            if "CE" in config:
-                stored_user = config["CE"].get("username", "admin")
-                stored_password = config["CE"].get("password")
-                base_url = config["CE"].get("base_url") or base_url
-        except Exception:
-            stored_password = stored_password
+    config, _read_failed = _load_bloodhound_ce_config(
+        context="auth_verify_stored_credentials",
+        emit_diagnostics=False,
+    )
+    if config is not None and "CE" in config:
+        stored_user = config["CE"].get("username", stored_user)
+        stored_password = config["CE"].get("password")
+        if not resolved_base_url_override:
+            configured_base_url = (config["CE"].get("base_url") or "").strip()
+            if (
+                allow_managed_password_bootstrap
+                and configured_base_url
+                and configured_base_url.rstrip("/") != base_url.rstrip("/")
+            ):
+                print_info_debug(
+                    "[bloodhound-ce] ignoring stored base_url during managed auth bootstrap: "
+                    f"stored={mark_sensitive(configured_base_url, 'url')} "
+                    f"effective={mark_sensitive(base_url, 'url')}"
+                )
+            else:
+                base_url = configured_base_url or base_url
 
     if stored_password and _persist_bloodhound_ce_config(
         username=stored_user, password=stored_password, base_url=base_url
     ):
         print_success("BloodHound CE authentication verified.")
         return True
+
+    if allow_managed_password_bootstrap:
+        print_info_debug(
+            "[bloodhound-ce] attempting managed desired-password auth fallback "
+            "before container-log recovery."
+        )
+        if _persist_bloodhound_ce_config(
+            username=resolved_username,
+            password=resolved_desired_password,
+            base_url=base_url,
+        ):
+            print_success(
+                "BloodHound CE authentication verified with the managed desired password."
+            )
+            return True
+        print_info_debug(
+            "[bloodhound-ce] managed auth verification failed with stored credentials; "
+            "attempting first-run password recovery from container logs."
+        )
+        if detect_existing_bloodhound_ce_state():
+            print_info_debug(
+                "[bloodhound-ce] managed auth recovery skipped: existing CE data state detected."
+            )
+        else:
+            recovered = ensure_bloodhound_admin_password(
+                desired_password=resolved_desired_password,
+                suppress_browser=True,
+                base_url=base_url,
+            )
+            if recovered and _persist_bloodhound_ce_config(
+                username=resolved_username,
+                password=resolved_desired_password,
+                base_url=base_url,
+            ):
+                print_success(
+                    "BloodHound CE authentication verified via managed password recovery."
+                )
+                return True
+            if not recovered:
+                print_info_debug(
+                    "[bloodhound-ce] managed auth recovery could not extract/update initial password."
+                )
 
     if not sys.stdin.isatty():
         print_warning(
@@ -1562,6 +1851,8 @@ def _print_docker_install_summary(
     bloodhound_admin_password: str,
     bloodhound_auth_verified: bool = True,
     bloodhound_desired_password_verified: bool = True,
+    bloodhound_stack_mode: str = DEFAULT_BLOODHOUND_STACK_MODE,
+    bloodhound_base_url: str | None = None,
 ) -> None:
     """Render a professional installation summary panel for Docker mode."""
     from rich.console import Group
@@ -1581,7 +1872,11 @@ def _print_docker_install_summary(
     renderables: list = []
 
     # ── BloodHound CE section ──
-    login_url = f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}/ui/login"
+    effective_url = (
+        str(bloodhound_base_url or "").strip()
+        or f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
+    ).rstrip("/")
+    login_url = f"{effective_url}/ui/login"
 
     bh_header = Text("BloodHound CE", style=f"bold {BRAND_COLORS['info']}")
     renderables.append(bh_header)
@@ -1595,6 +1890,7 @@ def _print_docker_install_summary(
     bh_table.add_column(justify="right", style="dim", no_wrap=True, min_width=12)
     bh_table.add_column(justify="left")
     bh_table.add_row("URL", login_url)
+    bh_table.add_row("Mode", bloodhound_stack_mode)
     bh_table.add_row("Username", "admin")
     if bloodhound_desired_password_verified:
         bh_table.add_row("Password", bloodhound_admin_password)
@@ -1678,14 +1974,146 @@ def _print_docker_install_summary(
         telemetry_console.print(next_panel)
 
 
+def _print_managed_bloodhound_runtime_troubleshooting(
+    *,
+    command_name: str,
+    compose_path: Path | None,
+    failure_reason: str,
+    auth_failed: bool = False,
+) -> None:
+    """Render actionable troubleshooting guidance for managed BloodHound CE failures."""
+    project_name = get_bloodhound_compose_project_name()
+    login_url = f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}/ui/login"
+    compose_path_display = (
+        mark_sensitive(str(compose_path), "path") if compose_path else "UNAVAILABLE"
+    )
+    details = [
+        "ADscan requires a healthy managed BloodHound CE stack to continue.",
+        f"Command: {command_name}",
+        f"Failure: {failure_reason}",
+        f"Managed compose path: {compose_path_display}",
+        (
+            "Compose source: bundled with ADscan (works for PyPI installs), then "
+            "written to the managed path above."
+        ),
+        f"Expected UI: {mark_sensitive(login_url, 'url')}",
+    ]
+    if auth_failed:
+        details.append(
+            "Authentication to BloodHound CE could not be verified with the current "
+            "managed configuration."
+        )
+        details.append(
+            "If ~/.bloodhound_config is stale or corrupt, ADscan can recreate it "
+            "after valid credentials are provided."
+        )
+    print_panel(
+        "\n".join(details),
+        title="BloodHound CE Runtime Required",
+        border_style="yellow",
+    )
+
+    if compose_path:
+        marked_path = mark_sensitive(str(compose_path), "path")
+        print_instruction(
+            f"Try: docker compose -p {project_name} -f {marked_path} pull"
+        )
+        print_instruction(
+            f"Try: docker compose -p {project_name} -f {marked_path} up -d"
+        )
+        print_instruction(
+            f"Try: docker compose -p {project_name} -f {marked_path} ps"
+        )
+    else:
+        print_instruction("Run: adscan install")
+
+    print_instruction(f"Inspect logs: docker logs {project_name}-bloodhound-1 --tail 200")
+    print_instruction(f"Troubleshooting guide: {_BLOODHOUND_TROUBLESHOOTING_DOCS_URL}")
+
+
+def _ensure_managed_bloodhound_runtime_ready(
+    *,
+    command_name: str,
+    desired_password: str | None = None,
+    pull_missing_images: bool,
+    pull_stream_output: bool,
+    start_stack: bool,
+    verify_auth: bool,
+    allow_auth_bootstrap: bool,
+) -> tuple[bool, Path | None]:
+    """Ensure the managed BloodHound CE compose stack is usable for Docker mode."""
+    compose_path = ensure_bloodhound_compose_file(version=BLOODHOUND_CE_VERSION)
+    if not compose_path:
+        _print_managed_bloodhound_runtime_troubleshooting(
+            command_name=command_name,
+            compose_path=None,
+            failure_reason="Managed BloodHound CE compose file is unavailable.",
+        )
+        return False, None
+
+    images = compose_list_images(compose_path)
+    if images is None:
+        _print_managed_bloodhound_runtime_troubleshooting(
+            command_name=command_name,
+            compose_path=compose_path,
+            failure_reason="Could not resolve images from managed compose file.",
+        )
+        return False, compose_path
+
+    present, missing = compose_images_present(images)
+    if not present:
+        print_warning("Some BloodHound CE images are missing locally.")
+        print_info_debug(f"[bloodhound-ce] missing images: {missing}")
+        if pull_missing_images:
+            print_info("Pulling missing BloodHound CE images...")
+            if not compose_pull(compose_path, stream_output=pull_stream_output):
+                _print_managed_bloodhound_runtime_troubleshooting(
+                    command_name=command_name,
+                    compose_path=compose_path,
+                    failure_reason="Failed to pull managed BloodHound CE images.",
+                )
+                return False, compose_path
+        else:
+            _print_managed_bloodhound_runtime_troubleshooting(
+                command_name=command_name,
+                compose_path=compose_path,
+                failure_reason="Managed BloodHound CE images are missing.",
+            )
+            return False, compose_path
+
+    if start_stack and not compose_up(compose_path):
+        _print_managed_bloodhound_runtime_troubleshooting(
+            command_name=command_name,
+            compose_path=compose_path,
+            failure_reason="Managed BloodHound CE stack could not be started.",
+        )
+        return False, compose_path
+
+    if verify_auth and not _ensure_bloodhound_ce_auth_for_docker(
+        desired_password=desired_password or _get_bloodhound_admin_password(),
+        allow_managed_password_bootstrap=allow_auth_bootstrap,
+    ):
+        _print_managed_bloodhound_runtime_troubleshooting(
+            command_name=command_name,
+            compose_path=compose_path,
+            failure_reason="Managed BloodHound CE authentication validation failed.",
+            auth_failed=True,
+        )
+        return False, compose_path
+
+    return True, compose_path
+
+
 def handle_install_docker(
     *,
     bloodhound_admin_password: str,
     suppress_bloodhound_browser: bool,
     pull_timeout_seconds: int | None = None,
+    bloodhound_stack_mode: str | None = None,
 ) -> bool:
     """Install ADscan via Docker (pull image + bootstrap BloodHound CE)."""
     password_len = len(str(bloodhound_admin_password or ""))
+    resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
     print_info_debug(
         "[bloodhound-ce] install desired admin password metadata: "
         f"length={password_len}, custom={bloodhound_admin_password != DEFAULT_BLOODHOUND_ADMIN_PASSWORD}"
@@ -1696,7 +2124,7 @@ def handle_install_docker(
     if not policy_ok:
         print_error(policy_error or "Invalid BloodHound CE admin password.")
         print_instruction(
-            "Use --bloodhound-admin-password with at least 12 characters."
+            "Use --bloodhound-admin-password with at least 12 characters, one lowercase, one uppercase, one number, and one of (!@#$%^&*)."
         )
         telemetry.capture(
             "docker_install_failed",
@@ -1716,6 +2144,7 @@ def handle_install_docker(
             "bloodhound_admin_password_custom": (
                 bloodhound_admin_password != "Adscan4thewin!"
             ),
+            "bloodhound_stack_mode": resolved_stack_mode,
             "suppress_browser": suppress_bloodhound_browser,
             "in_container": is_docker_env(),
         },
@@ -1866,6 +2295,11 @@ def handle_install_docker(
     )
     print_success("ADscan Docker image pulled successfully.")
 
+    auth_verified = False
+    desired_password_verified = False
+    password_automation_ok = False
+    effective_bloodhound_url = f"http://localhost:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
+
     # BloodHound compose download
     print_info("Configuring BloodHound CE stack (docker compose)...")
     telemetry.capture(
@@ -1892,6 +2326,11 @@ def handle_install_docker(
                 "total_duration_seconds": time.monotonic() - start_time,
                 "failure_stage": "compose_download",
             },
+        )
+        _print_managed_bloodhound_runtime_troubleshooting(
+            command_name="install",
+            compose_path=None,
+            failure_reason="Managed BloodHound CE compose file setup failed.",
         )
         return False
 
@@ -1928,6 +2367,11 @@ def handle_install_docker(
             },
         )
         print_error("Failed to pull BloodHound CE images.")
+        _print_managed_bloodhound_runtime_troubleshooting(
+            command_name="install",
+            compose_path=compose_path,
+            failure_reason="Failed to pull managed BloodHound CE images.",
+        )
         return False
 
     telemetry.capture(
@@ -1946,6 +2390,11 @@ def handle_install_docker(
                 "total_duration_seconds": time.monotonic() - start_time,
                 "failure_stage": "bloodhound_up",
             },
+        )
+        _print_managed_bloodhound_runtime_troubleshooting(
+            command_name="install",
+            compose_path=compose_path,
+            failure_reason="Managed BloodHound CE stack did not start.",
         )
         return False
 
@@ -1966,17 +2415,25 @@ def handle_install_docker(
         desired_password=bloodhound_admin_password,
         suppress_browser=suppress_bloodhound_browser,
     )
+
     telemetry.capture(
         "docker_install_bloodhound_auth_completed",
         {
             "password_automation_ok": bool(password_automation_ok),
             "desired_password_verified": bool(desired_password_verified),
             "auth_verified": bool(auth_verified),
+            "stack_mode": resolved_stack_mode,
         },
     )
     if not auth_verified:
         print_warning(
             "BloodHound CE is running, but authentication could not be verified automatically."
+        )
+        _print_managed_bloodhound_runtime_troubleshooting(
+            command_name="install",
+            compose_path=compose_path,
+            failure_reason="Managed BloodHound CE authentication could not be verified.",
+            auth_failed=True,
         )
 
     # Installation completed successfully
@@ -1994,15 +2451,21 @@ def handle_install_docker(
         bloodhound_admin_password=bloodhound_admin_password,
         bloodhound_auth_verified=bool(auth_verified),
         bloodhound_desired_password_verified=bool(desired_password_verified),
+        bloodhound_stack_mode=resolved_stack_mode,
+        bloodhound_base_url=effective_bloodhound_url,
     )
 
     return True
 
 
-def handle_check_docker() -> bool:
+def handle_check_docker(
+    *,
+    bloodhound_stack_mode: str | None = None,
+) -> bool:
     """Check ADscan Docker-mode prerequisites."""
     image = _select_existing_or_preferred_image()
     all_ok = True
+    _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
 
     print_info("Checking ADscan Docker mode...")
     if not docker_available():
@@ -2017,26 +2480,17 @@ def handle_check_docker() -> bool:
         print_instruction("Run: adscan install (pulls the latest image).")
         all_ok = False
 
-    compose_path = get_bloodhound_compose_path()
-    if not compose_path.exists():
-        print_warning("BloodHound CE docker-compose.yml not found.")
-        print_instruction("Run: adscan install (downloads compose + pulls images).")
+    managed_ready, _compose_path = _ensure_managed_bloodhound_runtime_ready(
+        command_name="check",
+        desired_password=_get_bloodhound_admin_password(),
+        pull_missing_images=False,
+        pull_stream_output=False,
+        start_stack=True,
+        verify_auth=True,
+        allow_auth_bootstrap=False,
+    )
+    if not managed_ready:
         all_ok = False
-    else:
-        images = compose_list_images(compose_path)
-        if images is None:
-            print_warning("Could not determine BloodHound CE images from compose file.")
-            print_instruction(
-                "Ensure docker compose is available, then retry: adscan check"
-            )
-            all_ok = False
-        else:
-            present, missing = compose_images_present(images)
-            if not present:
-                all_ok = False
-                print_warning("Some BloodHound CE images are missing locally.")
-                print_info_debug(f"[bloodhound-ce] missing images: {missing}")
-                print_instruction("Run: adscan install (pulls missing images).")
 
     # Best-effort: run `--version` inside the container to validate basic execution.
     if all_ok:
@@ -2093,32 +2547,26 @@ def handle_start_docker(
     verbose: bool,
     debug: bool,
     pull_timeout_seconds: int | None = None,
+    bloodhound_stack_mode: str | None = None,
 ) -> int:
     """Start ADscan inside Docker and return the docker exit code."""
     image = _select_existing_or_preferred_image()
+    resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
+    compose_path: Path | None = None
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
         return 1
 
-    compose_path = ensure_bloodhound_compose_file(version=BLOODHOUND_CE_VERSION)
-    if not compose_path:
-        return 1
-    images = compose_list_images(compose_path)
-    if images is not None:
-        present, missing = compose_images_present(images)
-        if not present:
-            print_warning("Some BloodHound CE images are missing; pulling now...")
-            print_info_debug(f"[bloodhound-ce] missing images: {missing}")
-            compose_pull(compose_path)
-    if not compose_up(compose_path):
-        print_error(
-            "BloodHound CE stack could not be started automatically. "
-            "ADscan Docker mode cannot proceed without a running BloodHound CE instance."
-        )
-        return 1
-
-    # Require a valid BloodHound CE token before starting the Dockerized ADscan.
-    if not _ensure_bloodhound_ce_auth_for_docker():
+    managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
+        command_name="start",
+        desired_password=_get_bloodhound_admin_password(),
+        pull_missing_images=True,
+        pull_stream_output=False,
+        start_stack=True,
+        verify_auth=True,
+        allow_auth_bootstrap=True,
+    )
+    if not managed_ready or compose_path is None:
         return 1
     _ensure_bloodhound_config_mountable()
     print_info_debug(
@@ -2200,10 +2648,17 @@ def handle_start_docker(
         workspaces_host_dir=workspaces,
         interactive=True,
         extra_run_args=tuple(extra_run_args),
-        extra_env=(
-            ("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path)),
-            ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
-            ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+        extra_env=tuple(
+            [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+            + (
+                [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
+                if compose_path is not None
+                else []
+            )
+            + [
+                ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
+                ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+            ]
         ),
     )
 
@@ -2251,23 +2706,27 @@ def handle_ci_docker(
     generate_report: bool,
     report_format: str,
     pull_timeout_seconds: int | None = None,
+    bloodhound_stack_mode: str | None = None,
 ) -> int:
     """Run `adscan ci` inside Docker and return the docker exit code."""
     image = _select_existing_or_preferred_image()
+    resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
+    compose_path: Path | None = None
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
         return 1
 
-    compose_path = ensure_bloodhound_compose_file(version=BLOODHOUND_CE_VERSION)
-    if not compose_path:
+    managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
+        command_name="ci",
+        desired_password=_get_bloodhound_admin_password(),
+        pull_missing_images=True,
+        pull_stream_output=False,
+        start_stack=True,
+        verify_auth=True,
+        allow_auth_bootstrap=True,
+    )
+    if not managed_ready or compose_path is None:
         return 1
-    images = compose_list_images(compose_path)
-    if images is not None:
-        present, missing = compose_images_present(images)
-        if not present:
-            print_warning("Some BloodHound CE images are missing; pulling now...")
-            print_info_debug(f"[bloodhound-ce] missing images: {missing}")
-            compose_pull(compose_path)
 
     if not image_exists(image):
         print_warning(f"ADscan docker image not present: {image}")
@@ -2339,10 +2798,17 @@ def handle_ci_docker(
         workspaces_host_dir=workspaces_dir,
         interactive=interactive,
         extra_run_args=tuple(extra_run_args),
-        extra_env=(
-            ("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path)),
-            ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
-            ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+        extra_env=tuple(
+            [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+            + (
+                [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
+                if compose_path is not None
+                else []
+            )
+            + [
+                ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
+                ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+            ]
         ),
     )
 
@@ -2417,6 +2883,7 @@ def run_adscan_passthrough_docker(
     verbose: bool,
     debug: bool,
     pull_timeout_seconds: int | None = None,
+    bloodhound_stack_mode: str | None = None,
 ) -> int:
     """Run an arbitrary `adscan ...` command inside the container (host-side).
 
@@ -2424,20 +2891,23 @@ def run_adscan_passthrough_docker(
     CLI argument parsing while still keeping Docker-mode preflight consistent.
     """
     image = _select_existing_or_preferred_image()
+    resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
+    compose_path: Path | None = None
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
         return 1
 
-    compose_path = ensure_bloodhound_compose_file(version=BLOODHOUND_CE_VERSION)
-    if not compose_path:
+    managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
+        command_name="passthrough",
+        desired_password=_get_bloodhound_admin_password(),
+        pull_missing_images=True,
+        pull_stream_output=True,
+        start_stack=True,
+        verify_auth=True,
+        allow_auth_bootstrap=True,
+    )
+    if not managed_ready or compose_path is None:
         return 1
-    images = compose_list_images(compose_path)
-    if images is not None:
-        present, missing = compose_images_present(images)
-        if not present:
-            print_warning("Some BloodHound CE images are missing; pulling now...")
-            print_info_debug(f"[bloodhound-ce] missing images: {missing}")
-            compose_pull(compose_path, stream_output=True)
 
     if not image_exists(image):
         print_warning(f"ADscan docker image not present: {image}")
@@ -2500,10 +2970,17 @@ def run_adscan_passthrough_docker(
             workspaces_host_dir=workspaces_dir,
             interactive=interactive,
             extra_run_args=tuple(extra_run_args),
-            extra_env=(
-                ("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path)),
-                ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
-                ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+            extra_env=tuple(
+                [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+                + (
+                    [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
+                    if compose_path is not None
+                    else []
+                )
+                + [
+                    ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
+                    ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+                ]
             ),
         )
 

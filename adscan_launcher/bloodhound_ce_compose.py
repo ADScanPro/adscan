@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+from importlib import resources
 from pathlib import Path
 from typing import Callable
 
@@ -27,9 +28,10 @@ from adscan_launcher.docker_runtime import (
     run_docker_stream,
     shell_quote_cmd,
 )
-from adscan_launcher.path_utils import expand_effective_user_path
+from adscan_launcher.path_utils import expand_effective_user_path, get_adscan_home
 from adscan_launcher.output import (
     confirm_operation,
+    mark_sensitive,
     print_error,
     print_info,
     print_info_debug,
@@ -41,23 +43,66 @@ from adscan_launcher.output import (
 
 
 BLOODHOUND_CE_DEFAULT_WEB_PORT = 8442
+BLOODHOUND_CE_GRAPH_HTTP_PORT = 17474
+BLOODHOUND_CE_GRAPH_BOLT_PORT = 17687
 BLOODHOUND_CE_VERSION = "7.4.1"
 BLOODHOUND_COMPOSE_URL = "https://raw.githubusercontent.com/SpecterOps/bloodhound/main/examples/docker-compose/docker-compose.yml"
+_VENDORED_BLOODHOUND_COMPOSE_RESOURCE = "assets/bloodhound/docker-compose.yml"
+_ALLOW_REMOTE_COMPOSE_FALLBACK_ENV = "ADSCAN_BLOODHOUND_ALLOW_REMOTE_COMPOSE_FALLBACK"
 _DOCKER_INSTALL_DOCS_URL = "https://www.adscanpro.com/docs/getting-started/installation"
+_DEFAULT_BH_COMPOSE_PROJECT = "adscan-bhce"
+_DEFAULT_BH_COMPOSE_DIRNAME = "bloodhound-ce"
 
 _PORT_BIND_ERROR_RE = re.compile(
     r"bind port 127\.0\.0\.1:(\d+)/tcp:.*address already in use", re.IGNORECASE
 )
 
-_PINNED_BLOODHOUND_CE_CONTAINERS: dict[str, str] = {
-    "bloodhound-bloodhound-1": f"specterops/bloodhound:{BLOODHOUND_CE_VERSION}",
-    "bloodhound-app-db-1": "postgres:16",
-    "bloodhound-graph-db-1": "neo4j:4.4.42",
+_PINNED_BLOODHOUND_CE_SERVICES: dict[str, str] = {
+    "bloodhound": f"specterops/bloodhound:{BLOODHOUND_CE_VERSION}",
+    "app-db": "postgres:16",
+    "graph-db": "neo4j:4.4.42",
 }
 
 
+def get_bloodhound_compose_project_name() -> str:
+    """Return the Docker Compose project name used for ADscan-managed CE."""
+    raw = os.getenv("ADSCAN_BLOODHOUND_COMPOSE_PROJECT", "").strip()
+    return raw or _DEFAULT_BH_COMPOSE_PROJECT
+
+
+def _compose_container_name(service_name: str) -> str:
+    """Return deterministic container name for a service in the managed project."""
+    return f"{get_bloodhound_compose_project_name()}-{service_name}-1"
+
+
+def get_pinned_bloodhound_ce_containers() -> dict[str, str]:
+    """Return expected container->image mapping for the managed CE project."""
+    return {
+        _compose_container_name(service): image
+        for service, image in _PINNED_BLOODHOUND_CE_SERVICES.items()
+    }
+
+
+_PINNED_BLOODHOUND_CE_CONTAINERS: dict[str, str] = get_pinned_bloodhound_ce_containers()
+_LEGACY_BLOODHOUND_CE_CONTAINER_NAMES: tuple[str, ...] = (
+    "bloodhound-bloodhound-1",
+    "bloodhound-app-db-1",
+    "bloodhound-graph-db-1",
+)
+_LEGACY_BLOODHOUND_UI_PORT_RE = re.compile(r"(?:127\.0\.0\.1:)?(\d+)->8080/tcp")
+
+
 def _get_bloodhound_config_dir() -> Path:
-    """Return the BloodHound config directory (XDG config)."""
+    """Return ADscan-managed BloodHound CE compose directory."""
+    override = os.getenv("ADSCAN_BLOODHOUND_COMPOSE_DIR", "").strip()
+    if override:
+        return Path(expand_effective_user_path(override))
+
+    return get_adscan_home() / "bloodhound" / _DEFAULT_BH_COMPOSE_DIRNAME
+
+
+def _get_legacy_bloodhound_config_dir() -> Path:
+    """Return previous shared BloodHound CE config directory (~/.config/bloodhound)."""
     xdg = os.getenv("XDG_CONFIG_HOME", "~/.config")
     return Path(expand_effective_user_path(xdg)) / "bloodhound"
 
@@ -132,6 +177,122 @@ def _download_text(url: str, *, timeout: int = 60) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
+def _load_vendored_compose_template() -> str | None:
+    """Load the vendored BloodHound CE compose template from package data."""
+    try:
+        package_root = resources.files("adscan_launcher")
+        template_path = (
+            package_root.joinpath("assets")
+            .joinpath("bloodhound")
+            .joinpath("docker-compose.yml")
+        )
+        if not template_path.is_file():
+            return None
+        return template_path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[bloodhound-ce] failed to read vendored compose template "
+            f"{_VENDORED_BLOODHOUND_COMPOSE_RESOURCE}: {exc}"
+        )
+        return None
+
+
+def _remote_compose_fallback_enabled() -> bool:
+    """Return True when runtime remote compose fallback is allowed."""
+    raw = str(os.getenv(_ALLOW_REMOTE_COMPOSE_FALLBACK_ENV, "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _apply_compose_port_migrations(content: str) -> tuple[str, bool, bool]:
+    """Apply ADscan port migrations to the upstream compose text.
+
+    Returns:
+        Tuple ``(updated_text, web_port_changed, graph_ports_changed)``.
+    """
+    updated = str(content or "")
+    original = updated
+
+    # Web UI host port migration.
+    updated = updated.replace(
+        "127.0.0.1:8080:8080",
+        f"127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}:8080",
+    )
+    updated = updated.replace("8080:8080", f"{BLOODHOUND_CE_DEFAULT_WEB_PORT}:8080")
+    updated = updated.replace(
+        "${BLOODHOUND_PORT:-8080}",
+        f"${{BLOODHOUND_PORT:-{BLOODHOUND_CE_DEFAULT_WEB_PORT}}}",
+    )
+
+    # Graph DB host port migration to avoid collisions with existing Neo4j.
+    updated = updated.replace(
+        "127.0.0.1:7474:7474",
+        f"127.0.0.1:{BLOODHOUND_CE_GRAPH_HTTP_PORT}:7474",
+    )
+    updated = updated.replace("7474:7474", f"{BLOODHOUND_CE_GRAPH_HTTP_PORT}:7474")
+    updated = updated.replace(
+        "127.0.0.1:7687:7687",
+        f"127.0.0.1:{BLOODHOUND_CE_GRAPH_BOLT_PORT}:7687",
+    )
+    updated = updated.replace("7687:7687", f"{BLOODHOUND_CE_GRAPH_BOLT_PORT}:7687")
+    updated = updated.replace(
+        "${NEO4J_HTTP_PORT:-7474}",
+        f"${{NEO4J_HTTP_PORT:-{BLOODHOUND_CE_GRAPH_HTTP_PORT}}}",
+    )
+    updated = updated.replace(
+        "${NEO4J_BOLT_PORT:-7687}",
+        f"${{NEO4J_BOLT_PORT:-{BLOODHOUND_CE_GRAPH_BOLT_PORT}}}",
+    )
+    updated = updated.replace(
+        "${NEO4J_WEB_PORT:-7474}",
+        f"${{NEO4J_WEB_PORT:-{BLOODHOUND_CE_GRAPH_HTTP_PORT}}}",
+    )
+    updated = updated.replace(
+        "${NEO4J_DB_PORT:-7687}",
+        f"${{NEO4J_DB_PORT:-{BLOODHOUND_CE_GRAPH_BOLT_PORT}}}",
+    )
+
+    web_changed = (
+        f"{BLOODHOUND_CE_DEFAULT_WEB_PORT}:8080" in updated
+        and f"{BLOODHOUND_CE_DEFAULT_WEB_PORT}:8080" not in original
+    )
+    graph_changed = (
+        f"{BLOODHOUND_CE_GRAPH_HTTP_PORT}:7474" in updated
+        or f"{BLOODHOUND_CE_GRAPH_BOLT_PORT}:7687" in updated
+    ) and (
+        f"{BLOODHOUND_CE_GRAPH_HTTP_PORT}:7474" not in original
+        or f"{BLOODHOUND_CE_GRAPH_BOLT_PORT}:7687" not in original
+    )
+
+    return updated, web_changed, graph_changed
+
+
+def _maybe_migrate_legacy_compose_path(target_path: Path) -> bool:
+    """Copy legacy ~/.config/bloodhound compose file into ADscan-managed location."""
+    legacy_path = _get_legacy_bloodhound_config_dir() / "docker-compose.yml"
+    if target_path.exists() or not legacy_path.exists():
+        return False
+
+    try:
+        legacy_content = legacy_path.read_text(encoding="utf-8", errors="replace")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(legacy_content, encoding="utf-8")
+        print_info(
+            "Migrated existing BloodHound CE compose file to ADscan-managed path "
+            "for isolated operation."
+        )
+        print_info_debug(
+            "[bloodhound-ce] compose migration: "
+            f"legacy={mark_sensitive(str(legacy_path), 'path')} "
+            f"new={mark_sensitive(str(target_path), 'path')}"
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[bloodhound-ce] compose migration failed: {exc}")
+        return False
+
+
 def ensure_bloodhound_compose_file(
     *, version: str = BLOODHOUND_CE_VERSION
 ) -> Path | None:
@@ -145,6 +306,7 @@ def ensure_bloodhound_compose_file(
     """
     compose_path = get_bloodhound_compose_path()
     compose_dir = compose_path.parent
+    _maybe_migrate_legacy_compose_path(compose_path)
 
     if compose_path.exists():
         # Best-effort: ensure the file is pinned and uses our preferred host port
@@ -160,28 +322,18 @@ def ensure_bloodhound_compose_file(
                     f"[bloodhound-ce] updated docker-compose.yml to pin version {version}"
                 )
 
-            # Migrate host port mappings from legacy 8080->8080 to our default
-            # BLOODHOUND_CE_DEFAULT_WEB_PORT if needed. Handle both literal and
-            # env-var-based mappings from upstream compose files.
-            if (
-                "127.0.0.1:8080:8080" in updated
-                or "8080:8080" in updated
-                or "${BLOODHOUND_PORT:-8080}:8080" in updated
-            ):
-                updated = updated.replace(
-                    "127.0.0.1:8080:8080",
-                    f"127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}:8080",
-                )
-                updated = updated.replace(
-                    "8080:8080", f"{BLOODHOUND_CE_DEFAULT_WEB_PORT}:8080"
-                )
-                updated = updated.replace(
-                    "${BLOODHOUND_PORT:-8080}",
-                    f"${{BLOODHOUND_PORT:-{BLOODHOUND_CE_DEFAULT_WEB_PORT}}}",
-                )
+            updated, web_changed, graph_changed = _apply_compose_port_migrations(
+                updated
+            )
+            if web_changed:
                 print_info_debug(
-                    "[bloodhound-ce] migrated docker-compose.yml host port "
-                    f"from 8080 to {BLOODHOUND_CE_DEFAULT_WEB_PORT}"
+                    "[bloodhound-ce] migrated docker-compose.yml host web port "
+                    f"to {BLOODHOUND_CE_DEFAULT_WEB_PORT}"
+                )
+            if graph_changed:
+                print_info_debug(
+                    "[bloodhound-ce] migrated docker-compose.yml graph-db ports to "
+                    f"{BLOODHOUND_CE_GRAPH_HTTP_PORT}/{BLOODHOUND_CE_GRAPH_BOLT_PORT}"
                 )
 
             if updated != existing:
@@ -194,21 +346,31 @@ def ensure_bloodhound_compose_file(
     print_info("Configuring BloodHound CE docker-compose.yml...")
     try:
         compose_dir.mkdir(parents=True, exist_ok=True)
-        content = _download_text(BLOODHOUND_COMPOSE_URL, timeout=60)
+        content = _load_vendored_compose_template()
+        compose_source = "vendored"
+        if content is None:
+            if _remote_compose_fallback_enabled():
+                print_warning(
+                    "Vendored BloodHound CE compose template is unavailable; "
+                    "falling back to upstream download."
+                )
+                content = _download_text(BLOODHOUND_COMPOSE_URL, timeout=60)
+                compose_source = "remote_fallback"
+            else:
+                print_error(
+                    "Vendored BloodHound CE compose template is unavailable and "
+                    "remote fallback is disabled."
+                )
+                print_instruction(
+                    "Reinstall ADscan or set "
+                    f"{_ALLOW_REMOTE_COMPOSE_FALLBACK_ENV}=1 and retry."
+                )
+                return None
         # Replace ${BLOODHOUND_TAG:-latest} with a pinned version for consistency.
         pinned = content.replace("${BLOODHOUND_TAG:-latest}", version)
-        # Also remap the default web UI host port from 8080 to our less-conflicting port.
-        # Handle both generic, 127.0.0.1-bound and env-var-based mappings.
-        pinned = pinned.replace(
-            "127.0.0.1:8080:8080",
-            f"127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}:8080",
-        )
-        pinned = pinned.replace("8080:8080", f"{BLOODHOUND_CE_DEFAULT_WEB_PORT}:8080")
-        pinned = pinned.replace(
-            "${BLOODHOUND_PORT:-8080}",
-            f"${{BLOODHOUND_PORT:-{BLOODHOUND_CE_DEFAULT_WEB_PORT}}}",
-        )
+        pinned, _, _ = _apply_compose_port_migrations(pinned)
         compose_path.write_text(pinned, encoding="utf-8")
+        print_info_debug(f"[bloodhound-ce] compose source: {compose_source}")
         print_success(
             f"BloodHound CE docker-compose.yml configured for version {version}."
         )
@@ -225,10 +387,18 @@ def ensure_bloodhound_compose_file(
 
 def _compose_base_args(compose_path: Path) -> list[str]:
     invocation = _get_compose_invocation()
+    project_name = get_bloodhound_compose_project_name()
     if invocation is None:
         # Callers guard with docker_compose_available(); keep a safe fallback.
-        return ["docker", "compose", "-f", str(compose_path)]
-    return invocation + ["-f", str(compose_path)]
+        return [
+            "docker",
+            "compose",
+            "-p",
+            project_name,
+            "-f",
+            str(compose_path),
+        ]
+    return invocation + ["-p", project_name, "-f", str(compose_path)]
 
 
 def compose_pull(compose_path: Path, *, stream_output: bool = False) -> bool:
@@ -322,14 +492,15 @@ def compose_up(compose_path: Path) -> bool:
             print_info_debug(f"[bloodhound-ce] up output:\n{combined}")
             return False
 
-        # Common case: local Neo4j service already running on 7474.
+        # Common case: graph-db host port already in use.
         match = _PORT_BIND_ERROR_RE.search(combined)
-        if match and match.group(1) == "7474":
+        if match and match.group(1) == str(BLOODHOUND_CE_GRAPH_HTTP_PORT):
             print_warning(
-                "Neo4j port 7474 is already in use on the host. This commonly happens when a local Neo4j service is running."
+                f"Graph DB host port {BLOODHOUND_CE_GRAPH_HTTP_PORT} is already in use on the host. "
+                "BloodHound CE cannot bind to it."
             )
-            if _maybe_stop_host_neo4j_service_for_bloodhound():
-                # Retry once after stopping Neo4j.
+            if _maybe_free_host_port_for_bloodhound_ce(BLOODHOUND_CE_GRAPH_HTTP_PORT):
+                # Retry once after freeing the conflicting port.
                 proc_retry = run_docker(
                     cmd, check=False, capture_output=True, timeout=600
                 )
@@ -340,7 +511,8 @@ def compose_up(compose_path: Path) -> bool:
                     (proc_retry.stderr or "") + "\n" + (proc_retry.stdout or "")
                 )
                 print_error(
-                    "Failed to start BloodHound CE containers after stopping Neo4j."
+                    "Failed to start BloodHound CE containers after freeing "
+                    f"port {BLOODHOUND_CE_GRAPH_HTTP_PORT}."
                 )
                 print_info_debug(f"[bloodhound-ce] up retry output:\n{combined_retry}")
                 return False
@@ -396,50 +568,28 @@ def _preflight_bloodhound_ce_host_conflicts(compose_path: Path) -> bool:
         if not _maybe_free_host_port_for_bloodhound_ce(BLOODHOUND_CE_DEFAULT_WEB_PORT):
             return False
 
-    if _is_tcp_port_listening(7474):
+    if _is_tcp_port_listening(BLOODHOUND_CE_GRAPH_HTTP_PORT):
         # If the port is already owned by the pinned BloodHound CE stack itself,
         # do not treat it as a host-level conflict.
-        if _pinned_ce_graph_db_owns_port(7474):
+        if _pinned_ce_graph_db_owns_port(BLOODHOUND_CE_GRAPH_HTTP_PORT):
             print_info_verbose(
-                "Port 7474 is already bound by the BloodHound CE graph-db container; "
+                f"Port {BLOODHOUND_CE_GRAPH_HTTP_PORT} is already bound by the BloodHound CE graph-db container; "
                 "skipping host Neo4j preflight."
             )
             return True
 
         print_warning(
-            "Port 7474 is already in use on the host. BloodHound CE's Neo4j container cannot bind to it."
+            f"Port {BLOODHOUND_CE_GRAPH_HTTP_PORT} is already in use on the host. "
+            "BloodHound CE's graph-db container cannot bind to it."
         )
-        is_ci = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
-        if is_ci:
-            print_info(
-                "CI environment detected. Attempting to stop the host Neo4j service automatically to unblock BloodHound CE..."
-            )
-            ok = _stop_host_neo4j_service(require_noninteractive_sudo=True)
-            if not ok:
-                print_error("Failed to stop local Neo4j service automatically in CI.")
-                print_instruction(
-                    "Stop it manually, then retry: sudo systemctl stop neo4j"
-                )
-                return False
-            if _is_tcp_port_listening(7474):
-                print_error(
-                    "Port 7474 is still in use after attempting to stop Neo4j in CI."
-                )
-                print_instruction(
-                    "Stop the service manually, then retry the install/start."
-                )
-                return False
-            print_success(
-                "Local Neo4j service stopped. Continuing BloodHound CE startup..."
-            )
-            return True
-        return _maybe_stop_host_neo4j_service_for_bloodhound()
+        return _maybe_free_host_port_for_bloodhound_ce(BLOODHOUND_CE_GRAPH_HTTP_PORT)
 
     return True
 
 
 def _pinned_ce_graph_db_owns_port(port: int) -> bool:
     """Return True if the pinned BloodHound CE graph-db container owns the given port."""
+    expected_graph_container = _compose_container_name("graph-db")
     try:
         proc = run_docker(
             [
@@ -460,7 +610,7 @@ def _pinned_ce_graph_db_owns_port(port: int) -> bool:
             if len(parts) < 2:
                 continue
             name, ports = parts[0], parts[1]
-            if name == "bloodhound-graph-db-1" and f":{port}->" in ports:
+            if name == expected_graph_container and f":{port}->" in ports:
                 return True
     except Exception as exc:
         telemetry.capture_exception(exc)
@@ -618,6 +768,150 @@ def check_bloodhound_ce_running(
         return False
 
 
+def detect_legacy_bloodhound_ce_running_stack() -> dict[str, object]:
+    """Detect an already-running non-managed BloodHound CE stack on the host.
+
+    Returns:
+        Dict with keys:
+            - detected (bool): Whether non-managed CE containers are running.
+            - container_names (list[str]): Running non-managed container names.
+            - ui_url (str|None): Best-effort CE UI URL from port mapping.
+            - compose_project (str|None): Detected compose project prefix when obvious.
+    """
+    result: dict[str, object] = {
+        "detected": False,
+        "container_names": [],
+        "ui_url": None,
+        "compose_project": None,
+    }
+    try:
+        if not docker_available():
+            return result
+        proc = run_docker(
+            ["docker", "ps", "--format", "{{.Names}}\t{{.Image}}\t{{.Ports}}"],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return result
+
+        seen_names: set[str] = set()
+        ui_url: str | None = None
+        compose_project: str | None = None
+        managed_names = set(_PINNED_BLOODHOUND_CE_CONTAINERS.keys())
+        expected_legacy_names = set(_LEGACY_BLOODHOUND_CE_CONTAINER_NAMES)
+        running: dict[str, tuple[str, str]] = {}
+
+        for line in (proc.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            name, image, ports = parts[0], parts[1], parts[2]
+            normalized_image = (image or "").split("@", 1)[0]
+            running[name] = (normalized_image, ports)
+
+        # Legacy project names (backward compatibility).
+        for name in expected_legacy_names:
+            if name not in running:
+                continue
+            seen_names.add(name)
+            if name == "bloodhound-bloodhound-1":
+                if compose_project is None:
+                    compose_project = "bloodhound"
+                ports = running[name][1]
+                match = _LEGACY_BLOODHOUND_UI_PORT_RE.search(ports or "")
+                if match:
+                    ui_url = f"http://127.0.0.1:{match.group(1)}"
+                elif "->8080/tcp" in (ports or ""):
+                    ui_url = f"http://127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
+
+        # Any non-managed BloodHound web container by image.
+        for name, (image, ports) in running.items():
+            if name in managed_names:
+                continue
+            if not image.startswith("specterops/bloodhound:"):
+                continue
+            seen_names.add(name)
+            match = _LEGACY_BLOODHOUND_UI_PORT_RE.search(ports or "")
+            if match and not ui_url:
+                ui_url = f"http://127.0.0.1:{match.group(1)}"
+            elif "->8080/tcp" in (ports or "") and not ui_url:
+                ui_url = f"http://127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
+
+            if name.endswith("-bloodhound-1"):
+                project_prefix = name[: -len("-bloodhound-1")]
+                if project_prefix:
+                    candidate_app_db = f"{project_prefix}-app-db-1"
+                    candidate_graph_db = f"{project_prefix}-graph-db-1"
+                    if candidate_app_db in running:
+                        seen_names.add(candidate_app_db)
+                    if candidate_graph_db in running:
+                        seen_names.add(candidate_graph_db)
+                    if compose_project is None:
+                        compose_project = project_prefix
+
+        if seen_names:
+            result["detected"] = True
+            result["container_names"] = sorted(seen_names)
+            result["ui_url"] = ui_url
+            result["compose_project"] = compose_project
+        return result
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[bloodhound-ce] legacy stack detection failed: {exc}")
+        return result
+
+
+def stop_legacy_bloodhound_ce_stack() -> bool:
+    """Stop running non-managed BloodHound CE containers without deleting data."""
+    detection = detect_legacy_bloodhound_ce_running_stack()
+    if not bool(detection.get("detected", False)):
+        return True
+    container_names = [
+        str(name).strip() for name in (detection.get("container_names") or []) if name
+    ]
+    if not container_names:
+        return True
+
+    print_info(
+        "Stopping non-managed BloodHound CE containers to migrate to managed mode..."
+    )
+    for name in container_names:
+        try:
+            proc = run_docker(
+                ["docker", "stop", name],
+                check=False,
+                capture_output=True,
+                timeout=45,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                "[bloodhound-ce] legacy stop exception "
+                f"(container={mark_sensitive(name, 'detail')}): {exc}"
+            )
+            return False
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            stdout = (proc.stdout or "").strip()
+            combined = (stderr + "\n" + stdout).lower()
+            if "no such container" in combined:
+                continue
+            print_info_debug(
+                "[bloodhound-ce] legacy stop failed "
+                f"(container={mark_sensitive(name, 'detail')}, rc={proc.returncode}): "
+                f"stderr={mark_sensitive(stderr, 'detail')} "
+                f"stdout={mark_sensitive(stdout, 'detail')}"
+            )
+            return False
+
+    print_success(
+        "Non-managed BloodHound CE containers stopped. Data volumes were not deleted."
+    )
+    return True
+
+
 def _maybe_replace_bloodhound_ce_stack(compose_path: Path) -> bool:
     """If a different BloodHound CE stack is running, offer to replace it."""
     is_ci = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
@@ -681,7 +975,7 @@ def _replace_bloodhound_ce_stack(
 
     # Verify ports are free (or at least no longer bound by old containers).
     time.sleep(1)
-    if _is_tcp_port_listening(7474) or _is_tcp_port_listening(
+    if _is_tcp_port_listening(BLOODHOUND_CE_GRAPH_HTTP_PORT) or _is_tcp_port_listening(
         BLOODHOUND_CE_DEFAULT_WEB_PORT
     ):
         # Ports might be used by other processes; let the normal preflight handle it.

@@ -540,6 +540,20 @@ def image_exists(image: str) -> bool:
     return proc.returncode == 0
 
 
+def _read_host_machine_id() -> str | None:
+    """Return host machine-id (best effort) for container env propagation."""
+    try:
+        machine_id = Path("/etc/machine-id")
+        if not machine_id.is_file():
+            return None
+        raw = machine_id.read_text(encoding="utf-8", errors="ignore").strip()
+        if not raw:
+            return None
+        return raw
+    except Exception:
+        return None
+
+
 def _compute_host_telemetry_id() -> str | None:
     """Compute a stable host telemetry id for container execution.
 
@@ -551,10 +565,7 @@ def _compute_host_telemetry_id() -> str | None:
         A short, stable hash string or None if it cannot be derived.
     """
     try:
-        machine_id = Path("/etc/machine-id")
-        if not machine_id.is_file():
-            return None
-        raw = machine_id.read_text(encoding="utf-8", errors="ignore").strip()
+        raw = _read_host_machine_id()
         if not raw:
             return None
         import hashlib

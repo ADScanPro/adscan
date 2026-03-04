@@ -30,7 +30,6 @@ BloodHound integration for Active Directory attack path analysis. Provides:
 - neo4j>=5.0.0
 - requests>=2.31.0
 - rich>=13.7.0
-- structlog>=24.1.0
 - pydantic-settings>=2.4.0
 
 **Import path**: `from adscan_internal.integrations.bloodhound_cli.core import ...`

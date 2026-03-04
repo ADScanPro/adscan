@@ -33,8 +33,13 @@ from adscan_launcher import __version__
 from adscan_launcher.bloodhound_ce_password import (
     validate_bloodhound_admin_password_policy,
 )
+from adscan_launcher.bloodhound_ce_compose import (
+    detect_legacy_bloodhound_ce_running_stack,
+    stop_legacy_bloodhound_ce_stack,
+)
 from adscan_launcher.docker_commands import (
     DEFAULT_BLOODHOUND_ADMIN_PASSWORD,
+    DEFAULT_BLOODHOUND_STACK_MODE,
     get_docker_image_name,
     handle_check_docker,
     handle_install_docker,
@@ -85,7 +90,10 @@ def _parse_bloodhound_admin_password(value: str) -> str:
     if not valid:
         raise argparse.ArgumentTypeError(
             error_message
-            or "Invalid BloodHound CE admin password (minimum length is 12)."
+            or (
+                "Invalid BloodHound CE admin password "
+                "(requires 12+ chars, lowercase, uppercase, number, and one of !@#$%^&*)."
+            )
         )
     return candidate
 
@@ -178,6 +186,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dev",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--bloodhound-stack-mode",
+        choices=["managed"],
+        default=None,
+        help=(
+            "BloodHound runtime mode. `managed` (default) starts ADscan's isolated compose stack."
+        ),
     )
 
     sub = parser.add_subparsers(dest="command", required=False)
@@ -313,6 +329,24 @@ def _consume_trailing_global_flags(
             setattr(ns, "channel", unknown[idx + 1])
             idx += 2
             continue
+        if token.startswith("--bloodhound-stack-mode="):
+            value = token.split("=", 1)[1]
+            if str(value).strip().lower() != "managed":
+                remaining.append(token)
+                idx += 1
+                continue
+            setattr(ns, "bloodhound_stack_mode", value)
+            idx += 1
+            continue
+        if token == "--bloodhound-stack-mode" and idx + 1 < len(unknown):
+            value = unknown[idx + 1]
+            if str(value).strip().lower() != "managed":
+                remaining.extend([token, value])
+                idx += 2
+                continue
+            setattr(ns, "bloodhound_stack_mode", value)
+            idx += 2
+            continue
 
         remaining.append(token)
         idx += 1
@@ -350,6 +384,187 @@ def _should_emit_system_context(command: str | None) -> bool:
     return command in {"install", "start", "ci", "update", "upgrade"}
 
 
+def _command_uses_bloodhound_stack(command: str | None) -> bool:
+    """Return whether the launcher command depends on BloodHound stack state."""
+    return command not in {"version", "update", "upgrade", "host-helper"}
+
+
+def _is_noninteractive_session() -> bool:
+    """Return True when launcher should avoid interactive prompts."""
+    if os.getenv("ADSCAN_NONINTERACTIVE", "").strip() == "1":
+        return True
+    return not (sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def _resolve_bloodhound_stack_mode_with_legacy_detection(
+    *,
+    command: str | None,
+    stack_mode: str,
+    stack_mode_explicit: bool,
+) -> str:
+    """Resolve effective BloodHound stack mode with legacy-stack auto-detection."""
+    if not _command_uses_bloodhound_stack(command):
+        return stack_mode
+
+    requested_mode = str(stack_mode or "").strip().lower()
+    if requested_mode != "managed":
+        print_warning(
+            "BloodHound external mode is deprecated and ignored. "
+            "ADscan always uses managed mode."
+        )
+        capture(
+            "bloodhound_stack_mode_autoswitch",
+            {
+                "from_mode": requested_mode or "unknown",
+                "to_mode": "managed",
+                "reason": "external_mode_deprecated_forced_managed",
+                "command": command or "",
+            },
+        )
+
+    stack_mode = "managed"
+
+    detection = detect_legacy_bloodhound_ce_running_stack()
+    if not bool(detection.get("detected", False)):
+        return stack_mode
+
+    container_names = ", ".join(detection.get("container_names") or [])
+    detected_ui_url = detection.get("ui_url")
+    if isinstance(detected_ui_url, str):
+        detected_ui_url = detected_ui_url.strip() or None
+    else:
+        detected_ui_url = None
+
+    if stack_mode_explicit:
+        print_info_debug(
+            "[bloodhound-ce] managed mode explicitly requested; checking legacy "
+            "containers for migration safety."
+        )
+
+    details = [
+        "Detected an existing BloodHound CE installation already running on this host.",
+        "ADscan always uses its managed isolated stack.",
+        "To prevent port/resource conflicts, stop non-managed containers before continuing.",
+        f"Running containers: {container_names or 'unknown'}",
+    ]
+    if detected_ui_url:
+        details.append(f"Detected CE URL: {detected_ui_url}")
+    print_panel(
+        "\n".join(details),
+        title="Existing BloodHound CE Detected",
+        border_style="cyan",
+    )
+
+    if _is_noninteractive_session():
+        print_info(
+            "Non-interactive session detected. Continuing in managed mode and "
+            "attempting to stop non-managed containers automatically."
+        )
+        stopped = stop_legacy_bloodhound_ce_stack()
+        if not stopped:
+            capture(
+                "bloodhound_stack_mode_autoswitch",
+                {
+                    "from_mode": "managed",
+                    "to_mode": "managed",
+                    "reason": "legacy_stack_detected_noninteractive_stop_failed_blocked",
+                    "command": command or "",
+                },
+            )
+            print_error(
+                "ADscan requires its managed BloodHound CE stack. "
+                "Detected non-managed containers could not be stopped automatically."
+            )
+            detected_names = list(detection.get("container_names") or [])
+            if detected_names:
+                manual_stop = "docker stop " + " ".join(detected_names)
+                print_instruction(
+                    f"Stop them manually (`{manual_stop}`) and retry."
+                )
+            else:
+                print_instruction(
+                    "Stop non-managed BloodHound CE containers manually and retry."
+                )
+            raise SystemExit(1)
+        capture(
+            "bloodhound_stack_mode_autoswitch",
+            {
+                "from_mode": "managed",
+                "to_mode": "managed",
+                "reason": (
+                    "legacy_stack_detected_noninteractive_stopped"
+                    if stopped
+                    else "legacy_stack_detected_noninteractive_stop_failed"
+                ),
+                "command": command or "",
+            },
+        )
+        return "managed"
+
+    stop_legacy_now = confirm_ask(
+        "Stop detected non-managed BloodHound CE containers and continue in managed mode?",
+        default=True,
+    )
+    if stop_legacy_now:
+        if stop_legacy_bloodhound_ce_stack():
+            print_success("Migration pre-step complete. Continuing with managed mode.")
+            capture(
+                "bloodhound_stack_mode_autoswitch",
+                {
+                    "from_mode": "managed",
+                    "to_mode": "managed",
+                    "reason": "legacy_stack_detected_migrated_to_managed",
+                    "command": command or "",
+                },
+            )
+            return "managed"
+        print_error("Could not stop non-managed BloodHound CE containers automatically.")
+        detected_names = list(detection.get("container_names") or [])
+        if detected_names:
+            manual_stop = "docker stop " + " ".join(detected_names)
+            print_instruction(
+                f"You can stop them manually (`{manual_stop}`) and retry managed mode."
+            )
+        else:
+            print_instruction(
+                "You can stop non-managed BloodHound CE containers manually and retry managed mode."
+            )
+        capture(
+            "bloodhound_stack_mode_autoswitch",
+            {
+                "from_mode": "managed",
+                "to_mode": "managed",
+                "reason": "legacy_stack_detected_stop_failed_interactive_blocked",
+                "command": command or "",
+            },
+        )
+        raise SystemExit(1)
+
+    print_error(
+        "ADscan cannot continue while non-managed BloodHound CE containers are running."
+    )
+    detected_names = list(detection.get("container_names") or [])
+    if detected_names:
+        manual_stop = "docker stop " + " ".join(detected_names)
+        print_instruction(
+            f"Stop them manually (`{manual_stop}`) and retry."
+        )
+    else:
+        print_instruction(
+            "Stop non-managed BloodHound CE containers manually and retry."
+        )
+    capture(
+        "bloodhound_stack_mode_autoswitch",
+        {
+            "from_mode": "managed",
+            "to_mode": "managed",
+            "reason": "legacy_stack_detected_user_declined_blocked",
+            "command": command or "",
+        },
+    )
+    raise SystemExit(1)
+
+
 def _emit_launcher_system_context(command: str | None) -> None:
     """Emit non-sensitive host system context for telemetry diagnostics."""
     if not _should_emit_system_context(command):
@@ -361,6 +576,26 @@ def _emit_launcher_system_context(command: str | None) -> None:
         if command:
             event_payload["command_type"] = str(command)
         capture("telemetry_system_context", event_payload)
+    except Exception as exc:  # pragma: no cover - best effort only
+        capture_exception(exc)
+
+
+def _seed_session_environment_from_host() -> None:
+    """Seed ADSCAN_SESSION_ENV from host context when not explicitly overridden.
+
+    This keeps container telemetry aligned with host classification (ci/dev/prod)
+    and avoids relying on container-local environment heuristics.
+    """
+    if os.getenv("ADSCAN_ENV") or os.getenv("ADSCAN_SESSION_ENV"):
+        return
+    try:
+        context = collect_system_context()
+        environment = str(context.get("environment") or "").strip().lower()
+        if environment:
+            os.environ["ADSCAN_SESSION_ENV"] = environment
+            print_info_debug(
+                f"Seeded ADSCAN_SESSION_ENV from host context: {environment!r}"
+            )
     except Exception as exc:  # pragma: no cover - best effort only
         capture_exception(exc)
 
@@ -561,6 +796,20 @@ def main(argv: list[str] | None = None) -> None:
     os.environ["ADSCAN_LAUNCHER_VERSION"] = str(__version__)
 
     _apply_image_overrides(ns)
+    raw_stack_mode = getattr(ns, "bloodhound_stack_mode", None)
+    stack_mode_explicit = (
+        raw_stack_mode is not None and str(raw_stack_mode).strip() != ""
+    )
+    resolved_stack_mode = (
+        str(raw_stack_mode).strip().lower()
+        if raw_stack_mode is not None
+        else DEFAULT_BLOODHOUND_STACK_MODE
+    ) or DEFAULT_BLOODHOUND_STACK_MODE
+    resolved_stack_mode = _resolve_bloodhound_stack_mode_with_legacy_detection(
+        command=cmd,
+        stack_mode=resolved_stack_mode,
+        stack_mode_explicit=stack_mode_explicit,
+    )
 
     if show_version:
         print_info(f"ADscan launcher: v{__version__}")
@@ -577,6 +826,7 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(2) from exc
         raise SystemExit(run_host_helper_server(str(getattr(ns, "socket", ""))))
 
+    _seed_session_environment_from_host()
     _emit_launcher_system_context(cmd)
 
     # Offer upgrades early for relevant subcommands (interactive only).
@@ -610,6 +860,7 @@ def main(argv: list[str] | None = None) -> None:
                 verbose=bool(getattr(ns, "verbose", False)),
                 debug=bool(getattr(ns, "debug", False)),
                 pull_timeout_seconds=int(pull_timeout),
+                bloodhound_stack_mode=resolved_stack_mode,
             )
         except KeyboardInterrupt:
             _log_launcher_interrupt(
@@ -634,6 +885,7 @@ def main(argv: list[str] | None = None) -> None:
                     bloodhound_admin_password=str(ns.bloodhound_admin_password),
                     suppress_bloodhound_browser=bool(ns.no_browser),
                     pull_timeout_seconds=int(ns.pull_timeout),
+                    bloodhound_stack_mode=resolved_stack_mode,
                 ),
                 extra={"mode": "docker"},
             )
@@ -644,7 +896,9 @@ def main(argv: list[str] | None = None) -> None:
             _run_host_command_with_session_capture(
                 command_type="check",
                 telemetry_console=telemetry_console,
-                runner=handle_check_docker,
+                runner=lambda: handle_check_docker(
+                    bloodhound_stack_mode=resolved_stack_mode,
+                ),
                 extra={"mode": "docker"},
             )
         )
@@ -676,6 +930,7 @@ def main(argv: list[str] | None = None) -> None:
                 verbose=bool(getattr(ns, "verbose", False)),
                 debug=bool(getattr(ns, "debug", False)),
                 pull_timeout_seconds=int(ns.pull_timeout),
+                bloodhound_stack_mode=resolved_stack_mode,
             )
         except KeyboardInterrupt:
             _log_launcher_interrupt(
@@ -708,6 +963,7 @@ def main(argv: list[str] | None = None) -> None:
             verbose=bool(getattr(ns, "verbose", False)),
             debug=bool(getattr(ns, "debug", False)),
             pull_timeout_seconds=3600,
+            bloodhound_stack_mode=resolved_stack_mode,
         )
     except KeyboardInterrupt:
         _log_launcher_interrupt(

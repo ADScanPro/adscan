@@ -1542,6 +1542,13 @@ class BloodHoundService(BaseService):
             return client.get_last_error()
         return None
 
+    def get_last_client_error(self) -> str | None:
+        """Return last client-level error (query/upload/auth), if available."""
+        client = getattr(self, "client", None)
+        if client and hasattr(client, "get_last_error"):
+            return client.get_last_error()
+        return None
+
     def get_access_paths(
         self,
         source: str,

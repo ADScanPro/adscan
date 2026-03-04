@@ -19,6 +19,7 @@ The automation is designed to be safe:
 from __future__ import annotations
 
 import getpass
+import json
 import os
 import re
 import sys
@@ -28,7 +29,10 @@ import requests
 
 from adscan_launcher import telemetry
 from adscan_launcher.docker_runtime import docker_available, run_docker
-from adscan_launcher.bloodhound_ce_compose import BLOODHOUND_CE_DEFAULT_WEB_PORT
+from adscan_launcher.bloodhound_ce_compose import (
+    BLOODHOUND_CE_DEFAULT_WEB_PORT,
+    get_bloodhound_compose_project_name,
+)
 from adscan_launcher.output import (
     mark_sensitive,
     print_info,
@@ -42,7 +46,7 @@ from adscan_launcher.output import (
 
 
 _DEFAULT_BH_BASE_URL = f"http://127.0.0.1:{BLOODHOUND_CE_DEFAULT_WEB_PORT}"
-_DEFAULT_BH_CONTAINER_NAME = "bloodhound-bloodhound-1"
+_DEFAULT_BH_CONTAINER_NAME = f"{get_bloodhound_compose_project_name()}-bloodhound-1"
 _DEFAULT_PASSWORD_PATTERNS = (
     re.compile(r"initial\s+password\s+set\s+to:\s*([^\s\"']+)", re.IGNORECASE),
     re.compile(r"initial\s+admin\s+password:\s*([^\s\"']+)", re.IGNORECASE),
@@ -54,10 +58,23 @@ _AUTH_RATE_LIMIT_MARKERS = (
     "neo.clienterror.security.authenticationratelimit",
     "incorrect authentication details too many times in a row",
 )
+_NON_FIRST_RUN_LOG_MARKERS = (
+    "no new sql migrations to run",
+    "database directory appears to contain a database; skipping initialization",
+    "server started successfully",
+)
 _MIN_BH_ADMIN_PASSWORD_LENGTH = 12
 _RECOMMENDED_BH_ADMIN_PASSWORD = "Adscan4thewin!"
 _PASSWORD_POLICY_MIN_LENGTH_RE = re.compile(
     r"at\s+least\s+(?P<min_len>\d+)\s+characters", re.IGNORECASE
+)
+_PASSWORD_POLICY_LOWERCASE_RE = re.compile(r"[a-z]")
+_PASSWORD_POLICY_UPPERCASE_RE = re.compile(r"[A-Z]")
+_PASSWORD_POLICY_NUMERIC_RE = re.compile(r"\d")
+_PASSWORD_POLICY_SPECIAL_RE = re.compile(r"[!@#$%^&*]")
+_PASSWORD_POLICY_HINT = (
+    "at least 12 characters, at least one lowercase, at least one uppercase, "
+    "at least one number, and at least one of (!@#$%^&*)"
 )
 
 
@@ -74,14 +91,19 @@ def validate_bloodhound_admin_password_policy(
         Tuple ``(is_valid, error_message)``.
     """
     value = str(password or "")
+    policy_errors: list[str] = []
     if len(value) < int(min_length):
-        return (
-            False,
-            (
-                "BloodHound CE admin password must have at least "
-                f"{int(min_length)} characters."
-            ),
-        )
+        policy_errors.append(f"must have at least {int(min_length)} characters")
+    if _PASSWORD_POLICY_LOWERCASE_RE.search(value) is None:
+        policy_errors.append("must have at least 1 lowercase character")
+    if _PASSWORD_POLICY_UPPERCASE_RE.search(value) is None:
+        policy_errors.append("must have at least 1 uppercase character")
+    if _PASSWORD_POLICY_NUMERIC_RE.search(value) is None:
+        policy_errors.append("must have at least 1 numeric character")
+    if _PASSWORD_POLICY_SPECIAL_RE.search(value) is None:
+        policy_errors.append("must have at least 1 special character from !@#$%^&*")
+    if policy_errors:
+        return False, "BloodHound CE admin password " + "; ".join(policy_errors) + "."
     return True, None
 
 
@@ -91,10 +113,44 @@ def _extract_password_policy_error_message(response_body: str) -> str | None:
     if not body:
         return None
     lowered = body.lower()
-    if "secret:" not in lowered:
-        return None
     if "must have at least" not in lowered:
         return None
+
+    # JSON shape:
+    # {"errors":[{"message":"Secret: must have at least ...; Secret: must have at least ..."}]}
+    extracted_requirements: list[str] = []
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        payload = None
+    if isinstance(payload, dict):
+        raw_errors = payload.get("errors")
+        if isinstance(raw_errors, list):
+            for item in raw_errors:
+                if not isinstance(item, dict):
+                    continue
+                message = str(item.get("message") or "").strip()
+                if not message:
+                    continue
+                for part in message.split(";"):
+                    normalized = str(part or "").strip()
+                    normalized = re.sub(
+                        r"^\s*secret:\s*",
+                        "",
+                        normalized,
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    if normalized and normalized not in extracted_requirements:
+                        extracted_requirements.append(normalized)
+
+    if extracted_requirements:
+        return (
+            "BloodHound CE rejected the requested admin password: "
+            + "; ".join(extracted_requirements)
+            + "."
+        )
+
+    # Fallback for non-JSON/plain bodies.
     match = _PASSWORD_POLICY_MIN_LENGTH_RE.search(body)
     if match:
         min_len = match.group("min_len")
@@ -102,7 +158,7 @@ def _extract_password_policy_error_message(response_body: str) -> str | None:
             "BloodHound CE rejected the requested admin password: "
             f"minimum length is {min_len} characters."
         )
-    return "BloodHound CE rejected the requested admin password due password policy."
+    return "BloodHound CE rejected the requested admin password due to password policy."
 
 
 def _resolve_interactive_desired_password(
@@ -555,6 +611,39 @@ def _get_initial_password_from_container_logs(
     return None
 
 
+def detect_existing_bloodhound_ce_state(
+    *, container_name: str = _DEFAULT_BH_CONTAINER_NAME
+) -> bool:
+    """Return True when logs indicate CE is already initialized (not first run)."""
+    if not docker_available():
+        return False
+
+    candidates = _list_bloodhound_container_candidates(
+        preferred_container_name=container_name
+    )
+    for candidate in candidates:
+        try:
+            proc = run_docker(
+                ["docker", "logs", "--tail", "250", candidate],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            continue
+
+        if proc.returncode != 0:
+            continue
+        logs = str(proc.stdout or "")
+        lowered = logs.lower()
+        if _parse_initial_password_from_logs(logs):
+            return False
+        if any(marker in lowered for marker in _NON_FIRST_RUN_LOG_MARKERS):
+            return True
+    return False
+
+
 def _log_head_excerpt(logs: str) -> str:
     """Return a bounded first-lines excerpt for diagnostics."""
     lines = (logs or "").splitlines()[:_PASSWORD_LOG_HEAD_LINES]
@@ -676,7 +765,7 @@ def ensure_bloodhound_admin_password(
         if not replacement:
             print_instruction(
                 "Use --bloodhound-admin-password (launcher) or --bh-admin-password (CLI) "
-                "with at least 12 characters."
+                f"with {_PASSWORD_POLICY_HINT}."
             )
             return False
         desired_password = replacement
@@ -723,7 +812,8 @@ def ensure_bloodhound_admin_password(
                 "BloodHound CE web container is not running, so initial-password login cannot be validated."
             )
             print_instruction(
-                "Inspect container logs (for example: docker logs bloodhound-bloodhound-1) and restart the stack."
+                "Inspect container logs (for example: "
+                f"docker logs {container_name}) and restart the stack."
             )
         else:
             print_warning(

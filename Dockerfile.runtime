@@ -275,7 +275,6 @@ RUN set -eux; \
     packaging==25.0 \
     questionary==2.1.1 \
     pypsrp==0.9.0 \
-    structlog==25.5.0 \
     pydantic-settings==2.13.1 \
     pydantic-ai==1.62.0 \
     python-magic==0.4.27 \

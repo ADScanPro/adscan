@@ -86,6 +86,10 @@ _DEFAULT_IP_PASSTHROUGH: tuple[str, ...] = (
     "8.8.4.4/32",
 )
 
+_PUBLIC_URL_PASSTHROUGH_ALLOWLIST: tuple[str, ...] = (
+    "https://nmap.org",
+)
+
 _PASSTHROUGH_MARKERS = PASSTHROUGH_MARKERS["passthrough"]
 
 # Well-known AD principals (built-in users/groups) that can be preserved in telemetry.
@@ -240,25 +244,45 @@ def _extract_passthrough_segments(content: str) -> tuple[str, dict[str, str]]:
         Tuple of (content_with_placeholders, placeholder_to_value_mapping).
     """
     start, end = _PASSTHROUGH_MARKERS
-    if start not in content:
-        return content, {}
-
-    pattern = re.compile(
-        re.escape(start) + r"(?P<value>.*?)" + re.escape(end),
-        re.DOTALL,
-    )
     mapping: dict[str, str] = {}
     counter = 0
 
-    def _replace(match: re.Match[str]) -> str:
-        nonlocal counter
-        value = match.group("value")
-        placeholder = f"__ADSCAN_PASSTHROUGH_{counter}__"
-        counter += 1
-        mapping[placeholder] = value
-        return placeholder
+    if start in content:
+        pattern = re.compile(
+            re.escape(start) + r"(?P<value>.*?)" + re.escape(end),
+            re.DOTALL,
+        )
 
-    return pattern.sub(_replace, content), mapping
+        def _replace(match: re.Match[str]) -> str:
+            nonlocal counter
+            value = match.group("value")
+            placeholder = f"__ADSCAN_PASSTHROUGH_{counter}__"
+            counter += 1
+            mapping[placeholder] = value
+            return placeholder
+
+        content = pattern.sub(_replace, content)
+
+    # Preserve allowlisted public URLs without requiring explicit passthrough markers.
+    # This keeps well-known documentation/reference links visible in session logs.
+    for url in _PUBLIC_URL_PASSTHROUGH_ALLOWLIST:
+        escaped = re.escape(url.rstrip("/"))
+        url_pattern = re.compile(
+            rf"(?P<value>{escaped}/?)(?=(?:[\s<>'\"),;:]|$))",
+            re.IGNORECASE,
+        )
+
+        def _replace_url(match: re.Match[str]) -> str:
+            nonlocal counter
+            value = match.group("value")
+            placeholder = f"__ADSCAN_PASSTHROUGH_{counter}__"
+            counter += 1
+            mapping[placeholder] = value
+            return placeholder
+
+        content = url_pattern.sub(_replace_url, content)
+
+    return content, mapping
 
 
 def _restore_passthrough_segments(content: str, mapping: dict[str, str]) -> str:
@@ -871,16 +895,28 @@ DEV_MACHINE_IDS = [
     "e7eed2305f90431c82155e2011dcdce5",
 ]
 
+def _resolve_machine_id_for_env_detection() -> str | None:
+    """Resolve machine-id source for environment detection.
 
-@functools.lru_cache(maxsize=1)
-def _is_dev_machine_by_id() -> bool:
-    """Check if running on a known development machine via /etc/machine-id."""
+    In container runtime mode we should never rely on the container's
+    `/etc/machine-id` for dev/prod classification.
+    """
+    if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
+        return None
     try:
         machine_id_path = Path("/etc/machine-id")
         if not machine_id_path.exists():
-            return False
-        machine_id = machine_id_path.read_text(encoding="utf-8").strip()
+            return None
+        return machine_id_path.read_text(encoding="utf-8").strip() or None
     except OSError:
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _is_dev_machine_by_id() -> bool:
+    """Check if running on a known development machine via host machine-id."""
+    machine_id = _resolve_machine_id_for_env_detection()
+    if not machine_id:
         return False
     return machine_id in DEV_MACHINE_IDS
 
@@ -891,17 +927,17 @@ def _determine_environment() -> str:
 
     Priority (highest to lowest):
     1. CI environment detected → "ci" (always wins; prevents production pollution)
-    2. Known development machine-id OR DOWNLOAD_SOURCE == "source" → "dev"
+    2. Known development machine-id → "dev"
        (prevents production pollution when running from a dev machine)
     3. ADSCAN_ENV or ADSCAN_SESSION_ENV → manual override
        (ignored if it tries to force "prod" on a dev machine)
-    4. Default → "prod" (binary, pipx, pip installations)
+    4. Default → "prod"
 
     Returns:
         Environment label: "dev", "ci", "prod", or custom value from env var
     """
     ci_detected = _is_ci_environment()
-    dev_detected = _is_dev_machine_by_id() or (DOWNLOAD_SOURCE == "source")
+    dev_detected = _is_dev_machine_by_id()
 
     # CI/CD environments should never be labelled as production.
     if ci_detected:
@@ -3911,7 +3947,7 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
                 session_env = _determine_session_environment()
             else:
                 # Never allow a known dev machine to claim production telemetry.
-                dev_detected = _is_dev_machine_by_id() or (DOWNLOAD_SOURCE == "source")
+                dev_detected = _is_dev_machine_by_id()
                 session_env = (
                     "dev" if dev_detected and candidate == "prod" else candidate
                 )
