@@ -386,6 +386,85 @@ def _should_emit_system_context(command: str | None) -> bool:
     return command in {"install", "start", "ci", "update", "upgrade"}
 
 
+def _emit_launcher_privilege_context(command: str | None) -> None:
+    """Emit launcher privilege/sudo context for troubleshooting."""
+    try:
+        is_root = os.geteuid() == 0
+        has_sudo_user = bool(os.getenv("SUDO_USER"))
+        has_sudo_uid = bool(os.getenv("SUDO_UID"))
+        has_sudo_gid = bool(os.getenv("SUDO_GID"))
+        has_adscan_home = bool(os.getenv("ADSCAN_HOME"))
+        has_ci = bool(os.getenv("CI"))
+        is_container_runtime = os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1"
+        is_sudo_invocation = has_sudo_user or has_sudo_uid or has_sudo_gid
+        # Best-effort heuristic for root shells entered via `sudo su` / `su -`.
+        # We avoid storing usernames/paths and only capture boolean context.
+        likely_sudo_su_shell = (
+            is_root
+            and not is_sudo_invocation
+            and not has_adscan_home
+            and not has_ci
+        )
+        context = {
+            "command_type": str(command or ""),
+            "is_root": is_root,
+            "is_low_priv_user": not is_root,
+            "is_sudo_invocation": is_sudo_invocation,
+            "likely_sudo_su_shell": likely_sudo_su_shell,
+            "has_sudo_user": has_sudo_user,
+            "has_sudo_uid": has_sudo_uid,
+            "has_sudo_gid": has_sudo_gid,
+            "has_adscan_home": has_adscan_home,
+            "has_ci": has_ci,
+            "is_container_runtime": is_container_runtime,
+            "root_without_user_context": is_root
+            and not is_sudo_invocation
+            and not has_adscan_home,
+        }
+        print_info_debug(f"Launcher privilege context: {context}")
+        capture("launcher_privilege_context", context)
+    except Exception as exc:  # pragma: no cover - best effort only
+        capture_exception(exc)
+
+
+def _guard_root_shell_without_user_context(command: str | None) -> None:
+    """Block accidental root-shell state split unless operator explicitly confirms.
+
+    Running launcher commands from a root shell created via `sudo su` / `su -`
+    commonly drops `SUDO_USER`, so launcher state can drift into `/root/.adscan`.
+    """
+    if command not in {"install", "start", "check"}:
+        return
+    if os.geteuid() != 0:
+        return
+    if os.getenv("CI"):
+        return
+    if os.getenv("SUDO_USER"):
+        return
+    if os.getenv("ADSCAN_HOME"):
+        return
+
+    message = (
+        "ADscan launcher is running as root, but without SUDO_USER/ADSCAN_HOME context.\n\n"
+        "This usually happens with `sudo su` or `su -` and can create state under `/root/.adscan`,\n"
+        "causing later permission and consistency issues.\n\n"
+        "Recommended:\n"
+        "  1) Exit the root shell\n"
+        "  2) Run ADscan as your normal user (without sudo)\n\n"
+        "Advanced alternative:\n"
+        "  Set ADSCAN_HOME explicitly before running as root."
+    )
+    print_panel(
+        message,
+        title="Root Shell Detected",
+        border_style="yellow",
+    )
+    proceed = confirm_ask("Continue anyway (not recommended)?", default=False)
+    if not proceed:
+        print_warning("Aborted to avoid creating launcher state under /root.")
+        raise SystemExit(1)
+
+
 def _command_uses_bloodhound_stack(command: str | None) -> bool:
     """Return whether the launcher command depends on BloodHound stack state."""
     return command not in {"version", "update", "upgrade", "host-helper"}
@@ -848,6 +927,8 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(2) from exc
         raise SystemExit(run_host_helper_server(str(getattr(ns, "socket", ""))))
 
+    _emit_launcher_privilege_context(cmd)
+    _guard_root_shell_without_user_context(cmd)
     _seed_session_environment_from_host()
     _seed_session_trace_id()
     _emit_launcher_system_context(cmd)

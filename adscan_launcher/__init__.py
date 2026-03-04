@@ -16,4 +16,4 @@ try:
     __version__ = version("adscan")
 except PackageNotFoundError:
     # Source checkout fallback.
-    __version__ = "5.1.2"
+    __version__ = "5.1.3"

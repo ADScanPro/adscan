@@ -19,6 +19,7 @@ import re
 import secrets
 import time
 from pathlib import Path
+from typing import Any
 
 import requests
 from rich.prompt import Confirm, Prompt
@@ -94,6 +95,7 @@ _DOCKER_INSTALL_DOCS_URL = "https://www.adscanpro.com/docs/getting-started/insta
 _BLOODHOUND_TROUBLESHOOTING_DOCS_URL = (
     "https://www.adscanpro.com/docs/guides/troubleshooting"
 )
+_ALLOW_PODMAN_DOCKER_API_ENV = "ADSCAN_ALLOW_PODMAN_DOCKER_API"
 _HOST_HELPER_TROUBLESHOOTING_DOCS_URL = (
     "https://www.adscanpro.com/docs/guides/troubleshooting#host-helper-docker-mode"
 )
@@ -106,8 +108,11 @@ _LOCAL_RESOLVER_LOOPBACK_CANDIDATES = (
 )
 _MIN_DOCKER_INSTALL_FREE_GB = 10
 _DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3600
+_LOW_MEMORY_WARNING_THRESHOLD_GB = 1.5
 _EPHEMERAL_CONTAINER_SHARED_TOKEN: str | None = None
 _LEGACY_IMAGE_WARNING_SHOWN = False
+_DOCKER_RUNTIME_CONTEXT_EMITTED = False
+_DOCKER_HOST_RESOURCES_CONTEXT_EMITTED = False
 
 # Keep BloodHound CE config in the effective user's home (sudo-safe), matching
 # the default behavior of bloodhound-cli tooling.
@@ -130,9 +135,7 @@ def _emit_bloodhound_ce_config_diagnostics(
             diagnostics.append(f"size_bytes={int(file_stats.st_size)}")
             diagnostics.append(f"mode={oct(file_stats.st_mode & 0o777)}")
         except OSError as stat_exc:
-            diagnostics.append(
-                f"stat_error={mark_sensitive(str(stat_exc), 'error')}"
-            )
+            diagnostics.append(f"stat_error={mark_sensitive(str(stat_exc), 'error')}")
     if exception is not None:
         diagnostics.append(f"exception={mark_sensitive(str(exception), 'error')}")
     print_info_debug("[bloodhound-ce] config diagnostics: " + " ".join(diagnostics))
@@ -338,15 +341,32 @@ def _get_free_memory_bytes() -> int:
 
 
 def _log_install_resource_status(path: Path) -> tuple[float, float]:
-    """Log free disk and memory, returning values in GB."""
+    """Return free disk and memory in GB for install preflight checks."""
     free_disk_bytes = _get_free_disk_bytes(path)
     free_mem_bytes = _get_free_memory_bytes()
     free_disk_gb = free_disk_bytes / (1024**3)
     free_mem_gb = free_mem_bytes / (1024**3)
-    print_info_debug(
-        f"[install] Free disk: {free_disk_gb:.2f} GB | Free RAM: {free_mem_gb:.2f} GB"
-    )
     return free_disk_gb, free_mem_gb
+
+
+def _maybe_warn_low_memory_for_bloodhound(*, free_mem_gb: float) -> None:
+    """Emit a soft warning when available RAM is likely too low for CE bootstrap."""
+    if free_mem_gb >= _LOW_MEMORY_WARNING_THRESHOLD_GB:
+        return
+    print_warning(
+        "Low available RAM detected. BloodHound CE may crash during startup "
+        f"(available: {free_mem_gb:.2f} GB)."
+    )
+    print_instruction(
+        "Close memory-heavy applications or add swap, then retry if BloodHound CE exits unexpectedly."
+    )
+    telemetry.capture(
+        "docker_install_low_memory_warning",
+        {
+            "free_memory_gb": round(float(free_mem_gb), 2),
+            "threshold_gb": _LOW_MEMORY_WARNING_THRESHOLD_GB,
+        },
+    )
 
 
 def _get_docker_storage_path() -> Path:
@@ -438,6 +458,248 @@ def _ensure_docker_compose_prerequisites(*, command_name: str) -> bool:
     return False
 
 
+def _extract_first_nonempty_line(text: str) -> str:
+    """Return the first non-empty line from command output."""
+    for line in str(text or "").splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _detect_linux_package_owner(binary_path: str) -> str:
+    """Best-effort package owner hint for a binary path (Deb/RPM families)."""
+    path = str(binary_path or "").strip()
+    if not path:
+        return ""
+
+    try:
+        if shutil.which("dpkg-query"):
+            proc = subprocess.run(  # noqa: S603
+                ["dpkg-query", "-S", path],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode == 0:
+                first = _extract_first_nonempty_line(proc.stdout or "")
+                if ":" in first:
+                    return first.split(":", 1)[0].strip()
+                return first
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        if shutil.which("rpm"):
+            proc = subprocess.run(  # noqa: S603
+                ["rpm", "-qf", path],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode == 0:
+                return _extract_first_nonempty_line(proc.stdout or "")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    return ""
+
+
+def _parse_docker_client_version(raw: str) -> str:
+    """Extract semantic-ish Docker client version from `docker --version`."""
+    line = _extract_first_nonempty_line(raw)
+    match = re.search(r"docker version\s+([^\s,]+)", line, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return line
+
+
+def _parse_compose_version(raw: str) -> str:
+    """Extract compose version token from `docker compose version` output."""
+    line = _extract_first_nonempty_line(raw)
+    match = re.search(r"v?(\d+\.\d+\.\d+[^\s,]*)", line, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return line
+
+
+def _categorize_daemon_diagnostic(diag: str) -> str:
+    """Bucket Docker daemon diagnostics into stable telemetry categories."""
+    lowered = str(diag or "").strip().lower()
+    if not lowered:
+        return "unknown"
+    if "is running" in lowered:
+        return "running"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "timeout"
+    if "cannot connect" in lowered or "not reachable" in lowered:
+        return "unreachable"
+    if "permission denied" in lowered or "got permission denied" in lowered:
+        return "permission_denied"
+    if "podman" in lowered:
+        return "podman_socket"
+    return "other"
+
+
+def _emit_docker_runtime_context(*, command_name: str) -> None:
+    """Emit one-time Docker/Compose runtime fingerprint for troubleshooting."""
+    global _DOCKER_RUNTIME_CONTEXT_EMITTED  # pylint: disable=global-statement
+    if _DOCKER_RUNTIME_CONTEXT_EMITTED:
+        return
+    _DOCKER_RUNTIME_CONTEXT_EMITTED = True
+
+    try:
+        docker_bin = shutil.which("docker") or ""
+        docker_client_version = ""
+        compose_mode = "missing"
+        compose_version = ""
+        compose_v1_bin = shutil.which("docker-compose") or ""
+        compose_v1_package = _detect_linux_package_owner(compose_v1_bin)
+
+        if docker_bin:
+            try:
+                proc = subprocess.run(  # noqa: S603
+                    [docker_bin, "--version"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+                if proc.returncode == 0:
+                    docker_client_version = _parse_docker_client_version(
+                        proc.stdout or proc.stderr or ""
+                    )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                telemetry.capture_exception(exc)
+
+        # Compose v2 plugin preferred.
+        try:
+            compose_v2_proc = run_docker(
+                ["docker", "compose", "version"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            compose_v2_text = (
+                f"{compose_v2_proc.stdout or ''}\n{compose_v2_proc.stderr or ''}"
+            )
+            if compose_v2_proc.returncode == 0 and "compose" in compose_v2_text.lower():
+                compose_mode = "v2"
+                compose_version = _parse_compose_version(compose_v2_text)
+        except Exception as exc:  # pragma: no cover - best effort only
+            telemetry.capture_exception(exc)
+
+        if compose_mode == "missing" and compose_v1_bin:
+            try:
+                compose_v1_proc = subprocess.run(  # noqa: S603
+                    [compose_v1_bin, "version"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+                compose_v1_text = (
+                    f"{compose_v1_proc.stdout or ''}\n{compose_v1_proc.stderr or ''}"
+                )
+                if (
+                    compose_v1_proc.returncode == 0
+                    and "compose" in compose_v1_text.lower()
+                ):
+                    compose_mode = "v1"
+                    compose_version = _parse_compose_version(compose_v1_text)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                telemetry.capture_exception(exc)
+
+        daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
+            run_docker_command_func=_run_docker_status_command
+        )
+
+        docker_server_version = ""
+        if daemon_running:
+            try:
+                server_proc = run_docker(
+                    ["docker", "version", "--format", "{{.Server.Version}}"],
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
+                if server_proc.returncode == 0:
+                    docker_server_version = _extract_first_nonempty_line(
+                        server_proc.stdout or ""
+                    )
+            except Exception as exc:  # pragma: no cover - best effort only
+                telemetry.capture_exception(exc)
+
+        payload: dict[str, Any] = {
+            "command_name": command_name,
+            "docker_cli_present": bool(docker_bin),
+            "docker_client_version": docker_client_version,
+            "docker_server_version": docker_server_version,
+            "docker_package_hint": _detect_linux_package_owner(docker_bin),
+            "compose_mode": compose_mode,
+            "compose_version": compose_version,
+            "compose_v1_package_hint": compose_v1_package,
+            "docker_daemon_reachable": bool(daemon_running),
+            "docker_daemon_diagnostic_kind": _categorize_daemon_diagnostic(
+                daemon_diagnostic
+            ),
+        }
+        print_info_debug(
+            "[docker] runtime context: "
+            f"command={mark_sensitive(command_name, 'status')} "
+            f"docker_cli_present={mark_sensitive(str(payload['docker_cli_present']).lower(), 'status')} "
+            f"docker_client={mark_sensitive(docker_client_version or 'unknown', 'status')} "
+            f"docker_server={mark_sensitive(docker_server_version or 'unknown', 'status')} "
+            f"docker_pkg={mark_sensitive(str(payload['docker_package_hint'] or 'unknown'), 'status')} "
+            f"compose_mode={mark_sensitive(compose_mode, 'status')} "
+            f"compose_version={mark_sensitive(compose_version or 'unknown', 'status')} "
+            f"compose_v1_pkg={mark_sensitive(str(compose_v1_package or 'unknown'), 'status')} "
+            f"daemon_reachable={mark_sensitive(str(bool(daemon_running)).lower(), 'status')} "
+            f"daemon_diag={mark_sensitive(str(payload['docker_daemon_diagnostic_kind']), 'status')}"
+        )
+        telemetry.capture("docker_runtime_context", payload)
+    except Exception as exc:  # pragma: no cover - best effort only
+        telemetry.capture_exception(exc)
+
+
+def _emit_docker_host_resources_context(*, command_name: str) -> None:
+    """Emit one-time host resources snapshot for Docker troubleshooting."""
+    global _DOCKER_HOST_RESOURCES_CONTEXT_EMITTED  # pylint: disable=global-statement
+    if _DOCKER_HOST_RESOURCES_CONTEXT_EMITTED:
+        return
+    _DOCKER_HOST_RESOURCES_CONTEXT_EMITTED = True
+
+    try:
+        storage_path = _get_docker_storage_path()
+        free_disk_bytes = _get_free_disk_bytes(storage_path)
+        free_mem_bytes = _get_free_memory_bytes()
+        free_disk_gb = round(free_disk_bytes / (1024**3), 2)
+        free_mem_gb = round(free_mem_bytes / (1024**3), 2)
+
+        payload: dict[str, Any] = {
+            "command_name": command_name,
+            "storage_path": str(storage_path),
+            "free_disk_gb": free_disk_gb,
+            "free_memory_gb": free_mem_gb,
+            "low_disk": free_disk_gb < _MIN_DOCKER_INSTALL_FREE_GB,
+            "low_memory": free_mem_gb < _LOW_MEMORY_WARNING_THRESHOLD_GB,
+        }
+        print_info_debug(
+            "[docker] host resources context: "
+            f"command={mark_sensitive(command_name, 'status')} "
+            f"storage_path={mark_sensitive(str(storage_path), 'path')} "
+            f"free_disk_gb={mark_sensitive(str(free_disk_gb), 'status')} "
+            f"free_memory_gb={mark_sensitive(str(free_mem_gb), 'status')} "
+            f"low_disk={mark_sensitive(str(payload['low_disk']).lower(), 'status')} "
+            f"low_memory={mark_sensitive(str(payload['low_memory']).lower(), 'status')}"
+        )
+        telemetry.capture("docker_host_resources_context", payload)
+    except Exception as exc:  # pragma: no cover - best effort only
+        telemetry.capture_exception(exc)
+
+
 def _select_existing_or_preferred_image() -> str:
     """Use an existing compatible image when available, else preferred image."""
     candidates = _get_docker_image_candidates()
@@ -518,8 +780,7 @@ def _emit_docker_daemon_troubleshooting_snapshot(*, stage: str) -> None:
     docker_host = os.getenv("DOCKER_HOST", "").strip()
     if docker_host:
         print_info_debug(
-            "[docker] DOCKER_HOST is set: "
-            f"{mark_sensitive(docker_host, 'detail')}"
+            f"[docker] DOCKER_HOST is set: {mark_sensitive(docker_host, 'detail')}"
         )
 
     sock_path = Path("/var/run/docker.sock")
@@ -618,20 +879,18 @@ def _print_docker_image_pull_failure_guidance(
         print_instruction("Check daemon logs:")
         print_instruction("  sudo journalctl -u docker -n 120 --no-pager")
         if os.getenv("DOCKER_HOST", "").strip():
-            print_instruction(
-                "If DOCKER_HOST is misconfigured, unset it and retry:"
-            )
+            print_instruction("If DOCKER_HOST is misconfigured, unset it and retry:")
             print_instruction("  unset DOCKER_HOST")
-        print_instruction(
-            f"Retry command: adscan {command_name}"
-        )
+        print_instruction(f"Retry command: adscan {command_name}")
         return
 
     print_instruction("Retry the command, or pull manually and retry:")
     pull_cmd_prefix = "sudo " if (docker_needs_sudo() and os.geteuid() != 0) else ""
     print_instruction(f"  {pull_cmd_prefix}docker pull {image}")
     suggested_timeout = 7200 if pull_timeout is None else max(pull_timeout, 7200)
-    print_instruction("If you are on a slow network, increase the pull timeout and retry:")
+    print_instruction(
+        "If you are on a slow network, increase the pull timeout and retry:"
+    )
     print_instruction(f"  adscan {command_name} --pull-timeout {suggested_timeout}")
     print_instruction("To disable the pull timeout entirely:")
     print_instruction(f"  adscan {command_name} --pull-timeout 0")
@@ -647,7 +906,9 @@ def _run_bloodhound_compose_pull_with_daemon_recovery(
     This helper centralizes daemon checks/retries for BloodHound CE image pulls so
     install/start/check/ci paths share the same resilient behavior.
     """
-    if not _ensure_docker_daemon_available_for_pull(stage="pre_bloodhound_compose_pull"):
+    if not _ensure_docker_daemon_available_for_pull(
+        stage="pre_bloodhound_compose_pull"
+    ):
         return False
 
     if compose_pull(compose_path, stream_output=stream_output):
@@ -709,7 +970,9 @@ def _run_bloodhound_compose_up_with_daemon_recovery(*, compose_path: Path) -> bo
     ):
         return False
 
-    print_info("Retrying BloodHound CE container startup after Docker daemon recovery...")
+    print_info(
+        "Retrying BloodHound CE container startup after Docker daemon recovery..."
+    )
     return compose_up(compose_path)
 
 
@@ -949,7 +1212,7 @@ def _reset_bloodhound_ce_stack_for_password_recovery(compose_path: Path) -> bool
             f"[bloodhound-ce] reset down exception: {mark_sensitive(str(exc), 'error')}"
         )
         return False
- 
+
     return compose_up(compose_path)
 
 
@@ -1417,8 +1680,10 @@ def _get_managed_bloodhound_container_statuses() -> dict[str, str] | None:
         f"{project_name}-graph-db-1",
     }
     try:
+        # Use `ps -a` so we can detect "Exited"/"Dead" containers explicitly
+        # instead of only seeing them as "missing" from the runtime gate.
         proc = run_docker(
-            ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}"],
+            ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}"],
             check=False,
             capture_output=True,
             timeout=15,
@@ -1467,6 +1732,13 @@ def _evaluate_managed_bloodhound_container_readiness(
     app_db_name = next(name for name in lowered if name.endswith("-app-db-1"))
     graph_db_name = next(name for name in lowered if name.endswith("-graph-db-1"))
 
+    if "dead" in lowered[bloodhound_name] or "exited" in lowered[bloodhound_name]:
+        return False, f"web_exited={snapshot[bloodhound_name]!r}"
+    if "dead" in lowered[app_db_name] or "exited" in lowered[app_db_name]:
+        return False, f"app_db_exited={snapshot[app_db_name]!r}"
+    if "dead" in lowered[graph_db_name] or "exited" in lowered[graph_db_name]:
+        return False, f"graph_db_exited={snapshot[graph_db_name]!r}"
+
     if "up" not in lowered[bloodhound_name]:
         return False, f"web_not_up={snapshot[bloodhound_name]!r}"
     if "up" not in lowered[app_db_name]:
@@ -1479,6 +1751,106 @@ def _evaluate_managed_bloodhound_container_readiness(
         return False, f"graph_db_not_healthy={snapshot[graph_db_name]!r}"
 
     return True, "ok"
+
+
+def _is_fatal_managed_readiness_reason(reason: str) -> bool:
+    """Return whether a managed readiness reason should fail immediately."""
+    normalized = str(reason or "").strip().lower()
+    return normalized.startswith(("web_exited=", "app_db_exited=", "graph_db_exited="))
+
+
+def _inspect_container_runtime_state(container_name: str) -> dict[str, str] | None:
+    """Return best-effort Docker inspect state for a container."""
+    try:
+        proc = run_docker(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                (
+                    "{{.State.Status}}\t{{.State.ExitCode}}\t{{.State.OOMKilled}}\t"
+                    "{{.State.Error}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{.State.FinishedAt}}"
+                ),
+                container_name,
+            ],
+            check=False,
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[bloodhound-ce] inspect state probe exception: "
+            f"container={mark_sensitive(container_name, 'detail')} "
+            f"error={mark_sensitive(str(exc), 'error')}"
+        )
+        return None
+
+    if proc.returncode != 0:
+        stderr = str(proc.stderr or "").strip()
+        if stderr:
+            print_info_debug(
+                "[bloodhound-ce] inspect state probe stderr: "
+                f"container={mark_sensitive(container_name, 'detail')} "
+                f"stderr={mark_sensitive(stderr, 'detail')}"
+            )
+        return None
+
+    raw = str(proc.stdout or "").strip()
+    if not raw:
+        return None
+    parts = raw.split("\t")
+    while len(parts) < 7:
+        parts.append("")
+    return {
+        "status": parts[0].strip(),
+        "exit_code": parts[1].strip(),
+        "oom_killed": parts[2].strip(),
+        "error": parts[3].strip(),
+        "restart_count": parts[4].strip(),
+        "started_at": parts[5].strip(),
+        "finished_at": parts[6].strip(),
+    }
+
+
+def _print_managed_runtime_failure_hint(*, reason: str) -> None:
+    """Print targeted guidance for fatal managed runtime failures."""
+    project_name = get_bloodhound_compose_project_name()
+    web_container = f"{project_name}-bloodhound-1"
+    state = _inspect_container_runtime_state(web_container) or {}
+    exit_code = str(state.get("exit_code") or "").strip()
+    oom_killed = str(state.get("oom_killed") or "").strip().lower() == "true"
+    probable_oom = exit_code == "137" or oom_killed
+
+    details = [
+        "BloodHound CE web container exited during startup, so authentication checks cannot continue.",
+        f"Reason: {mark_sensitive(reason, 'detail')}",
+    ]
+    if state:
+        details.append(
+            "Container state: "
+            f"status={mark_sensitive(state.get('status', ''), 'detail')} "
+            f"exit_code={mark_sensitive(exit_code or 'unknown', 'detail')} "
+            f"oom_killed={mark_sensitive(str(state.get('oom_killed', '')).lower(), 'detail')}"
+        )
+    if probable_oom:
+        details.append(
+            "Probable cause: out-of-memory kill (exit 137 / OOMKilled) while BloodHound CE was initializing."
+        )
+        details.append(
+            "Action: free RAM or add swap, then retry `adscan install` / `adscan start`."
+        )
+
+    print_panel(
+        "\n".join(details),
+        title="BloodHound CE Container Exited",
+        border_style="yellow",
+    )
+    print_instruction(f"Inspect logs: docker logs {web_container} --tail 200")
+    print_instruction(
+        f"Inspect state: docker inspect {web_container} --format '{{{{json .State}}}}'"
+    )
+    print_instruction(f"Troubleshooting guide: {_BLOODHOUND_TROUBLESHOOTING_DOCS_URL}")
 
 
 def _wait_for_bloodhound_ce_api_ready(
@@ -1520,6 +1892,13 @@ def _wait_for_bloodhound_ce_api_ready(
             )
             if not containers_ready:
                 consecutive_ok = 0
+                if _is_fatal_managed_readiness_reason(last_container_reason):
+                    print_warning(
+                        "BloodHound CE containers exited during startup; runtime checks cannot continue."
+                    )
+                    _print_managed_runtime_failure_hint(reason=last_container_reason)
+                    _print_bloodhound_ce_readiness_diagnostics()
+                    return False
                 time.sleep(interval_seconds)
                 continue
 
@@ -1628,6 +2007,17 @@ def _print_bloodhound_ce_readiness_diagnostics() -> None:
         name = line.split("\t", 1)[0].strip()
         if not name:
             continue
+        state = _inspect_container_runtime_state(name)
+        if state:
+            print_info_debug(
+                "[bloodhound-ce] readiness diagnostics inspect "
+                f"({mark_sensitive(name, 'detail')}): "
+                f"status={mark_sensitive(state.get('status', ''), 'detail')} "
+                f"exit_code={mark_sensitive(state.get('exit_code', ''), 'detail')} "
+                f"oom_killed={mark_sensitive(str(state.get('oom_killed', '')).lower(), 'detail')} "
+                f"restart_count={mark_sensitive(state.get('restart_count', ''), 'detail')} "
+                f"error={mark_sensitive(state.get('error', ''), 'detail')}"
+            )
         logs = _run_docker_debug(["docker", "logs", "--tail", "80", name])
         if not logs:
             continue
@@ -1737,6 +2127,23 @@ def _diagnostic_points_to_podman_socket(diagnostic: str) -> bool:
     )
 
 
+def _diagnostic_looks_transient_daemon_timeout(diagnostic: str) -> bool:
+    """Return True for daemon diagnostics that look like transient timeout errors."""
+    lowered = (diagnostic or "").lower()
+    return (
+        "daemon check timed out" in lowered
+        or "timeout" in lowered
+        or "timed out" in lowered
+        or "context deadline exceeded" in lowered
+    )
+
+
+def _allow_podman_docker_api_mode() -> bool:
+    """Return True when explicit Podman Docker API mode is enabled."""
+    raw = str(os.getenv(_ALLOW_PODMAN_DOCKER_API_ENV, "")).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _attempt_start_user_podman_socket() -> bool:
     """Best-effort start of rootless Podman socket used as Docker API endpoint."""
     if not shutil.which("systemctl"):
@@ -1787,12 +2194,44 @@ def _ensure_docker_daemon_available_for_pull(*, stage: str) -> bool:
     if running:
         return True
 
+    # Transient host load can occasionally make `docker info` status checks time
+    # out while the daemon remains healthy. Retry once before showing warnings.
+    if _diagnostic_looks_transient_daemon_timeout(diagnostic):
+        print_info_debug(
+            "[docker] daemon probe timed out; retrying once before recovery flow "
+            f"(stage={stage})."
+        )
+        time.sleep(0.8)
+        retry_running, retry_diagnostic = _is_docker_daemon_running_internal(
+            run_docker_command_func=_run_docker_status_command
+        )
+        if retry_running:
+            print_info_verbose(
+                "Docker daemon probe recovered after transient timeout."
+            )
+            return True
+        diagnostic = retry_diagnostic
+
     print_warning("Docker daemon is not reachable, so image pull cannot continue yet.")
     print_info_debug(
         f"[docker] daemon diagnostic ({stage}): {mark_sensitive(diagnostic, 'detail')}"
     )
 
     if _diagnostic_points_to_podman_socket(diagnostic):
+        if not _allow_podman_docker_api_mode():
+            print_error(
+                "Detected Docker CLI endpoint configured for Podman socket. "
+                "ADscan requires Docker Engine by default."
+            )
+            print_instruction(
+                "Use Docker Engine (recommended): unset DOCKER_HOST, start Docker daemon, and retry."
+            )
+            print_instruction(
+                "If you explicitly want Podman Docker API mode, set "
+                f"{_ALLOW_PODMAN_DOCKER_API_ENV}=1 and ensure podman.socket is running."
+            )
+            return False
+
         print_warning(
             "Detected Docker CLI endpoint pointing to a Podman socket that is not reachable."
         )
@@ -2116,9 +2555,7 @@ def _print_host_helper_log_tail(*, max_lines: int = 40) -> None:
         )
         return
     tail = "\n".join(lines[-max_lines:])
-    print_info_debug(
-        "[host-helper] log tail:\n" + mark_sensitive(tail, "detail")
-    )
+    print_info_debug("[host-helper] log tail:\n" + mark_sensitive(tail, "detail"))
 
 
 def _wait_for_host_helper_ready(
@@ -2142,9 +2579,7 @@ def _wait_for_host_helper_ready(
 
         returncode = proc.poll()
         if returncode is not None:
-            print_warning(
-                "Host helper exited before becoming ready."
-            )
+            print_warning("Host helper exited before becoming ready.")
             print_info_debug(
                 "[host-helper] readiness failed: "
                 f"socket={mark_sensitive(str(socket_path), 'path')} "
@@ -2181,9 +2616,7 @@ def _wait_for_host_helper_ready(
             )
         time.sleep(0.2)
 
-    print_warning(
-        "Host helper did not become ready within the expected time window."
-    )
+    print_warning("Host helper did not become ready within the expected time window.")
     if last_error is not None:
         print_info_debug(
             "[host-helper] readiness final error: "
@@ -2197,8 +2630,97 @@ def _wait_for_host_helper_ready(
     return False
 
 
-def _spawn_host_helper_process(*, socket_path: Path) -> subprocess.Popen[str]:
+def _spawn_host_helper_process(
+    *,
+    socket_path: Path,
+    force_self_executable: bool = False,
+) -> subprocess.Popen[str]:
     """Spawn the privileged host helper process."""
+
+    def _prepend_path_entry(existing: str, entry: str) -> str:
+        parts = [p for p in str(existing or "").split(os.pathsep) if p]
+        if entry not in parts:
+            parts.insert(0, entry)
+        return os.pathsep.join(parts)
+
+    def _build_host_helper_launch() -> tuple[list[str], dict[str, str], str]:
+        env = os.environ.copy()
+        preserve_env_vars = ["CONTAINER_SHARED_TOKEN"]
+        launch_mode = "self-executable"
+        # Avoid root-owned __pycache__ files in repo/workspace when helper is
+        # started via sudo Python in CI/self-hosted runners.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        # For Python launcher installs (pip/pipx/uv), invoking the console
+        # script under sudo can fail in two common ways:
+        #   1) root cannot import adscan_launcher from user-site paths
+        #   2) the resolved `adscan` entrypoint does not expose `host-helper`
+        #      (mixed/older wrapper on PATH)
+        # Use a direct inline import of host_privileged_helper and inject
+        # PYTHONPATH explicitly to avoid relying on CLI subcommand parsing.
+        if not bool(getattr(sys, "frozen", False)) and not force_self_executable:
+            package_root = str(Path(__file__).resolve().parent.parent)
+            if package_root:
+                env["PYTHONPATH"] = _prepend_path_entry(
+                    env.get("PYTHONPATH", ""),
+                    package_root,
+                )
+                launch_mode = "python-inline-host-helper"
+                python_exec = str(sys.executable or "").strip() or "python3"
+                inline_host_helper_entry = (
+                    "from adscan_launcher.host_privileged_helper import "
+                    "run_host_helper_server as _run;"
+                    "import sys;"
+                    "raise SystemExit(_run(sys.argv[1]))"
+                )
+                argv = [
+                    python_exec,
+                    "-B",
+                    "-c",
+                    inline_host_helper_entry,
+                    str(socket_path),
+                ]
+            else:
+                argv = [
+                    _resolve_self_executable(),
+                    "host-helper",
+                    "--socket",
+                    str(socket_path),
+                ]
+        else:
+            if force_self_executable and not bool(getattr(sys, "frozen", False)):
+                launch_mode = "self-executable-forced"
+            argv = [
+                _resolve_self_executable(),
+                "host-helper",
+                "--socket",
+                str(socket_path),
+            ]
+
+        if os.geteuid() != 0:
+            preserve = ",".join(preserve_env_vars)
+            sudo_prefix = ["sudo", f"--preserve-env={preserve}", "-n"]
+            if launch_mode.startswith("python-") and env.get("PYTHONPATH", "").strip():
+                # `sudo` can filter PYTHONPATH even when preserving env vars.
+                # Pass it via `env` so module resolution remains stable.
+                argv = (
+                    sudo_prefix
+                    + [
+                        "env",
+                        f"PYTHONPATH={env['PYTHONPATH']}",
+                        "PYTHONDONTWRITEBYTECODE=1",
+                    ]
+                    + argv
+                )
+            else:
+                argv = sudo_prefix + argv
+
+        print_info_debug(
+            "[host-helper] launch context: "
+            f"mode={launch_mode} socket={mark_sensitive(str(socket_path), 'path')}"
+        )
+        return argv, env, launch_mode
+
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         if socket_path.exists():
@@ -2206,10 +2728,7 @@ def _spawn_host_helper_process(*, socket_path: Path) -> subprocess.Popen[str]:
     except OSError:
         pass
 
-    exe = _resolve_self_executable()
-    argv = [exe, "host-helper", "--socket", str(socket_path)]
-    if os.geteuid() != 0:
-        argv = ["sudo", "--preserve-env=CONTAINER_SHARED_TOKEN", "-n"] + argv
+    argv, launch_env, _launch_mode = _build_host_helper_launch()
 
     logs_dir = _get_logs_dir()
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -2223,7 +2742,7 @@ def _spawn_host_helper_process(*, socket_path: Path) -> subprocess.Popen[str]:
             stdout=log_fh,
             stderr=log_fh,
             text=True,
-            env=os.environ.copy(),
+            env=launch_env,
         )
     except OSError:
         proc = subprocess.Popen(  # noqa: S603
@@ -2232,7 +2751,7 @@ def _spawn_host_helper_process(*, socket_path: Path) -> subprocess.Popen[str]:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             text=True,
-            env=os.environ.copy(),
+            env=launch_env,
         )
     finally:
         if log_fh is not None:
@@ -2255,8 +2774,11 @@ def _start_host_helper(*, socket_path: Path) -> subprocess.Popen[str] | None:
         print_info_debug("[host-helper] startup aborted: sudo validation failed")
         return None
 
-    for launch_attempt in (1, 2):
-        proc = _spawn_host_helper_process(socket_path=socket_path)
+    for launch_attempt, force_self_exec in ((1, False), (2, True)):
+        proc = _spawn_host_helper_process(
+            socket_path=socket_path,
+            force_self_executable=force_self_exec,
+        )
         if _wait_for_host_helper_ready(proc=proc, socket_path=socket_path):
             return proc
         _stop_host_helper(proc)
@@ -2364,17 +2886,11 @@ def _print_host_helper_runtime_troubleshooting(
 
     daemon_diag = diagnostics.get("docker_daemon_diagnostic", "").strip()
     if daemon_diag:
-        details.append(
-            "Daemon diagnostic: "
-            f"{mark_sensitive(daemon_diag, 'detail')}"
-        )
+        details.append(f"Daemon diagnostic: {mark_sensitive(daemon_diag, 'detail')}")
 
     sudo_detail = diagnostics.get("sudo_detail", "").strip()
     if sudo_detail:
-        details.append(
-            "Sudo detail: "
-            f"{mark_sensitive(sudo_detail, 'detail')}"
-        )
+        details.append(f"Sudo detail: {mark_sensitive(sudo_detail, 'detail')}")
 
     print_panel(
         "\n".join(details),
@@ -2387,9 +2903,7 @@ def _print_host_helper_runtime_troubleshooting(
     print_instruction("If needed, start daemon: sudo systemctl start docker")
     print_instruction("If sudo is required, refresh credentials: sudo -v")
     print_instruction(f"Retry: adscan {command_name}")
-    print_instruction(
-        f"Troubleshooting guide: {_HOST_HELPER_TROUBLESHOOTING_DOCS_URL}"
-    )
+    print_instruction(f"Troubleshooting guide: {_HOST_HELPER_TROUBLESHOOTING_DOCS_URL}")
 
 
 def _ensure_host_helper_runtime_ready(
@@ -2717,13 +3231,13 @@ def _print_managed_bloodhound_runtime_troubleshooting(
         print_instruction(
             f"Try: docker compose -p {project_name} -f {marked_path} up -d"
         )
-        print_instruction(
-            f"Try: docker compose -p {project_name} -f {marked_path} ps"
-        )
+        print_instruction(f"Try: docker compose -p {project_name} -f {marked_path} ps")
     else:
         print_instruction("Run: adscan install")
 
-    print_instruction(f"Inspect logs: docker logs {project_name}-bloodhound-1 --tail 200")
+    print_instruction(
+        f"Inspect logs: docker logs {project_name}-bloodhound-1 --tail 200"
+    )
     print_instruction(f"Troubleshooting guide: {_BLOODHOUND_TROUBLESHOOTING_DOCS_URL}")
 
 
@@ -2813,6 +3327,8 @@ def handle_install_docker(
     bloodhound_stack_mode: str | None = None,
 ) -> bool:
     """Install ADscan via Docker (pull image + bootstrap BloodHound CE)."""
+    _emit_docker_runtime_context(command_name="install")
+    _emit_docker_host_resources_context(command_name="install")
     password_len = len(str(bloodhound_admin_password or ""))
     resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
     print_info_debug(
@@ -2930,6 +3446,7 @@ def handle_install_docker(
         )
         print_info_debug(f"[install] Free RAM at install: {free_mem_gb:.2f} GB")
         return False
+    _maybe_warn_low_memory_for_bloodhound(free_mem_gb=free_mem_gb)
 
     # Pull ADscan image
     print_info(f"Pulling image: {image}")
@@ -3173,6 +3690,8 @@ def handle_check_docker(
     bloodhound_stack_mode: str | None = None,
 ) -> bool:
     """Check ADscan Docker-mode prerequisites."""
+    _emit_docker_runtime_context(command_name="check")
+    _emit_docker_host_resources_context(command_name="check")
     image = _select_existing_or_preferred_image()
     all_ok = True
     _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
@@ -3270,6 +3789,8 @@ def handle_start_docker(
     bloodhound_stack_mode: str | None = None,
 ) -> int:
     """Start ADscan inside Docker and return the docker exit code."""
+    _emit_docker_runtime_context(command_name="start")
+    _emit_docker_host_resources_context(command_name="start")
     image = _select_existing_or_preferred_image()
     resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
     compose_path: Path | None = None
@@ -3389,7 +3910,7 @@ def handle_start_docker(
                     ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
                     ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
                 ]
-            )
+            ),
         )
 
         adscan_args: list[str] = []
@@ -3439,6 +3960,8 @@ def handle_ci_docker(
     bloodhound_stack_mode: str | None = None,
 ) -> int:
     """Run `adscan ci` inside Docker and return the docker exit code."""
+    _emit_docker_runtime_context(command_name="ci")
+    _emit_docker_host_resources_context(command_name="ci")
     image = _select_existing_or_preferred_image()
     resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
     compose_path: Path | None = None
@@ -3599,6 +4122,8 @@ def update_docker_image(*, pull_timeout_seconds: int | None = None) -> int:
     Returns:
         Process exit code (0 success).
     """
+    _emit_docker_runtime_context(command_name="update")
+    _emit_docker_host_resources_context(command_name="update")
     image = _get_docker_image()
     if not docker_available():
         print_error("Docker is not installed or not in PATH.")
@@ -3634,6 +4159,8 @@ def run_adscan_passthrough_docker(
     This is used by the PyPI launcher to avoid duplicating the full internal
     CLI argument parsing while still keeping Docker-mode preflight consistent.
     """
+    _emit_docker_runtime_context(command_name="passthrough")
+    _emit_docker_host_resources_context(command_name="passthrough")
     image = _select_existing_or_preferred_image()
     resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
     compose_path: Path | None = None

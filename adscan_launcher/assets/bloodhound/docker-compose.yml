@@ -44,9 +44,6 @@ services:
     environment:
       - NEO4J_AUTH=${NEO4J_USER:-neo4j}/${NEO4J_SECRET:-bloodhoundcommunityedition}
       - NEO4J_dbms_allow__upgrade=${NEO4J_ALLOW_UPGRADE:-true}
-    ports:
-      - 127.0.0.1:${NEO4J_DB_PORT:-17687}:7687
-      - 127.0.0.1:${NEO4J_WEB_PORT:-17474}:7474
     volumes:
       - ${NEO4J_DATA_MOUNT:-neo4j-data}:/data
     healthcheck:
