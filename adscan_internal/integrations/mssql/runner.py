@@ -7,9 +7,15 @@ via NetExec with automatic error handling and output parsing.
 from __future__ import annotations
 
 import logging
+import subprocess
 from dataclasses import dataclass
 from typing import Optional, Callable, Any
 from pathlib import Path
+
+from adscan_internal.execution_outcomes import (
+    build_timeout_completed_process,
+    result_is_timeout,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -107,6 +113,12 @@ class MSSQLRunner:
             # Execute command
             result = ctx.command_runner(cmd_string, timeout)
 
+            if result_is_timeout(result, tool_name="netexec_mssql"):
+                logger.warning(
+                    "MSSQL command timed out before completion",
+                    extra={"host": host, "username": username, "timeout": timeout},
+                )
+
             success = result.returncode == 0
 
             if not success:
@@ -126,6 +138,16 @@ class MSSQLRunner:
                 success=success,
             )
 
+        except subprocess.TimeoutExpired:
+            timeout_result = build_timeout_completed_process(
+                cmd_string, tool_name="netexec_mssql"
+            )
+            return ExecutionResult(
+                stdout=timeout_result.stdout or "",
+                stderr=timeout_result.stderr or "",
+                returncode=timeout_result.returncode,
+                success=False,
+            )
         except Exception as e:
             logger.exception(
                 "Exception during MSSQL command execution",

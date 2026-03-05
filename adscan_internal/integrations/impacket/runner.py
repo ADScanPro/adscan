@@ -19,6 +19,7 @@ from adscan_internal import (
     print_error,
     print_error_verbose,
     print_info_debug,
+    print_instruction,
     print_warning,
     telemetry,
 )
@@ -27,6 +28,10 @@ from adscan_internal.command_runner import (
     CommandSpec,
     build_execution_output_preview,
     summarize_execution_result,
+)
+from adscan_internal.execution_outcomes import (
+    build_no_result_completed_process,
+    build_timeout_completed_process,
 )
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
 from adscan_internal.subprocess_env import (
@@ -472,7 +477,10 @@ class ImpacketRunner:
             result = self._command_runner.run(spec)
             if result is None:
                 print_warning(f"Command runner returned None for: {command}")
-                return None
+                return build_no_result_completed_process(
+                    command,
+                    tool_name="impacket",
+                )
 
             # Normalize output
             if isinstance(result, subprocess.CompletedProcess):
@@ -485,11 +493,12 @@ class ImpacketRunner:
 
         except subprocess.TimeoutExpired as exc:
             telemetry.capture_exception(exc)
-            print_error_verbose(
+            print_warning(
                 f"Impacket command timed out after {timeout if timeout is not None else 'unknown'}s: "
                 f"{command}"
             )
-            return None
+            print_instruction("Verify VPN/network connectivity to the target and retry.")
+            return build_timeout_completed_process(command, tool_name="impacket")
 
         except Exception as exc:
             telemetry.capture_exception(exc)

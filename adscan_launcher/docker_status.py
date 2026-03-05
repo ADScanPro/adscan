@@ -11,11 +11,18 @@ Canonical implementation for host/launcher operations.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from typing import Callable, Tuple
 
 from adscan_launcher import telemetry
+
+
+_DOCKER_SERVICE_UNIT_MISSING_RE = re.compile(
+    r"(unit\s+docker\.service\s+could\s+not\s+be\s+found|could\s+not\s+find\s+the\s+requested\s+service\s+docker)",
+    re.IGNORECASE,
+)
 
 
 def is_official_docker_installed() -> Tuple[bool, str]:
@@ -169,6 +176,36 @@ def ensure_docker_daemon_running(
             if is_running_after:
                 print_success_verbose_func("Docker service started successfully.")
                 return True
+
+            status_text = ""
+            try:
+                status_proc = run_systemctl_command_func(
+                    ["status", "docker", "--no-pager", "--full"],
+                    check=False,
+                )
+                if status_proc is not None:
+                    status_text = (
+                        f"{getattr(status_proc, 'stdout', '')}\n"
+                        f"{getattr(status_proc, 'stderr', '')}"
+                    ).strip()
+                    if status_text:
+                        print_info_debug_func(
+                            f"[docker] systemctl status docker output: {status_text}"
+                        )
+            except Exception as exc:  # pragma: no cover - best effort diagnostics
+                telemetry.capture_exception(exc)
+                print_info_debug_func(
+                    f"[docker] Unable to inspect docker.service status: {exc}"
+                )
+
+            if _DOCKER_SERVICE_UNIT_MISSING_RE.search(status_text):
+                print_error_func(
+                    "Docker service unit (`docker.service`) was not found on this host."
+                )
+                print_info_func(
+                    "Install Docker Engine + Docker Compose plugin, then rerun install/check."
+                )
+                return False
 
             if docker_access_denied_func(diagnostic_after):
                 if set_docker_use_sudo_func:

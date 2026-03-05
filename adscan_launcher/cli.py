@@ -218,8 +218,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=3600,
         help="Docker pull timeout in seconds (0 disables). Default: 3600.",
     )
+    install.add_argument(
+        "--allow-low-memory",
+        action="store_true",
+        help=(
+            "Allow install to continue when available RAM is critically low "
+            "(below 1.0 GB). Use only for constrained environments."
+        ),
+    )
 
-    sub.add_parser("check", help="Check Docker-mode prerequisites")
+    check = sub.add_parser("check", help="Check Docker-mode prerequisites")
+    check.add_argument(
+        "--allow-low-memory",
+        action="store_true",
+        help=(
+            "Allow checks to continue when available RAM is critically low "
+            "(below 1.0 GB)."
+        ),
+    )
 
     start = sub.add_parser("start", help="Start ADscan interactive session")
     start.add_argument(
@@ -228,6 +244,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=3600,
         help="Docker pull timeout in seconds when pulling the image (0 disables). Default: 3600.",
     )
+    start.add_argument(
+        "--allow-low-memory",
+        action="store_true",
+        help=(
+            "Allow start to continue when available RAM is critically low "
+            "(below 1.0 GB)."
+        ),
+    )
 
     ci = sub.add_parser("ci", help="Run `adscan ci` inside the container")
     ci.add_argument(
@@ -235,6 +259,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3600,
         help="Docker pull timeout in seconds when pulling the image (0 disables). Default: 3600.",
+    )
+    ci.add_argument(
+        "--allow-low-memory",
+        action="store_true",
+        help=(
+            "Allow CI preflight to continue when available RAM is critically low "
+            "(below 1.0 GB). Place this before CI passthrough args."
+        ),
     )
     ci.add_argument(
         "args",
@@ -295,6 +327,7 @@ def _consume_trailing_global_flags(
     """
     cmd = str(getattr(ns, "command", "") or "")
     known_cmds = {"install", "check", "start", "ci", "update", "upgrade", "version"}
+    low_memory_supported_cmds = {"install", "check", "start", "ci"}
     if cmd not in known_cmds:
         return unknown
 
@@ -313,6 +346,10 @@ def _consume_trailing_global_flags(
             continue
         if token == "--dev":
             setattr(ns, "dev", True)
+            idx += 1
+            continue
+        if token == "--allow-low-memory" and cmd in low_memory_supported_cmds:
+            setattr(ns, "allow_low_memory", True)
             idx += 1
             continue
         if token.startswith("--image="):
@@ -968,6 +1005,7 @@ def main(argv: list[str] | None = None) -> None:
                     debug=bool(getattr(ns, "debug", False)),
                     pull_timeout_seconds=int(pull_timeout),
                     bloodhound_stack_mode=resolved_stack_mode,
+                    allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
@@ -984,6 +1022,7 @@ def main(argv: list[str] | None = None) -> None:
                     suppress_bloodhound_browser=bool(ns.no_browser),
                     pull_timeout_seconds=int(ns.pull_timeout),
                     bloodhound_stack_mode=resolved_stack_mode,
+                    allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                 ),
                 extra={"mode": "docker"},
             )
@@ -996,6 +1035,7 @@ def main(argv: list[str] | None = None) -> None:
                 telemetry_console=telemetry_console,
                 runner=lambda: handle_check_docker(
                     bloodhound_stack_mode=resolved_stack_mode,
+                    allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                 ),
                 extra={"mode": "docker"},
             )
@@ -1032,6 +1072,7 @@ def main(argv: list[str] | None = None) -> None:
                     debug=bool(getattr(ns, "debug", False)),
                     pull_timeout_seconds=int(ns.pull_timeout),
                     bloodhound_stack_mode=resolved_stack_mode,
+                    allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),

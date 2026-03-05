@@ -27,6 +27,7 @@ from adscan_internal.command_runner import (
     build_execution_output_preview,
     summarize_execution_result,
 )
+from adscan_internal.execution_outcomes import build_timeout_completed_process
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
@@ -203,11 +204,14 @@ class NetExecRunner:
             except subprocess.TimeoutExpired as exc:
                 if not ignore_errors_flag:
                     telemetry.capture_exception(exc)
-                    print_error_verbose(
-                        f"Command timed out after {timeout if timeout is not None else 'unknown'}s: "
-                        f"{cmd}"
+                    print_warning(
+                        "NetExec command timed out before producing output. "
+                        "This usually indicates connectivity instability."
                     )
-                return None
+                    print_instruction(
+                        "Verify VPN/network connectivity to the target and retry."
+                    )
+                return build_timeout_completed_process(cmd, tool_name="netexec")
             except Exception as exc:
                 if not ignore_errors_flag:
                     telemetry.capture_exception(exc)

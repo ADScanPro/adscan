@@ -144,10 +144,6 @@ from adscan_internal.docker_runtime import (
     run_docker_command,
     emit_entrypoint_logs_from_state,
 )
-from adscan_internal.questionary_prompts import (
-    prompt_questionary_checkbox,
-    prompt_questionary_select,
-)
 from adscan_internal.docker_status import (
     ensure_docker_daemon_running as _ensure_docker_daemon_running_internal,
     is_docker_compose_plugin_available as _is_docker_compose_plugin_available,
@@ -173,7 +169,13 @@ from adscan_internal.bloodhound_legacy import (
 )
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.theme import ADSCAN_THEME
-from adscan_internal.rich_output import print_telemetry_only
+from adscan_internal.rich_output import (
+    configure_prompt_behavior,
+    install_prompt_logging_wrappers,
+    questionary_checkbox_values,
+    questionary_select_index,
+    set_prompt_auto_mode,
+)
 from adscan_internal.update_manager import (
     UpdateContext,
     offer_updates_for_command,
@@ -189,9 +191,6 @@ from adscan_internal.services.dns_discovery_service import (
     preflight_install_dns,
 )
 
-# Store original functions for monkey-patching in CI mode
-_ORIGINAL_PROMPT_ASK = Prompt.ask
-_ORIGINAL_CONFIRM_ASK = Confirm.ask
 _AUTO_MODE_ACTIVE = False  # pylint: disable=invalid-name
 
 
@@ -640,27 +639,6 @@ def _run_systemctl_command(
     )
 
 
-def _auto_mode_prompt_ask(*prompt_args, default=None, **kwargs):
-    """Wrapper for Prompt.ask that shows question always but returns default
-    in auto mode.
-    """
-    if _AUTO_MODE_ACTIVE:
-        # Extract prompt message from first positional argument
-        prompt_message = prompt_args[0] if prompt_args else "?"
-
-        # Show the question in CI mode (but don't wait for input)
-        if default is not None:
-            print_info(f"{prompt_message} [dim](auto: {default})[/dim]")
-        else:
-            print_info(f"{prompt_message} [dim](auto: )[/dim]")
-
-        # Return default value automatically without waiting for input
-        return default if default is not None else ""
-
-    # In non-CI mode, pass through to original function unchanged
-    return _ORIGINAL_PROMPT_ASK(*prompt_args, default=default, **kwargs)
-
-
 def _build_command_metadata(shell=None, command_type: str | None = None, extra=None):
     """Compose telemetry metadata including command type and optional extras."""
     metadata = {}
@@ -874,195 +852,6 @@ def _resolve_domain_key(domains_data: dict[str, Any], domain: str) -> str | None
     return None
 
 
-def _auto_mode_confirm_ask(*confirm_args, **kwargs):
-    """Wrapper for Confirm.ask that shows question always but returns default
-    in auto mode.
-
-    In CI mode:
-    - Always shows the question in output
-    - If default is specified in the call, use that value
-    - If no default is specified, return True (assume "yes" for confirmations in CI)
-    """
-    if _AUTO_MODE_ACTIVE:
-        # Extract prompt message from first positional argument
-        prompt_message = confirm_args[0] if confirm_args else "Confirm?"
-
-        # Determine auto response value
-        if "default" in kwargs:
-            auto_response = kwargs["default"]
-        else:
-            # If no default specified, assume True (yes) for CI
-            auto_response = True
-
-        # Show the question in CI mode with auto response (but don't wait for input)
-        response_text = "Yes" if auto_response else "No"
-        print_info(f"{prompt_message} [dim](auto: {response_text})[/dim]")
-
-        # Return auto response value without waiting for input
-        return auto_response
-
-    # In non-CI mode, pass through to original function unchanged
-    return _ORIGINAL_CONFIRM_ASK(*confirm_args, **kwargs)
-
-
-def _logged_prompt_ask(*prompt_args, **kwargs):
-    """Wrapper for Prompt.ask that logs the question via Rich output helpers.
-
-    This ensures that interactive prompts also appear in the telemetry HTML
-    recording, with the user's response captured via the sanitization layer.
-    """
-    prompt_message = prompt_args[0] if prompt_args else "?"
-    password_mode = bool(kwargs.get("password", False))
-    default_value = kwargs.get("default")
-
-    def _classify_prompt_answer(answer_text: str) -> str:
-        if password_mode:
-            return "password"
-        cleaned = answer_text.strip()
-        if not cleaned:
-            return "user"
-        try:
-            ipaddress.ip_network(cleaned, strict=False)
-            return "ip"
-        except ValueError:
-            pass
-        if cleaned.startswith(("/", "./", "../", "~")) or re.match(
-            r"^[A-Za-z]:\\\\", cleaned
-        ):
-            return "path"
-        if re.match(r"^[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$", cleaned):
-            return "domain"
-        return "user"
-
-    # Log only the question text; never the answer to avoid leaking secrets.
-    if password_mode:
-        printed_message = f"[prompt][password] {prompt_message}"
-    else:
-        printed_message = f"[prompt] {prompt_message}"
-
-    # Record into telemetry session output without duplicating the actual prompt
-    # that Rich/Questionary will render to the user's terminal.
-    print_telemetry_only(printed_message)
-
-    def _log_prompt_answer(answer: str | None) -> None:
-        if answer is None:
-            return
-        answer_text = str(answer)
-        data_type = _classify_prompt_answer(answer_text)
-        if password_mode:
-            answer_tag = "[prompt][password][answer]"
-        else:
-            answer_tag = "[prompt][answer]"
-        print_telemetry_only(
-            f"{answer_tag} {prompt_message}: {mark_sensitive(answer_text, data_type)}"
-        )
-
-    # Non-interactive runs must not block on prompt input; use default/empty.
-    if _should_disable_interactive_prompts():
-        fallback = "" if default_value is None else str(default_value)
-        print_info_debug(
-            f"[prompt] Non-interactive mode; using fallback for '{prompt_message}'."
-        )
-        _log_prompt_answer(fallback)
-        return fallback
-
-    # In Docker runtime we sometimes get terminal/PTY quirks where backspace is
-    # not interpreted correctly by Rich's Console.input(). Questionary uses
-    # prompt_toolkit which is generally more resilient in containers.
-    if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
-        try:
-            import questionary  # type: ignore
-        except Exception:
-            return _ORIGINAL_PROMPT_ASK(*prompt_args, **kwargs)
-
-        prompt_text = str(prompt_message)
-        try:
-            if password_mode:
-                answer = questionary.password(
-                    prompt_text,
-                    default=str(default_value) if default_value is not None else "",
-                ).ask()
-            else:
-                answer = questionary.text(
-                    prompt_text,
-                    default=str(default_value) if default_value is not None else "",
-                ).ask()
-        except EOFError:
-            _log_interrupt_debug(kind="eof", source="rich_prompt.ask(container)")
-            fallback = "" if default_value is None else str(default_value)
-            _log_prompt_answer(fallback)
-            return fallback
-        except KeyboardInterrupt:
-            _log_interrupt_debug(
-                kind="keyboard_interrupt", source="rich_prompt.ask(container)"
-            )
-            return ""
-
-        _log_prompt_answer(answer)
-        return "" if answer is None else str(answer)
-
-    answer = _ORIGINAL_PROMPT_ASK(*prompt_args, **kwargs)
-    _log_prompt_answer(answer)
-    return answer
-
-
-def _logged_confirm_ask(*confirm_args, **kwargs):
-    """Wrapper for Confirm.ask that logs the question via Rich output helpers.
-
-    The question and user's answer are logged via telemetry-only output.
-    """
-    prompt_message = confirm_args[0] if confirm_args else "Confirm?"
-    printed_message = f"[confirm] {prompt_message}"
-    # Record into telemetry session output without duplicating the actual prompt
-    # that Rich will render to the user's terminal.
-    print_telemetry_only(printed_message)
-
-    def _log_confirm_answer(answer: bool) -> None:
-        answer_text = "Yes" if answer else "No"
-        print_telemetry_only(f"[confirm][answer] {prompt_message}: {answer_text}")
-
-    # Non-interactive runs must not block on confirmation prompts.
-    if _should_disable_interactive_prompts():
-        resolved = bool(kwargs.get("default", True))
-        print_info_debug(
-            f"[confirm] Non-interactive mode; using fallback for '{prompt_message}': {resolved}"
-        )
-        _log_confirm_answer(resolved)
-        return resolved
-
-    # In Docker runtime we sometimes get terminal/PTY quirks where backspace
-    # and cursor keys are not interpreted correctly by Rich's Console.input().
-    # Questionary uses prompt_toolkit which is generally more resilient in
-    # containers.
-    if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
-        try:
-            import questionary  # type: ignore
-        except Exception:
-            return _ORIGINAL_CONFIRM_ASK(*confirm_args, **kwargs)
-
-        prompt_text = str(prompt_message)
-        default_value = bool(kwargs.get("default", False))
-        try:
-            answer = questionary.confirm(prompt_text, default=default_value).ask()
-        except EOFError:
-            _log_interrupt_debug(kind="eof", source="rich_confirm.ask(container)")
-            _log_confirm_answer(default_value)
-            return default_value
-        except KeyboardInterrupt:
-            _log_interrupt_debug(
-                kind="keyboard_interrupt", source="rich_confirm.ask(container)"
-            )
-            return default_value
-
-        resolved = default_value if answer is None else bool(answer)
-        _log_confirm_answer(resolved)
-        return resolved
-
-    answer = _ORIGINAL_CONFIRM_ASK(*confirm_args, **kwargs)
-    _log_confirm_answer(bool(answer))
-    return answer
-
-
 def _log_interrupt_debug(*, kind: str, source: str) -> None:
     """Emit a standardized debug line when an interactive interrupt is detected."""
     try:
@@ -1072,29 +861,49 @@ def _log_interrupt_debug(*, kind: str, source: str) -> None:
         pass
 
 
+def _configure_prompt_runtime_behavior() -> None:
+    """Configure centralized prompt wrappers for runtime-specific behavior."""
+
+    def _interrupt_logger(kind: str, source: str) -> None:
+        _log_interrupt_debug(kind=kind, source=source)
+
+    configure_prompt_behavior(
+        should_disable_interactive_prompts=_should_disable_interactive_prompts,
+        interrupt_logger=_interrupt_logger,
+        use_questionary_in_container=lambda: os.getenv("ADSCAN_CONTAINER_RUNTIME")
+        == "1",
+    )
+    install_prompt_logging_wrappers()
+
+
+# Configure centralized prompt wrappers once at import time.
+_configure_prompt_runtime_behavior()
+
+
+def _logged_prompt_ask(*prompt_args, **kwargs):
+    """Compatibility wrapper delegating to centralized Prompt.ask behavior."""
+    return Prompt.ask(*prompt_args, **kwargs)
+
+
+def _logged_confirm_ask(*confirm_args, **kwargs):
+    """Compatibility wrapper delegating to centralized Confirm.ask behavior."""
+    return Confirm.ask(*confirm_args, **kwargs)
+
+
 def enable_auto_mode():
     """Enable auto mode: all prompts return defaults without user interaction."""
     global _AUTO_MODE_ACTIVE  # pylint: disable=global-statement
     _AUTO_MODE_ACTIVE = True
-    Prompt.ask = _auto_mode_prompt_ask  # type: ignore[assignment]
-    Confirm.ask = _auto_mode_confirm_ask  # type: ignore[assignment]
+    set_prompt_auto_mode(True)
+    install_prompt_logging_wrappers()
 
 
 def disable_auto_mode():
     """Disable auto mode: restore original prompt functions."""
     global _AUTO_MODE_ACTIVE  # pylint: disable=global-statement
     _AUTO_MODE_ACTIVE = False
-    # Restore logged wrappers instead of raw Rich functions so that
-    # interactive questions continue to be captured in telemetry.
-    Prompt.ask = _logged_prompt_ask  # type: ignore[assignment]
-    Confirm.ask = _logged_confirm_ask  # type: ignore[assignment]
-
-
-# By default (non-auto mode), wrap Prompt.ask and Confirm.ask so that all
-# interactive questions are mirrored to the telemetry console via the
-# Rich output helpers. Auto mode will temporarily override these.
-Prompt.ask = _logged_prompt_ask  # type: ignore[assignment]
-Confirm.ask = _logged_confirm_ask  # type: ignore[assignment]
+    set_prompt_auto_mode(False)
+    install_prompt_logging_wrappers()
 
 
 # Secret mode runtime flag (internal traceback/detail visibility control).
@@ -9395,164 +9204,25 @@ class PentestShell:
         Returns:
             int | None: Index of selected option or None if cancelled
         """
-        if not options:
-            return None
-
-        try:
-            # Validate default_idx
-            if default_idx < 0 or default_idx >= len(options):
-                default_idx = 0
-
-            # CI / auto mode / non-TTY: never prompt (avoid hanging the runner). Always return the default.
-            # Note: `adscan ci` enables auto mode even when running in an interactive TTY.
-            if _should_disable_interactive_prompts(self):
-                try:
-                    print_info_debug(
-                        f"[questionary] Non-interactive; selecting default idx={default_idx}: {options[default_idx]}"
-                    )
-                    print_telemetry_only(
-                        f"[questionary][answer] {title}: {mark_sensitive(str(options[default_idx]), 'text')}"
-                    )
-                except Exception:
-                    pass
-                return default_idx
-
-            # Log prompt title for telemetry/debug (without blocking UI)
-            try:
-                print_info_debug(f"[questionary] Prompt: {title}")
-                print_telemetry_only(f"[questionary] Prompt: {title}")
-            except Exception:
-                pass
-
-            # Print a newline before the questionary prompt for better shell display.
-            print()
-            selected_value = prompt_questionary_select(title=title, options=options)
-
-            # Convert selected value back to index for compatibility with _curses_select
-            if selected_value is None:
-                try:
-                    print_info_debug(f"[questionary] Cancelled: {title}")
-                    print_telemetry_only(f"[questionary][answer] {title}: [cancelled]")
-                except Exception:
-                    pass
-                return None
-
-            # Log user selection for telemetry/debug
-            try:
-                print_info_debug(f"[questionary] Selected: {selected_value}")
-                print_telemetry_only(
-                    f"[questionary][answer] {title}: {mark_sensitive(str(selected_value), 'text')}"
-                )
-            except Exception:
-                pass
-
-            # Find the index of the selected value
-            try:
-                return options.index(selected_value)
-            except ValueError:
-                # Shouldn't happen, but handle gracefully
-                return None
-
-        except KeyboardInterrupt:
-            # User pressed Ctrl+C
-            _log_interrupt_debug(kind="keyboard_interrupt", source="questionary.select")
-            return None
-        except Exception as e:
-            # Fallback to a simple numeric selection (no curses).
-            try:
-                telemetry.capture_exception(e)
-            except Exception:
-                pass
-            try:
-                print_info_debug(
-                    f"[DEBUG] questionary.select failed: {type(e).__name__}: {e}, "
-                    "falling back to numeric selection."
-                )
-            except Exception:
-                pass
-
-            if not options:
-                return None
-
-            # Simple Rich-based numbered menu as last resort
-            print_info(f"[bold]{title}[/bold]")
-            for idx, opt in enumerate(options, start=1):
-                print_info(f"  {idx}. {opt}")
-
-            try:
-                default_number = (
-                    (default_idx + 1) if 0 <= default_idx < len(options) else 1
-                )
-                choice_num = IntPrompt.ask(
-                    "Enter a number (0 to cancel)", default=default_number
-                )
-            except Exception:
-                return None
-
-            if choice_num == 0:
-                return None
-            if 1 <= choice_num <= len(options):
-                return choice_num - 1
-            return None
+        print()
+        return questionary_select_index(
+            title=title,
+            options=options,
+            default_idx=default_idx,
+            shell=self,
+        )
 
     def _questionary_checkbox(self, title: str, options: list[str]) -> list[str] | None:
         """Interactive multi-select using Questionary checkbox.
 
         Returns selected option values, or None if cancelled.
         """
-        if not options:
-            return None
-
-        try:
-            if _should_disable_interactive_prompts(self):
-                try:
-                    print_info_debug(
-                        f"[questionary] Non-interactive; skipping checkbox prompt: {title}"
-                    )
-                    print_telemetry_only(f"[questionary] Prompt: {title}")
-                except Exception:
-                    pass
-                return None
-
-            try:
-                print_info_debug(f"[questionary] Prompt: {title}")
-                print_telemetry_only(f"[questionary] Prompt: {title}")
-            except Exception:
-                pass
-
-            print()
-            selected_values = prompt_questionary_checkbox(
-                title=title,
-                options=options,
-            )
-
-            if selected_values is None:
-                return None
-
-            try:
-                print_info_debug(f"[questionary] Selected: {selected_values}")
-                print_telemetry_only(
-                    f"[questionary][answer] {title}: {mark_sensitive(str(selected_values), 'text')}"
-                )
-            except Exception:
-                pass
-
-            return selected_values
-
-        except KeyboardInterrupt:
-            _log_interrupt_debug(
-                kind="keyboard_interrupt", source="questionary.checkbox"
-            )
-            return None
-        except Exception as e:
-            try:
-                telemetry.capture_exception(e)
-                print_info_debug(
-                    f"[DEBUG] questionary.checkbox failed: {type(e).__name__}: {e}"
-                )
-            except Exception:
-                pass
-            return None
+        print()
+        return questionary_checkbox_values(
+            title=title,
+            options=options,
+            shell=self,
+        )
 
     def _track_non_whitelisted_lab(self, lab_provider: str, lab_name: str):
         """Track non-whitelisted lab names for analytics and future whitelist additions.
@@ -14503,6 +14173,9 @@ class PentestShell:
                     "Credential verification command timed out for user "
                     f"'[bold]{marked_user}[/bold]' on domain '[bold]{marked_domain_name}[/bold]'."
                 )
+                print_instruction(
+                    "Verify VPN/network connectivity to the target and retry."
+                )
             else:
                 print_info_verbose(
                     f"[ui_silent] Credential verification timed out for user {marked_user} on domain {marked_domain_name}."
@@ -14510,14 +14183,16 @@ class PentestShell:
             return False
 
         # Default / ERROR / ACCOUNT_RESTRICTION and other unexpected states.
+        error_detail = (result.error_message or "").strip()
+        error_suffix = f" ({error_detail})" if error_detail else " with unknown error."
         if not ui_silent:
             print_error(
                 f"Credential verification failed for user '[bold]{marked_user}[/bold]' "
-                f"on domain '[bold]{marked_domain_name}[/bold]' with unknown error."
+                f"on domain '[bold]{marked_domain_name}[/bold]'{error_suffix}"
             )
         else:
             print_info_verbose(
-                f"[ui_silent] Credential verification failed for user {marked_user} on domain {marked_domain_name} (unknown error)."
+                f"[ui_silent] Credential verification failed for user {marked_user} on domain {marked_domain_name}{error_suffix}"
             )
 
         if result.raw_output and SECRET_MODE:

@@ -16,6 +16,7 @@ from adscan_internal import telemetry
 from adscan_internal.command_runner import CommandSpec, default_runner
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.core import CredentialFoundEvent
+from adscan_internal.execution_outcomes import output_has_timeout_marker
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
@@ -24,7 +25,7 @@ from adscan_internal.subprocess_env import (
 
 logger = logging.getLogger(__name__)
 
-CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str]]
+CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str] | None]
 
 
 def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess[str]:
@@ -50,6 +51,21 @@ def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess
             env=cmd_env,
         )
     )
+
+
+def _ensure_completed_process(
+    result: subprocess.CompletedProcess[str] | None, *, operation: str
+) -> subprocess.CompletedProcess[str]:
+    """Return a completed process or raise a descriptive error.
+
+    Some command runners may return ``None`` when execution fails before a
+    process result is available (for example, pre-execution errors in wrappers).
+    Service methods expect a process-like object and should fail with a clear
+    domain-specific message rather than ``AttributeError`` on ``stdout``.
+    """
+    if not isinstance(result, subprocess.CompletedProcess):
+        raise RuntimeError(f"{operation} command returned no process result.")
+    return result
 
 
 class CredentialStatus(str, Enum):
@@ -216,7 +232,10 @@ class CredentialService(BaseService):
         # Execute verification
         try:
             exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
+            result = _ensure_completed_process(
+                exec_fn(command, timeout),
+                operation="Credential verification",
+            )
 
             output = (result.stdout or "") + (result.stderr or "")
 
@@ -311,6 +330,17 @@ class CredentialService(BaseService):
             CredentialVerificationResult
         """
         # Check for various status codes
+        if output_has_timeout_marker(output):
+            return CredentialVerificationResult(
+                status=CredentialStatus.TIMEOUT,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message=(
+                    "NetExec command timed out. Verify VPN/network connectivity and retry."
+                ),
+            )
+
         if "STATUS_LOGON_FAILURE" in output:
             return CredentialVerificationResult(
                 status=CredentialStatus.INVALID,
@@ -454,7 +484,10 @@ class CredentialService(BaseService):
 
         try:
             exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
+            result = _ensure_completed_process(
+                exec_fn(command, timeout),
+                operation="Kerberoast",
+            )
 
             self._emit_progress(
                 scan_id=scan_id,
@@ -610,7 +643,10 @@ class CredentialService(BaseService):
 
         try:
             exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
+            result = _ensure_completed_process(
+                exec_fn(command, timeout),
+                operation="ASREPRoast",
+            )
 
             self._emit_progress(
                 scan_id=scan_id,
@@ -785,7 +821,10 @@ class CredentialService(BaseService):
 
         try:
             exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
+            result = _ensure_completed_process(
+                exec_fn(command, timeout),
+                operation="Local credential verification",
+            )
 
             output = (result.stdout or "") + (result.stderr or "")
 

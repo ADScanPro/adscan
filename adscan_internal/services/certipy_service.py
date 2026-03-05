@@ -24,9 +24,13 @@ from adscan_internal.command_runner import (
     build_execution_output_preview,
     summarize_execution_result,
 )
+from adscan_internal.execution_outcomes import (
+    output_has_timeout_marker,
+    result_is_timeout,
+)
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.base_service import BaseService
-from adscan_internal import print_error, print_info_debug
+from adscan_internal import print_error, print_info_debug, print_instruction
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
@@ -182,11 +186,20 @@ class CertipyService(BaseService):
             # Central command runner returns None on timeout/errors; it stores context on the shell.
             last_error = getattr(shell, "_last_run_command_error", None) if shell else None
             err_kind = last_error[0] if last_error else "error"
-            err_msg = (
-                f"Certipy auth command failed before completion ({err_kind})."
-                if err_kind
-                else "Certipy auth command failed before completion."
-            )
+            if err_kind == "timeout":
+                err_msg = (
+                    "Certipy auth command timed out before completion. "
+                    "Verify VPN/network connectivity to the target and retry."
+                )
+                print_instruction(
+                    "Verify VPN/network connectivity to the target and retry."
+                )
+            else:
+                err_msg = (
+                    f"Certipy auth command failed before completion ({err_kind})."
+                    if err_kind
+                    else "Certipy auth command failed before completion."
+                )
             print_error(err_msg)
             return PassTheCertificateResult(
                 domain=domain,
@@ -197,6 +210,24 @@ class CertipyService(BaseService):
                 raw_output="",
                 success=False,
                 error_message=err_msg,
+            )
+
+        if result_is_timeout(completed, tool_name="certipy"):
+            timeout_error = (
+                "Certipy auth command timed out. Verify VPN/network connectivity to the target and retry."
+            )
+            print_error(timeout_error)
+            print_instruction("Verify VPN/network connectivity to the target and retry.")
+            output = (completed.stdout or "") + (completed.stderr or "")
+            return PassTheCertificateResult(
+                domain=domain,
+                principal=None,
+                username=None,
+                resolved_domain=None,
+                nt_hash=None,
+                raw_output=output,
+                success=False,
+                error_message=timeout_error,
             )
 
         exit_code, stdout_count, stderr_count, duration_text = summarize_execution_result(
@@ -212,6 +243,20 @@ class CertipyService(BaseService):
             print_info_debug(f"[certipy] Output preview:\n{preview}", panel=True)
 
         output = (completed.stdout or "") + (completed.stderr or "")
+        if output_has_timeout_marker(output):
+            timeout_error = (
+                "Certipy auth command timed out. Verify VPN/network connectivity to the target and retry."
+            )
+            return PassTheCertificateResult(
+                domain=domain,
+                principal=None,
+                username=None,
+                resolved_domain=None,
+                nt_hash=None,
+                raw_output=output,
+                success=False,
+                error_message=timeout_error,
+            )
 
         # Parse NT hash using the same pattern as the legacy implementation.
         match = re.search(

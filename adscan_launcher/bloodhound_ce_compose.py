@@ -64,6 +64,10 @@ _GENERIC_BIND_TYPE_ERROR_RE = re.compile(
     r"error mounting\s+\"[^\"]+\"\s+to\s+rootfs\s+at\s+\"[^\"]+\".*not a directory",
     re.IGNORECASE | re.DOTALL,
 )
+_PULL_NETWORK_UNREACHABLE_RE = re.compile(
+    r"(registry-1\.docker\.io.*connect:\s*network is unreachable|dial tcp \[[0-9a-f:]+\]:443:\s*connect:\s*network is unreachable)",
+    re.IGNORECASE,
+)
 _GRAPH_DB_HOST_PORT_TOKENS: tuple[str, ...] = (
     "${NEO4J_WEB_PORT:-",
     "${NEO4J_DB_PORT:-",
@@ -80,6 +84,25 @@ _PINNED_BLOODHOUND_CE_SERVICES: dict[str, str] = {
     "app-db": "postgres:16",
     "graph-db": "neo4j:4.4.42",
 }
+
+
+def _emit_compose_pull_failure_network_guidance(*, diagnostic: str) -> None:
+    """Emit targeted guidance for compose pull network connectivity failures."""
+    if not _PULL_NETWORK_UNREACHABLE_RE.search(diagnostic or ""):
+        return
+    print_warning(
+        "Network connectivity to Docker Hub failed while pulling BloodHound CE images."
+    )
+    print_instruction("Verify internet connectivity from the host and retry.")
+    print_instruction(
+        "If your environment has broken IPv6 routing, prefer IPv4 connectivity for Docker pulls."
+    )
+    print_instruction(
+        "Quick checks: getent hosts registry-1.docker.io && ping -4 -c 2 registry-1.docker.io"
+    )
+    print_instruction(
+        "Then retry: adscan install"
+    )
 
 
 def get_bloodhound_compose_project_name() -> str:
@@ -549,6 +572,9 @@ def compose_pull(compose_path: Path, *, stream_output: bool = False) -> bool:
                 print_success("BloodHound CE images pulled successfully.")
                 return True
             print_error("Failed to pull BloodHound CE images.")
+            _emit_compose_pull_failure_network_guidance(
+                diagnostic=f"{stderr}\n{stdout}"
+            )
             if stderr:
                 print_info_debug(f"[bloodhound-ce] pull stderr:\n{stderr}")
             if stdout:
@@ -560,6 +586,9 @@ def compose_pull(compose_path: Path, *, stream_output: bool = False) -> bool:
             print_success("BloodHound CE images pulled successfully.")
             return True
         print_error("Failed to pull BloodHound CE images.")
+        _emit_compose_pull_failure_network_guidance(
+            diagnostic=f"{proc.stderr}\n{proc.stdout}"
+        )
         if proc.stderr:
             print_info_debug(f"[bloodhound-ce] pull stderr:\n{proc.stderr}")
         if proc.stdout:

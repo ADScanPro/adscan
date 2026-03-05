@@ -825,6 +825,20 @@ def _resolve_session_scope() -> str:
     return "launcher"
 
 
+def _should_sanitize_session_recording(
+    command_type: Optional[str], session_scope: Optional[str]
+) -> bool:
+    """Return True only for runtime ``start``/``ci`` session segments.
+
+    Sanitization is intentionally restricted to the container runtime execution
+    where most sensitive target data appears. Launcher/preflight segments and
+    host-maintenance commands should keep full context for diagnostics.
+    """
+    command = str(command_type or "").strip().lower()
+    scope = str(session_scope or "").strip().lower()
+    return command in {"start", "ci"} and scope == "runtime"
+
+
 def _resolve_session_trace_id() -> str | None:
     """Return a sanitized session trace identifier from the environment."""
     raw = str(os.getenv(_SESSION_TRACE_ID_ENV, "")).strip()
@@ -2835,9 +2849,9 @@ def _sanitize_rich_output(content: str) -> str:
 def _maybe_sanitize_rich_output(content: str, *, sanitize: bool) -> str:
     """Prepare Rich export for session storage, optionally applying redaction.
 
-    For non-sensitive commands (e.g. ``install``/``check``), we still normalize the
-    Rich export (strip ANSI/HTML) but avoid redaction to preserve debugging context.
-    In that mode we also strip invisible markers so they don't affect stored text.
+    When sanitization is disabled, we still normalize the Rich export (strip
+    ANSI/HTML) but avoid redaction to preserve debugging context. In that mode we
+    also strip invisible markers so they don't affect stored text.
     """
     if sanitize:
         return _sanitize_rich_output(content)
@@ -4015,12 +4029,16 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
         command_type = None
         if metadata_with_env:
             command_type = metadata_with_env.get("command_type")
-        sanitize_session = command_type not in {"install", "check"}
+        session_scope = metadata_with_env.get("session_scope")
+        sanitize_session = _should_sanitize_session_recording(
+            command_type, session_scope
+        )
         print_info_debug(
             "[DEBUG] capture_session_end metadata summary: "
             f"command_type={metadata_with_env.get('command_type')!r}, "
             f"session_scope={metadata_with_env.get('session_scope')!r}, "
             f"session_trace_id={metadata_with_env.get('session_trace_id')!r}, "
+            f"sanitize_session={sanitize_session!r}, "
             f"workspace_type={metadata_with_env.get('workspace_type')!r}, "
             f"lab_provider={metadata_with_env.get('lab_provider')!r}, "
             f"lab_name={metadata_with_env.get('lab_name')!r}, "

@@ -62,8 +62,10 @@ Examples:
 """
 
 from typing import Optional, List, Dict, Any, Union, Callable
+import ipaddress
 import logging
 import os
+import re
 import sys
 from contextlib import contextmanager
 from rich.console import Console, Group, RenderableType
@@ -570,17 +572,553 @@ def set_output_config(
     )
     if telemetry_console is not None:
         set_telemetry_console(telemetry_console)
+    install_prompt_logging_wrappers()
     update_modes(verbose_mode=verbose, debug_mode=debug, secret_mode=secret_mode)
 
 
-def confirm_ask(prompt: str, default: bool) -> bool:
-    """Ask a yes/no confirmation prompt with a safe fallback."""
+_ORIGINAL_PROMPT_ASK: Optional[Callable[..., Any]] = None
+_ORIGINAL_CONFIRM_ASK: Optional[Callable[..., Any]] = None
+_PROMPT_LOGGING_WRAPPERS_INSTALLED = False
+_PROMPT_AUTO_MODE_ACTIVE = False
+_PROMPT_SHOULD_DISABLE_INTERACTIVE: Callable[[object | None], bool] | None = None
+_PROMPT_INTERRUPT_LOGGER: Callable[[str, str], None] | None = None
+_PROMPT_USE_QUESTIONARY_IN_CONTAINER: Callable[[], bool] | None = None
+
+
+def _default_should_disable_interactive_prompts(shell: object | None = None) -> bool:
+    """Default non-interactive predicate shared by launcher/runtime."""
+    from adscan_core.interaction import is_non_interactive
+
+    return is_non_interactive(shell=shell)
+
+
+def _default_interrupt_logger(kind: str, source: str) -> None:
+    """Default interrupt debug logger routed through centralized debug output."""
+    from adscan_core.interrupts import emit_interrupt_debug
+
+    emit_interrupt_debug(kind=kind, source=source, print_debug=print_info_debug)
+
+
+def _default_use_questionary_in_container() -> bool:
+    """Return True when Questionary container fallback should be used."""
+    return os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1"
+
+
+def configure_prompt_behavior(
+    *,
+    should_disable_interactive_prompts: Callable[[object | None], bool] | None = None,
+    interrupt_logger: Callable[[str, str], None] | None = None,
+    use_questionary_in_container: Callable[[], bool] | None = None,
+) -> None:
+    """Configure centralized prompt behavior hooks.
+
+    Args:
+        should_disable_interactive_prompts: Predicate used to decide whether
+            prompts must auto-resolve defaults (non-interactive runs).
+        interrupt_logger: Callable invoked on EOF/KeyboardInterrupt.
+        use_questionary_in_container: Predicate to enable Questionary fallback
+            for Prompt/Confirm when running in container runtime.
+    """
+    global _PROMPT_SHOULD_DISABLE_INTERACTIVE
+    global _PROMPT_INTERRUPT_LOGGER
+    global _PROMPT_USE_QUESTIONARY_IN_CONTAINER
+
+    _PROMPT_SHOULD_DISABLE_INTERACTIVE = should_disable_interactive_prompts
+    _PROMPT_INTERRUPT_LOGGER = interrupt_logger
+    _PROMPT_USE_QUESTIONARY_IN_CONTAINER = use_questionary_in_container
+
+
+def set_prompt_auto_mode(active: bool) -> None:
+    """Enable/disable centralized prompt auto-mode."""
+    global _PROMPT_AUTO_MODE_ACTIVE
+    _PROMPT_AUTO_MODE_ACTIVE = bool(active)
+
+
+def is_prompt_auto_mode_enabled() -> bool:
+    """Return whether centralized prompt auto-mode is currently active."""
+    return bool(_PROMPT_AUTO_MODE_ACTIVE)
+
+
+def _should_disable_prompt_interaction(shell: object | None = None) -> bool:
+    """Best-effort predicate for non-interactive prompt behavior."""
+    callback = (
+        _PROMPT_SHOULD_DISABLE_INTERACTIVE
+        if _PROMPT_SHOULD_DISABLE_INTERACTIVE is not None
+        else _default_should_disable_interactive_prompts
+    )
     try:
+        return bool(callback(shell))
+    except Exception:
+        return True
+
+
+def _emit_prompt_interrupt_debug(*, kind: str, source: str) -> None:
+    """Emit standardized interrupt debug messages for prompt flows."""
+    callback = (
+        _PROMPT_INTERRUPT_LOGGER
+        if _PROMPT_INTERRUPT_LOGGER is not None
+        else _default_interrupt_logger
+    )
+    try:
+        callback(kind, source)
+    except Exception:
+        return
+
+
+def _should_use_questionary_prompt() -> bool:
+    """Return True when Prompt/Confirm should use Questionary fallback."""
+    callback = (
+        _PROMPT_USE_QUESTIONARY_IN_CONTAINER
+        if _PROMPT_USE_QUESTIONARY_IN_CONTAINER is not None
+        else _default_use_questionary_in_container
+    )
+    try:
+        return bool(callback())
+    except Exception:
+        return False
+
+
+def _classify_prompt_answer(answer_text: str, *, password_mode: bool) -> str:
+    """Best-effort classification for prompt answer sanitization."""
+    if password_mode:
+        return "password"
+
+    cleaned = str(answer_text or "").strip()
+    if not cleaned:
+        return "user"
+
+    try:
+        ipaddress.ip_network(cleaned, strict=False)
+        return "ip"
+    except ValueError:
+        pass
+
+    if cleaned.startswith(("/", "./", "../", "~")) or re.match(
+        r"^[A-Za-z]:\\", cleaned
+    ):
+        return "path"
+    if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", cleaned):
+        return "domain"
+    return "user"
+
+
+def _logged_prompt_ask(*prompt_args: Any, **kwargs: Any) -> str:
+    """Prompt.ask wrapper with centralized telemetry/debug answer logging."""
+    prompt_message = str(prompt_args[0]) if prompt_args else "?"
+    password_mode = bool(kwargs.get("password", False))
+    default_value = kwargs.get("default")
+
+    prompt_tag = "[prompt][password]" if password_mode else "[prompt]"
+    print_telemetry_only(f"{prompt_tag} {prompt_message}")
+    print_info_debug(f"[prompt] Prompt: {prompt_message}")
+
+    if _PROMPT_AUTO_MODE_ACTIVE:
+        fallback = "" if default_value is None else str(default_value)
+        shown = "[hidden]" if password_mode and fallback else fallback
+        print_info(f"{prompt_message} [dim](auto: {shown})[/dim]")
+        answer_type = _classify_prompt_answer(fallback, password_mode=password_mode)
+        marked_answer = mark_sensitive(fallback, answer_type)
+        answer_tag = (
+            "[prompt][password][answer]" if password_mode else "[prompt][answer]"
+        )
+        print_telemetry_only(f"{answer_tag} {prompt_message}: {marked_answer}")
+        print_info_debug(f"[prompt] Answer for '{prompt_message}': {marked_answer}")
+        return fallback
+
+    if _should_disable_prompt_interaction():
+        fallback = "" if default_value is None else str(default_value)
+        answer_type = _classify_prompt_answer(fallback, password_mode=password_mode)
+        marked_answer = mark_sensitive(fallback, answer_type)
+        answer_tag = (
+            "[prompt][password][answer]" if password_mode else "[prompt][answer]"
+        )
+        print_info_debug(
+            f"[prompt] Non-interactive mode; using fallback for '{prompt_message}'."
+        )
+        print_telemetry_only(f"{answer_tag} {prompt_message}: {marked_answer}")
+        return fallback
+
+    answer: Any = None
+    if _should_use_questionary_prompt():
+        try:
+            import questionary  # type: ignore
+        except Exception:
+            questionary = None  # type: ignore[assignment]
+
+        if questionary is not None:
+            default_text = "" if default_value is None else str(default_value)
+            try:
+                if password_mode:
+                    answer = questionary.password(prompt_message, default=default_text).ask()
+                else:
+                    answer = questionary.text(prompt_message, default=default_text).ask()
+            except EOFError:
+                _emit_prompt_interrupt_debug(
+                    kind="eof", source="rich_prompt.ask(container)"
+                )
+                fallback = "" if default_value is None else str(default_value)
+                answer_type = _classify_prompt_answer(
+                    fallback, password_mode=password_mode
+                )
+                marked_answer = mark_sensitive(fallback, answer_type)
+                answer_tag = (
+                    "[prompt][password][answer]"
+                    if password_mode
+                    else "[prompt][answer]"
+                )
+                print_telemetry_only(f"{answer_tag} {prompt_message}: {marked_answer}")
+                return fallback
+            except KeyboardInterrupt:
+                _emit_prompt_interrupt_debug(
+                    kind="keyboard_interrupt", source="rich_prompt.ask(container)"
+                )
+                return ""
+
+    if answer is None:
+        if _ORIGINAL_PROMPT_ASK is not None:
+            answer = _ORIGINAL_PROMPT_ASK(*prompt_args, **kwargs)
+        else:  # pragma: no cover - defensive fallback
+            from rich.prompt import Prompt
+
+            answer = Prompt.ask(*prompt_args, **kwargs)
+
+    answer_text = "" if answer is None else str(answer)
+    answer_type = _classify_prompt_answer(answer_text, password_mode=password_mode)
+    marked_answer = mark_sensitive(answer_text, answer_type)
+    answer_tag = "[prompt][password][answer]" if password_mode else "[prompt][answer]"
+    print_telemetry_only(f"{answer_tag} {prompt_message}: {marked_answer}")
+    print_info_debug(f"[prompt] Answer for '{prompt_message}': {marked_answer}")
+    return answer_text
+
+
+def _logged_confirm_ask(*confirm_args: Any, **kwargs: Any) -> bool:
+    """Confirm.ask wrapper with centralized telemetry/debug answer logging."""
+    prompt_message = str(confirm_args[0]) if confirm_args else "Confirm?"
+    print_telemetry_only(f"[confirm] {prompt_message}")
+    print_info_debug(f"[confirm] Prompt: {prompt_message}")
+
+    if _PROMPT_AUTO_MODE_ACTIVE:
+        auto_response = bool(kwargs.get("default", True))
+        response_text = "Yes" if auto_response else "No"
+        print_info(f"{prompt_message} [dim](auto: {response_text})[/dim]")
+        print_telemetry_only(f"[confirm][answer] {prompt_message}: {response_text}")
+        print_info_debug(f"[confirm] Answer for '{prompt_message}': {response_text}")
+        return auto_response
+
+    if _should_disable_prompt_interaction():
+        resolved = bool(kwargs.get("default", True))
+        answer_text = "Yes" if resolved else "No"
+        print_info_debug(
+            f"[confirm] Non-interactive mode; using fallback for '{prompt_message}': {resolved}"
+        )
+        print_telemetry_only(f"[confirm][answer] {prompt_message}: {answer_text}")
+        return resolved
+
+    if _should_use_questionary_prompt():
+        try:
+            import questionary  # type: ignore
+        except Exception:
+            questionary = None  # type: ignore[assignment]
+        if questionary is not None:
+            default_value = bool(kwargs.get("default", False))
+            try:
+                q_answer = questionary.confirm(
+                    prompt_message,
+                    default=default_value,
+                ).ask()
+                resolved = default_value if q_answer is None else bool(q_answer)
+                answer_text = "Yes" if resolved else "No"
+                print_telemetry_only(
+                    f"[confirm][answer] {prompt_message}: {answer_text}"
+                )
+                print_info_debug(f"[confirm] Answer for '{prompt_message}': {answer_text}")
+                return resolved
+            except EOFError:
+                _emit_prompt_interrupt_debug(
+                    kind="eof", source="rich_confirm.ask(container)"
+                )
+                answer_text = "Yes" if default_value else "No"
+                print_telemetry_only(
+                    f"[confirm][answer] {prompt_message}: {answer_text}"
+                )
+                return default_value
+            except KeyboardInterrupt:
+                _emit_prompt_interrupt_debug(
+                    kind="keyboard_interrupt", source="rich_confirm.ask(container)"
+                )
+                answer_text = "Yes" if default_value else "No"
+                print_telemetry_only(
+                    f"[confirm][answer] {prompt_message}: {answer_text}"
+                )
+                return default_value
+
+    if _ORIGINAL_CONFIRM_ASK is not None:
+        answer = _ORIGINAL_CONFIRM_ASK(*confirm_args, **kwargs)
+    else:  # pragma: no cover - defensive fallback
+        from rich.prompt import Confirm
+
+        answer = Confirm.ask(*confirm_args, **kwargs)
+
+    resolved = bool(answer)
+    answer_text = "Yes" if resolved else "No"
+    print_telemetry_only(f"[confirm][answer] {prompt_message}: {answer_text}")
+    print_info_debug(f"[confirm] Answer for '{prompt_message}': {answer_text}")
+    return resolved
+
+
+def install_prompt_logging_wrappers() -> None:
+    """Install Prompt/Confirm wrappers to centrally log questions and answers."""
+    global _ORIGINAL_PROMPT_ASK, _ORIGINAL_CONFIRM_ASK
+    global _PROMPT_LOGGING_WRAPPERS_INSTALLED
+
+    if _PROMPT_LOGGING_WRAPPERS_INSTALLED:
+        return
+
+    from rich.prompt import Confirm, Prompt
+
+    _ORIGINAL_PROMPT_ASK = Prompt.ask
+    _ORIGINAL_CONFIRM_ASK = Confirm.ask
+    Prompt.ask = _logged_prompt_ask  # type: ignore[assignment]
+    Confirm.ask = _logged_confirm_ask  # type: ignore[assignment]
+    _PROMPT_LOGGING_WRAPPERS_INSTALLED = True
+
+
+def confirm_ask(prompt: str, default: bool) -> bool:
+    """Ask a yes/no confirmation prompt with centralized prompt logging."""
+    try:
+        install_prompt_logging_wrappers()
         from rich.prompt import Confirm
 
         return bool(Confirm.ask(prompt, default=default))
-    except Exception:
+    except Exception as exc:
+        print_info_debug(
+            f"[confirm] Fallback to default for '{prompt}': {default} ({type(exc).__name__})"
+        )
+        answer_text = "Yes" if bool(default) else "No"
+        print_telemetry_only(f"[confirm][answer] {prompt}: {answer_text}")
         return default
+
+
+def prompt_ask(
+    prompt: str,
+    default: str | None = None,
+    *,
+    password: bool = False,
+    **kwargs: Any,
+) -> str:
+    """Ask a text prompt with centralized prompt logging and safe fallback."""
+    try:
+        install_prompt_logging_wrappers()
+        from rich.prompt import Prompt
+
+        answer = Prompt.ask(prompt, default=default, password=password, **kwargs)
+        return "" if answer is None else str(answer)
+    except Exception as exc:
+        fallback = "" if default is None else str(default)
+        print_info_debug(
+            f"[prompt] Fallback to default for '{prompt}': "
+            f"{mark_sensitive(fallback, _classify_prompt_answer(fallback, password_mode=password))} "
+            f"({type(exc).__name__})"
+        )
+        answer_tag = "[prompt][password][answer]" if password else "[prompt][answer]"
+        data_type = _classify_prompt_answer(fallback, password_mode=password)
+        print_telemetry_only(
+            f"{answer_tag} {prompt}: {mark_sensitive(fallback, data_type)}"
+        )
+        return fallback
+
+
+def questionary_select_value(
+    *,
+    title: str,
+    options: list[str],
+) -> str | None:
+    """Render a Questionary single-select prompt and return selected value."""
+    if not options:
+        return None
+    try:
+        import questionary  # type: ignore
+    except Exception:
+        return None
+    try:
+        return questionary.select(
+            title,
+            choices=list(options),
+            style=_questionary_style(questionary),
+        ).ask()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def questionary_checkbox_values(
+    *,
+    title: str,
+    options: list[str],
+    shell: object | None = None,
+) -> list[str] | None:
+    """Render a Questionary checkbox prompt and return selected values."""
+    if not options:
+        return None
+    if _should_disable_prompt_interaction(shell):
+        print_info_debug(f"[questionary] Non-interactive; skipping checkbox prompt: {title}")
+        print_telemetry_only(f"[questionary] Prompt: {title}")
+        return None
+
+    print_info_debug(f"[questionary] Prompt: {title}")
+    print_telemetry_only(f"[questionary] Prompt: {title}")
+    try:
+        selected_values = questionary_checkbox_values_raw(title=title, options=options)
+    except KeyboardInterrupt:
+        _emit_prompt_interrupt_debug(
+            kind="keyboard_interrupt", source="questionary.checkbox"
+        )
+        return None
+    except Exception as exc:
+        print_info_debug(
+            f"[DEBUG] questionary.checkbox failed: {type(exc).__name__}: {exc}"
+        )
+        return None
+    if selected_values is None:
+        return None
+    print_info_debug(f"[questionary] Selected: {selected_values}")
+    print_telemetry_only(
+        f"[questionary][answer] {title}: {mark_sensitive(str(selected_values), 'text')}"
+    )
+    return selected_values
+
+
+def questionary_checkbox_values_raw(
+    *,
+    title: str,
+    options: list[str],
+) -> list[str] | None:
+    """Render Questionary checkbox without extra logging logic."""
+    if not options:
+        return None
+    try:
+        import questionary  # type: ignore
+    except Exception:
+        return None
+    try:
+        selected = questionary.checkbox(
+            title,
+            choices=list(options),
+            style=_questionary_style(questionary),
+        ).ask()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if selected is None:
+        return None
+    return [str(value) for value in selected if str(value).strip()]
+
+
+def _questionary_style(questionary_module: Any) -> Any:
+    """Return shared Questionary style used across prompts."""
+    return questionary_module.Style(
+        [
+            ("qmark", "fg:#00D4FF bold"),
+            ("question", "bold white"),
+            ("answer", "fg:#00D4FF bold"),
+            ("pointer", "fg:#00D4FF bold"),
+            ("highlighted", "fg:#00D4FF bold"),
+            ("selected", "fg:#00D4FF bold"),
+            ("separator", "fg:#00D4FF"),
+            ("instruction", "fg:#cccccc"),
+            ("text", "white"),
+            ("choice", "white"),
+            ("disabled", "fg:#888888 italic"),
+        ]
+    )
+
+
+def questionary_select_index(
+    *,
+    title: str,
+    options: list[str],
+    default_idx: int = 0,
+    shell: object | None = None,
+) -> int | None:
+    """Select option index via Questionary with centralized fallback/logging."""
+    if not options:
+        return None
+
+    resolved_default_idx = default_idx
+    if resolved_default_idx < 0 or resolved_default_idx >= len(options):
+        resolved_default_idx = 0
+
+    if _should_disable_prompt_interaction(shell):
+        print_info_debug(
+            "[questionary] Non-interactive; selecting default "
+            f"idx={resolved_default_idx}: {options[resolved_default_idx]}"
+        )
+        print_telemetry_only(
+            f"[questionary][answer] {title}: "
+            f"{mark_sensitive(str(options[resolved_default_idx]), 'text')}"
+        )
+        return resolved_default_idx
+
+    print_info_debug(f"[questionary] Prompt: {title}")
+    print_telemetry_only(f"[questionary] Prompt: {title}")
+    try:
+        selected_value = questionary_select_value(title=title, options=options)
+    except KeyboardInterrupt:
+        _emit_prompt_interrupt_debug(
+            kind="keyboard_interrupt", source="questionary.select"
+        )
+        return None
+    except Exception as exc:
+        print_info_debug(
+            f"[DEBUG] questionary.select failed: {type(exc).__name__}: {exc}, "
+            "falling back to numeric selection."
+        )
+        return _fallback_numeric_select_index(
+            title=title, options=options, default_idx=resolved_default_idx
+        )
+    if selected_value is None:
+        print_info_debug(f"[questionary] Cancelled: {title}")
+        print_telemetry_only(f"[questionary][answer] {title}: [cancelled]")
+        return None
+
+    print_info_debug(f"[questionary] Selected: {selected_value}")
+    print_telemetry_only(
+        f"[questionary][answer] {title}: {mark_sensitive(str(selected_value), 'text')}"
+    )
+    try:
+        return options.index(selected_value)
+    except ValueError:
+        return None
+
+
+def _fallback_numeric_select_index(
+    *,
+    title: str,
+    options: list[str],
+    default_idx: int,
+) -> int | None:
+    """Fallback select menu using Rich numbered prompt."""
+    if not options:
+        return None
+
+    print_info(f"[bold]{title}[/bold]")
+    for idx, option in enumerate(options, start=1):
+        print_info(f"  {idx}. {option}")
+
+    default_number = (default_idx + 1) if 0 <= default_idx < len(options) else 1
+    try:
+        from rich.prompt import IntPrompt
+
+        choice_num = IntPrompt.ask(
+            "Enter a number (0 to cancel)",
+            default=default_number,
+        )
+    except Exception:
+        return None
+
+    if choice_num == 0:
+        return None
+    if 1 <= choice_num <= len(options):
+        return choice_num - 1
+    return None
 
 
 def print_telemetry_only(message: Any) -> None:
@@ -4754,11 +5292,6 @@ def confirm_operation(
         ...     icon="🔐"
         ... )
     """
-    # Confirm moved to rich.prompt in newer Rich versions.
-    try:
-        from rich.prompt import Confirm
-    except ImportError:  # pragma: no cover - fallback for older Rich versions
-        from rich.confirm import Confirm  # type: ignore[no-redef]
     from rich.panel import Panel
     from rich.text import Text
     from rich.table import Table
@@ -4802,7 +5335,7 @@ def confirm_operation(
 
     # Show confirmation prompt
     try:
-        return Confirm.ask(prompt_text, default=default)
+        return confirm_ask(prompt_text, default=default)
     except KeyboardInterrupt:
         # Handle Ctrl+C gracefully
         console.print("\n[yellow]Operation cancelled[/yellow]")

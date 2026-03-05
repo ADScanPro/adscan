@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import getpass
+import socket
 import re
 import secrets
 import time
@@ -59,6 +60,7 @@ from adscan_launcher.docker_status import (
     is_docker_daemon_running as _is_docker_daemon_running_internal,
 )
 from adscan_launcher.output import (
+    confirm_ask,
     mark_sensitive,
     print_exception,
     print_error,
@@ -96,6 +98,7 @@ _BLOODHOUND_TROUBLESHOOTING_DOCS_URL = (
     "https://www.adscanpro.com/docs/guides/troubleshooting"
 )
 _ALLOW_PODMAN_DOCKER_API_ENV = "ADSCAN_ALLOW_PODMAN_DOCKER_API"
+_ALLOW_LEGACY_IMAGE_FALLBACK_ENV = "ADSCAN_ALLOW_LEGACY_IMAGE_FALLBACK"
 _HOST_HELPER_TROUBLESHOOTING_DOCS_URL = (
     "https://www.adscanpro.com/docs/guides/troubleshooting#host-helper-docker-mode"
 )
@@ -106,13 +109,22 @@ _LOCAL_RESOLVER_LOOPBACK_CANDIDATES = (
     "127.0.0.5",
     "127.0.0.1",
 )
+_DOCKER_SERVICE_UNIT_MISSING_RE = re.compile(
+    r"(unit\s+docker\.service\s+could\s+not\s+be\s+found|could\s+not\s+find\s+the\s+requested\s+service\s+docker)",
+    re.IGNORECASE,
+)
 _MIN_DOCKER_INSTALL_FREE_GB = 10
 _DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3600
+_LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB = 1.0
 _LOW_MEMORY_WARNING_THRESHOLD_GB = 1.5
 _EPHEMERAL_CONTAINER_SHARED_TOKEN: str | None = None
 _LEGACY_IMAGE_WARNING_SHOWN = False
 _DOCKER_RUNTIME_CONTEXT_EMITTED = False
 _DOCKER_HOST_RESOURCES_CONTEXT_EMITTED = False
+_DOCKER_HOST_ENGINE_OVERRIDE_APPLIED = False
+_DOCKER_HOST_ENGINE_OVERRIDE_DECLINED = False
+_DOCKER_PULL_DNS_PREFLIGHT_HOST = "registry-1.docker.io"
+_DOCKER_PULL_NETWORK_PREFLIGHT_TIMEOUT_SECONDS = 2.0
 
 # Keep BloodHound CE config in the effective user's home (sudo-safe), matching
 # the default behavior of bloodhound-cli tooling.
@@ -330,8 +342,39 @@ def _get_free_disk_bytes(path: Path) -> int:
     return int(usage.free)
 
 
+def _parse_memavailable_bytes(meminfo_text: str) -> int | None:
+    """Parse `MemAvailable` from `/proc/meminfo` content.
+
+    Returns bytes when the key is present and valid, otherwise ``None``.
+    """
+    for raw_line in str(meminfo_text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("MemAvailable:"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+        try:
+            # `/proc/meminfo` reports kB.
+            return int(parts[1]) * 1024
+        except ValueError:
+            return None
+    return None
+
+
 def _get_free_memory_bytes() -> int:
     """Return available system memory in bytes (best effort)."""
+    meminfo_path = Path("/proc/meminfo")
+    try:
+        if meminfo_path.is_file():
+            parsed = _parse_memavailable_bytes(
+                meminfo_path.read_text(encoding="utf-8", errors="ignore")
+            )
+            if parsed is not None:
+                return parsed
+    except OSError:
+        pass
+
     try:
         page_size = os.sysconf("SC_PAGE_SIZE")
         avail_pages = os.sysconf("SC_AVPHYS_PAGES")
@@ -369,6 +412,105 @@ def _maybe_warn_low_memory_for_bloodhound(*, free_mem_gb: float) -> None:
     )
 
 
+def _enforce_bloodhound_memory_preflight(
+    *,
+    free_mem_gb: float,
+    command_name: str,
+    allow_low_memory: bool = False,
+) -> bool:
+    """Validate host RAM headroom before starting BloodHound CE bootstrap.
+
+    Policy:
+    - >= warning threshold: continue silently
+    - hard-block <= RAM < warning threshold: soft warning, continue
+    - RAM < hard-block threshold:
+      - continue only when ``allow_low_memory`` is True
+      - in non-interactive sessions, fail fast
+      - in interactive sessions, require explicit confirmation
+    """
+    if free_mem_gb >= _LOW_MEMORY_WARNING_THRESHOLD_GB:
+        return True
+
+    if free_mem_gb >= _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB:
+        _maybe_warn_low_memory_for_bloodhound(free_mem_gb=free_mem_gb)
+        return True
+
+    if allow_low_memory:
+        print_warning(
+            "Very low available RAM detected. Continuing because --allow-low-memory was provided "
+            f"(available: {free_mem_gb:.2f} GB)."
+        )
+        print_instruction(
+            "BloodHound CE may still crash (OOM). Free RAM or add swap if startup fails."
+        )
+        telemetry.capture(
+            "docker_install_low_memory_override",
+            {
+                "command_name": command_name,
+                "free_memory_gb": round(float(free_mem_gb), 2),
+                "hard_threshold_gb": _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB,
+                "warning_threshold_gb": _LOW_MEMORY_WARNING_THRESHOLD_GB,
+            },
+        )
+        return True
+
+    if not _is_interactive_launcher_session():
+        print_error(
+            "Available RAM is critically low for BloodHound CE startup "
+            f"(available: {free_mem_gb:.2f} GB)."
+        )
+        print_instruction(
+            "Free RAM or add swap and retry. To continue intentionally, rerun with "
+            "`adscan install --allow-low-memory`."
+        )
+        telemetry.capture(
+            "docker_install_low_memory_blocked",
+            {
+                "command_name": command_name,
+                "reason": "noninteractive_critical_low_memory",
+                "free_memory_gb": round(float(free_mem_gb), 2),
+                "hard_threshold_gb": _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB,
+            },
+        )
+        return False
+
+    panel_lines = [
+        "Available RAM is critically low for BloodHound CE startup.",
+        f"Available: {free_mem_gb:.2f} GB",
+        f"Recommended minimum: {_LOW_MEMORY_WARNING_THRESHOLD_GB:.2f} GB",
+        "At this level, BloodHound CE can crash with OOM (exit 137) during initialization.",
+    ]
+    print_panel(
+        "\n".join(panel_lines),
+        title="Critical Low Memory",
+        border_style="yellow",
+    )
+    should_continue = confirm_ask(
+        "Continue installation anyway with high OOM risk?",
+        default=False,
+    )
+    telemetry.capture(
+        "docker_install_low_memory_confirmation",
+        {
+            "command_name": command_name,
+            "accepted": bool(should_continue),
+            "free_memory_gb": round(float(free_mem_gb), 2),
+            "hard_threshold_gb": _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB,
+        },
+    )
+    if not should_continue:
+        print_warning("Installation cancelled due to critical low memory.")
+        return False
+
+    print_warning(
+        "Proceeding with critical low memory. BloodHound CE startup may fail with OOM."
+    )
+    print_instruction(
+        "If startup fails, free RAM or add swap and retry `adscan install`."
+    )
+    return True
+
+
 def _get_docker_storage_path() -> Path:
     """Return best-effort path for Docker storage."""
     docker_path = Path("/var/lib/docker")
@@ -383,17 +525,26 @@ def _get_docker_image_candidates() -> list[str]:
     Order:
     1. Explicit `ADSCAN_DOCKER_IMAGE` (single candidate, no fallback)
     2. New default naming by channel (`*-lite` / `*-lite-dev`)
-    3. Legacy naming fallback (`adscan/adscan*`) for backward compatibility
+    3. Legacy naming fallback (`adscan/adscan*`) only when explicitly enabled
+       via `ADSCAN_ALLOW_LEGACY_IMAGE_FALLBACK=1`.
     """
     explicit = os.getenv("ADSCAN_DOCKER_IMAGE", "").strip()
     if explicit:
         return [explicit]
 
+    allow_legacy_fallback = (
+        str(os.getenv(_ALLOW_LEGACY_IMAGE_FALLBACK_ENV, "")).strip().lower()
+        in ("1", "true", "yes", "on")
+    )
     channel = os.getenv("ADSCAN_DOCKER_CHANNEL", "").strip().lower()
     if channel == "dev":
-        return [DEFAULT_DEV_DOCKER_IMAGE, LEGACY_DEFAULT_DEV_DOCKER_IMAGE]
+        if allow_legacy_fallback:
+            return [DEFAULT_DEV_DOCKER_IMAGE, LEGACY_DEFAULT_DEV_DOCKER_IMAGE]
+        return [DEFAULT_DEV_DOCKER_IMAGE]
 
-    return [DEFAULT_DOCKER_IMAGE, LEGACY_DEFAULT_DOCKER_IMAGE]
+    if allow_legacy_fallback:
+        return [DEFAULT_DOCKER_IMAGE, LEGACY_DEFAULT_DOCKER_IMAGE]
+    return [DEFAULT_DOCKER_IMAGE]
 
 
 def _get_docker_image() -> str:
@@ -411,6 +562,10 @@ def _warn_using_legacy_image(*, selected_image: str, preferred_image: str) -> No
     print_warning(
         "Using legacy Docker image naming for compatibility: "
         f"{selected_image} (preferred: {preferred_image})."
+    )
+    print_instruction(
+        "Legacy fallback may be outdated. Remove "
+        f"{_ALLOW_LEGACY_IMAGE_FALLBACK_ENV} when stable tags recover."
     )
     _LEGACY_IMAGE_WARNING_SHOWN = True
 
@@ -714,6 +869,160 @@ def _select_existing_or_preferred_image() -> str:
     return preferred
 
 
+def _run_docker_pull_dns_preflight(*, host: str = _DOCKER_PULL_DNS_PREFLIGHT_HOST) -> bool:
+    """Best-effort DNS preflight for Docker Hub pulls.
+
+    This check is intentionally non-blocking: it emits early diagnostics when
+    DNS resolution appears broken, but the pull still proceeds in case of
+    transient resolver issues.
+    """
+    try:
+        addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        resolved_hosts = sorted({entry[4][0] for entry in addresses if entry[4]})
+        print_info_debug(
+            "[docker] pull DNS preflight passed: "
+            f"host={mark_sensitive(host, 'detail')} "
+            f"resolved={mark_sensitive(','.join(resolved_hosts[:3]) or 'yes', 'detail')}"
+        )
+        telemetry.capture(
+            "docker_pull_dns_preflight",
+            {
+                "host": host,
+                "resolved": True,
+                "resolved_count": len(resolved_hosts),
+            },
+        )
+        return True
+    except socket.gaierror as exc:
+        print_warning(
+            "DNS preflight could not resolve Docker Hub. Image pull may fail."
+        )
+        print_instruction(
+            "Check resolver health: getent hosts registry-1.docker.io"
+        )
+        print_instruction(
+            "If DNS is unstable, switch to a reliable resolver and retry."
+        )
+        print_info_debug(
+            "[docker] pull DNS preflight failed: "
+            f"host={mark_sensitive(host, 'detail')} "
+            f"error={mark_sensitive(str(exc), 'detail')}"
+        )
+        telemetry.capture(
+            "docker_pull_dns_preflight",
+            {
+                "host": host,
+                "resolved": False,
+                "error_kind": "gaierror",
+                "error": str(exc),
+            },
+        )
+        return False
+    except Exception as exc:  # pragma: no cover - best effort only
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[docker] pull DNS preflight skipped after unexpected error: "
+            f"{mark_sensitive(str(exc), 'detail')}"
+        )
+        return True
+
+
+def _run_docker_pull_network_preflight(
+    *,
+    host: str = _DOCKER_PULL_DNS_PREFLIGHT_HOST,
+    port: int = 443,
+    timeout_seconds: float = _DOCKER_PULL_NETWORK_PREFLIGHT_TIMEOUT_SECONDS,
+) -> bool:
+    """Best-effort network preflight for Docker Hub HTTPS connectivity.
+
+    This check is non-blocking: failures emit guidance and telemetry but do not
+    abort pull attempts because transient routing conditions can recover.
+    """
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        print_info_debug(
+            "[docker] pull network preflight skipped because DNS resolution failed: "
+            f"host={mark_sensitive(host, 'detail')} "
+            f"error={mark_sensitive(str(exc), 'detail')}"
+        )
+        telemetry.capture(
+            "docker_pull_network_preflight",
+            {
+                "host": host,
+                "port": int(port),
+                "reachable": False,
+                "skipped_reason": "dns_resolution_failed",
+                "error": str(exc),
+            },
+        )
+        return False
+
+    attempted = 0
+    failures: list[tuple[str, str]] = []
+    max_attempts = min(len(addresses), 6)
+    for entry in addresses[:max_attempts]:
+        sockaddr = entry[4]
+        if not sockaddr:
+            continue
+        ip = str(sockaddr[0])
+        attempted += 1
+        try:
+            with socket.create_connection((ip, port), timeout=timeout_seconds):
+                print_info_debug(
+                    "[docker] pull network preflight passed: "
+                    f"host={mark_sensitive(host, 'detail')} "
+                    f"ip={mark_sensitive(ip, 'detail')} "
+                    f"port={mark_sensitive(str(port), 'detail')}"
+                )
+                telemetry.capture(
+                    "docker_pull_network_preflight",
+                    {
+                        "host": host,
+                        "port": int(port),
+                        "reachable": True,
+                        "attempted": attempted,
+                        "successful_ip": ip,
+                    },
+                )
+                return True
+        except OSError as exc:
+            failures.append((ip, str(exc)))
+
+    ipv6_unreachable = any(
+        ":" in ip and "network is unreachable" in err.lower() for ip, err in failures
+    )
+    print_warning(
+        "Network preflight could not reach Docker Hub over HTTPS. Image pull may fail."
+    )
+    print_instruction("Verify host internet connectivity, VPN/proxy, and firewall policy.")
+    if ipv6_unreachable:
+        print_instruction(
+            "IPv6 route appears unreachable. Prefer IPv4 connectivity if IPv6 is unstable."
+        )
+    print_info_debug(
+        "[docker] pull network preflight failed: "
+        f"host={mark_sensitive(host, 'detail')} "
+        f"attempted={mark_sensitive(str(attempted), 'detail')} "
+        f"ipv6_unreachable={mark_sensitive(str(ipv6_unreachable).lower(), 'status')} "
+        f"failure_sample={mark_sensitive(str(failures[:2]), 'detail')}"
+    )
+    telemetry.capture(
+        "docker_pull_network_preflight",
+        {
+            "host": host,
+            "port": int(port),
+            "reachable": False,
+            "attempted": attempted,
+            "ipv6_unreachable": ipv6_unreachable,
+            "failure_sample": [
+                {"ip": ip, "error": err} for ip, err in failures[:3]
+            ],
+        },
+    )
+    return False
+
+
 def _ensure_image_pulled_with_legacy_fallback(
     *,
     pull_timeout: int | None,
@@ -722,6 +1031,8 @@ def _ensure_image_pulled_with_legacy_fallback(
     """Pull preferred image, then fallback to legacy naming if needed."""
     if not _ensure_docker_daemon_available_for_pull(stage="pre_pull"):
         return None
+    _run_docker_pull_dns_preflight()
+    _run_docker_pull_network_preflight()
 
     candidates = _get_docker_image_candidates()
     preferred = candidates[0]
@@ -798,14 +1109,14 @@ def _emit_docker_daemon_troubleshooting_snapshot(*, stage: str) -> None:
         )
         return
 
-    def _run_systemctl_capture(args: list[str]) -> None:
+    def _run_systemctl_capture(args: list[str]) -> tuple[str, str]:
         cmd: list[str] = ["systemctl"] + args
         if os.geteuid() != 0:
             if not _ensure_sudo_ticket_if_needed():
                 print_info_debug(
                     "[docker] systemctl diagnostics skipped: sudo validation failed."
                 )
-                return
+                return "", ""
             cmd = [
                 "sudo",
                 "--preserve-env=HOME,XDG_CONFIG_HOME,ADSCAN_HOME,ADSCAN_SESSION_ENV,CI,GITHUB_ACTIONS",
@@ -826,7 +1137,7 @@ def _emit_docker_daemon_troubleshooting_snapshot(*, stage: str) -> None:
                 f"stage={stage} cmd={shell_quote_cmd(cmd)} "
                 f"error={mark_sensitive(str(exc), 'error')}"
             )
-            return
+            return "", ""
 
         stdout = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
@@ -842,9 +1153,17 @@ def _emit_docker_daemon_troubleshooting_snapshot(*, stage: str) -> None:
                 f"stage={stage} cmd={shell_quote_cmd(cmd)}\n"
                 f"{mark_sensitive(stderr, 'detail')}"
             )
+        return stdout, stderr
 
     _run_systemctl_capture(["is-active", "docker"])
-    _run_systemctl_capture(["status", "docker", "--no-pager", "--full"])
+    status_stdout, status_stderr = _run_systemctl_capture(
+        ["status", "docker", "--no-pager", "--full"]
+    )
+    status_text = f"{status_stdout}\n{status_stderr}".strip()
+    if _DOCKER_SERVICE_UNIT_MISSING_RE.search(status_text):
+        print_error("Docker service unit (`docker.service`) was not found on this host.")
+        print_instruction("Install Docker Engine + Docker Compose plugin, then retry.")
+        print_instruction(f"Installation guide: {_DOCKER_INSTALL_DOCS_URL}")
 
 
 def _print_docker_image_pull_failure_guidance(
@@ -894,6 +1213,14 @@ def _print_docker_image_pull_failure_guidance(
     print_instruction(f"  adscan {command_name} --pull-timeout {suggested_timeout}")
     print_instruction("To disable the pull timeout entirely:")
     print_instruction(f"  adscan {command_name} --pull-timeout 0")
+    print_instruction(
+        "If the error mentions 'content descriptor ... not found', this is usually a "
+        "registry/tag consistency issue. Retry shortly."
+    )
+    print_instruction(
+        "Emergency compatibility fallback (may use older image naming): "
+        f"{_ALLOW_LEGACY_IMAGE_FALLBACK_ENV}=1 adscan {command_name}"
+    )
 
 
 def _run_bloodhound_compose_pull_with_daemon_recovery(
@@ -910,6 +1237,8 @@ def _run_bloodhound_compose_pull_with_daemon_recovery(
         stage="pre_bloodhound_compose_pull"
     ):
         return False
+    _run_docker_pull_dns_preflight()
+    _run_docker_pull_network_preflight()
 
     if compose_pull(compose_path, stream_output=stream_output):
         return True
@@ -1383,6 +1712,8 @@ def _ensure_bloodhound_ce_auth_for_docker(
     base_url_override: str | None = None,
     username_override: str | None = None,
     allow_managed_password_bootstrap: bool = False,
+    allow_destructive_reset: bool = False,
+    recovery_compose_path: Path | None = None,
 ) -> bool:
     """Ensure we can authenticate to BloodHound CE before starting Docker mode.
 
@@ -1440,6 +1771,54 @@ def _ensure_bloodhound_ce_auth_for_docker(
                 "[bloodhound-ce] desired-password bootstrap auth failed while "
                 "config file was missing."
             )
+            if allow_managed_password_bootstrap:
+                print_info_debug(
+                    "[bloodhound-ce] missing host config and default bootstrap failed; "
+                    "attempting managed password recovery before prompting."
+                )
+                recovered = ensure_bloodhound_admin_password(
+                    desired_password=resolved_desired_password,
+                    suppress_browser=True,
+                    base_url=resolved_base_url,
+                )
+                if recovered and _wait_for_bloodhound_ce_api_ready(
+                    base_url=resolved_base_url,
+                    timeout_seconds=60,
+                    interval_seconds=2,
+                    required_consecutive_successes=2,
+                    require_managed_container_health=True,
+                ):
+                    if _persist_bloodhound_ce_config(
+                        username=resolved_username,
+                        password=resolved_desired_password,
+                        base_url=resolved_base_url,
+                    ):
+                        print_success(
+                            "BloodHound CE authentication verified via managed password recovery."
+                        )
+                        return True
+
+                # Even when recovery from logs fails, retry desired-password auth once
+                # after a short readiness window to absorb transient API/network flaps.
+                print_info_debug(
+                    "[bloodhound-ce] retrying desired-password bootstrap after managed "
+                    "runtime stabilization window."
+                )
+                if _wait_for_bloodhound_ce_api_ready(
+                    base_url=resolved_base_url,
+                    timeout_seconds=60,
+                    interval_seconds=2,
+                    required_consecutive_successes=2,
+                    require_managed_container_health=True,
+                ) and _persist_bloodhound_ce_config(
+                    username=resolved_username,
+                    password=resolved_desired_password,
+                    base_url=resolved_base_url,
+                ):
+                    print_success(
+                        "BloodHound CE authentication verified after runtime stabilization retry."
+                    )
+                    return True
             if not sys.stdin.isatty():
                 print_warning(
                     "Default BloodHound CE password failed and no TTY available for prompt."
@@ -1625,6 +2004,75 @@ def _ensure_bloodhound_ce_auth_for_docker(
         password=new_password,
         base_url=base_url,
     ):
+        if (
+            allow_destructive_reset
+            and recovery_compose_path is not None
+            and sys.stdin.isatty()
+        ):
+            print_warning(
+                "Could not authenticate with the provided password. A full managed "
+                "BloodHound CE reset can regenerate first-run credentials."
+            )
+            should_reset = Confirm.ask(
+                "Reset managed BloodHound CE data and regenerate initial password?",
+                default=False,
+            )
+            if should_reset:
+                try:
+                    reset_confirmation = Prompt.ask(
+                        "Type RESET to confirm destructive BloodHound CE data reset",
+                        default="",
+                    )
+                except (EOFError, KeyboardInterrupt) as exc:
+                    interrupt_kind = (
+                        "keyboard_interrupt"
+                        if isinstance(exc, KeyboardInterrupt)
+                        else "eof"
+                    )
+                    emit_interrupt_debug(
+                        kind=interrupt_kind,
+                        source="launcher.bloodhound_ce_destructive_reset_confirmation_auth",
+                        print_debug=print_info_debug,
+                    )
+                    return False
+                if str(reset_confirmation or "").strip().upper() != "RESET":
+                    print_warning(
+                        "BloodHound CE reset cancelled. Destructive reset was not confirmed."
+                    )
+                    return False
+
+                if not _reset_bloodhound_ce_stack_for_password_recovery(
+                    recovery_compose_path
+                ):
+                    return False
+
+                if not _wait_for_bloodhound_ce_api_ready(
+                    base_url=base_url,
+                    timeout_seconds=120,
+                    interval_seconds=2,
+                    required_consecutive_successes=3,
+                    require_managed_container_health=True,
+                ):
+                    print_warning(
+                        "BloodHound CE runtime is not stable after reset; automatic recovery skipped."
+                    )
+                    return False
+
+                recovered = ensure_bloodhound_admin_password(
+                    desired_password=resolved_desired_password,
+                    suppress_browser=True,
+                    base_url=base_url,
+                )
+                if recovered and _persist_bloodhound_ce_config(
+                    username=resolved_username,
+                    password=resolved_desired_password,
+                    base_url=base_url,
+                ):
+                    print_success(
+                        "BloodHound CE authentication verified after destructive managed reset."
+                    )
+                    return True
+
         print_error(
             "Unable to authenticate to BloodHound CE with the provided password."
         )
@@ -2102,7 +2550,7 @@ def _run_systemctl_command_for_docker_service(
     return subprocess.run(  # noqa: S603
         cmd,
         check=check,
-        capture_output=False,
+        capture_output=True,
         text=True,
         timeout=timeout,
     )
@@ -2142,6 +2590,130 @@ def _allow_podman_docker_api_mode() -> bool:
     """Return True when explicit Podman Docker API mode is enabled."""
     raw = str(os.getenv(_ALLOW_PODMAN_DOCKER_API_ENV, "")).strip().lower()
     return raw in ("1", "true", "yes", "on")
+
+
+def _probe_docker_engine_without_docker_host() -> tuple[bool, str]:
+    """Check whether Docker Engine is reachable when DOCKER_HOST is ignored."""
+    env = os.environ.copy()
+    env.pop("DOCKER_HOST", None)
+    env.pop("DOCKER_CONTEXT", None)
+    cmd = ["docker", "info", "--format", "{{.ServerVersion}}"]
+
+    try:
+        proc = subprocess.run(  # noqa: S603
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        telemetry.capture_exception(exc)
+        return False, f"probe_exception={exc}"
+
+    if proc.returncode == 0:
+        version = _extract_first_nonempty_line(proc.stdout or "") or "unknown"
+        return True, version
+
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    diagnostic = stderr or stdout or "docker info failed"
+    return False, diagnostic
+
+
+def _attempt_docker_host_engine_autoremediation(
+    *,
+    stage: str,
+    diagnostic: str,
+) -> bool:
+    """Offer session-scoped DOCKER_HOST fix when Podman socket is misconfigured."""
+    del diagnostic
+    global _DOCKER_HOST_ENGINE_OVERRIDE_APPLIED  # pylint: disable=global-statement
+    global _DOCKER_HOST_ENGINE_OVERRIDE_DECLINED  # pylint: disable=global-statement
+
+    if _DOCKER_HOST_ENGINE_OVERRIDE_APPLIED:
+        running, _diag = _is_docker_daemon_running_internal(
+            run_docker_command_func=_run_docker_status_command
+        )
+        return bool(running)
+
+    if _DOCKER_HOST_ENGINE_OVERRIDE_DECLINED:
+        return False
+
+    current_docker_host = str(os.getenv("DOCKER_HOST", "")).strip()
+    if not current_docker_host:
+        return False
+
+    engine_reachable, probe_detail = _probe_docker_engine_without_docker_host()
+    if not engine_reachable:
+        print_info_debug(
+            "[docker] DOCKER_HOST auto-remediation skipped: Docker Engine probe "
+            "without DOCKER_HOST failed. "
+            f"stage={stage} detail={mark_sensitive(probe_detail, 'detail')}"
+        )
+        return False
+
+    if not _is_interactive_launcher_session():
+        print_info_debug(
+            "[docker] DOCKER_HOST auto-remediation available but skipped "
+            f"(non-interactive). stage={stage}"
+        )
+        return False
+
+    details = [
+        "Detected a Podman Docker API endpoint in DOCKER_HOST, but Docker Engine appears available.",
+        f"Current DOCKER_HOST: {mark_sensitive(current_docker_host, 'detail')}",
+        f"Docker Engine version (default socket): {mark_sensitive(probe_detail, 'status')}",
+        "",
+        "ADscan can auto-fix this for the current launcher session by unsetting DOCKER_HOST.",
+        "This does not modify your shell profile files.",
+    ]
+    print_panel(
+        "\n".join(details),
+        title="Docker Endpoint Auto-Remediation",
+        border_style="yellow",
+    )
+    proceed = confirm_ask(
+        "Apply session-only DOCKER_HOST fix now and continue?",
+        default=True,
+    )
+    if not proceed:
+        _DOCKER_HOST_ENGINE_OVERRIDE_DECLINED = True
+        telemetry.capture(
+            "docker_host_autoremediation_declined",
+            {
+                "stage": stage,
+                "docker_host": current_docker_host,
+            },
+        )
+        return False
+
+    os.environ.pop("DOCKER_HOST", None)
+    _DOCKER_HOST_ENGINE_OVERRIDE_APPLIED = True
+    print_success(
+        "Applied session-only Docker endpoint fix (DOCKER_HOST unset). Continuing."
+    )
+    telemetry.capture(
+        "docker_host_autoremediation_applied",
+        {
+            "stage": stage,
+            "docker_host_was": current_docker_host,
+            "engine_version": probe_detail,
+        },
+    )
+
+    running, post_diag = _is_docker_daemon_running_internal(
+        run_docker_command_func=_run_docker_status_command
+    )
+    if running:
+        return True
+
+    print_info_debug(
+        "[docker] DOCKER_HOST auto-remediation applied but daemon check still failed: "
+        f"{mark_sensitive(post_diag, 'detail')}"
+    )
+    return False
 
 
 def _attempt_start_user_podman_socket() -> bool:
@@ -2219,6 +2791,11 @@ def _ensure_docker_daemon_available_for_pull(*, stage: str) -> bool:
 
     if _diagnostic_points_to_podman_socket(diagnostic):
         if not _allow_podman_docker_api_mode():
+            if _attempt_docker_host_engine_autoremediation(
+                stage=stage,
+                diagnostic=diagnostic,
+            ):
+                return True
             print_error(
                 "Detected Docker CLI endpoint configured for Podman socket. "
                 "ADscan requires Docker Engine by default."
@@ -3250,6 +3827,7 @@ def _ensure_managed_bloodhound_runtime_ready(
     start_stack: bool,
     verify_auth: bool,
     allow_auth_bootstrap: bool,
+    allow_low_memory: bool = False,
 ) -> tuple[bool, Path | None]:
     """Ensure the managed BloodHound CE compose stack is usable for Docker mode."""
     compose_path = ensure_bloodhound_compose_file(version=BLOODHOUND_CE_VERSION)
@@ -3260,6 +3838,15 @@ def _ensure_managed_bloodhound_runtime_ready(
             failure_reason="Managed BloodHound CE compose file is unavailable.",
         )
         return False, None
+
+    if start_stack:
+        free_mem_gb = _get_free_memory_bytes() / (1024**3)
+        if not _enforce_bloodhound_memory_preflight(
+            free_mem_gb=free_mem_gb,
+            command_name=command_name,
+            allow_low_memory=allow_low_memory,
+        ):
+            return False, compose_path
 
     images = compose_list_images(compose_path)
     if images is None:
@@ -3307,6 +3894,8 @@ def _ensure_managed_bloodhound_runtime_ready(
     if verify_auth and not _ensure_bloodhound_ce_auth_for_docker(
         desired_password=desired_password or _get_bloodhound_admin_password(),
         allow_managed_password_bootstrap=allow_auth_bootstrap,
+        allow_destructive_reset=allow_auth_bootstrap,
+        recovery_compose_path=compose_path,
     ):
         _print_managed_bloodhound_runtime_troubleshooting(
             command_name=command_name,
@@ -3325,6 +3914,7 @@ def handle_install_docker(
     suppress_bloodhound_browser: bool,
     pull_timeout_seconds: int | None = None,
     bloodhound_stack_mode: str | None = None,
+    allow_low_memory: bool = False,
 ) -> bool:
     """Install ADscan via Docker (pull image + bootstrap BloodHound CE)."""
     _emit_docker_runtime_context(command_name="install")
@@ -3446,7 +4036,32 @@ def handle_install_docker(
         )
         print_info_debug(f"[install] Free RAM at install: {free_mem_gb:.2f} GB")
         return False
-    _maybe_warn_low_memory_for_bloodhound(free_mem_gb=free_mem_gb)
+    if not _enforce_bloodhound_memory_preflight(
+        free_mem_gb=free_mem_gb,
+        command_name="install",
+        allow_low_memory=allow_low_memory,
+    ):
+        telemetry.capture(
+            "docker_failure_constraint",
+            {
+                "constraint_type": "low_memory",
+                "failure_stage": "resource_preflight",
+                "user_guided_to_docs": True,
+            },
+        )
+        telemetry.capture(
+            "docker_install_failed",
+            {
+                "success": False,
+                "total_duration_seconds": time.monotonic() - start_time,
+                "failure_stage": "resource_preflight",
+                "failure_reason": "low_memory",
+                "free_memory_gb": round(float(free_mem_gb), 2),
+                "hard_threshold_gb": _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB,
+                "warning_threshold_gb": _LOW_MEMORY_WARNING_THRESHOLD_GB,
+            },
+        )
+        return False
 
     # Pull ADscan image
     print_info(f"Pulling image: {image}")
@@ -3688,6 +4303,7 @@ def handle_install_docker(
 def handle_check_docker(
     *,
     bloodhound_stack_mode: str | None = None,
+    allow_low_memory: bool = False,
 ) -> bool:
     """Check ADscan Docker-mode prerequisites."""
     _emit_docker_runtime_context(command_name="check")
@@ -3717,6 +4333,7 @@ def handle_check_docker(
         start_stack=True,
         verify_auth=True,
         allow_auth_bootstrap=False,
+        allow_low_memory=allow_low_memory,
     )
     if not managed_ready:
         all_ok = False
@@ -3787,6 +4404,7 @@ def handle_start_docker(
     debug: bool,
     pull_timeout_seconds: int | None = None,
     bloodhound_stack_mode: str | None = None,
+    allow_low_memory: bool = False,
 ) -> int:
     """Start ADscan inside Docker and return the docker exit code."""
     _emit_docker_runtime_context(command_name="start")
@@ -3808,6 +4426,7 @@ def handle_start_docker(
         start_stack=True,
         verify_auth=True,
         allow_auth_bootstrap=True,
+        allow_low_memory=allow_low_memory,
     )
     if not managed_ready or compose_path is None:
         return 1
@@ -3958,6 +4577,7 @@ def handle_ci_docker(
     report_format: str,
     pull_timeout_seconds: int | None = None,
     bloodhound_stack_mode: str | None = None,
+    allow_low_memory: bool = False,
 ) -> int:
     """Run `adscan ci` inside Docker and return the docker exit code."""
     _emit_docker_runtime_context(command_name="ci")
@@ -3979,6 +4599,7 @@ def handle_ci_docker(
         start_stack=True,
         verify_auth=True,
         allow_auth_bootstrap=True,
+        allow_low_memory=allow_low_memory,
     )
     if not managed_ready or compose_path is None:
         return 1
@@ -4153,6 +4774,7 @@ def run_adscan_passthrough_docker(
     debug: bool,
     pull_timeout_seconds: int | None = None,
     bloodhound_stack_mode: str | None = None,
+    allow_low_memory: bool = False,
 ) -> int:
     """Run an arbitrary `adscan ...` command inside the container (host-side).
 
@@ -4178,6 +4800,7 @@ def run_adscan_passthrough_docker(
         start_stack=True,
         verify_auth=True,
         allow_auth_bootstrap=True,
+        allow_low_memory=allow_low_memory,
     )
     if not managed_ready or compose_path is None:
         return 1

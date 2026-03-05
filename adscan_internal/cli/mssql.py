@@ -22,6 +22,10 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.integrations.mssql import MSSQLContext
+from adscan_internal.execution_outcomes import (
+    build_no_result_completed_process,
+    build_timeout_completed_process,
+)
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import mark_sensitive
@@ -70,9 +74,12 @@ def _build_mssql_context(shell: MssqlShell) -> MSSQLContext:
 
     def _runner(command: str, timeout: int):
         result = shell.run_command(command, timeout=timeout)
-        if result is None:
-            raise RuntimeError("Command runner returned no result")
-        return result
+        if result is not None:
+            return result
+        last_error = getattr(shell, "_last_run_command_error", None)
+        if isinstance(last_error, tuple) and last_error and last_error[0] == "timeout":
+            return build_timeout_completed_process(command, tool_name="netexec_mssql")
+        return build_no_result_completed_process(command, tool_name="netexec_mssql")
 
     return MSSQLContext(netexec_path=shell.netexec_path, command_runner=_runner)
 

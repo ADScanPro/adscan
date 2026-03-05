@@ -29,6 +29,7 @@ from adscan_launcher.output import (
     print_warning,
     print_warning_verbose,
     print_error,
+    print_instruction,
 )
 from adscan_launcher.paths import get_state_dir
 
@@ -36,7 +37,32 @@ from adscan_launcher.paths import get_state_dir
 _DOCKER_PERMISSION_DENIED_RE = re.compile(
     r"permission denied.*docker\.sock|got permission denied", re.IGNORECASE
 )
+_DOCKER_PULL_DNS_FAILURE_RE = re.compile(
+    r"(lookup\s+registry-1\.docker\.io.*no such host|temporary failure in name resolution|server misbehaving)",
+    re.IGNORECASE,
+)
 _DOCKER_PERMISSION_WARNING_SHOWN = False
+
+
+def _emit_pull_failure_dns_guidance(*, diagnostic: str) -> None:
+    """Emit targeted guidance when docker pull fails due to DNS resolution."""
+    if not _DOCKER_PULL_DNS_FAILURE_RE.search(diagnostic or ""):
+        return
+    print_warning(
+        "Docker registry DNS resolution failed while pulling images."
+    )
+    print_instruction(
+        "Verify host DNS settings and internet connectivity, then retry."
+    )
+    print_instruction(
+        "If needed, test resolver health with: getent hosts registry-1.docker.io"
+    )
+    print_instruction(
+        "If DNS is unstable, switch to a reliable resolver (for example 1.1.1.1 / 8.8.8.8)."
+    )
+    print_warning_verbose(
+        "Pull failure diagnostic indicates name-resolution issues for Docker Hub."
+    )
 
 
 def docker_access_denied(diagnostic: str) -> bool:
@@ -507,6 +533,7 @@ def ensure_image_pulled(
             f"docker pull failed: image={image!r}, rc={rc}, "
             f"stderr_tail={stderr!r}, stdout_tail={stdout!r}, timeout={timeout!r}"
         )
+        _emit_pull_failure_dns_guidance(diagnostic=f"{stderr}\n{stdout}")
         return False
 
     proc = run_docker(
@@ -524,6 +551,7 @@ def ensure_image_pulled(
         f"docker pull failed: image={image!r}, rc={proc.returncode}, "
         f"stderr_tail={proc.stderr!r}, stdout_tail={proc.stdout!r}, timeout={timeout!r}"
     )
+    _emit_pull_failure_dns_guidance(diagnostic=f"{proc.stderr}\n{proc.stdout}")
     return False
 
 
