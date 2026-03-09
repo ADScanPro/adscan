@@ -554,6 +554,98 @@ def parse_netexec_samaccountnames(output: str) -> list[str]:
     return results
 
 
+def parse_netexec_ldap_query_objects(output: str) -> list[dict[str, object]]:
+    """Parse NetExec LDAP ``--query`` output into structured objects.
+
+    NetExec prints LDAP query results as repeated blocks, for example::
+
+        LDAP ... [+] Response for object: CN=Guest,CN=Users,DC=baby,DC=vl
+        LDAP ... objectClass          top
+        LDAP ...                      person
+        LDAP ... cn                   Guest
+        LDAP ... sAMAccountName       Guest
+
+    This helper groups the lines by object and keeps multi-valued attributes
+    together so higher-level LDAP enumeration code can reason about partial
+    anonymous-bind results.
+
+    Args:
+        output: NetExec stdout/stderr text.
+
+    Returns:
+        List of dictionaries in the form::
+
+            {
+                "distinguished_name": "...",
+                "attributes": {"objectclass": ["top", "person"], "cn": ["Guest"]},
+            }
+    """
+    if not output:
+        return []
+
+    import re
+
+    objects: list[dict[str, object]] = []
+    current_dn: str | None = None
+    current_attrs: dict[str, list[str]] = {}
+    last_attr: str | None = None
+
+    attr_name_re = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
+
+    def flush_current() -> None:
+        nonlocal current_dn, current_attrs, last_attr
+        if not current_dn:
+            current_attrs = {}
+            last_attr = None
+            return
+        objects.append(
+            {
+                "distinguished_name": current_dn,
+                "attributes": current_attrs,
+            }
+        )
+        current_dn = None
+        current_attrs = {}
+        last_attr = None
+
+    for raw_line in output.splitlines():
+        line = (raw_line or "").rstrip()
+        if not line:
+            continue
+
+        parts = line.split(None, 4)
+        body = parts[4] if len(parts) >= 5 else line.strip()
+        if not body:
+            continue
+
+        if "Response for object:" in body:
+            flush_current()
+            current_dn = body.split("Response for object:", 1)[1].strip()
+            continue
+
+        if current_dn is None:
+            continue
+
+        body = body.rstrip()
+        attr_parts = re.split(r"\s{2,}", body.strip(), maxsplit=1)
+        if len(attr_parts) == 2 and attr_name_re.match(attr_parts[0].strip()):
+            attr_name = attr_parts[0].strip().casefold()
+            attr_value = attr_parts[1].strip()
+            if attr_value:
+                current_attrs.setdefault(attr_name, []).append(attr_value)
+            else:
+                current_attrs.setdefault(attr_name, [])
+            last_attr = attr_name
+            continue
+
+        continuation = body.strip()
+        if continuation and last_attr:
+            current_attrs.setdefault(last_attr, []).append(continuation)
+
+    flush_current()
+    return objects
+
+
 
 
 def parse_netexec_computer_badpwd(output: str) -> dict[str, int]:

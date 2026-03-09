@@ -16,6 +16,7 @@ from .credential_service import (
     CredentialService,
     CredentialStatus,
     CredentialVerificationResult,
+    PasswordChangeResult,
     RoastingResult,
 )
 from .enumeration import (
@@ -90,6 +91,7 @@ __all__ = [
     "CredentialService",
     "CredentialStatus",
     "CredentialVerificationResult",
+    "PasswordChangeResult",
     "RoastingResult",
     "EnumerationService",
     "SMBSession",

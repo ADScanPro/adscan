@@ -53,12 +53,27 @@ class SprayEligibilityResult:
     notes: list[str]
 
 
+@dataclass(frozen=True, slots=True)
+class LockoutThresholdParseResult:
+    """Parsed outcome for a NetExec lockout-threshold query."""
+
+    threshold: Optional[int]
+    explicit_none: bool = False
+
+
 _ACCOUNT_LOCKOUT_THRESHOLD_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\baccount\s+lockout\s+threshold\s*[:=]\s*(\d+)\b"),
     re.compile(r"(?i)\blockout\s+threshold\s*[:=]\s*(\d+)\b"),
     # Spanish-ish (best-effort)
     re.compile(r"(?i)\bumbral\s+de\s+bloqueo\s+de\s+cuenta\s*[:=]\s*(\d+)\b"),
     re.compile(r"(?i)\bumbral\s+de\s+bloqueo\s*[:=]\s*(\d+)\b"),
+)
+
+_ACCOUNT_LOCKOUT_THRESHOLD_NONE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)\baccount\s+lockout\s+threshold\s*[:=]\s*none\b"),
+    re.compile(r"(?i)\blockout\s+threshold\s*[:=]\s*none\b"),
+    re.compile(r"(?i)\bumbral\s+de\s+bloqueo\s+de\s+cuenta\s*[:=]\s*none\b"),
+    re.compile(r"(?i)\bumbral\s+de\s+bloqueo\s*[:=]\s*none\b"),
 )
 
 _BADPWDCOUNT_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -131,6 +146,20 @@ def parse_netexec_lockout_threshold(output: str) -> Optional[int]:
             except ValueError:
                 return None
     return None
+
+
+def parse_netexec_lockout_threshold_result(output: str) -> LockoutThresholdParseResult:
+    """Parse NetExec `--pass-pol` output without conflating `None` and unknown."""
+    normalized = normalize_cli_output(output)
+    threshold = parse_netexec_lockout_threshold(normalized)
+    if threshold is not None:
+        return LockoutThresholdParseResult(threshold=threshold, explicit_none=False)
+
+    for pattern in _ACCOUNT_LOCKOUT_THRESHOLD_NONE_PATTERNS:
+        if pattern.search(normalized):
+            return LockoutThresholdParseResult(threshold=None, explicit_none=True)
+
+    return LockoutThresholdParseResult(threshold=None, explicit_none=False)
 
 
 def parse_netexec_users_badpwd(output: str) -> dict[str, int]:
@@ -249,6 +278,7 @@ def compute_spray_eligibility(
     lockout_threshold: Optional[int],
     badpwd_by_user: Mapping[str, int] | None,
     safe_remaining_threshold: int,
+    no_lockout_enforced: bool = False,
     strict_missing_badpwd: bool = True,
 ) -> SprayEligibilityResult:
     """Compute eligible users based on lockout threshold and BadPwdCount.
@@ -259,14 +289,7 @@ def compute_spray_eligibility(
     eligible: list[str] = []
     excluded: list[ExcludedUser] = []
 
-    used_policy_data = (
-        lockout_threshold is not None
-        and badpwd_by_user is not None
-        and len(badpwd_by_user) > 0
-    )
-
-    # Explicitly handle domains with no lockout threshold (e.g., "None" from NetExec)
-    if lockout_threshold is None and badpwd_by_user:
+    if no_lockout_enforced:
         notes.append(
             "Account lockout threshold is None (no lockout enforced). All users are "
             "eligible; spraying cannot lock accounts, but use caution."
@@ -280,6 +303,12 @@ def compute_spray_eligibility(
             used_policy_data=False,
             notes=notes,
         )
+
+    used_policy_data = (
+        lockout_threshold is not None
+        and badpwd_by_user is not None
+        and len(badpwd_by_user) > 0
+    )
 
     if not used_policy_data:
         notes.append(

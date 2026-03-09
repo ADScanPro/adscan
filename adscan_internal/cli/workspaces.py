@@ -15,10 +15,6 @@ from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
-from adscan_core.lab_catalog import (
-    CTF_LAB_PROVIDER_OPTIONS,
-    provider_display_to_canonical,
-)
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
     BRAND_COLORS,
@@ -30,7 +26,6 @@ from adscan_internal.rich_output import (
     print_instruction,
     print_panel,
     print_success,
-    print_success_verbose,
     print_table,
     print_warning,
 )
@@ -50,20 +45,6 @@ class WorkspaceShell(Protocol):
     def _questionary_select(
         self, question: str, options: Sequence[str]
     ) -> int | None: ...
-
-    def _get_labs_for_provider(self, provider: str) -> list[str]: ...
-
-    def _fuzzy_select_lab(
-        self,
-        question: str,
-        options: Sequence[str],
-        *,
-        allow_custom: bool,
-    ) -> str | None: ...
-
-    def _is_lab_whitelisted(self, provider: str, lab_name: str) -> bool: ...
-
-    def _track_non_whitelisted_lab(self, provider: str, lab_name: str) -> None: ...
 
     def load_workspace_data(self, workspace_path: str) -> None: ...
 
@@ -192,102 +173,16 @@ def workspace_create(shell: WorkspaceShell, workspace_name: str | None = None) -
         print_error(f"Workspace '{workspace_name}' already exists at {workspace_path}")
         return
 
+    # One question only: purpose determines scan flow + telemetry split.
+    # Lab provider/name are inferred automatically at scan start from the domain.
     selection = shell._questionary_select(
         "Workspace purpose?", ["CTF / Lab", "Client / Prod"]
     )
-    if selection is None:
-        print_warning("No workspace purpose selected; defaulting to CTF / Lab")
-        workspace_type = "ctf"
-    elif selection == 0:
-        workspace_type = "ctf"
-    else:
+    if selection == 1:
         workspace_type = "audit"
-    print_success_verbose(f"Workspace type set to {workspace_type}")
-
-    lab_provider: str | None = None
-    lab_name: str | None = None
-    lab_name_whitelisted: bool | None = None
-
-    if workspace_type == "ctf":
-        lab_options = list(CTF_LAB_PROVIDER_OPTIONS)
-
-        provider_selection = shell._questionary_select(
-            "Select lab environment:", lab_options
-        )
-        lab_provider_display: str | None = None
-        if provider_selection is not None:
-            selected_provider_display = lab_options[provider_selection]
-            lab_provider_display = selected_provider_display
-
-            lab_provider = provider_display_to_canonical(selected_provider_display)
-            print_success_verbose(f"Lab provider set to: {lab_provider}")
-
-        if lab_provider:
-            special_providers = ["goad", "other", "local_test"]
-            if lab_provider.lower() in special_providers:
-                lab_name = lab_provider
-                lab_name_whitelisted = True
-                print_success_verbose(
-                    f"Lab name automatically set to provider: {lab_name}"
-                )
-            else:
-                lab_list = shell._get_labs_for_provider(
-                    lab_provider_display if lab_provider_display else lab_provider
-                )
-                if lab_list:
-                    skip_option = "None / Skip"
-                    lab_options_with_skip = [skip_option] + lab_list
-                    selected_lab = shell._fuzzy_select_lab(
-                        f"Select specific lab from {lab_provider} (or type '{skip_option}' to skip):",
-                        lab_options_with_skip,
-                        allow_custom=True,
-                    )
-                    if selected_lab is None or selected_lab == skip_option:
-                        lab_name = None
-                        lab_name_whitelisted = None
-                        print_info_verbose(
-                            "No specific lab name set (cancelled or skipped)"
-                        )
-                    else:
-                        lab_name = selected_lab
-                        lab_name_whitelisted = shell._is_lab_whitelisted(
-                            lab_provider_display
-                            if lab_provider_display
-                            else lab_provider,
-                            lab_name,
-                        )
-                        if not lab_name_whitelisted:
-                            shell._track_non_whitelisted_lab(lab_provider, lab_name)
-                            print_info_debug(
-                                f"Lab '{lab_name}' is not in whitelist and will not be sent to telemetry"
-                            )
-                        else:
-                            print_success_verbose(f"Lab selected: {lab_name}")
-                else:
-                    selected_lab = shell._fuzzy_select_lab(
-                        f"Enter lab/machine name for {lab_provider} (or leave empty/Ctrl+C to skip):",
-                        [],
-                        allow_custom=True,
-                    )
-                    if selected_lab is None:
-                        lab_name = None
-                        lab_name_whitelisted = None
-                        print_info_verbose("Lab selection cancelled or skipped")
-                    else:
-                        lab_name = selected_lab
-                        lab_name_whitelisted = shell._is_lab_whitelisted(
-                            lab_provider_display
-                            if lab_provider_display
-                            else lab_provider,
-                            lab_name,
-                        )
-                        if not lab_name_whitelisted:
-                            shell._track_non_whitelisted_lab(lab_provider, lab_name)
-                            print_info_verbose(
-                                f"Lab '{lab_name}' is not in whitelist and will not be sent to telemetry"
-                            )
-                        else:
-                            print_success_verbose(f"Lab name set to: {lab_name}")
+    else:
+        # Default to ctf on cancel (selection is None) or explicit CTF choice.
+        workspace_type = "ctf"
 
     try:
         create_workspace_dir(shell.workspaces_dir, workspace_name)
@@ -296,16 +191,10 @@ def workspace_create(shell: WorkspaceShell, workspace_name: str | None = None) -
             f"Workspace '{marked_workspace_name}' created at {workspace_path}"
         )
 
-        if not lab_name:
-            lab_name_whitelisted = None
-
         write_initial_workspace_variables(
             workspace_name=workspace_name,
             workspace_path=workspace_path,
             workspace_type=workspace_type,
-            lab_provider=lab_provider,
-            lab_name=lab_name,
-            lab_name_whitelisted=lab_name_whitelisted,
         )
         print_info_verbose(
             f"Initialized files for workspace '{marked_workspace_name}'."

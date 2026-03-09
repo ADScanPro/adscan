@@ -117,6 +117,68 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624", "4648"),
     ),
     _entry(
+        "localcredreusesource",
+        support_kind="context",
+        support_reason="Observed host where the reused local credential was recovered",
+        category="context",
+        description="Host-to-credential-cluster context edge used for SAM reuse correlation",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Prevent credential extraction from endpoints by hardening local admin usage, "
+            "deploying EDR protections, and reducing local admin privileges."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1003.002",
+        mitre_technique_name="OS Credential Dumping: Security Account Manager",
+        detection_event_ids=("4688", "4656"),
+    ),
+    _entry(
+        "localcredtodomainreuse",
+        support_kind="context",
+        support_reason="Observed local credential reused successfully against domain account(s)",
+        category="credential_access",
+        description="Credential reuse pivot from local credential material to domain identity",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Eliminate shared credential patterns between local and domain accounts. "
+            "Enforce unique strong passwords and rotate exposed credentials."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1078.002",
+        mitre_technique_name="Valid Accounts: Domain Accounts",
+        detection_event_ids=("4624", "4648", "4768", "4769"),
+    ),
+    _entry(
+        "domainpassreusesource",
+        support_kind="context",
+        support_reason="Observed source user participating in a reused domain password cluster",
+        category="context",
+        description="Source principal for password/hash reuse between domain users",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Eliminate password reuse between domain accounts and enforce unique secrets per identity."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1078.002",
+        mitre_technique_name="Valid Accounts: Domain Accounts",
+        detection_event_ids=("4624", "4768", "4769"),
+    ),
+    _entry(
+        "domainpassreuse",
+        support_kind="context",
+        support_reason="Observed domain users sharing the same password/hash material",
+        category="credential_access",
+        description="Domain account credential reuse pivot through clustered shared secret material",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Enforce unique random passwords for every domain user and rotate all accounts in the reuse cluster."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1078.002",
+        mitre_technique_name="Valid Accounts: Domain Accounts",
+        detection_event_ids=("4624", "4648", "4768", "4769"),
+    ),
+    _entry(
         "hassession",
         support_kind="supported",
         support_reason="Executable via schtask_as session abuse workflow",
@@ -1073,6 +1135,22 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4768",),
     ),
     # ── Entry vectors ────────────────────────────────────────────────────────
+    _entry(
+        "ldapanonymousbind",
+        support_kind="unsupported",
+        support_reason="Not implemented yet in ADscan",
+        category="entry_vector",
+        description="Anonymous LDAP bind entry vector",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Disable anonymous LDAP binds and restrict Anonymous Logon read access "
+            "to directory objects and attributes."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1087.002",
+        mitre_technique_name="Account Discovery: Domain Account",
+        detection_event_ids=(),
+    ),
     _entry(
         "passwordspray",
         support_kind="unsupported",

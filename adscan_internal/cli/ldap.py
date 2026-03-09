@@ -19,9 +19,17 @@ from typing import Optional, Protocol, Tuple
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
 
+from adscan_core.username_patterns import (
+    USERNAME_PATTERN_LABELS,
+    build_username_pattern_candidates,
+    format_username_pattern_option,
+    normalize_username_candidate,
+    rank_username_patterns_from_observed_pairs,
+)
 from adscan_internal import (
     print_error,
     print_exception,
+    print_info,
     print_info_debug,
     print_info_verbose,
     print_operation_header,
@@ -50,6 +58,7 @@ from adscan_internal.rich_output import (
     print_panel_with_table,
 )
 from adscan_internal.services import EnumerationService
+from adscan_internal.services.enumeration.ldap import LDAPAnonymousUserRecord
 from adscan_internal.services.credsweeper_service import CredSweeperService
 from adscan_internal.services.attack_graph_service import (
     CredentialSourceStep,
@@ -96,7 +105,18 @@ class LdapShell(Protocol):
         self, domain: str, filename: str, values: list[str]
     ) -> str: ...
 
-    def _postprocess_user_list_file(self, domain: str, filename: str) -> None: ...
+    def _write_user_list_file(
+        self, domain: str, filename: str, users: list[str]
+    ) -> str: ...
+
+    def _postprocess_user_list_file(
+        self,
+        domain: str,
+        filename: str,
+        *,
+        trigger_followups: bool = True,
+        source: str | None = None,
+    ) -> None: ...
 
     def build_auth_nxc(
         self, username: str, password: str, domain: str, kerberos: bool = False
@@ -106,7 +126,9 @@ class LdapShell(Protocol):
         self, command: str, timeout: int | None = None, cwd: str | None = None
     ) -> subprocess.CompletedProcess[str]: ...
 
-    def _questionary_select(self, message: str, options: list[str]) -> int | None: ...
+    def _questionary_select(
+        self, message: str, options: list[str], default_idx: int = 0
+    ) -> int | None: ...
 
     def _generate_user_permutations_interactive(self, domain: str) -> str | None: ...
 
@@ -115,6 +137,10 @@ class LdapShell(Protocol):
     ) -> None: ...
 
     def do_enum_with_users(self, domain: str) -> None: ...
+
+    def ask_for_asreproast(self, domain: str) -> None: ...
+
+    def ask_for_spraying(self, domain: str) -> None: ...
 
     def _is_full_adscan_container_runtime(self) -> bool: ...
 
@@ -214,6 +240,662 @@ def ask_for_ldap_computers(shell: LdapShell, target_domain: str) -> None:
         run_ldap_computers(shell, target_domain)
 
 
+_LDAP_ANONYMOUS_DISCOVERY_FILTER = "(objectClass=*)"
+
+_LDAP_NON_USER_DISCOVERY_CNS = {
+    "account operators",
+    "administrators",
+    "backup operators",
+    "cert publishers",
+    "cloneable domain controllers",
+    "cryptographic operators",
+    "denied rodc password replication group",
+    "distributed com users",
+    "dnsadmins",
+    "dnsupdateproxy",
+    "domain admins",
+    "domain computers",
+    "domain controllers",
+    "domain guests",
+    "domain users",
+    "enterprise admins",
+    "enterprise key admins",
+    "event log readers",
+    "group policy creator owners",
+    "guests",
+    "hyper-v administrators",
+    "iis_iusrs",
+    "incoming forest trust builders",
+    "key admins",
+    "network configuration operators",
+    "performance log users",
+    "performance monitor users",
+    "pre-windows 2000 compatible access",
+    "print operators",
+    "protected users",
+    "ras and ias servers",
+    "rdc denied password replication group",
+    "read-only domain controllers",
+    "remote desktop users",
+    "remote management users",
+    "replicator",
+    "schema admins",
+    "server operators",
+    "storage replica administrators",
+    "terminal server license servers",
+    "users",
+    "windows authorization access group",
+}
+
+_LDAP_NOISY_USER_CANDIDATE_CNS = {
+    "guest",
+    "invitado",
+    "krbtgt",
+}
+
+
+def _display_ldap_anonymous_pattern_preview(
+    records: list[LDAPAnonymousUserRecord],
+    *,
+    pattern_key: str,
+    max_rows: int = 20,
+) -> None:
+    """Preview how a username pattern applies to CN-only LDAP candidates."""
+    if not records:
+        return
+
+    table = Table(
+        title=(
+            "Anonymous LDAP Username Inference Preview "
+            f"({USERNAME_PATTERN_LABELS.get(pattern_key, pattern_key)})"
+        ),
+        show_header=True,
+        header_style="bold magenta",
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("CN", style="cyan", max_width=32)
+    table.add_column("Inferred Username", style="white", max_width=40)
+
+    shown_records = records[: max(1, max_rows)]
+    for idx, record in enumerate(shown_records, 1):
+        candidates = build_username_pattern_candidates(str(record.common_name or ""))
+        inferred = candidates.get(pattern_key) or candidates.get("single") or "-"
+        table.add_row(str(idx), str(record.common_name), str(inferred))
+
+    if len(records) > max_rows:
+        table.caption = (
+            f"Showing first {max_rows}. {len(records) - max_rows} more not shown."
+        )
+
+    print_panel_with_table(table, border_style=BRAND_COLORS["info"])
+
+
+def _select_recommended_username_pattern(
+    ranked_patterns: list[tuple[str, int]],
+) -> str | None:
+    """Return the strongest recommended username pattern, if any."""
+    if not ranked_patterns:
+        return None
+
+    top_pattern, top_score = ranked_patterns[0]
+    if len(ranked_patterns) == 1 or (
+        len(ranked_patterns) > 1 and ranked_patterns[1][1] < top_score
+    ):
+        return top_pattern
+    return None
+
+
+def _choose_username_pattern(
+    shell: LdapShell,
+    *,
+    domain: str,
+    unresolved_records: list[LDAPAnonymousUserRecord],
+    ranked_patterns: list[tuple[str, int]],
+) -> str:
+    """Choose a naming pattern for CN-only LDAP user objects."""
+    if not unresolved_records:
+        return "first.last"
+
+    recommended_pattern = _select_recommended_username_pattern(ranked_patterns)
+    if recommended_pattern:
+        print_info_debug(
+            f"[ldap] Recommended username pattern {recommended_pattern} from "
+            f"{ranked_patterns[0][1]} confirmed anonymous LDAP match(es)."
+        )
+
+    pattern_keys: list[str] = []
+    seen_pattern_keys: set[str] = set()
+    for record in unresolved_records:
+        candidates = build_username_pattern_candidates(str(record.common_name or ""))
+        for pattern_key in candidates:
+            if pattern_key in seen_pattern_keys:
+                continue
+            seen_pattern_keys.add(pattern_key)
+            pattern_keys.append(pattern_key)
+
+    if recommended_pattern and recommended_pattern not in seen_pattern_keys:
+        pattern_keys.append(recommended_pattern)
+        seen_pattern_keys.add(recommended_pattern)
+
+    if "single" not in seen_pattern_keys:
+        pattern_keys.append("single")
+        seen_pattern_keys.add("single")
+
+    example_record = next(
+        (
+            record
+            for record in unresolved_records
+            if len(build_username_pattern_candidates(str(record.common_name or ""))) > 1
+        ),
+        unresolved_records[0],
+    )
+    sample_cn = str(example_record.common_name or "").strip() or "John Smith"
+    options: list[str] = []
+    for pattern_key in pattern_keys:
+        label = format_username_pattern_option(pattern_key, sample_cn)
+        if pattern_key == recommended_pattern:
+            label = f"{label} (Recommended)"
+        options.append(label)
+
+    selector = getattr(shell, "_questionary_select", None)
+    marked_domain = mark_sensitive(domain, "domain")
+    if selector and not getattr(shell, "auto", False):
+        if recommended_pattern:
+            if Confirm.ask(
+                (
+                    f"Use the recommended username format "
+                    f"'{USERNAME_PATTERN_LABELS.get(recommended_pattern, recommended_pattern)}' "
+                    f"for {marked_domain}?"
+                ),
+                default=True,
+            ):
+                return recommended_pattern
+
+        while True:
+            default_idx = 0
+            if recommended_pattern and recommended_pattern in pattern_keys:
+                default_idx = pattern_keys.index(recommended_pattern)
+            idx = selector(
+                (
+                    f"Anonymous LDAP exposed CN-only users in {marked_domain}. "
+                    "Select the username format to validate via Kerberos:"
+                ),
+                options,
+                default_idx,
+            )
+            chosen_pattern = recommended_pattern or pattern_keys[0]
+            if idx is not None and 0 <= idx < len(pattern_keys):
+                chosen_pattern = pattern_keys[idx]
+
+            _display_ldap_anonymous_pattern_preview(
+                unresolved_records,
+                pattern_key=chosen_pattern,
+            )
+            if Confirm.ask(
+                "Use this inferred username format for Kerberos validation?",
+                default=True,
+            ):
+                return chosen_pattern
+
+    if recommended_pattern:
+        return recommended_pattern
+
+    default_pattern = pattern_keys[0] if pattern_keys else "first.last"
+    print_info_debug(
+        f"[ldap] Falling back to default username pattern {default_pattern} for "
+        f"anonymous LDAP CN inference in {domain}."
+    )
+    return default_pattern
+
+
+def _save_ldap_anonymous_inventory_json(
+    shell: LdapShell,
+    records: list[LDAPAnonymousUserRecord],
+    domain: str,
+) -> Optional[str]:
+    """Persist anonymous LDAP user inventory for troubleshooting."""
+    if not records:
+        return None
+
+    try:
+        workspace_cwd = shell._get_workspace_cwd()
+        ldap_dir = domain_subpath(
+            workspace_cwd, shell.domains_dir, domain, shell.ldap_dir
+        )
+        os.makedirs(ldap_dir, exist_ok=True)
+        json_file = os.path.join(ldap_dir, "anonymous_inventory.json")
+        with open(json_file, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "domain": domain,
+                    "count": len(records),
+                    "users": [record.to_dict() for record in records],
+                },
+                handle,
+                indent=2,
+                ensure_ascii=False,
+            )
+        return json_file
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_warning(f"Failed to save anonymous LDAP inventory: {exc}")
+        return None
+
+
+def _display_ldap_anonymous_unresolved_users(
+    records: list[LDAPAnonymousUserRecord],
+    *,
+    pattern_key: str | None = None,
+    max_rows: int = 20,
+) -> None:
+    """Display CN-only users that still need username inference."""
+    unresolved = [
+        record
+        for record in records
+        if not str(record.samaccountname or "").strip()
+        and str(record.common_name or "").strip()
+    ]
+    if not unresolved:
+        return
+
+    table = Table(
+        title=f"Anonymous LDAP Users Requiring Username Inference ({len(unresolved)})",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("CN", style="cyan", max_width=32)
+    if pattern_key:
+        table.add_column("Inferred Username", style="white", max_width=40)
+
+    for idx, record in enumerate(unresolved[: max(1, max_rows)], 1):
+        if pattern_key:
+            candidates = build_username_pattern_candidates(str(record.common_name or ""))
+            inferred = candidates.get(pattern_key) or candidates.get("single") or "-"
+            table.add_row(str(idx), str(record.common_name), str(inferred))
+        else:
+            table.add_row(str(idx), str(record.common_name))
+
+    if len(unresolved) > max_rows:
+        table.caption = (
+            f"Showing first {max_rows}. {len(unresolved) - max_rows} more not shown."
+        )
+
+    print_panel_with_table(table, border_style=BRAND_COLORS["warning"])
+
+
+def _display_ldap_anonymous_confirmed_users(
+    usernames: list[str], *, max_rows: int = 20
+) -> None:
+    """Display usernames confirmed directly through anonymous LDAP."""
+    if not usernames:
+        return
+
+    table = Table(
+        title=f"Anonymous LDAP Confirmed Enabled Users ({len(usernames)})",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("Username", style="cyan", max_width=40)
+
+    shown = usernames[: max(1, max_rows)]
+    for idx, username in enumerate(shown, 1):
+        table.add_row(str(idx), username)
+
+    if len(usernames) > max_rows:
+        table.caption = (
+            f"Showing first {max_rows}. {len(usernames) - max_rows} more not shown."
+        )
+
+    print_panel_with_table(table, border_style=BRAND_COLORS["info"])
+
+
+def _is_likely_ldap_user_candidate(record: LDAPAnonymousUserRecord) -> bool:
+    """Best-effort filter for CN-only objects discovered via anonymous LDAP.
+
+    The broad ``(objectClass=*)`` query can expose users without attributes, but
+    it also exposes groups, containers and system objects. We keep the heuristic
+    intentionally conservative and let Kerberos validation decide the final set.
+    """
+    dn = str(record.distinguished_name or "").strip()
+    common_name = str(record.common_name or "").strip()
+    if not dn or not common_name:
+        return False
+
+    dn_lower = dn.casefold()
+    cn_lower = common_name.casefold()
+    if dn.startswith("DC="):
+        return False
+    if common_name.endswith("$"):
+        return False
+    if "cn=configuration," in dn_lower or "cn=schema," in dn_lower:
+        return False
+    if cn_lower in _LDAP_NON_USER_DISCOVERY_CNS:
+        return False
+    if cn_lower in _LDAP_NOISY_USER_CANDIDATE_CNS:
+        return False
+
+    # Keep likely user placements: standard Users container or custom OUs.
+    return ",cn=users," in f",{dn_lower}" or ",ou=" in f",{dn_lower}"
+
+
+def _validate_ldap_anonymous_username_candidates(
+    shell: LdapShell,
+    domain: str,
+    candidates: list[str],
+) -> set[str]:
+    """Validate inferred usernames with Kerberos pre-auth enumeration."""
+    normalized = sorted(
+        {
+            normalize_username_candidate(candidate)
+            for candidate in candidates
+            if normalize_username_candidate(candidate)
+        }
+    )
+    if not normalized:
+        return set()
+
+    kerbrute_path = os.path.join(TOOLS_INSTALL_DIR, "kerbrute", "kerbrute")
+    if not os.path.isfile(kerbrute_path) or not os.access(kerbrute_path, os.X_OK):
+        print_warning(
+            "kerbrute is not available; skipping validation of anonymous LDAP username candidates."
+        )
+        return set()
+
+    workspace_cwd = shell._get_workspace_cwd()
+    kerberos_dir = domain_subpath(
+        workspace_cwd, shell.domains_dir, domain, shell.kerberos_dir
+    )
+    os.makedirs(kerberos_dir, exist_ok=True)
+    wordlist_path = Path(os.path.join(kerberos_dir, "ldap_anonymous_candidates.txt"))
+    output_file = Path(
+        os.path.join(kerberos_dir, "ldap_anonymous_candidate_validation.log")
+    )
+    wordlist_path.write_text("\n".join(normalized) + "\n", encoding="utf-8")
+
+    print_info(
+        f"Validating {len(normalized)} inferred LDAP anonymous username candidate(s) via Kerberos."
+    )
+    enum_service = EnumerationService()
+    executor = shell._get_service_executor()
+    validated = enum_service.kerberos.enumerate_users_kerberos(
+        domain=domain,
+        pdc=shell.domains_data[domain]["pdc"],
+        wordlist=str(wordlist_path),
+        kerbrute_path=kerbrute_path,
+        output_file=output_file,
+        executor=executor,
+        scan_id=None,
+        timeout=300,
+    )
+    validated_set = {
+        normalize_username_candidate(username) for username in validated if username
+    }
+    print_info_debug(
+        f"[ldap] Validated {len(validated_set)}/{len(normalized)} inferred username "
+        "candidate(s) through Kerberos."
+    )
+    return validated_set
+
+
+def run_post_user_discovery_followups(
+    shell: LdapShell,
+    domain: str,
+    *,
+    source: str,
+    pre_with_users_callback: Callable[[], None] | None = None,
+    pre_with_users_step: str | None = None,
+    allow_with_users: bool = True,
+) -> None:
+    """Run the shared follow-up workflow after recovering domain users.
+
+    This centralizes the transition from "we recovered users" to optional
+    pre-follow-up steps (for example LDAP/SMB descriptions) and finally the
+    legacy ``with_users`` flow. The helper avoids duplicated AS-REP/spraying
+    prompts by skipping the ``with_users`` transition when the domain is
+    already authenticated or already marked as ``with_users``.
+    """
+    def _capture_followup_event(action: str, **extra: object) -> None:
+        """Emit a telemetry event for post-user-discovery flow transitions."""
+        try:
+            properties: dict[str, object] = {
+                "source": source,
+                "action": action,
+                "auth_type": shell.domains_data.get(domain, {}).get("auth", "unknown"),
+                "pre_with_users_step": pre_with_users_step,
+                "allow_with_users": allow_with_users,
+                "scan_mode": getattr(shell, "scan_mode", None),
+                "workspace_type": getattr(shell, "type", None),
+                "auto_mode": getattr(shell, "auto", False),
+            }
+            properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+            properties.update(extra)
+            telemetry.capture("user_discovery_followups", properties)
+        except Exception as exc:  # pragma: no cover - best effort telemetry
+            telemetry.capture_exception(exc)
+
+    current_auth = str(shell.domains_data.get(domain, {}).get("auth") or "unknown")
+    print_info_debug(
+        f"[user_discovery_followups] source={source} domain={domain} "
+        f"auth_before={current_auth} allow_with_users={allow_with_users}"
+    )
+    _capture_followup_event("start", auth_before=current_auth)
+
+    if pre_with_users_callback is not None:
+        step_name = pre_with_users_step or "pre_with_users_callback"
+        print_info_debug(
+            f"[user_discovery_followups] source={source} domain={domain} "
+            f"running_pre_step={step_name}"
+        )
+        pre_with_users_callback()
+        current_auth = str(shell.domains_data.get(domain, {}).get("auth") or "unknown")
+        print_info_debug(
+            f"[user_discovery_followups] source={source} domain={domain} "
+            f"auth_after_pre_step={current_auth}"
+        )
+        _capture_followup_event(
+            "pre_step_completed",
+            auth_after=current_auth,
+            executed_pre_step=step_name,
+        )
+
+    if not allow_with_users:
+        print_info_debug(
+            f"[user_discovery_followups] source={source} domain={domain} "
+            "with_users_disabled_for_this_flow=True"
+        )
+        _capture_followup_event("skip_with_users", reason="allow_with_users_false")
+        return
+
+    if current_auth in {"auth", "pwned"}:
+        print_info_debug(
+            f"[user_discovery_followups] source={source} domain={domain} "
+            f"skipping_with_users_due_to_auth={current_auth}"
+        )
+        _capture_followup_event(
+            "skip_with_users",
+            reason="domain_already_authenticated",
+            auth_after=current_auth,
+        )
+        return
+
+    if current_auth == "with_users":
+        print_info_debug(
+            f"[user_discovery_followups] source={source} domain={domain} "
+            "skipping_with_users_already_active=True"
+        )
+        _capture_followup_event(
+            "skip_with_users",
+            reason="with_users_already_active",
+            auth_after=current_auth,
+        )
+        return
+
+    print_info_debug(
+        f"[user_discovery_followups] source={source} domain={domain} "
+        "launching_with_users=True"
+    )
+    _capture_followup_event("launch_with_users", auth_after=current_auth)
+    shell.do_enum_with_users(domain)
+
+
+def _run_ldap_anonymous_followups(shell: LdapShell, domain: str) -> None:
+    """Expand an anonymous LDAP bind into user discovery and standard follow-ups."""
+    if not shell.netexec_path:
+        return
+
+    enum_service = EnumerationService()
+    executor = shell._get_service_executor()
+    workspace_cwd = shell._get_workspace_cwd()
+
+    active_log_abs = domain_subpath(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.ldap_dir,
+        "ldap_anonymous_active_users.log",
+    )
+    query_log_abs = domain_subpath(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.ldap_dir,
+        "ldap_anonymous_discovery.log",
+    )
+    os.makedirs(os.path.dirname(active_log_abs), exist_ok=True)
+
+    active_users = enum_service.ldap.enumerate_active_users_anonymous(
+        pdc=shell.domains_data[domain]["pdc"],
+        netexec_path=shell.netexec_path,
+        log_file=active_log_abs,
+        executor=executor,
+        scan_id=None,
+        timeout=120,
+    )
+    records = enum_service.ldap.query_anonymous_user_inventory(
+        pdc=shell.domains_data[domain]["pdc"],
+        netexec_path=shell.netexec_path,
+        log_file=query_log_abs,
+        ldap_filter=_LDAP_ANONYMOUS_DISCOVERY_FILTER,
+        executor=executor,
+        scan_id=None,
+        timeout=180,
+    )
+
+    inventory_json = _save_ldap_anonymous_inventory_json(shell, records, domain)
+    if inventory_json:
+        marked_inventory_json = mark_sensitive(inventory_json, "path")
+        print_info_debug(
+            f"[ldap] Saved anonymous LDAP inventory to {marked_inventory_json}"
+        )
+
+    confirmed_users = {
+        normalize_username_candidate(username)
+        for username in active_users
+        if normalize_username_candidate(username)
+    }
+    if confirmed_users:
+        confirmed_sorted = sorted(confirmed_users)
+        _display_ldap_anonymous_confirmed_users(confirmed_sorted)
+        print_info(
+            f"Anonymous LDAP confirmed {len(confirmed_sorted)} enabled user(s) directly."
+        )
+
+    resolved_user_by_dn: dict[str, str] = {}
+    direct_sam_records: list[LDAPAnonymousUserRecord] = []
+    unresolved_records: list[LDAPAnonymousUserRecord] = []
+    active_users_keys = {user.casefold() for user in confirmed_users}
+
+    for record in records:
+        record_dn = str(record.distinguished_name or "").strip()
+        samaccountname = normalize_username_candidate(record.samaccountname)
+        if samaccountname and samaccountname.casefold() in active_users_keys:
+            resolved_user_by_dn[record_dn] = samaccountname
+            direct_sam_records.append(record)
+        elif not samaccountname and _is_likely_ldap_user_candidate(record):
+            unresolved_records.append(record)
+
+    # De-duplicate unresolved records by DN while preserving discovery order.
+    unresolved_by_dn: dict[str, LDAPAnonymousUserRecord] = {}
+    for record in unresolved_records:
+        record_dn = str(record.distinguished_name or "").strip()
+        if record_dn and record_dn not in unresolved_by_dn:
+            unresolved_by_dn[record_dn] = record
+    unresolved_records = list(unresolved_by_dn.values())
+
+    if unresolved_records:
+        observed_pairs = [
+            (str(record.common_name or ""), str(record.samaccountname or ""))
+            for record in direct_sam_records
+        ]
+        ranked_patterns = rank_username_patterns_from_observed_pairs(observed_pairs)
+        recommended_pattern = _select_recommended_username_pattern(ranked_patterns)
+        _display_ldap_anonymous_unresolved_users(
+            unresolved_records,
+            pattern_key=recommended_pattern,
+        )
+        selected_pattern = _choose_username_pattern(
+            shell,
+            domain=domain,
+            unresolved_records=unresolved_records,
+            ranked_patterns=ranked_patterns,
+        )
+        candidate_to_dn: dict[str, str] = {}
+        for record in unresolved_records:
+            candidates = build_username_pattern_candidates(record.common_name)
+            candidate = candidates.get(selected_pattern) or candidates.get("single")
+            candidate = normalize_username_candidate(candidate or "")
+            if not candidate or candidate in candidate_to_dn:
+                continue
+            candidate_to_dn[candidate] = str(record.distinguished_name or "").strip()
+
+        if candidate_to_dn:
+            print_info(
+                f"Anonymous LDAP also exposed {len(candidate_to_dn)} CN-only user candidate(s); validating them via Kerberos."
+            )
+            validated_candidates = _validate_ldap_anonymous_username_candidates(
+                shell, domain, list(candidate_to_dn.keys())
+            )
+            for candidate in validated_candidates:
+                record_dn = candidate_to_dn.get(candidate)
+                if not record_dn:
+                    continue
+                confirmed_users.add(candidate)
+                resolved_user_by_dn[record_dn] = candidate
+
+    if confirmed_users:
+        shell._write_user_list_file(domain, "users.txt", sorted(confirmed_users))
+        try:
+            shell._postprocess_user_list_file(
+                domain,
+                "users.txt",
+                trigger_followups=False,
+                source="ldap_anonymous",
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            telemetry.capture_exception(exc)
+            print_warning(f"Failed to postprocess anonymous LDAP users.txt: {exc}")
+        print_success(
+            f"Recovered {len(confirmed_users)} unique username(s) from anonymous LDAP."
+        )
+    else:
+        print_warning(
+            "Anonymous LDAP bind succeeded, but no reusable usernames were recovered."
+        )
+
+    run_post_user_discovery_followups(
+        shell,
+        domain,
+        source="ldap_anonymous",
+        pre_with_users_callback=lambda: run_ldap_descriptions(
+            shell, domain, anonymous=True
+        ),
+        pre_with_users_step="ldap_descriptions_anonymous",
+        allow_with_users=bool(confirmed_users),
+    )
+
+
 def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | None:
     """Test anonymous LDAP access via the LDAP service."""
     if domain not in shell.domains_data:
@@ -265,6 +947,25 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
     if accessible:
         print_success("Anonymous LDAP bind succeeded.")
         shell.update_report_field(domain, "ldap_anonymous", True)
+        try:
+            from adscan_internal.services.attack_graph_service import (
+                upsert_ldap_anonymous_bind_entry_edge,
+            )
+
+            upsert_ldap_anonymous_bind_entry_edge(
+                shell,
+                domain,
+                status="success",
+                notes={
+                    "source": "ldap_anonymous",
+                    "protocol": "ldap",
+                    "authentication": "anonymous_bind",
+                    "pdc": shell.domains_data[domain]["pdc"],
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+        _run_ldap_anonymous_followups(shell, domain)
         try:
             from adscan_internal.services.report_service import record_technical_finding
 
@@ -783,7 +1484,11 @@ def run_ldap_active_users(shell: LdapShell, target_domain: str) -> list[str] | N
 
     shell._write_domain_list_file(target_domain, "enabled_users.txt", usernames)
     try:
-        shell._postprocess_user_list_file(target_domain, "enabled_users.txt")
+        shell._postprocess_user_list_file(
+            target_domain,
+            "enabled_users.txt",
+            source="ldap_active_users",
+        )
     except Exception as e:  # pragma: no cover
         telemetry.capture_exception(e)
         marked_domain = mark_sensitive(target_domain, "domain")
@@ -1594,12 +2299,6 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
             print_error(f"The wordlist file {marked_wordlist} does not exist.")
             return
 
-    # Prepare output file paths
-    users_dir = Path(f"domains/{domain}")
-    users_dir.mkdir(parents=True, exist_ok=True)
-    users_file = users_dir / "users.txt"
-    users_file.touch(exist_ok=True)
-
     workspace_cwd = shell._get_workspace_cwd()
     kerberos_dir = domain_subpath(
         workspace_cwd, shell.domains_dir, domain, shell.kerberos_dir
@@ -1645,13 +2344,20 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         return
 
     unique_users = sorted(set(users))
-    users_file.write_text("\n".join(unique_users), encoding="utf-8")
-    shell.console.print(
-        f"[bold green]Saved {len(unique_users)} unique users to {users_file}[/bold green]"
+    shell._write_user_list_file(domain, "users.txt", unique_users)
+    shell._postprocess_user_list_file(
+        domain,
+        "users.txt",
+        trigger_followups=False,
+        source="kerberos_user_enum",
     )
 
     shell.ask_for_kerberos_user_enum(domain, relaunch=True)
-    shell.do_enum_with_users(domain)
+    run_post_user_discovery_followups(
+        shell,
+        domain,
+        source="kerberos_user_enum",
+    )
 
 
 def get_domain_controllers(shell: LdapShell, domain: str) -> list[str]:
@@ -1751,7 +2457,9 @@ def check_maq(shell: LdapShell, domain: str, username: str, password: str) -> in
         return 0
 
 
-def run_ldap_descriptions(shell: LdapShell, target_domain: str) -> None:
+def run_ldap_descriptions(
+    shell: LdapShell, target_domain: str, *, anonymous: bool = False
+) -> None:
     """Enumerate user descriptions and analyze them for leaked credentials.
 
     Primary flow: execute NetExec LDAP description-focused modules and parse the
@@ -1764,38 +2472,56 @@ def run_ldap_descriptions(shell: LdapShell, target_domain: str) -> None:
         )
         return
 
-    username = shell.domains_data[shell.domain]["username"]
-    password = shell.domains_data[shell.domain]["password"]
-    pdc_hostname = shell.domains_data[target_domain]["pdc_hostname"]
-    pdc_fqdn = f"{pdc_hostname}.{target_domain}"
-    use_kerberos = bool(shell.do_sync_clock_with_pdc(target_domain))
+    username = ""
+    password = ""
+    pdc_hostname = str(shell.domains_data[target_domain].get("pdc_hostname") or "").strip()
+    pdc_target = shell.domains_data[target_domain]["pdc"]
+    use_kerberos = False
+
+    if anonymous:
+        auth_label = "Anonymous"
+    else:
+        username = shell.domains_data[shell.domain]["username"]
+        password = shell.domains_data[shell.domain]["password"]
+        if pdc_hostname:
+            pdc_target = f"{pdc_hostname}.{target_domain}"
+        use_kerberos = bool(shell.do_sync_clock_with_pdc(target_domain))
+        auth_label = "Kerberos" if use_kerberos else "Password"
 
     print_operation_header(
         "LDAP User Descriptions Enumeration",
         details={
             "Domain": target_domain,
-            "PDC": pdc_fqdn,
-            "Authentication": "Kerberos" if use_kerberos else "Password",
+            "PDC": pdc_target,
+            "Authentication": auth_label,
             "Modules": "user-desc, get-desc-users, get-unixUserPassword, get-userPassword, get-info-users",
-            "Username": username,
+            "Username": username if username else "Anonymous",
         },
         icon="📝",
     )
 
     # Run the description-focused NetExec modules directly (no --users pre-pass).
-    auth = shell.build_auth_nxc(
-        username,
-        password,
-        shell.domain,
-        kerberos=use_kerberos,
-    )
-    marked_pdc_fqdn = mark_sensitive(pdc_fqdn, "hostname")
+    if anonymous:
+        auth = '-u "" -p ""'
+    else:
+        auth = shell.build_auth_nxc(
+            username,
+            password,
+            shell.domain,
+            kerberos=use_kerberos,
+        )
+    marked_pdc_target = mark_sensitive(str(pdc_target), "hostname")
     command = (
-        f"{shell.netexec_path} ldap {marked_pdc_fqdn} {auth} "
+        f"{shell.netexec_path} ldap {marked_pdc_target} {auth} "
         "-M user-desc -M get-desc-users -M get-unixUserPassword -M get-userPassword -M get-info-users"
     )
     print_info_debug(f"Command: {command}")
-    execute_netexec_ldap_descriptions(shell, command=command, domain=target_domain)
+    execute_netexec_ldap_descriptions(
+        shell,
+        command=command,
+        domain=target_domain,
+        anonymous=anonymous,
+    )
 
 
 def run_enumerate_user_aces(shell: LdapShell, args: str) -> None:
@@ -2233,6 +2959,8 @@ def _analyze_descriptions_for_passwords(
     descriptions_file: str,
     user_descriptions: dict[str, str],
     domain: str,
+    *,
+    anonymous: bool = False,
 ) -> None:
     """Analyze LDAP descriptions with CredSweeper CLI but avoid ML-based filtering.
 
@@ -2308,14 +3036,11 @@ def _analyze_descriptions_for_passwords(
                 domain,
                 username_norm,
                 value_norm,
-                source_steps=[
-                    CredentialSourceStep(
-                        relation="UserDescription",
-                        edge_type="user_description",
-                        entry_label="Domain Users",
-                        notes={"source": "ldap_descriptions"},
-                    )
-                ],
+                source_steps=_build_user_description_source_steps(
+                    username=username_norm,
+                    anonymous=anonymous,
+                    secret=value_norm,
+                ),
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -2323,8 +3048,30 @@ def _analyze_descriptions_for_passwords(
         print_exception(show_locals=False, exception=exc)
 
 
+def _build_user_description_source_steps(
+    *, username: str, anonymous: bool, secret: str | None = None
+) -> list[CredentialSourceStep]:
+    """Build credential provenance for a password recovered from LDAP descriptions."""
+    username_clean = str(username or "").strip().lower()
+    auth_mechanism = "ldap_anonymous_bind" if anonymous else "ldap_authenticated_bind"
+    return [
+        CredentialSourceStep(
+            relation="UserDescription",
+            edge_type="user_description",
+            entry_label="Domain Users",
+            notes={
+                "source": "ldap_descriptions",
+                "source_username": username_clean,
+                "source_protocol": "ldap",
+                "auth_mechanism": auth_mechanism,
+                **({"secret": str(secret).strip()} if str(secret or "").strip() else {}),
+            },
+        )
+    ]
+
+
 def execute_netexec_ldap_descriptions(
-    shell: LdapShell, *, command: str, domain: str
+    shell: LdapShell, *, command: str, domain: str, anonymous: bool = False
 ) -> None:
     """Execute LDAP descriptions command, find and move netexec's UserDesc log file,
     parse it, display with Rich, and analyze descriptions for passwords using CredSweeper.
@@ -2367,7 +3114,11 @@ def execute_netexec_ldap_descriptions(
                 # Analyze descriptions for passwords (regex-only, no ML)
                 if descriptions_file:
                     _analyze_descriptions_for_passwords(
-                        shell, descriptions_file, user_descriptions, domain
+                        shell,
+                        descriptions_file,
+                        user_descriptions,
+                        domain,
+                        anonymous=anonymous,
                     )
             else:
                 print_warning("No user descriptions found in UserDesc log file.")
@@ -2413,7 +3164,11 @@ def execute_netexec_users(
         # Check the process output
         if completed_process and completed_process.returncode == 0:
             try:
-                shell._postprocess_user_list_file(domain, filename)
+                shell._postprocess_user_list_file(
+                    domain,
+                    filename,
+                    source=f"netexec_users:{filename}",
+                )
             except Exception as e:
                 telemetry.capture_exception(e)
                 print_error("Error reading the users file.")

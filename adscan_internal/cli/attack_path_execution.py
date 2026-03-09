@@ -18,7 +18,6 @@ import os
 import re
 import secrets
 import shlex
-import string
 import sys
 import time
 
@@ -36,6 +35,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.interaction import is_non_interactive
+from adscan_internal.passwords import generate_strong_password, is_password_complex
 from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
@@ -44,10 +44,9 @@ from adscan_internal.rich_output import (
     print_attack_paths_summary,
 )
 from adscan_internal.services.attack_graph_service import (
-    compute_display_paths_for_owned_users,
-    compute_display_paths_for_principals,
-    compute_display_paths_for_user,
-    get_owned_domain_usernames,
+    get_node_by_label,
+    get_attack_path_summaries,
+    get_owned_domain_usernames_for_attack_paths,
     resolve_netexec_target_for_node_label,
     resolve_group_name_by_rid,
     resolve_group_user_members,
@@ -64,8 +63,10 @@ from adscan_internal.cli.roasting_execution import (
 from adscan_internal.cli.ace_step_execution import (
     ACL_ACE_RELATIONS,
     build_ace_step_context,
+    describe_ace_relation_support,
     describe_ace_step_support,
     execute_ace_step,
+    resolve_execution_user as _shared_resolve_execution_user,
 )
 from adscan_internal.cli.attack_step_followups import (
     build_followups_for_step,
@@ -135,6 +136,20 @@ _AUTO_REFRESH_AFFECTED_USERS_THRESHOLD = _env_int(
     minimum=0,
 )
 
+_EXECUTION_CONTEXT_ACTIONS = {
+    "adminto",
+    "sqladmin",
+    "canrdp",
+    "canpsremote",
+    "allowedtodelegate",
+    "adcsesc1",
+    "adcsesc3",
+    "adcsesc4",
+    "dumplsa",
+    "dumpdpapi",
+    *ACL_ACE_RELATIONS,
+}
+
 
 def _affected_user_count(summary: dict[str, Any]) -> int:
     """Return affected-user count from summary metadata when available."""
@@ -148,6 +163,237 @@ def _affected_user_count(summary: dict[str, Any]) -> int:
     if isinstance(users, list):
         return len(users)
     return 0
+
+
+def _get_stored_credential_map(shell: Any, domain: str) -> dict[str, str]:
+    """Return stored domain credentials indexed by normalized username."""
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        return {}
+    domain_data = domains_data.get(domain)
+    if not isinstance(domain_data, dict):
+        return {}
+    creds = domain_data.get("credentials")
+    if not isinstance(creds, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for username in creds.keys():
+        normalized_username = _normalize_account(str(username or ""))
+        if not normalized_username:
+            continue
+        normalized[normalized_username] = str(username)
+    return normalized
+
+
+def _first_credential_context_step(summary: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Return the first path step that requires an execution credential context."""
+    steps = summary.get("steps")
+    if not isinstance(steps, list):
+        return None
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip().lower()
+        if action in _EXECUTION_CONTEXT_ACTIONS:
+            details = step.get("details")
+            if isinstance(details, dict):
+                return action, details
+    return None
+
+
+def _execution_readiness_meta(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    context_username: str | None,
+    context_password: str | None,
+) -> dict[str, Any]:
+    """Estimate whether a path has usable execution credential context."""
+    step_info = _first_credential_context_step(summary)
+    if step_info is None:
+        return {}
+
+    action, details = step_info
+    from_label = str(details.get("from") or "")
+    to_label = str(details.get("to") or "")
+    stored_creds = _get_stored_credential_map(shell, domain)
+    target_kind = ""
+    if action in ACL_ACE_RELATIONS and to_label:
+        to_node = get_node_by_label(shell, domain, label=to_label)
+        if isinstance(to_node, dict):
+            kind = to_node.get("kind") or to_node.get("labels") or to_node.get("type")
+            if isinstance(kind, list) and kind:
+                target_kind = str(kind[0])
+            elif isinstance(kind, str):
+                target_kind = kind
+        supported, support_reason = describe_ace_relation_support(action, target_kind)
+        if not supported:
+            return {
+                "execution_context_required": True,
+                "execution_support_status": "unsupported",
+                "execution_support_reason": support_reason or "Unsupported target type",
+                "execution_support_target_kind": target_kind or "Unknown",
+                "execution_ready_count": 0,
+                "execution_candidate_count": 0,
+                "execution_candidate_source": "unsupported",
+                "execution_readiness_reason": "unsupported_target_type",
+                "execution_context_action": action,
+            }
+
+    normalized_context_user = _normalize_account(context_username or "")
+    if normalized_context_user:
+        ready = bool(
+            context_password
+            or _resolve_domain_password(shell, domain, normalized_context_user)
+        )
+        return {
+            "execution_context_required": True,
+            "execution_support_status": "supported",
+            "execution_support_target_kind": target_kind or "",
+            "execution_ready_count": 1 if ready else 0,
+            "execution_candidate_count": 1,
+            "execution_candidate_source": "context_username",
+            "execution_readiness_reason": (
+                "context_username"
+                if ready
+                else "context_username_missing_credential"
+            ),
+            "execution_context_action": action,
+        }
+
+    normalized_from_user = _normalize_account(from_label)
+    from_node = get_node_by_label(shell, domain, label=from_label) if from_label else None
+    from_kind = ""
+    if isinstance(from_node, dict):
+        kind = from_node.get("kind") or from_node.get("labels") or from_node.get("type")
+        if isinstance(kind, list) and kind:
+            from_kind = str(kind[0])
+        elif isinstance(kind, str):
+            from_kind = kind
+    if normalized_from_user and normalized_from_user in stored_creds:
+        return {
+            "execution_context_required": True,
+            "execution_support_status": "supported",
+            "execution_support_target_kind": target_kind or "",
+            "execution_ready_count": 1,
+            "execution_candidate_count": 1,
+            "execution_candidate_source": "from_label_credential",
+            "execution_readiness_reason": "from_label_credential",
+            "execution_context_action": action,
+        }
+    if normalized_from_user and from_kind.strip().lower() == "user":
+        return {
+            "execution_context_required": True,
+            "execution_support_status": "supported",
+            "execution_support_target_kind": target_kind or "",
+            "execution_ready_count": 0,
+            "execution_candidate_count": 1,
+            "execution_candidate_source": "from_label_user_node",
+            "execution_readiness_reason": "from_label_missing_stored_credential",
+            "execution_context_action": action,
+        }
+
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    affected_users = meta.get("affected_users") if isinstance(meta, dict) else None
+    affected_count = _affected_user_count(summary)
+    if isinstance(affected_users, list) and affected_users:
+        ready_users: list[str] = []
+        for raw_user in affected_users:
+            if not isinstance(raw_user, str):
+                continue
+            normalized = _normalize_account(raw_user)
+            if normalized and normalized in stored_creds:
+                ready_users.append(normalized)
+        ready_users = list(dict.fromkeys(ready_users))
+        return {
+            "execution_context_required": True,
+            "execution_support_status": "supported",
+            "execution_support_target_kind": target_kind or "",
+            "execution_ready_count": len(ready_users),
+            "execution_candidate_count": affected_count or len(affected_users),
+            "execution_candidate_source": "affected_users",
+            "execution_readiness_reason": (
+                "affected_users_intersection"
+                if ready_users
+                else "no_stored_credential_for_affected_users"
+            ),
+            "execution_context_action": action,
+        }
+
+    if stored_creds:
+        return {
+            "execution_context_required": True,
+            "execution_support_status": "supported",
+            "execution_support_target_kind": target_kind or "",
+            "execution_ready_count": len(stored_creds),
+            "execution_candidate_count": len(stored_creds),
+            "execution_candidate_source": "all_stored_credentials_fallback",
+            "execution_readiness_reason": "all_stored_credentials_fallback",
+            "execution_context_action": action,
+        }
+
+    return {
+        "execution_context_required": True,
+        "execution_support_status": "supported",
+        "execution_support_target_kind": target_kind or "",
+        "execution_ready_count": 0,
+        "execution_candidate_count": 0,
+        "execution_candidate_source": "unresolved",
+        "execution_readiness_reason": "no_stored_credentials_available",
+        "execution_context_action": action,
+    }
+
+
+def _annotate_execution_readiness(
+    shell: Any,
+    *,
+    domain: str,
+    summaries: list[dict[str, Any]],
+    context_username: str | None,
+    context_password: str | None,
+) -> list[dict[str, Any]]:
+    """Attach execution readiness metadata used by the attack-path UX."""
+    annotated: list[dict[str, Any]] = []
+    for summary in summaries:
+        current = dict(summary)
+        meta = current.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+            current["meta"] = meta
+        else:
+            meta = dict(meta)
+            current["meta"] = meta
+        readiness = _execution_readiness_meta(
+            shell,
+            domain=domain,
+            summary=current,
+            context_username=context_username,
+            context_password=context_password,
+        )
+        if readiness:
+            meta.update(readiness)
+        annotated.append(current)
+    return annotated
+
+
+def _path_has_ready_execution_context(summary: dict[str, Any]) -> bool:
+    """Return True when a path has usable execution context or does not require it."""
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    if not isinstance(meta, dict):
+        return True
+    if not meta.get("execution_context_required"):
+        return True
+    ready_count = meta.get("execution_ready_count")
+    return isinstance(ready_count, int) and ready_count > 0
+
+
+def _path_is_supported_for_execution(summary: dict[str, Any]) -> bool:
+    """Return False when the path is pre-identified as unsupported."""
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    if not isinstance(meta, dict):
+        return True
+    return str(meta.get("execution_support_status") or "").strip().lower() != "unsupported"
 
 
 def _choose_custom_attack_path_start_step(
@@ -561,137 +807,14 @@ def _resolve_execution_user(
     max_options: int = 20,
 ) -> str | None:
     """Resolve an execution user for attack steps that require credentials."""
-    exec_username = _normalize_account(context_username or "")
-    if exec_username:
-        print_info_debug(
-            f"[exec-user] Using context username: {mark_sensitive(exec_username, 'user')}"
-        )
-        return exec_username
-
-    creds = getattr(shell, "domains_data", {}).get(domain, {}).get("credentials", {})
-    if isinstance(creds, dict) and creds:
-        from_user = _normalize_account(from_label or "")
-        if from_user and from_user in {str(k).lower() for k in creds.keys()}:
-            print_info_debug(
-                f"[exec-user] Using from_label credential: {mark_sensitive(from_user, 'user')}"
-            )
-            return from_user
-
-    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
-    affected_users = meta.get("affected_users") if isinstance(meta, dict) else None
-    if isinstance(meta, dict):
-        affected_count = meta.get("affected_user_count")
-        affected_users_len = (
-            len(affected_users) if isinstance(affected_users, list) else None
-        )
-        print_info_debug(
-            "[exec-user] meta.affected_users summary: "
-            f"count={affected_count!r}, list_len={affected_users_len!r}"
-        )
-    else:
-        print_info_debug("[exec-user] No meta object available on path summary.")
-    if not (isinstance(affected_users, list) and affected_users) and isinstance(
-        meta, dict
-    ):
-        print_info_debug("[exec-user] meta.affected_users missing/empty.")
-
-    candidate_users: list[str] = []
-    if isinstance(affected_users, list) and isinstance(creds, dict):
-        cred_keys = {str(k).lower(): str(k) for k in creds.keys()}
-        for raw_user in affected_users:
-            if not isinstance(raw_user, str):
-                continue
-            normalized = _normalize_account(raw_user)
-            if not normalized:
-                continue
-            stored_key = cred_keys.get(normalized.lower())
-            if stored_key:
-                candidate_users.append(stored_key)
-
-    if not candidate_users and isinstance(creds, dict) and creds:
-        print_info_debug(
-            "[exec-user] No meta.affected_users match; falling back to all stored credentials."
-        )
-        candidate_users = [str(k) for k in creds.keys()]
-
-    if candidate_users:
-        print_info_debug(
-            f"[exec-user] Found {len(candidate_users)} candidate user(s) with stored credentials."
-        )
-        marked_domain = mark_sensitive(domain, "domain")
-        print_panel(
-            "\n".join(
-                [
-                    f"Domain: {marked_domain}",
-                    f"Users with stored credentials: {len(candidate_users)}",
-                ]
-            ),
-            title=Text("Select Execution User", style=f"bold {BRAND_COLORS['info']}"),
-            border_style=BRAND_COLORS["info"],
-            expand=False,
-        )
-
-        if len(candidate_users) == 1:
-            print_info_debug(
-                f"[exec-user] Auto-selected sole candidate: {mark_sensitive(candidate_users[0], 'user')}"
-            )
-            return candidate_users[0]
-
-        if hasattr(shell, "_questionary_select"):
-            options = [
-                mark_sensitive(user, "user") for user in candidate_users[:max_options]
-            ]
-            if len(candidate_users) > max_options:
-                options.append(
-                    f"Enter username (showing {max_options} of {len(candidate_users)})"
-                )
-            options.append("Cancel")
-            idx = shell._questionary_select(  # type: ignore[attr-defined]
-                "Select a user to execute this step:",
-                options,
-                default_idx=0,
-            )
-            if idx is None or idx >= len(options) - 1:
-                print_info_debug("[exec-user] User selection cancelled.")
-                return None
-            if len(candidate_users) > max_options and idx == len(options) - 2:
-                manual_user = Prompt.ask("Enter username")
-                if not manual_user:
-                    print_info_debug("[exec-user] Manual username entry empty.")
-                    return None
-                normalized = _normalize_account(manual_user)
-                if not normalized:
-                    print_info_debug("[exec-user] Manual username entry invalid.")
-                    print_warning("Invalid username entered.")
-                    return None
-                stored = cred_keys.get(normalized.lower())
-                if not stored:
-                    marked_user = mark_sensitive(normalized, "user")
-                    print_warning(
-                        f"No stored credential found for {marked_user}. "
-                        "Please select a user with saved credentials."
-                    )
-                    print_info_debug(
-                        f"[exec-user] Manual username not in credentials: {marked_user}"
-                    )
-                    return None
-                print_info_debug(
-                    f"[exec-user] Manual username matched credentials: {mark_sensitive(stored, 'user')}"
-                )
-                return stored
-            print_info_debug(
-                f"[exec-user] Selected candidate: {mark_sensitive(candidate_users[idx], 'user')}"
-            )
-            return str(candidate_users[idx]).strip().lower()
-
-        return candidate_users[0]
-
-    print_info_debug(
-        "[exec-user] No execution user resolved: "
-        f"from_label={from_label!r}, "
-        f"meta.affected_users_len={len(affected_users) if isinstance(affected_users, list) else None!r}"
+    return _shared_resolve_execution_user(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+        max_options=max_options,
     )
-    return None
 
 
 def _resolve_golden_cert_execution_user(
@@ -837,38 +960,13 @@ def _generate_default_hassession_username() -> str:
 
 
 def _generate_strong_password(length: int = 12) -> str:
-    """Generate a random password with AD-friendly complexity guarantees."""
-    if length < 12:
-        length = 12
-    lowers = string.ascii_lowercase
-    uppers = string.ascii_uppercase
-    digits = string.digits
-    symbols = "!@#$%^&*_-+="
-    pool = lowers + uppers + digits + symbols
-    chars = [
-        secrets.choice(lowers),
-        secrets.choice(uppers),
-        secrets.choice(digits),
-        secrets.choice(symbols),
-    ]
-    chars.extend(secrets.choice(pool) for _ in range(length - len(chars)))
-    shuffled: list[str] = []
-    while chars:
-        idx = secrets.randbelow(len(chars))
-        shuffled.append(chars.pop(idx))
-    return "".join(shuffled)
+    """Backward-compatible wrapper around centralized password generation."""
+    return generate_strong_password(length)
 
 
 def _is_password_complex(value: str) -> bool:
-    """Return True when password meets minimum AD complexity target."""
-    password = str(value or "")
-    if len(password) < 12:
-        return False
-    has_lower = any(char.islower() for char in password)
-    has_upper = any(char.isupper() for char in password)
-    has_digit = any(char.isdigit() for char in password)
-    has_symbol = any(not char.isalnum() for char in password)
-    return has_lower and has_upper and has_digit and has_symbol
+    """Backward-compatible wrapper around centralized password validation."""
+    return is_password_complex(value)
 
 
 def _run_netexec_for_domain(
@@ -3506,12 +3604,13 @@ def offer_attack_paths_for_execution(
 
     def _compute_summaries() -> list[dict[str, Any]]:
         if start_norm == "owned":
-            owned_users = get_owned_domain_usernames(shell, domain)
+            owned_users = get_owned_domain_usernames_for_attack_paths(shell, domain)
             if not owned_users:
                 return []
-            owned_summaries = compute_display_paths_for_owned_users(
+            owned_summaries = get_attack_path_summaries(
                 shell,
                 domain,
+                scope="owned",
                 max_depth=max_depth,
                 max_paths=None,
                 require_high_value_target=require_high_value_target,
@@ -3520,9 +3619,10 @@ def offer_attack_paths_for_execution(
         marked_domain = mark_sensitive(domain, "domain")
         marked_user = mark_sensitive(start, "user")
         print_info(f"Searching attack paths for {marked_user} in {marked_domain}...")
-        return compute_display_paths_for_user(
+        return get_attack_path_summaries(
             shell,
             domain,
+            scope="user",
             username=start,
             max_depth=max_depth,
             max_paths=None,
@@ -3594,9 +3694,10 @@ def offer_attack_paths_for_execution_for_principals(
     require_high_value_target = not include_all
 
     def _compute_summaries() -> list[dict[str, Any]]:
-        return compute_display_paths_for_principals(
+        return get_attack_path_summaries(
             shell,
             domain,
+            scope="principals",
             principals=principals,
             max_depth=max_depth,
             max_paths=None,
@@ -3683,9 +3784,16 @@ def offer_attack_paths_for_execution_summaries(
 
     def _refresh_summaries() -> list[dict[str, Any]]:
         if recompute_summaries is None:
-            return _sorted_paths(list(summaries))
-        updated = recompute_summaries() or []
-        return _sorted_paths(list(updated))
+            updated = _sorted_paths(list(summaries))
+        else:
+            updated = _sorted_paths(list(recompute_summaries() or []))
+        return _annotate_execution_readiness(
+            shell,
+            domain=domain,
+            summaries=updated,
+            context_username=context_username,
+            context_password=context_password,
+        )
 
     def _domain_now_pwned() -> bool:
         domains_data = getattr(shell, "domains_data", None)
@@ -3803,6 +3911,8 @@ def offer_attack_paths_for_execution_summaries(
         ):
             # Batch execution mode: attempt remaining theoretical paths (by default)
             candidates: list[dict[str, Any]] = []
+            skipped_no_context = 0
+            skipped_unsupported = 0
             for summary in summaries:
                 status = str(summary.get("status") or "theoretical").strip().lower()
                 if not _status_allowed_by_filter(status, desired_statuses_set):
@@ -3811,14 +3921,59 @@ def offer_attack_paths_for_execution_summaries(
                     continue
                 if status == "exploited":
                     continue
+                if not _path_is_supported_for_execution(summary):
+                    skipped_unsupported += 1
+                    continue
+                if not _path_has_ready_execution_context(summary):
+                    skipped_no_context += 1
+                    continue
                 candidates.append(summary)
 
             if not candidates:
+                if skipped_unsupported > 0:
+                    print_warning(
+                        "No remaining attack paths are supported for execution with "
+                        "their current target types."
+                    )
+                    print_info_debug(
+                        "[attack_paths] batch: "
+                        f"domain={marked_domain} skipped_unsupported={skipped_unsupported}"
+                    )
+                if skipped_no_context > 0:
+                    print_warning(
+                        "No remaining attack paths are currently executable with the "
+                        "stored credential context."
+                    )
+                    print_info_debug(
+                        "[attack_paths] batch: "
+                        f"domain={marked_domain} skipped_no_context={skipped_no_context}"
+                    )
                 print_info_verbose("No remaining attack paths eligible for execution.")
                 print_info_debug(
                     f"[attack_paths] batch: domain={marked_domain} no eligible candidates"
                 )
                 return executed
+
+            if skipped_unsupported > 0:
+                print_info(
+                    f"Skipping {skipped_unsupported} attack path(s) that are not "
+                    "implemented for their current target types."
+                )
+                print_info_debug(
+                    "[attack_paths] batch support pre-check: "
+                    f"domain={marked_domain} eligible={len(candidates)} "
+                    f"skipped_unsupported={skipped_unsupported}"
+                )
+            if skipped_no_context > 0:
+                print_info(
+                    f"Skipping {skipped_no_context} attack path(s) with no usable "
+                    "execution credential context."
+                )
+                print_info_debug(
+                    "[attack_paths] batch pre-check: "
+                    f"domain={marked_domain} eligible={len(candidates)} "
+                    f"skipped_no_context={skipped_no_context}"
+                )
 
             if not _confirm_or_default(
                 f"Execute {len(candidates)} attack path(s) now?",
@@ -3858,6 +4013,72 @@ def offer_attack_paths_for_execution_summaries(
         print_attack_path_detail(domain, selected, index=selected_idx + 1)
 
         status = str(selected.get("status") or "theoretical").lower()
+        selected_meta = selected.get("meta") if isinstance(selected.get("meta"), dict) else {}
+        execution_context_required = bool(
+            isinstance(selected_meta, dict)
+            and selected_meta.get("execution_context_required")
+        )
+        execution_support_status = (
+            str(selected_meta.get("execution_support_status") or "").strip().lower()
+            if isinstance(selected_meta, dict)
+            else ""
+        )
+        if execution_support_status == "unsupported":
+            marked_action = mark_sensitive(
+                str(selected_meta.get("execution_context_action") or "step"),
+                "detail",
+            )
+            marked_reason = mark_sensitive(
+                str(
+                    selected_meta.get("execution_support_reason")
+                    or "Unsupported target type"
+                ),
+                "detail",
+            )
+            print_warning(
+                "This path is not currently implemented for execution with its "
+                "current target type."
+            )
+            print_info_debug(
+                "[attack_paths] execution pre-check blocked: "
+                f"domain={marked_domain} action={marked_action} reason={marked_reason}"
+            )
+            if single_pass:
+                return executed
+            continue
+        execution_ready_count = (
+            selected_meta.get("execution_ready_count")
+            if isinstance(selected_meta, dict)
+            else None
+        )
+        if (
+            execution_context_required
+            and isinstance(execution_ready_count, int)
+            and execution_ready_count <= 0
+        ):
+            marked_action = mark_sensitive(
+                str(selected_meta.get("execution_context_action") or "step"),
+                "detail",
+            )
+            marked_reason = mark_sensitive(
+                str(
+                    selected_meta.get("execution_readiness_reason")
+                    or "no_usable_execution_context"
+                ),
+                "detail",
+            )
+            print_warning(
+                "This path currently has no usable execution credential context. "
+                "Acquire a stored credential for one of the affected users or pick another path."
+            )
+            print_info_debug(
+                "[attack_paths] execution pre-check blocked: "
+                f"domain={marked_domain} action={marked_action} reason={marked_reason}"
+            )
+            if single_pass:
+                return executed
+            continue
+
         if status == "exploited" and not _confirm_or_default(
             "This path is already exploited. Execute again?",
             default=False,

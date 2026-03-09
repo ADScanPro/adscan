@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from enum import Enum
 
+from adscan_core.time_utils import parse_iso_datetime_or_now, utc_now_iso, utc_now
+
 
 class HostType(str, Enum):
     """Type of host."""
@@ -65,7 +67,7 @@ class Host:
 
     # Status
     is_online: bool = True
-    last_seen: datetime = field(default_factory=datetime.utcnow)
+    last_seen: datetime = field(default_factory=utc_now)
 
     # Security configuration
     smb_signing: Optional[bool] = None
@@ -77,7 +79,7 @@ class Host:
     vulnerabilities: List[str] = field(default_factory=list)  # Vulnerability IDs
 
     # Timestamps
-    discovered_at: datetime = field(default_factory=datetime.utcnow)
+    discovered_at: datetime = field(default_factory=utc_now)
 
     # Additional metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -129,17 +131,13 @@ class Host:
             domain=data.get("domain"),
             is_dc=data.get("is_dc", False),
             is_online=data.get("is_online", True),
-            last_seen=datetime.fromisoformat(data["last_seen"])
-            if "last_seen" in data
-            else datetime.utcnow(),
+            last_seen=parse_iso_datetime_or_now(data.get("last_seen")),
             smb_signing=data.get("smb_signing"),
             ldap_signing=data.get("ldap_signing"),
             shares=data.get("shares", []),
             services=data.get("services", []),
             vulnerabilities=data.get("vulnerabilities", []),
-            discovered_at=datetime.fromisoformat(data["discovered_at"])
-            if "discovered_at" in data
-            else datetime.utcnow(),
+            discovered_at=parse_iso_datetime_or_now(data.get("discovered_at")),
             metadata=data.get("metadata", {}),
         )
 
@@ -158,7 +156,7 @@ class Host:
                 "name": share_name,
                 "permissions": permissions,
                 "accessible": accessible,
-                "discovered_at": datetime.utcnow().isoformat(),
+                "discovered_at": utc_now_iso(),
             }
         )
 
@@ -175,7 +173,7 @@ class Host:
                 "name": service_name,
                 "port": port,
                 "protocol": protocol,
-                "discovered_at": datetime.utcnow().isoformat(),
+                "discovered_at": utc_now_iso(),
             }
         )
 
@@ -305,7 +303,7 @@ class SMBShare:
     interesting_files: List[str] = field(default_factory=list)
 
     # Timestamp
-    discovered_at: datetime = field(default_factory=datetime.utcnow)
+    discovered_at: datetime = field(default_factory=utc_now)
 
     # Additional metadata
     metadata: Dict[str, Any] = field(default_factory=dict)

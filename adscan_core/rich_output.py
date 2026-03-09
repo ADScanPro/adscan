@@ -954,20 +954,36 @@ def questionary_checkbox_values(
     *,
     title: str,
     options: list[str],
+    default_values: list[str] | None = None,
     shell: object | None = None,
 ) -> list[str] | None:
     """Render a Questionary checkbox prompt and return selected values."""
     if not options:
         return None
+    resolved_defaults = (
+        [str(value) for value in default_values if str(value).strip()]
+        if default_values is not None
+        else [str(option) for option in options if str(option).strip()]
+    )
     if _should_disable_prompt_interaction(shell):
-        print_info_debug(f"[questionary] Non-interactive; skipping checkbox prompt: {title}")
-        print_telemetry_only(f"[questionary] Prompt: {title}")
-        return None
+        print_info_debug(
+            "[questionary] Non-interactive; selecting default checkbox values "
+            f"for '{title}': {resolved_defaults}"
+        )
+        print_telemetry_only(
+            f"[questionary][answer] {title}: "
+            f"{mark_sensitive(str(resolved_defaults), 'text')}"
+        )
+        return resolved_defaults
 
     print_info_debug(f"[questionary] Prompt: {title}")
     print_telemetry_only(f"[questionary] Prompt: {title}")
     try:
-        selected_values = questionary_checkbox_values_raw(title=title, options=options)
+        selected_values = questionary_checkbox_values_raw(
+            title=title,
+            options=options,
+            default_values=resolved_defaults,
+        )
     except KeyboardInterrupt:
         _emit_prompt_interrupt_debug(
             kind="keyboard_interrupt", source="questionary.checkbox"
@@ -991,6 +1007,7 @@ def questionary_checkbox_values_raw(
     *,
     title: str,
     options: list[str],
+    default_values: list[str] | None = None,
 ) -> list[str] | None:
     """Render Questionary checkbox without extra logging logic."""
     if not options:
@@ -1000,9 +1017,22 @@ def questionary_checkbox_values_raw(
     except Exception:
         return None
     try:
+        resolved_defaults = (
+            {str(value) for value in default_values if str(value).strip()}
+            if default_values is not None
+            else {str(option) for option in options if str(option).strip()}
+        )
+        choices = [
+            questionary.Choice(
+                title=str(option),
+                value=str(option),
+                checked=str(option) in resolved_defaults,
+            )
+            for option in options
+        ]
         selected = questionary.checkbox(
             title,
-            choices=list(options),
+            choices=choices,
             style=_questionary_style(questionary),
         ).ask()
     except (EOFError, KeyboardInterrupt):
@@ -2422,6 +2452,7 @@ def print_panel(
     content: Union[str, Text, Group, list[RenderableType], tuple[RenderableType, ...]],
     title: Optional[str] = None,
     subtitle: Optional[str] = None,
+    title_align: Optional[str] = None,
     border_style: Optional[str] = None,
     box: Box = ROUNDED,
     padding: tuple = (1, 2),
@@ -2442,6 +2473,7 @@ def print_panel(
             - Group object: Group(Text(...), Text(...)) for multiple renderables
             - List/tuple of renderables: [Table(...), Text(...)] (wrapped in Group)
         title: Optional panel title (supports Rich markup strings)
+        title_align: Optional panel title alignment (e.g., "left", "center", "right")
         border_style: Border color style (defaults to brand color if None)
         box: Box style (MINIMAL, ROUNDED, etc.) - default: MINIMAL
         padding: Padding tuple (vertical, horizontal) - default: (0, 1)
@@ -2531,6 +2563,7 @@ def print_panel(
             panel_content,
             title=title,
             subtitle=subtitle,
+            title_align=title_align,
             border_style=border_style,
             box=box,
             padding=padding,
@@ -2540,6 +2573,7 @@ def print_panel(
             panel_content,
             title=title,
             subtitle=subtitle,
+            title_align=title_align,
             border_style=border_style,
             box=box,
             padding=padding,
@@ -4815,17 +4849,33 @@ def print_attack_paths_summary(
     table.add_column("#", justify="right", width=3)
     table.add_column("Path", style="cyan", no_wrap=False)
     table.add_column("Affected", style="white", no_wrap=False, width=10)
+    table.add_column("Target", style="white", no_wrap=False, width=10)
+    table.add_column("Exec", style="white", no_wrap=False, width=10)
     table.add_column("Status", style="magenta", no_wrap=False, width=10)
     table.add_column("Len", justify="right", width=4)
-    format_node_label, format_relation_label = _get_attack_path_narrative_formatters()
+    format_node_label, _, format_relation_display, _ = (
+        _get_attack_path_narrative_formatters()
+    )
 
-    def _format_inline_chain(nodes: list[object], rels: list[object]) -> Text:
+    def _format_inline_chain(
+        nodes: list[object],
+        rels: list[object],
+        steps: list[object] | None = None,
+    ) -> Text:
         if not nodes:
             return Text("N/A")
         chain = Text()
         truncated = False
         rels_to_render = rels
         nodes_to_render = nodes
+        step_details_to_render: list[dict[str, object] | None] = []
+        if isinstance(steps, list):
+            for step in steps:
+                if isinstance(step, dict):
+                    details = step.get("details")
+                    step_details_to_render.append(
+                        details if isinstance(details, dict) else None
+                    )
         if (
             isinstance(max_path_steps, int)
             and max_path_steps > 0
@@ -4834,6 +4884,7 @@ def print_attack_paths_summary(
             truncated = True
             rels_to_render = rels[:max_path_steps]
             nodes_to_render = nodes[: max_path_steps + 1]
+            step_details_to_render = step_details_to_render[:max_path_steps]
 
         chain.append(
             _mark_path_node(format_node_label(str(nodes_to_render[0]), domain))
@@ -4841,7 +4892,15 @@ def print_attack_paths_summary(
         for idx, rel in enumerate(rels_to_render):
             if idx + 1 >= len(nodes_to_render):
                 break
-            rel_label = format_relation_label(str(rel))
+            step_details = (
+                step_details_to_render[idx]
+                if idx < len(step_details_to_render)
+                else None
+            )
+            rel_label = format_relation_display(
+                rel,
+                details=step_details,
+            )
             chain.append(" → ", style="dim")
             chain.append(rel_label, style=BRAND_COLORS["warning"])
             chain.append(" → ", style="dim")
@@ -4860,26 +4919,71 @@ def print_attack_paths_summary(
             chain.append(f"...(+{remaining} more)", style="dim")
         return chain
 
+    def _format_exec_cell(meta: dict[str, object] | None) -> Text:
+        if not isinstance(meta, dict):
+            return Text("", style="dim")
+        execution_support_status = str(
+            meta.get("execution_support_status") or ""
+        ).strip()
+        if execution_support_status.lower() == "unsupported":
+            return Text("Unsupported", style=BRAND_COLORS["error"])
+        execution_ready_count = meta.get("execution_ready_count")
+        execution_candidate_count = meta.get("execution_candidate_count")
+        execution_context_required = bool(meta.get("execution_context_required"))
+        if not execution_context_required:
+            return Text("Direct", style=BRAND_COLORS["info"])
+        if not (
+            isinstance(execution_ready_count, int)
+            and execution_ready_count >= 0
+            and isinstance(execution_candidate_count, int)
+            and execution_candidate_count >= 0
+        ):
+            return Text("?", style="dim")
+        if execution_ready_count <= 0:
+            return Text("NeedsCred", style=BRAND_COLORS["error"])
+        if execution_candidate_count > execution_ready_count:
+            return Text(
+                f"{execution_ready_count}/{execution_candidate_count}",
+                style=BRAND_COLORS["success"],
+            )
+        return Text("Ready", style=BRAND_COLORS["success"])
+
     for idx, path in enumerate(paths[:show_count], start=1):
         nodes = path.get("nodes", [])
         rels = path.get("relations", [])
+        steps = path.get("steps", [])
         if not isinstance(nodes, list):
             nodes = []
         if not isinstance(rels, list):
             rels = []
+        if not isinstance(steps, list):
+            steps = []
 
-        path_str = _format_inline_chain(nodes, rels)
+        path_str = _format_inline_chain(nodes, rels, steps)
         length = path.get("length", len(rels))
         status = str(path.get("status") or "theoretical")
 
         affected_cell = ""
+        target_cell = ""
         meta = path.get("meta") if isinstance(path, dict) else None
         if isinstance(meta, dict):
             affected_count = meta.get("affected_user_count")
             if isinstance(affected_count, int):
                 affected_cell = str(affected_count)
+            target_kind = str(meta.get("execution_support_target_kind") or "").strip()
+            if target_kind:
+                target_cell = target_kind
+        exec_cell = _format_exec_cell(meta if isinstance(meta, dict) else None)
 
-        row = [str(idx), path_str, affected_cell, status, str(length)]
+        row = [
+            str(idx),
+            path_str,
+            affected_cell,
+            target_cell,
+            exec_cell,
+            status,
+            str(length),
+        ]
         table.add_row(*row)
 
     print_table(table, spacing="both")
@@ -4917,8 +5021,196 @@ def _fallback_format_attack_path_relation_label(relation: str) -> str:
     return value
 
 
+def _fallback_format_attack_path_relation_display(
+    relation: object,
+    *,
+    details: dict[str, object] | None = None,
+    formatter: Callable[[str], str] | None = None,
+) -> str:
+    """Fallback compact relation label when reporting narratives are unavailable."""
+    relation_text = str(relation or "").strip()
+    relation_label = (
+        formatter(relation_text)
+        if callable(formatter) and relation_text
+        else _fallback_format_attack_path_relation_label(relation_text)
+    )
+    if not isinstance(details, dict):
+        return relation_label
+    relation_key = relation_text.lower()
+    if relation_key == "userdescription":
+        source_username = str(details.get("source_username") or "").strip()
+        if source_username:
+            return f"{relation_label} (from {source_username})"
+        return relation_label
+    if relation_key in {"passwordinshare", "gpppassword"}:
+        host_hint = ""
+        share_hint = ""
+        artifact_hint = ""
+        for value in details.get("hosts_list"), details.get("hosts"):
+            if isinstance(value, list) and value:
+                host_hint = str(value[0] or "").strip()
+                if host_hint:
+                    break
+            elif isinstance(value, str) and value.strip():
+                host_hint = value.strip()
+                break
+        for value in details.get("shares_list"), details.get("shares"):
+            if isinstance(value, list) and value:
+                share_hint = str(value[0] or "").strip()
+                if share_hint:
+                    break
+            elif isinstance(value, str) and value.strip():
+                share_hint = value.strip()
+                break
+        artifact_text = str(details.get("artifact") or "").strip().replace("\\", "/")
+        if artifact_text:
+            artifact_hint = artifact_text.rsplit("/", 1)[-1]
+        context_hint = ""
+        if share_hint and artifact_hint:
+            context_hint = f"{share_hint}/{artifact_hint}"
+        elif host_hint and share_hint:
+            context_hint = f"{host_hint}:{share_hint}"
+        elif artifact_hint:
+            context_hint = artifact_hint
+        elif share_hint:
+            context_hint = share_hint
+        elif host_hint:
+            context_hint = host_hint
+        return f"{relation_label} [{context_hint}]" if context_hint else relation_label
+    if relation_key in {"dumplsa", "dumpdpapi", "dumplsass"}:
+        context_hint = str(details.get("target_host") or "").strip() or str(
+            details.get("credential_username") or ""
+        ).strip()
+        return f"{relation_label} [{context_hint}]" if context_hint else relation_label
+    return relation_label
+
+
+def _fallback_format_attack_path_source_context(
+    relation: object,
+    *,
+    details: dict[str, object] | None = None,
+) -> str:
+    """Fallback source-context formatter when reporting narratives are unavailable."""
+    if not isinstance(details, dict):
+        return ""
+
+    relation_key = str(relation or "").strip().lower()
+    if relation_key == "userdescription":
+        source_username = str(details.get("source_username") or "").strip()
+        auth_mechanism = str(details.get("auth_mechanism") or "").strip().lower()
+        secret = str(details.get("secret") or "").strip()
+        context_parts: list[str] = []
+        if source_username:
+            context_parts.append(f"description of {source_username}")
+        if auth_mechanism == "ldap_anonymous_bind":
+            context_parts.append("via anonymous LDAP bind")
+        elif auth_mechanism == "ldap_authenticated_bind":
+            context_parts.append("via authenticated LDAP query")
+        if secret:
+            context_parts.append(f"secret {mark_sensitive(secret, 'password')}")
+        return " ".join(context_parts).strip()
+
+    if relation_key in {"passwordinshare", "gpppassword"}:
+        host_hint = ""
+        share_hint = ""
+        artifact_hint = str(details.get("artifact") or "").strip().replace("\\", "/")
+        secret = str(details.get("secret") or details.get("password") or "").strip()
+        for value in details.get("hosts_list"), details.get("hosts"):
+            if isinstance(value, list) and value:
+                host_hint = str(value[0] or "").strip()
+                if host_hint:
+                    break
+            elif isinstance(value, str) and value.strip():
+                host_hint = value.strip()
+                break
+        for value in details.get("shares_list"), details.get("shares"):
+            if isinstance(value, list) and value:
+                share_hint = str(value[0] or "").strip()
+                if share_hint:
+                    break
+            elif isinstance(value, str) and value.strip():
+                share_hint = value.strip()
+                break
+        context_parts: list[str] = []
+        if share_hint:
+            context_parts.append(f"share {share_hint}")
+        if host_hint:
+            context_parts.append(f"host {host_hint}")
+        if artifact_hint:
+            context_parts.append(f"artifact {artifact_hint}")
+        if secret:
+            context_parts.append(f"secret {mark_sensitive(secret, 'password')}")
+        return " | ".join(context_parts)
+
+    if relation_key in {"dumplsa", "dumpdpapi", "dumplsass"}:
+        target_host = str(details.get("target_host") or "").strip()
+        credential_username = str(details.get("credential_username") or "").strip()
+        secret = str(details.get("secret") or "").strip()
+        context_parts: list[str] = []
+        if target_host:
+            context_parts.append(f"host {target_host}")
+        if credential_username:
+            context_parts.append(f"credential {credential_username}")
+        if secret:
+            context_parts.append(f"secret {mark_sensitive(secret, 'password')}")
+        return " | ".join(context_parts)
+
+    if relation_key == "passwordspray":
+        spray_type = str(details.get("spray_type") or "").strip()
+        password = str(details.get("password") or "").strip()
+        context_parts: list[str] = []
+        if spray_type:
+            context_parts.append(f"mode {spray_type}")
+        if password:
+            context_parts.append(f"password {mark_sensitive(password, 'password')}")
+        return " | ".join(context_parts)
+
+    if relation_key in {"domainpassreuse", "domainpassreusesource"}:
+        credential_type = str(details.get("credential_type") or "").strip().lower()
+        credential = str(details.get("credential") or "").strip()
+        evidence_source = str(details.get("evidence_source") or "").strip()
+        context_parts: list[str] = []
+        if credential:
+            secret_label = (
+                credential_type if credential_type in {"password", "hash"} else "secret"
+            )
+            context_parts.append(
+                f"{secret_label} {mark_sensitive(credential, 'password')}"
+            )
+        if evidence_source:
+            context_parts.append(f"evidence {evidence_source}")
+        return " | ".join(context_parts)
+
+    if relation_key in {
+        "localadminpassreuse",
+        "localcredreusesource",
+        "localcredtodomainreuse",
+    }:
+        credential_type = str(details.get("credential_type") or "").strip().lower()
+        credential = str(details.get("credential") or "").strip()
+        source = str(details.get("source") or "").strip()
+        context_parts: list[str] = []
+        if credential:
+            secret_label = (
+                credential_type if credential_type in {"password", "hash"} else "secret"
+            )
+            context_parts.append(
+                f"{secret_label} {mark_sensitive(credential, 'password')}"
+            )
+        if source:
+            context_parts.append(f"evidence {source}")
+        return " | ".join(context_parts)
+
+    return ""
+
+
 def _get_attack_path_narrative_formatters(
-) -> tuple[Callable[[str, str], str], Callable[[str], str]]:
+) -> tuple[
+    Callable[[str, str], str],
+    Callable[[str], str],
+    Callable[..., str],
+    Callable[..., str],
+]:
     """Resolve attack-path label formatters with a LITE-safe fallback."""
     global _ATTACK_PATH_NARRATIVE_FALLBACK_LOGGED
     try:
@@ -4929,8 +5221,22 @@ def _get_attack_path_narrative_formatters(
         )
         format_node_label = getattr(module, "format_node_label", None)
         format_relation_label = getattr(module, "format_relation_label", None)
-        if callable(format_node_label) and callable(format_relation_label):
-            return format_node_label, format_relation_label
+        format_relation_display = getattr(module, "format_relation_display", None)
+        format_relation_source_context = getattr(
+            module, "format_relation_source_context", None
+        )
+        if (
+            callable(format_node_label)
+            and callable(format_relation_label)
+            and callable(format_relation_display)
+            and callable(format_relation_source_context)
+        ):
+            return (
+                format_node_label,
+                format_relation_label,
+                format_relation_display,
+                format_relation_source_context,
+            )
         raise AttributeError(
             "attack_path_narratives module missing required formatter callables"
         )
@@ -4944,6 +5250,15 @@ def _get_attack_path_narrative_formatters(
         return (
             _fallback_format_attack_path_node_label,
             _fallback_format_attack_path_relation_label,
+            lambda relation, details=None: _fallback_format_attack_path_relation_display(
+                relation,
+                details=details,
+                formatter=_fallback_format_attack_path_relation_label,
+            ),
+            lambda relation, details=None: _fallback_format_attack_path_source_context(
+                relation,
+                details=details,
+            ),
         )
 
 
@@ -4997,9 +5312,112 @@ def print_attack_path_detail(
         spacing="both",
     )
 
+    meta = path.get("meta") if isinstance(path.get("meta"), dict) else {}
+    if isinstance(meta, dict):
+        execution_scope = str(meta.get("execution_scope") or "").strip()
+        if execution_scope:
+            execution_summary = Text()
+            execution_summary.append("Execution Scope: ", style="bold white")
+            execution_summary.append(execution_scope, style=BRAND_COLORS["info"])
+            _get_console().print(execution_summary)
+
+        affected_source = str(meta.get("affected_users_source") or "").strip()
+        affected_count = meta.get("affected_user_count")
+        if affected_source:
+            affected_summary = Text()
+            affected_summary.append("Affected Scope: ", style="bold white")
+            if isinstance(affected_count, int) and affected_count >= 0:
+                affected_summary.append(
+                    f"{affected_count} principal(s)", style=BRAND_COLORS["warning"]
+                )
+            else:
+                affected_summary.append("unknown", style="dim")
+            affected_summary.append(" via ", style="dim")
+            affected_summary.append(affected_source, style=BRAND_COLORS["info"])
+            _get_console().print(affected_summary)
+
+        execution_ready_count = meta.get("execution_ready_count")
+        execution_candidate_count = meta.get("execution_candidate_count")
+        execution_candidate_source = str(
+            meta.get("execution_candidate_source") or ""
+        ).strip()
+        execution_readiness_reason = str(
+            meta.get("execution_readiness_reason") or ""
+        ).strip()
+        execution_support_status = str(
+            meta.get("execution_support_status") or ""
+        ).strip()
+        execution_support_reason = str(
+            meta.get("execution_support_reason") or ""
+        ).strip()
+        execution_support_target_kind = str(
+            meta.get("execution_support_target_kind") or ""
+        ).strip()
+        if execution_support_status.lower() == "unsupported":
+            support_summary = Text()
+            support_summary.append("Execution Support: ", style="bold white")
+            support_summary.append("Unsupported", style=BRAND_COLORS["error"])
+            if execution_support_target_kind:
+                support_summary.append("  ", style="dim")
+                support_summary.append(
+                    f"target={execution_support_target_kind}",
+                    style=BRAND_COLORS["warning"],
+                )
+            if execution_support_reason:
+                support_summary.append("  ", style="dim")
+                support_summary.append(
+                    execution_support_reason, style=BRAND_COLORS["warning"]
+                )
+            _get_console().print(support_summary)
+        if (
+            isinstance(execution_ready_count, int)
+            and execution_ready_count >= 0
+            and isinstance(execution_candidate_count, int)
+            and execution_candidate_count >= 0
+        ):
+            readiness_summary = Text()
+            readiness_summary.append("Execution Readiness: ", style="bold white")
+            if execution_ready_count <= 0:
+                readiness_summary.append(
+                    "Needs stored credential",
+                    style=BRAND_COLORS["error"],
+                )
+            elif execution_candidate_count > execution_ready_count:
+                readiness_summary.append(
+                    f"{execution_ready_count}/{execution_candidate_count} ready",
+                    style=(
+                        BRAND_COLORS["success"]
+                        if execution_ready_count > 0
+                        else BRAND_COLORS["error"]
+                    ),
+                )
+            else:
+                readiness_summary.append(
+                    f"{execution_ready_count} ready",
+                    style=(
+                        BRAND_COLORS["success"]
+                        if execution_ready_count > 0
+                        else BRAND_COLORS["error"]
+                    ),
+                )
+            if execution_candidate_source:
+                readiness_summary.append(" via ", style="dim")
+                readiness_summary.append(
+                    execution_candidate_source, style=BRAND_COLORS["info"]
+                )
+            if execution_ready_count <= 0 and execution_readiness_reason:
+                readiness_summary.append("  ", style="dim")
+                readiness_summary.append(
+                    execution_readiness_reason, style=BRAND_COLORS["warning"]
+                )
+            _get_console().print(readiness_summary)
+
     steps = path.get("steps", [])
     if not isinstance(steps, list):
         steps = []
+    _, _, format_relation_display, format_relation_source_context = (
+        _get_attack_path_narrative_formatters()
+    )
 
     step_status_map: dict[tuple[str, str, str], object] = {}
     for step in steps:
@@ -5025,6 +5443,16 @@ def print_attack_path_detail(
     table.add_column("From", style="cyan", no_wrap=False)
     table.add_column("Relation", style="yellow", no_wrap=False)
     table.add_column("To", style="cyan", no_wrap=False)
+    has_source_context = any(
+        format_relation_source_context(
+            str(step.get("action") or step.get("relation") or ""),
+            details=step.get("details") if isinstance(step.get("details"), dict) else None,
+        )
+        for step in steps
+        if isinstance(step, dict)
+    )
+    if has_source_context:
+        table.add_column("Source Context", style="dim", no_wrap=False)
     table.add_column("Status", style="white", no_wrap=True)
 
     if nodes and rels:
@@ -5035,11 +5463,28 @@ def print_attack_path_detail(
             to_node = str(nodes[idx])
             rel_name = str(rel)
             status = step_status_map.get((from_node, to_node, rel_name), "discovered")
+            details = next(
+                (
+                    step.get("details")
+                    for step in steps
+                    if isinstance(step, dict)
+                    and str(step.get("action") or "") == rel_name
+                    and isinstance(step.get("details"), dict)
+                    and str(step["details"].get("from") or "") == from_node
+                    and str(step["details"].get("to") or "") == to_node
+                ),
+                None,
+            )
             table.add_row(
                 str(idx),
                 _mark_node(from_node),
-                rel_name,
+                format_relation_display(rel_name, details=details),
                 _mark_node(to_node),
+                *(
+                    [format_relation_source_context(rel_name, details=details)]
+                    if has_source_context
+                    else []
+                ),
                 _format_status(status),
             )
         print_table(table, spacing="after")
@@ -5060,8 +5505,13 @@ def print_attack_path_detail(
             table.add_row(
                 str(idx),
                 _mark_node(from_label),
-                action,
+                format_relation_display(action, details=details),
                 _mark_node(to_label),
+                *(
+                    [format_relation_source_context(action, details=details)]
+                    if has_source_context
+                    else []
+                ),
                 _format_status(step.get("status")),
             )
         print_table(table, spacing="after")
@@ -5213,6 +5663,19 @@ def _build_attack_steps_table(
     steps_table.add_column("#", justify="right", width=3)
     steps_table.add_column("Action", style="cyan", no_wrap=False)
     steps_table.add_column("Status", style="white", no_wrap=False)
+    _, _, format_relation_display, format_relation_source_context = (
+        _get_attack_path_narrative_formatters()
+    )
+    has_source_context = any(
+        format_relation_source_context(
+            str(step.get("action") or step.get("type") or ""),
+            details=step.get("details") if isinstance(step.get("details"), dict) else None,
+        )
+        for step in steps
+        if isinstance(step, dict)
+    )
+    if has_source_context:
+        steps_table.add_column("Source Context", style="dim", no_wrap=False)
     steps_table.add_column("Details", style="dim", no_wrap=False)
 
     truncated = len(steps) > max_steps
@@ -5222,11 +5685,17 @@ def _build_attack_steps_table(
         action = step.get("action") or step.get("type") or "N/A"
         status = str(step.get("status") or "pending").lower()
         status_style = status_styles.get(status, BRAND_COLORS["warning"])
-        details_text = _format_attack_step_details(step.get("details"))
+        details = step.get("details") if isinstance(step.get("details"), dict) else None
+        details_text = _format_attack_step_details(details)
         steps_table.add_row(
             str(step.get("step") or idx),
-            str(action),
+            format_relation_display(str(action), details=details),
             Text(status, style=f"bold {status_style}"),
+            *(
+                [format_relation_source_context(str(action), details=details)]
+                if has_source_context
+                else []
+            ),
             details_text or "—",
         )
 
@@ -5292,11 +5761,8 @@ def confirm_operation(
         ...     icon="🔐"
         ... )
     """
-    from rich.panel import Panel
     from rich.text import Text
     from rich.table import Table
-
-    console = _get_console()
 
     # Build the prompt message
     if show_panel and context:
@@ -5315,15 +5781,14 @@ def confirm_operation(
             context_table,
         )
 
-        panel = Panel(
+        print_panel(
             panel_content,
             title=f"{icon} {operation_name}",
             title_align="left",
             border_style=BRAND_COLORS["info"],
             padding=(1, 2),
+            spacing="none",
         )
-
-        console.print(panel)
         prompt_text = "Proceed with this operation?"
     else:
         # Compact format without panel
@@ -5338,7 +5803,7 @@ def confirm_operation(
         return confirm_ask(prompt_text, default=default)
     except KeyboardInterrupt:
         # Handle Ctrl+C gracefully
-        console.print("\n[yellow]Operation cancelled[/yellow]")
+        print_warning("Operation cancelled")
         return False
 
 

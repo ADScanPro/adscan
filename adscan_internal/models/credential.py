@@ -9,6 +9,8 @@ from typing import Optional
 from datetime import datetime
 from enum import Enum
 
+from adscan_core.time_utils import ensure_utc, parse_iso_datetime_or_now, utc_now
+
 
 class CredentialType(str, Enum):
     """Type of credential."""
@@ -61,7 +63,7 @@ class Credential:
     source: CredentialSource = CredentialSource.UNKNOWN
     is_valid: bool = False
     is_admin: bool = False
-    discovered_at: datetime = field(default_factory=datetime.utcnow)
+    discovered_at: datetime = field(default_factory=utc_now)
 
     # Additional metadata
     metadata: dict = field(default_factory=dict)
@@ -105,9 +107,7 @@ class Credential:
             source=source,
             is_valid=data.get("is_valid", False),
             is_admin=data.get("is_admin", False),
-            discovered_at=datetime.fromisoformat(data["discovered_at"])
-            if "discovered_at" in data
-            else datetime.utcnow(),
+            discovered_at=parse_iso_datetime_or_now(data.get("discovered_at")),
             metadata=data.get("metadata", {}),
         )
 
@@ -160,7 +160,7 @@ class LocalCredential:
     # Discovery metadata
     source: CredentialSource = CredentialSource.UNKNOWN
     is_admin: bool = False
-    discovered_at: datetime = field(default_factory=datetime.utcnow)
+    discovered_at: datetime = field(default_factory=utc_now)
 
     # Additional metadata
     metadata: dict = field(default_factory=dict)
@@ -217,7 +217,7 @@ class KerberosTicket:
     expires_at: Optional[datetime] = None
 
     # Discovery metadata
-    discovered_at: datetime = field(default_factory=datetime.utcnow)
+    discovered_at: datetime = field(default_factory=utc_now)
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -245,7 +245,10 @@ class KerberosTicket:
             True if ticket is expired
         """
         if self.expires_at:
-            return datetime.utcnow() > self.expires_at
+            expires_at = ensure_utc(self.expires_at)
+            if expires_at is None:
+                return False
+            return utc_now() > expires_at
         return False
 
     @property

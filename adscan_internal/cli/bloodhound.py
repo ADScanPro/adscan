@@ -21,6 +21,7 @@ from adscan_internal import (
     print_exception,
     print_info,
     print_info_debug,
+    print_info_table,
     print_info_list,
     print_info_verbose,
     print_instruction,
@@ -320,7 +321,14 @@ class BloodHoundShell(Protocol):
         self, domain: str, username: str, *, logging: bool = True
     ) -> bool: ...
 
-    def _postprocess_user_list_file(self, domain: str, filename: str) -> None: ...
+    def _postprocess_user_list_file(
+        self,
+        domain: str,
+        filename: str,
+        *,
+        trigger_followups: bool = True,
+        source: str | None = None,
+    ) -> None: ...
 
     def _process_bloodhound_computers_list(
         self, domain: str, comp_file: str, computers: list[str]
@@ -1133,10 +1141,8 @@ def run_bloodhound_attack_paths(
     )
     from adscan_internal.services.attack_graph_service import (
         add_bloodhound_path_edges,
-        compute_maximal_attack_paths,
-        get_owned_domain_usernames,
+        get_owned_domain_usernames_for_attack_paths,
         load_attack_graph,
-        path_to_display_record,
         save_attack_graph,
     )
     from adscan_internal.rich_output import (
@@ -1902,26 +1908,13 @@ def run_bloodhound_attack_paths(
             f"[attack_paths] skipping owned-user path prompt for {marked_domain}: domain is pwned"
         )
         return
-    owned_users = get_owned_domain_usernames(shell, target_domain)
+    owned_users = get_owned_domain_usernames_for_attack_paths(shell, target_domain)
     if owned_users:
-        try:
-            from adscan_internal.services.attack_graph_service import (
-                _node_is_tier0,
-                get_node_by_label,
-            )
-
-            filtered: list[str] = []
-            for username in owned_users:
-                label = f"{username}@{target_domain}"
-                node = get_node_by_label(shell, target_domain, label=label)
-                if node is None:
-                    node = get_node_by_label(shell, target_domain, label=username)
-                if node is not None and _node_is_tier0(node):
-                    continue
-                filtered.append(username)
-            owned_users = filtered
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
+        print_info_debug(
+            "[attack_paths] owned-user candidates for Phase 2: "
+            f"domain={mark_sensitive(target_domain, 'domain')} "
+            f"users={', '.join(mark_sensitive(user, 'user') for user in owned_users)}"
+        )
     if owned_users:
         try:
             from adscan_internal.cli.owned_privileged_escalation import (
@@ -1956,18 +1949,26 @@ def run_bloodhound_attack_paths(
             include_all=False,
         )
     else:
-        # Fallback: show up to 10 maximal paths for transparency when no owned users exist yet.
-        computed = compute_maximal_attack_paths(graph, max_depth=max(max_depth, 10))
-        display_paths = [path_to_display_record(graph, path) for path in computed]
-        display_paths = sorted(
-            display_paths,
-            key=lambda item: (
-                int(item.get("length", 0))
-                if str(item.get("length", "")).isdigit()
-                else 0,
-                str(item.get("source", "")).lower(),
-                str(item.get("target", "")).lower(),
-            ),
+        # Fallback: use the global shell-aware domain-path computation so this
+        # summary inherits the same affected-user metadata, filtering, and
+        # debug instrumentation as the regular `attack_paths <domain>` UX.
+        from adscan_internal.services.attack_graph_service import (
+            get_attack_path_summaries,
+        )
+
+        print_info_debug(
+            "[attack_paths] Phase 2 falling back to domain-wide summaries because no owned users are stored: "
+            f"domain={mark_sensitive(target_domain, 'domain')}"
+        )
+
+        display_paths = get_attack_path_summaries(
+            shell,
+            target_domain,
+            scope="domain",
+            max_depth=max(max_depth, 10),
+            max_paths=20,
+            require_high_value_target=True,
+            target_mode="tier0",
         )
         if display_paths:
             print_attack_paths_summary(
@@ -2048,11 +2049,9 @@ def run_show_attack_paths(
 ) -> None:
     """Show attack paths and optionally a detailed path."""
     from adscan_internal.services.attack_graph_service import (
-        compute_display_paths_for_domain,
-        compute_display_paths_for_owned_users,
-        compute_display_paths_for_user,
         get_attack_paths_cache_stats,
-        get_owned_domain_usernames,
+        get_attack_path_summaries,
+        get_owned_domain_usernames_for_attack_paths,
     )
     from adscan_internal.services.membership_snapshot import (
         get_membership_snapshot_cache_stats,
@@ -2186,16 +2185,17 @@ def run_show_attack_paths(
 
     def _compute_paths() -> list[dict[str, Any]]:
         if start_user_norm == "owned":
-            owned_users = get_owned_domain_usernames(shell, target_domain)
+            owned_users = get_owned_domain_usernames_for_attack_paths(shell, target_domain)
             if not owned_users:
                 marked_domain = mark_sensitive(target_domain, "domain")
                 print_warning(
-                    f"No owned domain users found for {marked_domain} (no stored domain credentials)."
+                    f"No eligible owned domain users found for {marked_domain}."
                 )
                 return []
-            owned_paths = compute_display_paths_for_owned_users(
+            owned_paths = get_attack_path_summaries(
                 shell,
                 target_domain,
+                scope="owned",
                 max_depth=max_depth,
                 max_paths=max_paths_compute,
                 require_high_value_target=not include_all,
@@ -2212,9 +2212,10 @@ def run_show_attack_paths(
                 return []
             return _sort_paths(owned_paths)
         if start_user:
-            user_paths = compute_display_paths_for_user(
+            user_paths = get_attack_path_summaries(
                 shell,
                 target_domain,
+                scope="user",
                 username=start_user,
                 max_depth=max_depth,
                 max_paths=max_paths_compute,
@@ -2222,9 +2223,10 @@ def run_show_attack_paths(
                 target_mode=target_mode,
             )
             return _sort_paths(user_paths)
-        domain_paths = compute_display_paths_for_domain(
+        domain_paths = get_attack_path_summaries(
             shell,
             target_domain,
+            scope="domain",
             max_depth=max_depth,
             max_paths=max_paths_compute,
             require_high_value_target=not include_all,
@@ -2297,7 +2299,123 @@ def run_show_attack_steps(
     from adscan_internal.rich_output import mark_sensitive
     from adscan_internal.services.attack_graph_service import (
         compute_display_steps_for_domain,
+        load_attack_graph,
     )
+
+    def _render_local_cred_domain_reuse_clusters(
+        *,
+        graph: dict[str, Any],
+        relation_terms: set[str] | None,
+    ) -> None:
+        """Render compact summary for LocalCredToDomainReuse clusters."""
+        if start_user:
+            return
+        if relation_terms and not (
+            {"localcredtodomainreuse", "localcredreusesource"} & relation_terms
+        ):
+            return
+
+        nodes = graph.get("nodes")
+        edges = graph.get("edges")
+        if not isinstance(nodes, dict) or not isinstance(edges, list):
+            return
+
+        def _node_label(node_id: str) -> str:
+            node = nodes.get(node_id)
+            if not isinstance(node, dict):
+                return node_id
+            return str(node.get("label") or node.get("name") or node_id)
+
+        cluster_meta: dict[str, dict[str, str]] = {}
+        for node_id, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            props = node.get("properties")
+            if not isinstance(props, dict):
+                continue
+            if str(props.get("cluster_type") or "").strip() != "local_credential_reuse":
+                continue
+            cluster_meta[str(node_id)] = {
+                "fingerprint": str(props.get("credential_fingerprint") or "").strip(),
+                "credential_type": str(props.get("credential_type") or "").strip()
+                or "-",
+            }
+
+        if not cluster_meta:
+            return
+
+        hosts_by_cluster: dict[str, set[str]] = {
+            cluster_id: set() for cluster_id in cluster_meta
+        }
+        users_by_cluster: dict[str, set[str]] = {
+            cluster_id: set() for cluster_id in cluster_meta
+        }
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            relation = str(edge.get("relation") or "").strip().lower()
+            src_id = str(edge.get("from") or "").strip()
+            dst_id = str(edge.get("to") or "").strip()
+            if (
+                relation == "localcredreusesource"
+                and dst_id in hosts_by_cluster
+                and src_id
+            ):
+                hosts_by_cluster[dst_id].add(_node_label(src_id))
+            elif (
+                relation == "localcredtodomainreuse"
+                and src_id in users_by_cluster
+                and dst_id
+            ):
+                users_by_cluster[src_id].add(_node_label(dst_id))
+
+        rows_with_key: list[tuple[tuple[int, int, str], dict[str, Any]]] = []
+        for cluster_id, meta in cluster_meta.items():
+            hosts = sorted(hosts_by_cluster.get(cluster_id, set()), key=str.lower)
+            users = sorted(users_by_cluster.get(cluster_id, set()), key=str.lower)
+            if not hosts and not users:
+                continue
+            hosts_preview = ", ".join(
+                mark_sensitive(host, "hostname") for host in hosts[:3]
+            )
+            users_preview = ", ".join(
+                mark_sensitive(user, "user") for user in users[:3]
+            )
+            if len(hosts) > 3:
+                hosts_preview += f" (+{len(hosts) - 3} more)"
+            if len(users) > 3:
+                users_preview += f" (+{len(users) - 3} more)"
+            rows_with_key.append(
+                (
+                    (-len(users), -len(hosts), str(meta.get("fingerprint") or "")),
+                    {
+                        "Credential Cluster": mark_sensitive(
+                            str(meta.get("fingerprint") or "-"), "service"
+                        ),
+                        "Credential Type": str(meta.get("credential_type") or "-"),
+                        "Source Hosts": len(hosts),
+                        "Domain Users": len(users),
+                        "Hosts": hosts_preview or "-",
+                        "Users": users_preview or "-",
+                    },
+                )
+            )
+
+        if not rows_with_key:
+            return
+        rows = [row for _, row in sorted(rows_with_key, key=lambda item: item[0])]
+        print_info_table(
+            rows,
+            [
+                "Credential Cluster",
+                "Credential Type",
+                "Source Hosts",
+                "Domain Users",
+                "Hosts",
+                "Users",
+            ],
+            title="Local Credential Reuse (Domain) Clusters",
+        )
 
     if target_domain not in shell.domains:
         marked_domain = mark_sensitive(target_domain, "domain")
@@ -2307,8 +2425,9 @@ def run_show_attack_steps(
         return
 
     steps = compute_display_steps_for_domain(shell, target_domain, username=start_user)
+    wanted_relations: set[str] | None = None
     if relation_filter:
-        wanted = {
+        wanted_relations = {
             part.strip().lower()
             for part in str(relation_filter).split(",")
             if part.strip()
@@ -2316,7 +2435,7 @@ def run_show_attack_steps(
         steps = [
             step
             for step in steps
-            if str(step.get("action") or "").strip().lower() in wanted
+            if str(step.get("action") or "").strip().lower() in wanted_relations
         ]
     if not steps:
         if start_user:
@@ -2333,6 +2452,16 @@ def run_show_attack_steps(
         max_display=max_display,
         start_user=start_user,
     )
+    try:
+        graph = load_attack_graph(shell, target_domain)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return
+    if isinstance(graph, dict):
+        _render_local_cred_domain_reuse_clusters(
+            graph=graph,
+            relation_terms=wanted_relations,
+        )
 
 
 def enumerate_user_aces(
@@ -3015,7 +3144,11 @@ def run_bloodhound_all_users(shell: BloodHoundShell, target_domain: str) -> None
     try:
         users = shell._get_bloodhound_service().get_users(domain=target_domain)
         shell._write_user_list_file(target_domain, "enabled_users.txt", users)
-        shell._postprocess_user_list_file(target_domain, "enabled_users.txt")
+        shell._postprocess_user_list_file(
+            target_domain,
+            "enabled_users.txt",
+            source="bloodhound_enabled_users",
+        )
         return
     except Exception as e:
         telemetry.capture_exception(e)
@@ -3045,7 +3178,11 @@ def run_bloodhound_admin_users(shell: BloodHoundShell, target_domain: str) -> No
             domain=target_domain, filter_type="high_value"
         )
         shell._write_user_list_file(target_domain, "admins.txt", users)
-        shell._postprocess_user_list_file(target_domain, "admins.txt")
+        shell._postprocess_user_list_file(
+            target_domain,
+            "admins.txt",
+            source="bloodhound_admin_users",
+        )
         return
     except Exception as e:
         telemetry.capture_exception(e)
@@ -3075,7 +3212,11 @@ def run_bloodhound_privileged_users(shell: BloodHoundShell, target_domain: str) 
             domain=target_domain, filter_type="admin"
         )
         shell._write_user_list_file(target_domain, "privileged.txt", users)
-        shell._postprocess_user_list_file(target_domain, "privileged.txt")
+        shell._postprocess_user_list_file(
+            target_domain,
+            "privileged.txt",
+            source="bloodhound_privileged_users",
+        )
         return
     except Exception as e:
         telemetry.capture_exception(e)

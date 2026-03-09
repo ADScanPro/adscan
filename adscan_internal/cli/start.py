@@ -18,6 +18,7 @@ import sys
 from adscan_internal import (
     print_error,
     print_info,
+    print_info_debug,
     print_info_verbose,
     print_warning,
     print_instruction,
@@ -55,6 +56,222 @@ class _NetworkPreflightCheck:
     suggestion: str | None = None
 
 
+_LAB_STRONG_INFERENCE_THRESHOLD = 0.90
+_USER_CONFIRMED_LAB_STATES = {"manual", "accepted_inference"}
+
+
+def _has_explicit_lab_context(shell: Any) -> bool:
+    """Return True when the current lab context came from explicit user input.
+
+    Inferred contexts always populate ``lab_inference_source``. This lets us
+    distinguish user-selected provider/lab values from tentative, replaceable
+    inference results.
+    """
+    has_context = bool(
+        getattr(shell, "lab_provider", None) or getattr(shell, "lab_name", None)
+    )
+    if getattr(shell, "lab_confirmation_state", None) in _USER_CONFIRMED_LAB_STATES:
+        return has_context
+    return has_context and not getattr(shell, "lab_inference_source", None)
+
+
+def _current_lab_inference_confidence(shell: Any) -> float | None:
+    """Return the current inference confidence, normalized to float."""
+    raw_value = getattr(shell, "lab_inference_confidence", None)
+    if raw_value is None:
+        return None
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _should_replace_existing_inference(shell: Any, new_confidence: float) -> bool:
+    """Return True when a new inference should replace the current one."""
+    if _has_explicit_lab_context(shell):
+        return False
+    current_confidence = _current_lab_inference_confidence(shell)
+    if current_confidence is None:
+        return True
+    return float(new_confidence) >= current_confidence
+
+
+def _apply_lab_inference_result_to_shell(shell: Any, result: Any) -> bool:
+    """Apply an inferred lab result to the shell when policy allows it.
+
+    Stronger or first-time inference results may replace older inferred values.
+    Explicit user-selected context is preserved.
+    """
+    if not _should_replace_existing_inference(shell, float(result.confidence)):
+        return False
+
+    explicit_provider = bool(
+        getattr(shell, "lab_provider", None)
+        and not getattr(shell, "lab_inference_source", None)
+    )
+    explicit_lab = bool(
+        getattr(shell, "lab_name", None)
+        and not getattr(shell, "lab_inference_source", None)
+    )
+
+    if not getattr(shell, "type", None):
+        shell.type = result.workspace_type
+
+    if result.lab_provider and not explicit_provider:
+        shell.lab_provider = result.lab_provider
+
+    if result.lab_name and not explicit_lab:
+        existing_provider = getattr(shell, "lab_provider", None)
+        if not existing_provider or existing_provider == result.lab_provider:
+            shell.lab_name = result.lab_name
+            shell.lab_name_whitelisted = result.lab_name_whitelisted
+
+    shell.lab_inference_source = result.source.value
+    shell.lab_inference_confidence = float(result.confidence)
+    shell.lab_confirmation_state = None
+    return True
+
+
+def _clear_inferred_lab_context(shell: Any) -> None:
+    """Clear inferred lab metadata and inferred lab values from the shell."""
+    if getattr(shell, "lab_inference_source", None):
+        shell.lab_provider = None
+        shell.lab_name = None
+        shell.lab_name_whitelisted = None
+    shell.lab_inference_source = None
+    shell.lab_inference_confidence = None
+    if getattr(shell, "lab_confirmation_state", None) == "accepted_inference":
+        shell.lab_confirmation_state = None
+
+
+def _set_user_selected_lab_context(
+    shell: Any,
+    *,
+    provider: str,
+    lab_name: str,
+    whitelisted: bool,
+) -> None:
+    """Persist a manual operator choice as explicit lab context."""
+    shell.lab_provider = provider
+    shell.lab_name = lab_name
+    shell.lab_name_whitelisted = whitelisted
+    shell.lab_inference_source = None
+    shell.lab_inference_confidence = None
+    shell.lab_confirmation_state = "manual"
+
+
+def _accept_inferred_lab_context(shell: Any) -> None:
+    """Mark the current inferred lab context as confirmed by the operator."""
+    if getattr(shell, "lab_provider", None) or getattr(shell, "lab_name", None):
+        shell.lab_confirmation_state = "accepted_inference"
+
+
+def maybe_offer_post_scan_lab_confirmation(shell: Any) -> None:
+    """Prompt once at scan end when lab context is weak or still unknown.
+
+    Policy:
+    - Strong inference (>= 0.90): accepted silently.
+    - Weak inference (< 0.90): prompt once to accept/change/skip.
+    - Unknown lab/provider: prompt once for optional manual entry.
+    """
+    if getattr(shell, "type", None) != "ctf":
+        return
+    if getattr(shell, "_lab_prompt_shown", False):
+        return
+
+    provider = getattr(shell, "lab_provider", None)
+    lab_name = getattr(shell, "lab_name", None)
+    inference_source = getattr(shell, "lab_inference_source", None)
+    confidence = _current_lab_inference_confidence(shell)
+    confirmation_state = getattr(shell, "lab_confirmation_state", None)
+
+    if confirmation_state == "accepted_inference":
+        return
+
+    should_prompt = not provider or (
+        inference_source
+        and (confidence is None or confidence < _LAB_STRONG_INFERENCE_THRESHOLD)
+    )
+    if not should_prompt:
+        return
+
+    shell._lab_prompt_shown = True
+    shell.console.print()
+
+    if inference_source and provider and lab_name:
+        marked_provider = mark_sensitive(provider, "provider")
+        marked_lab = mark_sensitive(lab_name, "lab")
+        percent = int(round((confidence or 0.0) * 100))
+        print_panel(
+            "[bold]ADscan inferred the target lab from scan/workspace context.[/bold]\n\n"
+            f"Provider: {marked_provider}\n"
+            f"Lab: {marked_lab}\n"
+            f"Source: {inference_source}\n"
+            f"Confidence: {percent}%\n\n"
+            "[dim]Accept to keep it, reject to enter a different machine, or press Enter later to skip.[/dim]",
+            title="[bold]Lab Confirmation[/bold]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+        try:
+            if Confirm.ask("Use this inferred lab context?", default=True):
+                _accept_inferred_lab_context(shell)
+                if hasattr(shell, "save_workspace_data"):
+                    try:
+                        shell.save_workspace_data()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        # Explicit rejection means we should not keep the weak inferred value.
+        _clear_inferred_lab_context(shell)
+
+    try:
+        user_input = Prompt.ask(
+            "[dim]Which machine were you testing? (optional, Enter to skip)[/dim]",
+            default="",
+            console=shell.console,
+        )
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    if not user_input or not user_input.strip():
+        return
+
+    try:
+        from adscan_core.domain_inference import resolve_lab_from_text  # noqa: PLC0415
+
+        resolved = resolve_lab_from_text(user_input.strip())
+    except Exception:  # noqa: BLE001
+        resolved = None
+
+    if not resolved:
+        print_info_debug(
+            "[domain_inference] post-scan confirmation: no catalog match for manual input"
+        )
+        return
+
+    resolved_provider, resolved_lab, resolved_whitelisted = resolved
+    _set_user_selected_lab_context(
+        shell,
+        provider=resolved_provider,
+        lab_name=resolved_lab,
+        whitelisted=resolved_whitelisted,
+    )
+    print_info_debug(
+        f"[domain_inference] post-scan confirmation resolved: "
+        f"provider={resolved_provider} lab={resolved_lab} "
+        f"whitelisted={resolved_whitelisted}"
+    )
+    if hasattr(shell, "save_workspace_data"):
+        try:
+            shell.save_workspace_data()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _workspace_has_domain_data(shell: Any) -> bool:
     """Return True when the workspace has domain data worth cleaning.
 
@@ -69,7 +286,7 @@ def _workspace_has_domain_data(shell: Any) -> bool:
     return bool(domains_data)
 
 
-_WORKSPACE_CLEAN_CONFIRMATION = "I want to delete the workspace"
+_WORKSPACE_CLEAN_CONFIRMATION = "I want to clean the workspace"
 
 
 def _prompt_workspace_cleanup(shell: Any) -> None:
@@ -1012,7 +1229,7 @@ def maybe_relaunch_into_venv(
         print_error(f"Virtual environment Python not found at {venv_python}.")
         print_instruction("Please run: adscan install")
         docs_url = (
-            "https://www.adscanpro.com/docs/troubleshooting"
+            "https://www.adscanpro.com/docs/guides/troubleshooting"
             "?utm_source=cli&utm_medium=install_error#virtualenv-setup"
         )
         print_info(f"💡 [link={docs_url}]Troubleshooting installation errors[/link]")
@@ -1821,6 +2038,7 @@ def run_start_unauth(shell, args: str | None) -> None:
             return
 
         # Skip to enumeration for this domain
+        _maybe_apply_domain_inference(shell, known_domain)
         shell.workspace_save()
         if not shell._is_ctf_domain_pwned(known_domain):
             shell.ask_for_unauth_scan(known_domain)
@@ -1962,6 +2180,7 @@ def run_start_unauth(shell, args: str | None) -> None:
                 ):
                     return
 
+                _maybe_apply_domain_inference(shell, known_domain)
                 shell.workspace_save()
                 if not shell._is_ctf_domain_pwned(known_domain):
                     shell.ask_for_unauth_scan(known_domain)
@@ -2027,6 +2246,167 @@ def _prompt_auth_credentials_interactive(shell: Any) -> tuple[str, str] | None:
             return None
 
 
+def _maybe_apply_domain_inference(shell: Any, domain: str | None) -> None:
+    """Apply domain-based lab/workspace inference to the shell when context is missing.
+
+    Runs inference from the domain name and populates shell attributes
+    (``type``, ``lab_provider``, ``lab_name``, ``lab_name_whitelisted``) only
+    when they are not already explicitly set.  After updating the shell it
+    persists the new values via ``save_workspace_data`` so subsequent sessions
+    on the same workspace inherit the inferred context.
+
+    This function is best-effort: any exception during inference or persistence
+    is silently swallowed so that it can never block a scan.
+
+    Args:
+        shell: The PentestShell instance (or any compatible object).
+        domain: Fully qualified domain name being scanned.  Inference is
+            skipped when this is ``None`` or empty.
+    """
+    if not domain:
+        print_info_debug("[domain_inference] skip: domain is empty")
+        return
+
+    # Lab context inference is meaningless for audit workspaces — skip entirely.
+    if getattr(shell, "type", None) == "audit":
+        print_info_debug("[domain_inference] skip: workspace type is audit")
+        return
+
+    marked_domain = mark_sensitive(domain, "domain")
+    explicit_context_locked = _has_explicit_lab_context(shell)
+    current_provider: str | None = (
+        getattr(shell, "lab_provider", None) if explicit_context_locked else None
+    )
+    current_lab: str | None = (
+        getattr(shell, "lab_name", None) if explicit_context_locked else None
+    )
+
+    # Explicitly selected provider+lab — nothing to infer.
+    if current_provider and current_lab:
+        print_info_debug(
+            f"[domain_inference] skip for {marked_domain}: "
+            f"context already set (provider={current_provider} lab={current_lab})"
+        )
+        return
+
+    try:
+        from adscan_core.domain_inference import (
+            InferenceSource,
+            infer_from_ctf_context,
+        )
+
+        result = infer_from_ctf_context(
+            domain,
+            workspace_name=getattr(shell, "current_workspace", None),
+            pdc_hostname=getattr(shell, "pdc_hostname", None),
+            current_lab_provider=current_provider,
+            current_lab_name=current_lab,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"[domain_inference] error for {marked_domain}: {exc}")
+        return
+
+    if result.source is InferenceSource.DEFAULT:
+        # No confident signal — ensure workspace_type has a sane default.
+        if not getattr(shell, "type", None):
+            shell.type = "ctf"
+        print_info_debug(
+            f"[domain_inference] default fallback for {marked_domain}: "
+            f"no TLD/GOAD/name/pdc/sld match — workspace_type forced to ctf"
+        )
+        return
+
+    if not _apply_lab_inference_result_to_shell(shell, result):
+        print_info_debug(
+            f"[domain_inference] skipped weaker result for {marked_domain}: "
+            f"source={result.source.value} confidence={result.confidence:.2f}"
+        )
+        return
+
+    print_info_debug(
+        f"[domain_inference] {result.source.value} matched for {marked_domain}: "
+        f"type={getattr(shell, 'type', None)} "
+        f"provider={getattr(shell, 'lab_provider', None)} "
+        f"lab={getattr(shell, 'lab_name', None)} "
+        f"whitelisted={getattr(shell, 'lab_name_whitelisted', None)} "
+        f"confidence={result.confidence:.2f}"
+    )
+
+    # Persist updated lab context to workspace variables (best-effort).
+    if hasattr(shell, "save_workspace_data"):
+        try:
+            shell.save_workspace_data()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _maybe_upgrade_inference_from_pdc(shell: Any, domain: str | None) -> None:
+    """Upgrade lab inference metadata once PDC hostname is known.
+
+    ``_maybe_apply_domain_inference`` fires at scan-start, before
+    ``dns_find_dcs`` has resolved the PDC hostname.  This function is called
+    *after* ``shell.pdc_hostname`` is populated so that
+    ``infer_from_pdc_hostname`` can run with real data.
+
+    Behaviour:
+    * Explicit user-selected context is preserved.
+    * Inferred context may be upgraded when the PDC-based result is stronger
+      than the current inferred result.
+    * Best-effort: any exception is silently swallowed so the scan is never
+      interrupted.
+
+    Args:
+        shell: The PentestShell instance.
+        domain: Fully qualified domain name being scanned.
+    """
+    if not domain:
+        return
+    if getattr(shell, "type", None) == "audit":
+        return
+
+    pdc_hostname: str | None = getattr(shell, "pdc_hostname", None)
+    if not pdc_hostname:
+        return
+
+    try:
+        from adscan_core.domain_inference import (  # noqa: PLC0415
+            InferenceSource,
+            infer_from_ctf_context,
+        )
+
+        explicit_context_locked = _has_explicit_lab_context(shell)
+
+        result = infer_from_ctf_context(
+            domain,
+            workspace_name=getattr(shell, "current_workspace", None),
+            pdc_hostname=pdc_hostname,
+            current_lab_provider=(
+                getattr(shell, "lab_provider", None) if explicit_context_locked else None
+            ),
+            current_lab_name=(
+                getattr(shell, "lab_name", None) if explicit_context_locked else None
+            ),
+        )
+        if result.source is InferenceSource.DEFAULT:
+            return
+
+        if not _apply_lab_inference_result_to_shell(shell, result):
+            return
+        print_info_debug(
+            f"[domain_inference] pdc_hostname update: "
+            f"source={result.source.value} confidence={result.confidence:.2f} "
+            f"pdc_hostname={mark_sensitive(pdc_hostname, 'hostname')}"
+        )
+        if hasattr(shell, "save_workspace_data"):
+            try:
+                shell.save_workspace_data()
+            except Exception:  # noqa: BLE001
+                pass
+
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _start_auth_with_params(
     shell: Any,
     *,
@@ -2036,6 +2416,7 @@ def _start_auth_with_params(
     password: str,
 ) -> None:
     """Run the authenticated scan flow for validated parameters."""
+    _maybe_apply_domain_inference(shell, domain)
     interactive_mode = bool(sys.stdin.isatty())
     if not _run_start_network_preflight(
         shell,
@@ -2100,11 +2481,23 @@ def _start_auth_with_params(
         ).hexdigest()[:12]
 
     telemetry.capture("start_auth", properties)
+    print_info_debug(
+        "[start_auth] verified input context prepared; authenticated enumeration "
+        f"will be forced after credential validation for domain "
+        f"{mark_sensitive(domain, 'domain')}"
+    )
     print_info_verbose(
         f"Adding credential for domain {mark_sensitive(domain, 'domain')} "
         f"with PDC IP {mark_sensitive(pdc_ip, 'ip')}"
     )
-    shell.add_credential(domain, username, password, pdc_ip=pdc_ip)
+    shell.add_credential(
+        domain,
+        username,
+        password,
+        pdc_ip=pdc_ip,
+        force_authenticated_enumeration=True,
+        prompt_when_already_authenticated=True,
+    )
 
 
 def run_start_auth(shell, args: str | None) -> None:

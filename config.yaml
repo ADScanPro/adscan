@@ -35,7 +35,7 @@
   confidence: weak
   type: pattern
   values:
-    - (?P<wrap>[\"'`(])?\s*(?P<variable>(\w*(?i:(?<!by)passw?o?r?d?s?(?!e[dns]|ing|ion|age)|pwd?\b|\bp/w\b|token|secret|key|credential)\w*|비밀번호|비번|패스워드|키|암호화?|토큰))[\"'`]*(\s+(?i:is|are|was|were|set\s+to)(\s*[:-])?\s+|\s*(설정은|[=:!]{1,3})\s*)(?P<quote>[\"'`]{1,6})?(?P<value>(?(quote)(?(wrap)[^\"'`)]{4,80}|[^\"'`]{4,80})|(?(wrap)[^\"'`)]{4,80}|\S{4,80})))
+    - (?P<wrap>[\"'`(])?\s*(?P<variable>(\w*(?i:(?<!by)passw?o?r?d?s?(?!e[dns]|ing|ion|age)|pwd?\b|\bp/w\b|token|secret|key|credential)\w*|비밀번호|비번|패스워드|키|암호화?|토큰))[\"'`]*(\s+(?i:is|are|was|were|to|set\s+to)(\s*[:-])?\s+|\s*(설정은|[=:!]{1,3})\s*)(?P<quote>[\"'`]{1,6})?(?P<value>(?(quote)(?(wrap)[^\"'`)]{4,80}|[^\"'`]{4,80})|(?(wrap)[^\"'`)]{4,80}|\S{4,80})))
   filter_type:
     - ValueAllowlistCheck
     - LineGitBinaryCheck

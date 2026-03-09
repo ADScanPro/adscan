@@ -123,6 +123,7 @@ _DOCKER_RUNTIME_CONTEXT_EMITTED = False
 _DOCKER_HOST_RESOURCES_CONTEXT_EMITTED = False
 _DOCKER_HOST_ENGINE_OVERRIDE_APPLIED = False
 _DOCKER_HOST_ENGINE_OVERRIDE_DECLINED = False
+_DOCKER_CLI_RUNTIME_FLAVOR_CACHE: tuple[str, str] | None = None
 _DOCKER_PULL_DNS_PREFLIGHT_HOST = "registry-1.docker.io"
 _DOCKER_PULL_NETWORK_PREFLIGHT_TIMEOUT_SECONDS = 2.0
 
@@ -547,6 +548,51 @@ def _get_docker_image_candidates() -> list[str]:
     return [DEFAULT_DOCKER_IMAGE]
 
 
+def _image_reference_has_registry(image: str) -> bool:
+    """Return True when image ref already includes an explicit registry host."""
+    token = str(image or "").strip()
+    if not token:
+        return False
+    head = token.split("/", 1)[0]
+    return "." in head or ":" in head or head == "localhost"
+
+
+def _strip_default_docker_io_prefix(image: str) -> str:
+    """Strip docker.io prefix to compare semantic image identity."""
+    token = str(image or "").strip()
+    if token.startswith("docker.io/"):
+        return token[len("docker.io/") :]
+    return token
+
+
+def _qualify_image_reference_for_podman(image: str) -> str:
+    """Return docker.io-qualified image ref for Podman short-name safety."""
+    token = str(image or "").strip()
+    if not token or _image_reference_has_registry(token):
+        return token
+    return f"docker.io/{token}"
+
+
+def _normalize_image_reference_for_runtime(image: str) -> str:
+    """Normalize image references for runtime-specific compatibility behavior."""
+    token = str(image or "").strip()
+    if not token:
+        return token
+    if not _allow_podman_docker_api_mode():
+        return token
+    runtime, _detail = _get_docker_cli_runtime_flavor()
+    if runtime != "podman":
+        return token
+    normalized = _qualify_image_reference_for_podman(token)
+    if normalized != token:
+        print_info_debug(
+            "[docker] normalized image reference for Podman compatibility: "
+            f"source={mark_sensitive(token, 'detail')} "
+            f"normalized={mark_sensitive(normalized, 'detail')}"
+        )
+    return normalized
+
+
 def _get_docker_image() -> str:
     """Return the preferred Docker image for this environment."""
     return _get_docker_image_candidates()[0]
@@ -557,7 +603,9 @@ def _warn_using_legacy_image(*, selected_image: str, preferred_image: str) -> No
     global _LEGACY_IMAGE_WARNING_SHOWN  # pylint: disable=global-statement
     if _LEGACY_IMAGE_WARNING_SHOWN:
         return
-    if selected_image == preferred_image:
+    if _strip_default_docker_io_prefix(selected_image) == _strip_default_docker_io_prefix(
+        preferred_image
+    ):
         return
     print_warning(
         "Using legacy Docker image naming for compatibility: "
@@ -568,6 +616,79 @@ def _warn_using_legacy_image(*, selected_image: str, preferred_image: str) -> No
         f"{_ALLOW_LEGACY_IMAGE_FALLBACK_ENV} when stable tags recover."
     )
     _LEGACY_IMAGE_WARNING_SHOWN = True
+
+
+def _emit_docker_compose_missing_diagnostics(*, command_name: str) -> None:
+    """Emit debug/telemetry diagnostics when compose detection reports missing."""
+    docker_bin = shutil.which("docker") or ""
+    compose_v1_bin = shutil.which("docker-compose") or ""
+    docker_pkg = _detect_linux_package_owner(docker_bin)
+    compose_v1_pkg = _detect_linux_package_owner(compose_v1_bin)
+
+    compose_v2_rc: int | None = None
+    compose_v2_first_line = ""
+    compose_v2_error_line = ""
+    if docker_bin:
+        try:
+            proc = run_docker(
+                ["docker", "compose", "version"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            compose_v2_rc = int(proc.returncode)
+            compose_v2_first_line = _extract_first_nonempty_line(proc.stdout or "")
+            compose_v2_error_line = _extract_first_nonempty_line(proc.stderr or "")
+        except Exception as exc:  # pragma: no cover - best effort only
+            telemetry.capture_exception(exc)
+            compose_v2_error_line = str(exc)
+
+    compose_v1_rc: int | None = None
+    compose_v1_first_line = ""
+    compose_v1_error_line = ""
+    if compose_v1_bin:
+        try:
+            proc = run_docker(
+                ["docker-compose", "version"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            compose_v1_rc = int(proc.returncode)
+            compose_v1_first_line = _extract_first_nonempty_line(proc.stdout or "")
+            compose_v1_error_line = _extract_first_nonempty_line(proc.stderr or "")
+        except Exception as exc:  # pragma: no cover - best effort only
+            telemetry.capture_exception(exc)
+            compose_v1_error_line = str(exc)
+
+    payload: dict[str, Any] = {
+        "command_name": command_name,
+        "docker_bin_present": bool(docker_bin),
+        "docker_pkg_hint": docker_pkg,
+        "compose_v1_bin_present": bool(compose_v1_bin),
+        "compose_v1_pkg_hint": compose_v1_pkg,
+        "compose_v2_returncode": compose_v2_rc,
+        "compose_v2_stdout_head": compose_v2_first_line,
+        "compose_v2_stderr_head": compose_v2_error_line,
+        "compose_v1_returncode": compose_v1_rc,
+        "compose_v1_stdout_head": compose_v1_first_line,
+        "compose_v1_stderr_head": compose_v1_error_line,
+    }
+    print_info_debug(
+        "[docker] compose missing diagnostics: "
+        f"command={mark_sensitive(command_name, 'status')} "
+        f"docker_bin={mark_sensitive(docker_bin or 'missing', 'detail')} "
+        f"docker_pkg={mark_sensitive(docker_pkg or 'unknown', 'status')} "
+        f"compose_v2_rc={mark_sensitive(str(compose_v2_rc), 'status')} "
+        f"compose_v2_out={mark_sensitive(compose_v2_first_line or '(empty)', 'detail')} "
+        f"compose_v2_err={mark_sensitive(compose_v2_error_line or '(empty)', 'detail')} "
+        f"compose_v1_bin={mark_sensitive(compose_v1_bin or 'missing', 'detail')} "
+        f"compose_v1_pkg={mark_sensitive(compose_v1_pkg or 'unknown', 'status')} "
+        f"compose_v1_rc={mark_sensitive(str(compose_v1_rc), 'status')} "
+        f"compose_v1_out={mark_sensitive(compose_v1_first_line or '(empty)', 'detail')} "
+        f"compose_v1_err={mark_sensitive(compose_v1_error_line or '(empty)', 'detail')}"
+    )
+    telemetry.capture("docker_compose_missing_diagnostics", payload)
 
 
 def _ensure_docker_compose_prerequisites(*, command_name: str) -> bool:
@@ -588,6 +709,7 @@ def _ensure_docker_compose_prerequisites(*, command_name: str) -> bool:
         f"Docker Compose: {'OK' if has_compose else 'MISSING'}",
     ]
     if has_docker and not has_compose:
+        _emit_docker_compose_missing_diagnostics(command_name=command_name)
         lines.append("Detected Docker but Compose plugin is unavailable.")
         lines.append(
             "Install Compose plugin (for example on Debian/Ubuntu): "
@@ -680,6 +802,52 @@ def _parse_compose_version(raw: str) -> str:
     return line
 
 
+def _get_docker_cli_runtime_flavor() -> tuple[str, str]:
+    """Detect whether `docker` CLI is Docker Engine or Podman compatibility mode."""
+    global _DOCKER_CLI_RUNTIME_FLAVOR_CACHE  # pylint: disable=global-statement
+    if _DOCKER_CLI_RUNTIME_FLAVOR_CACHE is not None:
+        return _DOCKER_CLI_RUNTIME_FLAVOR_CACHE
+
+    docker_bin = shutil.which("docker") or ""
+    if not docker_bin:
+        _DOCKER_CLI_RUNTIME_FLAVOR_CACHE = ("unknown", "docker_not_found")
+        return _DOCKER_CLI_RUNTIME_FLAVOR_CACHE
+
+    package_hint = _detect_linux_package_owner(docker_bin)
+    command_output = ""
+    try:
+        proc = subprocess.run(  # noqa: S603
+            [docker_bin, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        command_output = (
+            f"{proc.stdout or ''}\n{proc.stderr or ''}"
+            if proc.returncode == 0
+            else proc.stderr or proc.stdout or ""
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        telemetry.capture_exception(exc)
+        command_output = str(exc)
+
+    lowered = f"{package_hint}\n{command_output}".lower()
+    detail = (
+        _extract_first_nonempty_line(command_output)
+        or str(package_hint or "").strip()
+        or "unknown"
+    )
+    if "podman" in lowered:
+        _DOCKER_CLI_RUNTIME_FLAVOR_CACHE = ("podman", detail)
+        return _DOCKER_CLI_RUNTIME_FLAVOR_CACHE
+    if "docker" in lowered:
+        _DOCKER_CLI_RUNTIME_FLAVOR_CACHE = ("docker", detail)
+        return _DOCKER_CLI_RUNTIME_FLAVOR_CACHE
+    _DOCKER_CLI_RUNTIME_FLAVOR_CACHE = ("unknown", detail)
+    return _DOCKER_CLI_RUNTIME_FLAVOR_CACHE
+
+
 def _categorize_daemon_diagnostic(diag: str) -> str:
     """Bucket Docker daemon diagnostics into stable telemetry categories."""
     lowered = str(diag or "").strip().lower()
@@ -696,6 +864,55 @@ def _categorize_daemon_diagnostic(diag: str) -> str:
     if "podman" in lowered:
         return "podman_socket"
     return "other"
+
+
+def _ensure_supported_container_runtime(*, stage: str) -> bool:
+    """Enforce Docker-by-default runtime policy for managed mode operations."""
+    runtime, runtime_detail = _get_docker_cli_runtime_flavor()
+    if runtime != "podman":
+        return True
+
+    if _allow_podman_docker_api_mode():
+        print_info_debug(
+            "[docker] Podman compatibility CLI detected and accepted via explicit opt-in: "
+            f"stage={mark_sensitive(stage, 'status')} "
+            f"runtime_detail={mark_sensitive(runtime_detail, 'detail')}"
+        )
+        telemetry.capture(
+            "docker_runtime_preflight",
+            {
+                "stage": stage,
+                "runtime": "podman",
+                "opt_in": True,
+            },
+        )
+        return True
+
+    print_error(
+        "Detected Podman compatibility Docker CLI (`docker` maps to Podman). "
+        "ADscan requires Docker Engine by default."
+    )
+    print_instruction(
+        "Use Docker Engine (docker-ce/docker-ce-cli/docker-compose-plugin), then retry."
+    )
+    print_instruction(
+        "If you explicitly want Podman compatibility mode, set "
+        f"{_ALLOW_PODMAN_DOCKER_API_ENV}=1 and retry."
+    )
+    print_info_debug(
+        "[docker] runtime preflight blocked unsupported default runtime: "
+        f"stage={mark_sensitive(stage, 'status')} "
+        f"runtime_detail={mark_sensitive(runtime_detail, 'detail')}"
+    )
+    telemetry.capture(
+        "docker_runtime_preflight",
+        {
+            "stage": stage,
+            "runtime": "podman",
+            "opt_in": False,
+        },
+    )
+    return False
 
 
 def _emit_docker_runtime_context(*, command_name: str) -> None:
@@ -992,6 +1209,10 @@ def _run_docker_pull_network_preflight(
     ipv6_unreachable = any(
         ":" in ip and "network is unreachable" in err.lower() for ip, err in failures
     )
+    ipv4_timed_out = any(
+        ":" not in ip and ("timed out" in err.lower() or "timeout" in err.lower())
+        for ip, err in failures
+    )
     print_warning(
         "Network preflight could not reach Docker Hub over HTTPS. Image pull may fail."
     )
@@ -1000,11 +1221,17 @@ def _run_docker_pull_network_preflight(
         print_instruction(
             "IPv6 route appears unreachable. Prefer IPv4 connectivity if IPv6 is unstable."
         )
+    if ipv6_unreachable and ipv4_timed_out:
+        print_instruction(
+            "IPv4 connections also timed out. Network path to Docker Hub is unstable; retry on a cleaner network."
+        )
+        print_instruction("Quick check: curl -4 -I https://registry-1.docker.io/v2/")
     print_info_debug(
         "[docker] pull network preflight failed: "
         f"host={mark_sensitive(host, 'detail')} "
         f"attempted={mark_sensitive(str(attempted), 'detail')} "
         f"ipv6_unreachable={mark_sensitive(str(ipv6_unreachable).lower(), 'status')} "
+        f"ipv4_timed_out={mark_sensitive(str(ipv4_timed_out).lower(), 'status')} "
         f"failure_sample={mark_sensitive(str(failures[:2]), 'detail')}"
     )
     telemetry.capture(
@@ -1015,6 +1242,7 @@ def _run_docker_pull_network_preflight(
             "reachable": False,
             "attempted": attempted,
             "ipv6_unreachable": ipv6_unreachable,
+            "ipv4_timed_out": ipv4_timed_out,
             "failure_sample": [
                 {"ip": ip, "error": err} for ip, err in failures[:3]
             ],
@@ -1031,29 +1259,86 @@ def _ensure_image_pulled_with_legacy_fallback(
     """Pull preferred image, then fallback to legacy naming if needed."""
     if not _ensure_docker_daemon_available_for_pull(stage="pre_pull"):
         return None
-    _run_docker_pull_dns_preflight()
-    _run_docker_pull_network_preflight()
+    dns_preflight_ok = _run_docker_pull_dns_preflight()
+    network_preflight_ok = _run_docker_pull_network_preflight()
+    preflight_ok = bool(dns_preflight_ok and network_preflight_ok)
+
+    def _on_pull_success(selected_image: str, *, preferred_image: str) -> str:
+        """Emit non-blocking preflight note when pull succeeds after warning."""
+        if not preflight_ok:
+            print_info(
+                "Continuing after non-blocking network preflight warning. "
+                "Docker image pull succeeded."
+            )
+            print_info_debug(
+                "[docker] pull succeeded despite preflight warning: "
+                f"image={mark_sensitive(selected_image, 'detail')} "
+                f"dns_preflight_ok={mark_sensitive(str(dns_preflight_ok).lower(), 'status')} "
+                f"network_preflight_ok={mark_sensitive(str(network_preflight_ok).lower(), 'status')}"
+            )
+            telemetry.capture(
+                "docker_pull_preflight_nonblocking_success",
+                {
+                    "image": selected_image,
+                    "dns_preflight_ok": bool(dns_preflight_ok),
+                    "network_preflight_ok": bool(network_preflight_ok),
+                },
+            )
+        _warn_using_legacy_image(
+            selected_image=selected_image,
+            preferred_image=preferred_image,
+        )
+        return selected_image
 
     candidates = _get_docker_image_candidates()
-    preferred = candidates[0]
+    preferred = _normalize_image_reference_for_runtime(candidates[0])
     for idx, candidate in enumerate(candidates):
+        candidate_to_pull = _normalize_image_reference_for_runtime(candidate)
         if idx > 0:
             print_warning(
                 "Primary Docker image pull failed; trying legacy image naming: "
-                f"{candidate}"
+                f"{candidate_to_pull}"
             )
         if ensure_image_pulled(
-            candidate, timeout=pull_timeout, stream_output=stream_output
+            candidate_to_pull, timeout=pull_timeout, stream_output=stream_output
         ):
-            _warn_using_legacy_image(
-                selected_image=candidate,
+            return _on_pull_success(
+                candidate_to_pull,
                 preferred_image=preferred,
             )
-            return candidate
 
         daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
             run_docker_command_func=_run_docker_status_command
         )
+        if daemon_running:
+            print_warning(
+                "Docker image pull failed. Retrying once in case of transient network/registry issues..."
+            )
+            print_info_debug(
+                "[docker] transient pull retry: "
+                f"image={mark_sensitive(candidate_to_pull, 'detail')} "
+                f"diagnostic={mark_sensitive(daemon_diagnostic, 'detail')}"
+            )
+            telemetry.capture(
+                "docker_pull_retry",
+                {
+                    "image": candidate_to_pull,
+                    "reason": "transient_pull_failure",
+                },
+            )
+            time.sleep(1.5)
+            if ensure_image_pulled(
+                candidate_to_pull,
+                timeout=pull_timeout,
+                stream_output=stream_output,
+            ):
+                return _on_pull_success(
+                    candidate_to_pull,
+                    preferred_image=preferred,
+                )
+            daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
+                run_docker_command_func=_run_docker_status_command
+            )
         if daemon_running:
             continue
 
@@ -1070,15 +1355,68 @@ def _ensure_image_pulled_with_legacy_fallback(
 
         print_info("Retrying image pull after Docker daemon recovery...")
         if ensure_image_pulled(
-            candidate,
+            candidate_to_pull,
             timeout=pull_timeout,
             stream_output=stream_output,
         ):
-            _warn_using_legacy_image(
-                selected_image=candidate,
+            return _on_pull_success(
+                candidate_to_pull,
                 preferred_image=preferred,
             )
-            return candidate
+    return None
+
+
+def _ensure_runtime_image_available(
+    *,
+    image: str,
+    pull_timeout_seconds: int | None,
+    command_name: str,
+) -> str | None:
+    """Ensure ADscan runtime image is locally available before heavy preflights."""
+    if image_exists(image):
+        return image
+    print_warning(f"ADscan docker image not present: {image}")
+    print_info("Pulling the image now...")
+    pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
+    resolved_image = _ensure_image_pulled_with_legacy_fallback(
+        pull_timeout=pull_timeout,
+        stream_output=True,
+    )
+    if resolved_image:
+        return resolved_image
+    _print_docker_image_pull_failure_guidance(
+        image=image,
+        pull_timeout=pull_timeout,
+        command_name=command_name,
+    )
+    return None
+
+
+def pull_runtime_image_with_diagnostics(
+    *,
+    image: str,
+    pull_timeout_seconds: int | None,
+    command_name: str,
+    stream_output: bool = True,
+) -> str | None:
+    """Pull the ADscan runtime image with the standard daemon/network diagnostics.
+
+    Unlike `_ensure_runtime_image_available`, this always attempts a pull even if
+    the image already exists locally, so update flows can reuse the same robust
+    troubleshooting path as install/start/check.
+    """
+    pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
+    resolved_image = _ensure_image_pulled_with_legacy_fallback(
+        pull_timeout=pull_timeout,
+        stream_output=stream_output,
+    )
+    if resolved_image:
+        return resolved_image
+    _print_docker_image_pull_failure_guidance(
+        image=image,
+        pull_timeout=pull_timeout,
+        command_name=command_name,
+    )
     return None
 
 
@@ -1227,6 +1565,8 @@ def _run_bloodhound_compose_pull_with_daemon_recovery(
     *,
     compose_path: Path,
     stream_output: bool,
+    pull_timeout_seconds: int | None,
+    command_name: str,
 ) -> bool:
     """Run `docker compose pull` with daemon availability recovery.
 
@@ -1240,7 +1580,12 @@ def _run_bloodhound_compose_pull_with_daemon_recovery(
     _run_docker_pull_dns_preflight()
     _run_docker_pull_network_preflight()
 
-    if compose_pull(compose_path, stream_output=stream_output):
+    if compose_pull(
+        compose_path,
+        stream_output=stream_output,
+        timeout_seconds=pull_timeout_seconds,
+        command_name=command_name,
+    ):
         return True
 
     daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
@@ -1264,7 +1609,12 @@ def _run_bloodhound_compose_pull_with_daemon_recovery(
         return False
 
     print_info("Retrying BloodHound CE image pull after Docker daemon recovery...")
-    return compose_pull(compose_path, stream_output=stream_output)
+    return compose_pull(
+        compose_path,
+        stream_output=stream_output,
+        timeout_seconds=pull_timeout_seconds,
+        command_name=command_name,
+    )
 
 
 def _run_bloodhound_compose_up_with_daemon_recovery(*, compose_path: Path) -> bool:
@@ -2122,16 +2472,43 @@ def _get_managed_bloodhound_container_statuses() -> dict[str, str] | None:
         Returns None when docker status cannot be collected.
     """
     project_name = get_bloodhound_compose_project_name()
+    service_names = ("bloodhound", "app-db", "graph-db")
     expected_names = {
-        f"{project_name}-bloodhound-1",
-        f"{project_name}-app-db-1",
-        f"{project_name}-graph-db-1",
+        f"{project_name}-{service_name}-1" for service_name in service_names
+    }
+    canonical_name_by_service = {
+        service_name: f"{project_name}-{service_name}-1"
+        for service_name in service_names
+    }
+    fallback_name_aliases = {
+        canonical_name_by_service["bloodhound"]: {
+            canonical_name_by_service["bloodhound"],
+            f"{project_name}_bloodhound_1",
+        },
+        canonical_name_by_service["app-db"]: {
+            canonical_name_by_service["app-db"],
+            f"{project_name}_app-db_1",
+            f"{project_name}_app_db_1",
+        },
+        canonical_name_by_service["graph-db"]: {
+            canonical_name_by_service["graph-db"],
+            f"{project_name}_graph-db_1",
+            f"{project_name}_graph_db_1",
+        },
     }
     try:
         # Use `ps -a` so we can detect "Exited"/"Dead" containers explicitly
         # instead of only seeing them as "missing" from the runtime gate.
         proc = run_docker(
-            ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}"],
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"label=com.docker.compose.project={project_name}",
+                "--format",
+                "{{.Names}}\t{{.Label \"com.docker.compose.service\"}}\t{{.Status}}",
+            ],
             check=False,
             capture_output=True,
             timeout=15,
@@ -2158,9 +2535,17 @@ def _get_managed_bloodhound_container_statuses() -> dict[str, str] | None:
         line = str(raw_line or "").strip()
         if not line or "\t" not in line:
             continue
-        name, status = line.split("\t", 1)
-        if name in snapshot:
-            snapshot[name] = status.strip()
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        name, service_name, status = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if service_name in canonical_name_by_service:
+            snapshot[canonical_name_by_service[service_name]] = status
+            continue
+        for canonical_name, aliases in fallback_name_aliases.items():
+            if name in aliases:
+                snapshot[canonical_name] = status
+                break
     return snapshot
 
 
@@ -2760,6 +3145,9 @@ def _attempt_start_user_podman_socket() -> bool:
 
 def _ensure_docker_daemon_available_for_pull(*, stage: str) -> bool:
     """Ensure Docker daemon is reachable before/after image pull attempts."""
+    if not _ensure_supported_container_runtime(stage=stage):
+        return False
+
     running, diagnostic = _is_docker_daemon_running_internal(
         run_docker_command_func=_run_docker_status_command
     )
@@ -3348,6 +3736,7 @@ def _start_host_helper(*, socket_path: Path) -> subprocess.Popen[str] | None:
         print_warning(
             "Sudo authorization is required to start the host helper in Docker mode."
         )
+        print_instruction("Run `sudo -v` and retry the command.")
         print_info_debug("[host-helper] startup aborted: sudo validation failed")
         return None
 
@@ -3824,6 +4213,7 @@ def _ensure_managed_bloodhound_runtime_ready(
     desired_password: str | None = None,
     pull_missing_images: bool,
     pull_stream_output: bool,
+    pull_timeout_seconds: int | None = None,
     start_stack: bool,
     verify_auth: bool,
     allow_auth_bootstrap: bool,
@@ -3866,6 +4256,8 @@ def _ensure_managed_bloodhound_runtime_ready(
             if not _run_bloodhound_compose_pull_with_daemon_recovery(
                 compose_path=compose_path,
                 stream_output=pull_stream_output,
+                pull_timeout_seconds=pull_timeout_seconds,
+                command_name=command_name,
             ):
                 _print_managed_bloodhound_runtime_troubleshooting(
                     command_name=command_name,
@@ -4192,6 +4584,8 @@ def handle_install_docker(
     if not _run_bloodhound_compose_pull_with_daemon_recovery(
         compose_path=compose_path,
         stream_output=True,
+        pull_timeout_seconds=pull_timeout_seconds,
+        command_name="install",
     ):
         telemetry.capture(
             "docker_failure_constraint",
@@ -4330,6 +4724,7 @@ def handle_check_docker(
         desired_password=_get_bloodhound_admin_password(),
         pull_missing_images=False,
         pull_stream_output=False,
+        pull_timeout_seconds=None,
         start_stack=True,
         verify_auth=True,
         allow_auth_bootstrap=False,
@@ -4417,12 +4812,21 @@ def handle_start_docker(
         return 1
     if not _ensure_docker_compose_prerequisites(command_name="start"):
         return 1
+    resolved_image = _ensure_runtime_image_available(
+        image=image,
+        pull_timeout_seconds=pull_timeout_seconds,
+        command_name="start",
+    )
+    if not resolved_image:
+        return 1
+    image = resolved_image
 
     managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
         command_name="start",
         desired_password=_get_bloodhound_admin_password(),
         pull_missing_images=True,
         pull_stream_output=False,
+        pull_timeout_seconds=pull_timeout_seconds,
         start_stack=True,
         verify_auth=True,
         allow_auth_bootstrap=True,
@@ -4436,23 +4840,6 @@ def handle_start_docker(
         f"path={mark_sensitive(str(BH_CONFIG_FILE), 'path')} "
         f"exists={BH_CONFIG_FILE.exists()}"
     )
-
-    if not image_exists(image):
-        print_warning(f"ADscan docker image not present: {image}")
-        print_info("Pulling the image now...")
-        pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
-        resolved_image = _ensure_image_pulled_with_legacy_fallback(
-            pull_timeout=pull_timeout,
-            stream_output=True,
-        )
-        if not resolved_image:
-            _print_docker_image_pull_failure_guidance(
-                image=image,
-                pull_timeout=pull_timeout,
-                command_name="start",
-            )
-            return 1
-        image = resolved_image
 
     workspaces = _get_workspaces_dir()
     config_dir = _get_config_dir()
@@ -4590,12 +4977,21 @@ def handle_ci_docker(
         return 1
     if not _ensure_docker_compose_prerequisites(command_name="ci"):
         return 1
+    resolved_image = _ensure_runtime_image_available(
+        image=image,
+        pull_timeout_seconds=pull_timeout_seconds,
+        command_name="ci",
+    )
+    if not resolved_image:
+        return 1
+    image = resolved_image
 
     managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
         command_name="ci",
         desired_password=_get_bloodhound_admin_password(),
         pull_missing_images=True,
         pull_stream_output=False,
+        pull_timeout_seconds=pull_timeout_seconds,
         start_stack=True,
         verify_auth=True,
         allow_auth_bootstrap=True,
@@ -4603,23 +4999,6 @@ def handle_ci_docker(
     )
     if not managed_ready or compose_path is None:
         return 1
-
-    if not image_exists(image):
-        print_warning(f"ADscan docker image not present: {image}")
-        print_info("Pulling the image now...")
-        pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
-        resolved_image = _ensure_image_pulled_with_legacy_fallback(
-            pull_timeout=pull_timeout,
-            stream_output=True,
-        )
-        if not resolved_image:
-            _print_docker_image_pull_failure_guidance(
-                image=image,
-                pull_timeout=pull_timeout,
-                command_name="ci",
-            )
-            return 1
-        image = resolved_image
 
     workspaces_dir = _get_workspaces_dir()
     config_dir = _get_config_dir()
@@ -4791,12 +5170,21 @@ def run_adscan_passthrough_docker(
         return 1
     if not _ensure_docker_compose_prerequisites(command_name="passthrough"):
         return 1
+    resolved_image = _ensure_runtime_image_available(
+        image=image,
+        pull_timeout_seconds=pull_timeout_seconds,
+        command_name="passthrough",
+    )
+    if not resolved_image:
+        return 1
+    image = resolved_image
 
     managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
         command_name="passthrough",
         desired_password=_get_bloodhound_admin_password(),
         pull_missing_images=True,
         pull_stream_output=True,
+        pull_timeout_seconds=pull_timeout_seconds,
         start_stack=True,
         verify_auth=True,
         allow_auth_bootstrap=True,
@@ -4804,23 +5192,6 @@ def run_adscan_passthrough_docker(
     )
     if not managed_ready or compose_path is None:
         return 1
-
-    if not image_exists(image):
-        print_warning(f"ADscan docker image not present: {image}")
-        print_info("Pulling the image now...")
-        pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
-        resolved_image = _ensure_image_pulled_with_legacy_fallback(
-            pull_timeout=pull_timeout,
-            stream_output=True,
-        )
-        if not resolved_image:
-            _print_docker_image_pull_failure_guidance(
-                image=image,
-                pull_timeout=pull_timeout,
-                command_name="passthrough",
-            )
-            return 1
-        image = resolved_image
 
     workspaces_dir = _get_workspaces_dir()
     config_dir = _get_config_dir()

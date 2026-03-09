@@ -10,6 +10,8 @@ from datetime import datetime
 from enum import Enum
 import uuid
 
+from adscan_core.time_utils import parse_iso_datetime_or_now, utc_now
+
 
 class WorkspaceType(str, Enum):
     """Type of workspace."""
@@ -65,8 +67,8 @@ class Workspace:
     )
 
     # Timestamps
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
 
     # Additional metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -122,12 +124,8 @@ class Workspace:
                     "db_password": "neo4j",
                 },
             ),
-            created_at=datetime.fromisoformat(data["created_at"])
-            if "created_at" in data
-            else datetime.utcnow(),
-            updated_at=datetime.fromisoformat(data["updated_at"])
-            if "updated_at" in data
-            else datetime.utcnow(),
+            created_at=parse_iso_datetime_or_now(data.get("created_at")),
+            updated_at=parse_iso_datetime_or_now(data.get("updated_at")),
             metadata=data.get("metadata", {}),
         )
 
@@ -139,7 +137,7 @@ class Workspace:
         """
         if domain_name not in self.domains:
             self.domains.append(domain_name)
-            self.updated_at = datetime.utcnow()
+            self.updated_at = utc_now()
 
     def remove_domain(self, domain_name: str) -> None:
         """Remove a domain from this workspace.
@@ -149,7 +147,7 @@ class Workspace:
         """
         if domain_name in self.domains:
             self.domains.remove(domain_name)
-            self.updated_at = datetime.utcnow()
+            self.updated_at = utc_now()
 
     def update_setting(self, key: str, value: Any) -> None:
         """Update a workspace setting.
@@ -159,7 +157,7 @@ class Workspace:
             value: Setting value
         """
         self.settings[key] = value
-        self.updated_at = datetime.utcnow()
+        self.updated_at = utc_now()
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         """Get a workspace setting.
@@ -213,7 +211,7 @@ class WorkspaceStatistics:
     total_vulnerabilities: int = 0
     vulnerabilities_by_severity: Dict[str, int] = field(default_factory=dict)
     last_scan_date: Optional[datetime] = None
-    computed_at: datetime = field(default_factory=datetime.utcnow)
+    computed_at: datetime = field(default_factory=utc_now)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert statistics to dictionary.

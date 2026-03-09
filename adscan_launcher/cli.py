@@ -17,6 +17,7 @@ Any other arguments are passed through to the container.
 from __future__ import annotations
 
 import argparse
+import platform
 import re
 from io import StringIO
 import os
@@ -83,6 +84,18 @@ from adscan_launcher.update_manager import (
 
 ADSCAN_SUDO_ALIAS_MARKER = "# ADscan auto-sudo alias"
 _SESSION_CAPTURE_FINALIZED = False
+_ALLOW_UNSUPPORTED_PLATFORM_ENV = "ADSCAN_ALLOW_UNSUPPORTED_PLATFORM"
+_ALLOW_UNSUPPORTED_ARCH_ENV = "ADSCAN_ALLOW_UNSUPPORTED_ARCH"
+_ALLOW_UNSUPPORTED_WSL_ENV = "ADSCAN_ALLOW_UNSUPPORTED_WSL"
+_LINUX_REQUIRED_COMMANDS = {
+    "install",
+    "check",
+    "start",
+    "ci",
+    "update",
+    "upgrade",
+    "host-helper",
+}
 
 
 def _parse_bloodhound_admin_password(value: str) -> str:
@@ -216,7 +229,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pull-timeout",
         type=int,
         default=3600,
-        help="Docker pull timeout in seconds (0 disables). Default: 3600.",
+        help="Docker pull timeout in seconds for ADscan and BloodHound CE image pulls (0 disables). Default: 3600.",
     )
     install.add_argument(
         "--allow-low-memory",
@@ -242,7 +255,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pull-timeout",
         type=int,
         default=3600,
-        help="Docker pull timeout in seconds when pulling the image (0 disables). Default: 3600.",
+        help="Docker pull timeout in seconds for ADscan and BloodHound CE image pulls (0 disables). Default: 3600.",
     )
     start.add_argument(
         "--allow-low-memory",
@@ -258,7 +271,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pull-timeout",
         type=int,
         default=3600,
-        help="Docker pull timeout in seconds when pulling the image (0 disables). Default: 3600.",
+        help="Docker pull timeout in seconds for ADscan and BloodHound CE image pulls (0 disables). Default: 3600.",
     )
     ci.add_argument(
         "--allow-low-memory",
@@ -500,6 +513,216 @@ def _guard_root_shell_without_user_context(command: str | None) -> None:
     if not proceed:
         print_warning("Aborted to avoid creating launcher state under /root.")
         raise SystemExit(1)
+
+
+def _allow_unsupported_platform_override() -> bool:
+    """Return True when unsupported-platform guard is explicitly bypassed."""
+    raw = str(os.getenv(_ALLOW_UNSUPPORTED_PLATFORM_ENV, "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _allow_unsupported_arch_override() -> bool:
+    """Return True when unsupported-arch guard is explicitly bypassed."""
+    raw = str(os.getenv(_ALLOW_UNSUPPORTED_ARCH_ENV, "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _allow_unsupported_wsl_override() -> bool:
+    """Return True when unsupported-WSL guard is explicitly bypassed."""
+    raw = str(os.getenv(_ALLOW_UNSUPPORTED_WSL_ENV, "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _is_windows_subsystem_for_linux() -> bool:
+    """Return True when launcher appears to be running inside WSL."""
+    release = str(platform.release() or "").strip().lower()
+    version_text = str(platform.version() or "").strip().lower()
+    if "microsoft" in release or "microsoft" in version_text:
+        return True
+    if os.getenv("WSL_INTEROP", "").strip():
+        return True
+    if os.getenv("WSL_DISTRO_NAME", "").strip():
+        return True
+    return False
+
+
+def _guard_supported_host_platform(
+    *,
+    command: str | None,
+    has_passthrough_args: bool,
+) -> None:
+    """Block launcher runtime commands on unsupported host platforms.
+
+    ADscan launcher Docker-mode runtime is Linux-first. Fail fast with a clear
+    message on unsupported host OSes so users do not hit deeper runtime errors.
+    """
+    host_platform = str(platform.system() or "").strip() or "Unknown"
+    needs_linux = bool(command in _LINUX_REQUIRED_COMMANDS or has_passthrough_args)
+    if not needs_linux:
+        return
+
+    host_arch = str(platform.machine() or "").strip() or "unknown"
+    normalized_arch = host_arch.lower()
+
+    if host_platform.lower() != "linux":
+        if _allow_unsupported_platform_override():
+            print_warning(
+                "Proceeding on an unsupported host platform because "
+                f"{_ALLOW_UNSUPPORTED_PLATFORM_ENV}=1 was set."
+            )
+            print_info_debug(
+                "[platform] unsupported platform override enabled: "
+                f"platform={host_platform} arch={host_arch} "
+                f"command={command or 'passthrough'}"
+            )
+            capture(
+                "launcher_platform_guard",
+                {
+                    "blocked": False,
+                    "override": True,
+                    "platform": host_platform,
+                    "architecture": host_arch,
+                    "reason": "unsupported_platform_override",
+                    "command": command or "passthrough",
+                },
+            )
+            return
+
+        print_error(
+            "ADscan launcher Docker mode is currently supported on Linux hosts only."
+        )
+        print_instruction(f"Detected platform: {host_platform}")
+        print_instruction(
+            "Use a supported Linux host (recommended: Kali, Ubuntu, Debian, or Parrot) and retry."
+        )
+        print_instruction(
+            "System requirements: https://www.adscanpro.com/docs/getting-started/system-requirements"
+        )
+        print_info_debug(
+            "[platform] blocked unsupported host platform: "
+            f"platform={host_platform} arch={host_arch} "
+            f"command={command or 'passthrough'}"
+        )
+        capture(
+            "launcher_platform_guard",
+            {
+                "blocked": True,
+                "override": False,
+                "platform": host_platform,
+                "architecture": host_arch,
+                "reason": "unsupported_platform",
+                "command": command or "passthrough",
+            },
+        )
+        raise SystemExit(2)
+
+    if _is_windows_subsystem_for_linux():
+        if _allow_unsupported_wsl_override():
+            print_warning(
+                "Proceeding on an unsupported WSL host because "
+                f"{_ALLOW_UNSUPPORTED_WSL_ENV}=1 was set."
+            )
+            print_info_debug(
+                "[platform] unsupported WSL override enabled: "
+                f"platform={host_platform} arch={host_arch} "
+                f"release={platform.release()} "
+                f"command={command or 'passthrough'}"
+            )
+            capture(
+                "launcher_platform_guard",
+                {
+                    "blocked": False,
+                    "override": True,
+                    "platform": host_platform,
+                    "architecture": host_arch,
+                    "reason": "unsupported_wsl_override",
+                    "command": command or "passthrough",
+                },
+            )
+            return
+
+        print_error(
+            "ADscan launcher Docker mode is not currently supported on WSL."
+        )
+        print_instruction("Detected environment: Windows Subsystem for Linux (WSL)")
+        print_instruction(
+            "Use a native Linux host or Linux VM instead of Docker-from-WSL."
+        )
+        print_instruction(
+            "System requirements: https://www.adscanpro.com/docs/getting-started/system-requirements"
+        )
+        print_info_debug(
+            "[platform] blocked unsupported WSL environment: "
+            f"platform={host_platform} arch={host_arch} "
+            f"release={platform.release()} "
+            f"command={command or 'passthrough'}"
+        )
+        capture(
+            "launcher_platform_guard",
+            {
+                "blocked": True,
+                "override": False,
+                "platform": host_platform,
+                "architecture": host_arch,
+                "reason": "unsupported_wsl",
+                "command": command or "passthrough",
+            },
+        )
+        raise SystemExit(2)
+
+    if normalized_arch in {"x86_64", "amd64"}:
+        return
+
+    if _allow_unsupported_arch_override():
+        print_warning(
+            "Proceeding on an unsupported host architecture because "
+            f"{_ALLOW_UNSUPPORTED_ARCH_ENV}=1 was set."
+        )
+        print_info_debug(
+            "[platform] unsupported architecture override enabled: "
+            f"platform={host_platform} arch={host_arch} "
+            f"command={command or 'passthrough'}"
+        )
+        capture(
+            "launcher_platform_guard",
+            {
+                "blocked": False,
+                "override": True,
+                "platform": host_platform,
+                "architecture": host_arch,
+                "reason": "unsupported_arch_override",
+                "command": command or "passthrough",
+            },
+        )
+        return
+
+    print_error(
+        "ADscan launcher Docker mode currently supports x86_64/amd64 Linux hosts only."
+    )
+    print_instruction(f"Detected architecture: {host_arch}")
+    print_instruction(
+        "Use a x86_64 Linux host, or rebuild/run the container stack with compatible images."
+    )
+    print_instruction(
+        "System requirements: https://www.adscanpro.com/docs/getting-started/system-requirements"
+    )
+    print_info_debug(
+        "[platform] blocked unsupported host architecture: "
+        f"platform={host_platform} arch={host_arch} "
+        f"command={command or 'passthrough'}"
+    )
+    capture(
+        "launcher_platform_guard",
+        {
+            "blocked": True,
+            "override": False,
+            "platform": host_platform,
+            "architecture": host_arch,
+            "reason": "unsupported_architecture",
+            "command": command or "passthrough",
+        },
+    )
+    raise SystemExit(2)
 
 
 def _command_uses_bloodhound_stack(command: str | None) -> bool:
@@ -954,6 +1177,11 @@ def main(argv: list[str] | None = None) -> None:
         img = get_docker_image_name()
         print_info(f"Docker image: {img}")
         raise SystemExit(0)
+
+    _guard_supported_host_platform(
+        command=cmd,
+        has_passthrough_args=bool(unknown),
+    )
 
     if cmd == "host-helper":
         try:

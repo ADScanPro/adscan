@@ -576,7 +576,13 @@ class NetExecRunner:
                             f"duration={duration_text}"
                         )
 
-                        preview_text = build_execution_output_preview(proc)
+                        preview_text = build_execution_output_preview(
+                            proc,
+                            stdout_head=20,
+                            stdout_tail=20,
+                            stderr_head=20,
+                            stderr_tail=20,
+                        )
                         if preview_text:
                             print_info_debug(
                                 "[netexec] Output preview:\n" + preview_text,

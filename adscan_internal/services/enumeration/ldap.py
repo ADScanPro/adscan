@@ -6,7 +6,7 @@ user enumeration, group enumeration, and computer enumeration.
 
 from collections.abc import Callable
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import subprocess
 import logging
 
@@ -15,6 +15,9 @@ from adscan_internal.command_runner import CommandSpec, default_runner
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
+)
+from adscan_internal.integrations.netexec.parsers import (
+    parse_netexec_ldap_query_objects,
 )
 
 
@@ -144,6 +147,41 @@ class LDAPComputer:
             "os_version": self.os_version,
             "is_enabled": self.is_enabled,
             "dns_hostname": self.dns_hostname,
+        }
+
+
+@dataclass
+class LDAPAnonymousUserRecord:
+    """Represents a partially-visible user object from anonymous LDAP bind.
+
+    Attributes:
+        distinguished_name: Distinguished name of the object.
+        common_name: ``cn`` attribute or best-effort DN-derived CN.
+        samaccountname: ``sAMAccountName`` when visible to the anonymous bind.
+        description: ``description`` attribute, if exposed.
+        object_classes: Multi-valued ``objectClass`` entries.
+        is_enabled: Best-effort enabled state derived from ``userAccountControl``.
+        raw_attributes: Full lower-cased attribute mapping parsed from NetExec.
+    """
+
+    distinguished_name: str
+    common_name: str = ""
+    samaccountname: str = ""
+    description: str = ""
+    object_classes: list[str] = field(default_factory=list)
+    is_enabled: bool = True
+    raw_attributes: Dict[str, list[str]] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for persistence/debugging."""
+        return {
+            "distinguished_name": self.distinguished_name,
+            "common_name": self.common_name,
+            "samaccountname": self.samaccountname,
+            "description": self.description,
+            "object_classes": list(self.object_classes),
+            "is_enabled": self.is_enabled,
+            "raw_attributes": dict(self.raw_attributes),
         }
 
 
@@ -565,6 +603,159 @@ class LDAPEnumerationMixin:
             )
             return []
 
+    def enumerate_active_users_anonymous(
+        self,
+        *,
+        pdc: str,
+        netexec_path: str,
+        log_file: Optional[str] = None,
+        executor: CommandExecutor | None = None,
+        scan_id: Optional[str] = None,
+        timeout: int = 120,
+    ) -> List[str]:
+        """Enumerate active users via anonymous LDAP when the server allows it.
+
+        Args:
+            pdc: Domain controller hostname/IP.
+            netexec_path: Path to NetExec.
+            log_file: Optional NetExec log file path.
+            executor: Optional injected executor.
+            scan_id: Optional scan ID.
+            timeout: Timeout in seconds.
+
+        Returns:
+            Lower-cased, de-duplicated username list.
+        """
+        self.parent._emit_progress(
+            scan_id=scan_id,
+            phase="ldap_active_user_enumeration_anonymous",
+            progress=0.0,
+            message=f"Enumerating active users via anonymous LDAP on {pdc}",
+        )
+
+        log_part = f' --log "{log_file}"' if log_file else ""
+        command = f'{netexec_path} ldap {pdc} -u "" -p "" --active-users{log_part}'
+
+        try:
+            exec_fn = executor or _default_executor
+            result = exec_fn(command, timeout)
+            usernames: list[str] = []
+            if result.returncode == 0 and result.stdout:
+                usernames = self._parse_netexec_active_users_output(result.stdout)
+
+            self.parent._emit_progress(
+                scan_id=scan_id,
+                phase="ldap_active_user_enumeration_anonymous",
+                progress=1.0,
+                message=f"Anonymous active user enumeration completed: {len(usernames)} user(s) found",
+            )
+            return usernames
+        except subprocess.TimeoutExpired:
+            self.parent._emit_progress(
+                scan_id=scan_id,
+                phase="ldap_active_user_enumeration_anonymous",
+                progress=1.0,
+                message="Anonymous active user enumeration timed out",
+            )
+            return []
+        except Exception as e:
+            self.logger.exception(
+                f"Error during anonymous LDAP active user enumeration: {e}"
+            )
+            self.parent._emit_progress(
+                scan_id=scan_id,
+                phase="ldap_active_user_enumeration_anonymous",
+                progress=1.0,
+                message="Anonymous active user enumeration failed",
+            )
+            return []
+
+    def query_anonymous_user_inventory(
+        self,
+        *,
+        pdc: str,
+        netexec_path: str,
+        log_file: Optional[str] = None,
+        ldap_filter: Optional[str] = None,
+        executor: CommandExecutor | None = None,
+        scan_id: Optional[str] = None,
+        timeout: int = 120,
+    ) -> List[LDAPAnonymousUserRecord]:
+        """Query LDAP anonymously for enabled user objects.
+
+        Args:
+            pdc: Domain controller hostname/IP.
+            netexec_path: Path to NetExec.
+            log_file: Optional NetExec log file path.
+            ldap_filter: Optional LDAP filter. When omitted, a default
+                enabled-user filter is used.
+            executor: Optional injected executor.
+            scan_id: Optional scan ID.
+            timeout: Timeout in seconds.
+
+        Returns:
+            List of best-effort user records extracted from NetExec query output.
+        """
+        effective_filter = (
+            ldap_filter
+            or "(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+        )
+        self.parent._emit_progress(
+            scan_id=scan_id,
+            phase="ldap_anonymous_user_inventory",
+            progress=0.0,
+            message=f"Querying anonymous LDAP user inventory on {pdc}",
+        )
+
+        log_part = f' --log "{log_file}"' if log_file else ""
+        command = (
+            f'{netexec_path} ldap {pdc} -u "" -p "" '
+            f"--query '{effective_filter}' \"\"{log_part}"
+        )
+
+        try:
+            exec_fn = executor or _default_executor
+            result = exec_fn(command, timeout)
+            if result.returncode != 0:
+                self.parent._emit_progress(
+                    scan_id=scan_id,
+                    phase="ldap_anonymous_user_inventory",
+                    progress=1.0,
+                    message="Anonymous LDAP user inventory query failed",
+                )
+                return []
+
+            combined_output = "\n".join(
+                segment for segment in ((result.stdout or ""), (result.stderr or "")) if segment
+            )
+            objects = parse_netexec_ldap_query_objects(combined_output)
+            records = self._parse_netexec_anonymous_user_inventory(objects)
+
+            self.parent._emit_progress(
+                scan_id=scan_id,
+                phase="ldap_anonymous_user_inventory",
+                progress=1.0,
+                message=f"Anonymous LDAP user inventory completed: {len(records)} user object(s) found",
+            )
+            return records
+        except subprocess.TimeoutExpired:
+            self.parent._emit_progress(
+                scan_id=scan_id,
+                phase="ldap_anonymous_user_inventory",
+                progress=1.0,
+                message="Anonymous LDAP user inventory timed out",
+            )
+            return []
+        except Exception as e:
+            self.logger.exception(f"Error during anonymous LDAP user inventory: {e}")
+            self.parent._emit_progress(
+                scan_id=scan_id,
+                phase="ldap_anonymous_user_inventory",
+                progress=1.0,
+                message="Anonymous LDAP user inventory failed",
+            )
+            return []
+
     def enumerate_computers(
         self,
         domain: str,
@@ -773,6 +964,77 @@ class LDAPEnumerationMixin:
             )
             return {"accessible": False, "error": str(e)}
 
+    def _parse_netexec_anonymous_user_inventory(
+        self, objects: list[dict[str, object]]
+    ) -> List[LDAPAnonymousUserRecord]:
+        """Normalize NetExec LDAP query objects into anonymous user records."""
+        records: list[LDAPAnonymousUserRecord] = []
+        seen_dns: set[str] = set()
+
+        for item in objects:
+            dn = str(item.get("distinguished_name") or "").strip()
+            if not dn:
+                continue
+
+            attrs_raw = item.get("attributes") or {}
+            if not isinstance(attrs_raw, dict):
+                continue
+
+            attrs: dict[str, list[str]] = {}
+            for key, values in attrs_raw.items():
+                normalized_key = str(key or "").casefold()
+                if not normalized_key:
+                    continue
+                if isinstance(values, list):
+                    attrs[normalized_key] = [
+                        str(value).strip() for value in values if str(value).strip()
+                    ]
+                else:
+                    value = str(values or "").strip()
+                    attrs[normalized_key] = [value] if value else []
+
+            object_classes = [entry.casefold() for entry in attrs.get("objectclass", [])]
+            if object_classes and "user" not in object_classes:
+                continue
+
+            cn = ""
+            if attrs.get("cn"):
+                cn = attrs["cn"][0]
+            elif dn.upper().startswith("CN="):
+                cn = dn.split(",", 1)[0].split("=", 1)[1].strip()
+
+            samaccountname = ""
+            if attrs.get("samaccountname"):
+                samaccountname = attrs["samaccountname"][0]
+
+            description = " | ".join(attrs.get("description", []))
+
+            is_enabled = True
+            if attrs.get("useraccountcontrol"):
+                try:
+                    uac = int(attrs["useraccountcontrol"][0], 10)
+                    is_enabled = not bool(uac & 0x0002)
+                except (TypeError, ValueError):
+                    is_enabled = True
+
+            key = dn.casefold()
+            if key in seen_dns:
+                continue
+            seen_dns.add(key)
+            records.append(
+                LDAPAnonymousUserRecord(
+                    distinguished_name=dn,
+                    common_name=cn,
+                    samaccountname=samaccountname,
+                    description=description,
+                    object_classes=object_classes,
+                    is_enabled=is_enabled,
+                    raw_attributes=attrs,
+                )
+            )
+
+        return records
+
     def _parse_netexec_computers_output(self, output: str) -> List[LDAPComputer]:
         """Parse NetExec --computers output.
 
@@ -843,15 +1105,30 @@ class LDAPEnumerationMixin:
                 continue
             if "-Username-" in line:
                 continue
-            # Extract domain\\user patterns.
             if "\\" in line:
                 candidate = line.split("\\")[-1].strip()
-                candidate = candidate.strip("[]")
-                if not candidate:
+            else:
+                parts = line.split(None, 5)
+                if len(parts) < 5:
                     continue
-                key = candidate.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                usernames.append(key)
+                candidate = parts[4].strip()
+
+            candidate = candidate.strip("[]")
+            if not candidate:
+                continue
+            if candidate in {"*", "+", "-"}:
+                continue
+            if candidate.startswith("[") or candidate.startswith("-"):
+                continue
+            if candidate.casefold() in {
+                "ldap",
+                "total",
+            }:
+                continue
+
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            usernames.append(key)
         return usernames

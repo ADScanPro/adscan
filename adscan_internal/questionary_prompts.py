@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from adscan_core.rich_output import (
-    questionary_checkbox_values_raw,
+    questionary_checkbox_values,
     questionary_select_value,
 )
 
@@ -23,6 +23,11 @@ def prompt_questionary_checkbox(
     *,
     title: str,
     options: Sequence[str],
+    default_values: Sequence[str] | None = None,
 ) -> list[str] | None:
     """Render a Questionary checkbox prompt and return selected values."""
-    return questionary_checkbox_values_raw(title=title, options=list(options))
+    return questionary_checkbox_values(
+        title=title,
+        options=list(options),
+        default_values=list(default_values) if default_values is not None else None,
+    )

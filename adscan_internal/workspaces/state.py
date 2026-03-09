@@ -33,6 +33,9 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
         "lab_provider": getattr(shell, "lab_provider", None),
         "lab_name": getattr(shell, "lab_name", None),
         "lab_name_whitelisted": getattr(shell, "lab_name_whitelisted", None),
+        "lab_confirmation_state": getattr(shell, "lab_confirmation_state", None),
+        "lab_inference_source": getattr(shell, "lab_inference_source", None),
+        "lab_inference_confidence": getattr(shell, "lab_inference_confidence", None),
         "password_spraying_history": getattr(shell, "password_spraying_history", {}),
     }
 
@@ -108,6 +111,9 @@ def apply_workspace_variables_to_shell(shell: Any, variables: dict[str, Any]) ->
         "lab_provider": None,
         "lab_name": None,
         "lab_name_whitelisted": None,
+        "lab_confirmation_state": None,
+        "lab_inference_source": None,
+        "lab_inference_confidence": None,
         "password_spraying_history": {},
     }
 

@@ -10,7 +10,12 @@ import shutil
 import subprocess
 
 from adscan_core.interaction import is_non_interactive
-from adscan_core.rich_output import print_info_debug, print_info_verbose
+from adscan_core.rich_output import (
+    print_info_debug,
+    print_info_verbose,
+    print_instruction,
+    print_warning,
+)
 
 _sudo_validated: bool = False
 
@@ -19,6 +24,25 @@ DEFAULT_SUDO_PRESERVE_ENV_KEYS: tuple[str, ...] = (
     "XDG_CONFIG_HOME",
     "ADSCAN_HOME",
 )
+_DEFAULT_INTERACTIVE_SUDO_TIMEOUT_SECONDS = 120
+_MAX_INTERACTIVE_SUDO_TIMEOUT_SECONDS = 900
+
+
+def _get_interactive_sudo_timeout_seconds() -> int:
+    """Return validated timeout for interactive sudo validation."""
+    raw = str(os.getenv("ADSCAN_SUDO_INTERACTIVE_TIMEOUT", "")).strip()
+    if not raw:
+        return _DEFAULT_INTERACTIVE_SUDO_TIMEOUT_SECONDS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        print_info_debug(
+            "Invalid ADSCAN_SUDO_INTERACTIVE_TIMEOUT value; using default timeout."
+        )
+        return _DEFAULT_INTERACTIVE_SUDO_TIMEOUT_SECONDS
+    if parsed <= 0:
+        return _DEFAULT_INTERACTIVE_SUDO_TIMEOUT_SECONDS
+    return min(parsed, _MAX_INTERACTIVE_SUDO_TIMEOUT_SECONDS)
 
 
 def sudo_validate() -> bool:
@@ -53,17 +77,27 @@ def sudo_validate() -> bool:
         print_info_verbose("Non-interactive environment; sudo requires NOPASSWD")
         return False
 
+    interactive_timeout = _get_interactive_sudo_timeout_seconds()
     try:
         result = subprocess.run(  # noqa: S603
             ["sudo", "true"],
             check=False,
             capture_output=False,
-            timeout=120,
+            timeout=interactive_timeout,
         )
         if result.returncode == 0:
             _sudo_validated = True
             return True
-    except (subprocess.TimeoutExpired, OSError) as exc:
+    except subprocess.TimeoutExpired as exc:
+        print_warning(
+            "Sudo authorization prompt timed out before confirmation."
+        )
+        print_instruction("Run `sudo -v` to refresh credentials, then retry.")
+        print_info_debug(
+            "sudo true (interactive) timed out: "
+            f"timeout_seconds={interactive_timeout} error={exc}"
+        )
+    except OSError as exc:
         print_info_debug(f"sudo true (interactive) failed: {exc}")
 
     return False

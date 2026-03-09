@@ -51,6 +51,7 @@ class ShareCredentialProvenanceService(BaseService):
         relation: str,
         edge_type: str,
         source: str,
+        secret: str | None = None,
         hosts: Sequence[str] | None = None,
         shares: Sequence[str] | None = None,
         artifact: str | None = None,
@@ -76,6 +77,7 @@ class ShareCredentialProvenanceService(BaseService):
         share_values = self._normalize_values(shares)
         artifact_text = str(artifact or "").strip()
         auth_text = str(auth_username or "").strip()
+        secret_text = str(secret or "").strip()
         notes: dict[str, Any] = {}
         if source_text:
             notes["source"] = source_text
@@ -91,6 +93,8 @@ class ShareCredentialProvenanceService(BaseService):
             notes["shares_list"] = share_values
         if auth_text:
             notes["auth_username"] = auth_text
+        if secret_text:
+            notes["secret"] = secret_text
         entry_label = resolve_entry_label_for_auth(auth_text)
         return [
             CredentialSourceStep(
@@ -106,6 +110,7 @@ class ShareCredentialProvenanceService(BaseService):
         *,
         source_context: dict[str, object] | None,
         spray_type: str | None = None,
+        secret: str | None = None,
         verified_via: str = "spraying",
     ) -> tuple[str, dict[str, object]] | None:
         """Build ``(entry_label, notes)`` for ``PasswordInShare`` edge upserts."""
@@ -135,6 +140,9 @@ class ShareCredentialProvenanceService(BaseService):
         artifact_text = str(source_context.get("artifact") or "").strip()
         if artifact_text:
             notes["artifact"] = artifact_text
+        secret_text = str(secret or "").strip()
+        if secret_text:
+            notes["password"] = secret_text
 
         host_values = self._normalize_context_values(source_context.get("hosts"))
         if host_values:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import ipaddress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -23,14 +24,77 @@ from adscan_internal.rich_output import (
     print_exception,
     print_info,
     print_info_debug,
+    print_panel,
     print_info_verbose,
     print_success,
     print_warning,
     print_warning_verbose,
 )
+from adscan_internal.interaction import is_non_interactive
+from rich.prompt import Confirm, Prompt
 from adscan_internal.workspaces.io import read_json_file
 from adscan_internal.workspaces.state import apply_workspace_variables_to_shell
 from adscan_internal.cli.common import build_telemetry_context
+
+
+def _apply_workspace_name_inference(shell: Any) -> None:
+    """Populate lab inference metadata from the workspace name if not already known.
+
+    Runs at workspace load time regardless of whether ``lab_provider`` is already
+    set.  The guard is ``lab_inference_source``: if it is already populated (e.g.
+    loaded from a persisted ``variables.json`` or set by domain inference in
+    ``start.py``), the function does nothing.
+
+    Two cases are handled:
+
+    * **No ``lab_provider``** — fresh/un-inferred workspace: sets provider, name,
+      whitelisted flag *and* inference metadata (same as the original inline block).
+    * **``lab_provider`` set but ``lab_inference_source`` is None** — existing
+      workspace created before this field was persisted: only fills in the inference
+      metadata when the inferred provider matches the stored one, so we never
+      silently overwrite a manually-configured provider.
+    """
+    if getattr(shell, "lab_inference_source", None) or getattr(
+        shell, "lab_confirmation_state", None
+    ) in {"manual", "accepted_inference"}:
+        return  # Already known — nothing to do
+
+    workspace_name = str(getattr(shell, "current_workspace", None) or "").strip()
+    if not workspace_name or getattr(shell, "type", None) != "ctf":
+        return
+
+    try:
+        from adscan_core.domain_inference import resolve_lab_from_text  # noqa: PLC0415
+
+        inferred = resolve_lab_from_text(workspace_name)
+        if not inferred:
+            return
+
+        inferred_provider, inferred_lab, inferred_whitelisted = inferred
+        existing_provider = getattr(shell, "lab_provider", None)
+
+        if not existing_provider:
+            # Fresh workspace — set lab context and inference metadata.
+            shell.lab_provider = inferred_provider
+            shell.lab_name = inferred_lab
+            shell.lab_name_whitelisted = inferred_whitelisted
+            shell.lab_inference_source = "workspace_name"
+            shell.lab_inference_confidence = 0.70
+            print_info_debug(
+                f"[domain_inference] workspace-load name match (new): "
+                f"provider={inferred_provider} lab={inferred_lab}"
+            )
+        elif existing_provider == inferred_provider:
+            # Retroactive fill: provider already known, just record how it was inferred.
+            shell.lab_inference_source = "workspace_name"
+            shell.lab_inference_confidence = 0.70
+            print_info_debug(
+                f"[domain_inference] workspace-load name match (retroactive): "
+                f"provider={inferred_provider} lab={inferred_lab}"
+            )
+        # If providers differ, leave inference_source as None — origin is ambiguous.
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class WorkspaceLoaderShell(Protocol):
@@ -49,6 +113,7 @@ class WorkspaceLoaderShell(Protocol):
     lab_provider: str | None
     lab_name: str | None
     lab_name_whitelisted: bool | None
+    lab_confirmation_state: str | None
     telemetry: bool
     variables: dict[str, Any] | None
 
@@ -57,6 +122,324 @@ class WorkspaceLoaderShell(Protocol):
     def do_update_resolv_conf(self, domain_pdc: str) -> bool: ...
     def add_to_hosts(self, domain: str) -> None: ...
     def _clean_domain_entries(self, domain: str) -> None: ...
+    def _get_dns_discovery_service(self) -> Any: ...
+
+
+def _capture_workspace_dns_repair_event(
+    *,
+    shell: WorkspaceLoaderShell,
+    event: str,
+    result: str,
+    reason: str | None = None,
+    pdc_changed: bool | None = None,
+) -> None:
+    """Capture workspace DNS repair telemetry with safe, high-signal fields."""
+    properties: dict[str, Any] = {
+        "result": result,
+        "mode": "workspace_load",
+        "interactive": not is_non_interactive(shell=shell),
+        "workspace_type": str(getattr(shell, "type", None) or "unknown"),
+    }
+    if reason is not None:
+        properties["reason"] = reason
+    if pdc_changed is not None:
+        properties["pdc_changed"] = bool(pdc_changed)
+
+    try:
+        telemetry.capture(event, properties=properties)
+    except Exception:
+        # Best-effort telemetry only.
+        return
+
+
+def _restore_hosts_entry_for_domain(
+    shell: WorkspaceLoaderShell,
+    *,
+    domain: str,
+    pdc_ip: str,
+    pdc_hostname: str | None,
+) -> None:
+    """Best-effort restore of /etc/hosts entry for a domain after DNS setup."""
+    original_pdc_hostname = shell.pdc_hostname
+    original_pdc = shell.pdc
+    try:
+        if pdc_hostname:
+            shell.pdc_hostname = pdc_hostname
+        shell.pdc = pdc_ip
+        shell.add_to_hosts(domain)
+    except Exception as exc:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(f"Could not add {marked_domain} to /etc/hosts.")
+        print_exception(show_locals=False, exception=exc)
+        telemetry.capture_exception(exc)
+    finally:
+        shell.pdc_hostname = original_pdc_hostname
+        shell.pdc = original_pdc
+
+
+def _refresh_domain_dc_metadata(
+    shell: WorkspaceLoaderShell,
+    *,
+    domain: str,
+    pdc_ip: str,
+    pdc_hostname: str | None,
+) -> None:
+    """Refresh `dcs`/`dcs_hostnames` for a domain after resolver updates."""
+    domain_data = shell.domains_data.setdefault(domain, {})
+    old_dcs = list(domain_data.get("dcs", [])) if isinstance(domain_data.get("dcs"), list) else []
+    old_hosts = (
+        list(domain_data.get("dcs_hostnames", []))
+        if isinstance(domain_data.get("dcs_hostnames"), list)
+        else []
+    )
+
+    discovered_ips: list[str] = []
+    discovered_hosts: list[str] = []
+    dc_ip_to_hostname: dict[str, str] = {}
+    try:
+        service_getter = getattr(shell, "_get_dns_discovery_service", None)
+        if callable(service_getter):
+            service = service_getter()
+            if service is not None and hasattr(service, "discover_domain_controllers"):
+                dc_ips, dc_hostnames, ip_to_host = service.discover_domain_controllers(
+                    domain=(domain or "").strip().rstrip("."),
+                    pdc_ip=pdc_ip,
+                    preferred_ips=[pdc_ip],
+                )
+                if isinstance(dc_ips, list):
+                    discovered_ips = [str(ip).strip() for ip in dc_ips if str(ip).strip()]
+                if isinstance(dc_hostnames, list):
+                    discovered_hosts = [
+                        str(host).strip() for host in dc_hostnames if str(host).strip()
+                    ]
+                if isinstance(ip_to_host, dict):
+                    dc_ip_to_hostname = {
+                        str(k): str(v) for k, v in ip_to_host.items() if str(k).strip()
+                    }
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[workspace_load] Failed to refresh DC metadata for {mark_sensitive(domain, 'domain')}: {exc}")
+
+    dcs: list[str] = []
+    for ip_value in discovered_ips:
+        if ip_value and ip_value not in dcs:
+            dcs.append(ip_value)
+    if pdc_ip and pdc_ip not in dcs:
+        dcs.insert(0, pdc_ip)
+    if not dcs and pdc_ip:
+        dcs = [pdc_ip]
+
+    dcs_hostnames: list[str] = []
+    for hostname in discovered_hosts:
+        short = hostname.split(".")[0].strip().lower()
+        if short and short not in dcs_hostnames:
+            dcs_hostnames.append(short)
+    if pdc_ip in dc_ip_to_hostname:
+        short = str(dc_ip_to_hostname[pdc_ip]).split(".")[0].strip().lower()
+        if short and short not in dcs_hostnames:
+            dcs_hostnames.insert(0, short)
+    if pdc_hostname:
+        short = str(pdc_hostname).split(".")[0].strip().lower()
+        if short and short not in dcs_hostnames:
+            dcs_hostnames.insert(0, short)
+
+    domain_data["dcs"] = dcs
+    if dcs_hostnames:
+        domain_data["dcs_hostnames"] = dcs_hostnames
+
+    if hasattr(shell, "dcs"):
+        try:
+            setattr(shell, "dcs", list(dcs))
+        except Exception:
+            pass
+
+    try:
+        workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
+        domains_dir_name = str(getattr(shell, "domains_dir", "domains") or "domains")
+        if workspace_dir:
+            dcs_file = os.path.join(workspace_dir, domains_dir_name, domain, "dcs.txt")
+            os.makedirs(os.path.dirname(dcs_file), exist_ok=True)
+            with open(dcs_file, "w", encoding="utf-8") as handle:
+                for dc_ip in dcs:
+                    handle.write(f"{dc_ip}\n")
+            print_info_debug(
+                "[workspace_load] Updated dcs.txt: "
+                f"path={mark_sensitive(dcs_file, 'path')} "
+                f"entries={len(dcs)}"
+            )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[workspace_load] Failed writing dcs.txt for {mark_sensitive(domain, 'domain')}: {exc}")
+
+    print_info_debug(
+        "[workspace_load] Refreshed DC metadata: "
+        f"domain={mark_sensitive(domain, 'domain')} "
+        f"dcs_old={len(old_dcs)} dcs_new={len(dcs)} "
+        f"dcs_hostnames_old={len(old_hosts)} dcs_hostnames_new={len(dcs_hostnames)}"
+    )
+
+
+def _prompt_updated_dc_ip_for_workspace_domain(domain: str) -> str | None:
+    """Prompt for an updated DC/DNS IP while restoring a workspace."""
+    while True:
+        ip_input = Prompt.ask(
+            f"Enter updated DC/DNS IP for {mark_sensitive(domain, 'domain')}",
+            default="",
+        ).strip()
+        if not ip_input:
+            return None
+        try:
+            ipaddress.ip_address(ip_input)
+            return ip_input
+        except ValueError:
+            print_warning(
+                f"Invalid IP format: {mark_sensitive(ip_input, 'ip')}. Please enter a valid IPv4 address."
+            )
+
+
+def _attempt_workspace_dns_repair_interactive(
+    shell: WorkspaceLoaderShell,
+    *,
+    domain: str,
+    saved_pdc_ip: str,
+    saved_pdc_hostname: str | None,
+) -> bool:
+    """Try interactive DNS repair for stale workspace domain/DC mappings."""
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_saved_pdc = mark_sensitive(saved_pdc_ip, "ip")
+    _capture_workspace_dns_repair_event(
+        shell=shell,
+        event="workspace_dns_repair_attempted",
+        result="attempted",
+    )
+
+    if is_non_interactive(shell=shell):
+        print_warning(
+            f"DNS for {marked_domain} is not currently reachable "
+            f"(saved DC/DNS: {marked_saved_pdc})."
+        )
+        print_info(
+            "If the target changed, reconfigure later with:\n"
+            f"  update_resolv_conf {domain} <new_dc_ip>\n"
+            "Or run `start_unauth` to rediscover DC/PDC."
+        )
+        _capture_workspace_dns_repair_event(
+            shell=shell,
+            event="workspace_dns_repair_skipped",
+            result="skipped",
+            reason="non_interactive",
+        )
+        return False
+
+    print_panel(
+        "[bold yellow]Workspace DNS mapping appears stale.[/bold yellow]\n\n"
+        f"Domain: {marked_domain}\n"
+        f"Saved DC/DNS IP: {marked_saved_pdc}\n\n"
+        "This is common in CTF labs where DC IPs rotate between sessions.\n"
+        "You can repair it now or skip (offline mode).\n",
+        title="[bold]🧭 Workspace DNS Repair[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+
+    if not Confirm.ask(
+        "Try to repair DNS mapping now? (recommended)",
+        default=True,
+    ):
+        print_warning(
+            f"Continuing without DNS repair for {marked_domain}. "
+            "Domain scans may fail until DNS is fixed."
+        )
+        _capture_workspace_dns_repair_event(
+            shell=shell,
+            event="workspace_dns_repair_skipped",
+            result="skipped",
+            reason="user_declined",
+        )
+        return False
+
+    try:
+        from adscan_internal.cli.dns import confirm_domain_pdc_mapping
+
+        def _on_reenter() -> tuple[str, str] | None:
+            updated_ip = _prompt_updated_dc_ip_for_workspace_domain(domain)
+            if not updated_ip:
+                return None
+            return domain, updated_ip
+
+        mapping = confirm_domain_pdc_mapping(
+            shell,
+            domain=domain,
+            candidate_ip=saved_pdc_ip,
+            interactive=True,
+            mode_label="workspace_load",
+            on_reenter=_on_reenter,
+        )
+        if not mapping:
+            print_warning(
+                f"Skipping DNS repair for {marked_domain}. "
+                "You can continue working offline."
+            )
+            _capture_workspace_dns_repair_event(
+                shell=shell,
+                event="workspace_dns_repair_skipped",
+                result="skipped",
+                reason="preflight_fallback",
+            )
+            return False
+
+        _validated_domain, validated_pdc_ip = mapping
+        if not shell.do_update_resolv_conf(f"{domain} {validated_pdc_ip}"):
+            print_warning(
+                f"Could not repair DNS for {marked_domain} using "
+                f"{mark_sensitive(validated_pdc_ip, 'ip')}."
+            )
+            _capture_workspace_dns_repair_event(
+                shell=shell,
+                event="workspace_dns_repair_failed",
+                result="failed",
+                reason="update_resolv_conf_failed",
+            )
+            return False
+
+        resolved_hostname = (shell.pdc_hostname or "").strip() or saved_pdc_hostname
+        shell.domains_data.setdefault(domain, {})["pdc"] = validated_pdc_ip
+        if resolved_hostname:
+            shell.domains_data.setdefault(domain, {})["pdc_hostname"] = resolved_hostname
+        _refresh_domain_dc_metadata(
+            shell,
+            domain=domain,
+            pdc_ip=validated_pdc_ip,
+            pdc_hostname=resolved_hostname,
+        )
+        _restore_hosts_entry_for_domain(
+            shell,
+            domain=domain,
+            pdc_ip=validated_pdc_ip,
+            pdc_hostname=resolved_hostname,
+        )
+        print_success(f"Workspace DNS repaired for {marked_domain}.")
+        _capture_workspace_dns_repair_event(
+            shell=shell,
+            event="workspace_dns_repair_succeeded",
+            result="succeeded",
+            pdc_changed=(validated_pdc_ip != saved_pdc_ip),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning(
+            f"Interactive DNS repair failed for {marked_domain}. "
+            "Continuing without blocking workspace load."
+        )
+        print_info_debug(f"[workspace_load] DNS repair exception: {exc}")
+        _capture_workspace_dns_repair_event(
+            shell=shell,
+            event="workspace_dns_repair_failed",
+            result="failed",
+            reason=f"exception:{type(exc).__name__}",
+        )
+        return False
 
 
 def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> None:
@@ -101,6 +484,10 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
         )
         if variables is not None:
             apply_workspace_variables_to_shell(shell, variables)
+
+            # Infer lab from workspace name, backfilling inference metadata
+            # even for existing workspaces that already have lab_provider set.
+            _apply_workspace_name_inference(shell)
 
             # Update telemetry context
             telemetry_context = build_telemetry_context(
@@ -318,32 +705,44 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
 
                     # Configure the local resolver (Unbound)
                     if shell.do_update_resolv_conf(f"{domain} {pdc}"):
-                        # Set pdc_hostname temporarily for add_to_hosts
-                        original_pdc_hostname = shell.pdc_hostname
-                        original_pdc = shell.pdc
-
-                        if pdc_hostname:
-                            shell.pdc_hostname = pdc_hostname
-                        shell.pdc = pdc
-
-                        # Add to /etc/hosts
-                        try:
-                            shell.add_to_hosts(domain)
-                        except Exception as e:
-                            marked_domain = mark_sensitive(domain, "domain")
-                            print_warning(
-                                f"Could not add {marked_domain} to /etc/hosts."
-                            )
-                            print_exception(show_locals=False, exception=e)
-                            telemetry.capture_exception(e)
-
-                        # Restore original values
-                        shell.pdc_hostname = original_pdc_hostname
-                        shell.pdc = original_pdc
+                        resolved_pdc_ip = str(getattr(shell, "pdc", "") or pdc)
+                        resolved_pdc_hostname = (
+                            str(getattr(shell, "pdc_hostname", "") or "").strip()
+                            or pdc_hostname
+                        )
+                        shell.domains_data.setdefault(domain, {})["pdc"] = resolved_pdc_ip
+                        if resolved_pdc_hostname:
+                            shell.domains_data.setdefault(domain, {})[
+                                "pdc_hostname"
+                            ] = resolved_pdc_hostname
+                        _refresh_domain_dc_metadata(
+                            shell,
+                            domain=domain,
+                            pdc_ip=resolved_pdc_ip,
+                            pdc_hostname=resolved_pdc_hostname,
+                        )
+                        _restore_hosts_entry_for_domain(
+                            shell,
+                            domain=domain,
+                            pdc_ip=resolved_pdc_ip,
+                            pdc_hostname=resolved_pdc_hostname,
+                        )
                     else:
                         marked_domain = mark_sensitive(domain, "domain")
                         print_warning(
                             f"Could not configure DNS for domain {marked_domain}"
+                        )
+                        _capture_workspace_dns_repair_event(
+                            shell=shell,
+                            event="workspace_dns_restore_failed",
+                            result="failed",
+                            reason="saved_mapping_unreachable",
+                        )
+                        _attempt_workspace_dns_repair_interactive(
+                            shell,
+                            domain=domain,
+                            saved_pdc_ip=pdc,
+                            saved_pdc_hostname=pdc_hostname,
                         )
         else:
             print_warning(

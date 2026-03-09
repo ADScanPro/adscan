@@ -16,6 +16,7 @@ to the existing methods on the interactive shell.
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Tuple
 import os
 import re
@@ -40,6 +41,126 @@ _DCSYNC_ALL_HUGE_THRESHOLD = 1000
 _DCSYNC_ALL_CRACKED_PREVIEW_DEFAULT = 15
 _DCSYNC_ALL_CRACKED_PREVIEW_LARGE = 8
 _DCSYNC_ALL_UNCRACKED_TABLE_MAX = 10
+
+
+def _capture_dcsync_batch_cracking_summary_telemetry(
+    shell: Any,
+    *,
+    domain: str,
+    total: int,
+    cracked_total: int,
+    uncracked_total: int,
+    tier0_extracted: int,
+    tier0_cracked: int,
+    high_value_extracted: int,
+    high_value_cracked: int,
+    standard_extracted: int,
+    standard_cracked: int,
+    cracked_reuse_groups: dict[str, list[dict[str, str]]],
+    uncracked_reuse_groups: dict[str, list[dict[str, str]]],
+) -> None:
+    """Emit telemetry for DCSync-All cracking summary analytics.
+
+    Only aggregate counters/ratios are emitted (no credential or user values).
+    """
+    try:
+        from adscan_internal.cli.common import build_lab_event_fields
+
+        cracked_reused_accounts = sum(
+            len(rows) for rows in cracked_reuse_groups.values()
+        )
+        uncracked_reused_accounts = sum(
+            len(rows) for rows in uncracked_reuse_groups.values()
+        )
+        cracked_reuse_largest_group = max(
+            (len(rows) for rows in cracked_reuse_groups.values()),
+            default=0,
+        )
+        uncracked_reuse_largest_group = max(
+            (len(rows) for rows in uncracked_reuse_groups.values()),
+            default=0,
+        )
+        largest_cracked_group_rows = (
+            max(cracked_reuse_groups.values(), key=len)
+            if cracked_reuse_groups
+            else []
+        )
+        largest_cracked_group_segment_counts = Counter(
+            str(row.get("risk_segment") or "Standard")
+            for row in largest_cracked_group_rows
+        )
+
+        properties: dict[str, Any] = {
+            "domain": domain,
+            "workspace_type": getattr(shell, "type", None),
+            "auto_mode": getattr(shell, "auto", False),
+            "scan_mode": getattr(shell, "scan_mode", None),
+            "credentials_extracted": total,
+            "hashes_cracked": cracked_total,
+            "hashes_uncracked": uncracked_total,
+            "hash_crack_rate_pct": round(((cracked_total / total) * 100), 2)
+            if total > 0
+            else 0.0,
+            "tier0_extracted_count": tier0_extracted,
+            "tier0_cracked_count": tier0_cracked,
+            "tier0_crack_coverage_pct": round(((tier0_cracked / tier0_extracted) * 100), 2)
+            if tier0_extracted > 0
+            else 0.0,
+            "tier0_cracked_pct": round(((tier0_cracked / cracked_total) * 100), 2)
+            if cracked_total > 0
+            else 0.0,
+            "high_value_extracted_count": high_value_extracted,
+            "high_value_cracked_count": high_value_cracked,
+            "high_value_crack_coverage_pct": round(
+                ((high_value_cracked / high_value_extracted) * 100), 2
+            )
+            if high_value_extracted > 0
+            else 0.0,
+            "high_value_cracked_pct": round(
+                ((high_value_cracked / cracked_total) * 100), 2
+            )
+            if cracked_total > 0
+            else 0.0,
+            "standard_extracted_count": standard_extracted,
+            "standard_cracked_count": standard_cracked,
+            "standard_crack_coverage_pct": round(
+                ((standard_cracked / standard_extracted) * 100), 2
+            )
+            if standard_extracted > 0
+            else 0.0,
+            "standard_cracked_pct": round(
+                ((standard_cracked / cracked_total) * 100), 2
+            )
+            if cracked_total > 0
+            else 0.0,
+            "reused_cracked_secret_count": len(cracked_reuse_groups),
+            "reused_cracked_accounts_count": cracked_reused_accounts,
+            "reused_cracked_accounts_pct": round(
+                ((cracked_reused_accounts / cracked_total) * 100), 2
+            )
+            if cracked_total > 0
+            else 0.0,
+            "reused_uncracked_hash_count": len(uncracked_reuse_groups),
+            "reused_uncracked_accounts_count": uncracked_reused_accounts,
+            "reused_cracked_largest_group_size": cracked_reuse_largest_group,
+            "reused_uncracked_largest_group_size": uncracked_reuse_largest_group,
+            "largest_cracked_reuse_cluster_tier0_count": largest_cracked_group_segment_counts.get(
+                "Tier-0", 0
+            ),
+            "largest_cracked_reuse_cluster_high_value_count": largest_cracked_group_segment_counts.get(
+                "High-Value", 0
+            ),
+            "largest_cracked_reuse_cluster_standard_count": largest_cracked_group_segment_counts.get(
+                "Standard", 0
+            ),
+        }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("dcsync_cracking_summary", properties)
+    except Exception as exc:  # pragma: no cover - telemetry best effort
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"[dcsync] Failed to emit cracking summary telemetry: {type(exc).__name__}"
+        )
 
 
 def _get_positive_int_env(name: str, default: int) -> int:
@@ -385,9 +506,30 @@ def execute_secretsdump(shell: Any, command: str, domain: str) -> None:
                 ui_silent=False,
             )
             _render_dcsync_batch_cracking_summary(
+                shell=shell,
                 domain=domain,
                 credentials=creds_to_persist,
             )
+            try:
+                created_domain_reuse_edges = _record_dcsync_domain_password_reuse(
+                    shell,
+                    domain=domain,
+                    credentials=raw_credentials,
+                )
+                if created_domain_reuse_edges > 0:
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_info(
+                        "Recorded "
+                        f"{created_domain_reuse_edges} DomainPassReuse context step(s) "
+                        f"from DCSync-All credentials in {marked_domain}."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                marked_domain = mark_sensitive(domain, "domain")
+                print_warning(
+                    "Failed to persist DomainPassReuse context steps from DCSync-All "
+                    f"credentials in {marked_domain}; continuing."
+                )
 
         for username, cred_value in creds_to_persist:
             display_rows.append({"User": username, "Credential": cred_value})
@@ -503,6 +645,7 @@ def _offer_machine_account_dump_fallback(shell: Any, domain: str) -> None:
 
 def _render_dcsync_batch_cracking_summary(
     *,
+    shell: Any,
     domain: str,
     credentials: list[tuple[str, str]],
 ) -> None:
@@ -512,32 +655,193 @@ def _render_dcsync_batch_cracking_summary(
 
     cracked_rows: list[dict[str, str]] = []
     uncracked_rows: list[dict[str, str]] = []
+    user_values: list[str] = []
     for username, credential in credentials:
         normalized_user = str(username or "").strip()
         normalized_credential = str(credential or "").strip()
         if not normalized_user or not normalized_credential:
             continue
+        user_values.append(normalized_user)
+        row_base = {
+            "raw_user": normalized_user,
+            "raw_credential": normalized_credential,
+        }
         if re.fullmatch(r"[0-9a-fA-F]{32}", normalized_credential):
-            uncracked_rows.append(
-                {
-                    "User": mark_sensitive(normalized_user, "user"),
-                    "Hash": mark_sensitive(normalized_credential, "password"),
-                }
-            )
+            uncracked_rows.append(row_base)
         else:
-            cracked_rows.append(
-                {
-                    "User": mark_sensitive(normalized_user, "user"),
-                    "Password": mark_sensitive(normalized_credential, "password"),
-                }
+            cracked_rows.append(row_base)
+
+    risk_map: dict[str, tuple[bool, bool]] = {}
+
+    def normalize_user_for_lookup(value: str) -> str:
+        return str(value or "").casefold()
+
+    if user_values:
+        try:
+            from adscan_internal.services.high_value import (
+                classify_users_tier0_high_value,
+                normalize_samaccountname,
             )
+
+            normalize_user_for_lookup = normalize_samaccountname
+            resolved_risks = classify_users_tier0_high_value(
+                shell, domain=domain, usernames=user_values
+            )
+            risk_map = {
+                normalize_user_for_lookup(username): (
+                    bool(flags.is_tier0),
+                    bool(flags.is_high_value),
+                )
+                for username, flags in resolved_risks.items()
+            }
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"[dcsync] Unable to classify cracked users by risk tier: {type(exc).__name__}"
+            )
+
+    def _classify_user(user_raw: str) -> tuple[bool, bool]:
+        normalized = normalize_user_for_lookup(user_raw)
+        return risk_map.get(normalized, (False, False))
+
+    def _risk_segment_for_user(user_raw: str) -> str:
+        is_tier0_user, is_high_value_user = _classify_user(user_raw)
+        if is_tier0_user:
+            return "Tier-0"
+        if is_high_value_user:
+            return "High-Value"
+        return "Standard"
+
+    for row in cracked_rows:
+        row["risk_segment"] = _risk_segment_for_user(row["raw_user"])
+        row["User"] = mark_sensitive(str(row["raw_user"]), "user")
+        row["Password"] = mark_sensitive(str(row["raw_credential"]), "password")
+    for row in uncracked_rows:
+        row["risk_segment"] = _risk_segment_for_user(row["raw_user"])
+        row["User"] = mark_sensitive(str(row["raw_user"]), "user")
+        row["Hash"] = mark_sensitive(str(row["raw_credential"]), "password")
+
+    cracked_total = len(cracked_rows)
+    uncracked_total = len(uncracked_rows)
+    extracted_by_segment = Counter(
+        row["risk_segment"] for row in [*cracked_rows, *uncracked_rows]
+    )
+    cracked_by_segment = Counter(row["risk_segment"] for row in cracked_rows)
+    tier0_extracted = int(extracted_by_segment.get("Tier-0", 0))
+    high_value_extracted = int(extracted_by_segment.get("High-Value", 0))
+    standard_extracted = int(extracted_by_segment.get("Standard", 0))
+    tier0_cracked = int(cracked_by_segment.get("Tier-0", 0))
+    high_value_cracked = int(cracked_by_segment.get("High-Value", 0))
+    standard_cracked = int(cracked_by_segment.get("Standard", 0))
+
+    def _format_count_and_percent(count: int, denominator: int) -> str:
+        if denominator <= 0:
+            return str(count)
+        return f"{count} ({(count / denominator) * 100:.1f}%)"
+
+    def _format_percent(count: int, denominator: int) -> str:
+        if denominator <= 0:
+            return "0.0%"
+        return f"{(count / denominator) * 100:.1f}%"
+
+    def _format_ratio_with_percent(count: int, denominator: int) -> str:
+        return f"{count}/{denominator} ({_format_percent(count, denominator)})"
+
+    def _build_reuse_groups(
+        rows: list[dict[str, str]],
+    ) -> dict[str, list[dict[str, str]]]:
+        grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+        for row in rows:
+            grouped[str(row["raw_credential"])].append(row)
+        return {value: users for value, users in grouped.items() if len(users) > 1}
+
+    cracked_reuse_groups = _build_reuse_groups(cracked_rows)
+    uncracked_reuse_groups = _build_reuse_groups(uncracked_rows)
+    cracked_reused_accounts = sum(len(rows) for rows in cracked_reuse_groups.values())
+    uncracked_reused_accounts = sum(
+        len(rows) for rows in uncracked_reuse_groups.values()
+    )
+    largest_cracked_reuse_cluster_size = max(
+        (len(rows) for rows in cracked_reuse_groups.values()),
+        default=0,
+    )
 
     total = len(cracked_rows) + len(uncracked_rows)
     summary_rows = [
         {"Metric": "Credentials Extracted", "Count": str(total)},
-        {"Metric": "Hashes Cracked", "Count": str(len(cracked_rows))},
-        {"Metric": "Hashes Uncracked", "Count": str(len(uncracked_rows))},
+        {
+            "Metric": "Hashes Cracked",
+            "Count": _format_count_and_percent(cracked_total, total),
+        },
+        {
+            "Metric": "Hashes Uncracked",
+            "Count": _format_count_and_percent(uncracked_total, total),
+        },
+        {
+            "Metric": "Tier-0 Cracked (share of cracked)",
+            "Count": _format_count_and_percent(tier0_cracked, cracked_total),
+        },
+        {"Metric": "Tier-0 Extracted", "Count": str(tier0_extracted)},
+        {
+            "Metric": "Tier-0 Crack Coverage",
+            "Count": _format_ratio_with_percent(tier0_cracked, tier0_extracted),
+        },
+        {
+            "Metric": "High-Value Cracked (share of cracked)",
+            "Count": _format_count_and_percent(high_value_cracked, cracked_total),
+        },
+        {"Metric": "High-Value Extracted", "Count": str(high_value_extracted)},
+        {
+            "Metric": "High-Value Crack Coverage",
+            "Count": _format_ratio_with_percent(
+                high_value_cracked, high_value_extracted
+            ),
+        },
+        {
+            "Metric": "Standard Cracked (share of cracked)",
+            "Count": _format_count_and_percent(standard_cracked, cracked_total),
+        },
+        {"Metric": "Standard Extracted", "Count": str(standard_extracted)},
+        {
+            "Metric": "Standard Crack Coverage",
+            "Count": _format_ratio_with_percent(standard_cracked, standard_extracted),
+        },
+        {
+            "Metric": "Reused Cracked Passwords",
+            "Count": (
+                f"{len(cracked_reuse_groups)} secret(s), {cracked_reused_accounts} account(s)"
+            ),
+        },
+        {
+            "Metric": "Cracked Accounts Using Reused Passwords",
+            "Count": _format_count_and_percent(cracked_reused_accounts, cracked_total),
+        },
+        {
+            "Metric": "Largest Reuse Cluster (Cracked)",
+            "Count": f"{largest_cracked_reuse_cluster_size} account(s)",
+        },
+        {
+            "Metric": "Reused Uncracked Hashes",
+            "Count": (
+                f"{len(uncracked_reuse_groups)} hash(es), {uncracked_reused_accounts} account(s)"
+            ),
+        },
     ]
+    _capture_dcsync_batch_cracking_summary_telemetry(
+        shell,
+        domain=domain,
+        total=total,
+        cracked_total=cracked_total,
+        uncracked_total=uncracked_total,
+        tier0_extracted=tier0_extracted,
+        tier0_cracked=tier0_cracked,
+        high_value_extracted=high_value_extracted,
+        high_value_cracked=high_value_cracked,
+        standard_extracted=standard_extracted,
+        standard_cracked=standard_cracked,
+        cracked_reuse_groups=cracked_reuse_groups,
+        uncracked_reuse_groups=uncracked_reuse_groups,
+    )
     print_info_table(
         summary_rows,
         ["Metric", "Count"],
@@ -563,6 +867,33 @@ def _render_dcsync_batch_cracking_summary(
         cracked_preview_limit = cracked_preview_default
 
     if cracked_rows:
+        segment_breakdown_rows = []
+        for segment in ("Tier-0", "High-Value", "Standard"):
+            extracted_count = int(extracted_by_segment.get(segment, 0))
+            cracked_count = int(cracked_by_segment.get(segment, 0))
+            uncracked_count = max(extracted_count - cracked_count, 0)
+            segment_breakdown_rows.append(
+                {
+                    "Segment": segment,
+                    "Extracted": str(extracted_count),
+                    "Cracked": str(cracked_count),
+                    "Uncracked": str(uncracked_count),
+                    "Crack Rate": _format_percent(cracked_count, extracted_count),
+                    "Share of Cracked": _format_percent(cracked_count, cracked_total),
+                }
+            )
+        print_info_table(
+            segment_breakdown_rows,
+            [
+                "Segment",
+                "Extracted",
+                "Cracked",
+                "Uncracked",
+                "Crack Rate",
+                "Share of Cracked",
+            ],
+            title="Cracked Privilege Breakdown",
+        )
         print_info_table(
             cracked_rows[:cracked_preview_limit],
             ["User", "Password"],
@@ -588,3 +919,96 @@ def _render_dcsync_batch_cracking_summary(
         print_info(
             f"Uncracked hashes retained for {len(uncracked_rows)} account(s)."
         )
+
+    reuse_rows: list[dict[str, str]] = []
+
+    def _append_reuse_rows(
+        *,
+        secret_label: str,
+        groups: dict[str, list[dict[str, str]]],
+    ) -> None:
+        ordered = sorted(
+            groups.items(),
+            key=lambda item: (-len(item[1]), str(item[0]).casefold()),
+        )
+        for secret_value, rows in ordered[:5]:
+            segment_counts = Counter(str(row.get("risk_segment") or "Standard") for row in rows)
+            reuse_rows.append(
+                {
+                    "Secret Type": secret_label,
+                    "Secret": mark_sensitive(str(secret_value), "password"),
+                    "Accounts": str(len(rows)),
+                    "Tier-0": str(segment_counts.get("Tier-0", 0)),
+                    "High-Value": str(segment_counts.get("High-Value", 0)),
+                    "Standard": str(segment_counts.get("Standard", 0)),
+                }
+            )
+
+    _append_reuse_rows(secret_label="Password", groups=cracked_reuse_groups)
+    _append_reuse_rows(secret_label="Hash", groups=uncracked_reuse_groups)
+
+    if reuse_rows:
+        print_info_table(
+            reuse_rows,
+            ["Secret Type", "Secret", "Accounts", "Tier-0", "High-Value", "Standard"],
+            title="Top Reused Secrets",
+        )
+
+
+def _record_dcsync_domain_password_reuse(
+    shell: Any,
+    *,
+    domain: str,
+    credentials: list[tuple[str, str]],
+) -> int:
+    """Record DomainPassReuse context edges from DCSync-All credential material."""
+    from adscan_internal.services.attack_graph_service import (
+        upsert_domain_password_reuse_edges,
+    )
+
+    grouped: dict[str, dict[str, object]] = {}
+    for username, credential in credentials:
+        user_clean = str(username or "").strip()
+        credential_clean = str(credential or "").strip()
+        if not user_clean or not credential_clean:
+            continue
+        key = credential_clean.lower()
+        bucket = grouped.setdefault(
+            key,
+            {"credential": credential_clean, "users": set()},
+        )
+        users = bucket.get("users")
+        if isinstance(users, set):
+            users.add(user_clean)
+
+    created_total = 0
+    for value in grouped.values():
+        users_raw = value.get("users")
+        if not isinstance(users_raw, set):
+            continue
+        usernames = sorted(
+            {
+                str(user).strip()
+                for user in users_raw
+                if isinstance(user, str) and str(user).strip()
+            },
+            key=str.lower,
+        )
+        if len(usernames) < 2:
+            continue
+        credential_value = str(value.get("credential") or "").strip()
+        if not credential_value:
+            continue
+        created_total += int(
+            upsert_domain_password_reuse_edges(
+                shell,
+                domain,
+                source_usernames=usernames,
+                target_usernames=usernames,
+                credential=credential_value,
+                status="discovered",
+                evidence_source="dcsync_all",
+            )
+            or 0
+        )
+    return created_total

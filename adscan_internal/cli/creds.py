@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from typing import Any
 
 from rich.panel import Panel
@@ -24,6 +25,7 @@ from adscan_internal import (
     print_error,
     print_info,
     print_info_debug,
+    print_instruction,
     print_info_verbose,
     print_success_verbose,
     print_table,
@@ -36,6 +38,95 @@ from adscan_internal.cli.cracking import (
     handle_hash_cracking,
     handle_hash_cracking_batch,
 )
+
+
+def normalize_creds_subcommand(subcommand: str) -> tuple[str, bool]:
+    """Normalize `creds` subcommand aliases to their canonical form.
+
+    Args:
+        subcommand: Raw subcommand provided by the user (for example `save`).
+
+    Returns:
+        Tuple ``(normalized, alias_used)``.
+    """
+    normalized = str(subcommand or "").strip().lower()
+    aliases = {
+        "add": "save",
+    }
+    target = aliases.get(normalized, normalized)
+    return target, target != normalized
+
+
+def ensure_domain_ready_for_manual_credential_save(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    is_local_target: bool = False,
+) -> bool:
+    """Validate that a domain is initialized before manual ``creds save`` usage.
+
+    The expected workflow is:
+    1) Initialize/validate target context with ``start_auth``.
+    2) Use ``creds save`` later to add additional credentials discovered outside
+       of ADscan while continuing the same workspace/domain campaign.
+
+    Args:
+        shell: Active shell instance.
+        domain: Domain received by ``creds save``.
+        username: Username received by ``creds save``.
+        is_local_target: Whether save operation targets local creds (host/service).
+
+    Returns:
+        ``True`` when domain context exists and save may continue, ``False`` when
+        the user should initialize the domain first.
+    """
+    domains_data = getattr(shell, "domains_data", {})
+    if isinstance(domains_data, dict) and domain in domains_data:
+        return True
+
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_user = mark_sensitive(username, "user")
+    operation_scope = "local credential" if is_local_target else "domain credential"
+
+    print_panel(
+        "\n".join(
+            [
+                "⚠️ Domain not initialized in this workspace.",
+                f"Domain: {marked_domain}",
+                f"Credential user: {marked_user}",
+                f"Requested operation: {operation_scope}",
+                "",
+                "Recommended workflow:",
+                "1) Run `start_auth` first to initialize domain context, validate DNS/DC, and verify credentials.",
+                "2) After `start_auth`, use `creds save` only to add additional credentials discovered later.",
+            ]
+        ),
+        title="[bold yellow]Initialize Domain First[/bold yellow]",
+        border_style="yellow",
+        expand=False,
+    )
+    print_instruction("Run `start_auth` now to initialize this domain properly.")
+    print_instruction(
+        "After initialization, you can add extra creds with: "
+        "`creds save <domain> <username> <password_or_hash>`"
+    )
+
+    try:
+        properties: dict[str, Any] = {
+            "domain": domain,
+            "username": username,
+            "is_local_target": bool(is_local_target),
+            "workspace_type": getattr(shell, "type", None),
+            "auto_mode": getattr(shell, "auto", False),
+            "scan_mode": getattr(shell, "scan_mode", None),
+        }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("creds_save_requires_start_auth", properties)
+    except Exception as exc:  # pragma: no cover - telemetry best effort
+        telemetry.capture_exception(exc)
+
+    return False
 
 
 def show_creds(shell: Any) -> None:
@@ -285,6 +376,8 @@ def handle_auth_and_optional_privs(
     users_with_creds: list[tuple[str, str]],
     *,
     prompt_for_user_privs_after: bool = True,
+    force_authenticated_enumeration: bool = False,
+    prompt_when_already_authenticated: bool = False,
 ) -> None:
     """Ensure authenticated enumeration and optionally ask for user privileges.
 
@@ -293,18 +386,127 @@ def handle_auth_and_optional_privs(
         domain: Domain to operate on.
         users_with_creds: List of (username, credential) tuples.
         prompt_for_user_privs_after: When True, prompt for user privilege checks.
+        force_authenticated_enumeration: When True, rerun authenticated
+            enumeration even if the domain is already in ``auth`` state.
+        prompt_when_already_authenticated: When True, and the domain is already
+            ``auth``, ask whether to rerun the full authenticated scan or only
+            continue with privilege enumeration for the current user.
     """
     marked_domain = mark_sensitive(domain, "domain")
     current_auth_status = shell.domains_data.get(domain, {}).get("auth", "")
     print_info_debug(
         f"[creds] handle_auth_and_optional_privs start: domain={marked_domain} "
         f"auth={current_auth_status!r} users={len(users_with_creds)} "
-        f"prompt_privs={prompt_for_user_privs_after}"
+        f"prompt_privs={prompt_for_user_privs_after} "
+        f"force_enum={force_authenticated_enumeration!r} "
+        f"prompt_existing_auth={prompt_when_already_authenticated!r}"
     )
-    if current_auth_status not in {"auth", "pwned"}:
-        try:
+
+    def _choose_authenticated_enumeration_action() -> str:
+        """Return how to proceed when start_auth targets an already-auth domain."""
+        if current_auth_status != "auth":
+            return "full_scan"
+        if not prompt_when_already_authenticated:
+            return "full_scan" if force_authenticated_enumeration else "skip"
+        if getattr(shell, "auto", False) or not sys.stdin.isatty():
             print_info_debug(
-                f"[creds] auth={current_auth_status!r}; running do_enum_authenticated"
+                "[creds] start_auth re-run on already-auth domain in non-interactive mode; "
+                "defaulting to full authenticated scan."
+            )
+            return "full_scan"
+
+        workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+        if workspace_type == "audit":
+            scan_focus = (
+                "Recommended for audits: refresh trust enumeration, BloodHound data, "
+                "and the full authenticated pipeline."
+            )
+            focused_option = "Only inspect this user's privileges and attack paths"
+        elif workspace_type == "ctf":
+            scan_focus = (
+                "Recommended for CTFs when you want a fresh authenticated pass before "
+                "continuing foothold validation or post-auth escalation."
+            )
+            focused_option = (
+                "Only inspect this user's privileges for quick foothold validation"
+            )
+        else:
+            scan_focus = (
+                "Recommended when you want a fresh authenticated pass across the full "
+                "domain pipeline."
+            )
+            focused_option = "Only inspect this user's privileges"
+        options = [
+            "Rerun full authenticated scan (Recommended)",
+            focused_option,
+        ]
+        print_panel(
+            "\n".join(
+                [
+                    "This domain is already marked as authenticated in the current workspace.",
+                    f"Workspace type: {str(workspace_type or 'unknown').upper()}",
+                    f"Domain: {marked_domain}",
+                    "",
+                    scan_focus,
+                    "",
+                    "Choose how to proceed:",
+                    "1) Rerun the full authenticated scan pipeline now",
+                    "2) Skip the full scan and stay on the current user context",
+                ]
+            ),
+            title="[bold cyan]Authenticated Domain Already Initialized[/bold cyan]",
+            border_style="cyan",
+            expand=False,
+        )
+
+        selected_idx: int | None = None
+        selector = getattr(shell, "_questionary_select", None)
+        if callable(selector):
+            try:
+                selected_idx = selector(
+                    "Select how to proceed:", options, default_idx=0
+                )
+            except TypeError:
+                selected_idx = selector("Select how to proceed:", options)
+        if selected_idx is None:
+            selected_choice = Prompt.ask(
+                Text("Select an option", style="cyan"),
+                choices=["1", "2"],
+                default="1",
+            )
+            try:
+                selected_idx = int(selected_choice) - 1
+            except ValueError:
+                selected_idx = 0
+
+        if selected_idx == 1:
+            print_info_debug(
+                "[creds] start_auth re-run on already-auth domain: user selected privileges-only flow."
+            )
+            return "privs_only"
+
+        print_info_debug(
+            "[creds] start_auth re-run on already-auth domain: user selected full authenticated scan."
+        )
+        return "full_scan"
+
+    enumeration_action = "skip"
+    if current_auth_status != "pwned":
+        if force_authenticated_enumeration:
+            enumeration_action = _choose_authenticated_enumeration_action()
+        elif current_auth_status not in {"auth", "pwned"}:
+            enumeration_action = "full_scan"
+
+    if enumeration_action == "full_scan":
+        try:
+            if force_authenticated_enumeration:
+                print_info(
+                    "Running full authenticated scan for "
+                    f"{marked_domain} using the verified credential."
+                )
+            print_info_debug(
+                f"[creds] auth={current_auth_status!r}; running do_enum_authenticated "
+                f"(force={force_authenticated_enumeration!r})"
             )
             shell.do_enum_authenticated(domain)
         except Exception as e:  # noqa: BLE001
@@ -313,6 +515,20 @@ def handle_auth_and_optional_privs(
             print_info(
                 "You can manually start enumeration with: enum_authenticated <domain>"
             )
+    else:
+        if force_authenticated_enumeration and enumeration_action == "privs_only":
+            primary_user = next(
+                (mark_sensitive(user, "user") for user, _cred in users_with_creds if user),
+                mark_sensitive("current user", "user"),
+            )
+            print_info(
+                "Skipping full authenticated scan. Continuing with privilege "
+                f"enumeration for {primary_user} only."
+            )
+        print_info_debug(
+            f"[creds] skipping do_enum_authenticated (auth={current_auth_status!r}, "
+            f"action={enumeration_action!r})"
+        )
 
     updated_auth_status = shell.domains_data.get(domain, {}).get("auth", "")
     print_info_debug(
@@ -453,6 +669,8 @@ def add_credential(
     prompt_local_reuse_after: bool = True,
     ui_silent: bool = False,
     ensure_fresh_kerberos_ticket: bool = True,
+    force_authenticated_enumeration: bool = False,
+    prompt_when_already_authenticated: bool = False,
 ) -> None:
     """Add a credential to the workspace.
 
@@ -490,6 +708,10 @@ def add_credential(
         ensure_fresh_kerberos_ticket: When True (default), refresh Kerberos tickets
             for verified domain credentials. This prevents stale/expired ccache
             files from breaking Kerberos-dependent workflows.
+        force_authenticated_enumeration: When True, rerun the full authenticated
+            scan pipeline after a verified domain credential is processed.
+        prompt_when_already_authenticated: When True, and the domain is already
+            authenticated, prompt before rerunning the full authenticated scan.
     """
     from adscan_internal import print_operation_header
     from adscan_internal.services.credential_store_service import (
@@ -543,25 +765,36 @@ def add_credential(
         time.sleep(1)
         if verify_credential:
             if _verify_domain_credentials(
-                shell, domain, user, cred, ui_silent=ui_silent
+                shell,
+                domain,
+                user,
+                cred,
+                ui_silent=ui_silent,
+                source_steps=source_steps,
             ):
+                cred = _resolve_verified_domain_credential(
+                    shell,
+                    domain=domain,
+                    user=user,
+                    fallback_credential=cred,
+                )
                 credential_verified = True
             else:
-                # Check if a credential for that user exists and remove it using the service
-                deleted = store_service.delete_domain_credential(
-                    domains_data=shell.domains_data, domain=domain, username=user
-                )
-                if deleted:
-                    marked_user = mark_sensitive(user, "user")
-                    marked_domain = mark_sensitive(domain, "domain")
-                    if not ui_silent:
-                        print_error(
-                            f"Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
-                        )
-                    else:
-                        print_info_verbose(
-                            f"[ui_silent] Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
-                        )
+                if _should_delete_failed_domain_credential(shell):
+                    deleted = store_service.delete_domain_credential(
+                        domains_data=shell.domains_data, domain=domain, username=user
+                    )
+                    if deleted:
+                        marked_user = mark_sensitive(user, "user")
+                        marked_domain = mark_sensitive(domain, "domain")
+                        if not ui_silent:
+                            print_error(
+                                f"Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
+                            )
+                        else:
+                            print_info_verbose(
+                                f"[ui_silent] Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
+                            )
                 return
         shell.domains_data[domain]["username"] = user
         shell.domains_data[domain]["password"] = cred
@@ -693,25 +926,36 @@ def add_credential(
         # Verify domain credentials before adding them (skip when domain is already pwned)
         if verify_credential and not credential_verified:
             if _verify_domain_credentials(
-                shell, domain, user, cred, ui_silent=ui_silent
+                shell,
+                domain,
+                user,
+                cred,
+                ui_silent=ui_silent,
+                source_steps=source_steps,
             ):
+                cred = _resolve_verified_domain_credential(
+                    shell,
+                    domain=domain,
+                    user=user,
+                    fallback_credential=cred,
+                )
                 credential_verified = True
             else:
-                # Check if a credential for that user exists and remove it using the service
-                deleted = store_service.delete_domain_credential(
-                    domains_data=shell.domains_data, domain=domain, username=user
-                )
-                if deleted:
-                    marked_user = mark_sensitive(user, "user")
-                    marked_domain = mark_sensitive(domain, "domain")
-                    if not ui_silent:
-                        print_error(
-                            f"Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
-                        )
-                    else:
-                        print_info_verbose(
-                            f"[ui_silent] Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
-                        )
+                if _should_delete_failed_domain_credential(shell):
+                    deleted = store_service.delete_domain_credential(
+                        domains_data=shell.domains_data, domain=domain, username=user
+                    )
+                    if deleted:
+                        marked_user = mark_sensitive(user, "user")
+                        marked_domain = mark_sensitive(domain, "domain")
+                        if not ui_silent:
+                            print_error(
+                                f"Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
+                            )
+                        else:
+                            print_info_verbose(
+                                f"[ui_silent] Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
+                            )
                 return
 
         if cred and not skip_store_update:
@@ -980,6 +1224,8 @@ def add_credential(
                 domain,
                 [(user, cred)],
                 prompt_for_user_privs_after=prompt_for_user_privs_after,
+                force_authenticated_enumeration=force_authenticated_enumeration,
+                prompt_when_already_authenticated=prompt_when_already_authenticated,
             )
 
         elif not credential_persisted and not store_update_skipped and not ui_silent:
@@ -1202,7 +1448,13 @@ def add_local_credentials_batch(
 
 
 def _verify_domain_credentials(
-    shell: Any, domain: str, user: str, cred: str, *, ui_silent: bool
+    shell: Any,
+    domain: str,
+    user: str,
+    cred: str,
+    *,
+    ui_silent: bool,
+    source_steps: list[object] | None = None,
 ) -> bool:
     """Verify credentials with backward-compatible support for `ui_silent`.
 
@@ -1211,10 +1463,53 @@ def _verify_domain_credentials(
     """
     try:
         return bool(
-            shell.verify_domain_credentials(domain, user, cred, ui_silent=ui_silent)
+            shell.verify_domain_credentials(
+                domain,
+                user,
+                cred,
+                ui_silent=ui_silent,
+                source_steps=source_steps,
+            )
         )
     except TypeError:
-        return bool(shell.verify_domain_credentials(domain, user, cred))
+        try:
+            return bool(shell.verify_domain_credentials(domain, user, cred, ui_silent=ui_silent))
+        except TypeError:
+            return bool(shell.verify_domain_credentials(domain, user, cred))
+
+
+def _should_delete_failed_domain_credential(shell: Any) -> bool:
+    """Return True only for genuinely invalid credentials that should be purged."""
+    from adscan_internal.services.credential_service import CredentialStatus
+
+    last_result = getattr(shell, "_last_domain_credential_verification_result", None)
+    status = getattr(last_result, "status", None)
+    return status in {
+        CredentialStatus.INVALID,
+        CredentialStatus.USER_NOT_FOUND,
+    }
+
+
+def _resolve_verified_domain_credential(
+    shell: Any,
+    *,
+    domain: str,
+    user: str,
+    fallback_credential: str,
+) -> str:
+    """Return the credential actually validated by the verification flow."""
+    verified_domain = getattr(shell, "_last_verified_domain_name", None)
+    verified_user = getattr(shell, "_last_verified_domain_username", None)
+    verified_credential = getattr(shell, "_last_verified_domain_credential", None)
+
+    if (
+        isinstance(verified_credential, str)
+        and verified_credential
+        and str(verified_domain or "").strip().lower() == domain.strip().lower()
+        and str(verified_user or "").strip().lower() == user.strip().lower()
+    ):
+        return verified_credential
+    return fallback_credential
 
 
 def check_local_creds(
@@ -1834,6 +2129,7 @@ def process_cpassword_text(
                     relation="GPPPassword",
                     edge_type="gpp_password",
                     source="gpp_cpassword",
+                    secret=plaintext_password,
                     hosts=source_hosts,
                     shares=source_shares,
                     artifact=source or None,

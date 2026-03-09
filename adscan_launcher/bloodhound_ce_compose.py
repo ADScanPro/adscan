@@ -52,6 +52,7 @@ _ALLOW_REMOTE_COMPOSE_FALLBACK_ENV = "ADSCAN_BLOODHOUND_ALLOW_REMOTE_COMPOSE_FAL
 _DOCKER_INSTALL_DOCS_URL = "https://www.adscanpro.com/docs/getting-started/installation"
 _DEFAULT_BH_COMPOSE_PROJECT = "adscan-bhce"
 _DEFAULT_BH_COMPOSE_DIRNAME = "bloodhound-ce"
+_DEFAULT_BLOODHOUND_COMPOSE_PULL_TIMEOUT_SECONDS = 3600
 
 _PORT_BIND_ERROR_RE = re.compile(
     r"bind port 127\.0\.0\.1:(\d+)/tcp:.*address already in use", re.IGNORECASE
@@ -66,6 +67,10 @@ _GENERIC_BIND_TYPE_ERROR_RE = re.compile(
 )
 _PULL_NETWORK_UNREACHABLE_RE = re.compile(
     r"(registry-1\.docker\.io.*connect:\s*network is unreachable|dial tcp \[[0-9a-f:]+\]:443:\s*connect:\s*network is unreachable)",
+    re.IGNORECASE,
+)
+_PULL_TLS_CERT_FAILURE_RE = re.compile(
+    r"(x509:|tls:\s*failed to verify certificate|certificate is not valid for any names|certificate signed by unknown authority)",
     re.IGNORECASE,
 )
 _GRAPH_DB_HOST_PORT_TOKENS: tuple[str, ...] = (
@@ -103,6 +108,61 @@ def _emit_compose_pull_failure_network_guidance(*, diagnostic: str) -> None:
     print_instruction(
         "Then retry: adscan install"
     )
+
+
+def _emit_compose_pull_failure_tls_guidance(*, diagnostic: str) -> None:
+    """Emit targeted guidance for TLS/x509 failures during compose pulls."""
+    if not _PULL_TLS_CERT_FAILURE_RE.search(diagnostic or ""):
+        return
+    print_warning(
+        "TLS certificate verification failed while pulling BloodHound CE images."
+    )
+    print_instruction(
+        "This is usually caused by a proxy / SSL inspection device, custom registry mirror, or broken CA trust on the host."
+    )
+    print_instruction("Verify host time first: date")
+    print_instruction("Check proxy settings: env | grep -i proxy")
+    print_instruction(
+        "Test Docker Hub TLS directly: curl -vI https://registry-1.docker.io/v2/"
+    )
+    print_instruction(
+        "If your network intercepts TLS, trust the organization CA for Docker or bypass inspection for Docker Hub/CDN endpoints."
+    )
+    print_instruction(
+        "Do not disable TLS verification globally. Fix trust/proxy configuration and retry."
+    )
+
+
+def _emit_compose_pull_timeout_guidance(
+    *,
+    timeout_seconds: int | None,
+    command_name: str,
+) -> None:
+    """Emit targeted guidance when compose pull exceeds the configured timeout."""
+    timeout_label = "disabled" if timeout_seconds is None else f"{timeout_seconds}s"
+    print_warning(
+        "BloodHound CE image pull exceeded the configured timeout."
+    )
+    print_instruction(f"Current compose pull timeout: {timeout_label}")
+    print_instruction(
+        "If your network or registry mirror is slow, increase the timeout and retry."
+    )
+    suggested_timeout = 7200 if timeout_seconds is None else max(timeout_seconds, 7200)
+    print_instruction(f"Retry: adscan {command_name} --pull-timeout {suggested_timeout}")
+    print_instruction(f"Disable timeout: adscan {command_name} --pull-timeout 0")
+
+
+def _normalize_compose_pull_timeout(timeout_seconds: int | None) -> int | None:
+    """Normalize compose pull timeout values.
+
+    `None` means use the default timeout. `0` or negative values disable the
+    timeout entirely so very slow registry pulls can complete.
+    """
+    if timeout_seconds is None:
+        return _DEFAULT_BLOODHOUND_COMPOSE_PULL_TIMEOUT_SECONDS
+    if int(timeout_seconds) <= 0:
+        return None
+    return int(timeout_seconds)
 
 
 def get_bloodhound_compose_project_name() -> str:
@@ -554,7 +614,13 @@ def _compose_base_args(compose_path: Path) -> list[str]:
     return invocation + ["-p", project_name, "-f", str(compose_path)]
 
 
-def compose_pull(compose_path: Path, *, stream_output: bool = False) -> bool:
+def compose_pull(
+    compose_path: Path,
+    *,
+    stream_output: bool = False,
+    timeout_seconds: int | None = None,
+    command_name: str = "install",
+) -> bool:
     """Pull BloodHound CE compose images."""
     if not docker_compose_available():
         print_error("Docker Compose is not available.")
@@ -564,15 +630,19 @@ def compose_pull(compose_path: Path, *, stream_output: bool = False) -> bool:
         return False
 
     cmd = _compose_base_args(compose_path) + ["pull"]
+    pull_timeout = _normalize_compose_pull_timeout(timeout_seconds)
     print_info_debug(f"[bloodhound-ce] pull: {shell_quote_cmd(cmd)}")
     try:
         if stream_output:
-            rc, stdout, stderr = run_docker_stream(cmd, timeout=1200)
+            rc, stdout, stderr = run_docker_stream(cmd, timeout=pull_timeout)
             if rc == 0:
                 print_success("BloodHound CE images pulled successfully.")
                 return True
             print_error("Failed to pull BloodHound CE images.")
             _emit_compose_pull_failure_network_guidance(
+                diagnostic=f"{stderr}\n{stdout}"
+            )
+            _emit_compose_pull_failure_tls_guidance(
                 diagnostic=f"{stderr}\n{stdout}"
             )
             if stderr:
@@ -581,7 +651,12 @@ def compose_pull(compose_path: Path, *, stream_output: bool = False) -> bool:
                 print_info_debug(f"[bloodhound-ce] pull stdout:\n{stdout}")
             return False
 
-        proc = run_docker(cmd, check=False, capture_output=True, timeout=1200)
+        proc = run_docker(
+            cmd,
+            check=False,
+            capture_output=True,
+            timeout=pull_timeout,
+        )
         if proc.returncode == 0:
             print_success("BloodHound CE images pulled successfully.")
             return True
@@ -589,10 +664,22 @@ def compose_pull(compose_path: Path, *, stream_output: bool = False) -> bool:
         _emit_compose_pull_failure_network_guidance(
             diagnostic=f"{proc.stderr}\n{proc.stdout}"
         )
+        _emit_compose_pull_failure_tls_guidance(
+            diagnostic=f"{proc.stderr}\n{proc.stdout}"
+        )
         if proc.stderr:
             print_info_debug(f"[bloodhound-ce] pull stderr:\n{proc.stderr}")
         if proc.stdout:
             print_info_debug(f"[bloodhound-ce] pull stdout:\n{proc.stdout}")
+        return False
+    except subprocess.TimeoutExpired as exc:
+        telemetry.capture_exception(exc)
+        print_error("Timed out while pulling BloodHound CE images.")
+        _emit_compose_pull_timeout_guidance(
+            timeout_seconds=pull_timeout,
+            command_name=command_name,
+        )
+        print_info_debug(f"[bloodhound-ce] pull exception: {exc}")
         return False
     except Exception as exc:
         telemetry.capture_exception(exc)

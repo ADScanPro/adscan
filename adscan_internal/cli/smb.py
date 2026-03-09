@@ -557,7 +557,11 @@ def execute_smb_rid_cycling(shell: Any, *, command: str, domain: str) -> None:
             if users:
                 shell.domains_data[domain]["auth"] = "guest"
                 shell._write_user_list_file(domain, "users.txt", users)
-                shell._postprocess_user_list_file(domain, "users.txt")
+                shell._postprocess_user_list_file(
+                    domain,
+                    "users.txt",
+                    source="smb_rid_cycling",
+                )
             return
 
         if "STATUS_NO_LOGON_SERVERS" in output_str or "NETBIOS" in output_str:
@@ -1675,7 +1679,11 @@ def run_smb_null_enum_users(shell: Any, *, domain: str) -> None:
 
     users = parse_smb_usernames(completed_process.stdout or "")
     shell._write_user_list_file(domain, "users.txt", users)
-    shell._postprocess_user_list_file(domain, "users.txt")
+    shell._postprocess_user_list_file(
+        domain,
+        "users.txt",
+        source="smb_users",
+    )
 
 
 def run_guest_shares_local(shell: Any, *, domain: str) -> None:
@@ -1903,20 +1911,20 @@ def run_gpp_autologin(shell: Any, *, target_domain: str) -> None:
     if auth:
         command = (
             f"{shell.netexec_path} smb {shell.domains_data[target_domain]['pdc']} "
-            f"{auth} --log domains/{target_domain}/smb/gpp_autologin.log -M gpp_autologin"
+            f"{auth} --smb-timeout 10 --log domains/{target_domain}/smb/gpp_autologin.log -M gpp_autologin"
         )
     elif auth_type == "guest":
         guest_auth = _build_guest_auth_nxc(shell, domain=target_domain)
         command = (
             f"{shell.netexec_path} smb {shell.domains_data[target_domain]['pdc']} "
             f"{guest_auth} "
-            f"--log domains/{target_domain}/smb/gpp_autologin.log -M gpp_autologin"
+            f"--smb-timeout 10 --log domains/{target_domain}/smb/gpp_autologin.log -M gpp_autologin"
         )
     elif auth_type == "null":
         command = (
             f"{shell.netexec_path} smb {shell.domains_data[target_domain]['pdc']} "
             f"-u '' -p '' "
-            f"--log domains/{target_domain}/smb/gpp_autologin.log -M gpp_autologin"
+            f"--smb-timeout 10 --log domains/{target_domain}/smb/gpp_autologin.log -M gpp_autologin"
         )
 
     if command is None:
@@ -1959,20 +1967,20 @@ def run_gpp_passwords(shell: Any, *, target_domain: str) -> None:
     if auth:
         command = (
             f"{shell.netexec_path} smb {shell.domains_data[target_domain]['pdc']} "
-            f"{auth} --log domains/{target_domain}/smb/gpp_password.log -M gpp_password"
+            f"{auth} --smb-timeout 10 --log domains/{target_domain}/smb/gpp_password.log -M gpp_password"
         )
     elif auth_type == "guest":
         guest_auth = _build_guest_auth_nxc(shell, domain=target_domain)
         command = (
             f"{shell.netexec_path} smb {shell.domains_data[target_domain]['pdc']} "
             f"{guest_auth} "
-            f"--log domains/{target_domain}/smb/gpp_password.log -M gpp_password"
+            f"--smb-timeout 10 --log domains/{target_domain}/smb/gpp_password.log -M gpp_password"
         )
     elif auth_type == "null":
         command = (
             f"{shell.netexec_path} smb {shell.domains_data[target_domain]['pdc']} "
             f"-u '' -p '' "
-            f"--log domains/{target_domain}/smb/gpp_password.log -M gpp_password"
+            f"--smb-timeout 10 --log domains/{target_domain}/smb/gpp_password.log -M gpp_password"
         )
 
     if command is None:
@@ -5545,6 +5553,7 @@ def _handle_prioritized_findings_actions(
                     relation="PasswordInShare",
                     edge_type="share_password",
                     source="share_ai_triage",
+                    secret=secret,
                     hosts=[host] if host else None,
                     shares=[share] if share else None,
                     artifact=path or None,

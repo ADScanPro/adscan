@@ -15,6 +15,8 @@ from datetime import datetime
 from enum import Enum
 import logging
 
+from adscan_core.time_utils import utc_now
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,7 +47,7 @@ class Event:
 
     event_type: EventType = EventType.PROGRESS  # Default, overridden by subclasses
     scan_id: Optional[str] = None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=utc_now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

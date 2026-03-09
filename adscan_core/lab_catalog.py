@@ -81,6 +81,7 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
         "Reel2",
         "Vintage",
         "Pirate",
+        "Overwatch",
     ),
     "tryhackme": (
         "VulnNet_Roasted",
@@ -116,6 +117,37 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
     "local_test": (),
 }
 
+# ---------------------------------------------------------------------------
+# Machine domain fingerprints
+# ---------------------------------------------------------------------------
+#
+# Exact domain → (canonical_provider, canonical_lab_name) index for
+# high-confidence lab identification at scan start.
+#
+# Design rules (see domain_inference.py for full rationale):
+#   1. Only domains UNIQUE to a single machine in this catalog.
+#      Ambiguous domains (multiple machines share the same domain) are omitted:
+#        htb.local      → Forest / Mantis / Reel / Sizzle
+#        megabank.local → Resolute / Monteverde
+#      For ambiguous domains, PDC hostname inference distinguishes machines.
+#   2. Only domains where the second-level label does NOT already match the
+#      machine name — those are caught by the SLD inference rule at no cost.
+#      (e.g. blackfield.local → SLD "blackfield" matches catalog; not listed)
+#   3. Subdomains resolve automatically: the consumer strips leading labels.
+#
+# To add a new entry: confirm domain uniqueness via public writeups, then
+# add ONE line here.  No other file needs changing.
+_MACHINE_DOMAIN_FINGERPRINTS: dict[str, tuple[str, str]] = {
+    # Sauna (HTB) — domain: egotistical-bank.local, DC: SAUNA.egotistical-bank.local
+    "egotistical-bank.local": ("hackthebox", "sauna"),
+    # Fuse (HTB) — domain: fabricorp.local, DC: FUSE.fabricorp.local
+    "fabricorp.local": ("hackthebox", "fuse"),
+    # Scrambled (HTB) — domain: scrm.local, DC: DC1.scrm.local
+    # SLD "scrm" and PDC "dc1" both fail → only explicit fingerprint works.
+    "scrm.local": ("hackthebox", "scrambled"),
+}
+
+
 _AD_LABS_LOWER_BY_PROVIDER: dict[str, set[str]] = {
     provider: {entry.lower() for entry in entries}
     for provider, entries in _AD_LABS_BY_PROVIDER.items()
@@ -142,6 +174,20 @@ def get_labs_for_provider(provider: str | None) -> list[str]:
     if not canonical:
         return []
     return list(_AD_LABS_BY_PROVIDER.get(canonical, ()))
+
+
+def get_machine_domain_index() -> dict[str, tuple[str, str]]:
+    """Return the exact domain → (provider, lab_name) fingerprint index.
+
+    Used by domain inference (Rule 2.5) to match known unique machine domains
+    before falling back to SLD and PDC hostname heuristics.
+
+    Returns:
+        Mapping of lowercased domain strings to ``(canonical_provider,
+        canonical_lab_name)`` tuples.  The returned dict is a copy — callers
+        may not mutate ``_MACHINE_DOMAIN_FINGERPRINTS`` through it.
+    """
+    return dict(_MACHINE_DOMAIN_FINGERPRINTS)
 
 
 def is_lab_whitelisted(provider: str | None, lab_name: str | None) -> bool:

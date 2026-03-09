@@ -61,6 +61,7 @@ def build_execution_output_preview(
     stdout_head: int = 10,
     stdout_tail: int = 10,
     stderr_head: int = 10,
+    stderr_tail: int = 10,
 ) -> str:
     """Build a compact output preview text (head/tail) for debug logs."""
     stdout_lines = _extract_non_empty_lines(result.stdout)
@@ -77,12 +78,28 @@ def build_execution_output_preview(
     if head:
         preview_lines.append("STDOUT (head):")
         preview_lines.extend(head)
+    omitted_stdout = len(stdout_lines) - len(head) - len(tail)
+    if omitted_stdout > 0:
+        preview_lines.append(f"... ({omitted_stdout} stdout line(s) omitted) ...")
     if tail:
         preview_lines.append("STDOUT (tail):")
         preview_lines.extend(tail)
     if stderr_lines:
         preview_lines.append("STDERR (head):")
         preview_lines.extend(stderr_lines[:stderr_head])
+        stderr_tail_lines = (
+            stderr_lines[-stderr_tail:]
+            if len(stderr_lines) > (stderr_head + stderr_tail)
+            else stderr_lines[stderr_head:]
+        )
+        omitted_stderr = len(stderr_lines) - stderr_head - len(stderr_tail_lines)
+        if omitted_stderr > 0:
+            preview_lines.append(
+                f"... ({omitted_stderr} stderr line(s) omitted) ..."
+            )
+        if stderr_tail_lines:
+            preview_lines.append("STDERR (tail):")
+            preview_lines.extend(stderr_tail_lines)
 
     return "\n".join(preview_lines)
 

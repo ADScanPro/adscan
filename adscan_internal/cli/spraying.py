@@ -12,9 +12,11 @@ The service layer (adscan_internal.spraying) performs the tool execution and bas
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import subprocess
 from datetime import datetime, timezone
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from adscan_internal import (
     print_error,
@@ -56,13 +58,361 @@ from adscan_internal.spraying import (
     build_netexec_pass_pol_command,
     build_netexec_users_command,
     compute_spray_eligibility,
-    parse_netexec_lockout_threshold,
+    parse_netexec_lockout_threshold_result,
     parse_netexec_users_badpwd,
     read_user_list,
     safe_log_filename_fragment,
     write_temp_combo_file,
     write_temp_users_file,
 )
+
+
+def _extract_typed_source_steps(source_steps: list[object] | None) -> list[object]:
+    """Return only typed credential provenance steps usable by the attack graph."""
+    if not source_steps:
+        return []
+    try:
+        from adscan_internal.services.attack_graph_service import CredentialSourceStep
+    except Exception:  # noqa: BLE001
+        return []
+    return [step for step in source_steps if isinstance(step, CredentialSourceStep)]
+
+
+def _domain_hit_is_hash(shell: object, credential: str) -> bool:
+    """Return whether a validated domain credential looks like an NTLM hash."""
+    is_hash_fn = getattr(shell, "is_hash", None)
+    if callable(is_hash_fn):
+        try:
+            return bool(is_hash_fn(credential))
+        except Exception:  # noqa: BLE001
+            pass
+    return bool(re.fullmatch(r"[0-9a-fA-F]{32}", str(credential or "").strip()))
+
+
+def _normalize_validated_domain_hits(
+    shell: object, hits: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """Deduplicate validated domain hits, preferring plaintext over hashes."""
+    deduped: dict[str, dict[str, object]] = {}
+    for hit in hits:
+        username = str(hit.get("username") or "").strip()
+        credential = str(hit.get("credential") or "").strip()
+        if not username or not credential:
+            continue
+        is_hash = bool(hit.get("is_hash", _domain_hit_is_hash(shell, credential)))
+        key = username.lower()
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = {
+                "username": username,
+                "credential": credential,
+                "is_hash": is_hash,
+            }
+            continue
+        if bool(existing.get("is_hash")) and not is_hash:
+            deduped[key] = {
+                "username": username,
+                "credential": credential,
+                "is_hash": False,
+            }
+    return sorted(deduped.values(), key=lambda item: str(item.get("username") or "").lower())
+
+
+def handle_validated_domain_hits_followup(
+    shell: SprayShell,
+    *,
+    domain: str,
+    hits: list[dict[str, object]],
+    source_steps: list[object] | None = None,
+    discovery_label: str = "validated",
+) -> bool:
+    """Handle post-validation UX for confirmed domain credentials.
+
+    This centralizes the post-hit flow shared by spraying and SAM->Domain reuse:
+    store credentials, classify Tier-0/high-value users, offer attack paths, and
+    optionally enumerate selected users when no path is available.
+    """
+    import sys
+
+    from adscan_internal.cli.attack_path_execution import (
+        offer_attack_paths_for_execution_for_principals,
+    )
+    from adscan_internal.services.credential_store_service import CredentialStoreService
+    from adscan_internal.services.high_value import (
+        UserRiskFlags,
+        classify_users_tier0_high_value,
+    )
+    from adscan_internal.rich_output import BRAND_COLORS, print_panel
+    from rich.prompt import Confirm
+    from rich.table import Table
+    from rich.text import Text
+
+    normalized_hits = _normalize_validated_domain_hits(shell, hits)
+    if not normalized_hits:
+        return False
+
+    is_interactive = bool(
+        sys.stdin.isatty() and not (os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
+    )
+    store = CredentialStoreService()
+
+    for hit in normalized_hits:
+        user = str(hit.get("username") or "")
+        credential = str(hit.get("credential") or "")
+        if not user or not credential:
+            continue
+        store.update_domain_credential(
+            domains_data=shell.domains_data,
+            domain=domain,
+            username=user,
+            credential=credential,
+            is_hash=bool(hit.get("is_hash")),
+        )
+
+    risk_flags_by_user: dict[str, UserRiskFlags] = {}
+    try:
+        risk_flags_by_user = classify_users_tier0_high_value(
+            shell,
+            domain=domain,
+            usernames=[str(hit.get("username") or "") for hit in normalized_hits],
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[domain-hits] Failed to classify validated users as Tier-0/high-value (continuing)."
+        )
+
+    privileged_hits = [
+        hit
+        for hit in normalized_hits
+        if (
+            risk_flags_by_user.get(
+                str(hit.get("username") or "").strip().lower(),
+                UserRiskFlags(),
+            ).is_tier0
+            or risk_flags_by_user.get(
+                str(hit.get("username") or "").strip().lower(),
+                UserRiskFlags(),
+            ).is_high_value
+        )
+    ]
+
+    if privileged_hits:
+        privileged_table = Table(
+            title=Text(
+                "Privileged Credentials Detected",
+                style=f"bold {BRAND_COLORS['warning']}",
+            ),
+            show_header=True,
+            header_style=f"bold {BRAND_COLORS['warning']}",
+            show_lines=True,
+        )
+        privileged_table.add_column("#", style="dim", width=4, justify="right")
+        privileged_table.add_column("Username", style="bold")
+        privileged_table.add_column("Risk", style="bold")
+
+        for idx, hit in enumerate(privileged_hits, start=1):
+            user = str(hit.get("username") or "")
+            flags = risk_flags_by_user.get(user.strip().lower(), UserRiskFlags())
+            risk_label = "Tier-0" if flags.is_tier0 else "High-Value"
+            privileged_table.add_row(str(idx), mark_sensitive(user, "user"), risk_label)
+
+        message = Text()
+        message.append(
+            "One or more privileged domain credentials were validated.\n\n",
+            style="bold yellow",
+        )
+        message.append(
+            "Pivoting with a Tier-0/high-value account is typically the fastest route to domain compromise.\n",
+            style="yellow",
+        )
+
+        print_panel(
+            [message, privileged_table],
+            title=Text("Privileged Credentials Found", style="bold yellow"),
+            border_style="yellow",
+            expand=False,
+        )
+
+        pivot_now = (
+            Confirm.ask(
+                "Do you want to continue with one of these privileged users now?",
+                default=True,
+            )
+            if is_interactive
+            else False
+        )
+
+        if pivot_now:
+            selected = privileged_hits[0]
+            if len(privileged_hits) > 1 and hasattr(shell, "_questionary_select"):
+                options = [str(hit.get("username") or "") for hit in privileged_hits] + [
+                    "Cancel"
+                ]
+                selected_idx = shell._questionary_select(
+                    "Select a privileged user to continue with:",
+                    options,
+                    default_idx=0,
+                )
+                if selected_idx is None or selected_idx >= len(options) - 1:
+                    selected = privileged_hits[0]
+                else:
+                    selected = privileged_hits[selected_idx]
+
+            shell.add_credential(
+                domain,
+                str(selected.get("username") or ""),
+                str(selected.get("credential") or ""),
+                source_steps=source_steps,
+            )
+            return True
+
+    principals = [str(hit.get("username") or "") for hit in normalized_hits]
+    executed = offer_attack_paths_for_execution_for_principals(
+        shell,
+        domain,
+        max_display=20,
+        principals=principals,
+        max_depth=10,
+        include_all=False,
+    )
+    if executed:
+        return True
+
+    marked_domain = mark_sensitive(domain, "domain")
+    print_warning(
+        f"No attack paths found from {discovery_label} users to high-value targets in {marked_domain}."
+    )
+    print_info_verbose(
+        "Tip: use `attack_paths <domain> owned --all` to include non-high-value targets."
+    )
+
+    if not (is_interactive or hasattr(shell, "_questionary_select")):
+        auth_state = shell.domains_data.get(domain, {}).get("auth", "")
+        if auth_state not in {"auth", "pwned"} and normalized_hits:
+            first_hit = normalized_hits[0]
+            shell.add_credential(
+                domain,
+                str(first_hit.get("username") or ""),
+                str(first_hit.get("credential") or ""),
+                source_steps=source_steps,
+                prompt_for_user_privs_after=False,
+            )
+            return True
+        return False
+
+    selection: list[dict[str, object]] = []
+    if len(normalized_hits) == 1:
+        only_hit = normalized_hits[0]
+        if hasattr(shell, "_questionary_select"):
+            choice_idx = shell._questionary_select(
+                "No attack paths found. Enumerate this user now?",
+                ["Enumerate user", "Skip"],
+                default_idx=0,
+            )
+            if choice_idx == 0:
+                selection = [only_hit]
+        else:
+            prompt = (
+                "Do you want to enumerate this user now "
+                f"({mark_sensitive(str(only_hit.get('username') or ''), 'user')})?"
+            )
+            if Confirm.ask(prompt, default=True):
+                selection = [only_hit]
+    else:
+        options = ["All users", "Select one user", "Select multiple users", "Skip"]
+        if hasattr(shell, "_questionary_select"):
+            choice_idx = shell._questionary_select(
+                "No attack paths found. Choose users to enumerate now:",
+                options,
+                default_idx=0,
+            )
+        else:
+            choice_idx = (
+                0
+                if Confirm.ask(
+                    "No attack paths found. Enumerate all users now?",
+                    default=False,
+                )
+                else 3
+            )
+
+        if choice_idx == 0:
+            selection = normalized_hits
+        elif choice_idx == 1:
+            user_options = [str(hit.get("username") or "") for hit in normalized_hits] + [
+                "Cancel"
+            ]
+            if hasattr(shell, "_questionary_select"):
+                idx = shell._questionary_select(
+                    "Select a user to enumerate:",
+                    user_options,
+                    default_idx=0,
+                )
+                if idx is not None and idx < len(user_options) - 1:
+                    selection = [normalized_hits[idx]]
+        elif choice_idx == 2:
+            user_options = ["All users"] + [
+                str(hit.get("username") or "") for hit in normalized_hits
+            ]
+            if hasattr(shell, "_questionary_checkbox"):
+                selected_values = shell._questionary_checkbox(
+                    "Select users to enumerate:",
+                    user_options,
+                )
+                if isinstance(selected_values, list) and selected_values:
+                    if "All users" in selected_values:
+                        selection = normalized_hits
+                    else:
+                        requested = {
+                            str(item).strip().lower()
+                            for item in selected_values
+                            if str(item).strip()
+                        }
+                        selection = [
+                            hit
+                            for hit in normalized_hits
+                            if str(hit.get("username") or "").lower() in requested
+                        ]
+            if not selection:
+                print_warning(
+                    "Multi-select prompt cancelled. Please choose a single user instead."
+                )
+                user_options = [str(hit.get("username") or "") for hit in normalized_hits] + [
+                    "Cancel"
+                ]
+                if hasattr(shell, "_questionary_select"):
+                    idx = shell._questionary_select(
+                        "Select a user to enumerate:",
+                        user_options,
+                        default_idx=0,
+                    )
+                    if idx is not None and idx < len(user_options) - 1:
+                        selection = [normalized_hits[idx]]
+
+    if selection:
+        for hit in selection:
+            shell.add_credential(
+                domain,
+                str(hit.get("username") or ""),
+                str(hit.get("credential") or ""),
+                source_steps=source_steps,
+                prompt_for_user_privs_after=True,
+            )
+        return True
+
+    auth_state = shell.domains_data.get(domain, {}).get("auth", "")
+    if auth_state not in {"auth", "pwned"} and normalized_hits:
+        first_hit = normalized_hits[0]
+        shell.add_credential(
+            domain,
+            str(first_hit.get("username") or ""),
+            str(first_hit.get("credential") or ""),
+            source_steps=source_steps,
+            prompt_for_user_privs_after=False,
+        )
+        return True
+    return False
 
 
 class SprayShell(Protocol):
@@ -112,6 +462,8 @@ class SprayShell(Protocol):
         host: str | None = None,
         service: str | None = None,
         skip_hash_cracking: bool = False,
+        source_steps: list[object] | None = None,
+        prompt_for_user_privs_after: bool = True,
     ) -> None: ...
 
     def ask_for_pass_policy(self, domain: str) -> None: ...
@@ -126,6 +478,50 @@ _RECOMMENDED_SPRAY_CATEGORIES = {
     "useraspass_upper",
     "computer_pre2k",
 }
+_DOMAIN_HASH_SPRAY_LINE_RE = re.compile(
+    r"^\s*SMB\s+\S+\s+\d+\s+\S+\s+\[(?P<status>[^\]]+)\]\s+(?P<rest>.*)$"
+)
+_DOMAIN_SPRAY_FAILURE_CODE_RE = re.compile(
+    r"\b(?P<code>(?:STATUS|NT_STATUS|KDC_ERR)_[A-Z0-9_]+)\b"
+)
+_NETEXEC_POLICY_QUERY_MAX_ATTEMPTS = 3
+
+
+def _run_netexec_query_with_parse_retry(
+    shell: SprayShell,
+    *,
+    command: str,
+    domain: str,
+    query_label: str,
+    parse_ok: Callable[[str], bool],
+    timeout: int = 300,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run a NetExec query and retry when output is present but not parseable."""
+    last_proc: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(1, _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS + 1):
+        proc = shell._run_netexec(
+            command,
+            domain=domain,
+            timeout=timeout,
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        last_proc = proc
+        stdout = strip_ansi_codes(getattr(proc, "stdout", "") or "")
+        if stdout and parse_ok(stdout):
+            if attempt > 1:
+                print_info_debug(
+                    f"[eligibility] {query_label} output became parseable on retry "
+                    f"{attempt}/{_NETEXEC_POLICY_QUERY_MAX_ATTEMPTS}."
+                )
+            return proc
+        if attempt < _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS:
+            print_warning_debug(
+                f"{query_label} output was empty or not parseable "
+                f"(attempt {attempt}/{_NETEXEC_POLICY_QUERY_MAX_ATTEMPTS}). Retrying."
+            )
+    return last_proc
 
 
 def _get_spraying_ux_state(shell: SprayShell, domain: str) -> dict[str, object]:
@@ -255,6 +651,345 @@ def _ensure_spraying_clock_sync(shell: SprayShell, domain: str, *, source: str) 
         extra={"source": source},
     )
     return False
+
+
+def _build_domain_reuse_eligibility(
+    shell: SprayShell,
+    *,
+    domain: str,
+) -> SprayEligibilityResult | None:
+    """Return eligibility list used by SAM -> domain reuse validations."""
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    requires_auth_users = auth_state in {"auth", "pwned"}
+    user_list_rel = get_spraying_user_list_path(
+        shell,
+        domain,
+        requires_auth_users=requires_auth_users,
+    )
+    if not user_list_rel:
+        return None
+    workspace_cwd = shell.current_workspace_dir or os.getcwd()
+    user_list_file = domain_subpath(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        os.path.basename(user_list_rel),
+    )
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    safe_threshold = 2 if auth_state in {"auth", "pwned"} else 0
+    eligibility = compute_spraying_eligibility(
+        shell,
+        domain=domain,
+        user_list_file=user_list_file,
+        safe_threshold=safe_threshold,
+    )
+    if eligibility is None:
+        return None
+    print_spraying_eligibility(shell, domain, eligibility)
+    default_confirm = shell.type == "ctf"
+    if not _enforce_lockout_guardrail(
+        domain=domain,
+        eligibility=eligibility,
+        prompt_text=(
+            "Continue with SAM-to-domain reuse validation using the full user list?"
+        ),
+        default_confirm=default_confirm,
+    ):
+        return None
+    if not eligibility.eligible_users:
+        print_warning(
+            "No eligible users available for domain reuse validation with current safety rules."
+        )
+        return None
+    return eligibility
+
+
+def _summarize_domain_spray_outcomes(log_text: str) -> tuple[list[str], dict[str, int]]:
+    """Parse NetExec SMB spray output for successful usernames and failure codes."""
+    hits_by_user: dict[str, str] = {}
+    outcome_counts: dict[str, int] = {}
+    if not log_text:
+        return [], outcome_counts
+
+    for raw_line in log_text.splitlines():
+        line = strip_ansi_codes(raw_line)
+        parsed = _DOMAIN_HASH_SPRAY_LINE_RE.match(line)
+        if not parsed and "SMB " in line:
+            smb_idx = line.find("SMB ")
+            if smb_idx > 0:
+                parsed = _DOMAIN_HASH_SPRAY_LINE_RE.match(line[smb_idx:])
+        if not parsed:
+            continue
+
+        status = str(parsed.group("status") or "").strip()
+        rest = str(parsed.group("rest") or "").strip()
+        if not rest:
+            continue
+
+        if status == "+":
+            account_token = rest.split(":", 1)[0].strip()
+            username = account_token.split("\\")[-1].split("@", 1)[0].strip()
+            if not username:
+                continue
+            hits_by_user.setdefault(username.lower(), username)
+            outcome_counts["SUCCESS"] = int(outcome_counts.get("SUCCESS", 0)) + 1
+            continue
+
+        failure_match = _DOMAIN_SPRAY_FAILURE_CODE_RE.search(rest)
+        if failure_match:
+            code = str(failure_match.group("code") or "").upper()
+            if code:
+                outcome_counts[code] = int(outcome_counts.get(code, 0)) + 1
+                continue
+        if "connection error" in rest.lower():
+            outcome_counts["CONNECTION_ERROR"] = (
+                int(outcome_counts.get("CONNECTION_ERROR", 0)) + 1
+            )
+            continue
+        outcome_counts["OTHER_FAILURE"] = (
+            int(outcome_counts.get("OTHER_FAILURE", 0)) + 1
+        )
+
+    return sorted(hits_by_user.values(), key=str.lower), outcome_counts
+
+
+def validate_domain_reuse_with_ntlm_hash(
+    shell: SprayShell,
+    *,
+    domain: str,
+    nt_hash: str,
+) -> dict[str, object]:
+    """Validate SAM-derived credential reuse against domain accounts using NTLM hash spray."""
+    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
+    from adscan_internal.services.credential_store_service import CredentialStoreService
+
+    normalized_hash = str(nt_hash or "").strip()
+    marked_domain = mark_sensitive(domain, "domain")
+    result: dict[str, object] = {
+        "status": "error",
+        "method": "netexec_ntlm_hash",
+        "credential_type": "hash",
+        "credential": normalized_hash,
+        "attempted_users": 0,
+        "hits": [],
+        "outcome_counts": {},
+        "error": None,
+    }
+
+    if not getattr(shell, "netexec_path", None):
+        message = "NetExec is not configured."
+        print_warning(f"Skipping domain reuse validation in {marked_domain}: {message}")
+        result["error"] = message
+        return result
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", normalized_hash):
+        message = "Credential is not a valid NTLM hash."
+        print_warning(f"Skipping domain reuse validation in {marked_domain}: {message}")
+        result["error"] = message
+        return result
+
+    eligibility = _build_domain_reuse_eligibility(shell, domain=domain)
+    if eligibility is None:
+        result["status"] = "skipped"
+        return result
+
+    result["attempted_users"] = len(eligibility.eligible_users)
+    kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
+    temp_users_path = write_temp_users_file(
+        list(eligibility.eligible_users),
+        directory=kerberos_output_dir,
+    )
+    workspace_cwd = shell.current_workspace_dir or os.getcwd()
+    log_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        "smb",
+        f"sam_domain_hash_spray_{safe_log_filename_fragment(normalized_hash, max_length=16)}.log",
+    )
+    log_abs = domain_subpath(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        "smb",
+        f"sam_domain_hash_spray_{safe_log_filename_fragment(normalized_hash, max_length=16)}.log",
+    )
+    os.makedirs(os.path.dirname(log_abs), exist_ok=True)
+    command = (
+        f"{shell.netexec_path} smb {shell.domains_data[domain]['pdc']} "
+        f"-u {shlex.quote(temp_users_path)} -H {shlex.quote(normalized_hash)} "
+        f"-d {shlex.quote(domain)} --log {shlex.quote(log_rel)}"
+    )
+    print_info_debug(f"[sam-domain-reuse] Hash spray command: {command}")
+
+    try:
+        completed = shell.run_command(
+            command,
+            timeout=1200,
+            shell=True,
+            capture_output=True,
+            text=True,
+            use_clean_env=command_string_needs_clean_env(command),
+        )
+        stdout_text = str(getattr(completed, "stdout", "") or "") if completed else ""
+        stderr_text = str(getattr(completed, "stderr", "") or "") if completed else ""
+        log_text = ""
+        if os.path.exists(log_abs):
+            try:
+                with open(log_abs, "r", encoding="utf-8", errors="ignore") as handle:
+                    log_text = handle.read()
+            except OSError as exc:
+                telemetry.capture_exception(exc)
+
+        hits, outcomes = _summarize_domain_spray_outcomes(
+            "\n".join(text for text in (stdout_text, stderr_text, log_text) if text)
+        )
+        result["hits"] = hits
+        result["outcome_counts"] = outcomes
+        store = CredentialStoreService()
+        for username in hits:
+            store.update_domain_credential(
+                domains_data=shell.domains_data,
+                domain=domain,
+                username=username,
+                credential=normalized_hash,
+                is_hash=True,
+            )
+
+        result["status"] = "success" if hits else "no_hits"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        result["error"] = str(exc)
+        return result
+    finally:
+        try:
+            os.remove(temp_users_path)
+        except OSError:
+            pass
+
+
+def validate_domain_reuse_with_password(
+    shell: SprayShell,
+    *,
+    domain: str,
+    password: str,
+) -> dict[str, object]:
+    """Validate SAM-derived credential reuse against domain accounts using Kerberos spray."""
+    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
+    from adscan_internal.services.credential_service import CredentialService
+    from adscan_internal.services.credential_store_service import CredentialStoreService
+
+    clear_password = str(password or "").strip()
+    marked_domain = mark_sensitive(domain, "domain")
+    result: dict[str, object] = {
+        "status": "error",
+        "method": "kerbrute_password",
+        "credential_type": "password",
+        "credential": clear_password,
+        "attempted_users": 0,
+        "hits": [],
+        "outcome_counts": {},
+        "error": None,
+    }
+    if not clear_password:
+        result["error"] = "Empty password."
+        return result
+    if not getattr(shell, "kerbrute_path", None):
+        message = "Kerbrute is not configured."
+        print_warning(f"Skipping domain reuse validation in {marked_domain}: {message}")
+        result["error"] = message
+        return result
+
+    eligibility = _build_domain_reuse_eligibility(shell, domain=domain)
+    if eligibility is None:
+        result["status"] = "skipped"
+        return result
+    result["attempted_users"] = len(eligibility.eligible_users)
+
+    kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
+    temp_users_path = write_temp_users_file(
+        list(eligibility.eligible_users),
+        directory=kerberos_output_dir,
+    )
+    output_file = os.path.join(
+        "domains",
+        domain,
+        "kerberos",
+        f"sam_domain_password_spray_{safe_log_filename_fragment(clear_password)}.log",
+    )
+    command = build_kerbrute_command(
+        kerbrute_path=shell.kerbrute_path,
+        domain=domain,
+        dc_ip=shell.domains_data[domain]["pdc"],
+        users_file=temp_users_path,
+        output_file=output_file,
+        password=clear_password,
+        user_as_pass=False,
+    )
+    print_info_debug(f"[sam-domain-reuse] Password spray command: {command}")
+
+    try:
+        service = CredentialService()
+
+        def _executor(cmd: str, timeout: int | None) -> object:
+            return shell.run_command(
+                cmd,
+                timeout=timeout,
+                shell=True,
+                capture_output=True,
+                text=True,
+                use_clean_env=command_string_needs_clean_env(cmd),
+            )
+
+        spray_result = service.execute_password_spraying(
+            command=command,
+            domain=domain,
+            executor=_executor,
+        )
+        hit_entries = spray_result.get("credentials", [])
+        if not isinstance(hit_entries, list):
+            hit_entries = []
+        hits: list[str] = []
+        for item in hit_entries:
+            if not isinstance(item, dict):
+                continue
+            username = str(item.get("username") or "").strip()
+            if not username:
+                continue
+            hits.append(username)
+
+        deduped_hits = sorted(
+            {user.lower(): user for user in hits}.values(), key=str.lower
+        )
+        result["hits"] = deduped_hits
+        outcomes = _summarize_domain_spray_outcomes(
+            "\n".join(
+                [
+                    str(spray_result.get("stdout") or ""),
+                    str(spray_result.get("stderr") or ""),
+                ]
+            )
+        )[1]
+        result["outcome_counts"] = outcomes
+        store = CredentialStoreService()
+        for username in deduped_hits:
+            store.update_domain_credential(
+                domains_data=shell.domains_data,
+                domain=domain,
+                username=username,
+                credential=clear_password,
+                is_hash=False,
+            )
+        result["status"] = "success" if deduped_hits else "no_hits"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        result["error"] = str(exc)
+        return result
+    finally:
+        try:
+            os.remove(temp_users_path)
+        except OSError:
+            pass
 
 
 def get_spraying_user_list_path(
@@ -495,12 +1230,14 @@ def compute_spraying_eligibility(
         print_exception(show_locals=False, exception=exc)
         return None
 
-    is_auth = shell.domains_data[domain]["auth"] == "auth"
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    is_auth = auth_state in {"auth", "pwned"}
     pdc_ip = shell.domains_data[domain]["pdc"]
     marked_domain = mark_sensitive(domain, "domain")
 
     lockout_threshold = None
     badpwd_by_user = None
+    no_lockout_enforced = False
 
     print_info_verbose(
         f"Starting spray eligibility computation for {marked_domain} "
@@ -508,7 +1245,14 @@ def compute_spraying_eligibility(
     )
 
     if is_auth and shell.netexec_path:
-        auth_domain = getattr(shell, "domain", None)
+        auth_domain: str | None = None
+        preferred_domain_data = shell.domains_data.get(domain, {})
+        preferred_username = preferred_domain_data.get("username")
+        preferred_password = preferred_domain_data.get("password")
+        if preferred_username and preferred_password:
+            auth_domain = domain
+        elif getattr(shell, "domain", None):
+            auth_domain = getattr(shell, "domain", None)
         auth_username = shell.domains_data.get(auth_domain or "", {}).get("username")
         auth_password = shell.domains_data.get(auth_domain or "", {}).get("password")
 
@@ -544,26 +1288,36 @@ def compute_spraying_eligibility(
                 kerberos=True,
             )
 
-            pass_pol_proc = shell._run_netexec(
-                pass_pol_cmd,
+            pass_pol_proc = _run_netexec_query_with_parse_retry(
+                shell,
+                command=pass_pol_cmd,
                 domain=auth_domain,
-                timeout=300,
-                shell=True,
-                capture_output=True,
-                text=True,
+                query_label="NetExec --pass-pol",
+                parse_ok=lambda output: (
+                    parse_netexec_lockout_threshold_result(output).explicit_none
+                    or parse_netexec_lockout_threshold_result(output).threshold
+                    is not None
+                ),
             )
             if pass_pol_proc and pass_pol_proc.stdout:
-                lockout_threshold = parse_netexec_lockout_threshold(
+                threshold_result = parse_netexec_lockout_threshold_result(
                     strip_ansi_codes(pass_pol_proc.stdout)
                 )
-                if lockout_threshold is None:
+                lockout_threshold = threshold_result.threshold
+                if threshold_result.explicit_none:
+                    no_lockout_enforced = True
                     print_info_verbose(
                         "Password policy returned 'None' for account lockout threshold. "
                         "No lockout is enforced; spraying cannot lock accounts."
                     )
-                else:
+                elif lockout_threshold is not None:
                     print_info_verbose(
                         f"Parsed account lockout threshold={lockout_threshold}."
+                    )
+                else:
+                    print_warning_verbose(
+                        "Password policy output did not contain a parseable account "
+                        "lockout threshold; treating the policy as unknown."
                     )
             else:
                 print_warning_verbose(
@@ -571,31 +1325,36 @@ def compute_spraying_eligibility(
                     "lockout threshold unavailable."
                 )
 
-            users_proc = shell._run_netexec(
-                users_cmd,
-                domain=auth_domain,
-                timeout=300,
-                shell=True,
-                capture_output=True,
-                text=True,
-            )
-            if users_proc and users_proc.stdout:
-                badpwd_by_user = parse_netexec_users_badpwd(
-                    strip_ansi_codes(users_proc.stdout)
+            if no_lockout_enforced:
+                print_info_debug(
+                    "[eligibility] Skipping user BadPwdCount lookup because "
+                    "the domain reports no lockout threshold."
                 )
-                print_info_verbose(
-                    f"Parsed BadPwdCount data for {len(badpwd_by_user)} user(s)."
-                )
-                if len(badpwd_by_user) == 0:
-                    print_warning_verbose(
-                        "User query returned output but no BadPwdCount values were "
-                        "recognized."
-                    )
             else:
-                print_warning_verbose(
-                    "User query command produced no output; BadPwdCount data "
-                    "unavailable."
+                users_proc = _run_netexec_query_with_parse_retry(
+                    shell,
+                    command=users_cmd,
+                    domain=auth_domain,
+                    query_label="NetExec --users",
+                    parse_ok=lambda output: bool(parse_netexec_users_badpwd(output)),
                 )
+                if users_proc and users_proc.stdout:
+                    badpwd_by_user = parse_netexec_users_badpwd(
+                        strip_ansi_codes(users_proc.stdout)
+                    )
+                    print_info_verbose(
+                        f"Parsed BadPwdCount data for {len(badpwd_by_user)} user(s)."
+                    )
+                    if len(badpwd_by_user) == 0:
+                        print_warning_verbose(
+                            "User query returned output but no BadPwdCount values were "
+                            "recognized."
+                        )
+                else:
+                    print_warning_verbose(
+                        "User query command produced no output; BadPwdCount data "
+                        "unavailable."
+                    )
     else:
         if not is_auth:
             print_warning_verbose(
@@ -613,6 +1372,7 @@ def compute_spraying_eligibility(
         lockout_threshold=lockout_threshold,
         badpwd_by_user=badpwd_by_user,
         safe_remaining_threshold=safe_threshold,
+        no_lockout_enforced=no_lockout_enforced,
         strict_missing_badpwd=True,
     )
 
@@ -667,8 +1427,10 @@ def compute_computer_spraying_eligibility(
     """Compute eligible computer accounts for pre2k checks."""
     lockout_threshold = None
     badpwd_by_user = None
+    no_lockout_enforced = False
 
-    is_auth = shell.domains_data[domain]["auth"] == "auth"
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    is_auth = auth_state in {"auth", "pwned"}
     pdc_ip = shell.domains_data[domain]["pdc"]
     marked_domain = mark_sensitive(domain, "domain")
 
@@ -678,7 +1440,14 @@ def compute_computer_spraying_eligibility(
     )
 
     if is_auth and shell.netexec_path:
-        auth_domain = getattr(shell, "domain", None)
+        auth_domain: str | None = None
+        preferred_domain_data = shell.domains_data.get(domain, {})
+        preferred_username = preferred_domain_data.get("username")
+        preferred_password = preferred_domain_data.get("password")
+        if preferred_username and preferred_password:
+            auth_domain = domain
+        elif getattr(shell, "domain", None):
+            auth_domain = getattr(shell, "domain", None)
         auth_username = shell.domains_data.get(auth_domain or "", {}).get("username")
         auth_password = shell.domains_data.get(auth_domain or "", {}).get("password")
 
@@ -714,26 +1483,35 @@ def compute_computer_spraying_eligibility(
         )
         print_info_debug(f"[netexec computers] {computers_cmd}")
 
-        pass_pol_proc = shell._run_netexec(
-            pass_pol_cmd,
+        pass_pol_proc = _run_netexec_query_with_parse_retry(
+            shell,
+            command=pass_pol_cmd,
             domain=auth_domain,
-            timeout=300,
-            shell=True,
-            capture_output=True,
-            text=True,
+            query_label="NetExec --pass-pol",
+            parse_ok=lambda output: (
+                parse_netexec_lockout_threshold_result(output).explicit_none
+                or parse_netexec_lockout_threshold_result(output).threshold is not None
+            ),
         )
         if pass_pol_proc and pass_pol_proc.stdout:
-            lockout_threshold = parse_netexec_lockout_threshold(
+            threshold_result = parse_netexec_lockout_threshold_result(
                 strip_ansi_codes(pass_pol_proc.stdout)
             )
-            if lockout_threshold is None:
+            lockout_threshold = threshold_result.threshold
+            if threshold_result.explicit_none:
+                no_lockout_enforced = True
                 print_info_verbose(
                     "Password policy returned 'None' for account lockout threshold. "
                     "No lockout is enforced; spraying cannot lock accounts."
                 )
-            else:
+            elif lockout_threshold is not None:
                 print_info_verbose(
                     f"Parsed account lockout threshold={lockout_threshold}."
+                )
+            else:
+                print_warning_verbose(
+                    "Password policy output did not contain a parseable account "
+                    "lockout threshold; treating the policy as unknown."
                 )
         else:
             print_warning_verbose(
@@ -741,31 +1519,36 @@ def compute_computer_spraying_eligibility(
                 "lockout threshold unavailable."
             )
 
-        computers_proc = shell._run_netexec(
-            computers_cmd,
-            domain=auth_domain,
-            timeout=300,
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
-        if computers_proc and computers_proc.stdout:
-            badpwd_by_user = parse_netexec_computer_badpwd(
-                strip_ansi_codes(computers_proc.stdout)
+        if no_lockout_enforced:
+            print_info_debug(
+                "[eligibility] Skipping computer BadPwdCount lookup because "
+                "the domain reports no lockout threshold."
             )
-            print_info_verbose(
-                f"Parsed BadPwdCount data for {len(badpwd_by_user)} computer(s)."
-            )
-            if len(badpwd_by_user) == 0:
-                print_warning_verbose(
-                    "Computer query returned output but no BadPwdCount values were "
-                    "recognized."
-                )
         else:
-            print_warning_verbose(
-                "Computer query command produced no output; BadPwdCount data "
-                "unavailable."
+            computers_proc = _run_netexec_query_with_parse_retry(
+                shell,
+                command=computers_cmd,
+                domain=auth_domain,
+                query_label="NetExec computer BadPwdCount query",
+                parse_ok=lambda output: bool(parse_netexec_computer_badpwd(output)),
             )
+            if computers_proc and computers_proc.stdout:
+                badpwd_by_user = parse_netexec_computer_badpwd(
+                    strip_ansi_codes(computers_proc.stdout)
+                )
+                print_info_verbose(
+                    f"Parsed BadPwdCount data for {len(badpwd_by_user)} computer(s)."
+                )
+                if len(badpwd_by_user) == 0:
+                    print_warning_verbose(
+                        "Computer query returned output but no BadPwdCount values were "
+                        "recognized."
+                    )
+            else:
+                print_warning_verbose(
+                    "Computer query command produced no output; BadPwdCount data "
+                    "unavailable."
+                )
     else:
         if not is_auth:
             print_warning_verbose(
@@ -783,6 +1566,7 @@ def compute_computer_spraying_eligibility(
         lockout_threshold=lockout_threshold,
         badpwd_by_user=badpwd_by_user,
         safe_remaining_threshold=safe_threshold,
+        no_lockout_enforced=no_lockout_enforced,
         strict_missing_badpwd=True,
     )
 
@@ -891,6 +1675,29 @@ def _show_lockout_policy_prompt(
             prompt_text,
             default=default_confirm,
         )
+    )
+
+
+def _enforce_lockout_guardrail(
+    *,
+    domain: str,
+    eligibility: SprayEligibilityResult,
+    prompt_text: str,
+    default_confirm: bool = False,
+) -> bool:
+    """Apply the centralized lockout guardrail for all spraying executions.
+
+    Returns:
+        True when execution can continue, False when it must stop.
+    """
+    if eligibility.used_policy_data:
+        return True
+    print_info_debug("[eligibility] Lockout data unavailable; showing policy UX.")
+    return _show_lockout_policy_prompt(
+        domain=domain,
+        eligibility=eligibility,
+        prompt_text=prompt_text,
+        default_confirm=default_confirm,
     )
 
 
@@ -1054,7 +1861,8 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
             )
         return
 
-    is_auth = shell.domains_data[domain]["auth"] == "auth"
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    is_auth = auth_state in {"auth", "pwned"}
     pdc_ip = shell.domains_data[domain]["pdc"]
     safe_threshold = 2 if is_auth else 0
 
@@ -1107,19 +1915,15 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     if eligibility is None:
         return
 
-    if (shell.domains_data[domain]["auth"] != "auth") or (
-        not eligibility.used_policy_data
+    default_mode = shell.type == "ctf"
+    if not _enforce_lockout_guardrail(
+        domain=domain,
+        eligibility=eligibility,
+        prompt_text="Continue with spraying using the full user list?",
+        default_confirm=default_mode,
     ):
-        print_info_debug("[eligibility] Lockout data unavailable; showing policy UX.")
-        default_mode = shell.type == "ctf"
-        if not _show_lockout_policy_prompt(
-            domain=domain,
-            eligibility=eligibility,
-            prompt_text="Continue with spraying using the full user list?",
-            default_confirm=default_mode,
-        ):
-            print_info("Password spraying cancelled by user.")
-            return
+        print_info("Password spraying cancelled by user.")
+        return
 
     print_spraying_eligibility(shell, domain, eligibility)
 
@@ -1222,6 +2026,7 @@ def spraying_with_password(
     password: str,
     *,
     source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
 ) -> None:
     """
     Performs password spraying on the specified domain using a specific password.
@@ -1285,9 +2090,23 @@ def spraying_with_password(
         shell,
         domain=domain,
         user_list_file=user_list_file,
-        safe_threshold=2 if shell.domains_data[domain]["auth"] == "auth" else 0,
+        safe_threshold=(
+            2
+            if str(shell.domains_data[domain].get("auth", "")).strip().lower()
+            in {"auth", "pwned"}
+            else 0
+        ),
     )
     if eligibility is None:
+        return
+    default_mode = shell.type == "ctf"
+    if not _enforce_lockout_guardrail(
+        domain=domain,
+        eligibility=eligibility,
+        prompt_text="Continue with custom-password spraying using the full user list?",
+        default_confirm=default_mode,
+    ):
+        print_info("Password spraying cancelled by user.")
         return
     print_spraying_eligibility(shell, domain, eligibility)
     file_users = list(eligibility.eligible_users)
@@ -1317,6 +2136,7 @@ def spraying_with_password(
             domain,
             spray_type="Custom Password",
             source_context=source_context,
+            source_steps=source_steps,
         )
     finally:
         try:
@@ -1333,6 +2153,7 @@ def spraying_command(
     spray_type: str | None = None,
     entry_label: str | None = None,
     source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
 ) -> None:
     """Wrapper for executing spraying command with operation header."""
     # Professional operation header
@@ -1370,6 +2191,7 @@ def spraying_command(
         spray_type=resolved_spray_type,
         entry_label=entry_label,
         source_context=source_context,
+        source_steps=source_steps,
     )
 
 
@@ -1381,23 +2203,18 @@ def execute_spraying_command(
     spray_type: str | None = None,
     entry_label: str | None = None,
     source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
 ) -> None:
     """Execute the spraying command and process results."""
-    import sys
-
     from adscan_internal.cli.common import SECRET_MODE
     from adscan_internal.rich_output import BRAND_COLORS, print_panel
-    from adscan_internal.services.credential_store_service import CredentialStoreService
-    from adscan_internal.workspaces import domain_subpath
 
     from adscan_internal.services.attack_graph_service import (
+        record_credential_source_steps,
+        upsert_domain_password_reuse_edges,
         upsert_password_spray_entry_edge,
         upsert_share_password_entry_edge,
     )
-    from adscan_internal.cli.attack_path_execution import (
-        offer_attack_paths_for_execution_for_principals,
-    )
-    from rich.prompt import Confirm
     from rich.table import Table
     from rich.text import Text
 
@@ -1405,6 +2222,7 @@ def execute_spraying_command(
     print_warning(
         f"Performing the spraying on {marked_domain}. Please be patient (this can take a while)"
     )
+    typed_source_steps = _extract_typed_source_steps(source_steps)
 
     try:
         # Use run_command instead of spawn_command to avoid output interleaving
@@ -1437,10 +2255,6 @@ def execute_spraying_command(
         output_lines = output.splitlines() if output else []
 
         hits_by_user: dict[str, dict[str, str]] = {}
-        is_interactive = bool(
-            sys.stdin.isatty() and not (os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
-        )
-
         # Process output to find valid logins (batch).
         for line in output_lines:
             line_stripped = line.strip()
@@ -1518,6 +2332,53 @@ def execute_spraying_command(
                 expand=False,
             )
 
+            # Record domain password/hash reuse context from spray hits:
+            # users that authenticate with the same secret are reachable pivots.
+            grouped_hits: dict[str, set[str]] = {}
+            for hit in hits_sorted:
+                username = str(hit.get("username") or "").strip()
+                credential = str(hit.get("password") or "").strip()
+                if not username or not credential:
+                    continue
+                grouped_hits.setdefault(credential.lower(), set()).add(username)
+
+            evidence_source = "password_spraying"
+            if isinstance(source_context, dict):
+                origin = str(source_context.get("origin") or "").strip().lower()
+                if origin:
+                    evidence_source = f"password_spraying:{origin}"
+
+            domain_reuse_created = 0
+            for hit in hits_sorted:
+                username = str(hit.get("username") or "").strip()
+                credential = str(hit.get("password") or "").strip()
+                if not username or not credential:
+                    continue
+                grouped = grouped_hits.get(credential.lower())
+                if not grouped:
+                    continue
+                targets = sorted(grouped, key=str.lower)
+                if len(targets) < 2:
+                    grouped_hits.pop(credential.lower(), None)
+                    continue
+                domain_reuse_created += int(
+                    upsert_domain_password_reuse_edges(
+                        shell,
+                        domain,
+                        source_usernames=targets,
+                        target_usernames=targets,
+                        credential=credential,
+                        status="discovered",
+                        evidence_source=evidence_source,
+                    )
+                    or 0
+                )
+                grouped_hits.pop(credential.lower(), None)
+            if domain_reuse_created > 0:
+                print_info_debug(
+                    f"[spray] Recorded {domain_reuse_created} DomainPassReuse edge(s)."
+                )
+
             # Record provenance edges in the attack graph for each hit.
             spray_type_label = spray_type or "Custom Password"
             should_record_spray_edge = (
@@ -1527,32 +2388,51 @@ def execute_spraying_command(
             for hit in hits_sorted:
                 username = str(hit.get("username") or "")
                 password = str(hit.get("password") or "")
-                if should_record_spray_edge:
+                if typed_source_steps:
                     try:
-                        upsert_password_spray_entry_edge(
+                        record_credential_source_steps(
                             shell,
                             domain,
                             username=username,
-                            password=password,
-                            spray_type=spray_type,
+                            steps=typed_source_steps,
                             status="success",
-                            entry_label=entry_label or "Domain Users",
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
                         print_info_debug(
-                            "[spray] Failed to record PasswordSpray edge in attack graph (continuing)."
+                            "[spray] Failed to record inherited credential provenance "
+                            "steps in attack graph (continuing)."
                         )
+                if should_record_spray_edge:
+                    if not typed_source_steps:
+                        try:
+                            upsert_password_spray_entry_edge(
+                                shell,
+                                domain,
+                                username=username,
+                                password=password,
+                                spray_type=spray_type,
+                                status="success",
+                                entry_label=entry_label or "Domain Users",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                            print_info_debug(
+                                "[spray] Failed to record PasswordSpray edge in attack graph (continuing)."
+                            )
                 if share_edge_payload:
                     try:
                         share_entry_label, share_notes = share_edge_payload
+                        share_notes = dict(share_notes)
+                        if password:
+                            share_notes["password"] = password
                         upsert_share_password_entry_edge(
                             shell,
                             domain,
                             username=username,
                             entry_label=share_entry_label,
                             status="success",
-                            notes=dict(share_notes),
+                            notes=share_notes,
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
@@ -1560,269 +2440,20 @@ def execute_spraying_command(
                             "[spray] Failed to record PasswordInShare edge (continuing)."
                         )
 
-            # Load admin list (best-effort) and decide whether to pivot immediately.
-            workspace_cwd = (
-                shell._get_workspace_cwd()  # type: ignore[attr-defined]
-                if hasattr(shell, "_get_workspace_cwd")
-                else (getattr(shell, "current_workspace_dir", None) or os.getcwd())
-            )
-            admins_file = domain_subpath(
-                str(workspace_cwd), shell.domains_dir, domain, "admins.txt"
-            )
-            admin_users: set[str] = set()
-            try:
-                if os.path.exists(admins_file):
-                    with open(
-                        admins_file, "r", encoding="utf-8", errors="ignore"
-                    ) as fh:
-                        admin_users = {
-                            strip_ansi_codes(line).strip().lower()
-                            for line in fh
-                            if line.strip()
-                        }
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_info_debug("[spray] Failed to load admins.txt (continuing).")
-
-            admin_hits = [
-                hit
-                for hit in hits_sorted
-                if str(hit.get("username") or "").lower() in admin_users
-            ]
-
-            store = CredentialStoreService()
-
-            if admin_hits:
-                admin_table = Table(
-                    title=Text(
-                        "Administrator Credentials Detected",
-                        style=f"bold {BRAND_COLORS['warning']}",
-                    ),
-                    show_header=True,
-                    header_style=f"bold {BRAND_COLORS['warning']}",
-                    show_lines=True,
-                )
-                admin_table.add_column("#", style="dim", width=4, justify="right")
-                admin_table.add_column("Username", style="bold")
-
-                for idx, hit in enumerate(admin_hits, start=1):
-                    user = str(hit.get("username") or "")
-                    admin_table.add_row(str(idx), mark_sensitive(user, "user"))
-
-                message = Text()
-                message.append(
-                    "One or more administrator credentials were found during spraying.\n\n",
-                    style="bold yellow",
-                )
-                message.append(
-                    "Pivoting with an admin account is typically the fastest route to domain compromise.\n",
-                    style="yellow",
-                )
-
-                print_panel(
-                    [message, admin_table],
-                    title=Text("Privileged Credentials Found", style="bold yellow"),
-                    border_style="yellow",
-                    expand=False,
-                )
-
-                pivot_now = (
-                    Confirm.ask(
-                        "Do you want to continue with one of these admin users now?",
-                        default=True,
-                    )
-                    if is_interactive
-                    else False
-                )
-
-                if pivot_now:
-                    # Store all non-selected credentials silently (no verification prompts).
-                    selected = admin_hits[0]
-                    if len(admin_hits) > 1 and hasattr(shell, "_questionary_select"):
-                        options = [
-                            str(hit.get("username") or "") for hit in admin_hits
-                        ] + ["Cancel"]
-                        selected_idx = shell._questionary_select(
-                            "Select an admin user to continue with:",
-                            options,
-                            default_idx=0,
-                        )
-                        if selected_idx is None or selected_idx >= len(options) - 1:
-                            selected = admin_hits[0]
-                        else:
-                            selected = admin_hits[selected_idx]
-
-                    selected_user = str(selected.get("username") or "")
-                    selected_pass = str(selected.get("password") or "")
-
-                    for hit in hits_sorted:
-                        user = str(hit.get("username") or "")
-                        if user.lower() == selected_user.lower():
-                            continue
-                        store.update_domain_credential(
-                            domains_data=shell.domains_data,
-                            domain=domain,
-                            username=user,
-                            credential=str(hit.get("password") or ""),
-                            is_hash=False,
-                        )
-
-                    shell.add_credential(domain, selected_user, selected_pass)
-                    return
-
-            # Default flow: store all credentials silently, then offer attack paths for these principals.
-            for hit in hits_sorted:
-                user = str(hit.get("username") or "")
-                store.update_domain_credential(
-                    domains_data=shell.domains_data,
-                    domain=domain,
-                    username=user,
-                    credential=str(hit.get("password") or ""),
-                    is_hash=False,
-                )
-
-            principals = [str(hit.get("username") or "") for hit in hits_sorted]
-            executed = offer_attack_paths_for_execution_for_principals(
+            handle_validated_domain_hits_followup(
                 shell,
-                domain,
-                max_display=20,
-                principals=principals,
-                max_depth=10,
-                include_all=False,
+                domain=domain,
+                hits=[
+                    {
+                        "username": str(hit.get("username") or ""),
+                        "credential": str(hit.get("password") or ""),
+                        "is_hash": False,
+                    }
+                    for hit in hits_sorted
+                ],
+                source_steps=source_steps,
+                discovery_label="sprayed",
             )
-            if not executed:
-                marked_domain = mark_sensitive(domain, "domain")
-                print_warning(
-                    f"No attack paths found from sprayed users to high-value targets in {marked_domain}."
-                )
-                print_info_verbose(
-                    "Tip: use `attack_paths <domain> owned --all` to include non-high-value targets."
-                )
-                if is_interactive or hasattr(shell, "_questionary_select"):
-                    selection: list[dict[str, str]] = []
-                    if len(hits_sorted) == 1:
-                        only_hit = hits_sorted[0]
-                        if hasattr(shell, "_questionary_select"):
-                            choice_idx = shell._questionary_select(
-                                "No attack paths found. Enumerate this user now?",
-                                ["Enumerate user", "Skip"],
-                                default_idx=0,
-                            )
-                            if choice_idx == 0:
-                                selection = [only_hit]
-                        else:
-                            prompt = (
-                                "Do you want to enumerate this user now "
-                                f"({mark_sensitive(str(only_hit.get('username') or ''), 'user')})?"
-                            )
-                            if Confirm.ask(prompt, default=True):
-                                selection = [only_hit]
-                    else:
-                        options = [
-                            "All users",
-                            "Select one user",
-                            "Select multiple users",
-                            "Skip",
-                        ]
-                        if hasattr(shell, "_questionary_select"):
-                            choice_idx = shell._questionary_select(
-                                "No attack paths found. Choose users to enumerate now:",
-                                options,
-                                default_idx=0,
-                            )
-                        else:
-                            choice_idx = (
-                                0
-                                if Confirm.ask(
-                                    "No attack paths found. Enumerate all users now?",
-                                    default=False,
-                                )
-                                else 3
-                            )
-
-                        if choice_idx == 0:
-                            selection = hits_sorted
-                        elif choice_idx == 1:
-                            user_options = [
-                                str(hit.get("username") or "") for hit in hits_sorted
-                            ] + ["Cancel"]
-                            if hasattr(shell, "_questionary_select"):
-                                idx = shell._questionary_select(
-                                    "Select a user to enumerate:",
-                                    user_options,
-                                    default_idx=0,
-                                )
-                                if idx is not None and idx < len(user_options) - 1:
-                                    selection = [hits_sorted[idx]]
-                        elif choice_idx == 2:
-                            user_options = ["All users"] + [
-                                str(hit.get("username") or "") for hit in hits_sorted
-                            ]
-                            if hasattr(shell, "_questionary_checkbox"):
-                                selected_values = shell._questionary_checkbox(
-                                    "Select users to enumerate:",
-                                    user_options,
-                                )
-                                if (
-                                    isinstance(selected_values, list)
-                                    and selected_values
-                                ):
-                                    if "All users" in selected_values:
-                                        selection = hits_sorted
-                                    else:
-                                        requested = {
-                                            str(item).strip().lower()
-                                            for item in selected_values
-                                            if str(item).strip()
-                                        }
-                                        selection = [
-                                            hit
-                                            for hit in hits_sorted
-                                            if str(hit.get("username") or "").lower()
-                                            in requested
-                                        ]
-                            if not selection:
-                                print_warning(
-                                    "Multi-select prompt cancelled. Please choose a single user instead."
-                                )
-                                user_options = [
-                                    str(hit.get("username") or "")
-                                    for hit in hits_sorted
-                                ] + ["Cancel"]
-                                if hasattr(shell, "_questionary_select"):
-                                    idx = shell._questionary_select(
-                                        "Select a user to enumerate:",
-                                        user_options,
-                                        default_idx=0,
-                                    )
-                                    if idx is not None and idx < len(user_options) - 1:
-                                        selection = [hits_sorted[idx]]
-
-                    if selection:
-                        for hit in selection:
-                            user = str(hit.get("username") or "")
-                            pwd = str(hit.get("password") or "")
-                            if not user or not pwd:
-                                continue
-                            shell.add_credential(
-                                domain,
-                                user,
-                                pwd,
-                                prompt_for_user_privs_after=True,
-                            )
-                    else:
-                        auth_state = shell.domains_data.get(domain, {}).get("auth", "")
-                        if auth_state not in {"auth", "pwned"} and hits_sorted:
-                            first_hit = hits_sorted[0]
-                            user = str(first_hit.get("username") or "")
-                            pwd = str(first_hit.get("password") or "")
-                            if user and pwd:
-                                shell.add_credential(
-                                    domain,
-                                    user,
-                                    pwd,
-                                    prompt_for_user_privs_after=False,
-                                )
 
         # Handle command result
         if completed_process.returncode != 0:
@@ -1922,19 +2553,14 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
     if eligibility is None:
         return
 
-    if not eligibility.used_policy_data:
-        print_info_debug(
-            "[spray] Lockout data unavailable for computer pre2k checks; "
-            "showing policy UX."
-        )
-        if not _show_lockout_policy_prompt(
-            domain=domain,
-            eligibility=eligibility,
-            prompt_text="Continue with computer pre2k checks using the full list?",
-            default_confirm=False,
-        ):
-            print_info("Computer pre2k check cancelled by user.")
-            return
+    if not _enforce_lockout_guardrail(
+        domain=domain,
+        eligibility=eligibility,
+        prompt_text="Continue with computer pre2k checks using the full list?",
+        default_confirm=False,
+    ):
+        print_info("Computer pre2k check cancelled by user.")
+        return
 
     print_spraying_eligibility(shell, domain, eligibility)
     if not eligibility.eligible_users:

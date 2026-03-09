@@ -326,6 +326,7 @@ def _persist_bulk_credentials(
                         host=host_value,
                         auth_username=auth_username,
                         credential_username=username,
+                        secret=credential,
                     )
                 )
         else:
@@ -335,6 +336,7 @@ def _persist_bulk_credentials(
                 host=None,
                 auth_username=auth_username,
                 credential_username=username,
+                secret=credential,
             )
         add_kwargs: dict[str, Any] = {
             "prompt_for_user_privs_after": False,
@@ -574,6 +576,8 @@ def _run_optional_local_admin_reuse_validation(
                     "username": user_clean,
                     "rid": rid_clean or "-",
                     "source_hosts": int(item.get("source_hosts", 0) or 0),
+                    "credential": cred_clean,
+                    "credential_was_cracked": bool(item.get("credential_was_cracked")),
                     "result": result if isinstance(result, dict) else {},
                 }
             )
@@ -587,6 +591,8 @@ def _run_optional_local_admin_reuse_validation(
                     "username": user_clean,
                     "rid": rid_clean or "-",
                     "source_hosts": int(item.get("source_hosts", 0) or 0),
+                    "credential": cred_clean,
+                    "credential_was_cracked": bool(item.get("credential_was_cracked")),
                     "result": {
                         "status": "error",
                         "error": str(exc),
@@ -600,6 +606,13 @@ def _run_optional_local_admin_reuse_validation(
         domain=domain,
         results=validation_results,
         title="Local Reuse Validation Summary",
+    )
+    _run_optional_domain_account_reuse_validation(
+        shell=shell,
+        domain=domain,
+        candidates=resolved_candidates,
+        source_scope="SAM dump (all hosts)",
+        local_validation_results=validation_results,
     )
 
 
@@ -800,6 +813,8 @@ def _run_single_host_local_admin_reuse_validation(
                     "username": user_clean,
                     "rid": rid_clean or "-",
                     "source_hosts": int(item.get("source_hosts", 0) or 0),
+                    "credential": cred_clean,
+                    "credential_was_cracked": bool(item.get("credential_was_cracked")),
                     "result": result if isinstance(result, dict) else {},
                 }
             )
@@ -813,6 +828,8 @@ def _run_single_host_local_admin_reuse_validation(
                     "username": user_clean,
                     "rid": rid_clean or "-",
                     "source_hosts": int(item.get("source_hosts", 0) or 0),
+                    "credential": cred_clean,
+                    "credential_was_cracked": bool(item.get("credential_was_cracked")),
                     "result": {
                         "status": "error",
                         "error": str(exc),
@@ -826,6 +843,526 @@ def _run_single_host_local_admin_reuse_validation(
         domain=domain,
         results=validation_results,
         title="Single-Host Reuse Validation Summary",
+    )
+    _run_optional_domain_account_reuse_validation(
+        shell=shell,
+        domain=domain,
+        candidates=resolved_candidates,
+        source_scope="SAM dump (single host)",
+        local_validation_results=validation_results,
+    )
+
+
+def _run_optional_domain_account_reuse_validation(
+    shell: Any,
+    *,
+    domain: str,
+    candidates: list[dict[str, Any]],
+    source_scope: str,
+    local_validation_results: list[dict[str, Any]] | None = None,
+) -> None:
+    """Optionally validate whether SAM credentials are also valid domain creds."""
+    from adscan_internal.cli.spraying import (
+        handle_validated_domain_hits_followup,
+        validate_domain_reuse_with_ntlm_hash,
+        validate_domain_reuse_with_password,
+    )
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        username = str(item.get("username") or "").strip()
+        credential = str(item.get("credential") or "").strip()
+        rid = str(item.get("rid") or "-").strip() or "-"
+        if not username or not credential:
+            continue
+        key = credential.lower()
+        bucket = grouped.setdefault(
+            key,
+            {
+                "credential": credential,
+                "accounts": [],
+                "source_hostnames": set(),
+                "credential_type": (
+                    "Password (cracked)"
+                    if bool(item.get("credential_was_cracked"))
+                    else "Hash"
+                    if _is_hash_credential(shell, credential)
+                    else "Password"
+                ),
+            },
+        )
+        accounts = bucket.get("accounts")
+        if isinstance(accounts, list):
+            accounts.append(f"{username} (RID {rid})")
+        source_hostnames = bucket.get("source_hostnames")
+        if isinstance(source_hostnames, set):
+            source_values = item.get("source_hostnames")
+            if isinstance(source_values, list):
+                for host_value in source_values:
+                    host_clean = str(host_value).strip()
+                    if host_clean:
+                        source_hostnames.add(host_clean)
+
+    if not grouped:
+        return
+
+    marked_domain = mark_sensitive(domain, "domain")
+    total = len(grouped)
+    hash_count = sum(
+        1
+        for value in grouped.values()
+        if _is_hash_credential(shell, str(value["credential"]))
+    )
+    password_count = total - hash_count
+    if not confirm_operation(
+        operation_name="Domain Reuse Validation",
+        description=(
+            "Tests whether SAM-derived credentials are also valid for domain users "
+            "using password spraying (Kerberos for passwords, NetExec for NTLM hashes)."
+        ),
+        context={
+            "Domain": marked_domain,
+            "Source Scope": source_scope,
+            "Credential Variants": str(total),
+            "Password Variants": str(password_count),
+            "Hash Variants": str(hash_count),
+        },
+        default=True,
+        icon="🎯",
+        show_panel=True,
+    ):
+        print_info(
+            f"Skipped SAM-to-domain reuse validation for {marked_domain} by user choice."
+        )
+        return
+
+    rows: list[dict[str, Any]] = []
+    for value in grouped.values():
+        credential = str(value.get("credential") or "").strip()
+        accounts = value.get("accounts")
+        account_values = (
+            sorted(str(account).strip() for account in accounts if str(account).strip())
+            if isinstance(accounts, list)
+            else []
+        )
+        rows.append(
+            {
+                "Accounts": ", ".join(
+                    mark_sensitive(account, "user") for account in account_values[:3]
+                )
+                + (
+                    f" (+{len(account_values) - 3} more)"
+                    if len(account_values) > 3
+                    else ""
+                ),
+                "Credential Type": str(value.get("credential_type") or "-"),
+                "Credential": mark_sensitive(credential, "password"),
+            }
+        )
+    if rows:
+        print_info_table(
+            rows,
+            ["Accounts", "Credential Type", "Credential"],
+            title="SAM -> Domain Reuse Candidates",
+        )
+
+    print_info(
+        f"Running SAM-to-domain reuse validation for {total} credential variant(s) in {marked_domain}."
+    )
+    result_rows: list[dict[str, Any]] = []
+    domain_results_by_credential: dict[str, dict[str, Any]] = {}
+    validated_domain_hits: list[dict[str, Any]] = []
+    for value in grouped.values():
+        credential = str(value.get("credential") or "").strip()
+        credential_type = (
+            "Hash" if _is_hash_credential(shell, credential) else "Password (cracked)"
+        )
+        accounts = value.get("accounts")
+        account_values = (
+            sorted(str(account).strip() for account in accounts if str(account).strip())
+            if isinstance(accounts, list)
+            else []
+        )
+        if _is_hash_credential(shell, credential):
+            spray_result = validate_domain_reuse_with_ntlm_hash(
+                shell,
+                domain=domain,
+                nt_hash=credential,
+            )
+        else:
+            spray_result = validate_domain_reuse_with_password(
+                shell,
+                domain=domain,
+                password=credential,
+            )
+        status = str(spray_result.get("status") or "-")
+        hits_raw = spray_result.get("hits")
+        hits = (
+            [str(item).strip() for item in hits_raw if str(item).strip()]
+            if isinstance(hits_raw, list)
+            else []
+        )
+        outcomes_raw = spray_result.get("outcome_counts")
+        outcomes = outcomes_raw if isinstance(outcomes_raw, dict) else {}
+        source_hostnames_raw = value.get("source_hostnames")
+        source_hostnames = (
+            sorted(
+                str(host).strip()
+                for host in source_hostnames_raw
+                if isinstance(host, str) and str(host).strip()
+            )
+            if isinstance(source_hostnames_raw, set)
+            else []
+        )
+        created_graph_steps = 0
+        created_domain_pass_reuse_steps = 0
+        if hits and source_hostnames:
+            try:
+                from adscan_internal.services.attack_graph_service import (
+                    upsert_domain_password_reuse_edges,
+                    upsert_local_cred_to_domain_reuse_edges,
+                )
+
+                created_graph_steps = int(
+                    upsert_local_cred_to_domain_reuse_edges(
+                        shell,
+                        domain,
+                        source_hosts=source_hostnames,
+                        domain_usernames=hits,
+                        credential=credential,
+                        status="discovered",
+                    )
+                    or 0
+                )
+                created_domain_pass_reuse_steps = int(
+                    upsert_domain_password_reuse_edges(
+                        shell,
+                        domain,
+                        source_usernames=hits,
+                        target_usernames=hits,
+                        credential=credential,
+                        status="discovered",
+                        evidence_source="sam_domain_reuse_validation",
+                    )
+                    or 0
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                marked_domain = mark_sensitive(domain, "domain")
+                print_warning(
+                    "Failed to persist SAM-to-domain reuse context steps for "
+                    f"{marked_domain}; continuing."
+                )
+        outcome_summary = ", ".join(
+            f"{code}={count}"
+            for code, count in sorted(
+                ((str(code), int(count)) for code, count in outcomes.items()),
+                key=lambda item: (-item[1], item[0]),
+            )[:3]
+        )
+        domain_results_by_credential[credential.lower()] = {
+            "status": status,
+            "hits": len(hits),
+            "outcomes": dict(outcomes),
+            "created_graph_steps": created_graph_steps,
+            "created_domain_pass_reuse_steps": created_domain_pass_reuse_steps,
+        }
+        validated_domain_hits.extend(
+            {
+                "username": username,
+                "credential": credential,
+                "is_hash": _is_hash_credential(shell, credential),
+            }
+            for username in hits
+        )
+        result_rows.append(
+            {
+                "Accounts": ", ".join(
+                    mark_sensitive(account, "user") for account in account_values[:2]
+                )
+                + (
+                    f" (+{len(account_values) - 2} more)"
+                    if len(account_values) > 2
+                    else ""
+                ),
+                "Credential Type": credential_type,
+                "Credential": mark_sensitive(credential, "password"),
+                "Status": status,
+                "Domain Hits": len(hits),
+                "Local->Domain Steps": created_graph_steps,
+                "DomainPassReuse": created_domain_pass_reuse_steps,
+                "Outcome Summary": outcome_summary or "-",
+            }
+        )
+
+    if result_rows:
+        print_info_table(
+            result_rows,
+            [
+                "Accounts",
+                "Credential Type",
+                "Credential",
+                "Status",
+                "Domain Hits",
+                "Local->Domain Steps",
+                "DomainPassReuse",
+                "Outcome Summary",
+            ],
+            title="SAM -> Domain Reuse Validation Results",
+        )
+    _print_sam_reuse_combined_summary(
+        shell=shell,
+        domain=domain,
+        grouped_candidates=grouped,
+        domain_results_by_credential=domain_results_by_credential,
+        local_validation_results=local_validation_results or [],
+    )
+    auth_state = str(shell.domains_data.get(domain, {}).get("auth", "")).strip().lower()
+    if validated_domain_hits and auth_state != "pwned":
+        handle_validated_domain_hits_followup(
+            shell,
+            domain=domain,
+            hits=validated_domain_hits,
+            discovery_label="validated",
+        )
+
+
+def _summarize_outcomes_for_table(
+    outcomes: dict[str, int],
+    *,
+    limit: int = 3,
+    excluded_codes: set[str] | None = None,
+) -> str:
+    """Render compact top-N outcome summary for UX tables."""
+    if not outcomes:
+        return "-"
+    excluded = {str(code).upper() for code in (excluded_codes or set())}
+    normalized: dict[str, int] = {}
+    for raw_code, raw_count in outcomes.items():
+        code = str(raw_code or "").strip().upper()
+        if not code or code in excluded:
+            continue
+        normalized[code] = int(normalized.get(code, 0)) + int(raw_count or 0)
+    if not normalized:
+        return "-"
+    ordered = sorted(normalized.items(), key=lambda item: (-item[1], item[0]))
+    summary = ", ".join(f"{code}={count}" for code, count in ordered[:limit])
+    if len(ordered) > limit:
+        summary += f", +{len(ordered) - limit} more"
+    return summary
+
+
+def _build_local_results_by_credential(
+    local_validation_results: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Aggregate local reuse validation result by credential value."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in local_validation_results:
+        if not isinstance(item, dict):
+            continue
+        credential = str(item.get("credential") or "").strip()
+        if not credential:
+            continue
+        key = credential.lower()
+        bucket = grouped.setdefault(
+            key,
+            {
+                "status": "not_reused",
+                "local_hits": 0,
+                "outcomes": {},
+            },
+        )
+        result_data = item.get("result")
+        if not isinstance(result_data, dict):
+            continue
+        raw_status = str(result_data.get("status") or "").strip().lower()
+        if raw_status not in {"reused", "no_reuse", "error"}:
+            raw_status = "reused" if result_data.get("reuse_targets") else "no_reuse"
+        if raw_status == "error":
+            bucket["status"] = "error"
+        elif raw_status == "reused" and str(bucket.get("status")) != "error":
+            bucket["status"] = "reused"
+        elif (
+            str(bucket.get("status")) not in {"error", "reused"}
+            and raw_status == "no_reuse"
+        ):
+            bucket["status"] = "not_reused"
+
+        targets_raw = result_data.get("reuse_targets")
+        targets = targets_raw if isinstance(targets_raw, list) else []
+        bucket["local_hits"] = max(int(bucket.get("local_hits", 0)), len(targets))
+
+        outcomes_raw = result_data.get("outcome_counts")
+        outcomes = outcomes_raw if isinstance(outcomes_raw, dict) else {}
+        merged_outcomes = bucket.get("outcomes")
+        if not isinstance(merged_outcomes, dict):
+            merged_outcomes = {}
+            bucket["outcomes"] = merged_outcomes
+        for code, count in outcomes.items():
+            normalized_code = str(code).strip().upper()
+            if not normalized_code:
+                continue
+            merged_outcomes[normalized_code] = int(
+                merged_outcomes.get(normalized_code, 0)
+            ) + int(count)
+
+    return grouped
+
+
+def _print_sam_reuse_combined_summary(
+    *,
+    shell: Any,
+    domain: str,
+    grouped_candidates: dict[str, dict[str, Any]],
+    domain_results_by_credential: dict[str, dict[str, Any]],
+    local_validation_results: list[dict[str, Any]],
+) -> None:
+    """Render one combined local+domain reuse summary per credential variant."""
+    if not grouped_candidates:
+        return
+    local_results_by_credential = _build_local_results_by_credential(
+        local_validation_results
+    )
+    rows_with_key: list[tuple[tuple[int, int, int, str], dict[str, Any]]] = []
+    local_reused = 0
+    domain_reused = 0
+    both_reused = 0
+    total_domain_steps = 0
+
+    for key, candidate in sorted(grouped_candidates.items(), key=lambda item: item[0]):
+        credential = str(candidate.get("credential") or "").strip()
+        credential_type = str(candidate.get("credential_type") or "-")
+        accounts_raw = candidate.get("accounts")
+        accounts = (
+            sorted(
+                str(account).strip() for account in accounts_raw if str(account).strip()
+            )
+            if isinstance(accounts_raw, list)
+            else []
+        )
+        accounts_label = ", ".join(
+            mark_sensitive(account, "user") for account in accounts[:2]
+        )
+        if len(accounts) > 2:
+            accounts_label += f" (+{len(accounts) - 2} more)"
+        if not accounts_label:
+            accounts_label = "-"
+
+        local_info = local_results_by_credential.get(key, {})
+        local_status_raw = str(local_info.get("status") or "not_reused")
+        local_hits = int(local_info.get("local_hits", 0) or 0)
+        if local_status_raw == "reused":
+            local_status = "Reused"
+            local_reused += 1
+        elif local_status_raw == "error":
+            local_status = "Error"
+        else:
+            local_status = "Not reused"
+
+        local_outcomes_raw = local_info.get("outcomes")
+        local_outcomes = (
+            local_outcomes_raw if isinstance(local_outcomes_raw, dict) else {}
+        )
+        local_outcomes_label = _summarize_outcomes_for_table(
+            local_outcomes,
+            excluded_codes={"PWN3D"},
+        )
+
+        domain_info = domain_results_by_credential.get(key, {})
+        domain_status_raw = str(domain_info.get("status") or "not_run").strip().lower()
+        domain_hits = int(domain_info.get("hits", 0) or 0)
+        domain_graph_steps = int(domain_info.get("created_graph_steps", 0) or 0)
+        total_domain_steps += domain_graph_steps
+        if domain_status_raw == "success":
+            domain_status = "Reused"
+            domain_reused += 1
+        elif domain_status_raw == "error":
+            domain_status = "Error"
+        elif domain_status_raw == "skipped":
+            domain_status = "Skipped"
+        elif domain_status_raw == "no_hits":
+            domain_status = "Not reused"
+        else:
+            domain_status = "Not run"
+
+        if local_status == "Reused" and domain_status == "Reused":
+            both_reused += 1
+
+        domain_outcomes_raw = domain_info.get("outcomes")
+        domain_outcomes = (
+            domain_outcomes_raw if isinstance(domain_outcomes_raw, dict) else {}
+        )
+        domain_outcomes_label = _summarize_outcomes_for_table(domain_outcomes)
+
+        impact_rank = 5
+        if local_status == "Reused" and domain_status == "Reused":
+            impact_rank = 0
+        elif domain_status == "Reused":
+            impact_rank = 1
+        elif local_status == "Reused":
+            impact_rank = 2
+        elif local_status == "Error" or domain_status == "Error":
+            impact_rank = 3
+        elif domain_status == "Skipped":
+            impact_rank = 4
+
+        rows_with_key.append(
+            (
+                (impact_rank, -domain_hits, -local_hits, credential.lower()),
+                {
+                    "Accounts": accounts_label,
+                    "Credential Type": credential_type,
+                    "Credential": mark_sensitive(credential, "password"),
+                    "Local Reuse": local_status,
+                    "Local Hosts": local_hits,
+                    "Domain Reuse": domain_status,
+                    "Domain Hits": domain_hits,
+                    "Domain Steps": domain_graph_steps,
+                    "Local Outcomes": local_outcomes_label,
+                    "Domain Outcomes": domain_outcomes_label,
+                },
+            )
+        )
+
+    if not rows_with_key:
+        return
+    rows = [row for _, row in sorted(rows_with_key, key=lambda item: item[0])]
+
+    print_info_table(
+        rows,
+        [
+            "Accounts",
+            "Credential Type",
+            "Credential",
+            "Local Reuse",
+            "Local Hosts",
+            "Domain Reuse",
+            "Domain Hits",
+            "Domain Steps",
+            "Local Outcomes",
+            "Domain Outcomes",
+        ],
+        title="SAM Reuse Final Summary",
+    )
+    marked_domain = mark_sensitive(domain, "domain")
+    print_panel(
+        "\n".join(
+            [
+                "[bold]SAM Reuse Correlation Completed[/bold]",
+                f"Domain: {marked_domain}",
+                "",
+                f"Credential variants analyzed: {len(rows)}",
+                f"Local reuse confirmed: {local_reused}",
+                f"Domain reuse confirmed: {domain_reused}",
+                f"Confirmed in both scopes: {both_reused}",
+                f"LocalCredToDomainReuse steps created: {total_domain_steps}",
+            ]
+        ),
+        title="[bold magenta]SAM Reuse Correlation[/bold magenta]",
+        border_style="magenta",
+        expand=False,
     )
 
 
@@ -1182,6 +1719,7 @@ def _build_dump_source_steps(
     host: str | None,
     auth_username: str | None = None,
     credential_username: str | None = None,
+    secret: str | None = None,
 ) -> list[object]:
     """Build credential provenance steps for dump-derived credentials."""
     from adscan_internal.principal_utils import normalize_machine_account
@@ -1219,6 +1757,8 @@ def _build_dump_source_steps(
         notes["auth_username"] = str(auth_username).strip()
     if credential_username:
         notes["credential_username"] = str(credential_username).strip()
+    if str(secret or "").strip():
+        notes["secret"] = str(secret).strip()
 
     # Avoid self-loop provenance edges for machine accounts dumped from themselves
     # (e.g., BRAAVOS$ -> DumpLSA -> BRAAVOS$), which add noise without new context.
@@ -1785,6 +2325,7 @@ def execute_dump_lsa(
                                         host=step_host,
                                         auth_username=auth_username,
                                         credential_username=username,
+                                        secret=nt_hash,
                                     ),
                                     **add_kwargs,
                                 )
@@ -1850,6 +2391,7 @@ def execute_dump_lsa(
                                         host=step_host,
                                         auth_username=auth_username,
                                         credential_username=username,
+                                        secret=password,
                                     ),
                                     **add_kwargs,
                                 )
@@ -2120,6 +2662,11 @@ def execute_dump_sam(
                             "credential": str(item.get("credential") or "").strip(),
                             "rid": str(item.get("rid") or "").strip(),
                             "source_hosts": host_count,
+                            "source_hostnames": sorted(
+                                str(host_name).strip()
+                                for host_name in hosts_set
+                                if isinstance(host_name, str) and str(host_name).strip()
+                            ),
                         }
                     )
                 _run_optional_local_admin_reuse_validation(
@@ -2150,6 +2697,11 @@ def execute_dump_sam(
                             "credential": str(item.get("credential") or "").strip(),
                             "rid": str(item.get("rid") or "").strip(),
                             "source_hosts": max(1, host_count),
+                            "source_hostnames": sorted(
+                                str(host_name).strip()
+                                for host_name in hosts_set
+                                if isinstance(host_name, str) and str(host_name).strip()
+                            ),
                         }
                     )
                 _run_single_host_local_admin_reuse_validation(
@@ -2273,6 +2825,8 @@ def execute_dump_dpapi(
                                         dump_kind="DPAPI",
                                         host=step_host,
                                         auth_username=auth_username,
+                                        credential_username=username,
+                                        secret=password,
                                     ),
                                 )
                             print_success(f"Credential saved for {marked_username}")

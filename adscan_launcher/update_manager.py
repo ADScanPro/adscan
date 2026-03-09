@@ -27,6 +27,8 @@ import requests
 from rich.console import Group
 from rich.text import Text
 
+from adscan_launcher.docker_commands import pull_runtime_image_with_diagnostics
+
 
 @dataclass(frozen=True)
 class UpdateContext:
@@ -271,18 +273,25 @@ def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> b
     return True
 
 
-def _update_docker_image(ctx: UpdateContext, image: str) -> bool:
+def _update_docker_image(
+    ctx: UpdateContext,
+    image: str,
+    *,
+    command_name: str,
+) -> bool:
     """Pull the Docker image to latest. Returns True if pull succeeded."""
     ctx.print_info(f"Pulling image: {image}")
     pull_start = time.monotonic()
-    pull_timeout = ctx.docker_pull_timeout_seconds
-    ok = ctx.ensure_image_pulled(image, timeout=pull_timeout, stream_output=True)
+    resolved_image = pull_runtime_image_with_diagnostics(
+        image=image,
+        pull_timeout_seconds=ctx.docker_pull_timeout_seconds,
+        command_name=command_name,
+        stream_output=True,
+    )
     ctx.print_info_debug(
         f"[update] Docker pull duration: {time.monotonic() - pull_start:.2f}s"
     )
-    if not ok:
-        ctx.print_error("Failed to pull the ADscan Docker image.")
-        ctx.print_instruction(f"Try: docker pull {image}")
+    if not resolved_image:
         return False
     ctx.print_success("ADscan Docker image pulled successfully.")
     return True
@@ -305,14 +314,14 @@ def _render_update_panel(
         lines.append(Text(f"Launcher: {current} (up-to-date)", style="green"))
 
     image = docker_info.get("image") or "unknown"
-    if docker_info.get("needs_update"):
+    if not docker_info.get("image_present"):
+        lines.append(Text(f"Docker image missing locally: {image}", style="yellow"))
+    elif docker_info.get("needs_update"):
         lines.append(
             Text(f"Docker image update available: {image}", style="bold yellow")
         )
     elif docker_info.get("image_present"):
         lines.append(Text(f"Docker image: {image} (up-to-date)", style="green"))
-    else:
-        lines.append(Text(f"Docker image missing: {image}", style="yellow"))
 
     ctx.print_panel(
         Group(*lines),
@@ -375,10 +384,26 @@ def offer_updates_for_command(ctx: UpdateContext, command: str) -> None:
                 os.execv(sys.executable, [sys.executable] + sys.argv)
 
     if docker_info.get("needs_update"):
-        if ctx.confirm_ask("Update the Docker image now?", False):
-            _update_docker_image(
-                ctx, str(docker_info.get("image") or ctx.get_docker_image_name())
+        image_missing_locally = not bool(docker_info.get("image_present"))
+        docker_prompt = (
+            "Docker image is required locally for runtime commands. Pull now?"
+            if image_missing_locally
+            else "Update the Docker image now?"
+        )
+        if ctx.confirm_ask(docker_prompt, image_missing_locally):
+            update_ok = _update_docker_image(
+                ctx,
+                str(docker_info.get("image") or ctx.get_docker_image_name()),
+                command_name=command,
             )
+            if image_missing_locally and not update_ok:
+                ctx.print_error(
+                    "ADscan runtime image is still unavailable, so the command cannot continue."
+                )
+                ctx.print_instruction(
+                    "Resolve Docker/image pull issues first, then retry the same command."
+                )
+                raise SystemExit(1)
 
 
 def run_update_command(ctx: UpdateContext) -> bool:
@@ -404,7 +429,7 @@ def run_update_command(ctx: UpdateContext) -> bool:
 
     image_name = str(docker_info.get("image") or ctx.get_docker_image_name())
     if docker_info.get("needs_update") or not docker_info.get("image_present"):
-        ok = _update_docker_image(ctx, image_name) and ok
+        ok = _update_docker_image(ctx, image_name, command_name="update") and ok
     else:
         ctx.print_info("Docker image already up-to-date.")
 

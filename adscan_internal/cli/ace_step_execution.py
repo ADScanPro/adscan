@@ -15,9 +15,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from rich.prompt import Confirm, Prompt
+from rich.text import Text
 
 from adscan_internal import print_warning, telemetry
-from adscan_internal.rich_output import mark_sensitive, print_info_verbose
+from adscan_internal.rich_output import (
+    BRAND_COLORS,
+    mark_sensitive,
+    print_info_debug,
+    print_panel,
+    print_info_verbose,
+)
 from adscan_internal.services.attack_graph_service import (
     get_node_by_label,
     resolve_netexec_target_for_node_label,
@@ -86,10 +93,17 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     creds = domain_data.get("credentials")
     if not isinstance(creds, dict):
         return None
-    value = creds.get(username)
-    if not isinstance(value, str) or not value:
+    normalized_target = _normalize_account(username)
+    if not normalized_target:
         return None
-    return value
+    for stored_user, stored_credential in creds.items():
+        if _normalize_account(str(stored_user or "")) != normalized_target:
+            continue
+        if not isinstance(stored_credential, str):
+            return None
+        candidate = stored_credential.strip()
+        return candidate or None
+    return None
 
 
 def _pick_execution_user(
@@ -115,6 +129,208 @@ def _pick_execution_user(
         if normalized:
             return normalized
     return None
+
+
+def _resolve_execution_user_with_source(
+    shell: Any,
+    *,
+    domain: str,
+    context_username: str | None,
+    summary: dict[str, Any],
+    from_label: str | None,
+    from_node_kind: str | None = None,
+    max_options: int = 20,
+) -> tuple[str | None, str]:
+    """Resolve an execution user and indicate which source was used."""
+    exec_username = _normalize_account(context_username or "")
+    if exec_username:
+        print_info_debug(
+            f"[exec-user] Using context username: {mark_sensitive(exec_username, 'user')}"
+        )
+        return exec_username, "context_username"
+
+    creds = getattr(shell, "domains_data", {}).get(domain, {}).get("credentials", {})
+    cred_keys = (
+        {
+            _normalize_account(str(stored_user or "")): str(stored_user)
+            for stored_user in creds.keys()
+        }
+        if isinstance(creds, dict)
+        else {}
+    )
+    from_user = _normalize_account(from_label or "")
+    if from_user and from_user in cred_keys:
+        print_info_debug(
+            f"[exec-user] Using from_label credential: {mark_sensitive(from_user, 'user')}"
+        )
+        return from_user, "from_label_credential"
+    if from_user and str(from_node_kind or "").strip().lower() == "user":
+        print_info_debug(
+            "[exec-user] Using from_label as execution user candidate without "
+            "stored credential match."
+        )
+        return from_user, "from_label_user_node"
+
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    affected_users = meta.get("affected_users") if isinstance(meta, dict) else None
+    if isinstance(meta, dict):
+        affected_count = meta.get("affected_user_count")
+        affected_users_len = (
+            len(affected_users) if isinstance(affected_users, list) else None
+        )
+        print_info_debug(
+            "[exec-user] meta.affected_users summary: "
+            f"count={affected_count!r}, list_len={affected_users_len!r}"
+        )
+    else:
+        print_info_debug("[exec-user] No meta object available on path summary.")
+    if not (isinstance(affected_users, list) and affected_users) and isinstance(
+        meta, dict
+    ):
+        print_info_debug("[exec-user] meta.affected_users missing/empty.")
+
+    candidate_users: list[str] = []
+    if isinstance(affected_users, list) and cred_keys:
+        for raw_user in affected_users:
+            if not isinstance(raw_user, str):
+                continue
+            normalized = _normalize_account(raw_user)
+            if not normalized:
+                continue
+            stored_key = cred_keys.get(normalized)
+            if stored_key:
+                candidate_users.append(stored_key)
+
+    if not candidate_users and isinstance(creds, dict) and creds:
+        print_info_debug(
+            "[exec-user] No meta.affected_users match; falling back to all stored credentials."
+        )
+        candidate_users = [str(stored_user) for stored_user in creds.keys()]
+
+    if candidate_users:
+        candidate_users = list(dict.fromkeys(candidate_users))
+        print_info_debug(
+            f"[exec-user] Found {len(candidate_users)} candidate user(s) with stored credentials."
+        )
+        marked_domain = mark_sensitive(domain, "domain")
+        print_panel(
+            "\n".join(
+                [
+                    f"Domain: {marked_domain}",
+                    f"Users with stored credentials: {len(candidate_users)}",
+                ]
+            ),
+            title=Text("Select Execution User", style=f"bold {BRAND_COLORS['info']}"),
+            border_style=BRAND_COLORS["info"],
+            expand=False,
+        )
+
+        if len(candidate_users) == 1:
+            print_info_debug(
+                f"[exec-user] Auto-selected sole candidate: {mark_sensitive(candidate_users[0], 'user')}"
+            )
+            return _normalize_account(candidate_users[0]), "affected_users"
+
+        if hasattr(shell, "_questionary_select"):
+            options = [
+                mark_sensitive(user, "user") for user in candidate_users[:max_options]
+            ]
+            if len(candidate_users) > max_options:
+                options.append(
+                    f"Enter username (showing {max_options} of {len(candidate_users)})"
+                )
+            options.append("Cancel")
+            idx = shell._questionary_select(
+                "Select a user to execute this step:",
+                options,
+                default_idx=0,
+            )
+            if idx is None or idx >= len(options) - 1:
+                print_info_debug("[exec-user] User selection cancelled.")
+                return None, "cancelled"
+            if len(candidate_users) > max_options and idx == len(options) - 2:
+                manual_user = Prompt.ask("Enter username")
+                if not manual_user:
+                    print_info_debug("[exec-user] Manual username entry empty.")
+                    return None, "manual_empty"
+                normalized = _normalize_account(manual_user)
+                if not normalized:
+                    print_info_debug("[exec-user] Manual username entry invalid.")
+                    print_warning("Invalid username entered.")
+                    return None, "manual_invalid"
+                stored = cred_keys.get(normalized)
+                if not stored:
+                    marked_user = mark_sensitive(normalized, "user")
+                    print_warning(
+                        f"No stored credential found for {marked_user}. "
+                        "Please select a user with saved credentials."
+                    )
+                    print_info_debug(
+                        f"[exec-user] Manual username not in credentials: {marked_user}"
+                    )
+                    return None, "manual_missing_credential"
+                print_info_debug(
+                    f"[exec-user] Manual username matched credentials: {mark_sensitive(stored, 'user')}"
+                )
+                return _normalize_account(stored), "manual_selection"
+            print_info_debug(
+                f"[exec-user] Selected candidate: {mark_sensitive(candidate_users[idx], 'user')}"
+            )
+            return _normalize_account(str(candidate_users[idx])), "interactive_selection"
+
+        return _normalize_account(candidate_users[0]), "fallback_stored_credential"
+
+    print_info_debug(
+        "[exec-user] No execution user resolved: "
+        f"from_label={from_label!r}, "
+        f"meta.affected_users_len={len(affected_users) if isinstance(affected_users, list) else None!r}"
+    )
+    return None, "unresolved"
+
+
+def resolve_execution_user(
+    shell: Any,
+    *,
+    domain: str,
+    context_username: str | None,
+    summary: dict[str, Any],
+    from_label: str | None,
+    from_node_kind: str | None = None,
+    max_options: int = 20,
+) -> str | None:
+    """Resolve an execution user for attack steps that require credentials."""
+    exec_username, _ = _resolve_execution_user_with_source(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+        from_node_kind=from_node_kind,
+        max_options=max_options,
+    )
+    return exec_username
+
+
+def resolve_exec_password(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    context_username: str | None,
+    context_password: str | None,
+) -> str | None:
+    """Resolve a password/hash for ``username`` without mismatching context creds."""
+    normalized_user = _normalize_account(username)
+    if not normalized_user:
+        return None
+    normalized_context_user = _normalize_account(context_username or "")
+    if (
+        context_password
+        and normalized_context_user
+        and normalized_user == normalized_context_user
+    ):
+        return context_password
+    return _resolve_domain_password(shell, domain, normalized_user)
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,21 +362,25 @@ ACL_ACE_RELATIONS: set[str] = {
 }
 
 
-def describe_ace_step_support(context: AceStepContext) -> tuple[bool, str | None]:
-    """Return whether an ACE step is supported for the given context.
+def describe_ace_relation_support(
+    relation: str,
+    target_kind: str,
+) -> tuple[bool, str | None]:
+    """Return whether an ACE relation is supported for a target object type.
 
     This is used to prevent "false supported" cases where the relationship
     exists in BloodHound (and the action name is mapped), but ADscan does not
     implement an exploitation path for the specific target object type.
 
     Args:
-        context: Prepared ACE step execution context.
+        relation: ACE/ACL relation to evaluate.
+        target_kind: Target object type.
 
     Returns:
         Tuple of (supported, reason). If supported is True, reason is None.
     """
-    relation = context.relation.strip().lower()
-    target_kind = context.target_kind.strip()
+    relation = relation.strip().lower()
+    target_kind = target_kind.strip()
     target_kind_norm = target_kind.lower()
 
     if relation in {"genericall", "genericwrite"}:
@@ -191,6 +411,14 @@ def describe_ace_step_support(context: AceStepContext) -> tuple[bool, str | None
     return True, None
 
 
+def describe_ace_step_support(context: AceStepContext) -> tuple[bool, str | None]:
+    """Return whether an ACE step is supported for the given context."""
+    return describe_ace_relation_support(
+        context.relation,
+        context.target_kind,
+    )
+
+
 def build_ace_step_context(
     shell: Any,
     domain: str,
@@ -205,26 +433,72 @@ def build_ace_step_context(
     """Build an ACE execution context for a given step (best-effort)."""
     from_node = get_node_by_label(shell, domain, label=from_label)
     to_node = get_node_by_label(shell, domain, label=to_label)
-
-    exec_username = _pick_execution_user(
-        summary=summary,
+    exec_username, exec_user_source = _resolve_execution_user_with_source(
+        shell,
+        domain=domain,
         context_username=context_username,
+        summary=summary,
         from_label=from_label,
-        from_node=from_node,
+        from_node_kind=_node_kind(from_node),
     )
     if not exec_username:
+        marked_domain = mark_sensitive(domain, "domain")
+        marked_from = mark_sensitive(from_label, "node")
+        marked_to = mark_sensitive(to_label, "node")
+        print_info_debug(
+            "[ace-context] Missing exec username: "
+            f"relation={mark_sensitive(relation, 'detail')} domain={marked_domain} "
+            f"from={marked_from} to={marked_to} "
+            f"context_username={'set' if context_username else 'unset'} "
+            f"applies_to_users={summary.get('applies_to_users')!r} "
+            f"from_node_kind={mark_sensitive(_node_kind(from_node), 'detail')} "
+            f"resolution_source={mark_sensitive(exec_user_source, 'detail')}"
+        )
         return None
 
-    password = context_password or _resolve_domain_password(
-        shell, domain, exec_username
+    stored_password = _resolve_domain_password(shell, domain, exec_username)
+    password = resolve_exec_password(
+        shell,
+        domain=domain,
+        username=exec_username,
+        context_username=context_username,
+        context_password=context_password,
     )
     if not password:
+        marked_domain = mark_sensitive(domain, "domain")
+        marked_from = mark_sensitive(from_label, "node")
+        marked_to = mark_sensitive(to_label, "node")
+        marked_user = mark_sensitive(exec_username, "user")
+        print_info_debug(
+            "[ace-context] Missing exec credential: "
+            f"relation={mark_sensitive(relation, 'detail')} domain={marked_domain} "
+            f"from={marked_from} to={marked_to} exec_user={marked_user} "
+            f"context_password={'set' if context_password else 'unset'} "
+            f"stored_domain_credential={'present' if stored_password else 'absent'} "
+            f"resolution_source={mark_sensitive(exec_user_source, 'detail')}"
+        )
         return None
 
     target_domain = _node_domain(to_node) or domain
     target_kind = _node_kind(to_node)
     target_enabled = _node_enabled(to_node)
     target_sam_or_label = _node_sam_or_label(to_node, to_label)
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_from = mark_sensitive(from_label, "node")
+    marked_to = mark_sensitive(to_label, "node")
+    marked_user = mark_sensitive(exec_username, "user")
+    credential_source = (
+        "context_password" if context_password else "stored_domain_credential"
+    )
+    print_info_debug(
+        "[ace-context] Built execution context: "
+        f"relation={mark_sensitive(relation, 'detail')} domain={marked_domain} "
+        f"from={marked_from} to={marked_to} exec_user={marked_user} "
+        f"credential_source={mark_sensitive(credential_source, 'detail')} "
+        f"user_source={mark_sensitive(exec_user_source, 'detail')} "
+        f"target_kind={mark_sensitive(target_kind, 'detail')} "
+        f"target_domain={mark_sensitive(target_domain, 'domain')}"
+    )
 
     return AceStepContext(
         domain=domain,

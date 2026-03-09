@@ -764,7 +764,16 @@ CONTAINER_SESSION_CAPTURE_COMMANDS = frozenset({"start", "ci"})
 SESSION_WORKSPACE_CONTEXT_COMMANDS = frozenset({"start", "ci"})
 _SESSION_TRACE_ID_ENV = "ADSCAN_SESSION_TRACE_ID"
 _SESSION_WORKSPACE_CONTEXT_FIELDS = frozenset(
-    {"workspace_type", "lab_provider", "lab_name", "lab_slug", "lab_name_whitelisted"}
+    {
+        "workspace_type",
+        "lab_provider",
+        "lab_name",
+        "lab_slug",
+        "lab_name_whitelisted",
+        "lab_confirmation_state",
+        "lab_inference_source",
+        "lab_inference_confidence",
+    }
 )
 
 
@@ -3740,6 +3749,15 @@ def _vercel_metadata_fields(metadata: Optional[dict[str, Any]]) -> dict[str, Any
         updates["target_slug"] = lab_slug.lower()
     if lab_name_whitelisted is not None:
         updates["target_whitelisted"] = bool(lab_name_whitelisted)
+    confirmation_state = metadata.get("lab_confirmation_state")
+    if confirmation_state:
+        updates["target_confirmation_state"] = str(confirmation_state)
+    inference_source = metadata.get("lab_inference_source")
+    inference_confidence = metadata.get("lab_inference_confidence")
+    if inference_source:
+        updates["target_inference_source"] = str(inference_source)
+    if inference_confidence is not None:
+        updates["target_inference_confidence"] = float(inference_confidence)
     return updates
 
 
@@ -3802,6 +3820,9 @@ def _summarize_vercel_payload_context(payload: dict[str, Any]) -> str:
         "target_name",
         "target_slug",
         "target_whitelisted",
+        "target_confirmation_state",
+        "target_inference_source",
+        "target_inference_confidence",
         "adscan_version",
         "adscan_version_source",
         "launcher_version",
@@ -3952,6 +3973,17 @@ def _build_session_metadata(shell=None) -> Optional[dict]:
     if lab_slug:
         metadata["lab_slug"] = str(lab_slug).lower()
 
+    # Inference metadata: which rule identified the lab and with what confidence.
+    inference_source = getattr(shell, "lab_inference_source", None)
+    inference_confidence = getattr(shell, "lab_inference_confidence", None)
+    if inference_source:
+        metadata["lab_inference_source"] = str(inference_source)
+    if inference_confidence is not None:
+        metadata["lab_inference_confidence"] = float(inference_confidence)
+    confirmation_state = getattr(shell, "lab_confirmation_state", None)
+    if confirmation_state:
+        metadata["lab_confirmation_state"] = str(confirmation_state)
+
     # Note: workspace_name is intentionally NOT included to avoid revealing internal information
     return metadata or None
 
@@ -4043,7 +4075,8 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
             f"lab_provider={metadata_with_env.get('lab_provider')!r}, "
             f"lab_name={metadata_with_env.get('lab_name')!r}, "
             f"lab_slug={metadata_with_env.get('lab_slug')!r}, "
-            f"lab_name_whitelisted={metadata_with_env.get('lab_name_whitelisted')!r}",
+            f"lab_name_whitelisted={metadata_with_env.get('lab_name_whitelisted')!r}, "
+            f"lab_confirmation_state={metadata_with_env.get('lab_confirmation_state')!r}"
         )
 
         # Export and send Rich recording if console is provided

@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from enum import Enum
 
+from adscan_core.time_utils import utc_now
+
 
 class AuthStatus(str, Enum):
     """Authentication status for a domain."""
@@ -94,8 +96,8 @@ class Domain:
 
     # Metadata
     scan_metadata: Dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert domain to dictionary (compatible with domains_data structure).
@@ -190,7 +192,7 @@ class Domain:
             credential: Password or hash
         """
         self.credentials[username] = credential
-        self.updated_at = datetime.utcnow()
+        self.updated_at = utc_now()
 
     def add_local_credential(
         self, host: str, service: str, username: str, credential: str
@@ -208,7 +210,7 @@ class Domain:
         if service not in self.local_credentials[host]:
             self.local_credentials[host][service] = {}
         self.local_credentials[host][service][username] = credential
-        self.updated_at = datetime.utcnow()
+        self.updated_at = utc_now()
 
     def update_progress(self, phase: str, progress: float) -> None:
         """Update scan progress.
@@ -219,4 +221,4 @@ class Domain:
         """
         self.current_phase = phase
         self.phase_progress = max(0.0, min(1.0, progress))  # Clamp to [0, 1]
-        self.updated_at = datetime.utcnow()
+        self.updated_at = utc_now()

@@ -14,6 +14,7 @@ have a user identifier (samAccountName/label). Provide both APIs:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from adscan_internal import print_info_debug, telemetry
@@ -59,6 +60,14 @@ def is_node_high_value(node: dict[str, Any]) -> bool:
 def is_node_tier0_or_high_value(node: dict[str, Any]) -> bool:
     """Return True if a node is Tier-0 or high-value."""
     return bool(is_node_tier0(node) or is_node_high_value(node))
+
+
+@dataclass(frozen=True)
+class UserRiskFlags:
+    """Tier-0/high-value classification flags for a user."""
+
+    is_tier0: bool = False
+    is_high_value: bool = False
 
 
 def _find_user_node_in_attack_graph(
@@ -382,3 +391,151 @@ def is_user_tier0_or_high_value(
         is_user_tier0(shell, domain=domain, samaccountname=normalized_sam)
         or is_user_high_value(shell, domain=domain, samaccountname=normalized_sam)
     )
+
+
+def classify_users_tier0_high_value(
+    shell: Any, *, domain: str, usernames: list[str]
+) -> dict[str, UserRiskFlags]:
+    """Classify many users as Tier-0/high-value in a single pass.
+
+    This helper is optimized for batch flows (for example DCSync summaries),
+    avoiding repeated graph loads and repetitive membership snapshot calls.
+
+    Resolution order:
+    1) Attack-graph User nodes (single graph load)
+    2) Membership snapshot RID checks (512/518/519) for unresolved Tier-0 users
+    3) Cached ``admins.txt`` positive matches for unresolved high-value users
+
+    Args:
+        shell: Shell-like object with workspace/BloodHound context.
+        domain: Target AD domain.
+        usernames: Candidate usernames/principals to classify.
+
+    Returns:
+        Mapping keyed by normalized samAccountName. Each value contains
+        Tier-0/high-value flags.
+    """
+    normalized_user_set: set[str] = set()
+    for username in usernames:
+        normalized = normalize_samaccountname(str(username))
+        if normalized:
+            normalized_user_set.add(normalized)
+    normalized_users = sorted(normalized_user_set, key=str.lower)
+    if not normalized_users:
+        return {}
+
+    results: dict[str, dict[str, bool]] = {
+        user: {"is_tier0": False, "is_high_value": False}
+        for user in normalized_users
+    }
+
+    # Pass 1: attack_graph.json (single load).
+    try:
+        from adscan_internal.services.attack_graph_service import load_attack_graph
+
+        graph = load_attack_graph(shell, domain)
+        nodes_map = graph.get("nodes") if isinstance(graph, dict) else None
+        if isinstance(nodes_map, dict):
+            for node in nodes_map.values():
+                if not isinstance(node, dict):
+                    continue
+                if str(node.get("kind") or "") != "User":
+                    continue
+
+                props = (
+                    node.get("properties")
+                    if isinstance(node.get("properties"), dict)
+                    else {}
+                )
+                candidates: set[str] = set()
+
+                node_sam = props.get("samaccountname")
+                if isinstance(node_sam, str):
+                    normalized = normalize_samaccountname(node_sam)
+                    if normalized:
+                        candidates.add(normalized)
+
+                label = str(node.get("label") or "").strip()
+                if label:
+                    normalized = normalize_samaccountname(label)
+                    if normalized:
+                        candidates.add(normalized)
+
+                if not candidates:
+                    continue
+
+                is_tier0_user = is_node_tier0(node)
+                is_high_value_user = is_node_high_value(node)
+                if not is_tier0_user and not is_high_value_user:
+                    continue
+
+                for candidate in candidates:
+                    if candidate not in results:
+                        continue
+                    if is_tier0_user:
+                        results[candidate]["is_tier0"] = True
+                    if is_high_value_user:
+                        results[candidate]["is_high_value"] = True
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+    # Pass 2: memberships snapshot RID fallback for unresolved Tier-0 users.
+    unresolved_tier0 = {
+        user for user, flags in results.items() if not bool(flags.get("is_tier0"))
+    }
+    if unresolved_tier0:
+        try:
+            from adscan_internal.services.attack_graph_service import (
+                get_users_in_group_rid_from_snapshot,
+            )
+
+            tier0_members: set[str] = set()
+            for rid in (512, 518, 519):
+                members = get_users_in_group_rid_from_snapshot(shell, domain, rid)
+                if not members:
+                    continue
+                for member in members:
+                    normalized = normalize_samaccountname(member)
+                    if normalized:
+                        tier0_members.add(normalized)
+
+            for user in unresolved_tier0:
+                if user in tier0_members:
+                    results[user]["is_tier0"] = True
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+    # Pass 3: positive-only high-value cache fallback (admins.txt union list).
+    unresolved_high_value = {
+        user
+        for user, flags in results.items()
+        if not bool(flags.get("is_tier0")) and not bool(flags.get("is_high_value"))
+    }
+    if unresolved_high_value:
+        cached_admins = _load_cached_user_list_file(
+            shell, domain=domain, filename="admins.txt"
+        )
+        if cached_admins:
+            for user in unresolved_high_value:
+                if user in cached_admins:
+                    results[user]["is_high_value"] = True
+
+    tier0_count = sum(1 for flags in results.values() if flags["is_tier0"])
+    high_value_only_count = sum(
+        1
+        for flags in results.values()
+        if flags["is_high_value"] and not flags["is_tier0"]
+    )
+    print_info_debug(
+        "[high-value] batch classify: "
+        f"domain={mark_sensitive(domain, 'domain')} "
+        f"users={len(results)} tier0={tier0_count} high_value_only={high_value_only_count}"
+    )
+
+    return {
+        user: UserRiskFlags(
+            is_tier0=bool(flags["is_tier0"]),
+            is_high_value=bool(flags["is_high_value"]),
+        )
+        for user, flags in results.items()
+    }

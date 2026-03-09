@@ -100,6 +100,7 @@ def write_initial_workspace_variables(
         "lab_provider": normalize_lab_provider(lab_provider),
         "lab_name": normalize_lab_name(lab_name),
         "lab_name_whitelisted": lab_name_whitelisted,
+        "lab_confirmation_state": "manual" if lab_provider or lab_name else None,
     }
 
     write_json_file(workspace_variables_path(workspace_path), variables)

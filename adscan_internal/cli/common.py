@@ -93,6 +93,10 @@ def build_lab_event_fields(*, shell: Any, include_slug: bool = True) -> dict[str
         lab_name_whitelisted=getattr(shell, "lab_name_whitelisted", None),
         include_slug=include_slug,
         lab_slug=lab_slug,
+    ) | (
+        {"lab_confirmation_state": str(getattr(shell, "lab_confirmation_state", None))}
+        if getattr(shell, "lab_confirmation_state", None)
+        else {}
     )
 
 
@@ -131,9 +135,9 @@ def show_first_run_helper(
         "💡 [bold]New to ADscan?[/bold]\n\n"
         "Quick Start:\n"
         "  1. Create workspace:  [cyan]workspace create my_pentest[/cyan]\n"
-        "  2. Scan unauth:       [cyan]start_unauth[/cyan]\n"
-        "  3. Scan auth:         [cyan]start_auth[/cyan]\n"
-        "  4. Add a credential:  [cyan]creds save <domain> <username> <password>[/cyan]\n\n"
+        "  2. Start scan:        [cyan]start_unauth[/cyan] (no creds) or [cyan]start_auth[/cyan] (with creds)\n"
+        "  3. Initialize domain: [cyan]start_auth[/cyan] before using [cyan]creds save[/cyan]\n"
+        "  4. Add extra creds:   [cyan]creds save <domain> <username> <password_or_hash>[/cyan]\n\n"
         "📚 Full documentation: [link=https://www.adscanpro.com/docs?utm_source=cli&utm_medium=first_run]"
         "www.adscanpro.com/docs[/link]\n"
         "   (Installation, guides, troubleshooting, and more)\n\n"
@@ -188,6 +192,87 @@ def resolve_command_context_domain(
     except Exception:
         pass
     return None, "none"
+
+
+def normalize_help_alias(
+    command_name: str,
+    args_list: list[str],
+    *,
+    known_commands: set[str] | None = None,
+) -> tuple[str, list[str], bool]:
+    """Normalize `command help`/`command -h` patterns into `help command`.
+
+    Examples:
+        - ``workspace help`` -> (``help``, [``workspace``], True)
+        - ``workspace -h`` -> (``help``, [``workspace``], True)
+        - ``workspace --help`` -> (``help``, [``workspace``], True)
+    """
+    cmd = (command_name or "").strip().lower()
+    if cmd in {"", "help"}:
+        return command_name, args_list, False
+    if not args_list:
+        return command_name, args_list, False
+
+    first_arg = str(args_list[0] or "").strip().lower()
+    if first_arg not in {"help", "-h", "--help"}:
+        return command_name, args_list, False
+
+    if known_commands is not None and cmd not in known_commands:
+        return command_name, args_list, False
+
+    # Keep backwards-compatible shape expected by do_help(arg_string)
+    # while allowing extra context if user wrote e.g. `foo help bar`.
+    normalized_args = [cmd]
+    if len(args_list) > 1:
+        normalized_args.extend(args_list[1:])
+    return "help", normalized_args, True
+
+
+def normalize_command_alias(
+    command_name: str,
+    args_list: list[str],
+    *,
+    known_commands: set[str] | None = None,
+) -> tuple[str, list[str], bool]:
+    """Normalize common CLI command aliases into canonical command names.
+
+    Examples:
+        - ``start auth`` -> (``start_auth``, [], True)
+        - ``start unauth`` -> (``start_unauth``, [], True)
+        - ``start-auth`` -> (``start_auth``, [...], True)
+    """
+    cmd = (command_name or "").strip().lower()
+    if not cmd:
+        return command_name, args_list, False
+
+    direct_aliases = {
+        "start-auth": "start_auth",
+        "startauth": "start_auth",
+        "start-unauth": "start_unauth",
+        "startunauth": "start_unauth",
+    }
+
+    mapped_direct = direct_aliases.get(cmd)
+    if mapped_direct:
+        if known_commands is not None and mapped_direct not in known_commands:
+            return command_name, args_list, False
+        return mapped_direct, args_list, True
+
+    if cmd != "start" or not args_list:
+        return command_name, args_list, False
+
+    first_arg = str(args_list[0] or "").strip().lower().replace("-", "_")
+    split_aliases = {
+        "auth": "start_auth",
+        "unauth": "start_unauth",
+    }
+    mapped_split = split_aliases.get(first_arg)
+    if not mapped_split:
+        return command_name, args_list, False
+    if known_commands is not None and mapped_split not in known_commands:
+        return command_name, args_list, False
+
+    return mapped_split, args_list[1:], True
 
 
 def load_bloodhound_ce_display_config() -> tuple[str, str, str]:

@@ -76,6 +76,7 @@ class CredentialStatus(str, Enum):
     ACCOUNT_LOCKED = "account_locked"
     ACCOUNT_DISABLED = "account_disabled"
     PASSWORD_EXPIRED = "password_expired"
+    PASSWORD_MUST_CHANGE = "password_must_change"
     USER_NOT_FOUND = "user_not_found"
     ACCOUNT_RESTRICTION = "account_restriction"
     TIMEOUT = "timeout"
@@ -161,6 +162,17 @@ class RoastingResult:
             "success": self.success,
             "error_message": self.error_message,
         }
+
+
+@dataclass
+class PasswordChangeResult:
+    """Result of a NetExec password-change operation."""
+
+    success: bool
+    username: str
+    domain: str
+    error_message: Optional[str] = None
+    raw_output: Optional[str] = None
 
 
 class CredentialService(BaseService):
@@ -311,6 +323,60 @@ class CredentialService(BaseService):
                 error_message=str(e),
             )
 
+    def change_password_with_netexec(
+        self,
+        *,
+        domain: str,
+        username: str,
+        pdc_fqdn: str,
+        netexec_path: str,
+        auth_string: str,
+        new_password: str,
+        log_file_path: str,
+        executor: CommandExecutor | None = None,
+        timeout: int = 120,
+    ) -> PasswordChangeResult:
+        """Change a domain password using NetExec's ``change-password`` module."""
+        command = (
+            f'{netexec_path} smb {pdc_fqdn} {auth_string} '
+            f'-M change-password -o NEWPASS={shlex.quote(new_password)} '
+            f'--log "{log_file_path}"'
+        )
+
+        try:
+            exec_fn = executor or _default_executor
+            result = _ensure_completed_process(
+                exec_fn(command, timeout),
+                operation="Password change",
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            parsed = self._parse_password_change_output(
+                output=output,
+                username=username,
+                domain=domain,
+            )
+            parsed.raw_output = output
+            return parsed
+        except subprocess.TimeoutExpired:
+            telemetry.capture_exception(
+                TimeoutError(f"Password change timed out for {username}@{domain}")
+            )
+            return PasswordChangeResult(
+                success=False,
+                username=username,
+                domain=domain,
+                error_message="Password change timed out",
+            )
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            self.logger.exception("Error changing password with NetExec: %s", exc)
+            return PasswordChangeResult(
+                success=False,
+                username=username,
+                domain=domain,
+                error_message=str(exc),
+            )
+
     def _parse_verification_output(
         self,
         output: str,
@@ -386,6 +452,15 @@ class CredentialService(BaseService):
                 error_message="Password expired",
             )
 
+        if "KDC_ERR_KEY_EXPIRED" in output or "STATUS_PASSWORD_MUST_CHANGE" in output:
+            return CredentialVerificationResult(
+                status=CredentialStatus.PASSWORD_MUST_CHANGE,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Password must be changed before logon",
+            )
+
         if "KDC_ERR_C_PRINCIPAL_UNKNOWN" in output:
             return CredentialVerificationResult(
                 status=CredentialStatus.USER_NOT_FOUND,
@@ -428,6 +503,46 @@ class CredentialService(BaseService):
             domain=domain,
             credential_type=credential_type,
             error_message="Unknown verification result",
+        )
+
+    def _parse_password_change_output(
+        self,
+        *,
+        output: str,
+        username: str,
+        domain: str,
+    ) -> PasswordChangeResult:
+        """Parse NetExec ``change-password`` output."""
+        if "Successfully changed password for" in output:
+            return PasswordChangeResult(
+                success=True,
+                username=username,
+                domain=domain,
+            )
+
+        if "STATUS_PASSWORD_MUST_CHANGE" in output:
+            return PasswordChangeResult(
+                success=False,
+                username=username,
+                domain=domain,
+                error_message=(
+                    "Current password is correct but must be changed before logon"
+                ),
+            )
+
+        if "STATUS_LOGON_FAILURE" in output or "KDC_ERR_PREAUTH_FAILED" in output:
+            return PasswordChangeResult(
+                success=False,
+                username=username,
+                domain=domain,
+                error_message="Current password was rejected during password change",
+            )
+
+        return PasswordChangeResult(
+            success=False,
+            username=username,
+            domain=domain,
+            error_message="Unknown password change result",
         )
 
     def kerberoast(

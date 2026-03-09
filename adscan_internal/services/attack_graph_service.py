@@ -103,9 +103,7 @@ def _env_float(
 _ATTACK_PATHS_CACHE_ENABLED = os.getenv(
     "ADSCAN_ATTACK_PATHS_CACHE_ENABLED", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
-_ATTACK_PATHS_CACHE_MAX_ENTRIES = _env_int(
-    "ADSCAN_ATTACK_PATHS_CACHE_MAX_ENTRIES", 64
-)
+_ATTACK_PATHS_CACHE_MAX_ENTRIES = _env_int("ADSCAN_ATTACK_PATHS_CACHE_MAX_ENTRIES", 64)
 _ATTACK_PATHS_CACHE_MAX_RECORDS = _env_int(
     "ADSCAN_ATTACK_PATHS_CACHE_MAX_RECORDS", 2000
 )
@@ -199,6 +197,100 @@ def _load_enabled_users(shell: object, domain: str) -> set[str] | None:
             f"[membership] enabled users load failed for {marked_domain}: {exc}"
         )
         return None
+
+
+def _load_domain_users(shell: object, domain: str) -> list[str] | None:
+    """Load the persisted domain user list for a workspace domain."""
+    try:
+        workspace_cwd = (
+            shell._get_workspace_cwd()  # type: ignore[attr-defined]
+            if hasattr(shell, "_get_workspace_cwd")
+            else getattr(shell, "current_workspace_dir", os.getcwd())
+        )
+        domains_dir = getattr(shell, "domains_dir", "domains")
+        users_path = domain_subpath(workspace_cwd, domains_dir, domain, "users.txt")
+        if not os.path.exists(users_path):
+            return None
+        with open(users_path, encoding="utf-8") as handle:
+            users = [
+                str(line).strip()
+                for line in handle
+                if isinstance(line, str) and str(line).strip()
+            ]
+        return users or None
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            f"[membership] users list load failed for {marked_domain}: {exc}"
+        )
+        return None
+
+
+def get_enabled_users_for_domain(
+    shell: object,
+    domain: str,
+) -> set[str] | None:
+    """Return enabled users for a domain using file-first + snapshot fallback."""
+    enabled_users = _load_enabled_users(shell, domain)
+    if enabled_users:
+        return enabled_users
+
+    snapshot = _load_membership_snapshot(shell, domain)
+    if not isinstance(snapshot, dict):
+        return None
+    enabled_map = snapshot.get("user_enabled")
+    if not isinstance(enabled_map, dict):
+        return None
+
+    users = {
+        str(username).strip().lower()
+        for username, is_enabled in enabled_map.items()
+        if str(username).strip() and bool(is_enabled)
+    }
+    if users:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            f"[membership] enabled users loaded from snapshot for {marked_domain}: count={len(users)}"
+        )
+        return users
+    return None
+
+
+def filter_enabled_domain_users(
+    shell: object,
+    domain: str,
+    usernames: Iterable[str],
+) -> tuple[list[str], bool]:
+    """Filter usernames using enabled-user data when available.
+
+    Returns:
+        Tuple ``(filtered_users, enabled_data_used)``.
+    """
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for username in usernames:
+        value = str(username or "").strip()
+        if not value:
+            continue
+        key = _normalize_account(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(value)
+    if not normalized:
+        return [], False
+
+    enabled_users = get_enabled_users_for_domain(shell, domain)
+    if not enabled_users:
+        return normalized, False
+
+    filtered = [
+        username
+        for username in normalized
+        if _normalize_account(username) in enabled_users
+    ]
+    return filtered, True
 
 
 def resolve_group_members_by_rid(
@@ -1162,8 +1254,8 @@ def resolve_group_name_by_rid(
             bh_service = service()
             client = getattr(bh_service, "client", None)
             if client and hasattr(client, "execute_query"):
-                escaped_domain = str(domain or "").replace("\\", "\\\\").replace(
-                    '"', '\\"'
+                escaped_domain = (
+                    str(domain or "").replace("\\", "\\\\").replace('"', '\\"')
                 )
                 query = f"""
                 MATCH (g:Group)
@@ -1210,9 +1302,7 @@ def resolve_group_name_by_rid(
                 f"[membership] BloodHound group RID {rid} lookup failed for {marked_domain}: {exc}"
             )
 
-    print_info_debug(
-        f"[membership] RID {rid} group unresolved for {marked_domain}."
-    )
+    print_info_debug(f"[membership] RID {rid} group unresolved for {marked_domain}.")
     return None
 
 
@@ -1291,15 +1381,15 @@ def resolve_group_user_members(
             if client and hasattr(client, "execute_query"):
                 group_base = _membership_label_to_name(canonical_group)
                 group_with_domain = canonical_group
-                escaped_domain = str(domain or "").replace("\\", "\\\\").replace(
-                    '"', '\\"'
+                escaped_domain = (
+                    str(domain or "").replace("\\", "\\\\").replace('"', '\\"')
                 )
-                escaped_group = str(group_base).replace("\\", "\\\\").replace(
-                    '"', '\\"'
+                escaped_group = (
+                    str(group_base).replace("\\", "\\\\").replace('"', '\\"')
                 )
-                escaped_group_with_domain = str(group_with_domain).replace(
-                    "\\", "\\\\"
-                ).replace('"', '\\"')
+                escaped_group_with_domain = (
+                    str(group_with_domain).replace("\\", "\\\\").replace('"', '\\"')
+                )
                 query = f"""
                 MATCH (g:Group)
                 WHERE toLower(coalesce(g.domain, "")) = toLower("{escaped_domain}")
@@ -1610,6 +1700,8 @@ def get_attack_paths_cache_stats(
 
 
 __all__ = [
+    "get_attack_path_summaries",
+    "get_owned_domain_usernames_for_attack_paths",
     "get_recursive_principal_groups_from_snapshot",
     "is_principal_member_of_rid_from_snapshot",
     "get_users_in_group_rid_from_snapshot",
@@ -1675,16 +1767,201 @@ def _apply_affected_user_metadata(
     *,
     filter_empty: bool = True,
 ) -> list[dict[str, Any]]:
-    """Annotate paths with affected user metadata and filter empty group paths."""
+    """Annotate paths with affected-user metadata plus shell-aware fallbacks."""
+    if not records:
+        return []
+
     snapshot = _load_membership_snapshot(shell, domain)
     base_graph = load_attack_graph(shell, domain)
-    return attack_paths_core.apply_affected_user_metadata(
+    annotated = attack_paths_core.apply_affected_user_metadata(
         records,
         graph=base_graph,
         domain=domain,
         snapshot=snapshot,
         filter_empty=filter_empty,
     )
+    if not annotated:
+        return []
+
+    nodes_map = (
+        base_graph.get("nodes") if isinstance(base_graph.get("nodes"), dict) else {}
+    )
+    label_kind_map: dict[str, str] = {}
+    if isinstance(nodes_map, dict):
+        for node in nodes_map.values():
+            if not isinstance(node, dict):
+                continue
+            canonical = _canonical_membership_label(
+                domain, _canonical_node_label(node)
+            )
+            if canonical:
+                label_kind_map[canonical] = _node_kind(node)
+
+    group_members, has_users = attack_paths_core.build_group_member_index(
+        snapshot, domain, exclude_tier0=True
+    )
+    broad_group_names = {
+        "DOMAIN USERS",
+        "AUTHENTICATED USERS",
+        "EVERYONE",
+        "USERS",
+    }
+
+    fallback_domain_users_source = ""
+    enabled_users = get_enabled_users_for_domain(shell, domain)
+    if enabled_users:
+        fallback_domain_users = sorted(enabled_users)
+        fallback_domain_users_source = "enabled_users"
+    else:
+        loaded_domain_users = _load_domain_users(shell, domain)
+        if loaded_domain_users:
+            fallback_domain_users = loaded_domain_users
+            fallback_domain_users_source = "users"
+        else:
+            snapshot_domain_users = sorted(
+                {
+                    _membership_label_to_name(label)
+                    for label in (
+                        snapshot.get("user_to_groups", {}).keys()
+                        if isinstance(snapshot, dict)
+                        and isinstance(snapshot.get("user_to_groups"), dict)
+                        else []
+                    )
+                    if isinstance(label, str) and str(label).strip()
+                },
+                key=str.lower,
+            )
+            fallback_domain_users = snapshot_domain_users or None
+            if snapshot_domain_users:
+                fallback_domain_users_source = "snapshot"
+
+    enriched: list[dict[str, Any]] = []
+    for record in annotated:
+        current = dict(record)
+        meta = current.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+            current["meta"] = meta
+
+        nodes = current.get("nodes")
+        if not isinstance(nodes, list) or not nodes:
+            enriched.append(current)
+            continue
+        source_label = str(nodes[0] or "").strip()
+        execution_scope = _derive_execution_scope_metadata(current, source_label)
+        if execution_scope:
+            meta.update(execution_scope)
+        scope_label = _canonical_membership_label(domain, source_label)
+        if not scope_label:
+            enriched.append(current)
+            continue
+
+        scope_name = _membership_label_to_name(scope_label).upper()
+        source_name = scope_name
+
+        should_override = (
+            not isinstance(meta.get("affected_user_count"), int)
+            or int(meta.get("affected_user_count", 0)) <= 0
+        )
+        if not should_override:
+            enriched.append(current)
+            continue
+
+        affected_users: list[str] = []
+        affected_count = 0
+        affected_source = ""
+        kind = label_kind_map.get(scope_label, "")
+        if kind == "Group":
+            resolved_members = resolve_group_user_members(
+                shell,
+                domain,
+                scope_label,
+                enabled_only=True,
+                max_results=100_000,
+            )
+            if resolved_members is not None:
+                affected_users = list(resolved_members)
+                affected_count = len(affected_users)
+                affected_source = "group_resolver"
+            elif scope_name in broad_group_names and fallback_domain_users:
+                affected_users = list(fallback_domain_users)
+                affected_count = len(affected_users)
+                affected_source = fallback_domain_users_source
+            elif has_users:
+                affected_users = sorted(group_members.get(scope_label, set()), key=str.lower)
+                affected_count = len(affected_users)
+                if affected_count > 0:
+                    affected_source = "snapshot_group_members"
+        elif scope_label:
+            affected_users = [_membership_label_to_name(scope_label)]
+            affected_count = 1
+            affected_source = "principal"
+
+        if affected_count > 0:
+            meta["affected_user_count"] = affected_count
+            meta["affected_users"] = affected_users
+            if affected_source:
+                meta["affected_users_source"] = affected_source
+            if affected_source == "group_resolver":
+                print_info_debug(
+                    "[attack_paths] affected users resolved through centralized group membership resolver: "
+                    f"domain={mark_sensitive(domain, 'domain')} "
+                    f"source={source_name or 'N/A'} "
+                    f"scope={scope_name} "
+                    f"count={affected_count}"
+                )
+            elif scope_name in broad_group_names and fallback_domain_users_source:
+                print_info_debug(
+                    "[attack_paths] affected users derived from broad group scope: "
+                    f"domain={mark_sensitive(domain, 'domain')} "
+                    f"source={source_name or 'N/A'} "
+                    f"scope={scope_name} "
+                    f"count={affected_count} "
+                    f"fallback={fallback_domain_users_source}"
+                )
+
+        enriched.append(current)
+
+    return enriched
+
+
+def _derive_execution_scope_metadata(
+    record: dict[str, Any],
+    source_label: str,
+) -> dict[str, str]:
+    """Return execution-scope metadata for synthetic entry principals."""
+    normalized_source = _membership_label_to_name(source_label).strip().upper()
+    if not normalized_source:
+        return {}
+
+    relations = record.get("relations")
+    first_relation = str(relations[0] or "").strip() if isinstance(relations, list) and relations else ""
+    relation_key = _normalize_relation_key(first_relation)
+
+    if normalized_source == "ANONYMOUS LOGON":
+        execution_scope = "Any unauthenticated internal client"
+        if relation_key == "ldapanonymousbind":
+            execution_scope = "Any unauthenticated internal client with LDAP access"
+        elif relation_key == "nullsession":
+            execution_scope = "Any unauthenticated SMB client"
+        return {
+            "execution_scope": execution_scope,
+            "execution_scope_source": "anonymous_logon",
+        }
+
+    if normalized_source in {"NULL SESSION", "NULLSESSION"}:
+        return {
+            "execution_scope": "Any unauthenticated SMB client",
+            "execution_scope_source": "null_session",
+        }
+
+    if normalized_source in {"GUEST SESSION", "GUEST"}:
+        return {
+            "execution_scope": "Any guest-authenticated client",
+            "execution_scope_source": "guest_session",
+        }
+
+    return {}
 
 
 def _filter_shortest_paths_for_principals(
@@ -3884,6 +4161,13 @@ def compute_maximal_attack_paths(
     By default we only return paths whose terminal node is marked high value.
     High-value detection relies on node metadata persisted in `attack_graph.json`
     (Tier Zero, highvalue, admin_tier_0 tag).
+
+    Important:
+        This is a core graph primitive. Do not use it directly for user-facing
+        CLI/web attack-path summaries. UX callers must go through
+        `get_attack_path_summaries()` so shell-aware post-processing is applied
+        consistently (Affected counts, zero-length filtering, cache/logging, and
+        future UX enrichments).
     """
     if max_depth <= 0:
         return []
@@ -4215,7 +4499,13 @@ def get_node_by_label(
 
 
 def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str, Any]:
-    """Convert an AttackPath to an existing UI-friendly dict shape."""
+    """Convert an AttackPath to the low-level display-record shape.
+
+    Important:
+        This helper intentionally performs only graph-local shaping. It does not
+        apply shell-aware UX enrichment such as affected-user fallbacks. Use
+        `get_attack_path_summaries()` for any user-facing CLI/web flow.
+    """
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     context_relations = _CONTEXT_RELATIONS_LOWER
 
@@ -4963,6 +5253,7 @@ def upsert_local_admin_password_reuse_edges(
     domain: str,
     *,
     local_admin_username: str,
+    credential: str | None = None,
     targets: list[dict[str, str]],
     status: str = "discovered",
 ) -> int:
@@ -4974,6 +5265,7 @@ def upsert_local_admin_password_reuse_edges(
     """
     domain_clean = str(domain or "").strip()
     user_clean = str(local_admin_username or "").strip()
+    credential_clean = str(credential or "").strip()
     if not domain_clean or not user_clean or not isinstance(targets, list):
         return 0
 
@@ -5050,13 +5342,10 @@ def upsert_local_admin_password_reuse_edges(
 
         node_ids = sorted(resolved.keys())
         total_hosts = len(node_ids)
-        reuse_cluster_seed = (
-            f"{user_clean.lower()}|"
-            + "|".join(sorted(node_ids, key=str.lower))
+        reuse_cluster_seed = f"{user_clean.lower()}|" + "|".join(
+            sorted(node_ids, key=str.lower)
         )
-        reuse_cluster_id = hashlib.md5(
-            reuse_cluster_seed.encode("utf-8")
-        ).hexdigest()
+        reuse_cluster_id = hashlib.md5(reuse_cluster_seed.encode("utf-8")).hexdigest()
 
         topology = _resolve_local_reuse_topology(total_hosts)
         anchor_id: str | None = None
@@ -5093,7 +5382,10 @@ def upsert_local_admin_password_reuse_edges(
                 if not isinstance(edge, dict):
                     compacted_edges.append(edge)
                     continue
-                if str(edge.get("relation") or "").strip().lower() != "localadminpassreuse":
+                if (
+                    str(edge.get("relation") or "").strip().lower()
+                    != "localadminpassreuse"
+                ):
                     compacted_edges.append(edge)
                     continue
                 notes = edge.get("notes")
@@ -5131,6 +5423,14 @@ def upsert_local_admin_password_reuse_edges(
 
         created = 0
         upserted = 0
+        credential_type = (
+            "hash"
+            if credential_clean
+            and bool(re.fullmatch(r"[0-9a-fA-F]{32}", credential_clean))
+            else "password"
+            if credential_clean
+            else ""
+        )
         for src_id, dst_id in sorted(edge_pairs):
             key = (src_id, "localadminpassreuse", dst_id)
             edge = upsert_edge(
@@ -5150,6 +5450,11 @@ def upsert_local_admin_password_reuse_edges(
                     "anchor_host": resolved.get(anchor_id, {}).get("label")
                     if anchor_id
                     else None,
+                    **(
+                        {"credential": credential_clean, "credential_type": credential_type}
+                        if credential_clean
+                        else {}
+                    ),
                 },
             )
             if edge:
@@ -5172,6 +5477,389 @@ def upsert_local_admin_password_reuse_edges(
         marked_domain = mark_sensitive(domain_clean, "domain")
         print_info_verbose(
             f"[local_reuse] Failed to persist local admin reuse edges for {marked_domain}."
+        )
+        return 0
+
+
+def upsert_local_cred_to_domain_reuse_edges(
+    shell: object,
+    domain: str,
+    *,
+    source_hosts: list[str],
+    domain_usernames: list[str],
+    credential: str,
+    status: str = "discovered",
+) -> int:
+    """Upsert compressed SAM local-credential -> domain-account reuse edges.
+
+    The graph is materialized with one synthetic cluster node per credential
+    variant fingerprint:
+
+      Computer -> LocalCredReuseSource -> LocalCredCluster -> LocalCredToDomainReuse -> User
+
+    This preserves path coverage while avoiding an O(N_hosts * M_users) mesh.
+    """
+    domain_clean = str(domain or "").strip()
+    credential_clean = str(credential or "").strip()
+    if (
+        not domain_clean
+        or not credential_clean
+        or not isinstance(source_hosts, list)
+        or not isinstance(domain_usernames, list)
+    ):
+        return 0
+
+    normalized_hosts = sorted(
+        {
+            str(host).strip()
+            for host in source_hosts
+            if isinstance(host, str) and str(host).strip()
+        },
+        key=str.lower,
+    )
+    normalized_users = sorted(
+        {
+            str(user).strip()
+            for user in domain_usernames
+            if isinstance(user, str) and str(user).strip()
+        },
+        key=str.lower,
+    )
+    if not normalized_hosts or not normalized_users:
+        return 0
+
+    try:
+        graph = load_attack_graph(shell, domain_clean)
+        source_node_ids: set[str] = set()
+        for host in normalized_hosts:
+            node_id = ensure_computer_node_for_domain(
+                shell,
+                domain_clean,
+                graph,
+                principal=host,
+            )
+            if node_id:
+                source_node_ids.add(node_id)
+        domain_user_ids: set[str] = set()
+        for username in normalized_users:
+            user_id = ensure_user_node_for_domain(
+                shell,
+                domain_clean,
+                graph,
+                username=username,
+            )
+            if user_id:
+                domain_user_ids.add(user_id)
+
+        if not source_node_ids or not domain_user_ids:
+            return 0
+
+        credential_type = (
+            "hash"
+            if bool(re.fullmatch(r"[0-9a-fA-F]{32}", credential_clean))
+            else "password"
+        )
+        cluster_fingerprint = hashlib.sha256(
+            f"{credential_type}:{credential_clean}".encode("utf-8")
+        ).hexdigest()[:16]
+        cluster_label = f"Local Credential Reuse [{cluster_fingerprint}]"
+        cluster_node = {
+            "name": cluster_label,
+            "kind": ["Group"],
+            "properties": {
+                "name": cluster_label,
+                "domain": domain_clean.upper(),
+                "synthetic": True,
+                "synthetic_source": "sam_domain_reuse",
+                "cluster_type": "local_credential_reuse",
+                "credential_fingerprint": cluster_fingerprint,
+                "credential_type": credential_type,
+            },
+        }
+        upsert_nodes(graph, [cluster_node])
+        cluster_node_id = _node_id(cluster_node)
+        if not cluster_node_id:
+            return 0
+
+        existing_keys: set[tuple[str, str, str]] = set()
+        for edge in graph.get("edges", []):
+            if not isinstance(edge, dict):
+                continue
+            relation_key = str(edge.get("relation") or "").strip().lower()
+            if relation_key not in {"localcredreusesource", "localcredtodomainreuse"}:
+                continue
+            from_key = str(edge.get("from") or "").strip()
+            to_key = str(edge.get("to") or "").strip()
+            if from_key and to_key:
+                existing_keys.add((from_key, relation_key, to_key))
+
+        created = 0
+        upserted = 0
+        common_notes: dict[str, Any] = {
+            "source": "sam_domain_reuse_validation",
+            "credential_fingerprint": cluster_fingerprint,
+            "credential_type": credential_type,
+            "credential": credential_clean,
+            "source_hosts": len(source_node_ids),
+            "domain_users": len(domain_user_ids),
+        }
+        for source_id in sorted(source_node_ids):
+            key = (source_id, "localcredreusesource", cluster_node_id)
+            edge = upsert_edge(
+                graph,
+                from_id=source_id,
+                to_id=cluster_node_id,
+                relation="LocalCredReuseSource",
+                edge_type="sam_domain_reuse",
+                status=status,
+                notes=common_notes,
+            )
+            if edge:
+                upserted += 1
+                if key not in existing_keys:
+                    created += 1
+
+        for user_id in sorted(domain_user_ids):
+            key = (cluster_node_id, "localcredtodomainreuse", user_id)
+            edge = upsert_edge(
+                graph,
+                from_id=cluster_node_id,
+                to_id=user_id,
+                relation="LocalCredToDomainReuse",
+                edge_type="sam_domain_reuse",
+                status=status,
+                notes=common_notes,
+            )
+            if edge:
+                upserted += 1
+                if key not in existing_keys:
+                    created += 1
+
+        if upserted:
+            save_attack_graph(shell, domain_clean, graph)
+            marked_domain = mark_sensitive(domain_clean, "domain")
+            print_info_debug(
+                "[sam_domain_reuse] Upserted "
+                f"{upserted} edge(s) (new={created}, hosts={len(source_node_ids)}, "
+                f"users={len(domain_user_ids)}) in {marked_domain}."
+            )
+        return created
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain_clean, "domain")
+        print_info_verbose(
+            f"[sam_domain_reuse] Failed to persist SAM->domain reuse edges for {marked_domain}."
+        )
+        return 0
+
+
+def upsert_domain_password_reuse_edges(
+    shell: object,
+    domain: str,
+    *,
+    source_usernames: list[str],
+    target_usernames: list[str],
+    credential: str,
+    status: str = "discovered",
+    evidence_source: str = "unknown",
+) -> int:
+    """Upsert compressed domain password/hash reuse edges.
+
+    Materialized topology:
+      User -> DomainPassReuseSource -> [Domain Password Reuse Cluster]
+      Cluster -> DomainPassReuse -> User
+
+    The cluster node keeps edge count linear and avoids O(N*M) pairwise meshes.
+    """
+    from adscan_internal.principal_utils import is_machine_account
+
+    domain_clean = str(domain or "").strip()
+    credential_clean = str(credential or "").strip()
+    if (
+        not domain_clean
+        or not credential_clean
+        or not isinstance(source_usernames, list)
+        or not isinstance(target_usernames, list)
+    ):
+        return 0
+
+    normalized_sources = sorted(
+        {
+            str(username).strip()
+            for username in source_usernames
+            if isinstance(username, str)
+            and str(username).strip()
+            and not is_machine_account(str(username).strip())
+        },
+        key=lambda item: _normalize_account(item),
+    )
+    normalized_targets = sorted(
+        {
+            str(username).strip()
+            for username in target_usernames
+            if isinstance(username, str)
+            and str(username).strip()
+            and not is_machine_account(str(username).strip())
+        },
+        key=lambda item: _normalize_account(item),
+    )
+    if not normalized_sources or not normalized_targets:
+        return 0
+
+    participant_seed = {_normalize_account(user) for user in normalized_sources}
+    participant_seed.update(_normalize_account(user) for user in normalized_targets)
+    participant_seed.discard("")
+    if len(participant_seed) < 2:
+        return 0
+
+    try:
+        enabled_users = get_enabled_users_for_domain(shell, domain_clean)
+        enabled_filter_applied = bool(enabled_users)
+        if enabled_users:
+            filtered_sources = [
+                username
+                for username in normalized_sources
+                if _normalize_account(username) in enabled_users
+            ]
+            filtered_targets = [
+                username
+                for username in normalized_targets
+                if _normalize_account(username) in enabled_users
+            ]
+        else:
+            filtered_sources = list(normalized_sources)
+            filtered_targets = list(normalized_targets)
+        if not filtered_sources or not filtered_targets:
+            return 0
+        filtered_participants = {
+            _normalize_account(user) for user in filtered_sources + filtered_targets
+        }
+        filtered_participants.discard("")
+        if len(filtered_participants) < 2:
+            return 0
+
+        graph = load_attack_graph(shell, domain_clean)
+        source_ids: set[str] = set()
+        target_ids: set[str] = set()
+        for username in filtered_sources:
+            node_id = ensure_user_node_for_domain(
+                shell,
+                domain_clean,
+                graph,
+                username=username,
+            )
+            if node_id:
+                source_ids.add(node_id)
+        for username in filtered_targets:
+            node_id = ensure_user_node_for_domain(
+                shell,
+                domain_clean,
+                graph,
+                username=username,
+            )
+            if node_id:
+                target_ids.add(node_id)
+        if not source_ids or not target_ids:
+            return 0
+
+        credential_type = (
+            "hash"
+            if bool(re.fullmatch(r"[0-9a-fA-F]{32}", credential_clean))
+            else "password"
+        )
+        fingerprint = hashlib.sha256(
+            f"{credential_type}:{credential_clean}".encode("utf-8")
+        ).hexdigest()[:16]
+        cluster_label = f"Domain Password Reuse [{fingerprint}]"
+        cluster_node = {
+            "name": cluster_label,
+            "kind": ["Group"],
+            "properties": {
+                "name": cluster_label,
+                "domain": domain_clean.upper(),
+                "synthetic": True,
+                "synthetic_source": "domain_password_reuse",
+                "cluster_type": "domain_password_reuse",
+                "credential_fingerprint": fingerprint,
+                "credential_type": credential_type,
+            },
+        }
+        upsert_nodes(graph, [cluster_node])
+        cluster_node_id = _node_id(cluster_node)
+        if not cluster_node_id:
+            return 0
+
+        existing_keys: set[tuple[str, str, str]] = set()
+        for edge in graph.get("edges", []):
+            if not isinstance(edge, dict):
+                continue
+            relation_key = str(edge.get("relation") or "").strip().lower()
+            if relation_key not in {"domainpassreusesource", "domainpassreuse"}:
+                continue
+            from_key = str(edge.get("from") or "").strip()
+            to_key = str(edge.get("to") or "").strip()
+            if from_key and to_key:
+                existing_keys.add((from_key, relation_key, to_key))
+
+        common_notes: dict[str, Any] = {
+            "source": "domain_password_reuse",
+            "evidence_source": str(evidence_source or "unknown").strip() or "unknown",
+            "credential_fingerprint": fingerprint,
+            "credential_type": credential_type,
+            "credential": credential_clean,
+            "source_users": len(source_ids),
+            "target_users": len(target_ids),
+            "enabled_filter_applied": enabled_filter_applied,
+        }
+
+        created = 0
+        upserted = 0
+        for src_id in sorted(source_ids):
+            key = (src_id, "domainpassreusesource", cluster_node_id)
+            edge = upsert_edge(
+                graph,
+                from_id=src_id,
+                to_id=cluster_node_id,
+                relation="DomainPassReuseSource",
+                edge_type="domain_password_reuse",
+                status=status,
+                notes=common_notes,
+            )
+            if edge:
+                upserted += 1
+                if key not in existing_keys:
+                    created += 1
+
+        for dst_id in sorted(target_ids):
+            key = (cluster_node_id, "domainpassreuse", dst_id)
+            edge = upsert_edge(
+                graph,
+                from_id=cluster_node_id,
+                to_id=dst_id,
+                relation="DomainPassReuse",
+                edge_type="domain_password_reuse",
+                status=status,
+                notes=common_notes,
+            )
+            if edge:
+                upserted += 1
+                if key not in existing_keys:
+                    created += 1
+
+        if upserted:
+            save_attack_graph(shell, domain_clean, graph)
+            marked_domain = mark_sensitive(domain_clean, "domain")
+            print_info_debug(
+                "[domain_pass_reuse] Upserted "
+                f"{upserted} edge(s) (new={created}, sources={len(source_ids)}, "
+                f"targets={len(target_ids)}) in {marked_domain}."
+            )
+        return created
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain_clean, "domain")
+        print_info_verbose(
+            f"[domain_pass_reuse] Failed to persist DomainPassReuse edges for {marked_domain}."
         )
         return 0
 
@@ -5611,6 +6299,33 @@ def upsert_roast_entry_edge(
         edge_type="entry_vector",
         status=status,
         notes=notes,
+    )
+    save_attack_graph(shell, domain, graph)
+    return True
+
+
+def upsert_ldap_anonymous_bind_entry_edge(
+    shell: object,
+    domain: str,
+    *,
+    status: str = "success",
+    entry_label: str = "ANONYMOUS LOGON",
+    target_label: str = "Domain Users",
+    notes: dict[str, Any] | None = None,
+) -> bool:
+    """Upsert an LDAP anonymous-bind entry edge: Anonymous -> LDAPAnonymousBind -> Domain Users."""
+    graph = load_attack_graph(shell, domain)
+    entry_id = ensure_entry_node_for_domain(shell, domain, graph, label=entry_label)
+    target_id = ensure_entry_node_for_domain(shell, domain, graph, label=target_label)
+
+    upsert_edge(
+        graph,
+        from_id=entry_id,
+        to_id=target_id,
+        relation="LDAPAnonymousBind",
+        edge_type="entry_vector",
+        status=status,
+        notes=notes or {},
     )
     save_attack_graph(shell, domain, graph)
     return True
@@ -6267,6 +6982,55 @@ def _sort_display_paths(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def _record_has_executable_steps(record: dict[str, Any]) -> bool:
+    """Return whether a display-path record includes at least one executable step."""
+    raw_length = record.get("length")
+    if isinstance(raw_length, int):
+        return raw_length > 0
+    if isinstance(raw_length, str) and raw_length.strip().isdigit():
+        return int(raw_length.strip()) > 0
+
+    relations = record.get("relations")
+    if isinstance(relations, list):
+        for relation in relations:
+            if str(relation or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER:
+                return True
+        return False
+
+    steps = record.get("steps")
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            relation = str(step.get("action") or step.get("relation") or "").strip()
+            if relation and relation.lower() not in _CONTEXT_RELATIONS_LOWER:
+                return True
+        return False
+
+    return False
+
+
+def _filter_zero_length_display_paths(
+    records: list[dict[str, Any]],
+    *,
+    domain: str,
+    scope: str,
+) -> list[dict[str, Any]]:
+    """Drop context-only display paths that have no executable attack steps."""
+    filtered = [
+        record
+        for record in records
+        if isinstance(record, dict) and _record_has_executable_steps(record)
+    ]
+    removed = len(records) - len(filtered)
+    if removed > 0:
+        print_info_debug(
+            "[attack_paths] filtered non-actionable display paths: "
+            f"domain={mark_sensitive(domain, 'domain')} scope={scope} removed={removed}"
+        )
+    return filtered
+
+
 def _node_ids_without_memberof_edges(
     graph: dict[str, Any], *, node_ids: set[str]
 ) -> set[str]:
@@ -6306,7 +7070,9 @@ def _stitch_principal_memberships_for_runtime_paths(
     Returns:
         Tuple ``(snapshot_injected, runtime_injected)``.
     """
-    missing = _node_ids_without_memberof_edges(runtime_graph, node_ids=principal_node_ids)
+    missing = _node_ids_without_memberof_edges(
+        runtime_graph, node_ids=principal_node_ids
+    )
     if not missing:
         return 0, 0
 
@@ -6384,6 +7150,10 @@ def compute_display_paths_for_user(
     )
     cached = _attack_paths_cache_get(cache_key, domain=domain, scope="user")
     if cached is not None:
+        cached = _filter_zero_length_display_paths(
+            cached, domain=domain, scope="user"
+        )
+        cached = _apply_affected_user_metadata(shell, domain, cached)
         _log_attack_path_compute_timing(
             domain=domain,
             scope="user",
@@ -6459,6 +7229,8 @@ def compute_display_paths_for_user(
             filter_shortest_paths=False,
         )
     )
+    records = _filter_zero_length_display_paths(records, domain=domain, scope="user")
+    records = _apply_affected_user_metadata(shell, domain, records)
     _log_attack_path_compute_timing(
         domain=domain,
         scope="user",
@@ -6507,6 +7279,10 @@ def compute_display_paths_for_domain(
     )
     cached = _attack_paths_cache_get(cache_key, domain=domain, scope="domain")
     if cached is not None:
+        cached = _filter_zero_length_display_paths(
+            cached, domain=domain, scope="domain"
+        )
+        cached = _apply_affected_user_metadata(shell, domain, cached)
         _log_attack_path_compute_timing(
             domain=domain,
             scope="domain",
@@ -6560,6 +7336,8 @@ def compute_display_paths_for_domain(
             expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
         )
     )
+    records = _filter_zero_length_display_paths(records, domain=domain, scope="domain")
+    records = _apply_affected_user_metadata(shell, domain, records)
     _log_attack_path_compute_timing(
         domain=domain,
         scope="domain",
@@ -6677,6 +7455,52 @@ def get_owned_domain_usernames(shell: object, domain: str) -> list[str]:
     )
 
 
+def get_owned_domain_usernames_for_attack_paths(
+    shell: object,
+    domain: str,
+) -> list[str]:
+    """Return the effective owned-user set for owned attack-path UX.
+
+    Tier-0 owned users are only filtered once the domain is already marked as
+    ``pwned``. Before that point, they remain visible so attack-path discovery
+    can reflect the newly achieved compromise level.
+    """
+    owned = get_owned_domain_usernames(shell, domain)
+    if not owned:
+        return []
+
+    domains_data = getattr(shell, "domains_data", None)
+    domain_data = domains_data.get(domain) if isinstance(domains_data, dict) else None
+    auth_state = (
+        str(domain_data.get("auth") or "").strip().lower()
+        if isinstance(domain_data, dict)
+        else ""
+    )
+    if auth_state != "pwned":
+        return owned
+
+    filtered: list[str] = []
+    skipped_tier0: list[str] = []
+    for username in owned:
+        label = f"{username}@{domain}"
+        node = get_node_by_label(shell, domain, label=label)
+        if node is None:
+            node = get_node_by_label(shell, domain, label=username)
+        if node is not None and _node_is_tier0(node):
+            skipped_tier0.append(username)
+            continue
+        filtered.append(username)
+
+    if skipped_tier0:
+        print_info_debug(
+            "[attack_paths] owned-user candidates skipped because the domain is already pwned and they are Tier-0: "
+            f"domain={mark_sensitive(domain, 'domain')} "
+            f"users={', '.join(mark_sensitive(user, 'user') for user in skipped_tier0)}"
+        )
+
+    return filtered
+
+
 def compute_display_paths_for_owned_users(
     shell: object,
     domain: str,
@@ -6700,7 +7524,7 @@ def compute_display_paths_for_owned_users(
     Returns:
         Deduplicated list of UI-ready path dicts (same shape as `path_to_display_record`).
     """
-    owned = get_owned_domain_usernames(shell, domain)
+    owned = get_owned_domain_usernames_for_attack_paths(shell, domain)
     if not owned:
         return []
     return compute_display_paths_for_principals(
@@ -6712,6 +7536,78 @@ def compute_display_paths_for_owned_users(
         require_high_value_target=require_high_value_target,
         target_mode=target_mode,
     )
+
+
+def get_attack_path_summaries(
+    shell: object,
+    domain: str,
+    *,
+    scope: str = "domain",
+    username: str | None = None,
+    principals: list[str] | None = None,
+    max_depth: int,
+    max_paths: int | None = None,
+    require_high_value_target: bool = True,
+    target_mode: str = "tier0",
+    membership_sample_max: int = 3,
+) -> list[dict[str, Any]]:
+    """Return user-facing attack-path summaries through the shell-aware layer.
+
+    This is the single entry point callers should use for CLI/web summaries.
+    It guarantees that all shell-aware post-processing is applied consistently:
+    filtering, affected-user metadata, cache handling, and future UX-oriented
+    enrichments.
+    """
+    scope_norm = str(scope or "domain").strip().lower()
+    if scope_norm == "domain":
+        return compute_display_paths_for_domain(
+            shell,
+            domain,
+            max_depth=max_depth,
+            max_paths=max_paths,
+            require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
+        )
+    if scope_norm == "user":
+        if not str(username or "").strip():
+            return []
+        return compute_display_paths_for_user(
+            shell,
+            domain,
+            username=str(username or "").strip(),
+            max_depth=max_depth,
+            max_paths=max_paths,
+            require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
+        )
+    if scope_norm == "owned":
+        return compute_display_paths_for_owned_users(
+            shell,
+            domain,
+            max_depth=max_depth,
+            max_paths=max_paths,
+            require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
+        )
+    if scope_norm == "principals":
+        normalized_principals = [
+            str(principal or "").strip()
+            for principal in (principals or [])
+            if str(principal or "").strip()
+        ]
+        if not normalized_principals:
+            return []
+        return compute_display_paths_for_principals(
+            shell,
+            domain,
+            principals=normalized_principals,
+            max_depth=max_depth,
+            max_paths=max_paths,
+            require_high_value_target=require_high_value_target,
+            membership_sample_max=membership_sample_max,
+            target_mode=target_mode,
+        )
+    raise ValueError(f"Unsupported attack path summary scope: {scope!r}")
 
 
 def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
@@ -6849,6 +7745,10 @@ def compute_display_paths_for_principals(
     )
     cached = _attack_paths_cache_get(cache_key, domain=domain, scope="principals")
     if cached is not None:
+        cached = _filter_zero_length_display_paths(
+            cached, domain=domain, scope="principals"
+        )
+        cached = _apply_affected_user_metadata(shell, domain, cached)
         _log_attack_path_compute_timing(
             domain=domain,
             scope="principals",
@@ -6970,6 +7870,10 @@ def compute_display_paths_for_principals(
             filter_shortest_paths=False,
         )
     )
+    records = _filter_zero_length_display_paths(
+        records, domain=domain, scope="principals"
+    )
+    records = _apply_affected_user_metadata(shell, domain, records)
     _log_attack_path_compute_timing(
         domain=domain,
         scope="principals",

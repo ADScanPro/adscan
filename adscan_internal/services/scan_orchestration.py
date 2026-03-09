@@ -13,10 +13,10 @@ Important design goals:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional
 import logging
 
+from adscan_core.time_utils import utc_now
 from adscan_internal.core import EventBus, LicenseMode, ScanPhase
 from adscan_internal.models.scan import (
     ScanConfiguration,
@@ -98,7 +98,7 @@ class ScanOrchestrationService(BaseService):
             ScanResult with status and timestamps.
         """
         scan_id = configuration.options.get("scan_id")
-        started_at = datetime.utcnow()
+        started_at = utc_now()
 
         self._emit_progress(
             scan_id=scan_id,
@@ -120,7 +120,7 @@ class ScanOrchestrationService(BaseService):
                 configuration=configuration,
                 status=ScanStatus.COMPLETED,
                 started_at=started_at,
-                completed_at=datetime.utcnow(),
+                completed_at=utc_now(),
             )
         except Exception as exc:
             self.logger.exception("Scan orchestration failed", exc_info=True)
@@ -136,7 +136,7 @@ class ScanOrchestrationService(BaseService):
                 status=ScanStatus.FAILED,
                 error_message=str(exc),
                 started_at=started_at,
-                completed_at=datetime.utcnow(),
+                completed_at=utc_now(),
             )
 
     # ------------------------------------------------------------------ #

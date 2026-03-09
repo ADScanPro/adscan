@@ -10,6 +10,8 @@ from datetime import datetime
 from enum import Enum
 import uuid
 
+from adscan_core.time_utils import monotonic_now, utc_now
+
 
 class ScanType(str, Enum):
     """Type of scan being performed."""
@@ -247,23 +249,32 @@ class Scan:
     error_message: Optional[str] = None
 
     # Timestamps
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utc_now)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=utc_now)
+    _started_monotonic: Optional[float] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _completed_monotonic: Optional[float] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def start(self) -> None:
         """Mark scan as started."""
         self.status = ScanStatus.RUNNING
-        self.started_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
+        self.started_at = utc_now()
+        self.updated_at = utc_now()
+        self._started_monotonic = monotonic_now()
+        self._completed_monotonic = None
 
     def complete(self) -> None:
         """Mark scan as completed successfully."""
         self.status = ScanStatus.COMPLETED
-        self.completed_at = datetime.utcnow()
+        self.completed_at = utc_now()
         self.progress_percentage = 100
-        self.updated_at = datetime.utcnow()
+        self.updated_at = utc_now()
+        self._completed_monotonic = monotonic_now()
 
     def fail(self, error_message: str) -> None:
         """Mark scan as failed.
@@ -273,14 +284,16 @@ class Scan:
         """
         self.status = ScanStatus.FAILED
         self.error_message = error_message
-        self.completed_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
+        self.completed_at = utc_now()
+        self.updated_at = utc_now()
+        self._completed_monotonic = monotonic_now()
 
     def cancel(self) -> None:
         """Mark scan as cancelled."""
         self.status = ScanStatus.CANCELLED
-        self.completed_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
+        self.completed_at = utc_now()
+        self.updated_at = utc_now()
+        self._completed_monotonic = monotonic_now()
 
     def update_progress(self, phase: str, percentage: int) -> None:
         """Update scan progress.
@@ -291,7 +304,7 @@ class Scan:
         """
         self.current_phase = phase
         self.progress_percentage = max(0, min(100, percentage))  # Clamp to [0, 100]
-        self.updated_at = datetime.utcnow()
+        self.updated_at = utc_now()
 
     def to_result(self) -> ScanResult:
         """Convert to ScanResult.
@@ -318,6 +331,11 @@ class Scan:
         Returns:
             Duration in seconds, or None if not started or completed
         """
+        if (
+            self._started_monotonic is not None
+            and self._completed_monotonic is not None
+        ):
+            return self._completed_monotonic - self._started_monotonic
         if self.started_at and self.completed_at:
             return (self.completed_at - self.started_at).total_seconds()
         return None

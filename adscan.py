@@ -3761,6 +3761,8 @@ from adscan_internal.cli.common import (  # noqa: E402
     show_first_run_helper,
     log_cli_command_context,
     build_cli_runtime_snapshot,
+    normalize_command_alias,
+    normalize_help_alias,
 )
 
 
@@ -3906,6 +3908,258 @@ def show_victory_hint_explicit(victory_type: str, title: str, message: str):
         )
     except Exception:
         pass
+
+
+def _is_attribution_asked() -> bool:
+    """Return True if attribution question has already been asked (once-ever flag)."""
+    flag_file = Path(ADSCAN_STATE_DIR) / ".attribution_asked"
+    return flag_file.exists()
+
+
+def _mark_attribution_asked() -> None:
+    """Persist the once-ever attribution flag."""
+    flag_file = Path(ADSCAN_STATE_DIR) / ".attribution_asked"
+    try:
+        flag_file.parent.mkdir(parents=True, exist_ok=True)
+        flag_file.touch()
+    except Exception:
+        pass
+
+
+def _maybe_ask_attribution(shell) -> None:
+    """Ask once-ever how the user found ADscan. Captured to PostHog as attribution_source.
+
+    Shown on the first exit only, before the session summary, so the user
+    still has the session context in mind.  Non-blocking: Ctrl-C or any
+    cancel returns None and is silently ignored.
+    """
+    if _is_attribution_asked():
+        return
+    if _should_disable_interactive_prompts():
+        return
+
+    options = [
+        "LinkedIn",
+        "GitHub (search / trending / Awesome lists)",
+        "A colleague or friend recommended it",
+        "Web (adscanpro.com)",
+        "Conference or talk (RootedCON, Hackén...)",
+        "Other / Prefer not to say",
+    ]
+
+    _ATTR_KEYS = [
+        "linkedin",
+        "github_organic",
+        "word_of_mouth",
+        "landing_web",
+        "conference",
+        "other",
+    ]
+
+    try:
+        shell.console.print()
+        print_info("[dim]Quick question (optional) — helps us show up where pentesters actually look:[/dim]")
+        idx = questionary_select_index(
+            title="How did you first hear about ADscan?",
+            options=options,
+            default_idx=5,   # default → "Other / Prefer not to say"
+            shell=shell,
+        )
+    except Exception:
+        idx = None
+    finally:
+        _mark_attribution_asked()
+
+    if idx is None:
+        return
+
+    source = _ATTR_KEYS[idx] if 0 <= idx < len(_ATTR_KEYS) else "other"
+    try:
+        telemetry.capture("attribution_source", {"source": source, "source_label": options[idx]})
+    except Exception:
+        pass
+
+
+def _show_exit_summary(shell) -> str | None:
+    """Show a context-aware session summary panel at exit.
+
+    Returns the victory level shown ("domain_compromise", "findings") or None.
+    Only shown when the session produced meaningful results.
+    """
+    victories = getattr(shell, "_session_victories", [])
+    session_attack_paths = getattr(shell, "_session_attack_paths_count", 0)
+    attack_paths = _resolve_session_attack_paths_for_summary(
+        shell, fallback_count=session_attack_paths
+    )
+    creds = getattr(shell, "_session_credentials_count", 0)
+    hashes = getattr(shell, "_session_hashes_count", 0)
+    workspace_creds = _count_workspace_credentials(shell)
+
+    start_time = getattr(shell, "_session_start_time", None)
+    duration_str = ""
+    if start_time is not None:
+        minutes = max(0.0, (time.monotonic() - start_time) / 60.0)
+        if minutes >= 60:
+            duration_str = f"{int(minutes // 60)}h {int(minutes % 60)}m"
+        elif minutes >= 1:
+            duration_str = f"{int(minutes)}m"
+
+    nothing_found = (
+        not victories and session_attack_paths == 0 and creds == 0 and hashes == 0
+    )
+    if nothing_found:
+        return None
+
+    lines = []
+    border = "green" if "domain_compromise" in victories else "cyan"
+
+    if "domain_compromise" in victories:
+        lines.append("[bold green]Domain compromised[/bold green] ✓")
+    if attack_paths:
+        s = "s" if attack_paths != 1 else ""
+        lines.append(f"[cyan]{attack_paths}[/cyan] attack path{s} identified")
+    if creds:
+        s = "s" if creds != 1 else ""
+        lines.append(f"[cyan]{creds}[/cyan] new credential{s} obtained")
+    if workspace_creds and workspace_creds != creds:
+        s = "s" if workspace_creds != 1 else ""
+        lines.append(
+            f"[cyan]{workspace_creds}[/cyan] credential{s} currently stored in workspace"
+        )
+    if hashes:
+        s = "es" if hashes != 1 else ""
+        lines.append(f"[cyan]{hashes}[/cyan] hash{s} captured")
+    if duration_str:
+        lines.append(f"[dim]Duration: {duration_str}[/dim]")
+
+    if not lines:
+        return None
+
+    from rich.text import Text as _Text
+
+    panel_text = _Text.from_markup("\n".join(lines))
+    print_panel(
+        panel_text,
+        title="[bold]Session Summary[/bold]",
+        title_align="center",
+        border_style=border,
+        padding=(0, 2),
+        fit=True,
+    )
+
+    return "domain_compromise" if "domain_compromise" in victories else "findings"
+
+
+def _maybe_show_report_cta(shell) -> None:
+    """Show a contextual report CTA when the session produced actionable findings."""
+    session_attack_paths = getattr(shell, "_session_attack_paths_count", 0)
+    attack_paths = _resolve_session_attack_paths_for_summary(
+        shell, fallback_count=session_attack_paths
+    )
+    creds = getattr(shell, "_session_credentials_count", 0)
+    victories = getattr(shell, "_session_victories", [])
+    if not (bool(victories) or attack_paths > 0 or creds > 0):
+        return
+    shell.console.print()
+    _reports_url = mark_passthrough("https://adscanpro.com/reports")
+    if "domain_compromise" in victories:
+        print_info(
+            f"[dim]You have a Domain Admin finding — document it before the engagement closes. "
+            f"PRO generates a Word/PDF in minutes: exec summary, attack chains, "
+            f"MITRE mapping, remediation roadmap → {_reports_url}[/dim]"
+        )
+    elif attack_paths > 0:
+        print_info(
+            f"[dim]You found {attack_paths} attack path(s) — turn them into a client deliverable "
+            f"before session data is gone. PRO generates exec summary + remediation roadmap "
+            f"→ {_reports_url}[/dim]"
+        )
+    else:
+        print_info(
+            f"[dim]You collected credentials this session — document the evidence. "
+            f"PRO generates a Word/PDF report with findings and remediation steps "
+            f"→ {_reports_url}[/dim]"
+        )
+
+
+def _count_workspace_credentials(shell: object) -> int:
+    """Return total credentials currently stored across all loaded domains."""
+    try:
+        domains_data = getattr(shell, "domains_data", {}) or {}
+        if not isinstance(domains_data, dict):
+            return 0
+        total = 0
+        for domain_data in domains_data.values():
+            if not isinstance(domain_data, dict):
+                continue
+            creds = domain_data.get("credentials")
+            if isinstance(creds, dict):
+                total += len(creds)
+        return max(0, total)
+    except Exception as exc:  # pragma: no cover - defensive
+        telemetry.capture_exception(exc)
+        return 0
+
+
+def _resolve_session_attack_paths_for_summary(
+    shell: object, *, fallback_count: int
+) -> int:
+    """Resolve user-facing attack-path count for summaries and CTAs.
+
+    Runtime counters can include raw BloodHound path-entry vectors and accumulate
+    across repeated refreshes. For UX-facing summaries we prefer stable
+    domain-level path totals (`paths_to_tier0`) derived from each attack graph.
+    """
+    fallback = max(0, int(fallback_count or 0))
+    if fallback == 0:
+        return 0
+
+    try:
+        from adscan_internal.services.attack_graph_service import compute_attack_path_metrics
+
+        workspace_cwd = (
+            shell._get_workspace_cwd()
+            if hasattr(shell, "_get_workspace_cwd")
+            else getattr(shell, "current_workspace_dir", os.getcwd())
+        )
+        domains_dir = getattr(shell, "domains_dir", "domains")
+        domains_data = getattr(shell, "domains_data", {}) or {}
+        if not isinstance(domains_data, dict):
+            return fallback
+
+        total_paths = 0
+        analyzed_domains = 0
+        for domain_name in domains_data.keys():
+            domain = str(domain_name or "").strip()
+            if not domain:
+                continue
+            graph_path = domain_subpath(workspace_cwd, domains_dir, domain, "attack_graph.json")
+            if not os.path.exists(graph_path):
+                continue
+            metrics = compute_attack_path_metrics(shell, domain, max_depth=10)
+            paths_to_tier0 = int(metrics.get("paths_to_tier0") or 0)
+            total_paths += max(0, paths_to_tier0)
+            analyzed_domains += 1
+
+        if analyzed_domains == 0:
+            return fallback
+
+        print_info_debug(
+            "[summary] attack-path count recalculated from attack graphs: "
+            f"domains={analyzed_domains} total={total_paths} fallback={fallback}"
+        )
+        return total_paths
+    except Exception as exc:  # pragma: no cover - best effort
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[summary] attack-path count fallback ({fallback}) due to recalculation error: {exc}"
+        )
+        return fallback
+
+
+def _maybe_show_star_cta(shell) -> None:
+    # Star CTA moved to domain_compromise euphoria block (Hormozi: ask at peak goodwill)
+    pass
 
 
 def track_docs_link_shown(context: str, url: str):
@@ -9212,7 +9466,12 @@ class PentestShell:
             shell=self,
         )
 
-    def _questionary_checkbox(self, title: str, options: list[str]) -> list[str] | None:
+    def _questionary_checkbox(
+        self,
+        title: str,
+        options: list[str],
+        default_values: list[str] | None = None,
+    ) -> list[str] | None:
         """Interactive multi-select using Questionary checkbox.
 
         Returns selected option values, or None if cancelled.
@@ -9221,6 +9480,7 @@ class PentestShell:
         return questionary_checkbox_values(
             title=title,
             options=options,
+            default_values=default_values,
             shell=self,
         )
 
@@ -9497,6 +9757,10 @@ class PentestShell:
             )
 
             if not selected or not selected.strip():
+                try:
+                    print_info_debug("[fuzzy] No lab selected: empty submission")
+                except Exception:
+                    pass
                 return None
 
             selected = selected.strip()
@@ -9542,6 +9806,10 @@ class PentestShell:
             return None
         except KeyboardInterrupt:
             _log_interrupt_debug(kind="keyboard_interrupt", source="fuzzy_select_lab")
+            try:
+                print_info_debug("[fuzzy] No lab selected: keyboard interrupt")
+            except Exception:
+                pass
             return None
         except Exception as e:
             telemetry.capture_exception(e)
@@ -9757,6 +10025,9 @@ class PentestShell:
     def _generate_user_permutations_interactive(self, domain):
         """Interactively build a username wordlist based on provided names."""
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_core.username_patterns import (
+            generate_username_candidates_for_name_pairs,
+        )
 
         # Choose input method for custom wordlist via interactive menu
         options = [
@@ -9808,29 +10079,7 @@ class PentestShell:
         if not names:
             print_error("No names provided to build wordlist.")
             return None
-        # Generate permutations
-        perms = set()
-        for first, last in names:
-            f = first.strip()
-            last_clean = last.strip()
-            fi = f[0] if f else ""
-            li = last_clean[0] if last_clean else ""
-            f3 = f[:3]
-            l3 = last_clean[:3]
-            variants = [
-                f + last_clean,
-                f + "." + last_clean,
-                f3 + l3,
-                f3 + "." + l3,
-                fi + last_clean,
-                fi + "." + last_clean,
-                last_clean + f,
-                last_clean + "." + f,
-                last_clean + fi,
-                last_clean + "." + li,
-            ]
-            for v in variants:
-                perms.add(v.lower())
+        perms = generate_username_candidates_for_name_pairs(names)
         # Write to file
         km_dir = os.path.join(
             self.current_workspace_dir, self.domains_dir, domain, "kerberos"
@@ -9881,6 +10130,7 @@ class PentestShell:
         self.lab_provider: Optional[str] = None
         self.lab_name: Optional[str] = None
         self.lab_name_whitelisted: Optional[bool] = None
+        self.lab_confirmation_state: Optional[str] = None
         # Preflight installation check status (set by `handle_start`).
         self.preflight_check_passed: bool | None = None
         self.preflight_check_fix_attempted: bool = False
@@ -12905,6 +13155,35 @@ class PentestShell:
 
                 command_name = parts[0].lower()
                 args_list = parts[1:]
+                normalized_command, normalized_args, command_alias_used = (
+                    normalize_command_alias(
+                        command_name,
+                        args_list,
+                        known_commands=set(self.commands.keys()),
+                    )
+                )
+                if command_alias_used:
+                    print_info_debug(
+                        f"[cli] Command alias detected: {command_name} {' '.join(args_list)} -> "
+                        f"{normalized_command} {' '.join(normalized_args)}"
+                    )
+                    command_name = normalized_command
+                    args_list = normalized_args
+                normalized_command, normalized_args, help_alias_used = (
+                    normalize_help_alias(
+                        command_name,
+                        args_list,
+                        known_commands=set(self.commands.keys()),
+                    )
+                )
+                if help_alias_used:
+                    print_info_debug(
+                        f"[cli] Help alias detected: {command_name} {' '.join(args_list)} -> "
+                        f"{normalized_command} {' '.join(normalized_args)}"
+                    )
+                    command_name = normalized_command
+                    args_list = normalized_args
+
                 marked_user_input = mark_sensitive(user_input.strip(), "text")
                 print_info_debug(f"[cli] Execute command: {marked_user_input}")
                 log_cli_command_context(self, command_name, args_list, source="cli")
@@ -13330,7 +13609,9 @@ class PentestShell:
         content.append("Starting Domain: ", style=f"bold {BRAND_COLORS['info']}")
         content.append(str(snapshot.get("starting_domain")) + "\n", style="white")
         content.append("Starting Domain Auth: ", style=f"bold {BRAND_COLORS['info']}")
-        content.append(str(snapshot.get("starting_domain_auth", "unknown")) + "\n", style="white")
+        content.append(
+            str(snapshot.get("starting_domain_auth", "unknown")) + "\n", style="white"
+        )
         content.append("Configured Domains: ", style=f"bold {BRAND_COLORS['info']}")
         content.append(str(snapshot.get("configured_domains")) + "\n", style="white")
         content.append("Automatic Mode: ", style=f"bold {BRAND_COLORS['info']}")
@@ -13689,10 +13970,14 @@ class PentestShell:
             select <domain>: Run the enumeration of the user of the selected credential.
 
             save <domain> <username> <credential> [host] [service]: Saves a credential for the specified domain in the current workspace.
+
+            add <domain> <username> <credential> [host] [service]: Alias of `save`.
         """
         from adscan_internal.cli.creds import (
             add_credential,
             clear_creds,
+            ensure_domain_ready_for_manual_credential_save,
+            normalize_creds_subcommand,
             select_cred,
             show_creds,
         )
@@ -13706,7 +13991,11 @@ class PentestShell:
             self.do_help("creds")
             return
 
-        command = command_parts[0].lower()
+        command, alias_used = normalize_creds_subcommand(command_parts[0])
+        if alias_used:
+            print_info_debug(
+                f"[cli] creds alias detected: {command_parts[0].lower()} -> {command}"
+            )
 
         if command == "show":
             show_creds(self)
@@ -13731,6 +14020,22 @@ class PentestShell:
             cred = command_parts[3]
             host = command_parts[4] if len(command_parts) > 4 else None
             service = command_parts[5] if len(command_parts) > 5 else None
+            is_local_target = bool(host and service)
+            if not ensure_domain_ready_for_manual_credential_save(
+                self,
+                domain=domain,
+                username=user,
+                is_local_target=is_local_target,
+            ):
+                if not _should_disable_interactive_prompts(self):
+                    from adscan_internal.cli.start import run_start_auth
+
+                    if Confirm.ask(
+                        "Do you want to start authenticated initialization now?",
+                        default=True,
+                    ):
+                        run_start_auth(self, None)
+                return
             add_credential(self, domain, user, cred, host, service)
         else:
             print_error(
@@ -13800,6 +14105,188 @@ class PentestShell:
             self._credential_service = CredentialService()
         return self._credential_service
 
+    def _build_domain_log_file_path(
+        self,
+        domain_name: str,
+        username: str,
+        *,
+        prefix: str,
+        extension: str = ".log",
+    ) -> str:
+        """Return a workspace-aware log path for per-domain NetExec actions."""
+        safe_user = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(username or "").strip())
+        safe_user = safe_user.strip("._") or "user"
+        filename = f"{prefix}_{safe_user}{extension}"
+
+        if self.current_workspace_dir:
+            log_dir = os.path.join(self.current_workspace_dir, "domains", domain_name, "smb")
+            os.makedirs(log_dir, exist_ok=True)
+            return os.path.join(log_dir, filename)
+
+        return f"{prefix}_{domain_name}_{safe_user}{extension}"
+
+    def _maybe_change_password_after_must_change(
+        self,
+        *,
+        domain_name: str,
+        user: str,
+        current_password: str,
+        pdc_host: str,
+        pdc_fqdn: str,
+        ui_silent: bool,
+    ) -> str | None:
+        """Offer a password change when the current credential must be rotated."""
+        from rich.prompt import Confirm, Prompt
+
+        from adscan_internal.passwords import (
+            generate_strong_password,
+            is_password_complex,
+        )
+        from adscan_internal.services.credential_store_service import (
+            CredentialStoreService,
+        )
+
+        marked_user = mark_sensitive(user, "user")
+        marked_domain_name = mark_sensitive(domain_name, "domain")
+
+        if self.is_hash(current_password):
+            if not ui_silent:
+                print_warning(
+                    f"The credential for '[bold]{marked_user}[/bold]' on domain "
+                    f"'[bold]{marked_domain_name}[/bold]' is a hash, so ADscan cannot "
+                    "change the password automatically. A plaintext password is required."
+                )
+            else:
+                print_info_verbose(
+                    f"[ui_silent] Password must change for {marked_user} on {marked_domain_name}, "
+                    "but only a hash is available."
+                )
+            return None
+
+        if ui_silent:
+            print_info_verbose(
+                f"[ui_silent] Password must change for {marked_user} on domain "
+                f"{marked_domain_name}; interactive password rotation skipped."
+            )
+            return None
+
+        print_warning(
+            f"The credential for '[bold]{marked_user}[/bold]' on domain "
+            f"'[bold]{marked_domain_name}[/bold]' is valid, but the user must change "
+            "the password before interactive use can continue."
+        )
+
+        if not Confirm.ask(
+            "Would you like ADscan to assign a new strong password now?",
+            default=True,
+        ):
+            return None
+
+        suggested_password = generate_strong_password(16)
+        new_password = Prompt.ask(
+            "New password to assign",
+            default=suggested_password,
+        ).strip()
+
+        if not is_password_complex(new_password):
+            print_error(
+                "The new password does not meet AD complexity requirements. "
+                "Use at least 12 characters with lower, upper, digit, and symbol."
+            )
+            return None
+
+        change_auth_string = self.build_auth_nxc(
+            user,
+            current_password,
+            domain_name,
+            kerberos=False,
+        )
+        change_log_file_path = self._build_domain_log_file_path(
+            domain_name,
+            user,
+            prefix="change_password",
+        )
+
+        print_info_verbose("Executing password change for password-must-change account")
+        print_info_debug(
+            f'{self.netexec_path} smb {pdc_fqdn} {change_auth_string} '
+            f'-M change-password -o NEWPASS={mark_sensitive(new_password, "password")} '
+            f'--log "{change_log_file_path}"'
+        )
+
+        service = self._get_credential_service()
+        change_result = service.change_password_with_netexec(
+            domain=domain_name,
+            username=user,
+            pdc_fqdn=pdc_fqdn,
+            netexec_path=self.netexec_path,
+            auth_string=change_auth_string,
+            new_password=new_password,
+            log_file_path=change_log_file_path,
+            executor=lambda cmd, timeout: self._run_netexec(
+                cmd,
+                domain=domain_name,
+                timeout=timeout,
+                pre_sync=False,
+            ),
+        )
+
+        if not change_result.success:
+            error_suffix = (
+                f" ({change_result.error_message})"
+                if change_result.error_message
+                else ""
+            )
+            print_error(
+                f"Failed to change the password for '[bold]{marked_user}[/bold]' "
+                f"on domain '[bold]{marked_domain_name}[/bold]'{error_suffix}"
+            )
+            return None
+
+        store_service = CredentialStoreService()
+        store_service.update_domain_credential(
+            domains_data=self.domains_data,
+            domain=domain_name,
+            username=user,
+            credential=new_password,
+            is_hash=False,
+        )
+
+        domain_data = self.domains_data.setdefault(domain_name, {})
+        if str(domain_data.get("username") or "").strip().lower() == user.strip().lower():
+            domain_data["password"] = new_password
+
+        ticket_path = store_service.get_kerberos_ticket(
+            domains_data=self.domains_data,
+            domain=domain_name,
+            username=user,
+        )
+        if ticket_path:
+            store_service.delete_kerberos_ticket(
+                domains_data=self.domains_data,
+                domain=domain_name,
+                username=user,
+            )
+            try:
+                if os.path.exists(ticket_path):
+                    os.remove(ticket_path)
+            except OSError:
+                pass
+
+        if self.current_workspace_dir:
+            self.save_workspace_data()
+
+        print_success(
+            f"Password updated successfully for '[bold]{marked_user}[/bold]' on domain "
+            f"'[bold]{marked_domain_name}[/bold]'. New password: "
+            f"{mark_sensitive(new_password, 'password')}"
+        )
+        print_info(
+            f"Re-verifying the updated credential for '[bold]{marked_user}[/bold]' "
+            f"against PDC [bold]{pdc_host}[/bold]."
+        )
+        return new_password
+
     def check_local_creds(self, domain_name, username, cred_value, host, service):
         from adscan_internal.cli.creds import check_local_creds
 
@@ -13829,6 +14316,8 @@ class PentestShell:
         prompt_local_reuse_after: bool = True,
         ui_silent: bool = False,
         ensure_fresh_kerberos_ticket: bool = True,
+        force_authenticated_enumeration: bool = False,
+        prompt_when_already_authenticated: bool = False,
     ):
         """Add a credential (domain or local) delegating to the CLI helper for reuse."""
         from adscan_internal.cli.creds import add_credential
@@ -13849,6 +14338,8 @@ class PentestShell:
             prompt_local_reuse_after=prompt_local_reuse_after,
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
+            force_authenticated_enumeration=force_authenticated_enumeration,
+            prompt_when_already_authenticated=prompt_when_already_authenticated,
         )
 
     def add_credentials_batch(
@@ -13912,13 +14403,25 @@ class PentestShell:
         return handle_hash_cracking(self, domain, user, cred)
 
     def verify_domain_credentials(
-        self, domain_name, user, cred_value, *, ui_silent: bool = False
+        self,
+        domain_name,
+        user,
+        cred_value,
+        *,
+        ui_silent: bool = False,
+        password_change_attempted: bool = False,
+        source_steps: list[object] | None = None,
     ):
         """Verifies domain credentials against the domain's PDC using NetExec."""
         from rich.panel import Panel
 
         from adscan_internal.rich_output import mark_sensitive
         from adscan_internal.services.credential_service import CredentialStatus
+
+        self._last_domain_credential_verification_result = None
+        self._last_verified_domain_name = None
+        self._last_verified_domain_username = None
+        self._last_verified_domain_credential = None
 
         # Safely get PDC information, handling case when it doesn't exist
         domain_data = self.domains_data.get(domain_name, {})
@@ -14055,11 +14558,15 @@ class PentestShell:
                 )
             return False
 
+        self._last_domain_credential_verification_result = result
         status = result.status
         marked_user = mark_sensitive(user, "user")
         marked_domain_name = mark_sensitive(domain_name, "domain")
 
         if status == CredentialStatus.VALID:
+            self._last_verified_domain_name = domain_name
+            self._last_verified_domain_username = user
+            self._last_verified_domain_credential = cred_value
             print_info_verbose(
                 f"Successfully verified credentials for user '[bold]{marked_user}[/bold]' "
                 f"on domain '[bold]{marked_domain_name}[/bold]' against PDC [bold]{pdc_host}[/bold]."
@@ -14093,7 +14600,15 @@ class PentestShell:
                             default=True,
                         )
                         if respuesta:
-                            self.spraying_with_password(domain_name, cred_value)
+                            self.spraying_with_password(
+                                domain_name,
+                                cred_value,
+                                source_context={
+                                    "auth_username": user,
+                                    "origin": "credential_validation",
+                                },
+                                source_steps=source_steps,
+                            )
                     else:
                         print_info_verbose(
                             "[ui_silent] Password spraying prompt suppressed."
@@ -14148,6 +14663,42 @@ class PentestShell:
                     f"[ui_silent] Password expired for user {marked_user} on domain {marked_domain_name}."
                 )
             return False
+
+        if status == CredentialStatus.PASSWORD_MUST_CHANGE:
+            if not ui_silent:
+                print_warning(
+                    f"Password must be changed for user '[bold]{marked_user}[/bold]' "
+                    f"on domain '[bold]{marked_domain_name}[/bold]' before logon can continue."
+                )
+            else:
+                print_info_verbose(
+                    f"[ui_silent] Password must change for user {marked_user} on domain "
+                    f"{marked_domain_name}."
+                )
+
+            if password_change_attempted:
+                return False
+
+            new_password = self._maybe_change_password_after_must_change(
+                domain_name=domain_name,
+                user=user,
+                current_password=cred_value,
+                pdc_host=pdc_host,
+                pdc_fqdn=pdc_fqdn,
+                ui_silent=ui_silent,
+            )
+            if not new_password:
+                return False
+
+            return bool(
+                self.verify_domain_credentials(
+                    domain_name,
+                    user,
+                    new_password,
+                    ui_silent=ui_silent,
+                    password_change_attempted=True,
+                )
+            )
 
         if status == CredentialStatus.USER_NOT_FOUND:
             if not ui_silent:
@@ -14974,7 +15525,7 @@ class PentestShell:
                 )
                 from adscan_internal.rich_output import print_panel
                 from adscan_internal.services.attack_graph_service import (
-                    compute_display_paths_for_domain,
+                    get_attack_path_summaries,
                 )
 
                 default_execute_all = bool(
@@ -14992,9 +15543,10 @@ class PentestShell:
                 )
 
                 def _compute_summaries() -> list[dict[str, Any]]:
-                    return compute_display_paths_for_domain(
+                    return get_attack_path_summaries(
                         self,
                         domain,
+                        scope="domain",
                         max_depth=10,
                         max_paths=None,
                         require_high_value_target=True,
@@ -15017,6 +15569,44 @@ class PentestShell:
 
         # Capture scan_complete event with case study metrics
         self._capture_scan_complete(domain)
+
+        # Report CTA and zero-findings diagnostic after scan
+        # Hormozi: CTA with "what + why now" at victory (show the stack);
+        # Perceived Likelihood when 0 findings (transparency builds credibility)
+        _scan_attack_paths = getattr(self, "_session_attack_paths_count", 0)
+        _scan_mode = getattr(self, "scan_mode", None)
+        if _scan_attack_paths > 0 and should_show_victory_hint("scan_complete_report", "subtle"):
+            _reports_url = mark_passthrough("https://adscanpro.com/reports")
+            self.console.print()
+            print_info(
+                f"[dim]💡 Found {_scan_attack_paths} attack path(s) — PRO turns them into a "
+                f"board-ready report (exec summary, attack diagrams, remediation priorities) "
+                f"in minutes → {_reports_url}[/dim]"
+            )
+            mark_victory_hint_shown("scan_complete_report")
+        elif _scan_attack_paths == 0 and _scan_mode == "unauth":
+            self.console.print()
+            print_info(
+                "[dim]No attack paths found in unauthenticated mode — expected without credentials.\n"
+                "→ Scan the authenticated attack surface: "
+                "[cyan]creds save <domain> <user> <pass>[/cyan][/dim]"
+            )
+        elif _scan_attack_paths == 0 and _scan_mode == "auth":
+            self.console.print()
+            print_info(
+                "[dim]No exploitable attack paths detected. "
+                "Checked 32+ attack vectors (kerberoasting, delegation, ADCS, DCSync, and more). "
+                "Domain appears hardened against the scanned vectors.[/dim]"
+            )
+
+        # Post-scan lab confirmation: ask once only when lab context is still
+        # unknown or inferred with weak confidence. Strong signals stay frictionless.
+        try:
+            from adscan_internal.cli.start import maybe_offer_post_scan_lab_confirmation
+
+            maybe_offer_post_scan_lab_confirmation(self)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
 
     def _capture_scan_complete(self, domain: str) -> None:
         """Capture scan_complete telemetry event with case study metrics."""
@@ -16885,6 +17475,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                     self,
                     domain,
                     local_admin_username=user,
+                    credential=cred,
                     targets=reuse_targets,
                     status="discovered",
                 )
@@ -17433,21 +18024,42 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         *,
         spray_type: str | None = None,
         entry_label: str | None = None,
+        source_context: dict[str, object] | None = None,
+        source_steps: list[object] | None = None,
     ):
         """Wrapper for executing spraying command with operation header."""
         from adscan_internal.cli.spraying import spraying_command
 
         spraying_command(
-            self, command, domain, spray_type=spray_type, entry_label=entry_label
+            self,
+            command,
+            domain,
+            spray_type=spray_type,
+            entry_label=entry_label,
+            source_context=source_context,
+            source_steps=source_steps,
         )
 
     def execute_spraying_command(
-        self, command, domain, *, entry_label: str | None = None
+        self,
+        command,
+        domain,
+        *,
+        entry_label: str | None = None,
+        source_context: dict[str, object] | None = None,
+        source_steps: list[object] | None = None,
     ):
         """Execute the spraying command and process results."""
         from adscan_internal.cli.spraying import execute_spraying_command
 
-        execute_spraying_command(self, command, domain, entry_label=entry_label)
+        execute_spraying_command(
+            self,
+            command,
+            domain,
+            entry_label=entry_label,
+            source_context=source_context,
+            source_steps=source_steps,
+        )
 
     def execute_nopac(self, command, domain):
         """Execute the noPac exploit command and process results."""
@@ -18057,7 +18669,14 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             print_error("Error executing bloodhound.")
             print_exception(show_locals=False, exception=e)
 
-    def _postprocess_user_list_file(self, domain: str, filename: str) -> None:
+    def _postprocess_user_list_file(
+        self,
+        domain: str,
+        filename: str,
+        *,
+        trigger_followups: bool = True,
+        source: str | None = None,
+    ) -> None:
         """Post-process a generated user list file and trigger follow-up steps.
 
         This logic is shared across multiple user list generators.
@@ -18065,6 +18684,10 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         Args:
             domain: Target domain.
             filename: List filename (e.g. "admins.txt", "privileged.txt").
+            trigger_followups: Whether to launch follow-up enumeration flows
+                after sanitizing and displaying the list.
+            source: Logical source that produced this user list. Used for
+                telemetry correlation and downstream follow-up logging.
         """
         from adscan_internal.rich_output import mark_sensitive
         from adscan_internal.workspaces import domain_subpath
@@ -18123,6 +18746,8 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
         count = len(users)
 
+        effective_source = source or f"postprocess_user_list:{filename}"
+
         try:
             user_type_map = {
                 "admins.txt": "admins",
@@ -18134,6 +18759,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             properties = {
                 "user_type": user_type,
                 "count": count,
+                "source": effective_source,
                 "scan_mode": getattr(self, "scan_mode", None),
                 "auth_type": self.domains_data[domain].get("auth", "unknown"),
             }
@@ -18151,11 +18777,31 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         elif filename == "enabled_users.txt":
             self._display_items(users, "Enabled Users")
 
-        if self.domains_data[domain]["auth"] == "null":
-            self.ask_for_smb_descriptions(domain)
+        if not trigger_followups:
+            print_info_debug(
+                f"[users] Follow-up workflow skipped for {filename} in domain {domain} "
+                f"(source={effective_source})"
+            )
+            return
 
-        if self.domains_data[domain]["auth"] != "auth":
-            self.do_enum_with_users(domain)
+        from adscan_internal.cli.ldap import run_post_user_discovery_followups
+
+        pre_with_users_callback = None
+        pre_with_users_step = None
+        if self.domains_data[domain]["auth"] == "null":
+            def _run_smb_descriptions() -> None:
+                self.ask_for_smb_descriptions(domain)
+
+            pre_with_users_callback = _run_smb_descriptions
+            pre_with_users_step = "smb_descriptions"
+
+        run_post_user_discovery_followups(
+            self,
+            domain,
+            source=effective_source,
+            pre_with_users_callback=pre_with_users_callback,
+            pre_with_users_step=pre_with_users_step,
+        )
 
     def _write_user_list_file(
         self, domain: str, filename: str, users: list[str]
@@ -18196,7 +18842,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 file.truncate(0)
 
         marked_path = mark_sensitive(users_file, "path")
-        print_info_debug(f"[users] Wrote {len(normalized)} entries to {marked_path}")
+        print_info(f"[users] Wrote {len(normalized)} entries to {marked_path}")
         return users_file
 
     def execute_netexec_users(self, command, domain, filename):
@@ -18653,6 +19299,84 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             return
         self._cve_findings.pop((target_domain, scope), None)
 
+    def _resolve_netexec_cve_timeout_seconds(
+        self,
+        *,
+        cve: str,
+        target_scope: str,
+    ) -> int:
+        """Return the default NetExec timeout for CVE modules."""
+        cve_key = str(cve or "").strip().lower()
+        scope_key = str(target_scope or "").strip().lower()
+        if cve_key == "zerologon":
+            return 900 if scope_key == "dcs" else 600
+        return 300
+
+    def _run_netexec_cve_with_timeout_recovery(
+        self,
+        *,
+        command: str,
+        target_domain: str,
+        cve: str,
+        target_scope: str,
+    ):
+        """Run a NetExec CVE command and optionally retry on timeout."""
+        from adscan_internal.execution_outcomes import result_is_timeout
+        from adscan_internal.rich_output import mark_sensitive
+
+        timeout_seconds = self._resolve_netexec_cve_timeout_seconds(
+            cve=cve,
+            target_scope=target_scope,
+        )
+        completed_process = self._run_netexec(
+            command,
+            domain=target_domain,
+            timeout=timeout_seconds,
+        )
+        if not result_is_timeout(completed_process, tool_name="netexec"):
+            return completed_process
+
+        marked_cve = mark_sensitive(str(cve or "").strip(), "text")
+        marked_target_domain = mark_sensitive(target_domain, "domain")
+        print_warning(
+            f"NetExec {marked_cve} check for {marked_target_domain} timed out after {timeout_seconds} seconds."
+        )
+        print_info(
+            "Some NetExec CVE modules, especially Zerologon, can legitimately take longer on slow targets."
+        )
+
+        is_non_interactive = bool(os.getenv("CI")) or bool(
+            getattr(self, "non_interactive", False)
+        )
+        if is_non_interactive:
+            print_warning(
+                "Non-interactive mode detected; skipping retry with extended timeout."
+            )
+            return completed_process
+
+        extended_timeout = max(
+            timeout_seconds * 2,
+            1800 if str(cve or "").strip().lower() == "zerologon" else 900,
+        )
+        if not Confirm.ask(
+            (
+                f"Do you want to retry the {marked_cve} check "
+                f"with a longer timeout ({extended_timeout}s)?"
+            ),
+            default=True,
+        ):
+            return completed_process
+
+        print_info(
+            f"Retrying NetExec {marked_cve} check for {marked_target_domain} "
+            f"with timeout={extended_timeout}s."
+        )
+        return self._run_netexec(
+            command,
+            domain=target_domain,
+            timeout=extended_timeout,
+        )
+
     def execute_netexec_cve_all(self, command, target_domain, cve):
         # We use sets to avoid duplicates
         from adscan_internal.rich_output import mark_sensitive
@@ -18676,8 +19400,11 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         record_steps = cve_key not in {"spooler", "smbghost", "webdav"}
 
         try:
-            completed_process = self._run_netexec(
-                command, domain=target_domain, timeout=300
+            completed_process = self._run_netexec_cve_with_timeout_recovery(
+                command=command,
+                target_domain=target_domain,
+                cve=cve,
+                target_scope="all",
             )
             output = strip_ansi_codes(completed_process.stdout or "")
             errors = strip_ansi_codes(completed_process.stderr or "")
@@ -18861,7 +19588,12 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         record_steps_for_coerce = set()
 
         try:
-            completed_process = self.run_command(command, timeout=300)
+            completed_process = self._run_netexec_cve_with_timeout_recovery(
+                command=command,
+                target_domain=target_domain,
+                cve="coerce_plus",
+                target_scope="all",
+            )
 
             if completed_process.returncode == 0:
                 output_str = completed_process.stdout
@@ -19794,7 +20526,12 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         )
 
     def spraying_with_password(
-        self, domain, password, *, source_context: dict[str, object] | None = None
+        self,
+        domain,
+        password,
+        *,
+        source_context: dict[str, object] | None = None,
+        source_steps: list[object] | None = None,
     ):
         """
         Performs password spraying on the specified domain using a specific password.
@@ -19813,6 +20550,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             domain,
             password,
             source_context=source_context,
+            source_steps=source_steps,
         )
 
     def list_zip(self, zip_file):
@@ -20562,6 +21300,13 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                         f"{len(group_sids)} SID(s) for {marked_username}@{marked_domain} "
                         f"(source={source})."
                     )
+                    self._debug_log_privileged_membership_resolution(
+                        domain=domain,
+                        username=username,
+                        source=source,
+                        group_sids=group_sids,
+                        privileged_groups=privileged_groups,
+                    )
                 elif group_names:
                     raw_text = "\n".join(f"{group}@{domain}" for group in group_names)
                     privileged_groups = self._parse_privileged_group_output(raw_text)
@@ -20569,6 +21314,13 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                         "[priv-groups] group name lookup resolved "
                         f"{len(group_names)} group(s) for {marked_username}@{marked_domain} "
                         f"(source={source})."
+                    )
+                    self._debug_log_privileged_membership_resolution(
+                        domain=domain,
+                        username=username,
+                        source=source,
+                        group_names=group_names,
+                        privileged_groups=privileged_groups,
                     )
                 else:
                     print_info_debug(
@@ -20597,6 +21349,23 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 )
                 return {}
 
+            structured_groups = privileged_groups.get("groups")
+            if isinstance(structured_groups, list):
+                resolved_group_names = [
+                    f"{group.get('group', '')}@{group.get('domain', '')}"
+                    for group in structured_groups
+                    if isinstance(group, dict)
+                ]
+            else:
+                resolved_group_names = []
+            self._debug_log_privileged_membership_resolution(
+                domain=domain,
+                username=username,
+                source=source,
+                group_names=resolved_group_names,
+                privileged_groups=privileged_groups,
+            )
+
             if not execute_actions:
                 return privileged_groups
 
@@ -20616,15 +21385,21 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         """Execute follow-up actions based on privileged group membership."""
         from adscan_internal.rich_output import mark_sensitive
 
+        summary = None
         privileged_groups = {
             "domain_admin": bool(membership.get("domain_admin")),
             "backup_operators": bool(membership.get("backup_operators")),
             "Administrators": bool(membership.get("Administrators")),
             "account_operators": bool(membership.get("account_operators")),
         }
+        marked_username = mark_sensitive(username, "user")
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            "[priv-groups] executing follow-up actions for "
+            f"{marked_username}@{marked_domain}: source={source} flags={privileged_groups}"
+        )
 
         if privileged_groups["domain_admin"]:
-            marked_username = mark_sensitive(username, "user")
             print_warning(
                 f"The user {marked_username} is a member of the Domain Admins group"
             )
@@ -20709,15 +21484,28 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                     victory_type="da_compromise",
                     title="🎯 Major Win: Domain Admin Compromised!",
                     message=(
-                        "[bold green]You've found a Domain Admin credential![/bold green]\n\n"
-                        "This is a critical finding that demonstrates full domain compromise capability.\n\n"
-                        "💡 [bold]Share this win with your team?[/bold]\n"
-                        "   Your team lead might be interested in the free 30-day POV to see if ADscan\n"
-                        "   can save your team ≥1 day per engagement.\n\n"
-                        "   [link=https://www.adscanpro.com/share?utm_source=cli&utm_medium=victory_da_compromise]"
-                        "Quick share link[/link]"
+                        "[bold green]You've just proven full domain compromise.[/bold green]\n\n"
+                        "Domain Admin access confirmed. This is the finding your client is paying you to discover.\n\n"
+                        "[bold]Next step:[/bold] Document it before the engagement window closes.\n"
+                        "Generate a board-ready report → "
+                        "[link=https://adscanpro.com/reports?utm_source=cli&utm_medium=victory_da_compromise]"
+                        "adscanpro.com/reports[/link]"
                     ),
                 )
+            # Star CTA at peak goodwill — domain compromise euphoria (Hormozi: give first, ask at max goodwill)
+            if should_show_victory_hint("github_star", "explicit"):
+                raw_url = "https://github.com/ADscanPro/adscan"
+                url = mark_passthrough(raw_url)
+                self.console.print()
+                print_info(
+                    f"[dim]Enjoying ADscan? A ⭐ on GitHub helps other pentesters discover it "
+                    f"→ [link={raw_url}]{url}[/link][/dim]"
+                )
+                mark_victory_hint_shown("github_star")
+                try:
+                    telemetry.capture("star_cta_shown", {"trigger": "domain_compromise"})
+                except Exception:
+                    pass
 
             if self.type == "ctf":
                 # CTF mode: run minimal post-compromise actions immediately (flags + DCSync).
@@ -20756,7 +21544,6 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             return privileged_groups
 
         if privileged_groups["Administrators"]:
-            marked_username = mark_sensitive(username, "user")
             print_warning(
                 f"The user {marked_username} is a member of the Administrators group"
             )
@@ -20765,7 +21552,6 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             self.ask_for_dcsync(domain, username, password)
 
         if privileged_groups["backup_operators"]:
-            marked_username = mark_sensitive(username, "user")
             print_warning(
                 f"The user {marked_username} is a member of the Backup Operators group"
             )
@@ -20791,7 +21577,6 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 print_info_debug(f"[backup-ops] escalation helper failed: {exc}")
 
         if privileged_groups["account_operators"]:
-            marked_username = mark_sensitive(username, "user")
             print_warning(
                 f"The user {marked_username} is a member of the Account Operators group"
             )
@@ -20930,6 +21715,53 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             print_error("LDAP privileged group lookup failed.")
             print_exception(show_locals=False, exception=exc)
             return None
+
+    def _format_privileged_debug_sample(
+        self,
+        values: list[str] | tuple[str, ...] | set[str],
+        *,
+        limit: int = 8,
+    ) -> str:
+        """Return a compact preview for privileged-membership debug logs."""
+        normalized = [str(value).strip() for value in values if str(value).strip()]
+        if not normalized:
+            return "none"
+
+        unique_sorted = sorted(dict.fromkeys(normalized))
+        preview = unique_sorted[:limit]
+        if len(unique_sorted) > limit:
+            remaining = len(unique_sorted) - limit
+            return f"{', '.join(preview)} ... (+{remaining} more)"
+        return ", ".join(preview)
+
+    def _debug_log_privileged_membership_resolution(
+        self,
+        *,
+        domain: str,
+        username: str,
+        source: str,
+        group_sids: list[str] | None = None,
+        group_names: list[str] | None = None,
+        privileged_groups: dict[str, object] | None = None,
+    ) -> None:
+        """Emit a structured debug line for privileged-group resolution."""
+        from adscan_internal.rich_output import mark_sensitive
+
+        marked_user = mark_sensitive(username, "user")
+        marked_domain = mark_sensitive(domain, "domain")
+        sid_preview = self._format_privileged_debug_sample(group_sids or [])
+        name_preview = self._format_privileged_debug_sample(group_names or [])
+        flags = {
+            "domain_admin": bool((privileged_groups or {}).get("domain_admin")),
+            "Administrators": bool((privileged_groups or {}).get("Administrators")),
+            "backup_operators": bool((privileged_groups or {}).get("backup_operators")),
+            "account_operators": bool((privileged_groups or {}).get("account_operators")),
+        }
+        print_info_debug(
+            "[priv-groups] resolved membership for "
+            f"{marked_user}@{marked_domain}: source={source} "
+            f"sids=[{sid_preview}] groups=[{name_preview}] flags={flags}"
+        )
 
     def _parse_privileged_group_output(self, raw_text: str) -> Dict[str, Any]:
         """Parse CLI output and return dict of privileged group memberships.
@@ -22949,6 +23781,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             attack_steps north.sevenkingdoms.local --max 50
             attack_steps north.sevenkingdoms.local jon.snow
             attack_steps north.sevenkingdoms.local --relation AdminTo
+            attack_steps north.sevenkingdoms.local --relation LocalCredToDomainReuse
             attack_steps north.sevenkingdoms.local jon.snow --relation AllowedToDelegate
         """
         from adscan_internal.cli.bloodhound import run_show_attack_steps
@@ -23025,7 +23858,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             print_info(
                 "Attack graph report validation is available with ADscan Report License."
             )
-            print_info("Learn more: https://www.adscanpro.com/report")
+            print_info("Learn more: https://www.adscanpro.com/reports")
             return
 
         errors = validate_attack_graph_findings(self, target_domain)
@@ -24196,7 +25029,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             initialize_report(self)
         except ImportError:
             print_info("Report initialization is available with ADscan Report License.")
-            print_info("Learn more: https://www.adscanpro.com/report")
+            print_info("Learn more: https://www.adscanpro.com/reports")
 
     def update_report_for_domain(self, domain):
         """Initialize or update the vulnerability report for a specific domain.
@@ -24680,6 +25513,17 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 f"[dns_find_dcs] Multiple DCs found ({len(self.dcs)}), searching for PDC specifically"
             )
             self.dns_find_pdc(domain)
+
+        # Upgrade lab inference now that pdc_hostname is known.  The scan-start
+        # call to _maybe_apply_domain_inference fired before DC discovery so
+        # infer_from_pdc_hostname had no data to work with at that point.
+        try:
+            from adscan_internal.cli.start import (  # noqa: PLC0415
+                _maybe_upgrade_inference_from_pdc,
+            )
+            _maybe_upgrade_inference_from_pdc(self, domain)
+        except Exception:  # noqa: BLE001
+            pass
 
     def update_domain_data(
         self,
@@ -26181,10 +27025,10 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         # only used for sanitized session uploads.
         self.workspace_save()
         print_info("Workspace saved.")
-        # Discrete session-end CTA for reports
-        self.console.print()
-        _reports_url = mark_passthrough("https://adscanpro.com/reports")
-        print_info(f"[dim]Need automated Word/PDF reports? -> {_reports_url}[/dim]")
+        # Context-aware exit: attribution (once-ever) → summary → CTAs
+        _maybe_ask_attribution(self)
+        _show_exit_summary(self)
+        _maybe_show_report_cta(self)
         # Build metadata from workspace context
         command_type = _resolve_command_type(shell=self)
         if _is_session_capture_allowed(command_type):
@@ -26235,8 +27079,12 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 # Case study metrics (TTFAP, TTFH only - TTFC/TTC in their own events)
                 "ttfap_minutes": ttfap_minutes,
                 "ttfh_minutes": ttfh_minutes,
-                "attack_paths_count": getattr(self, "_session_attack_paths_count", 0),
+                "attack_paths_count": _resolve_session_attack_paths_for_summary(
+                    self,
+                    fallback_count=getattr(self, "_session_attack_paths_count", 0),
+                ),
                 "credentials_count": getattr(self, "_session_credentials_count", 0),
+                "workspace_credentials_count": _count_workspace_credentials(self),
                 "hashes_count": getattr(self, "_session_hashes_count", 0),
             }
             telemetry.capture("session_end", session_summary)
