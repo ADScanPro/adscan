@@ -16011,6 +16011,31 @@ class PentestShell:
             credential_username=credential_username,
         )
 
+    def do_smb_sensitive_benchmark(self, args):
+        """Benchmark deterministic SMB sensitive-data backends.
+
+        Usage: smb_sensitive_benchmark <domain> [credential_username]
+        """
+        import shlex
+
+        from adscan_internal import print_error
+        from adscan_internal.cli.smb import run_smb_sensitive_benchmark
+
+        parts = shlex.split(str(args or ""))
+        if not parts or len(parts) > 2:
+            print_error(
+                "Usage: smb_sensitive_benchmark <domain> [credential_username]"
+            )
+            return
+
+        domain = parts[0]
+        credential_username = parts[1] if len(parts) == 2 else None
+        return run_smb_sensitive_benchmark(
+            self,
+            domain=domain,
+            credential_username=credential_username,
+        )
+
     def do_smb_guest_benchmark(self, args):
         """Benchmark guest SMB share strategies and compare speed/coverage.
 
@@ -18216,6 +18241,9 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
     def manspider_passwd_files(self, target_domain, username, password, shares, hosts):
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.services.smb_exclusion_policy import (
+            build_manspider_exclusion_args,
+        )
 
         if self._should_skip_unauth_followups(target_domain, username):
             return
@@ -18231,6 +18259,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         spider_output_arg = shlex.quote(spider_output_dir)
         manspider_bin = shlex.quote(str(self.manspider_path))
         hosts_str = " ".join(shlex.quote(str(host)) for host in hosts)
+        exclusion_args = build_manspider_exclusion_args()
         if self.domains_data[target_domain]["auth"] == "auth":
             auth = self.build_auth_nxc(
                 username, password, target_domain, kerberos=False
@@ -18238,15 +18267,13 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             command = (
                 f"{manspider_bin} --threads 256 {hosts_str} {auth} "
                 f"-c '\\$ANSIBLE_VAULT' -l {spider_output_arg} "
-                "--exclude-sharenames 'NETLOGON' 'IPC$' 'PRINT$' "
-                "--exclude-dirnames 'tools'"
+                f"{exclusion_args}"
             )
         else:
             command = (
                 f"{manspider_bin} --threads 256 {hosts_str} "
                 f"-c '\\$ANSIBLE_VAULT' -l {spider_output_arg} "
-                "--exclude-sharenames 'NETLOGON' 'IPC$' 'PRINT$' "
-                "--exclude-dirnames 'tools'"
+                f"{exclusion_args}"
             )
 
         # Professional operation header
@@ -18272,8 +18299,26 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             auth_username=username,
         )
 
-    def manspider_extensions(self, target_domain, username, password, shares, hosts):
+    def manspider_extensions(
+        self,
+        target_domain,
+        username,
+        password,
+        shares,
+        hosts,
+        *,
+        extensions=None,
+        phase=None,
+    ):
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.services.smb_sensitive_file_policy import (
+            SMB_SENSITIVE_SCAN_PHASE_DIRECT_SECRET_ARTIFACTS,
+            SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
+        )
+        from adscan_internal.services.smb_exclusion_policy import (
+            build_manspider_exclusion_args,
+            GLOBAL_SMB_HEAVY_ARTIFACT_MAX_FILESIZE_MB,
+        )
 
         if self._should_skip_unauth_followups(target_domain, username):
             return
@@ -18285,26 +18330,51 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             )
             return
         workspace_path = os.path.abspath(self.current_workspace_dir)
-        spider_output_dir = os.path.join(workspace_path, "smb", "spidering")
+        output_subdir = "artifacts"
+        if phase == SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS:
+            output_subdir = "heavy_artifacts"
+        elif phase == SMB_SENSITIVE_SCAN_PHASE_DIRECT_SECRET_ARTIFACTS:
+            output_subdir = "direct_secret_artifacts"
+        spider_output_dir = os.path.join(workspace_path, "smb", "spidering", output_subdir)
+        os.makedirs(spider_output_dir, exist_ok=True)
         spider_output_arg = shlex.quote(spider_output_dir)
         manspider_bin = shlex.quote(str(self.manspider_path))
         hosts_str = " ".join(shlex.quote(str(host)) for host in hosts)
+        exclusion_args = build_manspider_exclusion_args()
+        selected_extensions = list(extensions or [
+            "pfx",
+            "vdi",
+            "kdbx",
+            "kdb",
+            "conf",
+            "rsa",
+            "key",
+            "pem",
+            "psd1",
+            "psm1",
+            "pub",
+            "config",
+            "xlsm",
+            "zip",
+            "pcap",
+            "DMP",
+            "xlsx",
+        ])
+        extensions_arg = " ".join(shlex.quote(str(ext)) for ext in selected_extensions)
         if self.domains_data[target_domain]["auth"] == "auth":
             auth = self.build_auth_nxc(
                 username, password, target_domain, kerberos=False
             )
             command = (
                 f"{manspider_bin} --threads 256 {hosts_str} {auth} "
-                f"-e pfx vdi kdbx kdb conf rsa key pem psd1 psm1 pub config xlsm zip "
-                f"pcap DMP xlsx -l {spider_output_arg} "
-                f"--max-filesize 50M --exclude-sharenames 'NETLOGON' 'IPC$' 'PRINT$' --exclude-dirnames 'tools'"
+                f"-e {extensions_arg} -l {spider_output_arg} "
+                f"--max-filesize {GLOBAL_SMB_HEAVY_ARTIFACT_MAX_FILESIZE_MB}M {exclusion_args}"
             )
         else:
             command = (
                 f"{manspider_bin} --threads 256 {hosts_str} "
-                f"-e pfx vdi kdbx kdb conf rsa key pem psd1 psm1 pub config xlsm zip "
-                f"pcap DMP xlsx -l {spider_output_arg} "
-                f"--max-filesize 50M --exclude-sharenames 'NETLOGON' 'IPC$' 'PRINT$' --exclude-dirnames 'tools'"
+                f"-e {extensions_arg} -l {spider_output_arg} "
+                f"--max-filesize {GLOBAL_SMB_HEAVY_ARTIFACT_MAX_FILESIZE_MB}M {exclusion_args}"
             )
 
         # Professional operation header
@@ -18322,17 +18392,39 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         )
 
         print_info_debug(f"Command: {command}")
-        self.execute_manspider(
+        return self.execute_manspider(
             command,
             target_domain,
             "ext",
             hosts=hosts,
             shares=shares,
             auth_username=username,
+            loot_dir=spider_output_dir,
         )
 
-    def manspider_passw(self, target_domain, username, password, shares, hosts):
+    def manspider_passw(
+        self,
+        target_domain,
+        username,
+        password,
+        shares,
+        hosts,
+        *,
+        profile=None,
+        phase=None,
+    ):
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.services.credsweeper_service import (
+            get_default_credsweeper_jobs,
+        )
+        from adscan_internal.services.smb_exclusion_policy import (
+            build_manspider_exclusion_args,
+        )
+        from adscan_internal.services.smb_sensitive_file_policy import (
+            DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+            SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+            get_manspider_sensitive_extensions,
+        )
 
         if self._should_skip_unauth_followups(target_domain, username):
             return
@@ -18343,37 +18435,51 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
             )
             return
+        workspace_path = os.path.abspath(self.current_workspace_dir)
+        output_subdir = "passw"
+        if phase == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS:
+            output_subdir = "document_credentials"
+        spider_output_dir = os.path.join(workspace_path, "smb", "spidering", output_subdir)
+        os.makedirs(spider_output_dir, exist_ok=True)
+        spider_output_arg = shlex.quote(spider_output_dir)
         manspider_bin = shlex.quote(str(self.manspider_path))
         hosts_str = " ".join(shlex.quote(str(host)) for host in hosts)
+        exclusion_args = build_manspider_exclusion_args()
+        extensions_arg = " ".join(
+            shlex.quote(extension)
+            for extension in get_manspider_sensitive_extensions(
+                str(profile or DEFAULT_SMB_SENSITIVE_FILE_PROFILE)
+            )
+        )
         if self.domains_data[target_domain]["auth"] == "auth":
             auth = self.build_auth_nxc(
                 username, password, target_domain, kerberos=False
             )
             command = (
                 f"{manspider_bin} --threads 256 {hosts_str} {auth} "
-                "-c 'passw' 'contraseña' --no-download "
-                "--exclude-sharenames 'NETLOGON' 'IPC$' 'PRINT$' "
-                "--exclude-dirnames 'tools'"
+                f"-e {extensions_arg} -l {spider_output_arg} "
+                f"{exclusion_args}"
             )
         else:
             command = (
                 f"{manspider_bin} --threads 256 {hosts_str} "
-                "-c 'passw' 'contraseña' --no-download "
-                "--exclude-sharenames 'NETLOGON' 'IPC$' 'PRINT$' "
-                "--exclude-dirnames 'tools'"
+                f"-e {extensions_arg} -l {spider_output_arg} "
+                f"{exclusion_args}"
             )
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_info(
             f"Searching for possible passwords in the shares of domain {marked_target_domain}. This might take a while, please be patient"
         )
         print_info_debug(f"Command: {command}")
-        self.execute_manspider(
+        return self.execute_manspider(
             command,
             target_domain,
             "passw",
             hosts=hosts,
             shares=shares,
             auth_username=username,
+            loot_dir=spider_output_dir,
+            credsweeper_jobs=get_default_credsweeper_jobs(),
         )
 
     def do_netexec_smb_descriptions(self, domain):
@@ -19965,6 +20071,11 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
     def execute_netexec_gpp(self, command, type, domain: str | None = None):
         try:
+            from adscan_internal.integrations.netexec.parsers import (
+                parse_netexec_gpp_autologin_credentials,
+                parse_netexec_gpp_password_credentials,
+            )
+
             completed_process = self.run_command(command)
 
             # Handle cases where the command execution itself failed (e.g., timeout)
@@ -20013,7 +20124,21 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 )
 
                 if type == "passwords":
+                    parsed_passwords = parse_netexec_gpp_password_credentials(
+                        output_str
+                    )
+                    found_passwords = bool(parsed_passwords) or found_passwords
                     _update_gpp_report("gpp_passwords", found_passwords)
+                    if parsed_passwords and domain:
+                        for entry in parsed_passwords:
+                            credential_domain = (
+                                str(entry.domain or "").strip().lower() or domain
+                            )
+                            self.add_credential(
+                                credential_domain,
+                                entry.username,
+                                entry.password,
+                            )
                     if found_passwords and domain:
                         try:
                             from adscan_internal.services.report_service import (
@@ -20026,7 +20151,17 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                                 domain,
                                 key="gpp_passwords",
                                 value=True,
-                                details={"output_detected": "found_password"},
+                                details={
+                                    "output_detected": "found_password",
+                                    "credentials_detected": len(parsed_passwords),
+                                    "source_xmls": sorted(
+                                        {
+                                            str(entry.source_xml).strip()
+                                            for entry in parsed_passwords
+                                            if str(entry.source_xml or "").strip()
+                                        }
+                                    ),
+                                },
                                 evidence=[
                                     {
                                         "type": "log",
@@ -20040,7 +20175,21 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                         except Exception as exc:  # pragma: no cover
                             telemetry.capture_exception(exc)
                 elif type == "autologin":
+                    parsed_autologin = parse_netexec_gpp_autologin_credentials(
+                        output_str
+                    )
+                    found_autologin = bool(parsed_autologin) or found_autologin
                     _update_gpp_report("gpp_autologin", found_autologin)
+                    if parsed_autologin and domain:
+                        for entry in parsed_autologin:
+                            credential_domain = (
+                                str(entry.domain or "").strip().lower() or domain
+                            )
+                            self.add_credential(
+                                credential_domain,
+                                entry.username,
+                                entry.password,
+                            )
                     if found_autologin and domain:
                         try:
                             from adscan_internal.services.report_service import (
@@ -20053,7 +20202,17 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                                 domain,
                                 key="gpp_autologin",
                                 value=True,
-                                details={"output_detected": "autologin"},
+                                details={
+                                    "output_detected": "autologin",
+                                    "credentials_detected": len(parsed_autologin),
+                                    "source_xmls": sorted(
+                                        {
+                                            str(entry.source_xml).strip()
+                                            for entry in parsed_autologin
+                                            if str(entry.source_xml or "").strip()
+                                        }
+                                    ),
+                                },
                                 evidence=[
                                     {
                                         "type": "log",
@@ -20069,6 +20228,8 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
                 if found_passwords:
                     print_success("Passwords found in SYSVOL (GPP).")
+                elif type == "autologin" and found_autologin:
+                    print_success("Autologin credentials found in SYSVOL (GPP).")
                 else:
                     print_info(f"No GPP {type} found in SYSVOL.")
             else:
@@ -20388,7 +20549,15 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             print_exception(show_locals=False, exception=e)
 
     def execute_manspider(
-        self, command, domain, scan_type, hosts=None, shares=None, auth_username=None
+        self,
+        command,
+        domain,
+        scan_type,
+        hosts=None,
+        shares=None,
+        auth_username=None,
+        loot_dir=None,
+        credsweeper_jobs=None,
     ):
         """Delegate to smb module for consistency."""
         from adscan_internal.cli.smb import execute_manspider
@@ -20401,6 +20570,8 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             hosts=hosts,
             shares=shares,
             auth_username=auth_username,
+            loot_dir=loot_dir,
+            credsweeper_jobs=credsweeper_jobs,
         )
 
     def analyze_log_with_credsweeper(self, log_file: str) -> dict:
@@ -21004,15 +21175,12 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 logging=logging,
             )
             if result is None:
-                # Invalid credentials or execution error
-                if (
-                    domain in self.domains_data
-                    and "credentials" in self.domains_data[domain]
-                    and username in self.domains_data[domain]["credentials"]
-                ):
-                    del self.domains_data[domain]["credentials"][username]
-                    marked_username = mark_sensitive(username, "user")
-                    print_success(f"Credentials removed for user {marked_username}")
+                marked_username = mark_sensitive(username, "user")
+                marked_domain = mark_sensitive(domain, "domain")
+                print_info_debug(
+                    "[admin-count] LDAP adminCount check returned None for "
+                    f"{marked_username}@{marked_domain}; keeping stored credential."
+                )
                 return None
             return bool(result)
 
@@ -21091,7 +21259,14 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
         # Build the authentication part
         auth = f"-u '{username}' "
-        auth += f"-H {password}" if is_hash else f"-p '{password}'"
+        if is_hash:
+            auth += f"-H {password}"
+        else:
+            from adscan_internal.integrations.netexec.helpers import (
+                build_nxc_plaintext_password_arg,
+            )
+
+            auth += build_nxc_plaintext_password_arg(password)
 
         # Add the domain if provided
         if domain:
@@ -21653,6 +21828,8 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         """Resolve group membership using live LDAP queries (preferred)."""
         try:
             from adscan_internal.cli.ldap import (
+                clear_exact_ldap_connection_timeout_state,
+                consume_exact_ldap_connection_timeout_state,
                 get_recursive_user_groups_in_chain,
                 get_recursive_principal_group_sids_in_chain,
                 run_ldap_groupmembership_privileged,
@@ -21661,6 +21838,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 classify_privileged_membership_from_group_sids,
             )
 
+            clear_exact_ldap_connection_timeout_state(self)
             group_sids = get_recursive_principal_group_sids_in_chain(
                 self,
                 domain=domain,
@@ -21674,6 +21852,15 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 # Keep the legacy shape for any downstream consumers.
                 result["groups"] = []
                 return result
+            if consume_exact_ldap_connection_timeout_state(self):
+                marked_user = mark_sensitive(username, "user")
+                marked_domain = mark_sensitive(domain, "domain")
+                print_info_debug(
+                    "[priv-groups] LDAP group SID lookup hit the exact LDAP "
+                    f"connection-timeout signature for {marked_user}@{marked_domain}; "
+                    "skipping further LDAP fallbacks."
+                )
+                return None
             try:
                 marked_user = mark_sensitive(username, "user")
                 marked_domain = mark_sensitive(domain, "domain")
@@ -21694,6 +21881,15 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             if groups is not None:
                 raw_text = "\n".join(f"{group}@{domain}" for group in groups)
                 return self._parse_privileged_group_output(raw_text)
+            if consume_exact_ldap_connection_timeout_state(self):
+                marked_user = mark_sensitive(username, "user")
+                marked_domain = mark_sensitive(domain, "domain")
+                print_info_debug(
+                    "[priv-groups] LDAP recursive group lookup hit the exact LDAP "
+                    f"connection-timeout signature for {marked_user}@{marked_domain}; "
+                    "skipping NetExec LDAP module fallback."
+                )
+                return None
 
             # Only emit a debug hint when we are falling back within LDAP.
             try:
@@ -21707,9 +21903,17 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 pass
 
             # Fallback: legacy NetExec module output (non-recursive).
-            return run_ldap_groupmembership_privileged(
+            result = run_ldap_groupmembership_privileged(
                 self, domain=domain, username=username, password=password
             )
+            if result is None and consume_exact_ldap_connection_timeout_state(self):
+                marked_user = mark_sensitive(username, "user")
+                marked_domain = mark_sensitive(domain, "domain")
+                print_info_debug(
+                    "[priv-groups] LDAP groupmembership module hit the exact LDAP "
+                    f"connection-timeout signature for {marked_user}@{marked_domain}."
+                )
+            return result
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_error("LDAP privileged group lookup failed.")

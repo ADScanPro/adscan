@@ -51,6 +51,7 @@ from adscan_internal.integrations.netexec.parsers import (
     parse_netexec_group_members,
     parse_netexec_samaccountnames,
 )
+from adscan_internal.execution_outcomes import output_has_exact_ldap_connection_timeout
 from adscan_internal.path_utils import get_adscan_home, get_effective_user_home
 from adscan_internal.rich_output import (
     BRAND_COLORS,
@@ -1549,15 +1550,28 @@ def run_ldap_admincount_and_signing(
         domain,
         kerberos=False,
     )
+    workspace_cwd = shell.current_workspace_dir or shell._get_workspace_cwd()
+    ldap_dir_abs = domain_subpath(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.ldap_dir,
+    )
+    os.makedirs(ldap_dir_abs, exist_ok=True)
     marked_domain = mark_sensitive(domain, "domain")
     marked_username = mark_sensitive(username, "user")
-    base_log = f"domains/{marked_domain}/ldap/admincount_{marked_username}.log"
+    base_log = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.ldap_dir,
+        f"admincount_{username}.log",
+    )
 
     def _build_command(current_auth: str) -> str:
         return (
             f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} "
             f"{current_auth} --log {base_log} "
-            f"--query '(sAMAccountName={marked_username})' adminCount"
+            f"--query '(sAMAccountName={username})' adminCount"
         )
 
     command = _build_command(auth_str)
@@ -1567,6 +1581,14 @@ def run_ldap_admincount_and_signing(
 
     completed_process = shell.run_command(command, timeout=300)
     if not completed_process:
+        return None
+
+    if _is_exact_ldap_connection_timeout_result(completed_process):
+        mark_exact_ldap_connection_timeout_state(shell)
+        print_info_debug(
+            "[ldap-admincount] Exact LDAP connection timeout detected; "
+            "skipping Kerberos/signing fallback for adminCount."
+        )
         return None
 
     output_str = completed_process.stdout or ""
@@ -1586,6 +1608,13 @@ def run_ldap_admincount_and_signing(
         command = _build_command(auth_str)
         print_info_debug(f"[ldap-admincount] Command (Kerberos): {command}")
         completed_process = shell.run_command(command, timeout=300)
+        if _is_exact_ldap_connection_timeout_result(completed_process):
+            mark_exact_ldap_connection_timeout_state(shell)
+            print_info_debug(
+                "[ldap-admincount] Exact LDAP connection timeout detected after "
+                "Kerberos retry; stopping adminCount checks."
+            )
+            return None
         output_str = completed_process.stdout or ""
         errors_str = completed_process.stderr or ""
 
@@ -1668,6 +1697,14 @@ def run_ldap_groupmembership_privileged(
         )
         return None
 
+    if _is_exact_ldap_connection_timeout_result(completed_process):
+        mark_exact_ldap_connection_timeout_state(shell)
+        print_info_debug(
+            "[ldap-groupmembership] Exact LDAP connection timeout detected; "
+            "skipping further LDAP groupmembership handling."
+        )
+        return None
+
     if completed_process.returncode != 0:
         output_str = completed_process.stdout or ""
         errors_str = completed_process.stderr or ""
@@ -1688,6 +1725,53 @@ def run_ldap_groupmembership_privileged(
         return parser(output_str)
 
     return None
+
+
+def _combined_completed_process_output(
+    completed_process: subprocess.CompletedProcess[str] | None,
+) -> str:
+    """Return combined stdout/stderr text for a completed process."""
+    if not isinstance(completed_process, subprocess.CompletedProcess):
+        return ""
+    return f"{completed_process.stdout or ''}\n{completed_process.stderr or ''}"
+
+
+_EXACT_LDAP_TIMEOUT_STATE_ATTR = "_adscan_exact_ldap_timeout_state"
+
+
+def clear_exact_ldap_connection_timeout_state(shell: object) -> None:
+    """Clear the per-shell exact LDAP timeout state used by higher-level flows."""
+    try:
+        setattr(shell, _EXACT_LDAP_TIMEOUT_STATE_ATTR, False)
+    except Exception:
+        pass
+
+
+def mark_exact_ldap_connection_timeout_state(shell: object) -> None:
+    """Record that the current LDAP flow hit the exact NetExec timeout signature."""
+    try:
+        setattr(shell, _EXACT_LDAP_TIMEOUT_STATE_ATTR, True)
+    except Exception:
+        pass
+
+
+def consume_exact_ldap_connection_timeout_state(shell: object) -> bool:
+    """Return and clear the exact LDAP timeout state for the current shell."""
+    try:
+        value = bool(getattr(shell, _EXACT_LDAP_TIMEOUT_STATE_ATTR, False))
+        setattr(shell, _EXACT_LDAP_TIMEOUT_STATE_ATTR, False)
+        return value
+    except Exception:
+        return False
+
+
+def _is_exact_ldap_connection_timeout_result(
+    completed_process: subprocess.CompletedProcess[str] | None,
+) -> bool:
+    """Return True when a NetExec LDAP result matches the exact timeout signature."""
+    return output_has_exact_ldap_connection_timeout(
+        _combined_completed_process_output(completed_process)
+    )
 
 
 def _run_netexec_ldap_query_attribute_values(
@@ -1751,6 +1835,7 @@ def _run_netexec_ldap_query_attribute_values(
     saw_successful_query = False
 
     for auth_mode in auth_modes:
+        successful_empty_result = False
         auth_str = shell.build_auth_nxc(
             str(auth_username),
             str(auth_password),
@@ -1779,6 +1864,15 @@ def _run_netexec_ldap_query_attribute_values(
                     time.sleep(delay * (backoff ** (attempt - 1)))
                 continue
             if completed_process.returncode != 0:
+                if _is_exact_ldap_connection_timeout_result(completed_process):
+                    mark_exact_ldap_connection_timeout_state(shell)
+                    print_info_debug(
+                        "[ldap-in-chain] "
+                        f"{debug_label} hit the exact LDAP connection-timeout signature "
+                        f"({auth_label}, attempt {attempt}/{attempts}) via error result; "
+                        "stopping retries and skipping auth fallback."
+                    )
+                    return None
                 output = str(completed_process.stderr or "").strip() or str(
                     completed_process.stdout or ""
                 ).strip()
@@ -1803,6 +1897,17 @@ def _run_netexec_ldap_query_attribute_values(
             if not require_non_empty:
                 return []
 
+            successful_empty_result = True
+            if _is_exact_ldap_connection_timeout_result(completed_process):
+                mark_exact_ldap_connection_timeout_state(shell)
+                print_info_debug(
+                    "[ldap-in-chain] "
+                    f"{debug_label} hit the exact LDAP connection-timeout signature "
+                    f"({auth_label}, attempt {attempt}/{attempts}); stopping retries "
+                    "and skipping auth fallback."
+                )
+                return None
+
             if attempt < attempts:
                 print_info_debug(
                     "[ldap-in-chain] "
@@ -1810,6 +1915,14 @@ def _run_netexec_ldap_query_attribute_values(
                     f"({auth_label}, attempt {attempt}/{attempts}); retrying."
                 )
                 time.sleep(delay * (backoff ** (attempt - 1)))
+
+        if auth_mode and successful_empty_result:
+            print_info_debug(
+                "[ldap-in-chain] "
+                f"{debug_label} exhausted Kerberos retries with 0 {attribute} values; "
+                "skipping NTLM fallback."
+            )
+            return []
 
     if saw_successful_query:
         return []

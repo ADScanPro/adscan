@@ -97,20 +97,17 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
         "Exploiting_Active_Directory",
         "Persisting_Active_Directory",
     ),
-    "dockerlabs": (
-        "dc01",
-        "dc02",
-        "dc03",
-        "web",
-        "sql",
-        "exchange",
-    ),
-    "vulnhub": (
-        "Zico2",
-        "FristiLeaks",
-        "Breach",
-        "HackLAB",
-    ),
+    # DockerLabs currently exposes a large public catalog, but its official API
+    # and public writeups did not provide enough reliable AD-specific machine
+    # fingerprints to justify whitelisting generic host labels.  Keeping
+    # placeholders such as ``dc01``/``web``/``sql`` created false positives in
+    # domain inference, so we intentionally leave the provider empty until
+    # machine names, domains, and PDC hostnames are verified.
+    "dockerlabs": (),
+    # VulnHub suffers from the same issue here: the previous entries were
+    # generic/non-AD boxes and were not backed by stable AD fingerprints.
+    # Leave the provider empty rather than risking incorrect inference.
+    "vulnhub": (),
     "goad": (),
     "proving_grounds": (),
     "other": (),
@@ -198,4 +195,3 @@ def is_lab_whitelisted(provider: str | None, lab_name: str | None) -> bool:
     return str(lab_name).strip().lower() in _AD_LABS_LOWER_BY_PROVIDER.get(
         canonical, set()
     )
-

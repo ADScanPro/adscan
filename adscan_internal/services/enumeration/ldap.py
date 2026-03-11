@@ -19,6 +19,9 @@ from adscan_internal.subprocess_env import (
 from adscan_internal.integrations.netexec.parsers import (
     parse_netexec_ldap_query_objects,
 )
+from adscan_internal.execution_outcomes import (
+    result_is_exact_ldap_connection_timeout,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -269,6 +272,18 @@ class LDAPEnumerationMixin:
 
             exec_fn = executor or _default_executor
             result = exec_fn(command, timeout)
+            if result_is_exact_ldap_connection_timeout(result):
+                self.logger.warning(
+                    "LDAP user enumeration hit the exact NetExec LDAP timeout signature; "
+                    "treating LDAP as unavailable for this attempt."
+                )
+                self.parent._emit_progress(
+                    scan_id=scan_id,
+                    phase="ldap_user_enumeration",
+                    progress=1.0,
+                    message="LDAP user enumeration unavailable (connection timeout)",
+                )
+                return []
 
             users = []
             if result.returncode == 0 and result.stdout:
@@ -368,6 +383,18 @@ class LDAPEnumerationMixin:
 
             exec_fn = executor or _default_executor
             result = exec_fn(command, timeout)
+            if result_is_exact_ldap_connection_timeout(result):
+                self.logger.warning(
+                    "LDAP group enumeration hit the exact NetExec LDAP timeout signature; "
+                    "treating LDAP as unavailable for this attempt."
+                )
+                self.parent._emit_progress(
+                    scan_id=scan_id,
+                    phase="ldap_group_enumeration",
+                    progress=1.0,
+                    message="LDAP group enumeration unavailable (connection timeout)",
+                )
+                return []
 
             groups = []
             if result.returncode == 0 and result.stdout:

@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import DefaultDict
+import ast
 import re
 
 from adscan_internal.spraying import normalize_username
@@ -188,6 +189,197 @@ def parse_netexec_exec_status(output: str) -> NetexecExecStatus:
         method=method,
         not_found=[entry.strip() for entry in not_found if entry.strip()],
     )
+
+
+@dataclass(frozen=True)
+class ParsedGppAutologinCredential:
+    """Parsed credential entry emitted by NetExec/CME ``gpp_autologin``."""
+
+    username: str
+    password: str
+    domain: str | None = None
+    source_xml: str | None = None
+
+
+@dataclass(frozen=True)
+class ParsedGppPasswordCredential:
+    """Parsed credential entry emitted by NetExec/CME ``gpp_password``."""
+
+    username: str
+    password: str
+    domain: str | None = None
+    source_xml: str | None = None
+
+
+def _parse_gpp_autologin_list(raw_value: str) -> list[str]:
+    """Parse a Python-like list fragment from NetExec GPP autologin output."""
+    candidate = str(raw_value or "").strip()
+    if not candidate:
+        return []
+    try:
+        parsed = ast.literal_eval(candidate)
+    except (SyntaxError, ValueError):
+        parsed = None
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return []
+
+
+def parse_netexec_gpp_autologin_credentials(
+    output: str,
+) -> list[ParsedGppAutologinCredential]:
+    """Parse NetExec/CME ``gpp_autologin`` output into credential entries."""
+    if not output:
+        return []
+
+    normalized = normalize_cli_output(output)
+    found_credentials_re = re.compile(
+        r"Found credentials in\s+(.+?Registry\.xml)",
+        re.IGNORECASE,
+    )
+    usernames_re = re.compile(r"Usernames:\s*(\[[^\]]*\])", re.IGNORECASE)
+    domains_re = re.compile(r"Domains:\s*(\[[^\]]*\])", re.IGNORECASE)
+    passwords_re = re.compile(r"Passwords:\s*(\[[^\]]*\])", re.IGNORECASE)
+
+    parsed: list[ParsedGppAutologinCredential] = []
+    current_source_xml: str | None = None
+    pending_usernames: list[str] = []
+    pending_domains: list[str] = []
+    pending_passwords: list[str] = []
+
+    def _flush_pending() -> None:
+        nonlocal pending_usernames, pending_domains, pending_passwords
+        if not pending_usernames or not pending_passwords:
+            return
+
+        domains = pending_domains or [None]
+        for idx, username in enumerate(pending_usernames):
+            password = pending_passwords[idx] if idx < len(pending_passwords) else None
+            if not username or not password:
+                continue
+            domain_value = domains[idx] if idx < len(domains) else domains[-1]
+            parsed.append(
+                ParsedGppAutologinCredential(
+                    username=username,
+                    password=password,
+                    domain=domain_value,
+                    source_xml=current_source_xml,
+                )
+            )
+        pending_usernames = []
+        pending_domains = []
+        pending_passwords = []
+
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        source_match = found_credentials_re.search(line)
+        if source_match:
+            _flush_pending()
+            current_source_xml = source_match.group(1).strip()
+            continue
+
+        usernames_match = usernames_re.search(line)
+        if usernames_match:
+            pending_usernames = _parse_gpp_autologin_list(usernames_match.group(1))
+            if pending_usernames and pending_passwords:
+                _flush_pending()
+            continue
+
+        domains_match = domains_re.search(line)
+        if domains_match:
+            pending_domains = _parse_gpp_autologin_list(domains_match.group(1))
+            continue
+
+        passwords_match = passwords_re.search(line)
+        if passwords_match:
+            pending_passwords = _parse_gpp_autologin_list(passwords_match.group(1))
+            if pending_usernames and pending_passwords:
+                _flush_pending()
+            continue
+
+    _flush_pending()
+    return parsed
+
+
+def parse_netexec_gpp_password_credentials(
+    output: str,
+) -> list[ParsedGppPasswordCredential]:
+    """Parse NetExec/CME ``gpp_password`` output into credential entries."""
+    if not output:
+        return []
+
+    normalized = normalize_cli_output(output)
+    found_credentials_re = re.compile(
+        r"Found credentials in\s+(.+?\.xml)",
+        re.IGNORECASE,
+    )
+    password_re = re.compile(r"Password:\s*(.+?)\s*$", re.IGNORECASE)
+    username_re = re.compile(r"userName:\s*(.+?)\s*$", re.IGNORECASE)
+
+    parsed: list[ParsedGppPasswordCredential] = []
+    current_source_xml: str | None = None
+    pending_password: str | None = None
+    pending_username: str | None = None
+
+    def _flush_pending() -> None:
+        nonlocal pending_password, pending_username
+        if not pending_password or not pending_username:
+            return
+
+        raw_user = str(pending_username).strip()
+        domain_value: str | None = None
+        username_value = raw_user
+        if "\\" in raw_user:
+            domain_part, username_part = raw_user.split("\\", 1)
+            domain_value = domain_part.strip() or None
+            username_value = username_part.strip()
+        elif "/" in raw_user:
+            domain_part, username_part = raw_user.split("/", 1)
+            domain_value = domain_part.strip() or None
+            username_value = username_part.strip()
+
+        if username_value and pending_password:
+            parsed.append(
+                ParsedGppPasswordCredential(
+                    username=username_value,
+                    password=str(pending_password).strip(),
+                    domain=domain_value,
+                    source_xml=current_source_xml,
+                )
+            )
+        pending_password = None
+        pending_username = None
+
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        source_match = found_credentials_re.search(line)
+        if source_match:
+            _flush_pending()
+            current_source_xml = source_match.group(1).strip()
+            continue
+
+        password_match = password_re.search(line)
+        if password_match:
+            pending_password = password_match.group(1).strip()
+            if pending_username:
+                _flush_pending()
+            continue
+
+        username_match = username_re.search(line)
+        if username_match:
+            pending_username = username_match.group(1).strip()
+            if pending_password:
+                _flush_pending()
+            continue
+
+    _flush_pending()
+    return parsed
 
 
 def parse_netexec_sysvol_listing(output: str) -> list[str]:

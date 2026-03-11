@@ -3982,10 +3982,11 @@ def _detect_gpu_docker_run_args() -> tuple[str, ...]:
 def _ensure_host_mount_dir_writable(path: Path, *, description: str) -> bool:
     """Ensure host mount directory exists and is writable by the current user.
 
-    Docker-mode runs the container entrypoint as root, fixes mount ownership
-    inside the container (affecting the host bind mount), and then drops
-    privileges to the host UID/GID. This avoids root-owned files on the host
-    without requiring the host to run privileged `chown` commands.
+    Docker-mode runs the container entrypoint as root, repairs ownership
+    inside the container on the bind-mounted tree without traversing nested
+    mount points, and then drops privileges to the host UID/GID. This avoids
+    root-owned files on the host without trying to recurse into CIFS mounts or
+    requiring the host to run privileged `chown` commands.
 
     Args:
         path: Host path that will be bind-mounted into the container.

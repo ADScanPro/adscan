@@ -32,6 +32,7 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.services.network_discovery import (
     extract_netbios,
+    infer_domain_from_ldap_banner,
     infer_domain_from_smb_banner,
 )
 from adscan_internal.services.enumeration.network import is_computer_dc_for_domain
@@ -164,6 +165,8 @@ def confidence_from_methods(methods: list[str]) -> str:
     """Return a confidence label based on discovery methods."""
     if "hosts" in methods:
         return "[green]High[/green]"
+    if "ldap" in methods:
+        return "[green]High[/green]"
     if "smb" in methods:
         return "[yellow]Medium[/yellow]"
     if "ptr" in methods:
@@ -234,6 +237,7 @@ def infer_domain_from_candidate_ip(
     *,
     candidate_ip: str,
     timeout_seconds: int = 60,
+    open_tcp_ports: set[int] | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Infer a domain from a candidate DC/DNS IP using robust fallbacks.
 
@@ -241,10 +245,11 @@ def infer_domain_from_candidate_ip(
         shell: Active shell instance.
         candidate_ip: Candidate DC/DNS IP address.
         timeout_seconds: Timeout for SMB fingerprinting probe.
+        open_tcp_ports: Optional open-port hints already known for the candidate.
 
     Returns:
         Tuple of (domain, method, hostname) where method is one of:
-        "hosts", "smb", "ptr". Values are None when inference fails.
+        "hosts", "ldap", "smb", "ptr". Values are None when inference fails.
     """
     ip_clean = (candidate_ip or "").strip()
     if not ip_clean:
@@ -258,11 +263,31 @@ def infer_domain_from_candidate_ip(
         if inferred and fqdn:
             return inferred, "hosts", fqdn
 
-    smb_domain, smb_hostname = infer_domain_from_smb_banner(
-        shell, target_ip=ip_clean, timeout_seconds=timeout_seconds
-    )
-    if smb_domain:
-        return smb_domain, "smb", smb_hostname
+    if open_tcp_ports is None or 389 in open_tcp_ports:
+        ldap_domain, ldap_hostname = infer_domain_from_ldap_banner(
+            shell, target_ip=ip_clean, timeout_seconds=timeout_seconds
+        )
+        if ldap_domain:
+            return ldap_domain, "ldap", ldap_hostname
+    else:
+        marked_ip = mark_sensitive(ip_clean, "ip")
+        print_info_debug(
+            f"[domain_infer] Skipping LDAP fingerprinting for {marked_ip}; port 389 "
+            "was not open in candidate discovery."
+        )
+
+    if open_tcp_ports is None or 445 in open_tcp_ports:
+        smb_domain, smb_hostname = infer_domain_from_smb_banner(
+            shell, target_ip=ip_clean, timeout_seconds=timeout_seconds
+        )
+        if smb_domain:
+            return smb_domain, "smb", smb_hostname
+    else:
+        marked_ip = mark_sensitive(ip_clean, "ip")
+        print_info_debug(
+            f"[domain_infer] Skipping SMB fingerprinting for {marked_ip}; port 445 "
+            "was not open in candidate discovery."
+        )
 
     fqdn = service.reverse_resolve_fqdn_robust(ip_clean, preferred_resolvers=[ip_clean])
     inferred = infer_domain_from_fqdn(fqdn or "") if fqdn else None
@@ -277,6 +302,7 @@ def discover_domains_from_candidate_ips(
     *,
     candidate_ips: list[str],
     timeout_seconds: int = 60,
+    candidate_open_ports: dict[str, set[int]] | None = None,
 ) -> list[DomainCandidateSummary]:
     """Infer domains from a list of candidate DC/DNS IPs.
 
@@ -284,6 +310,7 @@ def discover_domains_from_candidate_ips(
         shell: Active shell instance.
         candidate_ips: List of IPs to inspect.
         timeout_seconds: Timeout for SMB fingerprinting probes.
+        candidate_open_ports: Optional per-candidate open-port hints from Nmap.
 
     Returns:
         A list of DomainCandidateSummary entries (sorted by domain).
@@ -291,7 +318,10 @@ def discover_domains_from_candidate_ips(
     domain_map: dict[str, dict[str, set[str]]] = {}
     for ip in candidate_ips or []:
         domain, method, hostname = infer_domain_from_candidate_ip(
-            shell, candidate_ip=ip, timeout_seconds=timeout_seconds
+            shell,
+            candidate_ip=ip,
+            timeout_seconds=timeout_seconds,
+            open_tcp_ports=(candidate_open_ports or {}).get(ip),
         )
         if not domain:
             continue
@@ -325,6 +355,272 @@ class PdcPreflightResult:
     action: Literal["use", "reenter", "fallback"]
     domain: str
     pdc_ip: str | None = None
+
+
+@dataclass(frozen=True)
+class DomainValidationAttempt:
+    """One strict DNS validation attempt for a candidate domain namespace."""
+
+    domain: str
+    ok: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class DomainValidationOutcome:
+    """DNS validation outcome, including parent-domain fallback attempts."""
+
+    requested_domain: str
+    selected_domain: str
+    ok: bool
+    error: str | None
+    attempts: list[DomainValidationAttempt]
+
+
+@dataclass(frozen=True)
+class CandidateIpFingerprintEvidence:
+    """Best-effort fingerprint evidence gathered from a candidate DC/DNS IP."""
+
+    domain: str
+    method: str
+    hostname: str | None
+
+
+def _candidate_domains_for_dns_validation(domain: str) -> list[str]:
+    """Return progressively broader domain candidates for strict DNS validation."""
+    normalized = (domain or "").strip().rstrip(".").lower()
+    if not normalized:
+        return []
+
+    labels = [label for label in normalized.split(".") if label]
+    candidates = [normalized]
+    if len(labels) >= 3:
+        parent_domain = ".".join(labels[1:])
+        if parent_domain and parent_domain not in candidates:
+            candidates.append(parent_domain)
+    return candidates
+
+
+def _validate_domain_with_resolver_fallbacks(
+    shell: Any,
+    *,
+    domain: str,
+    resolver_ip: str,
+) -> DomainValidationOutcome:
+    """Validate a domain against a resolver, optionally retrying the parent domain."""
+    attempts: list[DomainValidationAttempt] = []
+    requested_domain = (domain or "").strip().rstrip(".").lower()
+    candidates = _candidate_domains_for_dns_validation(requested_domain)
+    marked_requested = mark_sensitive(requested_domain, "domain")
+    marked_resolver = mark_sensitive(resolver_ip, "ip")
+
+    print_info_debug(
+        f"[pdc_preflight] DNS validation candidates for {marked_requested} via "
+        f"{marked_resolver}: {candidates}"
+    )
+
+    for idx, candidate_domain in enumerate(candidates, start=1):
+        marked_candidate = mark_sensitive(candidate_domain, "domain")
+        print_info_debug(
+            f"[pdc_preflight] DNS validation attempt {idx}/{len(candidates)}: "
+            f"domain={marked_candidate} resolver={marked_resolver}"
+        )
+        ok, error = _validate_dns_with_resolver(
+            shell,
+            domain=candidate_domain,
+            resolver_ip=resolver_ip,
+        )
+        attempts.append(
+            DomainValidationAttempt(
+                domain=candidate_domain,
+                ok=ok,
+                error=error,
+            )
+        )
+        if ok:
+            if candidate_domain != requested_domain:
+                print_info_debug(
+                    f"[pdc_preflight] Parent-domain fallback succeeded for "
+                    f"{marked_requested}: {marked_candidate} via {marked_resolver}"
+                )
+            return DomainValidationOutcome(
+                requested_domain=requested_domain,
+                selected_domain=candidate_domain,
+                ok=True,
+                error=None,
+                attempts=attempts,
+            )
+
+    last_error = attempts[-1].error if attempts else "invalid_domain"
+    print_info_debug(
+        f"[pdc_preflight] DNS validation exhausted all candidates for "
+        f"{marked_requested} via {marked_resolver}; final_error={last_error}"
+    )
+    return DomainValidationOutcome(
+        requested_domain=requested_domain,
+        selected_domain=requested_domain,
+        ok=False,
+        error=last_error,
+        attempts=attempts,
+    )
+
+
+def _format_domain_validation_attempt_lines(
+    attempts: list[DomainValidationAttempt],
+) -> list[str]:
+    """Return human-readable lines describing validation attempts."""
+    reason_label = {
+        "validation_error": "validation error",
+        "no_servers": "resolver did not answer",
+        "no_targets": "no SRV targets returned",
+        "dns_validation_failed": "DNS validation failed",
+        "timeout": "query timed out",
+        "servfail": "SERVFAIL",
+        "no_answer": "no DNS answer",
+    }
+    lines: list[str] = []
+    for item in attempts:
+        status = "[green]OK[/green]" if item.ok else "[red]FAIL[/red]"
+        reason = reason_label.get(item.error or "", item.error or "unknown")
+        lines.append(
+            f"• {status} {mark_sensitive(item.domain, 'domain')}: {reason}"
+        )
+    return lines
+
+
+def _inspect_dc_like_candidate_ip(
+    shell: Any,
+    *,
+    candidate_ip: str,
+    timeout_seconds: int = 20,
+) -> CandidateIpFingerprintEvidence | None:
+    """Return best-effort AD/DC-like evidence from a candidate IP."""
+    domain, method, hostname = infer_domain_from_candidate_ip(
+        shell,
+        candidate_ip=candidate_ip,
+        timeout_seconds=timeout_seconds,
+    )
+    if not domain or not method:
+        return None
+    return CandidateIpFingerprintEvidence(
+        domain=domain,
+        method=method,
+        hostname=hostname,
+    )
+
+
+def _format_candidate_ip_evidence_lines(
+    *,
+    evidence: CandidateIpFingerprintEvidence | None,
+    requested_domain: str,
+    selected_domain: str,
+) -> list[str]:
+    """Render extra diagnosis lines from the candidate IP fingerprint evidence."""
+    if evidence is None:
+        return []
+
+    marked_domain = mark_sensitive(evidence.domain, "domain")
+    method_label = {
+        "hosts": "/etc/hosts",
+        "ldap": "LDAP fingerprint",
+        "smb": "SMB fingerprint",
+        "ptr": "PTR result",
+    }.get(evidence.method, evidence.method.upper())
+    detail_value = marked_domain
+    if evidence.hostname and evidence.method in {"ldap", "smb"}:
+        detail_value = (
+            f"{marked_domain} (host: {mark_sensitive(evidence.hostname, 'host')})"
+        )
+
+    lines = [
+        "[bold]Additional host evidence:[/bold]",
+        f"• {method_label}: {detail_value}",
+    ]
+    if evidence.domain == selected_domain:
+        lines.append(
+            "• The resolved IP still looks AD-related for the validated domain, but DNS SRV did not answer."
+        )
+    elif evidence.domain == requested_domain:
+        lines.append(
+            "• The resolved IP still looks AD-related for the original domain candidate, but DNS SRV did not answer."
+        )
+    else:
+        lines.append(
+            "• The resolved IP looks AD-related, but it points to a different domain namespace than the one being validated."
+        )
+    return lines
+
+
+def _build_domain_validation_next_step(
+    *,
+    validation: DomainValidationOutcome,
+    fingerprint_evidence: CandidateIpFingerprintEvidence | None,
+) -> str:
+    """Return the most actionable next-step guidance for DNS validation failures."""
+    if fingerprint_evidence:
+        marked_evidence_domain = mark_sensitive(fingerprint_evidence.domain, "domain")
+        if fingerprint_evidence.domain == validation.selected_domain:
+            return (
+                "This host still looks like a DC for the validated domain. "
+                "Verify that DNS queries to port 53/TCP+UDP are actually allowed from your network path."
+            )
+        if fingerprint_evidence.domain == validation.requested_domain:
+            return (
+                "This host still looks like a DC for the original domain candidate. "
+                "Retry with that domain explicitly or verify whether the DNS service is filtered."
+            )
+        return (
+            f"Try {marked_evidence_domain} as the domain for this host, or use discovery "
+            "to enumerate a larger AD-connected range."
+        )
+
+    if validation.selected_domain != validation.requested_domain:
+        return (
+            f"Try the validated parent domain {mark_sensitive(validation.selected_domain, 'domain')}, "
+            "or re-enter the values if you expected the original subdomain to resolve."
+        )
+    return "Verify the host is a DC/DNS for that domain, try the parent domain if appropriate, or use discovery."
+
+
+def _capture_domain_validation_telemetry(
+    *,
+    mode_label: str,
+    validation: DomainValidationOutcome,
+    fingerprint_evidence: CandidateIpFingerprintEvidence | None = None,
+) -> None:
+    """Capture a compact telemetry event for strict DNS validation attempts."""
+    used_parent = validation.selected_domain != validation.requested_domain
+    if validation.ok and used_parent:
+        result = "parent_fallback"
+    elif validation.ok:
+        result = "validated"
+    else:
+        result = "failed"
+
+    telemetry.capture(
+        "pdc_preflight_dns_validation",
+        properties={
+            "mode": mode_label,
+            "result": result,
+            "attempt_count": len(validation.attempts),
+            "used_parent_domain": used_parent,
+            "final_error": validation.error,
+            "fingerprint_method": (
+                fingerprint_evidence.method if fingerprint_evidence else None
+            ),
+            "fingerprint_domain": (
+                fingerprint_evidence.domain if fingerprint_evidence else None
+            ),
+            "fingerprint_domain_matches_requested": bool(
+                fingerprint_evidence
+                and fingerprint_evidence.domain == validation.requested_domain
+            ),
+            "fingerprint_domain_matches_selected": bool(
+                fingerprint_evidence
+                and fingerprint_evidence.domain == validation.selected_domain
+            ),
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -583,11 +879,40 @@ def preflight_domain_pdc_noninteractive(
     """Best-effort DC/PDC preflight without prompting."""
     marked_domain = mark_sensitive(domain, "domain")
     marked_candidate = mark_sensitive(candidate_ip, "ip")
-    dns_ok, dns_error = _validate_dns_with_resolver(
+    validation = _validate_domain_with_resolver_fallbacks(
         shell,
         domain=domain,
         resolver_ip=candidate_ip,
     )
+    dns_ok = validation.ok
+    dns_error = validation.error
+    effective_domain = validation.selected_domain
+    fingerprint_evidence = None
+    if not dns_ok:
+        fingerprint_evidence = _inspect_dc_like_candidate_ip(
+            shell,
+            candidate_ip=candidate_ip,
+        )
+    _capture_domain_validation_telemetry(
+        mode_label=mode_label,
+        validation=validation,
+        fingerprint_evidence=fingerprint_evidence,
+    )
+    if effective_domain != domain:
+        print_info(
+            "Primary domain DNS validation failed; parent domain fallback succeeded: "
+            f"{mark_sensitive(domain, 'domain')} -> {mark_sensitive(effective_domain, 'domain')}"
+        )
+        telemetry.capture(
+            "pdc_preflight_domain_fallback",
+            properties={
+                "mode": mode_label,
+                "result": "auto_switched_parent_domain",
+            },
+        )
+        domain = effective_domain
+        marked_domain = mark_sensitive(domain, "domain")
+
     if dns_error == "validation_error":
         print_warning(
             "Failed to verify DNS configuration; proceeding with the provided DC target."
@@ -602,11 +927,26 @@ def preflight_domain_pdc_noninteractive(
         print_warning(
             "DNS validation did not succeed; proceeding with the provided DC target."
         )
+        next_step = _build_domain_validation_next_step(
+            validation=validation,
+            fingerprint_evidence=fingerprint_evidence,
+        )
         if dns_error:
             print_info_verbose(
                 f"[pdc_preflight_noninteractive] DNS SRV check failed for {marked_domain} "
                 f"using {marked_candidate}: {dns_error}"
             )
+            for attempt_line in _format_domain_validation_attempt_lines(validation.attempts):
+                print_info_debug(
+                    f"[pdc_preflight_noninteractive] {attempt_line}"
+                )
+        for evidence_line in _format_candidate_ip_evidence_lines(
+            evidence=fingerprint_evidence,
+            requested_domain=validation.requested_domain,
+            selected_domain=validation.selected_domain,
+        ):
+            print_info(f"{evidence_line}")
+        print_info(f"[bold]Next:[/bold] {next_step}")
         return PdcPreflightResult(action="use", domain=domain, pdc_ip=candidate_ip)
 
     selection = _select_reachable_dc_resolver(
@@ -658,21 +998,89 @@ def preflight_domain_pdc_interactive(
     marked_candidate = mark_sensitive(candidate_ip, "ip")
 
     # Ensure DNS is usable for this domain before attempting SRV-based validation.
-    dns_ok, dns_error = _validate_dns_with_resolver(
+    validation = _validate_domain_with_resolver_fallbacks(
         shell,
         domain=domain,
         resolver_ip=candidate_ip,
     )
+    dns_ok = validation.ok
+    dns_error = validation.error
+    fingerprint_evidence = None
+    if not dns_ok:
+        fingerprint_evidence = _inspect_dc_like_candidate_ip(
+            shell,
+            candidate_ip=candidate_ip,
+        )
+    _capture_domain_validation_telemetry(
+        mode_label=mode_label,
+        validation=validation,
+        fingerprint_evidence=fingerprint_evidence,
+    )
+    if validation.selected_domain != domain:
+        parent_domain = validation.selected_domain
+        marked_parent = mark_sensitive(parent_domain, "domain")
+        attempt_lines = _format_domain_validation_attempt_lines(validation.attempts)
+        print_panel(
+            "[bold yellow]The original domain did not validate, but a parent-domain fallback did.[/bold yellow]\n\n"
+            f"Provided domain: {marked_domain}\n"
+            f"Fallback domain: {marked_parent}\n"
+            f"IP: {marked_candidate}\n\n"
+            + "\n".join(attempt_lines)
+            + "\n\n[bold]Next:[/bold] Proceed with the validated parent domain or re-enter values.",
+            title="[bold]🧭 Parent Domain Fallback[/bold]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        print_info_debug(
+            f"[pdc_preflight] parent-domain fallback selected: "
+            f"{marked_domain} -> {marked_parent} via {marked_candidate}"
+        )
+        telemetry.capture(
+            "pdc_preflight_domain_fallback",
+            properties={
+                "mode": mode_label,
+                "result": "interactive_parent_domain_available",
+            },
+        )
+        if Confirm.ask(
+            Text(
+                f"Use {marked_parent} as the domain for validation and continue?",
+                style="cyan",
+            ),
+            default=True,
+        ):
+            domain = parent_domain
+            marked_domain = marked_parent
+        else:
+            if Confirm.ask(
+                Text("Re-enter the domain and DC/PDC IP?", style="cyan"),
+                default=True,
+            ):
+                return PdcPreflightResult(action="reenter", domain=domain)
+            return PdcPreflightResult(action="fallback", domain=domain)
+
     if dns_error == "validation_error":
         print_error("Failed to verify DNS configuration.")
 
     if not dns_ok:
+        attempt_lines = _format_domain_validation_attempt_lines(validation.attempts)
+        evidence_lines = _format_candidate_ip_evidence_lines(
+            evidence=fingerprint_evidence,
+            requested_domain=validation.requested_domain,
+            selected_domain=validation.selected_domain,
+        )
+        next_step = _build_domain_validation_next_step(
+            validation=validation,
+            fingerprint_evidence=fingerprint_evidence,
+        )
         print_panel(
             "[bold]We couldn't validate the DC/PDC IP.[/bold]\n\n"
             f"Domain: {marked_domain}\n"
             f"IP: {marked_candidate}\n\n"
-            "[yellow]DNS is not working for this domain with the provided IP.[/yellow]\n\n"
-            "[bold]Next:[/bold] Verify the host is a DC/DNS for that domain, or use discovery.",
+            "[yellow]The host resolved, but it did not answer DNS SRV queries for the tested domain namespace.[/yellow]\n\n"
+            + "\n".join(attempt_lines)
+            + ("\n\n" + "\n".join(evidence_lines) if evidence_lines else "")
+            + f"\n\n[bold]Next:[/bold] {next_step}",
             title="[bold]🧭 Domain Validation Failed[/bold]",
             border_style="red",
             padding=(1, 2),
@@ -681,6 +1089,44 @@ def preflight_domain_pdc_interactive(
             print_info_debug(
                 f"[pdc_preflight] DNS SRV check failed for {marked_domain} "
                 f"using {marked_candidate}: {dns_error}"
+            )
+            for attempt_line in attempt_lines:
+                print_info_debug(f"[pdc_preflight] {attempt_line}")
+            if fingerprint_evidence:
+                print_info_debug(
+                    "[pdc_preflight] candidate IP still looks AD-related via "
+                    f"{fingerprint_evidence.method}: "
+                    f"{mark_sensitive(fingerprint_evidence.domain, 'domain')}"
+                )
+        if (
+            fingerprint_evidence
+            and fingerprint_evidence.domain != validation.selected_domain
+            and Confirm.ask(
+                Text(
+                    f"Retry validation with {mark_sensitive(fingerprint_evidence.domain, 'domain')} "
+                    "for this same DC/DNS IP? (recommended)",
+                    style="cyan",
+                ),
+                default=True,
+            )
+        ):
+            print_info_debug(
+                "[pdc_preflight] retrying validation with fingerprint-derived domain "
+                f"{mark_sensitive(fingerprint_evidence.domain, 'domain')} for "
+                f"{marked_candidate}"
+            )
+            telemetry.capture(
+                "pdc_preflight_retry_with_fingerprint_domain",
+                properties={
+                    "mode": mode_label,
+                    "fingerprint_method": fingerprint_evidence.method,
+                },
+            )
+            return preflight_domain_pdc_interactive(
+                shell,
+                domain=fingerprint_evidence.domain,
+                candidate_ip=candidate_ip,
+                mode_label=mode_label,
             )
         if Confirm.ask(
             Text("Re-enter the domain and DC/PDC IP?", style="cyan"),

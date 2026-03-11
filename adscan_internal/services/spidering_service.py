@@ -14,18 +14,24 @@ for user interaction (confirmation prompts, password spraying decisions, etc.).
 from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
 import subprocess
+from pathlib import Path
+import shlex
+import shutil
 
 from adscan_internal import (
     print_info_verbose,
+    print_info_debug,
     print_success,
     print_warning,
     print_warning_debug,
     print_error,
     print_error_debug,
 )
+from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.credsweeper_service import CredSweeperService
@@ -34,6 +40,14 @@ from adscan_internal.services.share_file_analyzer_service import (
 )
 from adscan_internal.services.share_file_finding_action_service import (
     ShareFileFindingActionService,
+)
+from adscan_internal.services.smb_exclusion_policy import (
+    is_globally_excluded_smb_relative_path,
+    prune_excluded_walk_dirs,
+)
+from adscan_internal.services.smb_sensitive_file_policy import (
+    SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+    SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
 )
 from adscan_internal import telemetry
 
@@ -233,6 +247,173 @@ class SpideringService(BaseService):
     # Artifact processing (GPP, dumps, PFX, ZIP, etc.)
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _structured_suffix_to_scan_type_for_phase(phase: str) -> dict[str, str]:
+        """Return structured file suffixes that require deterministic handling."""
+        phase_name = str(phase or "").strip()
+        if phase_name == SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS:
+            return {
+                ".xml": "gpp",
+                ".yml": "gpp",
+                ".yaml": "gpp",
+            }
+        if phase_name == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS:
+            return {
+                ".xlsm": "ext",
+            }
+        return {}
+
+    def process_local_structured_files(
+        self,
+        *,
+        root_path: str,
+        phase: str,
+        domain: str,
+        source_hosts: list[str] | None = None,
+        source_shares: list[str] | None = None,
+        auth_username: str | None = None,
+        apply_actions: bool = True,
+    ) -> dict[str, int]:
+        """Process deterministic structured files under one local loot root.
+
+        This is the shared backend-agnostic path for structured findings such as
+        GPP ``cpassword`` in XML files. It intentionally does not depend on
+        CredSweeper so those findings remain stable across backends.
+        """
+        suffix_to_scan_type = self._structured_suffix_to_scan_type_for_phase(phase)
+        if not suffix_to_scan_type:
+            return {"candidate_files": 0, "processed_files": 0}
+
+        root = Path(str(root_path or "")).expanduser().resolve(strict=False)
+        if not root.is_dir():
+            return {"candidate_files": 0, "processed_files": 0}
+
+        candidates: list[tuple[str, str]] = []
+        remaining_suffixes = dict(suffix_to_scan_type)
+        xml_candidates = self._find_xml_cpassword_candidates(root)
+        if xml_candidates is not None:
+            remaining_suffixes.pop(".xml", None)
+            candidates.extend((file_path, "gpp") for file_path in xml_candidates)
+            if xml_candidates:
+                preview = ", ".join(
+                    mark_sensitive(path, "path") for path in xml_candidates[:3]
+                )
+                print_info_debug(
+                    "Deterministic structured XML candidates selected via ripgrep: "
+                    f"phase={phase} count={len(xml_candidates)} preview=[{preview}]"
+                )
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            prune_excluded_walk_dirs(dirnames)
+            base_dir = Path(dirpath)
+            for filename in sorted(filenames):
+                file_path = base_dir / filename
+                try:
+                    relative_path = file_path.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                if is_globally_excluded_smb_relative_path(relative_path):
+                    continue
+                scan_type = remaining_suffixes.get(file_path.suffix.casefold())
+                if scan_type:
+                    candidates.append((str(file_path), scan_type))
+
+        # Preserve deterministic ordering and deduplicate overlapping paths.
+        deduped_candidates: list[tuple[str, str]] = []
+        seen_candidates: set[tuple[str, str]] = set()
+        for file_path, scan_type in sorted(candidates, key=lambda item: (item[0], item[1])):
+            key = (file_path, scan_type)
+            if key in seen_candidates:
+                continue
+            seen_candidates.add(key)
+            deduped_candidates.append(key)
+        candidates = deduped_candidates
+
+        processed = 0
+        for file_path, scan_type in candidates:
+            self.process_found_file(
+                file_path,
+                domain,
+                scan_type,
+                source_hosts=source_hosts,
+                source_shares=source_shares,
+                auth_username=auth_username,
+                enable_legacy_zip_callbacks=False,
+                apply_actions=apply_actions,
+            )
+            processed += 1
+
+        print_info_debug(
+            "Deterministic structured-file post-scan completed: "
+            f"phase={phase} candidate_files={len(candidates)} processed_files={processed} "
+            f"root={root}"
+        )
+        return {"candidate_files": len(candidates), "processed_files": processed}
+
+    def _find_xml_cpassword_candidates(self, root: Path) -> list[str] | None:
+        """Return XML files containing ``cpassword=`` using ``rg`` when available.
+
+        Returns ``None`` when ``rg`` is unavailable or fails unexpectedly so the
+        caller can fall back to the Python filesystem walk.
+        """
+        rg_path = shutil.which("rg")
+        if not rg_path:
+            return None
+
+        command = " ".join(
+            [
+                shlex.quote(rg_path),
+                "-l",
+                "-0",
+                "-i",
+                "--iglob",
+                shlex.quote("*.xml"),
+                shlex.quote(r"cpassword\s*="),
+                shlex.quote(str(root)),
+            ]
+        )
+        completed_process = self._command_executor(
+            command,
+            timeout=120,
+            use_clean_env=True,
+        )
+        if completed_process is None:
+            return None
+
+        return_code = int(getattr(completed_process, "returncode", 1))
+        if return_code not in (0, 1):
+            print_warning_debug(
+                "ripgrep structured XML prefilter failed unexpectedly. "
+                f"Falling back to Python walk. rc={return_code}"
+            )
+            return None
+
+        stdout_text = str(getattr(completed_process, "stdout", "") or "")
+        if not stdout_text.strip("\0\r\n\t "):
+            return []
+
+        candidates: list[str] = []
+        for raw_path in stdout_text.split("\0"):
+            normalized_path = str(raw_path or "").strip()
+            if not normalized_path:
+                continue
+            file_path = Path(normalized_path).resolve(strict=False)
+            if not file_path.is_file():
+                continue
+            try:
+                relative_path = file_path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if is_globally_excluded_smb_relative_path(relative_path):
+                continue
+            candidates.append(str(file_path))
+
+        print_info_debug(
+            "ripgrep structured XML prefilter completed: "
+            f"root={root} candidate_files={len(candidates)}"
+        )
+        return candidates
+
     def process_found_file(
         self,
         file_path: str,
@@ -242,6 +423,8 @@ class SpideringService(BaseService):
         source_hosts: list[str] | None = None,
         source_shares: list[str] | None = None,
         auth_username: str | None = None,
+        enable_legacy_zip_callbacks: bool = True,
+        apply_actions: bool = True,
     ) -> None:
         """Process a manspider-discovered file according to its extension."""
         filename = os.path.basename(file_path)
@@ -255,37 +438,118 @@ class SpideringService(BaseService):
                 source_hosts=source_hosts,
                 source_shares=source_shares,
                 auth_username=auth_username,
+                apply_actions=apply_actions,
             )
             return
 
         if filename_lower.endswith((".yml", ".yaml")) and scan_type == "gpp":
-            self._process_yml_file(file_path=file_path, domain=domain, filename=filename)
+            self._process_yml_file(
+                file_path=file_path,
+                domain=domain,
+                filename=filename,
+                apply_actions=apply_actions,
+            )
             return
 
         if filename_lower.endswith(".xlsm") and scan_type == "ext":
-            self._process_xlsm_file(file_path=file_path, domain=domain, filename=filename)
+            self._process_xlsm_file(
+                file_path=file_path,
+                domain=domain,
+                filename=filename,
+                apply_actions=apply_actions,
+            )
             return
 
         if filename_lower.endswith(".dmp") and scan_type == "ext":
             print_warning(f"Memory dump file found: {filename}")
-            self._process_dmp_file(file_path, domain)
+            self._process_dmp_file(file_path, domain, apply_actions=apply_actions)
             return
 
         if filename_lower.endswith(".pfx") and scan_type == "ext":
             print_info_verbose(f"Found .pfx file: {filename}")
-            self._process_pfx_file(file_path=file_path, domain=domain)
+            self._process_pfx_file(
+                file_path=file_path,
+                domain=domain,
+                apply_actions=apply_actions,
+            )
             return
 
         if filename_lower.endswith(".zip") and scan_type == "ext":
             print_info_verbose(f"Found .zip file: {filename}")
-            if self._list_zip_callback:
+            if enable_legacy_zip_callbacks and self._list_zip_callback:
                 self._list_zip_callback(file_path)
-            if self._extract_zip_callback:
+            if enable_legacy_zip_callbacks and self._extract_zip_callback:
                 self._extract_zip_callback(file_path, domain)
-            self._process_zip_file(file_path, domain)
+            self._process_zip_file(file_path, domain, apply_actions=apply_actions)
             return
 
         print_warning(f"No interesting information found in {scan_type}")
+
+    def process_found_files_batch(
+        self,
+        file_paths: list[str],
+        domain: str,
+        scan_type: str,
+        *,
+        source_hosts: list[str] | None = None,
+        source_shares: list[str] | None = None,
+        auth_username: str | None = None,
+        enable_legacy_zip_callbacks: bool = True,
+        apply_actions: bool = True,
+        max_workers: int = 1,
+    ) -> None:
+        """Process multiple found files, optionally in parallel.
+
+        Parallel execution is only enabled for the safe, analysis-only case
+        where no follow-up actions or legacy ZIP callbacks are requested.
+        """
+        normalized_paths = [
+            str(path or "").strip() for path in file_paths if str(path or "").strip()
+        ]
+        if not normalized_paths:
+            return
+
+        workers = max(1, int(max_workers or 1))
+        allow_parallel = (
+            workers > 1
+            and not apply_actions
+            and not enable_legacy_zip_callbacks
+        )
+        if not allow_parallel:
+            for file_path in normalized_paths:
+                self.process_found_file(
+                    file_path,
+                    domain,
+                    scan_type,
+                    source_hosts=source_hosts,
+                    source_shares=source_shares,
+                    auth_username=auth_username,
+                    enable_legacy_zip_callbacks=enable_legacy_zip_callbacks,
+                    apply_actions=apply_actions,
+                )
+            return
+
+        print_info_debug(
+            "Processing artifact batch in parallel: "
+            f"files={len(normalized_paths)} workers={workers} scan_type={scan_type}"
+        )
+
+        def _process(file_path: str) -> None:
+            self.process_found_file(
+                file_path,
+                domain,
+                scan_type,
+                source_hosts=source_hosts,
+                source_shares=source_shares,
+                auth_username=auth_username,
+                enable_legacy_zip_callbacks=enable_legacy_zip_callbacks,
+                apply_actions=apply_actions,
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_process, file_path) for file_path in normalized_paths]
+            for future in as_completed(futures):
+                future.result()
 
     def _process_gpp_xml_file(
         self,
@@ -296,26 +560,46 @@ class SpideringService(BaseService):
         source_hosts: list[str] | None,
         source_shares: list[str] | None,
         auth_username: str | None,
+        apply_actions: bool,
     ) -> None:
         """Process GPP XML files using shared deterministic analyzer."""
         try:
+            marked_file_path = mark_sensitive(file_path, "path")
+            print_info_debug(
+                "Processing deterministic GPP XML candidate: "
+                f"path={marked_file_path} apply_actions={apply_actions}"
+            )
             result = self._share_file_analyzer_service.analyze_local_file(
                 source_path=file_path
             )
             for note in result.notes:
                 print_info_verbose(note)
+            print_info_debug(
+                "Deterministic GPP XML validator result: "
+                f"path={marked_file_path} findings={len(result.findings)} "
+                f"handled={result.handled} continue_with_ai={result.continue_with_ai}"
+            )
             content = ""
+            stats = None
             if result.findings:
                 with open(file_path, "r", encoding="utf-8") as handle:
                     content = handle.read()
-            self._share_file_finding_action_service.apply_findings(
-                domain=domain,
-                source_path=file_path,
-                findings=result.findings,
-                xml_content=content,
-                source_hosts=source_hosts,
-                source_shares=source_shares,
-                auth_username=auth_username,
+            if apply_actions:
+                stats = self._share_file_finding_action_service.apply_findings(
+                    domain=domain,
+                    source_path=file_path,
+                    findings=result.findings,
+                    xml_content=content,
+                    source_hosts=source_hosts,
+                    source_shares=source_shares,
+                    auth_username=auth_username,
+                )
+            applied = 0
+            if stats:
+                applied = int(stats.by_type.get("cpassword", 0))
+            print_info_debug(
+                "Deterministic GPP XML action result: "
+                f"path={marked_file_path} findings={len(result.findings)} applied={applied}"
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -327,6 +611,7 @@ class SpideringService(BaseService):
         file_path: str,
         domain: str,
         filename: str,
+        apply_actions: bool,
     ) -> None:
         """Process YAML files with Ansible Vault blocks via deterministic analyzer."""
         print_success(f"Found .yml file: {filename}")
@@ -336,12 +621,14 @@ class SpideringService(BaseService):
             )
             for note in result.notes:
                 print_info_verbose(note)
-            stats = self._share_file_finding_action_service.apply_findings(
-                domain=domain,
-                source_path=file_path,
-                findings=result.findings,
-            )
-            if stats.by_type.get("ansible_vault", 0) == 0:
+            stats = None
+            if apply_actions:
+                stats = self._share_file_finding_action_service.apply_findings(
+                    domain=domain,
+                    source_path=file_path,
+                    findings=result.findings,
+                )
+            if apply_actions and stats and stats.by_type.get("ansible_vault", 0) == 0:
                 print_warning(f"No Ansible Vault hashes found in {filename}")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -353,6 +640,7 @@ class SpideringService(BaseService):
         file_path: str,
         domain: str,
         filename: str,
+        apply_actions: bool,
     ) -> None:
         """Process XLSM files via shared deterministic analyzer."""
         print_success(f"Found .xlsm file: {filename}")
@@ -362,18 +650,26 @@ class SpideringService(BaseService):
             )
             for note in result.notes:
                 print_info_verbose(note)
-            stats = self._share_file_finding_action_service.apply_findings(
-                domain=domain,
-                source_path=file_path,
-                findings=result.findings,
-            )
-            if stats.by_type.get("macro_password", 0) == 0:
+            stats = None
+            if apply_actions:
+                stats = self._share_file_finding_action_service.apply_findings(
+                    domain=domain,
+                    source_path=file_path,
+                    findings=result.findings,
+                )
+            if apply_actions and stats and stats.by_type.get("macro_password", 0) == 0:
                 print_warning(f"No credential-related words found in {filename}")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error(f"Error executing olevba on {filename}.")
 
-    def _process_dmp_file(self, dmp_file: str, domain: str) -> None:
+    def _process_dmp_file(
+        self,
+        dmp_file: str,
+        domain: str,
+        *,
+        apply_actions: bool,
+    ) -> None:
         """Process a .DMP file through the shared deterministic analyzer."""
         try:
             result = self._share_file_analyzer_service.analyze_local_file(
@@ -384,18 +680,26 @@ class SpideringService(BaseService):
             if not result.handled:
                 print_warning("Deterministic analyzer did not handle this DMP file.")
                 return
-            stats = self._share_file_finding_action_service.apply_findings(
-                domain=domain,
-                source_path=dmp_file,
-                findings=result.findings,
-            )
-            if stats.by_type.get("ntlm_hash", 0) == 0:
+            stats = None
+            if apply_actions:
+                stats = self._share_file_finding_action_service.apply_findings(
+                    domain=domain,
+                    source_path=dmp_file,
+                    findings=result.findings,
+                )
+            if apply_actions and stats and stats.by_type.get("ntlm_hash", 0) == 0:
                 print_warning("No valid credentials found in the dump file")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error("Error processing DMP file.")
 
-    def _process_zip_file(self, zip_file: str, domain: str) -> None:
+    def _process_zip_file(
+        self,
+        zip_file: str,
+        domain: str,
+        *,
+        apply_actions: bool,
+    ) -> None:
         """Process ZIP artifacts through the shared deterministic analyzer."""
         try:
             result = self._share_file_analyzer_service.analyze_local_file(
@@ -405,12 +709,14 @@ class SpideringService(BaseService):
                 print_info_verbose(note)
             if not result.handled:
                 return
-            stats = self._share_file_finding_action_service.apply_findings(
-                domain=domain,
-                source_path=zip_file,
-                findings=result.findings,
-            )
-            if stats.by_type.get("ntlm_hash", 0) == 0:
+            stats = None
+            if apply_actions:
+                stats = self._share_file_finding_action_service.apply_findings(
+                    domain=domain,
+                    source_path=zip_file,
+                    findings=result.findings,
+                )
+            if apply_actions and stats and stats.by_type.get("ntlm_hash", 0) == 0:
                 print_info_verbose("No deterministic credential findings in ZIP file.")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -421,13 +727,15 @@ class SpideringService(BaseService):
         *,
         file_path: str,
         domain: str,
+        apply_actions: bool,
     ) -> None:
         """Process PFX artifacts via shared action dispatcher."""
         try:
-            self._share_file_finding_action_service.apply_pfx_artifact(
-                domain=domain,
-                source_path=file_path,
-            )
+            if apply_actions:
+                self._share_file_finding_action_service.apply_pfx_artifact(
+                    domain=domain,
+                    source_path=file_path,
+                )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error("Error processing PFX file.")

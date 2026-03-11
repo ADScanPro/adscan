@@ -10,7 +10,6 @@ This module centralizes all functionality related to:
 
 from __future__ import annotations
 
-import ipaddress
 import os
 import re
 import shlex
@@ -31,6 +30,7 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
+from adscan_internal.cli.target_scope_warning import confirm_large_target_scope
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.workspaces import domain_subpath
 
@@ -68,20 +68,6 @@ class NmapShell(Protocol):
     def _get_lab_slug(self) -> str | None: ...
 
 
-def _estimate_target_size(hosts: str) -> int | None:
-    """Estimate target host count when input is a CIDR range."""
-    target = str(hosts or "").strip()
-    if not target:
-        return None
-    try:
-        network = ipaddress.ip_network(target, strict=False)
-    except ValueError:
-        return None
-    # num_addresses includes network/broadcast on IPv4; this is enough as a
-    # rough UX warning heuristic.
-    return int(network.num_addresses)
-
-
 def _confirm_large_dc_discovery_scan(
     shell: NmapShell,
     *,
@@ -89,45 +75,21 @@ def _confirm_large_dc_discovery_scan(
     timeout_seconds: int,
 ) -> bool:
     """Warn users about very large CIDR ranges before DC discovery scan."""
-    estimated_targets = _estimate_target_size(hosts)
-    if (
-        not estimated_targets
-        or estimated_targets <= NMAP_DC_DISCOVERY_LARGE_RANGE_THRESHOLD
-    ):
-        return True
-
-    from adscan_internal.rich_output import print_panel
-
-    marked_hosts = mark_sensitive(hosts, "host")
-    panel_lines = [
-        "[bold]Large Target Range Detected[/bold]",
-        "",
-        f"Range: {marked_hosts}",
-        f"Estimated targets: {estimated_targets}",
-        f"Current timeout safeguard: {timeout_seconds} seconds",
-        "",
-        "Recommendation: narrow the range to likely DC subnets first.",
-        "This reduces scan time and network noise significantly.",
-    ]
-    print_panel(
-        "\n".join(panel_lines),
+    return confirm_large_target_scope(
+        shell,
+        targets=[hosts],
+        threshold=NMAP_DC_DISCOVERY_LARGE_RANGE_THRESHOLD,
         title="[bold yellow]⚠️  DC Discovery Scope Warning[/bold yellow]",
-        border_style="yellow",
-        expand=False,
-    )
-
-    is_non_interactive = bool(os.getenv("CI")) or bool(
-        getattr(shell, "non_interactive", False)
-    )
-    if is_non_interactive:
-        print_warning(
+        context_label=f"DC discovery scan (timeout safeguard: {timeout_seconds} seconds)",
+        recommendation_lines=[
+            "Recommendation: narrow the range to likely DC subnets first.",
+            "This reduces scan time and network noise significantly.",
+        ],
+        confirm_prompt="Continue DC discovery scan on this large range?",
+        default_confirm=False,
+        non_interactive_message=(
             "Non-interactive mode detected. Continuing with timeout safeguard enabled."
-        )
-        return True
-
-    return Confirm.ask(
-        "Continue DC discovery scan on this large range?",
-        default=False,
+        ),
     )
 
 
@@ -151,6 +113,32 @@ def discover_dc_candidates_with_nmap(
     Returns:
         List of IPs that have at least one of the target ports open.
     """
+    return sorted(
+        discover_dc_candidates_with_nmap_details(
+            shell,
+            hosts=hosts,
+            ports=ports,
+            output_path=output_path,
+            timeout_seconds=timeout_seconds,
+        ).keys()
+    )
+
+
+def discover_dc_candidates_with_nmap_details(
+    shell: NmapShell,
+    *,
+    hosts: str,
+    ports: list[int] | None = None,
+    output_path: str | None = None,
+    timeout_seconds: int = 600,
+) -> dict[str, set[int]]:
+    """Discover likely DC candidates and retain their open-port hints.
+
+    Returns a dictionary keyed by candidate IP with the set of open AD-related
+    ports discovered during the lightweight Nmap pass. This lets later domain
+    inference skip probes we already know cannot work (for example SMB/445 when
+    445 was closed but LDAP/389 was open).
+    """
     try:
         if not _confirm_large_dc_discovery_scan(
             shell,
@@ -158,7 +146,7 @@ def discover_dc_candidates_with_nmap(
             timeout_seconds=timeout_seconds,
         ):
             print_warning("DC discovery scan cancelled by user.")
-            return []
+            return {}
 
         target_ports = ports or [88, 389, 53]
         port_list = ",".join(str(p) for p in target_ports)
@@ -183,7 +171,7 @@ def discover_dc_candidates_with_nmap(
         result = shell.run_command(scan_cmd, timeout=timeout_seconds)
         if result is None:
             print_error("Nmap DC candidate scan did not return a result.")
-            return []
+            return {}
 
         output_text = (result.stdout or "") + "\n" + (result.stderr or "")
         if _nmap_output_indicates_missing_privileges(output_text):
@@ -198,7 +186,7 @@ def discover_dc_candidates_with_nmap(
             result = shell.run_command(sudo_scan_cmd, timeout=timeout_seconds)
             if result is None:
                 print_error("Nmap DC candidate scan did not return a result.")
-                return []
+                return {}
 
             output_text = (result.stdout or "") + "\n" + (result.stderr or "")
             if _nmap_output_indicates_missing_privileges(output_text):
@@ -216,7 +204,7 @@ def discover_dc_candidates_with_nmap(
                 result = shell.run_command(scan_cmd, timeout=timeout_seconds)
                 if result is None:
                     print_error("Nmap DC candidate scan did not return a result.")
-                    return []
+                    return {}
 
         gnmap_text = _read_text_file_best_effort(output_path)
         open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
@@ -226,12 +214,12 @@ def discover_dc_candidates_with_nmap(
             f"Discovered {len(candidates)} DC candidate host(s) "
             f"with ports {marked_ports} open."
         )
-        return candidates
+        return open_ports_by_host
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error("Failed to run DC candidate discovery with Nmap.")
         print_exception(show_locals=False, exception=exc)
-        return []
+        return {}
 
 
 def _read_text_file_best_effort(path: str) -> str:

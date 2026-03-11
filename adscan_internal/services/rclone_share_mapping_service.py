@@ -14,11 +14,92 @@ import json
 import shlex
 
 from adscan_internal.services.base_service import BaseService
+from adscan_internal.services.smb_guest_auth_service import is_guest_alias
 from adscan_internal.workspaces import write_json_file
 
 
 class RcloneShareMappingService(BaseService):
     """Generate spider_plus-compatible host JSON metadata using rclone."""
+
+    @staticmethod
+    def resolve_smb_remote_auth(
+        *,
+        username: str,
+        password: str,
+        domain: str,
+    ) -> dict[str, str]:
+        """Normalize one SMB auth context for inline rclone remotes.
+
+        ``rclone`` null sessions must omit ``user=``, ``pass=``, and ``domain=``
+        entirely. Guest transport keeps the username but can still legitimately
+        use an empty password.
+        """
+        normalized_username = str(username or "").strip()
+        normalized_password = str(password or "")
+        normalized_domain = str(domain or "").strip()
+        lowered_username = normalized_username.lower()
+
+        if lowered_username == "null":
+            return {
+                "auth_mode": "null",
+                "username": "",
+                "password": "",
+                "domain": "",
+            }
+
+        if is_guest_alias(lowered_username) and normalized_password == "":
+            return {
+                "auth_mode": "guest",
+                "username": normalized_username,
+                "password": "",
+                "domain": normalized_domain,
+            }
+
+        return {
+            "auth_mode": "authenticated",
+            "username": normalized_username,
+            "password": normalized_password,
+            "domain": normalized_domain,
+        }
+
+    def obscure_password(
+        self,
+        *,
+        command_executor: Callable[..., Any],
+        rclone_path: str,
+        password: str,
+    ) -> str:
+        """Return rclone-obscured password text for SMB inline remote config."""
+        if password == "":
+            return ""
+        return self._obscure_password(
+            command_executor=command_executor,
+            rclone_path=rclone_path,
+            password=password,
+        )
+
+    @staticmethod
+    def build_smb_remote(
+        *,
+        host: str,
+        share: str,
+        username: str,
+        obscured_password: str,
+        domain: str,
+    ) -> str:
+        """Build one inline rclone SMB remote for a host/share target."""
+        auth = RcloneShareMappingService.resolve_smb_remote_auth(
+            username=username,
+            password=obscured_password,
+            domain=domain,
+        )
+        remote_parts = [":smb", f"host={host}"]
+        if auth["username"]:
+            remote_parts.append(f"user={auth['username']}")
+            remote_parts.append(f"pass={auth['password']}")
+        if auth["domain"]:
+            remote_parts.append(f"domain={auth['domain']}")
+        return f"{','.join(remote_parts)}:{share}"
 
     def generate_host_metadata_json(
         self,
@@ -50,12 +131,17 @@ class RcloneShareMappingService(BaseService):
         run_output_path = Path(run_output_dir).expanduser().resolve(strict=False)
         run_output_path.mkdir(parents=True, exist_ok=True)
         normalized_targets = self._unique_targets(host_share_targets)
-        obscured_password = self._obscure_password(
+        transport_auth = self.resolve_smb_remote_auth(
+            username=username,
+            password=password,
+            domain=domain,
+        )
+        obscured_password = self.obscure_password(
             command_executor=command_executor,
             rclone_path=rclone_path,
-            password=password,
+            password=transport_auth["password"],
         )
-        if not obscured_password:
+        if transport_auth["password"] and not obscured_password:
             return {
                 "run_output_dir": str(run_output_path),
                 "host_json_files": 0,
@@ -76,9 +162,9 @@ class RcloneShareMappingService(BaseService):
                 rclone_path=rclone_path,
                 host=host,
                 share=share,
-                username=username,
+                username=transport_auth["username"],
                 obscured_password=obscured_password,
-                domain=domain,
+                domain=transport_auth["domain"],
             )
             result = command_executor(
                 command,
@@ -179,9 +265,12 @@ class RcloneShareMappingService(BaseService):
         domain: str,
     ) -> str:
         """Build one ``rclone lsjson`` command for one SMB host/share target."""
-        remote = (
-            f":smb,host={host},user={username},pass={obscured_password},"
-            f"domain={domain}:{share}"
+        remote = RcloneShareMappingService.build_smb_remote(
+            host=host,
+            share=share,
+            username=username,
+            obscured_password=obscured_password,
+            domain=domain,
         )
         return (
             f"{shlex.quote(rclone_path)} lsjson {shlex.quote(remote)} "

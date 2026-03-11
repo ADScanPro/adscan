@@ -10,9 +10,13 @@ extraction operations (dumps), see `dumps.py`.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import partial
+from pathlib import Path
 import csv
 import json
 import os
@@ -50,6 +54,9 @@ from adscan_internal.integrations.netexec.parsers import (
 )
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.interaction import is_non_interactive
+from adscan_internal.cli.target_scope_warning import (
+    confirm_large_target_scope,
+)
 from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
@@ -59,24 +66,49 @@ from adscan_internal.services.smb_guest_auth_service import (
     is_guest_alias,
     resolve_smb_guest_username,
 )
+from adscan_internal.services.smb_exclusion_policy import (
+    GLOBAL_SMB_EXCLUDE_FILTER_TOKENS,
+    GLOBAL_SMB_HEAVY_ARTIFACT_MAX_FILESIZE_MB,
+    GLOBAL_SMB_MAPPING_EXCLUDED_EXTENSIONS,
+    build_manspider_exclusion_args,
+    filter_share_map_by_global_smb_exclusions,
+    filter_shares_by_global_smb_exclusions,
+    is_globally_excluded_smb_share,
+    is_globally_excluded_smb_relative_path,
+    prune_excluded_walk_dirs,
+)
+from adscan_internal.services.smb_sensitive_file_policy import (
+    DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+    SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED,
+    SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY,
+    SMB_SENSITIVE_BENCHMARK_SCOPE_DOCUMENTS_DEPTH_EXPERIMENTAL,
+    SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+    SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY,
+    SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY,
+    SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS,
+    SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+    SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
+    SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+    get_sensitive_benchmark_profile,
+    get_manspider_phase_extensions,
+    get_manspider_sensitive_extensions,
+    get_production_sensitive_scan_phase_sequence,
+    get_sensitive_phase_definition,
+    get_sensitive_phase_extensions,
+    get_sensitive_file_extensions,
+)
+from adscan_internal.services.credsweeper_service import get_default_credsweeper_jobs
+from adscan_internal.services.rclone_tuning_service import (
+    RcloneCatTuning,
+    RcloneTuning,
+    choose_rclone_cat_tuning,
+    choose_rclone_tuning,
+)
+from adscan_internal.services.artifact_processing_tuning_service import (
+    choose_artifact_processing_tuning,
+)
 from adscan_internal.workspaces.subpaths import domain_path, domain_relpath
 
-
-GLOBAL_SMB_MAPPING_EXCLUDED_SHARES: tuple[str, ...] = (
-    "print$",
-    "ipc$",
-    "admin$",
-)
-GLOBAL_SMB_MAPPING_EXCLUDED_DRIVE_SHARES: tuple[str, ...] = tuple(
-    f"{letter}$" for letter in "abcdefghijklmnopqrstuvwxyz"
-)
-GLOBAL_SMB_MAPPING_EXCLUDE_FILTER_TOKENS: tuple[str, ...] = (
-    GLOBAL_SMB_MAPPING_EXCLUDED_SHARES + GLOBAL_SMB_MAPPING_EXCLUDED_DRIVE_SHARES
-)
-GLOBAL_SMB_MAPPING_EXCLUDED_EXTENSIONS: tuple[str, ...] = ("ico", "lnk")
-GLOBAL_SMB_MAPPING_EXCLUDED_SHARES_CASEFOLD: set[str] = {
-    name.casefold() for name in GLOBAL_SMB_MAPPING_EXCLUDE_FILTER_TOKENS
-}
 _SMB_HOST_IDENTITY_RE = re.compile(
     r"^\s*SMB\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+(?P<hostname>\S+)\s+"
 )
@@ -85,55 +117,24 @@ _SMB_GUEST_SESSION_RE = re.compile(
     r"\[\+\].*\(\s*Guest\s*\)",
     re.IGNORECASE,
 )
+_SMB_TARGET_SCOPE_WARNING_THRESHOLD = 2048
 
 
 def _is_globally_excluded_mapping_share(share_name: str) -> bool:
     """Return True when share is excluded by global SMB mapping policy."""
-    return (
-        str(share_name or "").strip().casefold()
-        in GLOBAL_SMB_MAPPING_EXCLUDED_SHARES_CASEFOLD
-    )
+    return is_globally_excluded_smb_share(share_name)
 
 
 def _filter_shares_by_global_mapping_exclusions(shares: list[str]) -> list[str]:
     """Filter share names according to global SMB mapping exclusions."""
-    filtered: list[str] = []
-    seen: set[str] = set()
-    for share in shares:
-        share_name = str(share or "").strip()
-        if not share_name:
-            continue
-        key = share_name.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        if _is_globally_excluded_mapping_share(share_name):
-            continue
-        filtered.append(share_name)
-    return filtered
+    return filter_shares_by_global_smb_exclusions(shares)
 
 
 def _filter_share_map_by_global_mapping_exclusions(
     share_map: dict[str, dict[str, str]] | None,
 ) -> dict[str, dict[str, str]] | None:
     """Filter host/share permissions map according to global mapping exclusions."""
-    if not isinstance(share_map, dict):
-        return share_map
-    filtered: dict[str, dict[str, str]] = {}
-    for host, host_shares in share_map.items():
-        if not isinstance(host_shares, dict):
-            continue
-        filtered_host_shares: dict[str, str] = {}
-        for share_name, perms in host_shares.items():
-            normalized_share = str(share_name or "").strip()
-            if not normalized_share or _is_globally_excluded_mapping_share(
-                normalized_share
-            ):
-                continue
-            filtered_host_shares[normalized_share] = str(perms or "")
-        if filtered_host_shares:
-            filtered[str(host or "").strip()] = filtered_host_shares
-    return filtered
+    return filter_share_map_by_global_smb_exclusions(share_map)
 
 
 def execute_netexec_shares(
@@ -355,9 +356,6 @@ def execute_netexec_shares(
                     list(read_hosts),
                     share_map=share_map,
                 )
-
-            if any(share.upper() == "SYSVOL" for share in (read_shares + write_shares)):
-                shell.ask_for_smb_gpp(domain)
             return
 
         marked_domain = mark_sensitive(domain, "domain")
@@ -681,6 +679,30 @@ def _normalize_smb_target_tokens(raw_value: Any) -> list[str]:
     return normalized
 
 
+def confirm_large_smb_target_scope(
+    shell: Any,
+    *,
+    targets: list[str],
+    prompt_context: str,
+) -> bool:
+    """Warn before enumerating a very large SMB target scope."""
+    if getattr(shell, "auto", False):
+        return True
+    return confirm_large_target_scope(
+        shell,
+        targets=targets,
+        threshold=_SMB_TARGET_SCOPE_WARNING_THRESHOLD,
+        title="[bold yellow]⚠️  SMB Scope Warning[/bold yellow]",
+        context_label=prompt_context,
+        recommendation_lines=[
+            "Large share enumeration scopes can generate significant noise and take a long time.",
+            "Recommendation: narrow the scope to likely member servers or a smaller subnet first.",
+        ],
+        confirm_prompt="Continue with this SMB target scope?",
+        default_confirm=False,
+    )
+
+
 def _set_guest_smb_targets(shell: Any, *, domain: str, targets: list[str]) -> None:
     """Persist guest SMB target tokens in domain runtime state."""
     domain_data = shell.domains_data.setdefault(domain, {})
@@ -787,22 +809,33 @@ def _maybe_override_guest_smb_targets(
             current_targets=current_targets,
             pdc_ip=pdc_ip or None,
         )
-        raw_input = Prompt.ask(
-            Text(
-                "Enter SMB target ranges/IPs (comma/space-separated)",
-                style="cyan",
-            ),
-            default=default_input,
-        ).strip()
-        parsed_targets = _normalize_smb_target_tokens(raw_input)
-        if not parsed_targets:
-            print_warning(
-                "No valid SMB targets entered. Keeping the current guest target set."
-            )
-            return current_targets, current_source
-        _set_guest_smb_targets(shell, domain=domain, targets=parsed_targets)
-        shell.hosts = ", ".join(parsed_targets)
-        return parsed_targets, "configured_custom"
+        while True:
+            raw_input = Prompt.ask(
+                Text(
+                    "Enter SMB target ranges/IPs (comma/space-separated)",
+                    style="cyan",
+                ),
+                default=default_input,
+            ).strip()
+            parsed_targets = _normalize_smb_target_tokens(raw_input)
+            if not parsed_targets:
+                print_warning(
+                    "No valid SMB targets entered. Keeping the current guest target set."
+                )
+                return current_targets, current_source
+            if not confirm_large_smb_target_scope(
+                shell,
+                targets=parsed_targets,
+                prompt_context="Guest SMB target scope",
+            ):
+                print_info(
+                    "Large SMB target scope rejected. Enter a narrower scope or keep the current one."
+                )
+                default_input = raw_input
+                continue
+            _set_guest_smb_targets(shell, domain=domain, targets=parsed_targets)
+            shell.hosts = ", ".join(parsed_targets)
+            return parsed_targets, "configured_custom"
 
     return current_targets, current_source
 
@@ -2693,19 +2726,34 @@ def ask_for_smb_shares_read(
     selected_method = _select_post_mapping_sensitive_data_method(
         shell=shell,
         ai_configured=availability.configured,
+        domain=domain,
+        username=username,
+        password=password,
     )
     if selected_method is None:
         print_info("SMB sensitive-data analysis skipped by user.")
         return
 
     if shell.auto:
-        selected_method = "deterministic"
+        selected_method = _resolve_default_deterministic_share_analysis_method(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
 
-    if selected_method == "deterministic":
+    if selected_method in {
+        "deterministic_rclone_direct",
+        "deterministic_rclone_mapped",
+        "deterministic_cifs",
+        "deterministic_manspider",
+    }:
+        workspace_cwd = shell._get_workspace_cwd()
         _run_post_mapping_sensitive_data_workflow(
             shell,
             domain=domain,
             aggregate_map_abs=domain_path(
+                workspace_cwd,
                 shell.domains_dir,
                 domain,
                 shell.smb_dir,
@@ -2717,7 +2765,8 @@ def ask_for_smb_shares_read(
             hosts=hosts,
             triage_username=username,
             triage_password=password,
-            selected_method="deterministic",
+            selected_method=selected_method,
+            cifs_mount_root=_resolve_cifs_mount_root(shell=shell, domain=domain),
         )
         return
 
@@ -3020,6 +3069,7 @@ def run_smb_map_benchmark(
     results: list[dict[str, Any]] = []
     for method in selected_methods:
         started = time.perf_counter()
+        label = method
         try:
             if method == "spider_plus":
                 success = run_smb_share_tree_mapping_with_spider_plus(
@@ -3067,8 +3117,15 @@ def run_smb_map_benchmark(
                 continue
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+            print_warning(
+                f"SMB mapping benchmark backend {label} failed unexpectedly."
+            )
+            print_warning_debug(
+                f"Benchmark backend failure: method={label} "
+                f"type={type(exc).__name__} error={exc}"
+            )
+            print_warning_debug(traceback.format_exc())
             success = False
-            label = method
 
         elapsed_seconds = max(0.0, time.perf_counter() - started)
         results.append(
@@ -3108,6 +3165,811 @@ def run_smb_map_benchmark(
         hosts_count=len(hosts),
         selected_methods=selected_methods,
         results=results,
+    )
+
+
+@dataclass(frozen=True)
+class SMBSensitiveBenchmarkScenario:
+    """One executable SMB sensitive-data benchmark scenario."""
+
+    label: str
+    backend: str
+    benchmark_kind: str
+    benchmark_scope: str
+    benchmark_execution_mode: str
+    mapping_mode: str
+    read_mode: str
+
+
+def run_smb_sensitive_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    credential_username: str | None = None,
+) -> None:
+    """Benchmark deterministic SMB sensitive-data backends."""
+    if domain not in getattr(shell, "domains_data", {}):
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"Domain {marked_domain} is not configured in the current workspace."
+        )
+        return
+
+    resolved_credential = _resolve_smb_map_benchmark_credential(
+        shell=shell,
+        domain=domain,
+        credential_username=credential_username,
+    )
+    if resolved_credential is None:
+        return
+    username, password = resolved_credential
+
+    shares, hosts, share_map = _enumerate_readable_share_context_for_mapping(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+    )
+    if not shares or not hosts:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            "Benchmark aborted: no readable SMB shares/hosts were discovered for "
+            f"{marked_domain}."
+        )
+        return
+    benchmark_kind, benchmark_scope, benchmark_execution_mode = (
+        _select_smb_sensitive_benchmark_mode(shell=shell)
+    )
+    selected_backends = _select_smb_sensitive_benchmark_backends(shell=shell)
+    if not selected_backends:
+        print_info("No deterministic SMB sensitive-data backend selected.")
+        return
+
+    mapping_modes_by_backend: dict[str, list[str]] = {}
+    cifs_read_modes: list[str] = []
+    rclone_read_modes: list[str] = []
+    if "cifs" in selected_backends:
+        mapping_modes_by_backend["cifs"] = _select_smb_sensitive_benchmark_mapping_modes(
+            shell=shell,
+            backend="cifs",
+        )
+        cifs_read_modes = _select_smb_sensitive_benchmark_cifs_read_modes(shell=shell)
+    if "rclone" in selected_backends:
+        mapping_modes_by_backend["rclone"] = _select_smb_sensitive_benchmark_mapping_modes(
+            shell=shell,
+            backend="rclone",
+        )
+        rclone_read_modes = _select_smb_sensitive_benchmark_rclone_read_modes(
+            shell=shell,
+            benchmark_kind=benchmark_kind,
+        )
+
+    scenarios = _build_smb_sensitive_benchmark_scenarios(
+        benchmark_kind=benchmark_kind,
+        benchmark_scope=benchmark_scope,
+        benchmark_execution_mode=benchmark_execution_mode,
+        selected_backends=selected_backends,
+        mapping_modes_by_backend=mapping_modes_by_backend,
+        cifs_read_modes=cifs_read_modes,
+        rclone_read_modes=rclone_read_modes,
+    )
+    if not scenarios:
+        print_warning("No valid SMB sensitive-data benchmark scenario could be built.")
+        return
+
+    selected_methods = [scenario.label for scenario in scenarios]
+    scope_label_map = {
+        SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY: "Text files only",
+        SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY: "Document-like binaries only",
+        SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED: (
+            "All CredSweeper-supported files"
+        ),
+        SMB_SENSITIVE_BENCHMARK_SCOPE_DOCUMENTS_DEPTH_EXPERIMENTAL: (
+            "Documents with --doc --depth (experimental)"
+        ),
+        "specialized_artifacts": "Specialized artifacts",
+    }
+
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_user = mark_sensitive(username, "user")
+    print_operation_header(
+        "SMB Sensitive-Data Benchmark",
+        details={
+            "Domain": marked_domain,
+            "Principal": marked_user,
+            "Hosts": str(len(hosts)),
+            "Readable Shares": str(len(shares)),
+            "Benchmark Type": (
+                "Artifacts"
+                if benchmark_kind == "artifacts"
+                else "Full production-like"
+                if benchmark_kind == "full"
+                else "Credentials"
+            ),
+            "Selected Scenarios": str(len(scenarios)),
+            "Content Scope": scope_label_map.get(benchmark_scope, benchmark_scope),
+            "Execution Mode": (
+                "Production-sequenced"
+                if benchmark_execution_mode == "production_sequenced"
+                else "Combined throughput"
+                if benchmark_execution_mode == "combined_throughput"
+                else "Single phase"
+            ),
+        },
+        icon="⏱️",
+    )
+
+    results: list[dict[str, Any]] = []
+    for scenario in scenarios:
+        started = time.perf_counter()
+        label = scenario.label
+        try:
+            benchmark_result = _run_smb_sensitive_benchmark_scenario(
+                shell=shell,
+                domain=domain,
+                shares=shares,
+                hosts=hosts,
+                username=username,
+                password=password,
+                share_map=share_map,
+                scenario=scenario,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning(
+                f"SMB sensitive-data benchmark backend {label} failed unexpectedly."
+            )
+            print_warning_debug(
+                f"Sensitive benchmark backend failure: method={label} "
+                f"type={type(exc).__name__} error={exc}"
+            )
+            print_warning_debug(traceback.format_exc())
+            benchmark_result = {
+                "success": False,
+                "candidate_files": 0,
+                "scanned_files": 0,
+                "files_with_findings": 0,
+                "credential_like_findings": 0,
+                "artifact_hits": 0,
+                "mapped_shares": 0,
+                "mapping_seconds": 0.0,
+                "text_prepare_seconds": 0.0,
+                "text_analysis_seconds": 0.0,
+                "document_prepare_seconds": 0.0,
+                "document_analysis_seconds": 0.0,
+                "artifact_prepare_seconds": 0.0,
+                "artifact_analysis_seconds": 0.0,
+                "credential_preview_values": [],
+                "artifact_preview_values": [],
+            }
+
+        elapsed_seconds = max(0.0, time.perf_counter() - started)
+        mapping_seconds = max(
+            0.0,
+            float(benchmark_result.get("mapping_seconds", 0.0) or 0.0),
+        )
+        mapping_seconds = min(mapping_seconds, elapsed_seconds)
+        post_mapping_seconds = max(0.0, elapsed_seconds - mapping_seconds)
+        results.append(
+            {
+                "method": label,
+                "success": bool(benchmark_result.get("success")),
+                "duration_seconds": elapsed_seconds,
+                "mapping_seconds": mapping_seconds,
+                "post_mapping_seconds": post_mapping_seconds,
+                "candidate_files": int(benchmark_result.get("candidate_files", 0) or 0),
+                "scanned_files": int(benchmark_result.get("scanned_files", 0) or 0),
+                "files_with_findings": int(
+                    benchmark_result.get("files_with_findings", 0) or 0
+                ),
+                "credential_like_findings": int(
+                    benchmark_result.get("credential_like_findings", 0) or 0
+                ),
+                "artifact_hits": int(benchmark_result.get("artifact_hits", 0) or 0),
+                "mapped_shares": int(benchmark_result.get("mapped_shares", 0) or 0),
+                "text_phase_seconds": float(
+                    benchmark_result.get("text_phase_seconds", 0.0) or 0.0
+                ),
+                "document_phase_seconds": float(
+                    benchmark_result.get("document_phase_seconds", 0.0) or 0.0
+                ),
+                "artifact_phase_seconds": float(
+                    benchmark_result.get("artifact_phase_seconds", 0.0) or 0.0
+                ),
+                "text_prepare_seconds": float(
+                    benchmark_result.get("text_prepare_seconds", 0.0) or 0.0
+                ),
+                "text_analysis_seconds": float(
+                    benchmark_result.get("text_analysis_seconds", 0.0) or 0.0
+                ),
+                "document_prepare_seconds": float(
+                    benchmark_result.get("document_prepare_seconds", 0.0) or 0.0
+                ),
+                "document_analysis_seconds": float(
+                    benchmark_result.get("document_analysis_seconds", 0.0) or 0.0
+                ),
+                "artifact_prepare_seconds": float(
+                    benchmark_result.get("artifact_prepare_seconds", 0.0) or 0.0
+                ),
+                "artifact_analysis_seconds": float(
+                    benchmark_result.get("artifact_analysis_seconds", 0.0) or 0.0
+                ),
+                "credential_preview_values": list(
+                    benchmark_result.get("credential_preview_values", []) or []
+                ),
+                "artifact_preview_values": list(
+                    benchmark_result.get("artifact_preview_values", []) or []
+                ),
+            }
+        )
+
+    if not results:
+        print_warning("SMB sensitive-data benchmark completed with no executed methods.")
+        return
+
+    table = _build_smb_sensitive_benchmark_results_table(
+        results=results,
+        benchmark_kind=benchmark_kind,
+    )
+
+    print_panel_with_table(table, border_style=BRAND_COLORS["info"])
+    if benchmark_kind == "full":
+        print_panel_with_table(
+            _build_smb_sensitive_benchmark_phase_breakdown_table(results=results),
+            border_style=BRAND_COLORS["info"],
+        )
+    _persist_smb_sensitive_benchmark_results(
+        shell=shell,
+        domain=domain,
+        username=username,
+        shares_count=len(shares),
+        hosts_count=len(hosts),
+        selected_methods=selected_methods,
+        benchmark_kind=benchmark_kind,
+        benchmark_scope=benchmark_scope,
+        benchmark_execution_mode=benchmark_execution_mode,
+        results=results,
+    )
+
+
+def _select_smb_sensitive_benchmark_mode(shell: Any) -> tuple[str, str, str]:
+    """Select the high-level benchmark mode."""
+    selector = getattr(shell, "_questionary_select", None)
+    if not callable(selector):
+        return ("full", SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED, "production_sequenced")
+    selected = selector(
+        "Select SMB sensitive-data benchmark mode:",
+        [
+            "Text credentials only",
+            "Document credentials only",
+            "Artifacts only",
+            "Full production-like (text + docs + artifacts)",
+            "Documents with --doc --depth (experimental)",
+        ],
+        default_idx=3,
+    )
+    if selected == 0:
+        return ("credentials", SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY, "single_phase")
+    if selected == 1:
+        return ("credentials", SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY, "single_phase")
+    if selected == 2:
+        return ("artifacts", "specialized_artifacts", "single_phase")
+    if selected == 4:
+        return (
+            "credentials",
+            SMB_SENSITIVE_BENCHMARK_SCOPE_DOCUMENTS_DEPTH_EXPERIMENTAL,
+            "single_phase",
+        )
+    return ("full", SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED, "production_sequenced")
+
+
+def _select_smb_sensitive_benchmark_backends(shell: Any) -> list[str]:
+    """Select benchmark backends."""
+    checkbox = getattr(shell, "_questionary_checkbox", None)
+    options = ["manspider", "cifs", "rclone"]
+    if not callable(checkbox):
+        return list(options)
+    selected = checkbox(
+        "Select SMB sensitive-data benchmark backends:",
+        ["manspider", "CIFS", "rclone"],
+    )
+    if selected is None:
+        return []
+    normalized: list[str] = []
+    if "manspider" in selected:
+        normalized.append("manspider")
+    if "CIFS" in selected:
+        normalized.append("cifs")
+    if "rclone" in selected:
+        normalized.append("rclone")
+    return normalized
+
+
+def _select_smb_sensitive_benchmark_mapping_modes(
+    shell: Any,
+    *,
+    backend: str,
+) -> list[str]:
+    """Select whether a backend should benchmark mapped, non-mapped, or both modes."""
+    if backend == "manspider":
+        return ["native"]
+    selector = getattr(shell, "_questionary_select", None)
+    if not callable(selector):
+        return ["direct", "mapped"]
+    selected = selector(
+        f"Select mapping mode for {backend}:",
+        [
+            "Without prior mapping",
+            "With prior mapping",
+            "Both",
+        ],
+        default_idx=2,
+    )
+    if selected == 0:
+        return ["direct"]
+    if selected == 1:
+        return ["mapped"]
+    return ["direct", "mapped"]
+
+
+def _select_smb_sensitive_benchmark_cifs_read_modes(shell: Any) -> list[str]:
+    """Select CIFS read modes for the benchmark."""
+    selector = getattr(shell, "_questionary_select", None)
+    if not callable(selector):
+        return ["candidate_paths", "full_mount"]
+    selected = selector(
+        "Select CIFS read mode(s):",
+        [
+            "Candidate paths only",
+            "Full mount only",
+            "Both",
+        ],
+        default_idx=2,
+    )
+    if selected == 0:
+        return ["candidate_paths"]
+    if selected == 1:
+        return ["full_mount"]
+    return ["candidate_paths", "full_mount"]
+
+
+def _select_smb_sensitive_benchmark_rclone_read_modes(
+    shell: Any,
+    *,
+    benchmark_kind: str,
+) -> list[str]:
+    """Select rclone read modes for the benchmark."""
+    selector = getattr(shell, "_questionary_select", None)
+    if benchmark_kind == "artifacts":
+        return ["copy"]
+    if not callable(selector):
+        return ["copy", "cat_library"]
+    options = [
+        "copy only",
+        (
+            "cat + CredSweeper library only"
+            if benchmark_kind != "full"
+            else "cat + CredSweeper library (artifacts fallback to copy)"
+        ),
+        "Both",
+    ]
+    selected = selector(
+        "Select rclone read mode(s):",
+        options,
+        default_idx=2,
+    )
+    if selected == 0:
+        return ["copy"]
+    if selected == 1:
+        return ["cat_library"]
+    return ["copy", "cat_library"]
+
+
+def _build_smb_sensitive_benchmark_scenarios(
+    *,
+    benchmark_kind: str,
+    benchmark_scope: str,
+    benchmark_execution_mode: str,
+    selected_backends: list[str],
+    mapping_modes_by_backend: dict[str, list[str]],
+    cifs_read_modes: list[str],
+    rclone_read_modes: list[str],
+) -> list[SMBSensitiveBenchmarkScenario]:
+    """Build executable benchmark scenarios from UX selections."""
+    scenarios: list[SMBSensitiveBenchmarkScenario] = []
+    if "manspider" in selected_backends:
+        scenarios.append(
+            SMBSensitiveBenchmarkScenario(
+                label="Legacy manspider download",
+                backend="manspider",
+                benchmark_kind=benchmark_kind,
+                benchmark_scope=benchmark_scope,
+                benchmark_execution_mode=benchmark_execution_mode,
+                mapping_mode="native",
+                read_mode="download",
+            )
+        )
+
+    for mapping_mode in mapping_modes_by_backend.get("cifs", []):
+        for read_mode in cifs_read_modes or ["candidate_paths"]:
+            effective_mapping_mode = mapping_mode
+            if read_mode == "full_mount" and mapping_mode == "mapped":
+                print_warning(
+                    "CIFS full mount scans the mounted tree directly. "
+                    "Using no-mapping mode for that scenario."
+                )
+                effective_mapping_mode = "direct"
+            scenarios.append(
+                SMBSensitiveBenchmarkScenario(
+                    label=_build_smb_sensitive_benchmark_scenario_label(
+                        backend="cifs",
+                        read_mode=read_mode,
+                        mapping_mode=effective_mapping_mode,
+                        benchmark_kind=benchmark_kind,
+                    ),
+                    backend="cifs",
+                    benchmark_kind=benchmark_kind,
+                    benchmark_scope=benchmark_scope,
+                    benchmark_execution_mode=benchmark_execution_mode,
+                    mapping_mode=effective_mapping_mode,
+                    read_mode=read_mode,
+                )
+            )
+
+    for mapping_mode in mapping_modes_by_backend.get("rclone", []):
+        for read_mode in rclone_read_modes or ["copy"]:
+            effective_mapping_mode = mapping_mode
+            if read_mode == "cat_library" and mapping_mode == "direct":
+                print_warning(
+                    "rclone cat + CredSweeper library requires prior mapping. "
+                    "Using mapped mode for that scenario."
+                )
+                effective_mapping_mode = "mapped"
+            scenarios.append(
+                SMBSensitiveBenchmarkScenario(
+                    label=_build_smb_sensitive_benchmark_scenario_label(
+                        backend="rclone",
+                        read_mode=read_mode,
+                        mapping_mode=effective_mapping_mode,
+                        benchmark_kind=benchmark_kind,
+                    ),
+                    backend="rclone",
+                    benchmark_kind=benchmark_kind,
+                    benchmark_scope=benchmark_scope,
+                    benchmark_execution_mode=benchmark_execution_mode,
+                    mapping_mode=effective_mapping_mode,
+                    read_mode=read_mode,
+                )
+            )
+
+    deduped: list[SMBSensitiveBenchmarkScenario] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for scenario in scenarios:
+        key = (
+            scenario.backend,
+            scenario.benchmark_kind,
+            scenario.mapping_mode,
+            scenario.read_mode,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(scenario)
+    return deduped
+
+
+def _build_smb_sensitive_benchmark_scenario_label(
+    *,
+    backend: str,
+    read_mode: str,
+    mapping_mode: str,
+    benchmark_kind: str,
+) -> str:
+    """Render one stable scenario label for tables/history."""
+    backend_label = {
+        "manspider": "Legacy manspider",
+        "cifs": "CIFS",
+        "rclone": "rclone",
+    }.get(backend, backend)
+    read_label = {
+        "download": "download",
+        "candidate_paths": "candidate paths",
+        "full_mount": "full mount",
+        "copy": "copy",
+        "cat_library": (
+            "cat + library"
+            if benchmark_kind != "full"
+            else "cat + library + copy fallback"
+        ),
+    }.get(read_mode, read_mode)
+    mapping_label = {
+        "native": "",
+        "direct": "no mapping",
+        "mapped": "mapped",
+    }.get(mapping_mode, mapping_mode)
+    parts = [backend_label, read_label]
+    if mapping_label:
+        parts.append(mapping_label)
+    return " | ".join(parts)
+
+
+def _select_smb_sensitive_benchmark_kind(shell: Any) -> str:
+    """Select whether the benchmark targets credentials or specialized artifacts."""
+    selector = getattr(shell, "_questionary_select", None)
+    if not callable(selector):
+        return "credentials"
+    selected = selector(
+        "Select SMB sensitive-data benchmark type:",
+        [
+            "Credential benchmark (CredSweeper)",
+            "Artifact benchmark (specialized parsers)",
+            "Full production-like benchmark",
+        ],
+        default_idx=0,
+    )
+    if selected == 1:
+        return "artifacts"
+    if selected == 2:
+        return "full"
+    return "credentials"
+
+
+def _select_smb_sensitive_benchmark_scope(
+    shell: Any,
+    *,
+    benchmark_kind: str,
+) -> str:
+    """Select one benchmark content scope for CredSweeper-backed methods."""
+    if benchmark_kind == "artifacts":
+        return "specialized_artifacts"
+    if benchmark_kind == "full":
+        return SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED
+    selector = getattr(shell, "_questionary_select", None)
+    if not callable(selector):
+        return SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY
+    selected = selector(
+        "Select SMB sensitive-data benchmark content scope:",
+        [
+            "Text files only (current benchmark)",
+            "Document-like binaries only (pdf/docx/xlsx...)",
+            "All CredSweeper-supported files",
+            "Documents with --doc --depth (experimental)",
+        ],
+        default_idx=0,
+    )
+    if selected == 1:
+        return SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY
+    if selected == 2:
+        return SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED
+    if selected == 3:
+        return SMB_SENSITIVE_BENCHMARK_SCOPE_DOCUMENTS_DEPTH_EXPERIMENTAL
+    return SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY
+
+
+def _select_smb_sensitive_benchmark_execution_mode(
+    shell: Any,
+    *,
+    benchmark_kind: str,
+    benchmark_scope: str,
+) -> str:
+    """Select execution mode for credential benchmarking."""
+    if benchmark_kind == "full":
+        return "production_sequenced"
+    if benchmark_kind != "credentials":
+        return "single_phase"
+    if benchmark_scope != SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED:
+        return "single_phase"
+    selector = getattr(shell, "_questionary_select", None)
+    if not callable(selector):
+        return "production_sequenced"
+    selected = selector(
+        "Select credential benchmark execution mode:",
+        [
+            "Production-sequenced (Recommended)",
+            "Combined throughput",
+        ],
+        default_idx=0,
+    )
+    if selected == 1:
+        return "combined_throughput"
+    return "production_sequenced"
+
+
+def _build_smb_sensitive_benchmark_results_table(
+    *,
+    results: list[dict[str, Any]],
+    benchmark_kind: str,
+) -> Table:
+    """Build a benchmark summary table for credential or artifact modes."""
+    show_mapping_breakdown = any(
+        float(result.get("mapping_seconds", 0.0) or 0.0) > 0.0 for result in results
+    )
+    table = Table(
+        title="[bold cyan]SMB Sensitive-Data Benchmark Results[/bold cyan]",
+        header_style="bold magenta",
+        box=rich.box.SIMPLE_HEAVY,
+    )
+    table.add_column("Method", style="cyan")
+    table.add_column("Status", style="magenta")
+    table.add_column("Total (s)", style="green", justify="right")
+    if show_mapping_breakdown:
+        table.add_column("Mapping (s)", style="green", justify="right")
+        table.add_column("Post-map (s)", style="green", justify="right")
+    table.add_column("Candidates", style="white", justify="right")
+
+    if benchmark_kind == "full":
+        table.add_column("Scanned", style="white", justify="right")
+        table.add_column("Text (s)", style="green", justify="right")
+        table.add_column("Docs (s)", style="green", justify="right")
+        table.add_column("Artifacts (s)", style="green", justify="right")
+        table.add_column("Cred Findings", style="yellow", justify="right")
+        table.add_column("Artifact Hits", style="yellow", justify="right")
+        table.add_column("Credential Preview", style="white", overflow="fold")
+        table.add_column("Artifact Preview", style="white", overflow="fold")
+        for result in results:
+            row = [
+                str(result["method"]),
+                "ok" if result["success"] else "failed",
+                f"{float(result['duration_seconds']):.3f}",
+            ]
+            if show_mapping_breakdown:
+                mapping_seconds = float(result.get("mapping_seconds", 0.0) or 0.0)
+                post_mapping_seconds = float(
+                    result.get("post_mapping_seconds", 0.0) or 0.0
+                )
+                if mapping_seconds > 0.0:
+                    row.extend(
+                        [
+                            f"{mapping_seconds:.3f}",
+                            f"{post_mapping_seconds:.3f}",
+                        ]
+                    )
+                else:
+                    row.extend(["-", "-"])
+            row.extend(
+                [
+                    str(int(result["candidate_files"])),
+                    str(int(result["scanned_files"])),
+                    f"{float(result.get('text_phase_seconds', 0.0) or 0.0):.3f}",
+                    f"{float(result.get('document_phase_seconds', 0.0) or 0.0):.3f}",
+                    f"{float(result.get('artifact_phase_seconds', 0.0) or 0.0):.3f}",
+                    str(int(result.get("credential_like_findings", 0))),
+                    str(int(result.get("artifact_hits", 0))),
+                    _render_credential_preview_cell(
+                        list(result.get("credential_preview_values", []) or [])
+                    ),
+                    _render_artifact_preview_cell(
+                        list(result.get("artifact_preview_values", []) or [])
+                    ),
+                ]
+            )
+            table.add_row(*row)
+        return table
+
+    if benchmark_kind == "artifacts":
+        table.add_column("Processed", style="white", justify="right")
+        table.add_column("Prep (s)", style="green", justify="right")
+        table.add_column("Analysis (s)", style="green", justify="right")
+        table.add_column("Artifact Hits", style="yellow", justify="right")
+        table.add_column("Artifact Preview", style="white", overflow="fold")
+        for result in results:
+            row = [
+                str(result["method"]),
+                "ok" if result["success"] else "failed",
+                f"{float(result['duration_seconds']):.3f}",
+            ]
+            if show_mapping_breakdown:
+                mapping_seconds = float(result.get("mapping_seconds", 0.0) or 0.0)
+                post_mapping_seconds = float(
+                    result.get("post_mapping_seconds", 0.0) or 0.0
+                )
+                if mapping_seconds > 0.0:
+                    row.extend(
+                        [
+                            f"{mapping_seconds:.3f}",
+                            f"{post_mapping_seconds:.3f}",
+                        ]
+                    )
+                else:
+                    row.extend(["-", "-"])
+            row.extend(
+                [
+                    str(int(result["candidate_files"])),
+                    str(int(result.get("processed_files", result["candidate_files"]))),
+                    f"{float(result.get('artifact_prepare_seconds', 0.0) or 0.0):.3f}",
+                    f"{float(result.get('artifact_analysis_seconds', 0.0) or 0.0):.3f}",
+                    str(int(result.get("artifact_hits", 0))),
+                    _render_artifact_preview_cell(
+                        list(result.get("artifact_preview_values", []) or [])
+                    ),
+                ]
+            )
+            table.add_row(*row)
+        return table
+
+    table.add_column("Scanned", style="white", justify="right")
+    table.add_column("Prep (s)", style="green", justify="right")
+    table.add_column("Scan (s)", style="green", justify="right")
+    table.add_column("Files w/ Findings", style="white", justify="right")
+    table.add_column("Credential Findings", style="yellow", justify="right")
+    table.add_column("Credential Preview", style="white", overflow="fold")
+    for result in results:
+        prepare_seconds = float(result.get("text_prepare_seconds", 0.0) or 0.0) + float(
+            result.get("document_prepare_seconds", 0.0) or 0.0
+        )
+        analysis_seconds = float(result.get("text_analysis_seconds", 0.0) or 0.0) + float(
+            result.get("document_analysis_seconds", 0.0) or 0.0
+        )
+        row = [
+            str(result["method"]),
+            "ok" if result["success"] else "failed",
+            f"{float(result['duration_seconds']):.3f}",
+        ]
+        if show_mapping_breakdown:
+            mapping_seconds = float(result.get("mapping_seconds", 0.0) or 0.0)
+            post_mapping_seconds = float(
+                result.get("post_mapping_seconds", 0.0) or 0.0
+            )
+            if mapping_seconds > 0.0:
+                row.extend(
+                    [
+                        f"{mapping_seconds:.3f}",
+                        f"{post_mapping_seconds:.3f}",
+                    ]
+                )
+            else:
+                row.extend(["-", "-"])
+        row.extend(
+            [
+                str(int(result["candidate_files"])),
+                str(int(result["scanned_files"])),
+                f"{prepare_seconds:.3f}",
+                f"{analysis_seconds:.3f}",
+                str(int(result["files_with_findings"])),
+                str(int(result["credential_like_findings"])),
+                _render_credential_preview_cell(
+                    list(result.get("credential_preview_values", []) or [])
+                ),
+            ]
+        )
+        table.add_row(*row)
+    return table
+
+
+def _build_smb_sensitive_benchmark_phase_breakdown_table(
+    *,
+    results: list[dict[str, Any]],
+) -> Table:
+    """Build one detailed timing breakdown table for full production-like runs."""
+    table = Table(
+        title="[bold cyan]SMB Sensitive-Data Phase Timing Breakdown[/bold cyan]",
+        header_style="bold magenta",
+        box=rich.box.SIMPLE_HEAVY,
+    )
+    table.add_column("Method", style="cyan")
+    table.add_column("Text Prep (s)", style="green", justify="right")
+    table.add_column("Text Scan (s)", style="green", justify="right")
+    table.add_column("Docs Prep (s)", style="green", justify="right")
+    table.add_column("Docs Scan (s)", style="green", justify="right")
+    table.add_column("Artifacts Prep (s)", style="green", justify="right")
+    table.add_column("Artifacts Scan (s)", style="green", justify="right")
+    for result in results:
+        table.add_row(
+            str(result["method"]),
+            f"{float(result.get('text_prepare_seconds', 0.0) or 0.0):.3f}",
+            f"{float(result.get('text_analysis_seconds', 0.0) or 0.0):.3f}",
+            f"{float(result.get('document_prepare_seconds', 0.0) or 0.0):.3f}",
+            f"{float(result.get('document_analysis_seconds', 0.0) or 0.0):.3f}",
+            f"{float(result.get('artifact_prepare_seconds', 0.0) or 0.0):.3f}",
+            f"{float(result.get('artifact_analysis_seconds', 0.0) or 0.0):.3f}",
+        )
+    return table
+
+
+def _benchmark_result_findings_score(result: dict[str, Any]) -> int:
+    """Return one comparable findings score across benchmark kinds."""
+    return int(result.get("credential_like_findings", 0) or 0) + int(
+        result.get("artifact_hits", 0) or 0
     )
 
 
@@ -3244,6 +4106,148 @@ def _persist_smb_mapping_benchmark_results(
         )
 
 
+def _persist_smb_sensitive_benchmark_results(
+    *,
+    shell: Any,
+    domain: str,
+    username: str,
+    shares_count: int,
+    hosts_count: int,
+    selected_methods: list[str],
+    benchmark_kind: str,
+    benchmark_scope: str,
+    benchmark_execution_mode: str,
+    results: list[dict[str, Any]],
+) -> None:
+    """Persist deterministic SMB sensitive-data benchmark results."""
+    from adscan_internal.workspaces import read_json_file, write_json_file
+
+    workspace_cwd = shell._get_workspace_cwd()
+    benchmark_root_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "sensitive_benchmark",
+    )
+    runs_dir_abs = os.path.join(benchmark_root_abs, "runs")
+    os.makedirs(runs_dir_abs, exist_ok=True)
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_basename = f"{run_id}_{_slugify_token(username)}.json"
+    run_file_abs = os.path.join(runs_dir_abs, run_basename)
+    run_file_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "sensitive_benchmark",
+        "runs",
+        run_basename,
+    )
+    history_abs = os.path.join(benchmark_root_abs, "history.json")
+    history_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "sensitive_benchmark",
+        "history.json",
+    )
+
+    created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    successful = [item for item in results if bool(item.get("success"))]
+    best_findings = (
+        max(successful, key=_benchmark_result_findings_score)
+        if successful
+        else None
+    )
+    fastest_success = (
+        min(
+            successful,
+            key=lambda item: float(item.get("duration_seconds", 0.0)),
+        )
+        if successful
+        else None
+    )
+
+    run_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "created_at": created_at,
+        "domain": domain,
+        "principal": f"{domain}\\{username}",
+        "hosts_count": int(hosts_count),
+        "shares_count": int(shares_count),
+        "benchmark_kind": benchmark_kind,
+        "selected_methods": list(selected_methods),
+        "benchmark_scope": benchmark_scope,
+        "benchmark_execution_mode": benchmark_execution_mode,
+        "results": list(results),
+        "fastest_successful_method": (
+            str(fastest_success.get("method", "")) if fastest_success else ""
+        ),
+        "most_findings_method": (
+            str(best_findings.get("method", "")) if best_findings else ""
+        ),
+    }
+    history_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "domain": domain,
+        "updated_at": created_at,
+        "runs": [],
+    }
+    if os.path.exists(history_abs):
+        existing = read_json_file(history_abs)
+        if isinstance(existing, dict):
+            history_payload = existing
+            history_payload.setdefault("schema_version", 1)
+            history_payload.setdefault("domain", domain)
+            history_payload.setdefault("runs", [])
+
+    history_runs = history_payload.get("runs")
+    if not isinstance(history_runs, list):
+        history_runs = []
+    history_runs.append(
+        {
+            "run_id": run_id,
+            "created_at": created_at,
+            "principal": f"{domain}\\{username}",
+            "hosts_count": int(hosts_count),
+            "shares_count": int(shares_count),
+            "benchmark_kind": benchmark_kind,
+            "selected_methods": list(selected_methods),
+            "benchmark_scope": benchmark_scope,
+            "benchmark_execution_mode": benchmark_execution_mode,
+            "results_count": len(results),
+            "run_file": run_file_rel,
+            "fastest_successful_method": (
+                str(fastest_success.get("method", "")) if fastest_success else ""
+            ),
+            "most_findings_method": (
+                str(best_findings.get("method", "")) if best_findings else ""
+            ),
+        }
+    )
+    history_payload["runs"] = history_runs[-500:]
+    history_payload["updated_at"] = created_at
+
+    try:
+        write_json_file(run_file_abs, run_payload)
+        write_json_file(history_abs, history_payload)
+        marked_run_rel = mark_sensitive(run_file_rel, "path")
+        marked_history_rel = mark_sensitive(history_rel, "path")
+        print_info(
+            "SMB sensitive-data benchmark results saved to "
+            f"{marked_run_rel} (history: {marked_history_rel})."
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning("SMB sensitive-data benchmark completed, but persistence failed.")
+        print_warning_debug(
+            f"SMB sensitive-data benchmark persistence error: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 def _normalize_benchmark_method_results(
     results: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -3257,14 +4261,3104 @@ def _normalize_benchmark_method_results(
             duration = float(item.get("duration_seconds", 0.0) or 0.0)
         except Exception:
             duration = 0.0
+        try:
+            mapping_seconds = float(item.get("mapping_seconds", 0.0) or 0.0)
+        except Exception:
+            mapping_seconds = 0.0
+        try:
+            post_mapping_seconds = float(item.get("post_mapping_seconds", 0.0) or 0.0)
+        except Exception:
+            post_mapping_seconds = 0.0
+        try:
+            text_phase_seconds = float(item.get("text_phase_seconds", 0.0) or 0.0)
+        except Exception:
+            text_phase_seconds = 0.0
+        try:
+            document_phase_seconds = float(
+                item.get("document_phase_seconds", 0.0) or 0.0
+            )
+        except Exception:
+            document_phase_seconds = 0.0
+        try:
+            artifact_phase_seconds = float(
+                item.get("artifact_phase_seconds", 0.0) or 0.0
+            )
+        except Exception:
+            artifact_phase_seconds = 0.0
+        try:
+            text_prepare_seconds = float(item.get("text_prepare_seconds", 0.0) or 0.0)
+        except Exception:
+            text_prepare_seconds = 0.0
+        try:
+            text_analysis_seconds = float(item.get("text_analysis_seconds", 0.0) or 0.0)
+        except Exception:
+            text_analysis_seconds = 0.0
+        try:
+            document_prepare_seconds = float(
+                item.get("document_prepare_seconds", 0.0) or 0.0
+            )
+        except Exception:
+            document_prepare_seconds = 0.0
+        try:
+            document_analysis_seconds = float(
+                item.get("document_analysis_seconds", 0.0) or 0.0
+            )
+        except Exception:
+            document_analysis_seconds = 0.0
+        try:
+            artifact_prepare_seconds = float(
+                item.get("artifact_prepare_seconds", 0.0) or 0.0
+            )
+        except Exception:
+            artifact_prepare_seconds = 0.0
+        try:
+            artifact_analysis_seconds = float(
+                item.get("artifact_analysis_seconds", 0.0) or 0.0
+            )
+        except Exception:
+            artifact_analysis_seconds = 0.0
         normalized.append(
             {
                 "method": method,
                 "success": bool(item.get("success")),
                 "duration_seconds": max(0.0, duration),
+                "mapping_seconds": max(0.0, mapping_seconds),
+                "post_mapping_seconds": max(0.0, post_mapping_seconds),
+                "text_phase_seconds": max(0.0, text_phase_seconds),
+                "document_phase_seconds": max(0.0, document_phase_seconds),
+                "artifact_phase_seconds": max(0.0, artifact_phase_seconds),
+                "text_prepare_seconds": max(0.0, text_prepare_seconds),
+                "text_analysis_seconds": max(0.0, text_analysis_seconds),
+                "document_prepare_seconds": max(0.0, document_prepare_seconds),
+                "document_analysis_seconds": max(0.0, document_analysis_seconds),
+                "artifact_prepare_seconds": max(0.0, artifact_prepare_seconds),
+                "artifact_analysis_seconds": max(0.0, artifact_analysis_seconds),
             }
         )
     return normalized
+
+
+def _count_grouped_credential_findings(
+    findings: dict[str, list[tuple[str, float | None, str, int, str]]],
+) -> tuple[int, int]:
+    """Return total findings and distinct source files for grouped findings."""
+    total_findings = 0
+    file_paths: set[str] = set()
+    for entries in findings.values():
+        if not isinstance(entries, list):
+            continue
+        total_findings += len(entries)
+        for entry in entries:
+            if isinstance(entry, tuple) and len(entry) >= 5:
+                file_paths.add(str(entry[4] or "").strip())
+    return total_findings, len({path for path in file_paths if path})
+
+
+def _build_grouped_credential_preview(
+    findings: dict[str, list[tuple[str, float | None, str, int, str]]],
+    *,
+    limit: int = 3,
+) -> list[str]:
+    """Return a compact deduplicated preview of credential values."""
+    seen: set[str] = set()
+    preview: list[str] = []
+    for entries in findings.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, tuple) or not entry:
+                continue
+            value = str(entry[0] or "").strip()
+            if not value:
+                continue
+            key = value.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            preview.append(value)
+            if len(preview) >= limit:
+                return preview
+    return preview
+
+
+def _render_credential_preview_cell(values: list[str]) -> str:
+    """Render benchmark credential preview for one table cell."""
+    if not values:
+        return "-"
+    rendered = ", ".join(mark_sensitive(value, "password") for value in values[:3])
+    if len(values) > 3:
+        rendered = f"{rendered}, ..."
+    return rendered
+
+
+def _render_artifact_preview_cell(values: list[str]) -> str:
+    """Render benchmark artifact preview for one table cell."""
+    if not values:
+        return "-"
+    rendered = ", ".join(mark_sensitive(value, "path") for value in values[:3])
+    if len(values) > 3:
+        rendered = f"{rendered}, ..."
+    return rendered
+
+
+def _resolve_credsweeper_artifacts_dir(
+    *,
+    shell: Any,
+    domain: str,
+    purpose: str,
+) -> str:
+    """Return writable workspace directory for CredSweeper JSON artifacts."""
+    workspace_cwd = shell._get_workspace_cwd()
+    return domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "credsweeper",
+        "artifacts",
+        purpose,
+    )
+
+
+def _count_files_under_path_with_extensions(
+    root_path: str,
+    *,
+    extensions: tuple[str, ...],
+) -> int:
+    """Count files under a local directory tree filtered by suffix."""
+    suffixes = {str(extension).strip().casefold() for extension in extensions if str(extension).strip()}
+    if not suffixes:
+        return 0
+    total = 0
+    root = Path(root_path)
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        prune_excluded_walk_dirs(dirnames)
+        base_dir = Path(dirpath)
+        for filename in filenames:
+            file_path = base_dir / filename
+            try:
+                relative_path = file_path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if is_globally_excluded_smb_relative_path(relative_path):
+                continue
+            if file_path.suffix.casefold() in suffixes:
+                total += 1
+    return total
+
+
+def _merge_grouped_credential_findings(
+    *findings_groups: dict[str, list[tuple[str, float | None, str, int, str]]],
+) -> dict[str, list[tuple[str, float | None, str, int, str]]]:
+    """Merge grouped CredSweeper findings from multiple passes."""
+    merged: dict[str, list[tuple[str, float | None, str, int, str]]] = {}
+    seen: set[tuple[str, str, int, str]] = set()
+    for findings in findings_groups:
+        if not isinstance(findings, dict):
+            continue
+        for rule_name, entries in findings.items():
+            if not isinstance(entries, list):
+                continue
+            bucket = merged.setdefault(str(rule_name), [])
+            for entry in entries:
+                if not isinstance(entry, tuple) or len(entry) < 5:
+                    continue
+                dedup_key = (
+                    str(rule_name),
+                    str(entry[0] or ""),
+                    int(entry[3] or 0),
+                    str(entry[4] or ""),
+                )
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                bucket.append(entry)
+    return merged
+
+
+def _run_timed_benchmark_phase(
+    *,
+    phase_seconds_key: str,
+    runner: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Execute one benchmark phase and annotate its elapsed seconds."""
+    started = time.perf_counter()
+    result = dict(runner())
+    result[phase_seconds_key] = max(0.0, time.perf_counter() - started)
+    return result
+
+
+def _merge_credential_benchmark_results(
+    phase_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Merge per-phase credential benchmark summaries into one result."""
+    merged: dict[str, Any] = {
+        "success": all(bool(result.get("success")) for result in phase_results),
+        "candidate_files": 0,
+        "scanned_files": 0,
+        "files_with_findings": 0,
+        "credential_like_findings": 0,
+        "mapped_shares": 0,
+        "credential_preview_values": [],
+        "text_phase_seconds": 0.0,
+        "document_phase_seconds": 0.0,
+        "text_prepare_seconds": 0.0,
+        "text_analysis_seconds": 0.0,
+        "document_prepare_seconds": 0.0,
+        "document_analysis_seconds": 0.0,
+    }
+    preview_values: list[str] = []
+    seen_preview_values: set[str] = set()
+    for result in phase_results:
+        merged["candidate_files"] += int(result.get("candidate_files", 0) or 0)
+        merged["scanned_files"] += int(result.get("scanned_files", 0) or 0)
+        merged["files_with_findings"] += int(result.get("files_with_findings", 0) or 0)
+        merged["credential_like_findings"] += int(
+            result.get("credential_like_findings", 0) or 0
+        )
+        merged["mapped_shares"] = max(
+            int(merged["mapped_shares"]),
+            int(result.get("mapped_shares", 0) or 0),
+        )
+        merged["text_phase_seconds"] += float(result.get("text_phase_seconds", 0.0) or 0.0)
+        merged["document_phase_seconds"] += float(
+            result.get("document_phase_seconds", 0.0) or 0.0
+        )
+        merged["text_prepare_seconds"] += float(
+            result.get("text_prepare_seconds", 0.0) or 0.0
+        )
+        merged["text_analysis_seconds"] += float(
+            result.get("text_analysis_seconds", 0.0) or 0.0
+        )
+        merged["document_prepare_seconds"] += float(
+            result.get("document_prepare_seconds", 0.0) or 0.0
+        )
+        merged["document_analysis_seconds"] += float(
+            result.get("document_analysis_seconds", 0.0) or 0.0
+        )
+        for value in list(result.get("credential_preview_values", []) or []):
+            normalized = str(value or "").strip()
+            if not normalized:
+                continue
+            key = normalized.casefold()
+            if key in seen_preview_values:
+                continue
+            seen_preview_values.add(key)
+            preview_values.append(normalized)
+    merged["credential_preview_values"] = preview_values[:3]
+    return merged
+
+
+def _merge_full_benchmark_results(
+    credential_result: dict[str, Any],
+    artifact_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge one credential benchmark result and one artifact result."""
+    credential_preview_values = list(
+        credential_result.get("credential_preview_values", []) or []
+    )
+    artifact_preview_values = list(
+        artifact_result.get("artifact_preview_values", []) or []
+    )
+    return {
+        "success": bool(credential_result.get("success")) and bool(
+            artifact_result.get("success")
+        ),
+        "candidate_files": int(credential_result.get("candidate_files", 0) or 0)
+        + int(artifact_result.get("candidate_files", 0) or 0),
+        "scanned_files": int(credential_result.get("scanned_files", 0) or 0)
+        + int(artifact_result.get("processed_files", 0) or 0),
+        "files_with_findings": int(
+            credential_result.get("files_with_findings", 0) or 0
+        ),
+        "credential_like_findings": int(
+            credential_result.get("credential_like_findings", 0) or 0
+        ),
+        "artifact_hits": int(artifact_result.get("artifact_hits", 0) or 0),
+        "mapped_shares": max(
+            int(credential_result.get("mapped_shares", 0) or 0),
+            int(artifact_result.get("mapped_shares", 0) or 0),
+        ),
+        "text_phase_seconds": float(
+            credential_result.get("text_phase_seconds", 0.0) or 0.0
+        ),
+        "document_phase_seconds": float(
+            credential_result.get("document_phase_seconds", 0.0) or 0.0
+        ),
+        "artifact_phase_seconds": float(
+            artifact_result.get("artifact_phase_seconds", 0.0) or 0.0
+        ),
+        "text_prepare_seconds": float(
+            credential_result.get("text_prepare_seconds", 0.0) or 0.0
+        ),
+        "text_analysis_seconds": float(
+            credential_result.get("text_analysis_seconds", 0.0) or 0.0
+        ),
+        "document_prepare_seconds": float(
+            credential_result.get("document_prepare_seconds", 0.0) or 0.0
+        ),
+        "document_analysis_seconds": float(
+            credential_result.get("document_analysis_seconds", 0.0) or 0.0
+        ),
+        "artifact_prepare_seconds": float(
+            artifact_result.get("artifact_prepare_seconds", 0.0) or 0.0
+        ),
+        "artifact_analysis_seconds": float(
+            artifact_result.get("artifact_analysis_seconds", 0.0) or 0.0
+        ),
+        "credential_preview_values": credential_preview_values[:3],
+        "artifact_preview_values": artifact_preview_values[:3],
+    }
+
+
+def _run_full_production_like_backend_benchmark(
+    *,
+    credential_runner: Callable[[], dict[str, Any]],
+    artifact_runner: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Execute the production-like three-phase benchmark for one backend."""
+    credential_result = credential_runner()
+    artifact_started = time.perf_counter()
+    artifact_result = artifact_runner()
+    artifact_elapsed = max(0.0, time.perf_counter() - artifact_started)
+    artifact_result = dict(artifact_result)
+    artifact_result["artifact_phase_seconds"] = artifact_elapsed
+    artifact_result.setdefault("artifact_prepare_seconds", 0.0)
+    artifact_result.setdefault("artifact_analysis_seconds", artifact_elapsed)
+    return _merge_full_benchmark_results(credential_result, artifact_result)
+
+
+def _generate_cifs_benchmark_mapping(
+    *,
+    shell: Any,
+    domain: str,
+    username: str,
+    password: str,
+    hosts: list[str],
+    shares: list[str],
+    share_map: dict[str, dict[str, str]] | None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Generate a fresh CIFS mapping for mapped benchmark scenarios."""
+    success = run_smb_share_tree_mapping_with_cifs(
+        shell=shell,
+        domain=domain,
+        shares=shares,
+        username=username,
+        password=password,
+        hosts=hosts,
+        share_map=share_map,
+        run_post_mapping_workflow=False,
+    )
+    aggregate_map_path = _resolve_cifs_aggregate_map_path(shell=shell, domain=domain)
+    return aggregate_map_path, {"success": bool(success)}
+
+
+def _resolve_rclone_benchmark_mapping_purpose(
+    scenario: SMBSensitiveBenchmarkScenario,
+) -> str:
+    """Return one stable per-scenario rclone mapping purpose."""
+    return (
+        "rclone_"
+        f"{_slugify_token(scenario.benchmark_kind)}_"
+        f"{_slugify_token(scenario.read_mode)}_"
+        f"{_slugify_token(scenario.mapping_mode)}"
+    )
+
+
+def _run_smb_sensitive_benchmark_scenario(
+    *,
+    shell: Any,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+    scenario: SMBSensitiveBenchmarkScenario,
+) -> dict[str, Any]:
+    """Execute one benchmark scenario."""
+    benchmark_profile = get_sensitive_benchmark_profile(scenario.benchmark_scope)
+    use_mapping = scenario.mapping_mode == "mapped"
+    rclone_aggregate_map_path: str | None = None
+    mapping_seconds = 0.0
+
+    def _with_mapping_timing(result: dict[str, Any]) -> dict[str, Any]:
+        timed_result = dict(result)
+        timed_result["mapping_seconds"] = max(0.0, mapping_seconds)
+        return timed_result
+
+    if scenario.backend == "rclone" and use_mapping:
+        mapping_started = time.perf_counter()
+        rclone_aggregate_map_path, mapping_result = _generate_rclone_benchmark_mapping(
+            shell=shell,
+            domain=domain,
+            username=username,
+            password=password,
+            hosts=hosts,
+            shares=shares,
+            share_map=share_map,
+            purpose=_resolve_rclone_benchmark_mapping_purpose(scenario),
+        )
+        mapping_seconds += max(0.0, time.perf_counter() - mapping_started)
+        if not rclone_aggregate_map_path or not bool(mapping_result.get("success")):
+            return _with_mapping_timing({"success": False})
+
+    if scenario.backend == "manspider":
+        if scenario.benchmark_kind == "artifacts":
+            return _with_mapping_timing(_run_manspider_artifact_benchmark(
+                shell=shell,
+                domain=domain,
+                shares=shares,
+                hosts=hosts,
+                username=username,
+                password=password,
+            ))
+        if scenario.benchmark_kind == "full":
+            return _with_mapping_timing(_run_full_production_like_backend_benchmark(
+                credential_runner=lambda: _run_manspider_credsweeper_benchmark(
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS,
+                    benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED,
+                    benchmark_execution_mode="production_sequenced",
+                ),
+                artifact_runner=lambda: _run_manspider_artifact_benchmark(
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                ),
+            ))
+        return _with_mapping_timing(_run_manspider_credsweeper_benchmark(
+            shell=shell,
+            domain=domain,
+            shares=shares,
+            hosts=hosts,
+            username=username,
+            password=password,
+            benchmark_profile=benchmark_profile,
+            benchmark_scope=scenario.benchmark_scope,
+            benchmark_execution_mode=scenario.benchmark_execution_mode,
+        ))
+
+    if scenario.backend == "rclone":
+        if scenario.benchmark_kind == "artifacts":
+            if use_mapping:
+                return _with_mapping_timing(_run_rclone_mapped_artifact_benchmark(
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    aggregate_map_path=rclone_aggregate_map_path,
+                ))
+            return _with_mapping_timing(_run_rclone_artifact_benchmark(
+                shell=shell,
+                domain=domain,
+                shares=shares,
+                hosts=hosts,
+                username=username,
+                password=password,
+                share_map=share_map,
+            ))
+        if scenario.benchmark_kind == "full":
+            credential_runner: Callable[[], dict[str, Any]]
+            artifact_runner: Callable[[], dict[str, Any]]
+            if scenario.read_mode == "cat_library":
+                credential_runner = partial(
+                    _run_rclone_cat_credsweeper_library_benchmark,
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS,
+                    benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED,
+                    benchmark_execution_mode="production_sequenced",
+                )
+            elif use_mapping:
+                credential_runner = partial(
+                    _run_rclone_mapped_credsweeper_benchmark,
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS,
+                    benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED,
+                    benchmark_execution_mode="production_sequenced",
+                    aggregate_map_path=rclone_aggregate_map_path,
+                )
+            else:
+                credential_runner = partial(
+                    _run_rclone_credsweeper_benchmark,
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS,
+                    benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED,
+                    benchmark_execution_mode="production_sequenced",
+                )
+            if use_mapping:
+                artifact_runner = partial(
+                    _run_rclone_mapped_artifact_benchmark,
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    aggregate_map_path=rclone_aggregate_map_path,
+                )
+            else:
+                artifact_runner = partial(
+                    _run_rclone_artifact_benchmark,
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                )
+            return _with_mapping_timing(_run_full_production_like_backend_benchmark(
+                credential_runner=credential_runner,
+                artifact_runner=artifact_runner,
+            ))
+        if scenario.read_mode == "cat_library":
+            return _with_mapping_timing(_run_rclone_cat_credsweeper_library_benchmark(
+                shell=shell,
+                domain=domain,
+                shares=shares,
+                hosts=hosts,
+                username=username,
+                password=password,
+                share_map=share_map,
+                benchmark_profile=benchmark_profile,
+                benchmark_scope=scenario.benchmark_scope,
+                benchmark_execution_mode=scenario.benchmark_execution_mode,
+                aggregate_map_path=rclone_aggregate_map_path,
+            ))
+        if use_mapping:
+            return _with_mapping_timing(_run_rclone_mapped_credsweeper_benchmark(
+                shell=shell,
+                domain=domain,
+                shares=shares,
+                hosts=hosts,
+                username=username,
+                password=password,
+                share_map=share_map,
+                benchmark_profile=benchmark_profile,
+                benchmark_scope=scenario.benchmark_scope,
+                benchmark_execution_mode=scenario.benchmark_execution_mode,
+                aggregate_map_path=rclone_aggregate_map_path,
+            ))
+        return _with_mapping_timing(_run_rclone_credsweeper_benchmark(
+            shell=shell,
+            domain=domain,
+            shares=shares,
+            hosts=hosts,
+            username=username,
+            password=password,
+            share_map=share_map,
+            benchmark_profile=benchmark_profile,
+            benchmark_scope=scenario.benchmark_scope,
+            benchmark_execution_mode=scenario.benchmark_execution_mode,
+        ))
+
+    if scenario.backend == "cifs":
+        aggregate_map_path: str | None = None
+        if use_mapping:
+            mapping_started = time.perf_counter()
+            aggregate_map_path, mapping_result = _generate_cifs_benchmark_mapping(
+                shell=shell,
+                domain=domain,
+                username=username,
+                password=password,
+                hosts=hosts,
+                shares=shares,
+                share_map=share_map,
+            )
+            mapping_seconds += max(0.0, time.perf_counter() - mapping_started)
+            if not aggregate_map_path or not bool(mapping_result.get("success")):
+                return _with_mapping_timing({"success": False})
+        if scenario.benchmark_kind == "artifacts":
+            if scenario.read_mode == "full_mount":
+                return _with_mapping_timing(_run_cifs_full_mount_artifact_benchmark(
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    aggregate_map_path=aggregate_map_path,
+                ))
+            return _with_mapping_timing(_run_cifs_artifact_benchmark(
+                shell=shell,
+                domain=domain,
+                shares=shares,
+                hosts=hosts,
+                username=username,
+                password=password,
+                share_map=share_map,
+                use_mapping=use_mapping,
+                aggregate_map_path=aggregate_map_path,
+            ))
+        if scenario.benchmark_kind == "full":
+            credential_runner: Callable[[], dict[str, Any]]
+            artifact_runner: Callable[[], dict[str, Any]]
+            if scenario.read_mode == "full_mount":
+                credential_runner = partial(
+                    _run_cifs_full_mount_credsweeper_benchmark,
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS,
+                    benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED,
+                    benchmark_execution_mode="production_sequenced",
+                )
+
+                artifact_runner = partial(
+                    _run_cifs_full_mount_artifact_benchmark,
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    aggregate_map_path=aggregate_map_path if use_mapping else None,
+                )
+            else:
+                credential_runner = partial(
+                    _run_cifs_credsweeper_benchmark,
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS,
+                    benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED,
+                    benchmark_execution_mode="production_sequenced",
+                    use_mapping=use_mapping,
+                    aggregate_map_path=aggregate_map_path,
+                )
+
+                artifact_runner = partial(
+                    _run_cifs_artifact_benchmark,
+                    shell=shell,
+                    domain=domain,
+                    shares=shares,
+                    hosts=hosts,
+                    username=username,
+                    password=password,
+                    share_map=share_map,
+                    use_mapping=use_mapping,
+                    aggregate_map_path=aggregate_map_path,
+                )
+            return _with_mapping_timing(_run_full_production_like_backend_benchmark(
+                credential_runner=credential_runner,
+                artifact_runner=artifact_runner,
+            ))
+        if scenario.read_mode == "full_mount":
+            return _with_mapping_timing(_run_cifs_full_mount_credsweeper_benchmark(
+                shell=shell,
+                domain=domain,
+                shares=shares,
+                hosts=hosts,
+                username=username,
+                password=password,
+                share_map=share_map,
+                benchmark_profile=benchmark_profile,
+                benchmark_scope=scenario.benchmark_scope,
+                benchmark_execution_mode=scenario.benchmark_execution_mode,
+            ))
+        return _with_mapping_timing(_run_cifs_credsweeper_benchmark(
+            shell=shell,
+            domain=domain,
+            shares=shares,
+            hosts=hosts,
+            username=username,
+            password=password,
+            share_map=share_map,
+            benchmark_profile=benchmark_profile,
+            benchmark_scope=scenario.benchmark_scope,
+            benchmark_execution_mode=scenario.benchmark_execution_mode,
+            use_mapping=use_mapping,
+            aggregate_map_path=aggregate_map_path,
+        ))
+
+    return _with_mapping_timing({"success": False})
+
+
+def _run_credsweeper_path_scan_with_scope(
+    *,
+    credsweeper_service: Any,
+    credsweeper_path: str,
+    path_to_scan: str,
+    json_output_dir: str,
+    benchmark_scope: str,
+    jobs: int | None = None,
+    find_by_ext: bool = False,
+) -> dict[str, list[tuple[str, float | None, str, int, str]]]:
+    """Run one CredSweeper path scan with scope-aware document semantics."""
+    common_kwargs = {
+        "credsweeper_path": credsweeper_path,
+        "json_output_dir": json_output_dir,
+        "include_custom_rules": True,
+        "custom_ml_threshold": "0.0",
+        "jobs": jobs,
+        "find_by_ext": find_by_ext,
+    }
+    if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY:
+        return credsweeper_service.analyze_path_with_options(
+            path_to_scan,
+            doc=True,
+            **common_kwargs,
+        )
+    if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_DOCUMENTS_DEPTH_EXPERIMENTAL:
+        return credsweeper_service.analyze_path_with_options(
+            path_to_scan,
+            doc=True,
+            depth=True,
+            **common_kwargs,
+        )
+    if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED:
+        text_findings = credsweeper_service.analyze_path_with_options(
+            path_to_scan,
+            doc=False,
+            **common_kwargs,
+        )
+        doc_findings = credsweeper_service.analyze_path_with_options(
+            path_to_scan,
+            doc=True,
+            **common_kwargs,
+        )
+        return _merge_grouped_credential_findings(text_findings, doc_findings)
+    return credsweeper_service.analyze_path_with_options(
+        path_to_scan,
+        doc=False,
+        **common_kwargs,
+    )
+
+
+def _run_credsweeper_benchmark_path_scan(
+    *,
+    credsweeper_service: Any,
+    credsweeper_path: str,
+    path_to_scan: str,
+    json_output_dir: str,
+    benchmark_scope: str,
+    jobs: int | None = None,
+    find_by_ext: bool = False,
+) -> dict[str, list[tuple[str, float | None, str, int, str]]]:
+    """Backward-compatible benchmark wrapper around scoped CredSweeper scan."""
+    return _run_credsweeper_path_scan_with_scope(
+        credsweeper_service=credsweeper_service,
+        credsweeper_path=credsweeper_path,
+        path_to_scan=path_to_scan,
+        json_output_dir=json_output_dir,
+        benchmark_scope=benchmark_scope,
+        jobs=jobs,
+        find_by_ext=find_by_ext,
+    )
+
+
+def _run_credsweeper_library_benchmark_target_scan(
+    *,
+    library_service: Any,
+    targets: list[Any],
+    benchmark_scope: str,
+    jobs: int | None = None,
+) -> dict[str, list[tuple[str, float | None, str, int, str]]]:
+    """Run one in-memory CredSweeper library benchmark with scope-aware semantics."""
+    common_kwargs = {
+        "include_custom_rules": True,
+        "jobs": jobs,
+    }
+    if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY:
+        return library_service.analyze_targets_with_options(
+            targets,
+            doc=True,
+            **common_kwargs,
+        )
+    if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_DOCUMENTS_DEPTH_EXPERIMENTAL:
+        return library_service.analyze_targets_with_options(
+            targets,
+            doc=True,
+            depth=True,
+            **common_kwargs,
+        )
+    if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED:
+        text_findings = library_service.analyze_targets_with_options(
+            targets,
+            doc=False,
+            **common_kwargs,
+        )
+        doc_findings = library_service.analyze_targets_with_options(
+            targets,
+            doc=True,
+            **common_kwargs,
+        )
+        return _merge_grouped_credential_findings(text_findings, doc_findings)
+    return library_service.analyze_targets_with_options(
+        targets,
+        doc=False,
+        **common_kwargs,
+    )
+
+
+def _build_manspider_passw_command(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    hosts: list[str],
+    loot_dir: str,
+    benchmark_profile: str = DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+) -> str:
+    """Build the legacy manspider password-hunting command."""
+    manspider_bin = shlex.quote(str(getattr(shell, "manspider_path", "manspider")))
+    hosts_str = " ".join(shlex.quote(str(host)) for host in hosts)
+    loot_dir_arg = shlex.quote(str(loot_dir))
+    extensions_arg = " ".join(
+        shlex.quote(extension)
+        for extension in get_manspider_sensitive_extensions(
+            benchmark_profile
+        )
+    )
+    domain_auth = str(
+        getattr(shell, "domains_data", {}).get(domain, {}).get("auth", "")
+    ).strip()
+    exclusion_args = build_manspider_exclusion_args()
+    if domain_auth == "auth":
+        auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
+        return (
+            f"{manspider_bin} --threads 256 {hosts_str} {auth} "
+            f"-e {extensions_arg} -l {loot_dir_arg} "
+            f"{exclusion_args}"
+        )
+    return (
+        f"{manspider_bin} --threads 256 {hosts_str} "
+        f"-e {extensions_arg} -l {loot_dir_arg} "
+        f"{exclusion_args}"
+    )
+
+
+def _build_manspider_extensions_command(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    hosts: list[str],
+    loot_dir: str,
+    extensions: tuple[str, ...],
+) -> str:
+    """Build a manspider command for artifact-style extension hunting."""
+    manspider_bin = shlex.quote(str(getattr(shell, "manspider_path", "manspider")))
+    hosts_str = " ".join(shlex.quote(str(host)) for host in hosts)
+    loot_dir_arg = shlex.quote(str(loot_dir))
+    extensions_arg = " ".join(shlex.quote(str(extension)) for extension in extensions)
+    domain_auth = str(
+        getattr(shell, "domains_data", {}).get(domain, {}).get("auth", "")
+    ).strip()
+    exclusion_args = build_manspider_exclusion_args()
+    if domain_auth == "auth":
+        auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
+        return (
+            f"{manspider_bin} --threads 256 {hosts_str} {auth} "
+            f"-e {extensions_arg} -l {loot_dir_arg} "
+            f"--max-filesize {GLOBAL_SMB_HEAVY_ARTIFACT_MAX_FILESIZE_MB}M {exclusion_args}"
+        )
+    return (
+        f"{manspider_bin} --threads 256 {hosts_str} "
+        f"-e {extensions_arg} -l {loot_dir_arg} "
+        f"--max-filesize {GLOBAL_SMB_HEAVY_ARTIFACT_MAX_FILESIZE_MB}M {exclusion_args}"
+    )
+
+
+def _resolve_rclone_benchmark_parallelism() -> int:
+    """Return default worker count for parallel rclone cat fetches."""
+    return max(1, min(8, int(os.cpu_count() or 4)))
+
+
+def _resolve_rclone_cat_parallelism() -> int:
+    """Return worker count for parallel rclone cat benchmark fetches."""
+    return max(1, _resolve_rclone_benchmark_parallelism())
+
+
+def _is_rclone_small_file_profile(benchmark_profile: str) -> bool:
+    """Return True when one benchmark profile mostly targets small text-like files."""
+    return str(benchmark_profile or "").strip() == SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY
+
+
+def _ensure_rclone_available(shell: Any) -> str | None:
+    """Validate rclone availability and return its resolved executable path."""
+    rclone_path = _resolve_rclone_path(shell)
+    version_result = shell.run_command(
+        f"{shlex.quote(rclone_path)} version",
+        timeout=30,
+        ignore_errors=True,
+    )
+    if version_result is None or int(getattr(version_result, "returncode", 1)) != 0:
+        print_warning("rclone is not configured or not available. Skipping rclone benchmark.")
+        return None
+    return rclone_path
+
+
+def _build_rclone_include_args(
+    *,
+    extensions: tuple[str, ...],
+) -> str:
+    """Build repeated rclone include filters for one shared extension whitelist."""
+    patterns: list[str] = []
+    seen: set[str] = set()
+    for extension in extensions:
+        normalized = str(extension or "").strip().casefold()
+        if not normalized.startswith("."):
+            continue
+        pattern = f"*{normalized}"
+        if pattern in seen:
+            continue
+        seen.add(pattern)
+        patterns.append(f"--include {shlex.quote(pattern)}")
+    return " ".join(patterns)
+
+
+def _build_rclone_copy_command(
+    *,
+    rclone_path: str,
+    remote: str,
+    destination_dir: str,
+    extensions: tuple[str, ...],
+    tuning: RcloneTuning,
+) -> str:
+    """Build one rclone copy command for a filtered SMB share download."""
+    include_args = _build_rclone_include_args(extensions=extensions)
+    destination_arg = shlex.quote(str(destination_dir))
+    command_parts = [
+        shlex.quote(rclone_path),
+        "copy",
+        shlex.quote(remote),
+        destination_arg,
+        "--checkers",
+        str(max(1, int(tuning.checkers))),
+        "--transfers",
+        str(max(1, int(tuning.transfers))),
+        "--buffer-size",
+        shlex.quote(str(tuning.buffer_size)),
+        "--ignore-times",
+    ]
+    if include_args:
+        command_parts.append(include_args)
+    return " ".join(command_parts)
+
+
+def _build_rclone_copy_files_from_command(
+    *,
+    rclone_path: str,
+    remote: str,
+    destination_dir: str,
+    files_from_path: str,
+    tuning: RcloneTuning,
+) -> str:
+    """Build one rclone copy command constrained by files-from manifest."""
+    destination_arg = shlex.quote(str(destination_dir))
+    files_from_arg = shlex.quote(str(files_from_path))
+    command_parts = [
+        shlex.quote(rclone_path),
+        "copy",
+        shlex.quote(remote),
+        destination_arg,
+        "--files-from-raw",
+        files_from_arg,
+        "--checkers",
+        str(max(1, int(tuning.checkers))),
+        "--transfers",
+        str(max(1, int(tuning.transfers))),
+        "--buffer-size",
+        shlex.quote(str(tuning.buffer_size)),
+        "--ignore-times",
+        "--no-traverse",
+    ]
+    return " ".join(command_parts)
+
+
+def _build_rclone_cat_command(
+    *,
+    rclone_path: str,
+    remote_file: str,
+) -> str:
+    """Build one rclone cat command for an exact remote file path."""
+    return f"{shlex.quote(rclone_path)} cat {shlex.quote(remote_file)}"
+
+
+def _resolve_rclone_benchmark_root(
+    *,
+    shell: Any,
+    domain: str,
+    purpose: str,
+) -> str:
+    """Return one workspace-scoped root directory for rclone benchmark artifacts."""
+    workspace_cwd = shell._get_workspace_cwd()
+    return domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "sensitive_benchmark",
+        purpose,
+    )
+
+
+def _generate_rclone_mapping(
+    *,
+    shell: Any,
+    domain: str,
+    username: str,
+    password: str,
+    hosts: list[str],
+    shares: list[str],
+    share_map: dict[str, dict[str, str]] | None,
+    run_output_abs: str,
+    aggregate_map_abs: str,
+) -> dict[str, Any]:
+    """Generate one fresh rclone mapping and merge it into an aggregate JSON."""
+    from adscan_internal.services.rclone_share_mapping_service import (
+        RcloneShareMappingService,
+    )
+    from adscan_internal.services.share_mapping_service import ShareMappingService
+
+    rclone_path = _ensure_rclone_available(shell)
+    if not rclone_path:
+        return {"success": False}
+    if not _is_rclone_supported_for_smb_auth(
+        shell,
+        domain=domain,
+        username=username,
+    ):
+        print_warning_debug(
+            "Skipping rclone mapping because SMB null-session auth is not supported "
+            "by the rclone SMB backend."
+        )
+        return {"success": False}
+
+    os.makedirs(run_output_abs, exist_ok=True)
+    target_pairs = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+    )
+    transport_username, transport_password, transport_domain = (
+        _resolve_rclone_transport_auth(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+    )
+    rclone_service = RcloneShareMappingService()
+    mapping_result = rclone_service.generate_host_metadata_json(
+        run_output_dir=run_output_abs,
+        host_share_targets=target_pairs,
+        username=transport_username,
+        password=transport_password,
+        domain=transport_domain,
+        command_executor=shell.run_command,
+        rclone_path=rclone_path,
+        timeout_seconds=1200,
+    )
+    run_id = Path(run_output_abs).name
+    share_mapping_service = ShareMappingService()
+    share_mapping_service.merge_spider_plus_run(
+        domain=domain,
+        principal=f"{domain}\\{username}",
+        run_id=run_id,
+        run_output_dir=run_output_abs,
+        aggregate_map_path=aggregate_map_abs,
+        requested_hosts=hosts,
+        requested_shares=shares,
+        host_share_permissions=share_map,
+    )
+    return {
+        "success": bool(int(mapping_result.get("host_json_files", 0) or 0) > 0),
+        "mapped_shares": int(mapping_result.get("mapped_shares", 0) or 0),
+        "partial_targets": int(mapping_result.get("partial_targets", 0) or 0),
+        "failed_targets": int(mapping_result.get("failed_targets", 0) or 0),
+        "aggregate_map_path": aggregate_map_abs,
+        "run_output_dir": run_output_abs,
+    }
+
+
+def _generate_rclone_benchmark_mapping(
+    *,
+    shell: Any,
+    domain: str,
+    username: str,
+    password: str,
+    hosts: list[str],
+    shares: list[str],
+    share_map: dict[str, dict[str, str]] | None,
+    purpose: str,
+) -> tuple[str | None, dict[str, Any]]:
+    """Generate one benchmark-scoped rclone aggregate map for later exact downloads."""
+    rclone_path = _ensure_rclone_available(shell)
+    if not rclone_path:
+        return None, {"success": False}
+
+    benchmark_root_abs = _resolve_rclone_benchmark_root(
+        shell=shell,
+        domain=domain,
+        purpose=purpose,
+    )
+    os.makedirs(benchmark_root_abs, exist_ok=True)
+    mapping_root_abs = os.path.join(benchmark_root_abs, "mapping")
+    os.makedirs(mapping_root_abs, exist_ok=True)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_output_abs = os.path.join(mapping_root_abs, "runs", f"{run_id}_{_slugify_token(username)}")
+    os.makedirs(run_output_abs, exist_ok=True)
+    aggregate_map_abs = os.path.join(mapping_root_abs, "share_tree_map.json")
+    mapping_result = _generate_rclone_mapping(
+        shell=shell,
+        domain=domain,
+        username=username,
+        password=password,
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+        run_output_abs=run_output_abs,
+        aggregate_map_abs=aggregate_map_abs,
+    )
+    return aggregate_map_abs, mapping_result
+
+
+def _write_rclone_files_from_manifest(
+    *,
+    manifest_dir: str,
+    host: str,
+    share: str,
+    remote_paths: list[str],
+) -> str:
+    """Write one files-from-raw manifest for a host/share exact download."""
+    os.makedirs(manifest_dir, exist_ok=True)
+    manifest_name = f"{_slugify_token(host)}__{_slugify_token(share)}.txt"
+    manifest_path = os.path.join(manifest_dir, manifest_name)
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        for remote_path in remote_paths:
+            normalized = str(remote_path or "").strip().replace("\\", "/")
+            if not normalized:
+                continue
+            handle.write(normalized + "\n")
+    return manifest_path
+
+
+def _build_rclone_remote_file_path(
+    *,
+    remote_share: str,
+    remote_path: str,
+) -> str:
+    """Build one rclone remote file path from share root and relative file path."""
+    normalized_path = str(remote_path or "").strip().replace("\\", "/").lstrip("/")
+    if not normalized_path:
+        return remote_share
+    return f"{remote_share}/{normalized_path}"
+
+
+def _run_rclone_copy_loot_download(
+    *,
+    shell: Any,
+    domain: str,
+    username: str,
+    password: str,
+    target_pairs: list[tuple[str, str]],
+    loot_dir: str,
+    extensions: tuple[str, ...],
+    mostly_small_files: bool = True,
+    operation_label: str = "benchmark",
+) -> dict[str, Any]:
+    """Download matching SMB share files with rclone into one local loot tree."""
+    from adscan_internal.services.rclone_share_mapping_service import (
+        RcloneShareMappingService,
+    )
+
+    rclone_path = _ensure_rclone_available(shell)
+    if not rclone_path:
+        return {"success": False, "copied_targets": 0, "failed_targets": len(target_pairs)}
+    if not _is_rclone_supported_for_smb_auth(
+        shell,
+        domain=domain,
+        username=username,
+    ):
+        print_warning_debug(
+            f"Skipping rclone {operation_label}: SMB null-session auth is not supported "
+            "by the rclone SMB backend."
+        )
+        return {"success": False, "copied_targets": 0, "failed_targets": len(target_pairs)}
+
+    service = RcloneShareMappingService()
+    transport_username, transport_password, transport_domain = (
+        _resolve_rclone_transport_auth(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+    )
+    obscured_password = service.obscure_password(
+        command_executor=shell.run_command,
+        rclone_path=rclone_path,
+        password=transport_password,
+    )
+    if transport_password and obscured_password == "":
+        print_warning(
+            f"rclone could not obscure the SMB password. Skipping rclone {operation_label}."
+        )
+        return {"success": False, "copied_targets": 0, "failed_targets": len(target_pairs)}
+
+    tuning = choose_rclone_tuning(
+        target_count=len(target_pairs),
+        mostly_small_files=mostly_small_files,
+    )
+    copied_targets = 0
+    failed_targets = 0
+    partial_targets = 0
+    print_info_debug(
+        f"rclone {operation_label} tuning: "
+        f"targets={len(target_pairs)} workers={tuning.target_workers} "
+        f"transfers={tuning.transfers} checkers={tuning.checkers} "
+        f"buffer_size={tuning.buffer_size}"
+    )
+
+    def _download_one_target(target: tuple[str, str]) -> dict[str, Any]:
+        host, share = target
+        remote = service.build_smb_remote(
+            host=host,
+            share=share,
+            username=transport_username,
+            obscured_password=obscured_password,
+            domain=transport_domain,
+        )
+        target_loot_dir = os.path.join(loot_dir, host, share)
+        os.makedirs(target_loot_dir, exist_ok=True)
+        command = _build_rclone_copy_command(
+            rclone_path=rclone_path,
+            remote=remote,
+            destination_dir=target_loot_dir,
+            extensions=extensions,
+            tuning=tuning,
+        )
+        print_info_debug(
+            f"rclone {operation_label} download command: "
+            f"host={mark_sensitive(host, 'host')} share={mark_sensitive(share, 'share')} "
+            f"command={command}"
+        )
+        result = shell.run_command(
+            command,
+            timeout=1200,
+            ignore_errors=True,
+        )
+        copied_file_count = _count_files_under_path(target_loot_dir)
+        if result is None:
+            return {"status": "failed", "host": host, "share": share, "rc": None}
+        return_code = int(getattr(result, "returncode", 1))
+        if return_code == 0:
+            return {"status": "copied", "host": host, "share": share, "rc": return_code}
+        if copied_file_count > 0:
+            return {
+                "status": "partial",
+                "host": host,
+                "share": share,
+                "rc": return_code,
+            }
+        return {"status": "failed", "host": host, "share": share, "rc": return_code}
+
+    if target_pairs:
+        with ThreadPoolExecutor(max_workers=tuning.target_workers) as executor:
+            futures = {
+                executor.submit(_download_one_target, target): target
+                for target in target_pairs
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                status = str(result.get("status", "failed"))
+                host = str(result.get("host", ""))
+                share = str(result.get("share", ""))
+                rc = result.get("rc")
+                if status == "copied":
+                    copied_targets += 1
+                    continue
+                if status == "partial":
+                    partial_targets += 1
+                    copied_targets += 1
+                    print_warning_debug(
+                        f"rclone {operation_label} target returned non-zero after partial download: "
+                        f"host={host} share={share} rc={rc}"
+                    )
+                    continue
+                failed_targets += 1
+                print_warning_debug(
+                    f"rclone {operation_label} target download failed: "
+                    f"host={host} share={share} rc={rc}"
+                )
+
+    return {
+        "success": copied_targets > 0 or (not target_pairs),
+        "copied_targets": copied_targets,
+        "partial_targets": partial_targets,
+        "failed_targets": failed_targets,
+    }
+
+
+def _run_rclone_copy_mapped_loot_download(
+    *,
+    shell: Any,
+    domain: str,
+    username: str,
+    password: str,
+    grouped_remote_paths: dict[tuple[str, str], list[str]],
+    loot_dir: str,
+    manifest_dir: str,
+    mostly_small_files: bool = True,
+    operation_label: str = "mapped benchmark",
+) -> dict[str, Any]:
+    """Download exact remote paths with rclone using files-from manifests."""
+    from adscan_internal.services.rclone_share_mapping_service import (
+        RcloneShareMappingService,
+    )
+
+    rclone_path = _ensure_rclone_available(shell)
+    if not rclone_path:
+        return {"success": False, "copied_targets": 0, "failed_targets": len(grouped_remote_paths)}
+    if not _is_rclone_supported_for_smb_auth(
+        shell,
+        domain=domain,
+        username=username,
+    ):
+        print_warning_debug(
+            f"Skipping rclone {operation_label}: SMB null-session auth is not supported "
+            "by the rclone SMB backend."
+        )
+        return {
+            "success": False,
+            "copied_targets": 0,
+            "failed_targets": len(grouped_remote_paths),
+        }
+
+    service = RcloneShareMappingService()
+    transport_username, transport_password, transport_domain = (
+        _resolve_rclone_transport_auth(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+    )
+    obscured_password = service.obscure_password(
+        command_executor=shell.run_command,
+        rclone_path=rclone_path,
+        password=transport_password,
+    )
+    if transport_password and obscured_password == "":
+        print_warning(
+            f"rclone could not obscure the SMB password. Skipping rclone {operation_label}."
+        )
+        return {"success": False, "copied_targets": 0, "failed_targets": len(grouped_remote_paths)}
+
+    tuning = choose_rclone_tuning(
+        target_count=len(grouped_remote_paths),
+        mostly_small_files=mostly_small_files,
+    )
+    copied_targets = 0
+    failed_targets = 0
+    partial_targets = 0
+    print_info_debug(
+        f"rclone {operation_label} tuning: "
+        f"targets={len(grouped_remote_paths)} workers={tuning.target_workers} "
+        f"transfers={tuning.transfers} checkers={tuning.checkers} "
+        f"buffer_size={tuning.buffer_size}"
+    )
+
+    def _download_one_target(
+        target: tuple[tuple[str, str], list[str]]
+    ) -> dict[str, Any]:
+        (host, share), remote_paths = target
+        if not remote_paths:
+            return {"status": "skipped", "host": host, "share": share, "rc": 0}
+        remote = service.build_smb_remote(
+            host=host,
+            share=share,
+            username=transport_username,
+            obscured_password=obscured_password,
+            domain=transport_domain,
+        )
+        manifest_path = _write_rclone_files_from_manifest(
+            manifest_dir=manifest_dir,
+            host=host,
+            share=share,
+            remote_paths=remote_paths,
+        )
+        target_loot_dir = os.path.join(loot_dir, host, share)
+        os.makedirs(target_loot_dir, exist_ok=True)
+        command = _build_rclone_copy_files_from_command(
+            rclone_path=rclone_path,
+            remote=remote,
+            destination_dir=target_loot_dir,
+            files_from_path=manifest_path,
+            tuning=tuning,
+        )
+        print_info_debug(
+            f"rclone {operation_label} download command: "
+            f"host={mark_sensitive(host, 'host')} share={mark_sensitive(share, 'share')} "
+            f"command={command}"
+        )
+        result = shell.run_command(
+            command,
+            timeout=1200,
+            ignore_errors=True,
+        )
+        copied_file_count = _count_files_under_path(target_loot_dir)
+        if result is None:
+            return {"status": "failed", "host": host, "share": share, "rc": None}
+        return_code = int(getattr(result, "returncode", 1))
+        if return_code == 0:
+            return {"status": "copied", "host": host, "share": share, "rc": return_code}
+        if copied_file_count > 0:
+            return {
+                "status": "partial",
+                "host": host,
+                "share": share,
+                "rc": return_code,
+            }
+        return {"status": "failed", "host": host, "share": share, "rc": return_code}
+
+    if grouped_remote_paths:
+        with ThreadPoolExecutor(max_workers=tuning.target_workers) as executor:
+            futures = {
+                executor.submit(_download_one_target, item): item
+                for item in grouped_remote_paths.items()
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                status = str(result.get("status", "failed"))
+                host = str(result.get("host", ""))
+                share = str(result.get("share", ""))
+                rc = result.get("rc")
+                if status in {"copied", "skipped"}:
+                    if status == "copied":
+                        copied_targets += 1
+                    continue
+                if status == "partial":
+                    partial_targets += 1
+                    copied_targets += 1
+                    print_warning_debug(
+                        f"rclone {operation_label} target returned non-zero after partial download: "
+                        f"host={host} share={share} rc={rc}"
+                    )
+                    continue
+                failed_targets += 1
+                print_warning_debug(
+                    f"rclone {operation_label} target download failed: "
+                    f"host={host} share={share} rc={rc}"
+                )
+
+    return {
+        "success": copied_targets > 0 or (not grouped_remote_paths),
+        "copied_targets": copied_targets,
+        "partial_targets": partial_targets,
+        "failed_targets": failed_targets,
+    }
+
+
+def _run_rclone_cat_library_fetch(
+    *,
+    shell: Any,
+    domain: str,
+    username: str,
+    password: str,
+    grouped_remote_paths: dict[tuple[str, str], list[str]],
+    tuning: RcloneCatTuning,
+) -> list[dict[str, Any]]:
+    """Fetch exact remote files via rclone cat for in-memory library scanning."""
+    from adscan_internal.services.rclone_share_mapping_service import (
+        RcloneShareMappingService,
+    )
+
+    rclone_path = _ensure_rclone_available(shell)
+    if not rclone_path:
+        return []
+    if not _is_rclone_supported_for_smb_auth(
+        shell,
+        domain=domain,
+        username=username,
+    ):
+        print_warning_debug(
+            "Skipping in-memory rclone benchmark: SMB null-session auth is not supported "
+            "by the rclone SMB backend."
+        )
+        return []
+
+    service = RcloneShareMappingService()
+    transport_username, transport_password, transport_domain = (
+        _resolve_rclone_transport_auth(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+    )
+    obscured_password = service.obscure_password(
+        command_executor=shell.run_command,
+        rclone_path=rclone_path,
+        password=transport_password,
+    )
+    if transport_password and obscured_password == "":
+        print_warning(
+            "rclone could not obscure the SMB password. Skipping in-memory rclone benchmark."
+        )
+        return []
+
+    fetch_tasks: list[tuple[int, str, str, str, str]] = []
+    task_index = 0
+    for (host, share), remote_paths in grouped_remote_paths.items():
+        remote_share = service.build_smb_remote(
+            host=host,
+            share=share,
+            username=transport_username,
+            obscured_password=obscured_password,
+            domain=transport_domain,
+        )
+        for remote_path in remote_paths:
+            remote_file = _build_rclone_remote_file_path(
+                remote_share=remote_share,
+                remote_path=remote_path,
+            )
+            fetch_tasks.append((task_index, host, share, remote_path, remote_file))
+            task_index += 1
+
+    if not fetch_tasks:
+        return []
+
+    max_workers = min(max(1, int(tuning.fetch_workers)), len(fetch_tasks))
+    print_info_debug(
+        "rclone library benchmark fetch plan: "
+        f"targets={len(fetch_tasks)} workers={max_workers} "
+        f"analysis_jobs={tuning.analysis_jobs}"
+    )
+
+    def _fetch_one(task: tuple[int, str, str, str, str]) -> tuple[int, dict[str, Any] | None]:
+        index, host, share, remote_path, remote_file = task
+        command = _build_rclone_cat_command(
+            rclone_path=rclone_path,
+            remote_file=remote_file,
+        )
+        print_info_debug(
+            "rclone library benchmark cat command: "
+            f"host={mark_sensitive(host, 'host')} share={mark_sensitive(share, 'share')} "
+            f"path={mark_sensitive(remote_path, 'path')} command={command}"
+        )
+        result = shell.run_command(
+            command,
+            timeout=300,
+            ignore_errors=True,
+            text=False,
+            capture_output=True,
+            use_clean_env=True,
+        )
+        if result is None:
+            return index, None
+        return_code = int(getattr(result, "returncode", 1))
+        stdout_payload = getattr(result, "stdout", b"") or b""
+        if return_code != 0 or not isinstance(stdout_payload, bytes):
+            print_warning_debug(
+                "rclone library benchmark cat failed: "
+                f"host={host} share={share} path={remote_path} rc={return_code}"
+            )
+            return index, None
+        return (
+            index,
+            {
+                "content": stdout_payload,
+                "file_path": f"{host}/{share}/{remote_path}".replace("\\", "/"),
+                "file_type": Path(remote_path).suffix or "",
+                "info": f"RCLONE_CAT:{host}/{share}",
+            },
+        )
+
+    ordered_results: dict[int, dict[str, Any]] = {}
+    if max_workers <= 1:
+        for task in fetch_tasks:
+            index, payload = _fetch_one(task)
+            if payload is not None:
+                ordered_results[index] = payload
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_fetch_one, task) for task in fetch_tasks]
+            for future in as_completed(futures):
+                index, payload = future.result()
+                if payload is not None:
+                    ordered_results[index] = payload
+
+    return [ordered_results[index] for index in sorted(ordered_results)]
+
+
+def _run_manspider_credsweeper_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    benchmark_profile: str = DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+    benchmark_scope: str = SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+    benchmark_execution_mode: str = "single_phase",
+) -> dict[str, Any]:
+    """Run non-interactive legacy manspider + CredSweeper benchmark."""
+    if (
+        benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED
+        and benchmark_execution_mode == "production_sequenced"
+    ):
+        return _merge_credential_benchmark_results(
+            [
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="text_phase_seconds",
+                    runner=lambda: _run_manspider_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+                        benchmark_execution_mode="single_phase",
+                    ),
+                ),
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="document_phase_seconds",
+                    runner=lambda: _run_manspider_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY,
+                        benchmark_execution_mode="single_phase",
+                    ),
+                ),
+            ]
+        )
+    if not getattr(shell, "manspider_path", None):
+        print_warning("manspider is not configured. Skipping legacy benchmark.")
+        return {"success": False}
+    if not getattr(shell, "credsweeper_path", None):
+        print_warning("CredSweeper is not configured. Skipping legacy benchmark.")
+        return {"success": False}
+
+    workspace_cwd = shell._get_workspace_cwd()
+    benchmark_root_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "sensitive_benchmark",
+        "manspider",
+    )
+    os.makedirs(benchmark_root_abs, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_file = os.path.join(
+        benchmark_root_abs,
+        f"spidering_passw_{timestamp}_{_slugify_token(username)}.log",
+    )
+    loot_dir = os.path.join(
+        benchmark_root_abs,
+        f"loot_{timestamp}_{_slugify_token(username)}",
+    )
+    os.makedirs(loot_dir, exist_ok=True)
+    command = _build_manspider_passw_command(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+        hosts=hosts,
+        loot_dir=loot_dir,
+        benchmark_profile=benchmark_profile,
+    )
+    print_info_debug(f"Legacy manspider benchmark command: {command}")
+    prepare_started = time.perf_counter()
+    completed_process = shell.run_command(command)
+    prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+    if completed_process is None:
+        return {"success": False}
+
+    stdout_text = str(getattr(completed_process, "stdout", "") or "")
+    output_lines = 0
+    if stdout_text:
+        with open(log_file, "w", encoding="utf-8") as handle:
+            for line in stdout_text.splitlines():
+                clean_line = strip_ansi_codes(line.strip())
+                if not clean_line:
+                    continue
+                handle.write(clean_line + "\n")
+                output_lines += 1
+
+    service = shell._get_credsweeper_service()
+    artifacts_dir = _resolve_credsweeper_artifacts_dir(
+        shell=shell,
+        domain=domain,
+        purpose="sensitive_benchmark_manspider",
+    )
+    analysis_started = time.perf_counter()
+    findings = _run_credsweeper_benchmark_path_scan(
+        credsweeper_service=service,
+        credsweeper_path=shell.credsweeper_path,
+        path_to_scan=loot_dir,
+        json_output_dir=artifacts_dir,
+        benchmark_scope=benchmark_scope,
+        jobs=get_default_credsweeper_jobs(),
+        find_by_ext=False,
+    )
+    analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    downloaded_files = _count_files_under_path(loot_dir)
+    total_findings, files_with_findings = _count_grouped_credential_findings(findings)
+    credential_preview_values = _build_grouped_credential_preview(findings)
+    timing_key_prefix = (
+        "document"
+        if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY
+        else "text"
+    )
+    return {
+        "success": bool(getattr(completed_process, "returncode", 1) == 0),
+        "candidate_files": int(downloaded_files),
+        "scanned_files": int(downloaded_files),
+        "files_with_findings": int(files_with_findings),
+        "credential_like_findings": int(total_findings),
+        "mapped_shares": int(len(shares)),
+        f"{timing_key_prefix}_prepare_seconds": prepare_seconds,
+        f"{timing_key_prefix}_analysis_seconds": analysis_seconds,
+        "credential_preview_values": credential_preview_values,
+    }
+
+
+def _run_manspider_artifact_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+) -> dict[str, Any]:
+    """Run non-interactive manspider artifact benchmark."""
+    if not getattr(shell, "manspider_path", None):
+        print_warning("manspider is not configured. Skipping artifact benchmark.")
+        return {"success": False}
+
+    workspace_cwd = shell._get_workspace_cwd()
+    benchmark_root_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "sensitive_benchmark",
+        "manspider_artifacts",
+    )
+    os.makedirs(benchmark_root_abs, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    loot_dir = os.path.join(
+        benchmark_root_abs,
+        f"loot_{timestamp}_{_slugify_token(username)}",
+    )
+    os.makedirs(loot_dir, exist_ok=True)
+    artifact_extensions = tuple(
+        dict.fromkeys(
+            get_manspider_phase_extensions("direct_secret_artifacts")
+            + get_manspider_phase_extensions("heavy_artifacts")
+        )
+    )
+    command = _build_manspider_extensions_command(
+        shell=shell,
+        domain=domain,
+        username=username,
+        password=password,
+        hosts=hosts,
+        loot_dir=loot_dir,
+        extensions=artifact_extensions,
+    )
+    print_info_debug(f"Legacy manspider artifact benchmark command: {command}")
+    prepare_started = time.perf_counter()
+    completed_process = shell.run_command(command)
+    prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+    if completed_process is None:
+        return {"success": False}
+
+    artifact_files = _list_files_under_path(loot_dir)
+    spidering_service = shell._get_spidering_service()
+    artifact_tuning = choose_artifact_processing_tuning(file_count=len(artifact_files))
+    print_info_debug(
+        "Artifact benchmark tuning: "
+        f"backend=manspider files={len(artifact_files)} workers={artifact_tuning.workers}"
+    )
+    analysis_started = time.perf_counter()
+    spidering_service.process_found_files_batch(
+        artifact_files,
+        domain,
+        "ext",
+        source_hosts=hosts,
+        source_shares=shares,
+        auth_username=username,
+        enable_legacy_zip_callbacks=False,
+        apply_actions=False,
+        max_workers=artifact_tuning.workers,
+    )
+    analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    return {
+        "success": bool(getattr(completed_process, "returncode", 1) == 0),
+        "candidate_files": len(artifact_files),
+        "processed_files": len(artifact_files),
+        "artifact_hits": len(artifact_files),
+        "mapped_shares": int(len(shares)),
+        "artifact_prepare_seconds": prepare_seconds,
+        "artifact_analysis_seconds": analysis_seconds,
+        "artifact_preview_values": _build_artifact_preview_values(artifact_files),
+    }
+
+
+def _run_rclone_credsweeper_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+    benchmark_profile: str = DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+    benchmark_scope: str = SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+    benchmark_execution_mode: str = "single_phase",
+) -> dict[str, Any]:
+    """Run rclone download + CredSweeper benchmark over one local loot tree."""
+    if (
+        benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED
+        and benchmark_execution_mode == "production_sequenced"
+    ):
+        return _merge_credential_benchmark_results(
+            [
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="text_phase_seconds",
+                    runner=lambda: _run_rclone_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+                        benchmark_execution_mode="single_phase",
+                    ),
+                ),
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="document_phase_seconds",
+                    runner=lambda: _run_rclone_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY,
+                        benchmark_execution_mode="single_phase",
+                    ),
+                ),
+            ]
+        )
+    if not getattr(shell, "credsweeper_path", None):
+        print_warning("CredSweeper is not configured. Skipping rclone benchmark.")
+        return {"success": False}
+
+    workspace_cwd = shell._get_workspace_cwd()
+    benchmark_root_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "sensitive_benchmark",
+        "rclone",
+    )
+    os.makedirs(benchmark_root_abs, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    loot_dir = os.path.join(
+        benchmark_root_abs,
+        f"loot_{timestamp}_{_slugify_token(username)}",
+    )
+    os.makedirs(loot_dir, exist_ok=True)
+    target_pairs = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+    )
+    prepare_started = time.perf_counter()
+    download_result = _run_rclone_copy_loot_download(
+        shell=shell,
+        domain=domain,
+        username=username,
+        password=password,
+        target_pairs=target_pairs,
+        loot_dir=loot_dir,
+        extensions=get_sensitive_file_extensions(benchmark_profile),
+        mostly_small_files=True,
+    )
+    prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+    if not bool(download_result.get("success")):
+        return {"success": False}
+
+    service = shell._get_credsweeper_service()
+    artifacts_dir = _resolve_credsweeper_artifacts_dir(
+        shell=shell,
+        domain=domain,
+        purpose="sensitive_benchmark_rclone",
+    )
+    analysis_started = time.perf_counter()
+    findings = _run_credsweeper_benchmark_path_scan(
+        credsweeper_service=service,
+        credsweeper_path=shell.credsweeper_path,
+        path_to_scan=loot_dir,
+        json_output_dir=artifacts_dir,
+        benchmark_scope=benchmark_scope,
+        jobs=get_default_credsweeper_jobs(),
+        find_by_ext=False,
+    )
+    analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    downloaded_files = _count_files_under_path(loot_dir)
+    total_findings, files_with_findings = _count_grouped_credential_findings(findings)
+    timing_key_prefix = (
+        "document"
+        if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY
+        else "text"
+    )
+    return {
+        "success": True,
+        "candidate_files": int(downloaded_files),
+        "scanned_files": int(downloaded_files),
+        "files_with_findings": int(files_with_findings),
+        "credential_like_findings": int(total_findings),
+        "mapped_shares": int(len(shares)),
+        f"{timing_key_prefix}_prepare_seconds": prepare_seconds,
+        f"{timing_key_prefix}_analysis_seconds": analysis_seconds,
+        "credential_preview_values": _build_grouped_credential_preview(findings),
+    }
+
+
+def _run_rclone_mapped_credsweeper_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+    benchmark_profile: str = DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+    benchmark_scope: str = SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+    benchmark_execution_mode: str = "single_phase",
+    aggregate_map_path: str | None = None,
+) -> dict[str, Any]:
+    """Run mapping-first rclone benchmark using exact files-from downloads."""
+    if (
+        benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED
+        and benchmark_execution_mode == "production_sequenced"
+    ):
+        generated_map_path = aggregate_map_path
+        if not generated_map_path:
+            generated_map_path, mapping_result = _generate_rclone_benchmark_mapping(
+                shell=shell,
+                domain=domain,
+                username=username,
+                password=password,
+                hosts=hosts,
+                shares=shares,
+                share_map=share_map,
+                purpose="rclone_mapped",
+            )
+            if not generated_map_path or not bool(mapping_result.get("success")):
+                return {"success": False}
+        return _merge_credential_benchmark_results(
+            [
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="text_phase_seconds",
+                    runner=lambda: _run_rclone_mapped_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+                        benchmark_execution_mode="single_phase",
+                        aggregate_map_path=generated_map_path,
+                    ),
+                ),
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="document_phase_seconds",
+                    runner=lambda: _run_rclone_mapped_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY,
+                        benchmark_execution_mode="single_phase",
+                        aggregate_map_path=generated_map_path,
+                    ),
+                ),
+            ]
+        )
+    if not getattr(shell, "credsweeper_path", None):
+        print_warning("CredSweeper is not configured. Skipping mapped rclone benchmark.")
+        return {"success": False}
+
+    benchmark_root_abs = _resolve_rclone_benchmark_root(
+        shell=shell,
+        domain=domain,
+        purpose="rclone_mapped",
+    )
+    os.makedirs(benchmark_root_abs, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    loot_dir = os.path.join(
+        benchmark_root_abs,
+        f"loot_{timestamp}_{_slugify_token(username)}",
+    )
+    manifest_dir = os.path.join(
+        benchmark_root_abs,
+        f"manifests_{timestamp}_{_slugify_token(username)}",
+    )
+    os.makedirs(loot_dir, exist_ok=True)
+    os.makedirs(manifest_dir, exist_ok=True)
+
+    effective_aggregate_map_path = aggregate_map_path
+    if not effective_aggregate_map_path:
+        effective_aggregate_map_path, mapping_result = _generate_rclone_benchmark_mapping(
+            shell=shell,
+            domain=domain,
+            username=username,
+            password=password,
+            hosts=hosts,
+            shares=shares,
+            share_map=share_map,
+            purpose="rclone_mapped",
+        )
+        if not effective_aggregate_map_path or not bool(mapping_result.get("success")):
+            return {"success": False}
+
+    from adscan_internal.services.share_mapping_service import ShareMappingService
+
+    share_mapping_service = ShareMappingService()
+    grouped_remote_paths = share_mapping_service.resolve_candidate_remote_paths_from_aggregate(
+        aggregate_map_path=effective_aggregate_map_path,
+        hosts=hosts,
+        shares=shares,
+        extensions=get_sensitive_file_extensions(benchmark_profile),
+    )
+    prepare_started = time.perf_counter()
+    download_result = _run_rclone_copy_mapped_loot_download(
+        shell=shell,
+        domain=domain,
+        username=username,
+        password=password,
+        grouped_remote_paths=grouped_remote_paths,
+        loot_dir=loot_dir,
+        manifest_dir=manifest_dir,
+        mostly_small_files=True,
+    )
+    prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+    if not bool(download_result.get("success")):
+        return {"success": False}
+
+    service = shell._get_credsweeper_service()
+    artifacts_dir = _resolve_credsweeper_artifacts_dir(
+        shell=shell,
+        domain=domain,
+        purpose="sensitive_benchmark_rclone_mapped",
+    )
+    analysis_started = time.perf_counter()
+    findings = _run_credsweeper_benchmark_path_scan(
+        credsweeper_service=service,
+        credsweeper_path=shell.credsweeper_path,
+        path_to_scan=loot_dir,
+        json_output_dir=artifacts_dir,
+        benchmark_scope=benchmark_scope,
+        jobs=get_default_credsweeper_jobs(),
+        find_by_ext=False,
+    )
+    analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    downloaded_files = _count_files_under_path(loot_dir)
+    total_findings, files_with_findings = _count_grouped_credential_findings(findings)
+    timing_key_prefix = (
+        "document"
+        if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY
+        else "text"
+    )
+    return {
+        "success": True,
+        "candidate_files": int(downloaded_files),
+        "scanned_files": int(downloaded_files),
+        "files_with_findings": int(files_with_findings),
+        "credential_like_findings": int(total_findings),
+        "mapped_shares": int(len(grouped_remote_paths)),
+        f"{timing_key_prefix}_prepare_seconds": prepare_seconds,
+        f"{timing_key_prefix}_analysis_seconds": analysis_seconds,
+        "credential_preview_values": _build_grouped_credential_preview(findings),
+    }
+
+
+def _run_rclone_cat_credsweeper_library_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+    benchmark_profile: str = DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+    benchmark_scope: str = SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+    benchmark_execution_mode: str = "single_phase",
+    aggregate_map_path: str | None = None,
+) -> dict[str, Any]:
+    """Run mapping-first rclone cat benchmark with in-memory CredSweeper library scan."""
+    if (
+        benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED
+        and benchmark_execution_mode == "production_sequenced"
+    ):
+        generated_map_path = aggregate_map_path
+        if not generated_map_path:
+            generated_map_path, mapping_result = _generate_rclone_benchmark_mapping(
+                shell=shell,
+                domain=domain,
+                username=username,
+                password=password,
+                hosts=hosts,
+                shares=shares,
+                share_map=share_map,
+                purpose="rclone_library",
+            )
+            if not generated_map_path or not bool(mapping_result.get("success")):
+                return {"success": False}
+        return _merge_credential_benchmark_results(
+            [
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="text_phase_seconds",
+                    runner=lambda: _run_rclone_cat_credsweeper_library_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+                        benchmark_execution_mode="single_phase",
+                        aggregate_map_path=generated_map_path,
+                    ),
+                ),
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="document_phase_seconds",
+                    runner=lambda: _run_rclone_cat_credsweeper_library_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY,
+                        benchmark_execution_mode="single_phase",
+                        aggregate_map_path=generated_map_path,
+                    ),
+                ),
+            ]
+        )
+
+    from adscan_internal.services.credsweeper_library_service import (
+        CredSweeperLibraryService,
+        InMemoryCredSweeperTarget,
+    )
+    from adscan_internal.services.share_mapping_service import ShareMappingService
+
+    effective_aggregate_map_path = aggregate_map_path
+    if not effective_aggregate_map_path:
+        effective_aggregate_map_path, mapping_result = _generate_rclone_benchmark_mapping(
+            shell=shell,
+            domain=domain,
+            username=username,
+            password=password,
+            hosts=hosts,
+            shares=shares,
+            share_map=share_map,
+            purpose="rclone_library",
+        )
+        if not effective_aggregate_map_path or not bool(mapping_result.get("success")):
+            return {"success": False}
+
+    share_mapping_service = ShareMappingService()
+    grouped_remote_paths = share_mapping_service.resolve_candidate_remote_paths_from_aggregate(
+        aggregate_map_path=effective_aggregate_map_path,
+        hosts=hosts,
+        shares=shares,
+        extensions=get_sensitive_file_extensions(benchmark_profile),
+    )
+    file_count = sum(len(paths) for paths in grouped_remote_paths.values())
+    cat_tuning = choose_rclone_cat_tuning(
+        file_count=file_count,
+        share_count=len(grouped_remote_paths),
+        mostly_small_files=_is_rclone_small_file_profile(benchmark_profile),
+    )
+    print_info_debug(
+        "rclone library benchmark tuning: "
+        f"files={file_count} shares={len(grouped_remote_paths)} "
+        f"fetch_workers={cat_tuning.fetch_workers} "
+        f"analysis_jobs={cat_tuning.analysis_jobs}"
+    )
+    prepare_started = time.perf_counter()
+    fetched_payloads = _run_rclone_cat_library_fetch(
+        shell=shell,
+        domain=domain,
+        username=username,
+        password=password,
+        grouped_remote_paths=grouped_remote_paths,
+        tuning=cat_tuning,
+    )
+    prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+    if not fetched_payloads:
+        return {"success": False}
+
+    targets = [
+        InMemoryCredSweeperTarget(
+            content=entry["content"],
+            file_path=entry["file_path"],
+            file_type=entry["file_type"],
+            info=entry["info"],
+        )
+        for entry in fetched_payloads
+    ]
+    library_service = CredSweeperLibraryService()
+    analysis_started = time.perf_counter()
+    findings = _run_credsweeper_library_benchmark_target_scan(
+        library_service=library_service,
+        targets=targets,
+        benchmark_scope=benchmark_scope,
+        jobs=cat_tuning.analysis_jobs,
+    )
+    analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    total_findings, files_with_findings = _count_grouped_credential_findings(findings)
+    timing_key_prefix = (
+        "document"
+        if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY
+        else "text"
+    )
+    return {
+        "success": True,
+        "candidate_files": len(targets),
+        "scanned_files": len(targets),
+        "files_with_findings": int(files_with_findings),
+        "credential_like_findings": int(total_findings),
+        "mapped_shares": int(len(grouped_remote_paths)),
+        f"{timing_key_prefix}_prepare_seconds": prepare_seconds,
+        f"{timing_key_prefix}_analysis_seconds": analysis_seconds,
+        "credential_preview_values": _build_grouped_credential_preview(findings),
+    }
+
+
+def _run_rclone_artifact_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+) -> dict[str, Any]:
+    """Run rclone-backed specialized artifact benchmark over downloaded loot."""
+    workspace_cwd = shell._get_workspace_cwd()
+    benchmark_root_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "sensitive_benchmark",
+        "rclone_artifacts",
+    )
+    os.makedirs(benchmark_root_abs, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    loot_dir = os.path.join(
+        benchmark_root_abs,
+        f"loot_{timestamp}_{_slugify_token(username)}",
+    )
+    os.makedirs(loot_dir, exist_ok=True)
+    target_pairs = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+    )
+    artifact_extensions = tuple(
+        dict.fromkeys(
+            get_sensitive_phase_extensions("direct_secret_artifacts")
+            + get_sensitive_phase_extensions("heavy_artifacts")
+        )
+    )
+    prepare_started = time.perf_counter()
+    download_result = _run_rclone_copy_loot_download(
+        shell=shell,
+        domain=domain,
+        username=username,
+        password=password,
+        target_pairs=target_pairs,
+        loot_dir=loot_dir,
+        extensions=artifact_extensions,
+        mostly_small_files=False,
+    )
+    prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+    if not bool(download_result.get("success")):
+        return {"success": False}
+
+    artifact_files = _list_files_under_path(loot_dir)
+    spidering_service = shell._get_spidering_service()
+    artifact_tuning = choose_artifact_processing_tuning(file_count=len(artifact_files))
+    print_info_debug(
+        "Artifact benchmark tuning: "
+        f"backend=rclone_copy files={len(artifact_files)} workers={artifact_tuning.workers}"
+    )
+    analysis_started = time.perf_counter()
+    spidering_service.process_found_files_batch(
+        artifact_files,
+        domain,
+        "ext",
+        source_hosts=hosts,
+        source_shares=shares,
+        auth_username=username,
+        enable_legacy_zip_callbacks=False,
+        apply_actions=False,
+        max_workers=artifact_tuning.workers,
+    )
+    analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    return {
+        "success": True,
+        "candidate_files": len(artifact_files),
+        "processed_files": len(artifact_files),
+        "artifact_hits": len(artifact_files),
+        "mapped_shares": int(len(shares)),
+        "artifact_prepare_seconds": prepare_seconds,
+        "artifact_analysis_seconds": analysis_seconds,
+        "artifact_preview_values": _build_artifact_preview_values(artifact_files),
+    }
+
+
+def _run_rclone_mapped_artifact_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+    aggregate_map_path: str | None = None,
+) -> dict[str, Any]:
+    """Run mapping-first rclone artifact benchmark using exact files-from downloads."""
+    benchmark_root_abs = _resolve_rclone_benchmark_root(
+        shell=shell,
+        domain=domain,
+        purpose="rclone_mapped_artifacts",
+    )
+    os.makedirs(benchmark_root_abs, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    loot_dir = os.path.join(
+        benchmark_root_abs,
+        f"loot_{timestamp}_{_slugify_token(username)}",
+    )
+    manifest_dir = os.path.join(
+        benchmark_root_abs,
+        f"manifests_{timestamp}_{_slugify_token(username)}",
+    )
+    os.makedirs(loot_dir, exist_ok=True)
+    os.makedirs(manifest_dir, exist_ok=True)
+
+    effective_aggregate_map_path = aggregate_map_path
+    if not effective_aggregate_map_path:
+        effective_aggregate_map_path, mapping_result = _generate_rclone_benchmark_mapping(
+            shell=shell,
+            domain=domain,
+            username=username,
+            password=password,
+            hosts=hosts,
+            shares=shares,
+            share_map=share_map,
+            purpose="rclone_mapped_artifacts",
+        )
+        if not effective_aggregate_map_path or not bool(mapping_result.get("success")):
+            return {"success": False}
+
+    from adscan_internal.services.share_mapping_service import ShareMappingService
+
+    artifact_extensions = tuple(
+        dict.fromkeys(
+            get_sensitive_phase_extensions("direct_secret_artifacts")
+            + get_sensitive_phase_extensions("heavy_artifacts")
+        )
+    )
+    share_mapping_service = ShareMappingService()
+    grouped_remote_paths = share_mapping_service.resolve_candidate_remote_paths_from_aggregate(
+        aggregate_map_path=effective_aggregate_map_path,
+        hosts=hosts,
+        shares=shares,
+        extensions=artifact_extensions,
+    )
+    prepare_started = time.perf_counter()
+    download_result = _run_rclone_copy_mapped_loot_download(
+        shell=shell,
+        domain=domain,
+        username=username,
+        password=password,
+        grouped_remote_paths=grouped_remote_paths,
+        loot_dir=loot_dir,
+        manifest_dir=manifest_dir,
+        mostly_small_files=False,
+    )
+    prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+    if not bool(download_result.get("success")):
+        return {"success": False}
+
+    artifact_files = _list_files_under_path(loot_dir)
+    spidering_service = shell._get_spidering_service()
+    artifact_tuning = choose_artifact_processing_tuning(file_count=len(artifact_files))
+    print_info_debug(
+        "Artifact benchmark tuning: "
+        f"backend=rclone_mapped_copy files={len(artifact_files)} workers={artifact_tuning.workers}"
+    )
+    analysis_started = time.perf_counter()
+    spidering_service.process_found_files_batch(
+        artifact_files,
+        domain,
+        "ext",
+        source_hosts=hosts,
+        source_shares=shares,
+        auth_username=username,
+        enable_legacy_zip_callbacks=False,
+        apply_actions=False,
+        max_workers=artifact_tuning.workers,
+    )
+    analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    return {
+        "success": True,
+        "candidate_files": len(artifact_files),
+        "processed_files": len(artifact_files),
+        "artifact_hits": len(artifact_files),
+        "mapped_shares": int(len(grouped_remote_paths)),
+        "artifact_prepare_seconds": prepare_seconds,
+        "artifact_analysis_seconds": analysis_seconds,
+        "artifact_preview_values": _build_artifact_preview_values(artifact_files),
+    }
+
+
+def _run_cifs_credsweeper_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+    benchmark_profile: str = DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+    benchmark_scope: str = SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+    benchmark_execution_mode: str = "single_phase",
+    use_mapping: bool = True,
+    aggregate_map_path: str | None = None,
+) -> dict[str, Any]:
+    """Run non-interactive CIFS + CredSweeper benchmark."""
+    if (
+        benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED
+        and benchmark_execution_mode == "production_sequenced"
+    ):
+        return _merge_credential_benchmark_results(
+            [
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="text_phase_seconds",
+                    runner=lambda: _run_cifs_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+                        benchmark_execution_mode="single_phase",
+                    ),
+                ),
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="document_phase_seconds",
+                    runner=lambda: _run_cifs_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY,
+                        benchmark_execution_mode="single_phase",
+                    ),
+                ),
+            ]
+        )
+    from adscan_internal.services.cifs_credsweeper_scan_service import (
+        CIFSCredSweeperScanService,
+    )
+    from adscan_internal.services.credsweeper_service import CredSweeperService
+
+    if not getattr(shell, "credsweeper_path", None):
+        print_warning("CredSweeper is not configured. Skipping CIFS benchmark.")
+        return {"success": False}
+
+    effective_mount_root = _resolve_cifs_mount_root(shell=shell, domain=domain)
+    aggregate_map_abs = (
+        str(aggregate_map_path or "").strip()
+        if use_mapping
+        else ""
+    ) or (
+        _resolve_cifs_aggregate_map_path(shell=shell, domain=domain)
+        if use_mapping
+        else None
+    )
+    mount_targets = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+    )
+    mounted_points: list[str] = []
+    try:
+        mounted_points = _mount_cifs_targets_via_host_helper(
+            domain=domain,
+            username=username,
+            password=password,
+            mount_root=effective_mount_root,
+            targets=mount_targets,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"CIFS sensitive benchmark mount error: {type(exc).__name__}: {exc}"
+        )
+
+    if not os.path.isdir(effective_mount_root):
+        return {"success": False}
+
+    credsweeper_service = (
+        shell._get_credsweeper_service()
+        if callable(getattr(shell, "_get_credsweeper_service", None))
+        else CredSweeperService(shell.run_command)
+    )
+    scan_service = CIFSCredSweeperScanService()
+    artifacts_dir = _resolve_credsweeper_artifacts_dir(
+        shell=shell,
+        domain=domain,
+        purpose="sensitive_benchmark_cifs",
+    )
+    try:
+        scan_result = scan_service.scan_mounted_shares(
+            mount_root=effective_mount_root,
+            hosts=hosts,
+            shares=shares,
+            credsweeper_service=credsweeper_service,
+            credsweeper_path=shell.credsweeper_path,
+            json_output_dir=artifacts_dir,
+            profile=benchmark_profile,
+            aggregate_map_path=aggregate_map_abs if use_mapping else None,
+            document_depth=(
+                benchmark_scope
+                == SMB_SENSITIVE_BENCHMARK_SCOPE_DOCUMENTS_DEPTH_EXPERIMENTAL
+            ),
+        )
+    finally:
+        try:
+            _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"CIFS sensitive benchmark unmount error: {type(exc).__name__}: {exc}"
+            )
+
+    return {
+        "success": True,
+        "candidate_files": int(scan_result.candidate_files),
+        "scanned_files": int(scan_result.scanned_files),
+        "files_with_findings": int(scan_result.files_with_findings),
+        "credential_like_findings": int(scan_result.total_findings),
+        "mapped_shares": int(scan_result.mapped_shares),
+        (
+            "document_prepare_seconds"
+            if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY
+            else "text_prepare_seconds"
+        ): float(scan_result.prepare_seconds),
+        (
+            "document_analysis_seconds"
+            if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY
+            else "text_analysis_seconds"
+        ): float(scan_result.analysis_seconds),
+        "credential_preview_values": _build_grouped_credential_preview(
+            scan_result.findings
+        ),
+    }
+
+
+def _run_cifs_artifact_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+    use_mapping: bool = True,
+    aggregate_map_path: str | None = None,
+) -> dict[str, Any]:
+    """Run non-interactive CIFS artifact benchmark using mounted files."""
+    effective_mount_root = _resolve_cifs_mount_root(shell=shell, domain=domain)
+    prepare_seconds = 0.0
+    analysis_seconds = 0.0
+    aggregate_map_abs = (
+        str(aggregate_map_path or "").strip()
+        if use_mapping
+        else ""
+    ) or (
+        _resolve_cifs_aggregate_map_path(shell=shell, domain=domain)
+        if use_mapping
+        else None
+    )
+    mount_targets = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+    )
+    mounted_points: list[str] = []
+    try:
+        mounted_points = _mount_cifs_targets_via_host_helper(
+            domain=domain,
+            username=username,
+            password=password,
+            mount_root=effective_mount_root,
+            targets=mount_targets,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"CIFS artifact benchmark mount error: {type(exc).__name__}: {exc}"
+        )
+
+    if not os.path.isdir(effective_mount_root):
+        return {"success": False}
+
+    try:
+        artifact_extensions = tuple(
+            dict.fromkeys(
+                get_sensitive_phase_extensions("direct_secret_artifacts")
+                + get_sensitive_phase_extensions("heavy_artifacts")
+            )
+        )
+        prepare_started = time.perf_counter()
+        artifact_files = _iter_cifs_extension_candidate_files(
+            mount_root=effective_mount_root,
+            hosts=hosts,
+            shares=shares,
+            extensions=artifact_extensions,
+            aggregate_map_path=aggregate_map_abs if use_mapping else None,
+        )
+        prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+        spidering_service = shell._get_spidering_service()
+        artifact_tuning = choose_artifact_processing_tuning(file_count=len(artifact_files))
+        print_info_debug(
+            "Artifact benchmark tuning: "
+            f"backend=cifs_candidate_paths files={len(artifact_files)} workers={artifact_tuning.workers}"
+        )
+        analysis_started = time.perf_counter()
+        spidering_service.process_found_files_batch(
+            artifact_files,
+            domain,
+            "ext",
+            source_hosts=hosts,
+            source_shares=shares,
+            auth_username=username,
+            enable_legacy_zip_callbacks=False,
+            apply_actions=False,
+            max_workers=artifact_tuning.workers,
+        )
+        analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    finally:
+        try:
+            _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"CIFS artifact benchmark unmount error: {type(exc).__name__}: {exc}"
+            )
+
+    return {
+        "success": True,
+        "candidate_files": len(artifact_files),
+        "processed_files": len(artifact_files),
+        "artifact_hits": len(artifact_files),
+        "mapped_shares": int(len(shares)),
+        "artifact_prepare_seconds": prepare_seconds,
+        "artifact_analysis_seconds": analysis_seconds,
+        "artifact_preview_values": _build_artifact_preview_values(artifact_files),
+    }
+
+
+def _run_cifs_full_mount_artifact_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+    aggregate_map_path: str | None = None,
+) -> dict[str, Any]:
+    """Run CIFS artifact benchmark by reading from a mounted tree."""
+    effective_mount_root = _resolve_cifs_mount_root(shell=shell, domain=domain)
+    prepare_seconds = 0.0
+    analysis_seconds = 0.0
+    mount_targets = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+    )
+    mounted_points: list[str] = []
+    try:
+        mounted_points = _mount_cifs_targets_via_host_helper(
+            domain=domain,
+            username=username,
+            password=password,
+            mount_root=effective_mount_root,
+            targets=mount_targets,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"CIFS full-mount artifact benchmark mount error: {type(exc).__name__}: {exc}"
+        )
+
+    if not os.path.isdir(effective_mount_root):
+        return {"success": False}
+
+    try:
+        artifact_extensions = tuple(
+            dict.fromkeys(
+                get_sensitive_phase_extensions("direct_secret_artifacts")
+                + get_sensitive_phase_extensions("heavy_artifacts")
+            )
+        )
+        prepare_started = time.perf_counter()
+        artifact_files = _iter_cifs_extension_candidate_files(
+            mount_root=effective_mount_root,
+            hosts=hosts,
+            shares=shares,
+            extensions=artifact_extensions,
+            aggregate_map_path=str(aggregate_map_path or "").strip() or None,
+        )
+        prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+        spidering_service = shell._get_spidering_service()
+        artifact_tuning = choose_artifact_processing_tuning(file_count=len(artifact_files))
+        print_info_debug(
+            "Artifact benchmark tuning: "
+            f"backend=cifs_full_mount files={len(artifact_files)} workers={artifact_tuning.workers}"
+        )
+        analysis_started = time.perf_counter()
+        spidering_service.process_found_files_batch(
+            artifact_files,
+            domain,
+            "ext",
+            source_hosts=hosts,
+            source_shares=shares,
+            auth_username=username,
+            enable_legacy_zip_callbacks=False,
+            apply_actions=False,
+            max_workers=artifact_tuning.workers,
+        )
+        analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    finally:
+        try:
+            _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"CIFS full-mount artifact benchmark unmount error: {type(exc).__name__}: {exc}"
+            )
+
+    return {
+        "success": True,
+        "candidate_files": len(artifact_files),
+        "processed_files": len(artifact_files),
+        "artifact_hits": len(artifact_files),
+        "mapped_shares": int(len(shares)),
+        "artifact_prepare_seconds": prepare_seconds,
+        "artifact_analysis_seconds": analysis_seconds,
+        "artifact_preview_values": _build_artifact_preview_values(artifact_files),
+    }
+
+
+def _run_cifs_full_mount_credsweeper_benchmark(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    share_map: dict[str, dict[str, str]] | None,
+    benchmark_profile: str = DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+    benchmark_scope: str = SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+    benchmark_execution_mode: str = "single_phase",
+) -> dict[str, Any]:
+    """Run native full-mount CredSweeper benchmark with internal parallelism."""
+    if (
+        benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED
+        and benchmark_execution_mode == "production_sequenced"
+    ):
+        return _merge_credential_benchmark_results(
+            [
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="text_phase_seconds",
+                    runner=lambda: _run_cifs_full_mount_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY,
+                        benchmark_execution_mode="single_phase",
+                    ),
+                ),
+                _run_timed_benchmark_phase(
+                    phase_seconds_key="document_phase_seconds",
+                    runner=lambda: _run_cifs_full_mount_credsweeper_benchmark(
+                        shell=shell,
+                        domain=domain,
+                        shares=shares,
+                        hosts=hosts,
+                        username=username,
+                        password=password,
+                        share_map=share_map,
+                        benchmark_profile=SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY,
+                        benchmark_scope=SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY,
+                        benchmark_execution_mode="single_phase",
+                    ),
+                ),
+            ]
+        )
+    from adscan_internal.services.credsweeper_service import CredSweeperService
+
+    if not getattr(shell, "credsweeper_path", None):
+        print_warning("CredSweeper is not configured. Skipping CIFS full-mount benchmark.")
+        return {"success": False}
+
+    effective_mount_root = _resolve_cifs_mount_root(shell=shell, domain=domain)
+    mount_targets = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=share_map,
+    )
+    mounted_points: list[str] = []
+    try:
+        mounted_points = _mount_cifs_targets_via_host_helper(
+            domain=domain,
+            username=username,
+            password=password,
+            mount_root=effective_mount_root,
+            targets=mount_targets,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"CIFS full-mount benchmark mount error: {type(exc).__name__}: {exc}"
+        )
+
+    if not os.path.isdir(effective_mount_root):
+        return {"success": False}
+
+    credsweeper_service = (
+        shell._get_credsweeper_service()
+        if callable(getattr(shell, "_get_credsweeper_service", None))
+        else CredSweeperService(shell.run_command)
+    )
+    artifacts_dir = _resolve_credsweeper_artifacts_dir(
+        shell=shell,
+        domain=domain,
+        purpose="sensitive_benchmark_cifs_full_mount",
+    )
+    prepare_started = time.perf_counter()
+    candidate_files = _count_files_under_path_with_extensions(
+        effective_mount_root,
+        extensions=get_sensitive_file_extensions(benchmark_profile),
+    )
+    prepare_seconds = max(0.0, time.perf_counter() - prepare_started)
+    jobs = _resolve_credsweeper_benchmark_jobs()
+    print_info_debug(
+        "Running native full-mount CredSweeper benchmark: "
+        f"mount_root={mark_sensitive(effective_mount_root, 'path')} jobs={jobs} "
+        f"profile={benchmark_profile}"
+    )
+
+    try:
+        analysis_started = time.perf_counter()
+        findings = _run_credsweeper_benchmark_path_scan(
+            credsweeper_service=credsweeper_service,
+            credsweeper_path=shell.credsweeper_path,
+            path_to_scan=effective_mount_root,
+            json_output_dir=artifacts_dir,
+            benchmark_scope=benchmark_scope,
+            jobs=jobs,
+            find_by_ext=False,
+        )
+        analysis_seconds = max(0.0, time.perf_counter() - analysis_started)
+    finally:
+        try:
+            _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"CIFS full-mount benchmark unmount error: {type(exc).__name__}: {exc}"
+            )
+
+    total_findings, files_with_findings = _count_grouped_credential_findings(findings)
+    timing_key_prefix = (
+        "document"
+        if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY
+        else "text"
+    )
+    return {
+        "success": True,
+        "candidate_files": int(candidate_files),
+        "scanned_files": int(candidate_files),
+        "files_with_findings": int(files_with_findings),
+        "credential_like_findings": int(total_findings),
+        "mapped_shares": int(len(shares)),
+        f"{timing_key_prefix}_prepare_seconds": prepare_seconds,
+        f"{timing_key_prefix}_analysis_seconds": analysis_seconds,
+        "credential_preview_values": _build_grouped_credential_preview(findings),
+    }
+
+
+def _count_files_under_path(root_path: str) -> int:
+    """Count visible files under a local directory tree."""
+    total = 0
+    root = Path(root_path)
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        prune_excluded_walk_dirs(dirnames)
+        base_dir = Path(dirpath)
+        for filename in filenames:
+            file_path = base_dir / filename
+            try:
+                relative_path = file_path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if is_globally_excluded_smb_relative_path(relative_path):
+                continue
+            total += 1
+    return total
+
+
+def _list_files_under_path(root_path: str) -> list[str]:
+    """Return stable file list under one local directory tree."""
+    files: list[str] = []
+    root = Path(root_path)
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        prune_excluded_walk_dirs(dirnames)
+        for filename in sorted(filenames):
+            file_path = Path(dirpath) / filename
+            try:
+                relative_path = file_path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if is_globally_excluded_smb_relative_path(relative_path):
+                continue
+            files.append(str(file_path))
+    return files
+
+
+def _build_artifact_preview_values(
+    file_paths: list[str],
+    *,
+    limit: int = 3,
+) -> list[str]:
+    """Return a compact deduplicated preview of artifact filenames."""
+    preview: list[str] = []
+    seen: set[str] = set()
+    for file_path in file_paths:
+        name = Path(file_path).name.strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        preview.append(name)
+        if len(preview) >= limit:
+            break
+    return preview
+
+
+def _resolve_credsweeper_benchmark_jobs() -> int:
+    """Return a conservative parallelism level for native CredSweeper benchmarks."""
+    return get_default_credsweeper_jobs()
 
 
 def run_smb_map_benchmark_history(
@@ -3641,6 +7735,126 @@ def _build_spider_plus_auth(
     return shell.build_auth_nxc(username, password, domain)
 
 
+def _resolve_rclone_transport_auth(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+) -> tuple[str, str, str]:
+    """Resolve the effective SMB auth context for rclone backends.
+
+    ``rclone`` null sessions must omit all auth fields from the SMB remote, so
+    this returns empty transport credentials/domain for logical ``null``.
+    Guest sessions keep an empty password but switch to the configured guest
+    transport username shared with the rest of the SMB stack.
+    """
+    normalized_username = str(username or "").strip()
+    normalized_password = str(password or "")
+    lowered_username = normalized_username.lower()
+    if lowered_username == "null":
+        return "null", "", ""
+    if is_guest_alias(lowered_username) and normalized_password == "":
+        return resolve_smb_guest_username(shell=shell, domain=domain), "", domain
+    return normalized_username, normalized_password, domain
+
+
+def _is_null_session_smb_auth(
+    shell: Any,
+    *,
+    domain: str | None,
+    username: str | None,
+) -> bool:
+    """Return True when the effective SMB auth context is a null session."""
+    normalized_username = str(username or "").strip().lower()
+    if normalized_username == "null":
+        return True
+    if normalized_username:
+        return False
+    if domain and isinstance(getattr(shell, "domains_data", None), dict):
+        domain_auth = str(
+            shell.domains_data.get(domain, {}).get("auth", "")  # type: ignore[index]
+            or ""
+        ).strip().lower()
+        return domain_auth == "null"
+    return False
+
+
+def _normalize_sensitive_data_method_for_smb_auth(
+    shell: Any,
+    *,
+    domain: str | None,
+    username: str | None,
+    selected_method: str | None,
+) -> str | None:
+    """Normalize unsupported SMB analysis methods for the current auth context."""
+    def _describe_method(method: str) -> str:
+        labels = {
+            "ai_rclone": "AI-assisted rclone mapping",
+            "ai": "AI-assisted spider_plus mapping",
+            "deterministic_rclone_direct": "deterministic rclone direct analysis",
+            "deterministic_rclone_mapped": "deterministic rclone mapped analysis",
+            "deterministic_manspider": "deterministic manspider analysis",
+        }
+        return labels.get(method, method)
+
+    def _announce_once(original_method: str, normalized_method: str, reason: str) -> None:
+        cache = getattr(shell, "_smb_sensitive_auth_normalization_notices", None)
+        if not isinstance(cache, set):
+            cache = set()
+            setattr(shell, "_smb_sensitive_auth_normalization_notices", cache)
+        notice_key = (
+            str(domain or "").strip().lower(),
+            str(original_method).strip(),
+            str(normalized_method).strip(),
+        )
+        if notice_key in cache:
+            return
+        cache.add(notice_key)
+        marked_domain = mark_sensitive(str(domain or "unknown"), "domain")
+        marked_original = mark_sensitive(_describe_method(original_method), "text")
+        marked_normalized = mark_sensitive(_describe_method(normalized_method), "text")
+        print_info(
+            "Null session detected. "
+            f"{reason} Using {marked_normalized} instead of {marked_original} "
+            f"for domain {marked_domain}."
+        )
+
+    normalized_method = str(selected_method or "").strip()
+    if not normalized_method:
+        return selected_method
+    if not _is_null_session_smb_auth(shell, domain=domain, username=username):
+        return selected_method
+    if normalized_method == "ai_rclone":
+        _announce_once(
+            "ai_rclone",
+            "ai",
+            "rclone SMB does not support anonymous authentication.",
+        )
+        return "ai"
+    if normalized_method in {
+        "deterministic_rclone_direct",
+        "deterministic_rclone_mapped",
+    }:
+        _announce_once(
+            normalized_method,
+            "deterministic_manspider",
+            "rclone SMB does not support anonymous authentication.",
+        )
+        return "deterministic_manspider"
+    return selected_method
+
+
+def _is_rclone_supported_for_smb_auth(
+    shell: Any,
+    *,
+    domain: str | None,
+    username: str | None,
+) -> bool:
+    """Return True when rclone SMB backend supports the requested auth mode."""
+    return not _is_null_session_smb_auth(shell, domain=domain, username=username)
+
+
 def _slugify_token(token: str) -> str:
     """Return a filesystem-safe token for output folder naming."""
     slug = re.sub(r"[^a-zA-Z0-9_.-]+", "_", token or "").strip("_")
@@ -3655,7 +7869,9 @@ def _resolve_cifs_mount_root(
     """Resolve CIFS mount root path from shell/env/default workspace path."""
     configured_root = str(getattr(shell, "smb_cifs_mount_root", "") or "").strip()
     env_root = os.getenv("ADSCAN_SMB_CIFS_MOUNT_ROOT", "").strip()
+    workspace_cwd = shell._get_workspace_cwd()
     default_root = domain_path(
+        workspace_cwd,
         shell.domains_dir,
         domain,
         shell.smb_dir,
@@ -3669,6 +7885,23 @@ def _resolve_cifs_mount_root(
         if os.path.isdir(candidate):
             return os.path.abspath(candidate)
     return os.path.abspath(configured_root or env_root or default_root)
+
+
+def _resolve_cifs_aggregate_map_path(
+    *,
+    shell: Any,
+    domain: str,
+) -> str:
+    """Resolve the consolidated CIFS mapping JSON path for one domain."""
+    workspace_cwd = shell._get_workspace_cwd()
+    return domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "cifs",
+        "share_tree_map.json",
+    )
 
 
 def _resolve_cifs_host_share_targets(
@@ -3749,6 +7982,10 @@ def _mount_cifs_targets_via_host_helper(
     mounted_points: list[str] = []
     mounted_count = 0
     already_mounted_count = 0
+    mounted_new_count = 0
+    reused_same_identity_count = 0
+    reused_existing_mount_count = 0
+    remounted_due_to_identity_change_count = 0
     failed_count = 0
 
     for host, share in targets:
@@ -3789,25 +8026,68 @@ def _mount_cifs_targets_via_host_helper(
 
         mount_point = ""
         mounted_by_helper = False
+        reuse_status = ""
+        remounted_due_to_identity_change = False
         try:
             payload = json.loads(resp.stdout or "{}")
             mount_point = str(payload.get("mount_point", "")).strip()
             mounted_by_helper = bool(payload.get("mounted_by_helper", False))
+            reuse_status = str(payload.get("reuse_status", "") or "").strip()
+            remounted_due_to_identity_change = bool(
+                payload.get("remounted_due_to_identity_change", False)
+            )
         except Exception:
             mount_point = ""
             mounted_by_helper = False
+            reuse_status = ""
+            remounted_due_to_identity_change = False
 
         if mounted_by_helper and mount_point:
             mounted_count += 1
             mounted_points.append(mount_point)
+            marked_mount_point = mark_sensitive(mount_point, "path")
+            if remounted_due_to_identity_change:
+                remounted_due_to_identity_change_count += 1
+                print_info_debug(
+                    "CIFS host-helper remounted share due to auth context change: "
+                    f"host={marked_host} share={marked_share} "
+                    f"mount_point={marked_mount_point}"
+                )
+            else:
+                mounted_new_count += 1
+                print_info_debug(
+                    "CIFS host-helper mounted new share: "
+                    f"host={marked_host} share={marked_share} "
+                    f"mount_point={marked_mount_point}"
+                )
         else:
             already_mounted_count += 1
+            if reuse_status == "reused_same_identity":
+                reused_same_identity_count += 1
+                marked_mount_point = mark_sensitive(mount_point or "<unknown>", "path")
+                print_info_debug(
+                    "CIFS host-helper reused existing mount with matching auth context: "
+                    f"host={marked_host} share={marked_share} "
+                    f"mount_point={marked_mount_point}"
+                )
+            elif reuse_status == "reused_existing_mount":
+                reused_existing_mount_count += 1
+                marked_mount_point = mark_sensitive(mount_point or "<unknown>", "path")
+                print_info_debug(
+                    "CIFS host-helper reused existing mount without identity metadata: "
+                    f"host={marked_host} share={marked_share} "
+                    f"mount_point={marked_mount_point}"
+                )
 
     marked_root = mark_sensitive(mount_root, "path")
     print_info_debug(
         "CIFS host-helper mount summary: "
         f"mount_root={marked_root} targets={len(targets)} "
-        f"mounted={mounted_count} already_mounted={already_mounted_count} "
+        f"mounted={mounted_count} mounted_new={mounted_new_count} "
+        f"already_mounted={already_mounted_count} "
+        f"reused_same_identity={reused_same_identity_count} "
+        f"reused_existing_mount={reused_existing_mount_count} "
+        f"remounted_due_to_identity_change={remounted_due_to_identity_change_count} "
         f"failed={failed_count}"
     )
     return mounted_points
@@ -3947,7 +8227,9 @@ def run_smb_share_tree_mapping_with_cifs(
         _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
         return False
 
+    workspace_cwd = shell._get_workspace_cwd()
     cifs_root_abs = domain_path(
+        workspace_cwd,
         shell.domains_dir,
         domain,
         shell.smb_dir,
@@ -3971,15 +8253,15 @@ def run_smb_share_tree_mapping_with_cifs(
     try:
         print_operation_header(
             "SMB Share Tree Mapping (CIFS)",
-            [
-                ("Domain", mark_sensitive(domain, "domain")),
-                ("Principal", mark_sensitive(username, "user")),
-                ("Hosts", str(len(hosts))),
-                ("Readable Shares", str(len(shares))),
-                ("CIFS Root", marked_mount_root),
-                ("Run Output", mark_sensitive(run_output_abs, "path")),
-                ("Aggregate JSON", marked_aggregate_rel),
-            ],
+            details={
+                "Domain": mark_sensitive(domain, "domain"),
+                "Principal": mark_sensitive(username, "user"),
+                "Hosts": str(len(hosts)),
+                "Readable Shares": str(len(shares)),
+                "CIFS Root": marked_mount_root,
+                "Run Output": mark_sensitive(run_output_abs, "path"),
+                "Aggregate JSON": marked_aggregate_rel,
+            },
             icon="🗺️",
         )
         cifs_service = CIFSShareMappingService()
@@ -4123,7 +8405,7 @@ def run_smb_share_tree_mapping_with_spider_plus(
     hosts_arg = " ".join(shlex.quote(str(host)) for host in hosts)
     module_options = [
         f"EXCLUDE_EXTS={','.join(GLOBAL_SMB_MAPPING_EXCLUDED_EXTENSIONS)}",
-        f"EXCLUDE_FILTER={','.join(GLOBAL_SMB_MAPPING_EXCLUDE_FILTER_TOKENS)}",
+        f"EXCLUDE_FILTER={','.join(GLOBAL_SMB_EXCLUDE_FILTER_TOKENS)}",
         f"OUTPUT_FOLDER={run_output_abs}",
     ]
     module_options_arg = " ".join(shlex.quote(option) for option in module_options)
@@ -4289,6 +8571,16 @@ def run_smb_share_tree_mapping_with_rclone(
             "to use rclone SMB mapping."
         )
         return False
+    if not _is_rclone_supported_for_smb_auth(
+        shell,
+        domain=domain,
+        username=username,
+    ):
+        print_warning(
+            "rclone SMB mapping does not support null-session authentication. "
+            "Use spider_plus for AI/null-session mapping instead."
+        )
+        return False
 
     workspace_cwd = shell._get_workspace_cwd()
     rclone_root_abs = domain_path(
@@ -4347,12 +8639,20 @@ def run_smb_share_tree_mapping_with_rclone(
 
     try:
         rclone_service = RcloneShareMappingService()
+        transport_username, transport_password, transport_domain = (
+            _resolve_rclone_transport_auth(
+                shell,
+                domain=domain,
+                username=username,
+                password=password,
+            )
+        )
         mapping_result = rclone_service.generate_host_metadata_json(
             run_output_dir=run_output_abs,
             host_share_targets=target_pairs,
-            username=username,
-            password=password,
-            domain=domain,
+            username=transport_username,
+            password=transport_password,
+            domain=transport_domain,
             command_executor=shell.run_command,
             rclone_path=rclone_path,
             timeout_seconds=1200,
@@ -4449,7 +8749,16 @@ def _run_post_mapping_sensitive_data_workflow(
         selected_method = _select_post_mapping_sensitive_data_method(
             shell=shell,
             ai_configured=availability.configured,
+            domain=domain,
+            username=triage_username,
+            password=triage_password,
         )
+    selected_method = _normalize_sensitive_data_method_for_smb_auth(
+        shell,
+        domain=domain,
+        username=triage_username,
+        selected_method=selected_method,
+    )
     _capture_post_mapping_sensitive_data_telemetry(
         shell=shell,
         stage="selected",
@@ -4465,7 +8774,15 @@ def _run_post_mapping_sensitive_data_workflow(
         print_info("Post-mapping sensitive-data analysis skipped by user.")
         return
 
-    if selected_method not in {"deterministic", "ai", "ai_cifs", "ai_rclone"}:
+    if selected_method not in {
+        "deterministic_rclone_direct",
+        "deterministic_rclone_mapped",
+        "deterministic_cifs",
+        "deterministic_manspider",
+        "ai",
+        "ai_cifs",
+        "ai_rclone",
+    }:
         marked_method = mark_sensitive(selected_method, "text")
         print_warning(
             f"Unsupported sensitive-data analysis method selected: {marked_method}."
@@ -4479,16 +8796,24 @@ def _run_post_mapping_sensitive_data_workflow(
     ai_success: bool | None = None
     fallback_used = False
 
-    if selected_method == "deterministic":
+    if selected_method in {
+        "deterministic_rclone_direct",
+        "deterministic_rclone_mapped",
+        "deterministic_cifs",
+        "deterministic_manspider",
+    }:
         deterministic_executed = True
-        _run_post_mapping_deterministic_share_scan(
+        deterministic_result = _run_selected_deterministic_share_scan(
             shell=shell,
             domain=domain,
             shares=shares,
             hosts=hosts,
             username=triage_username or "",
             password=triage_password or "",
+            selected_method=selected_method,
+            cifs_mount_root=cifs_mount_root,
         )
+        fallback_used = bool(deterministic_result.get("fallback_used"))
     if selected_method in {"ai", "ai_cifs", "ai_rclone"}:
         ai_attempted = True
         read_backend = "cifs_local" if selected_method == "ai_cifs" else "smb_impacket"
@@ -4520,17 +8845,47 @@ def _run_post_mapping_sensitive_data_workflow(
                 "Falling back to deterministic share analysis."
             )
             deterministic_executed = True
-            _run_post_mapping_deterministic_share_scan(
+            deterministic_result = _run_selected_deterministic_share_scan(
                 shell=shell,
                 domain=domain,
                 shares=shares,
                 hosts=hosts,
                 username=triage_username or "",
                 password=triage_password or "",
+                selected_method=(
+                    "deterministic_cifs"
+                    if selected_method == "ai_cifs"
+                    else _resolve_default_deterministic_share_analysis_method(
+                        shell,
+                        domain=domain,
+                        username=triage_username,
+                        password=triage_password,
+                    )
+                ),
+                cifs_mount_root=cifs_mount_root,
             )
+            fallback_used = True
 
-    if selected_method == "deterministic":
-        outcome = "deterministic_completed"
+    if selected_method == "deterministic_rclone_direct":
+        outcome = (
+            "deterministic_rclone_direct_completed"
+            if not fallback_used
+            else "deterministic_rclone_direct_failed_fallback_attempted"
+        )
+    elif selected_method == "deterministic_rclone_mapped":
+        outcome = (
+            "deterministic_rclone_mapped_completed"
+            if not fallback_used
+            else "deterministic_rclone_mapped_failed_fallback_attempted"
+        )
+    elif selected_method == "deterministic_cifs":
+        outcome = (
+            "deterministic_cifs_completed"
+            if not fallback_used
+            else "deterministic_cifs_failed_fallback_manspider_attempted"
+        )
+    elif selected_method == "deterministic_manspider":
+        outcome = "deterministic_manspider_completed"
     elif selected_method == "ai_cifs":
         outcome = (
             "ai_cifs_completed"
@@ -4567,6 +8922,110 @@ def _run_post_mapping_sensitive_data_workflow(
         ai_success=ai_success,
         fallback_used=fallback_used,
     )
+
+
+def _resolve_default_deterministic_share_analysis_method(
+    shell: Any,
+    *,
+    domain: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> str:
+    """Resolve the production deterministic SMB backend from workspace type."""
+    del password
+    if _is_null_session_smb_auth(shell, domain=domain, username=username):
+        return "deterministic_manspider"
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    if workspace_type == "audit":
+        return "deterministic_rclone_mapped"
+    return "deterministic_rclone_direct"
+
+
+def _resolve_deterministic_backend_from_method(selected_method: str) -> str:
+    """Map one user-visible deterministic method to an internal backend id."""
+    mapping = {
+        "deterministic_rclone_direct": "rclone_direct",
+        "deterministic_rclone_mapped": "rclone_mapped",
+        "deterministic_cifs": "cifs",
+        "deterministic_manspider": "manspider",
+    }
+    return mapping.get(str(selected_method or "").strip(), "manspider")
+
+
+def _run_selected_deterministic_share_scan(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    selected_method: str,
+    cifs_mount_root: str | None = None,
+) -> dict[str, Any]:
+    """Run deterministic scan with the configured fallback chain."""
+    selected_method = _normalize_sensitive_data_method_for_smb_auth(
+        shell,
+        domain=domain,
+        username=username,
+        selected_method=selected_method,
+    )
+    primary_backend = _resolve_deterministic_backend_from_method(selected_method)
+    executed_backends: list[str] = []
+
+    def _run_backend(backend: str) -> bool:
+        executed_backends.append(backend)
+        return _run_post_mapping_deterministic_share_scan_with_backend(
+            shell=shell,
+            domain=domain,
+            shares=shares,
+            hosts=hosts,
+            username=username,
+            password=password,
+            backend=backend,
+            cifs_mount_root=cifs_mount_root,
+        )
+
+    completed = _run_backend(primary_backend)
+    fallback_used = False
+    if completed:
+        return {
+            "completed": True,
+            "fallback_used": False,
+            "executed_backends": executed_backends,
+        }
+
+    if primary_backend.startswith("rclone"):
+        fallback_used = True
+        print_warning(
+            "rclone deterministic analysis did not complete successfully. "
+            "Falling back to CIFS deterministic analysis."
+        )
+        completed = _run_backend("cifs")
+        if completed:
+            return {
+                "completed": True,
+                "fallback_used": True,
+                "executed_backends": executed_backends,
+            }
+        print_warning(
+            "CIFS deterministic fallback did not complete successfully. "
+            "Falling back to legacy manspider analysis."
+        )
+        completed = _run_backend("manspider")
+    elif primary_backend == "cifs":
+        fallback_used = True
+        print_warning(
+            "CIFS deterministic analysis did not complete successfully. "
+            "Falling back to legacy manspider analysis."
+        )
+        completed = _run_backend("manspider")
+
+    return {
+        "completed": bool(completed),
+        "fallback_used": fallback_used,
+        "executed_backends": executed_backends,
+    }
 
 
 def _capture_post_mapping_sensitive_data_telemetry(
@@ -4615,51 +9074,1097 @@ def _run_post_mapping_deterministic_share_scan(
     hosts: list[str],
     username: str,
     password: str,
-) -> None:
-    """Run deterministic share secret search via manspider + credsweeper."""
-    manspider_passw = getattr(shell, "manspider_passw", None)
-    if not callable(manspider_passw):
-        print_warning(
-            "Deterministic SMB share search is unavailable: "
-            "shell.manspider_passw is not callable."
+) -> bool:
+    """Run deterministic share secret search via selected backend."""
+    return _run_post_mapping_deterministic_share_scan_with_backend(
+        shell=shell,
+        domain=domain,
+        shares=shares,
+        hosts=hosts,
+        username=username,
+        password=password,
+        backend=_resolve_deterministic_backend_from_method(
+            _resolve_default_deterministic_share_analysis_method(
+                shell,
+                domain=domain,
+                username=username,
+                password=password,
+            )
+        ),
+    )
+
+
+def _run_post_mapping_deterministic_share_scan_with_backend(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    backend: str,
+    cifs_mount_root: str | None = None,
+) -> bool:
+    """Run deterministic share secret search via chosen backend."""
+    result = _run_post_mapping_deterministic_share_scan_sequence(
+        shell=shell,
+        domain=domain,
+        shares=shares,
+        hosts=hosts,
+        username=username,
+        password=password,
+        backend=backend,
+        cifs_mount_root=cifs_mount_root,
+    )
+    return bool(result.get("completed"))
+
+
+def _run_post_mapping_deterministic_share_scan_sequence(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    backend: str,
+    cifs_mount_root: str | None = None,
+) -> dict[str, Any]:
+    """Run staged deterministic SMB analysis using a backend-specific runner."""
+    phase_sequence = get_production_sensitive_scan_phase_sequence()
+    if not phase_sequence:
+        return {"completed": False, "credential_findings": 0, "phases_run": []}
+
+    backend_context: dict[str, Any] | None = None
+    if backend in {"rclone_direct", "rclone_mapped"}:
+        backend_context = _prepare_post_mapping_deterministic_rclone_context(
+            shell=shell,
+            domain=domain,
+            shares=shares,
+            hosts=hosts,
+            username=username,
+            password=password,
+            backend=backend,
         )
+        if not bool(backend_context.get("completed")):
+            return {
+                "completed": False,
+                "credential_findings": 0,
+                "artifact_hits": 0,
+                "phases_run": [],
+                "backend_context": backend_context,
+            }
+
+    results: list[dict[str, Any]] = []
+    first_phase = phase_sequence[0]
+    first_result = _run_sensitive_scan_phase_with_backend(
+        shell=shell,
+        domain=domain,
+        shares=shares,
+        hosts=hosts,
+        username=username,
+        password=password,
+        backend=backend,
+        phase=first_phase,
+        cifs_mount_root=cifs_mount_root,
+        backend_context=backend_context,
+    )
+    results.append(first_result)
+    if not bool(first_result.get("completed")):
+        _print_deterministic_rclone_completion_summary(backend_context=backend_context)
+        return {
+            "completed": False,
+            "credential_findings": int(first_result.get("credential_findings", 0) or 0),
+            "phases_run": results,
+        }
+
+    continue_deeper = _should_continue_with_deeper_sensitive_scan(
+        shell=shell,
+        domain=domain,
+        phase_result=first_result,
+    )
+    if not continue_deeper:
+        _print_deterministic_rclone_completion_summary(backend_context=backend_context)
+        return {
+            "completed": True,
+            "credential_findings": int(first_result.get("credential_findings", 0) or 0),
+            "phases_run": results,
+        }
+
+    for phase in phase_sequence[1:3]:
+        phase_result = _run_sensitive_scan_phase_with_backend(
+            shell=shell,
+            domain=domain,
+            shares=shares,
+            hosts=hosts,
+            username=username,
+                password=password,
+                backend=backend,
+                phase=phase,
+                cifs_mount_root=cifs_mount_root,
+                backend_context=backend_context,
+            )
+        results.append(phase_result)
+        if not bool(phase_result.get("completed")):
+            break
+
+    if _should_continue_with_heavy_artifact_analysis(shell=shell, domain=domain):
+        heavy_result = _run_sensitive_scan_phase_with_backend(
+            shell=shell,
+            domain=domain,
+            shares=shares,
+            hosts=hosts,
+            username=username,
+            password=password,
+            backend=backend,
+            phase=SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
+            cifs_mount_root=cifs_mount_root,
+            backend_context=backend_context,
+        )
+        results.append(heavy_result)
+
+    _print_deterministic_rclone_completion_summary(backend_context=backend_context)
+
+    return {
+        "completed": all(bool(item.get("completed")) for item in results if item),
+        "credential_findings": sum(
+            int(item.get("credential_findings", 0) or 0) for item in results
+        ),
+        "artifact_hits": sum(int(item.get("artifact_hits", 0) or 0) for item in results),
+        "phases_run": results,
+        "backend_context": backend_context,
+    }
+
+
+def _print_deterministic_rclone_completion_summary(
+    *,
+    backend_context: dict[str, Any] | None,
+) -> None:
+    """Print one final production summary for deterministic rclone runs."""
+    if not backend_context or backend_context.get("mode") not in {"direct", "mapped"}:
         return
+    loot_root_rel = str(backend_context.get("loot_root_rel", "") or "").strip()
+    if not loot_root_rel:
+        return
+    print_info(
+        "Deterministic rclone analysis completed. "
+        f"Loot root: {mark_sensitive(loot_root_rel, 'path')}."
+    )
+
+
+def _prepare_post_mapping_deterministic_rclone_context(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    backend: str,
+) -> dict[str, Any]:
+    """Prepare shared rclone state once for one production deterministic run."""
+    mode = "mapped" if backend == "rclone_mapped" else "direct"
+    workspace_cwd = shell._get_workspace_cwd()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_folder = f"{run_id}_{_slugify_token(username)}_{mode}"
+    run_root_abs = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "rclone",
+        "deterministic",
+        run_folder,
+    )
+    loot_root_abs = os.path.join(run_root_abs, "phases")
+    os.makedirs(loot_root_abs, exist_ok=True)
+    loot_root_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "rclone",
+        "deterministic",
+        run_folder,
+        "phases",
+    )
+    rationale = "Audit traceability" if mode == "mapped" else "CTF speed"
+    print_info(
+        "Deterministic backend: "
+        f"{mark_sensitive('rclone', 'text')} | Mode: {mark_sensitive(mode, 'text')} "
+        f"({mark_sensitive(rationale, 'text')})."
+    )
+    print_info(f"Deterministic rclone loot root: {mark_sensitive(loot_root_rel, 'path')}.")
+
+    context = {
+        "completed": True,
+        "mode": mode,
+        "run_root_abs": run_root_abs,
+        "loot_root_abs": loot_root_abs,
+        "loot_root_rel": loot_root_rel,
+        "aggregate_map_path": None,
+    }
+    if mode != "mapped":
+        return context
+
+    mapping_root_abs = os.path.join(run_root_abs, "mapping")
+    run_output_abs = os.path.join(mapping_root_abs, "runs", run_folder)
+    aggregate_map_abs = os.path.join(mapping_root_abs, "share_tree_map.json")
+    mapping_result = _generate_rclone_mapping(
+        shell=shell,
+        domain=domain,
+        username=username,
+        password=password,
+        hosts=hosts,
+        shares=shares,
+        share_map=None,
+        run_output_abs=run_output_abs,
+        aggregate_map_abs=aggregate_map_abs,
+    )
+    if not bool(mapping_result.get("success")):
+        print_warning(
+            "Fresh rclone mapping for deterministic analysis did not complete successfully."
+        )
+        return {**context, "completed": False, "mapping_result": mapping_result}
+    aggregate_map_rel = domain_relpath(
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "rclone",
+        "deterministic",
+        run_folder,
+        "mapping",
+        "share_tree_map.json",
+    )
+    print_info(
+        "Deterministic rclone mapping prepared at "
+        f"{mark_sensitive(aggregate_map_rel, 'path')}."
+    )
+    context["aggregate_map_path"] = aggregate_map_abs
+    context["mapping_result"] = mapping_result
+    return context
+
+
+def _should_continue_with_deeper_sensitive_scan(
+    *,
+    shell: Any,
+    domain: str,
+    phase_result: dict[str, Any],
+) -> bool:
+    """Ask whether deeper deterministic SMB analysis should continue."""
+    if _should_skip_sensitive_scan_prompt_for_ctf_pwned(shell=shell, domain=domain):
+        print_info_debug(
+            "Skipping deeper deterministic SMB prompt because the CTF domain is "
+            f"already pwned: domain={mark_sensitive(domain, 'domain')}"
+        )
+        return False
+    credential_findings = int(phase_result.get("credential_findings", 0) or 0)
+    files_with_findings = int(phase_result.get("files_with_findings", 0) or 0)
+    if credential_findings > 0 or files_with_findings > 0:
+        prompt = (
+            "Text-file credential findings were identified. Continue with deeper "
+            "analysis for additional artifacts and document-based secrets?"
+        )
+    else:
+        prompt = (
+            "No credential-like findings were identified in text files. Continue "
+            "with deeper analysis on high-value artifacts and document formats? "
+            "This will take longer."
+        )
+    confirmer = getattr(shell, "_questionary_confirm", None)
+    if callable(confirmer):
+        response = confirmer(prompt, default=True)
+        return bool(response)
+    return Confirm.ask(prompt, default=True)
+
+
+def _should_continue_with_heavy_artifact_analysis(
+    *,
+    shell: Any,
+    domain: str,
+) -> bool:
+    """Ask whether to run the slowest artifact analysis phase."""
+    if _should_skip_sensitive_scan_prompt_for_ctf_pwned(shell=shell, domain=domain):
+        print_info_debug(
+            "Skipping heavy-artifact deterministic SMB prompt because the CTF "
+            f"domain is already pwned: domain={mark_sensitive(domain, 'domain')}"
+        )
+        return False
+    prompt = (
+        "Do you want to continue with heavy artifact analysis "
+        "(ZIP/DMP/PCAP/VDI)? This is slower and more resource-intensive."
+    )
+    confirmer = getattr(shell, "_questionary_confirm", None)
+    if callable(confirmer):
+        response = confirmer(prompt, default=True)
+        return bool(response)
+    return Confirm.ask(prompt, default=True)
+
+
+def _should_skip_sensitive_scan_prompt_for_ctf_pwned(*, shell: Any, domain: str) -> bool:
+    """Return True when CTF SMB follow-up prompts should be skipped entirely."""
+    checker = getattr(shell, "_is_ctf_domain_pwned", None)
+    if callable(checker):
+        try:
+            if bool(checker(domain)):
+                return True
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                "CTF pwned-domain check failed during SMB prompt gating; "
+                f"falling back to domain auth state. error={type(exc).__name__}: {exc}"
+            )
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    domain_auth = str(
+        getattr(shell, "domains_data", {}).get(domain, {}).get("auth", "") or ""
+    ).strip().lower()
+    return workspace_type == "ctf" and domain_auth == "pwned"
+
+
+def _run_sensitive_scan_phase_with_backend(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    backend: str,
+    phase: str,
+    cifs_mount_root: str | None = None,
+    backend_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run one deterministic sensitive-data phase through a selected backend."""
+    if backend in {"rclone_direct", "rclone_mapped"}:
+        if phase in {
+            SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+            SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+        }:
+            return _run_post_mapping_deterministic_rclone_credsweeper_scan(
+                shell=shell,
+                domain=domain,
+                shares=shares,
+                hosts=hosts,
+                username=username,
+                password=password,
+                phase=phase,
+                backend_context=backend_context or {},
+            )
+        return _run_post_mapping_deterministic_rclone_artifact_scan(
+            shell=shell,
+            domain=domain,
+            shares=shares,
+            hosts=hosts,
+            username=username,
+            password=password,
+            phase=phase,
+            backend_context=backend_context or {},
+        )
+
+    if backend == "cifs":
+        if phase in {
+            SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+            SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+        }:
+            return _run_post_mapping_deterministic_cifs_credsweeper_scan(
+                shell=shell,
+                domain=domain,
+                shares=shares,
+                hosts=hosts,
+                username=username,
+                password=password,
+                cifs_mount_root=cifs_mount_root,
+                profile=str(get_sensitive_phase_definition(phase).get("profile", "")),
+                phase=phase,
+            )
+        return _run_post_mapping_deterministic_cifs_artifact_scan(
+            shell=shell,
+            domain=domain,
+            shares=shares,
+            hosts=hosts,
+            username=username,
+            password=password,
+            cifs_mount_root=cifs_mount_root,
+            phase=phase,
+        )
+
+    if phase in {
+        SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+        SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+    }:
+        manspider_passw = getattr(shell, "manspider_passw", None)
+        if not callable(manspider_passw):
+            print_warning(
+                "Deterministic SMB share search is unavailable: "
+                "shell.manspider_passw is not callable."
+            )
+            return {"completed": False, "credential_findings": 0, "phase": phase}
+        return manspider_passw(
+            domain,
+            username,
+            password,
+            shares,
+            hosts,
+            profile=str(get_sensitive_phase_definition(phase).get("profile", "")),
+            phase=phase,
+        ) or {"completed": True, "credential_findings": 0, "phase": phase}
+
+    manspider_extensions = getattr(shell, "manspider_extensions", None)
+    if not callable(manspider_extensions):
+        print_warning(
+            "Deterministic SMB artifact analysis is unavailable: "
+            "shell.manspider_extensions is not callable."
+        )
+        return {"completed": False, "artifact_hits": 0, "phase": phase}
+    return manspider_extensions(
+        domain,
+        username,
+        password,
+        shares,
+        hosts,
+        extensions=get_manspider_phase_extensions(phase),
+        phase=phase,
+    ) or {"completed": True, "artifact_hits": 0, "phase": phase}
+
+
+def _run_post_mapping_deterministic_rclone_credsweeper_scan(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    phase: str,
+    backend_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one production deterministic rclone credential phase."""
+    from adscan_internal.services.share_mapping_service import ShareMappingService
+
+    credsweeper_path = str(getattr(shell, "credsweeper_path", "") or "").strip()
+    if not credsweeper_path:
+        print_warning(
+            "Deterministic rclone share analysis is unavailable because "
+            "CredSweeper is not configured."
+        )
+        return {"completed": False, "credential_findings": 0, "phase": phase}
+
+    phase_profile = str(get_sensitive_phase_definition(phase).get("profile", "")).strip()
+    if not phase_profile:
+        return {"completed": False, "credential_findings": 0, "phase": phase}
+
+    phase_root_abs = os.path.join(str(backend_context.get("run_root_abs", "") or ""), phase)
+    loot_dir = os.path.join(phase_root_abs, "loot")
+    manifest_dir = os.path.join(phase_root_abs, "manifests")
+    os.makedirs(loot_dir, exist_ok=True)
+    os.makedirs(manifest_dir, exist_ok=True)
+    marked_phase_label = mark_sensitive(
+        str(get_sensitive_phase_definition(phase).get("label", phase)),
+        "text",
+    )
+    print_info(f"Running deterministic share analysis ({marked_phase_label}) via rclone.")
+
+    if str(backend_context.get("mode", "")) == "mapped":
+        aggregate_map_path = str(backend_context.get("aggregate_map_path", "") or "").strip()
+        share_mapping_service = ShareMappingService()
+        grouped_remote_paths = share_mapping_service.resolve_candidate_remote_paths_from_aggregate(
+            aggregate_map_path=aggregate_map_path,
+            hosts=hosts,
+            shares=shares,
+            extensions=get_sensitive_file_extensions(phase_profile),
+        )
+        download_result = _run_rclone_copy_mapped_loot_download(
+            shell=shell,
+            domain=domain,
+            username=username,
+            password=password,
+            grouped_remote_paths=grouped_remote_paths,
+            loot_dir=loot_dir,
+            manifest_dir=manifest_dir,
+            mostly_small_files=True,
+            operation_label="deterministic mapped scan",
+        )
+    else:
+        target_pairs = _resolve_cifs_host_share_targets(
+            hosts=hosts,
+            shares=shares,
+            share_map=None,
+        )
+        download_result = _run_rclone_copy_loot_download(
+            shell=shell,
+            domain=domain,
+            username=username,
+            password=password,
+            target_pairs=target_pairs,
+            loot_dir=loot_dir,
+            extensions=get_sensitive_file_extensions(phase_profile),
+            mostly_small_files=True,
+            operation_label="deterministic scan",
+        )
+    if not bool(download_result.get("success")):
+        return {"completed": False, "credential_findings": 0, "phase": phase}
+
+    credsweeper_service = shell._get_credsweeper_service()
+    findings = _run_credsweeper_path_scan_with_scope(
+        credsweeper_service=credsweeper_service,
+        credsweeper_path=credsweeper_path,
+        path_to_scan=loot_dir,
+        json_output_dir=os.path.join(phase_root_abs, "credsweeper"),
+        benchmark_scope=(
+            SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY
+            if phase == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS
+            else SMB_SENSITIVE_BENCHMARK_SCOPE_TEXT_ONLY
+        ),
+        jobs=get_default_credsweeper_jobs(),
+        find_by_ext=False,
+    )
+    total_findings, files_with_findings = _count_grouped_credential_findings(findings)
+    candidate_files = _count_files_under_path(loot_dir)
+    shell._get_spidering_service().process_local_structured_files(
+        root_path=loot_dir,
+        phase=phase,
+        domain=domain,
+        source_hosts=hosts,
+        source_shares=shares,
+        auth_username=username,
+        apply_actions=True,
+    )
+    if findings:
+        shell.handle_found_credentials(
+            findings,
+            domain,
+            source_hosts=hosts,
+            source_shares=shares,
+            auth_username=username,
+            source_artifact="rclone deterministic share scan",
+        )
+    loot_rel = os.path.relpath(loot_dir, shell._get_workspace_cwd())
+    print_info(
+        "Deterministic rclone phase summary: "
+        f"phase={marked_phase_label} candidate_files={candidate_files} "
+        f"files_with_findings={files_with_findings} "
+        f"credential_like_findings={total_findings} "
+        f"loot={mark_sensitive(loot_rel, 'path')}"
+    )
+    if not findings:
+        print_info("No credential-like findings were detected in this rclone phase.")
+    return {
+        "completed": True,
+        "credential_findings": int(total_findings),
+        "files_with_findings": int(files_with_findings),
+        "candidate_files": int(candidate_files),
+        "phase": phase,
+        "loot_dir": loot_dir,
+    }
+
+
+def _run_post_mapping_deterministic_rclone_artifact_scan(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    phase: str,
+    backend_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one production deterministic rclone artifact phase."""
+    from adscan_internal.services.share_mapping_service import ShareMappingService
+
+    phase_root_abs = os.path.join(str(backend_context.get("run_root_abs", "") or ""), phase)
+    loot_dir = os.path.join(phase_root_abs, "loot")
+    manifest_dir = os.path.join(phase_root_abs, "manifests")
+    os.makedirs(loot_dir, exist_ok=True)
+    os.makedirs(manifest_dir, exist_ok=True)
+    phase_label = str(get_sensitive_phase_definition(phase).get("label", phase))
+    print_info(
+        f"Running deterministic share analysis ({mark_sensitive(phase_label, 'text')}) via rclone."
+    )
+    if str(backend_context.get("mode", "")) == "mapped":
+        aggregate_map_path = str(backend_context.get("aggregate_map_path", "") or "").strip()
+        share_mapping_service = ShareMappingService()
+        grouped_remote_paths = share_mapping_service.resolve_candidate_remote_paths_from_aggregate(
+            aggregate_map_path=aggregate_map_path,
+            hosts=hosts,
+            shares=shares,
+            extensions=get_sensitive_phase_extensions(phase),
+        )
+        download_result = _run_rclone_copy_mapped_loot_download(
+            shell=shell,
+            domain=domain,
+            username=username,
+            password=password,
+            grouped_remote_paths=grouped_remote_paths,
+            loot_dir=loot_dir,
+            manifest_dir=manifest_dir,
+            mostly_small_files=False,
+            operation_label="deterministic mapped artifact scan",
+        )
+    else:
+        target_pairs = _resolve_cifs_host_share_targets(
+            hosts=hosts,
+            shares=shares,
+            share_map=None,
+        )
+        download_result = _run_rclone_copy_loot_download(
+            shell=shell,
+            domain=domain,
+            username=username,
+            password=password,
+            target_pairs=target_pairs,
+            loot_dir=loot_dir,
+            extensions=get_sensitive_phase_extensions(phase),
+            mostly_small_files=False,
+            operation_label="deterministic artifact scan",
+        )
+    if not bool(download_result.get("success")):
+        return {"completed": False, "artifact_hits": 0, "phase": phase}
+
+    artifact_files = _list_files_under_path(loot_dir)
+    spidering_service = shell._get_spidering_service()
+    for file_path in artifact_files:
+        spidering_service.process_found_file(
+            file_path,
+            domain,
+            "ext",
+            source_hosts=hosts,
+            source_shares=shares,
+            auth_username=username,
+            enable_legacy_zip_callbacks=False,
+            apply_actions=True,
+        )
+    loot_rel = os.path.relpath(loot_dir, shell._get_workspace_cwd())
+    if not artifact_files:
+        print_info(f"No artifact candidates were detected for phase {phase_label}.")
+    print_info(
+        "Deterministic rclone artifact summary: "
+        f"phase={mark_sensitive(phase_label, 'text')} "
+        f"artifact_hits={len(artifact_files)} "
+        f"loot={mark_sensitive(loot_rel, 'path')}"
+    )
+    return {
+        "completed": True,
+        "artifact_hits": len(artifact_files),
+        "phase": phase,
+        "loot_dir": loot_dir,
+    }
+
+
+def _run_post_mapping_deterministic_cifs_credsweeper_scan(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    cifs_mount_root: str | None = None,
+    profile: str = DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+    phase: str = SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+) -> dict[str, Any]:
+    """Run deterministic CIFS-mounted share analysis with CredSweeper."""
+    from adscan_internal.services.cifs_credsweeper_scan_service import (
+        CIFSCredSweeperScanService,
+    )
+    from adscan_internal.services.credsweeper_service import CredSweeperService
+
+    credsweeper_path = str(getattr(shell, "credsweeper_path", "") or "").strip()
+    if not credsweeper_path:
+        print_warning(
+            "Deterministic CIFS share analysis is unavailable because "
+            "CredSweeper is not configured."
+        )
+        return {"completed": False, "credential_findings": 0, "phase": phase}
+
+    effective_mount_root = str(
+        cifs_mount_root or ""
+    ).strip() or _resolve_cifs_mount_root(
+        shell=shell,
+        domain=domain,
+    )
+    marked_mount_root = mark_sensitive(effective_mount_root, "path")
+    mount_targets = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=None,
+    )
+    mounted_points: list[str] = []
+    try:
+        mounted_points = _mount_cifs_targets_via_host_helper(
+            domain=domain,
+            username=username,
+            password=password,
+            mount_root=effective_mount_root,
+            targets=mount_targets,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            "CIFS mount orchestration for deterministic scan failed unexpectedly."
+        )
+        print_warning_debug(
+            f"CIFS deterministic mount exception: {type(exc).__name__}: {exc}"
+        )
+        print_warning_debug(traceback.format_exc())
+
+    if not os.path.isdir(effective_mount_root):
+        print_warning(
+            "CIFS deterministic analysis root is not accessible. "
+            f"Expected mounted content at {marked_mount_root}."
+        )
+        _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        return {"completed": False, "credential_findings": 0, "phase": phase}
 
     marked_domain = mark_sensitive(domain, "domain")
     marked_user = mark_sensitive(username or "unknown", "user")
     print_info(
-        "Running deterministic share analysis (manspider + credsweeper) "
+        "Running deterministic share analysis "
+        f"({get_sensitive_phase_definition(phase).get('label', 'CIFS + CredSweeper')}) "
         f"for domain {marked_domain} as {marked_user}."
     )
-    manspider_passw(domain, username, password, shares, hosts)
+
+    credsweeper_service = (
+        shell._get_credsweeper_service()
+        if callable(getattr(shell, "_get_credsweeper_service", None))
+        else CredSweeperService(shell.run_command)
+    )
+    scan_service = CIFSCredSweeperScanService()
+    artifacts_dir = _resolve_credsweeper_artifacts_dir(
+        shell=shell,
+        domain=domain,
+        purpose="cifs_deterministic",
+    )
+    try:
+        scan_result = scan_service.scan_mounted_shares(
+            mount_root=effective_mount_root,
+            hosts=hosts,
+            shares=shares,
+            credsweeper_service=credsweeper_service,
+            credsweeper_path=credsweeper_path,
+            json_output_dir=artifacts_dir,
+            profile=profile,
+        )
+
+        print_info(
+            "Deterministic CIFS scan summary: "
+            f"mapped_shares={scan_result.mapped_shares} "
+            f"candidate_files={scan_result.candidate_files} "
+            f"scanned_files={scan_result.scanned_files} "
+            f"files_with_findings={scan_result.files_with_findings} "
+            f"credential_like_findings={scan_result.total_findings}"
+        )
+
+        shell._get_spidering_service().process_local_structured_files(
+            root_path=effective_mount_root,
+            phase=phase,
+            domain=domain,
+            source_hosts=hosts,
+            source_shares=shares,
+            auth_username=username,
+            apply_actions=True,
+        )
+
+        if scan_result.findings:
+            shell.handle_found_credentials(
+                scan_result.findings,
+                domain,
+                source_hosts=hosts,
+                source_shares=shares,
+                auth_username=username,
+                source_artifact="CIFS mounted share scan",
+            )
+        else:
+            print_info("No credential-like findings were detected in mounted CIFS shares.")
+        return {
+            "completed": True,
+            "credential_findings": int(scan_result.total_findings),
+            "files_with_findings": int(scan_result.files_with_findings),
+            "candidate_files": int(scan_result.candidate_files),
+            "phase": phase,
+        }
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning("CIFS deterministic share analysis failed unexpectedly.")
+        print_warning_debug(
+            f"CIFS deterministic scan exception: {type(exc).__name__}: {exc}"
+        )
+        print_warning_debug(traceback.format_exc())
+        return {"completed": False, "credential_findings": 0, "phase": phase}
+    finally:
+        try:
+            _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                "CIFS unmount cleanup failed unexpectedly after deterministic scan."
+            )
+            print_warning_debug(
+                f"CIFS deterministic unmount exception: {type(exc).__name__}: {exc}"
+            )
+
+
+def _run_post_mapping_deterministic_cifs_artifact_scan(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    username: str,
+    password: str,
+    cifs_mount_root: str | None = None,
+    phase: str,
+) -> dict[str, Any]:
+    """Run one local CIFS-backed artifact phase using the shared spidering service."""
+    effective_mount_root = str(
+        cifs_mount_root or ""
+    ).strip() or _resolve_cifs_mount_root(
+        shell=shell,
+        domain=domain,
+    )
+    marked_mount_root = mark_sensitive(effective_mount_root, "path")
+    mount_targets = _resolve_cifs_host_share_targets(
+        hosts=hosts,
+        shares=shares,
+        share_map=None,
+    )
+    mounted_points: list[str] = []
+    try:
+        mounted_points = _mount_cifs_targets_via_host_helper(
+            domain=domain,
+            username=username,
+            password=password,
+            mount_root=effective_mount_root,
+            targets=mount_targets,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"CIFS artifact phase mount exception: {type(exc).__name__}: {exc}"
+        )
+
+    if not os.path.isdir(effective_mount_root):
+        print_warning(
+            "CIFS artifact analysis root is not accessible. "
+            f"Expected mounted content at {marked_mount_root}."
+        )
+        _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        return {"completed": False, "artifact_hits": 0, "phase": phase}
+
+    phase_label = str(get_sensitive_phase_definition(phase).get("label", phase))
+    print_info(
+        f"Running deterministic share analysis ({phase_label}) "
+        f"from mounted CIFS content at {marked_mount_root}."
+    )
+
+    artifact_hits = 0
+    try:
+        spidering_service = shell._get_spidering_service()
+        for file_path in _iter_cifs_phase_candidate_files(
+            mount_root=effective_mount_root,
+            hosts=hosts,
+            shares=shares,
+            phase=phase,
+            aggregate_map_path=_resolve_cifs_aggregate_map_path(
+                shell=shell,
+                domain=domain,
+            ),
+        ):
+            artifact_hits += 1
+            spidering_service.process_found_file(
+                file_path,
+                domain,
+                "ext",
+                source_hosts=hosts,
+                source_shares=shares,
+                auth_username=username,
+                enable_legacy_zip_callbacks=False,
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning("CIFS artifact phase failed unexpectedly.")
+        print_warning_debug(
+            f"CIFS artifact phase exception: {type(exc).__name__}: {exc}"
+        )
+        print_warning_debug(traceback.format_exc())
+        return {"completed": False, "artifact_hits": artifact_hits, "phase": phase}
+    finally:
+        try:
+            _unmount_cifs_targets_via_host_helper(mount_points=mounted_points)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"CIFS artifact phase unmount exception: {type(exc).__name__}: {exc}"
+            )
+
+    if artifact_hits == 0:
+        print_info(f"No artifact candidates were detected for phase {phase_label}.")
+    return {"completed": True, "artifact_hits": artifact_hits, "phase": phase}
+
+
+def _iter_cifs_phase_candidate_files(
+    *,
+    mount_root: str,
+    hosts: list[str],
+    shares: list[str],
+    phase: str,
+    aggregate_map_path: str | None = None,
+) -> list[str]:
+    """Return local CIFS-backed files matching one artifact phase."""
+    return _iter_cifs_extension_candidate_files(
+        mount_root=mount_root,
+        hosts=hosts,
+        shares=shares,
+        extensions=get_sensitive_phase_extensions(phase),
+        aggregate_map_path=aggregate_map_path,
+    )
+
+
+def _iter_cifs_extension_candidate_files(
+    *,
+    mount_root: str,
+    hosts: list[str],
+    shares: list[str],
+    extensions: tuple[str, ...],
+    aggregate_map_path: str | None = None,
+) -> list[str]:
+    """Return local CIFS-backed files matching one extension set."""
+    from adscan_internal.services.cifs_share_mapping_service import CIFSShareMappingService
+
+    mapping_service = CIFSShareMappingService()
+    mount_root_path = Path(mount_root).expanduser().resolve(strict=False)
+    suffixes = {ext.casefold() for ext in extensions}
+    if not suffixes:
+        return []
+
+    unique_hosts = list(dict.fromkeys(str(host).strip() for host in hosts if str(host).strip()))
+    unique_shares = list(dict.fromkeys(str(share).strip() for share in shares if str(share).strip()))
+    allow_share_fallback = len(unique_hosts) <= 1
+    if aggregate_map_path:
+        mapped_candidates = mapping_service.resolve_candidate_local_paths_from_aggregate(
+            aggregate_map_path=aggregate_map_path,
+            mount_root=str(mount_root_path),
+            hosts=unique_hosts,
+            shares=unique_shares,
+            extensions=tuple(suffixes),
+        )
+        if mapped_candidates:
+            return mapped_candidates
+
+    candidates: list[str] = []
+    for host in unique_hosts:
+        for share in unique_shares:
+            share_root = mapping_service.resolve_share_mount_path(
+                mount_root=mount_root_path,
+                host=host,
+                share=share,
+                allow_share_root_fallback=allow_share_fallback,
+            )
+            if share_root is None:
+                continue
+            for dirpath, dirnames, filenames in os.walk(share_root):
+                prune_excluded_walk_dirs(dirnames)
+                for filename in sorted(filenames):
+                    file_path = Path(dirpath) / filename
+                    try:
+                        relative_path = file_path.relative_to(share_root).as_posix()
+                    except ValueError:
+                        continue
+                    if is_globally_excluded_smb_relative_path(relative_path):
+                        continue
+                    if file_path.suffix.casefold() in suffixes:
+                        candidates.append(str(file_path))
+    return candidates
 
 
 def _select_post_mapping_sensitive_data_method(
     *,
     shell: Any,
     ai_configured: bool,
+    domain: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
 ) -> str | None:
     """Select sensitive-data analysis mode for SMB share workflows.
 
-    UX is intentionally two-step when AI is available:
+    UX is intentionally simple when AI is available:
     1) Choose analysis mode (deterministic or AI).
-    2) If AI selected, choose mapping backend (spider_plus, CIFS, rclone).
+    2) If AI is selected, use rclone mapping automatically because it is the
+       fastest mapping backend from the benchmark results.
     """
+    selector = getattr(shell, "_questionary_select", None)
     if getattr(shell, "auto", False):
-        return "deterministic"
+        selected = _resolve_default_deterministic_share_analysis_method(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+        return _normalize_sensitive_data_method_for_smb_auth(
+            shell,
+            domain=domain,
+            username=username,
+            selected_method=selected,
+        )
 
     if not ai_configured:
-        print_info_debug(
-            "AI method selector skipped: no configured AI backend detected."
+        if not callable(selector):
+            print_info_debug(
+                "AI method selector skipped: no configured AI backend detected "
+                "and no interactive selector is available."
+            )
+            return _select_deterministic_share_analysis_method(
+                shell,
+                domain=domain,
+                username=username,
+                password=password,
+            )
+        primary_options = [
+            "Deterministic share analysis",
+            "Skip sensitive-data analysis",
+        ]
+        primary_idx = selector(
+            "Select SMB sensitive-data analysis mode:",
+            primary_options,
+            default_idx=0,
         )
-        return "deterministic"
+        if primary_idx == 0:
+            return _select_deterministic_share_analysis_method(
+                shell,
+                domain=domain,
+                username=username,
+                password=password,
+            )
+        if primary_idx == 1:
+            return None
+        selected = _resolve_default_deterministic_share_analysis_method(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+        return _normalize_sensitive_data_method_for_smb_auth(
+            shell,
+            domain=domain,
+            username=username,
+            selected_method=selected,
+        )
 
-    selector = getattr(shell, "_questionary_select", None)
     if not callable(selector):
-        return "deterministic"
+        selected = _resolve_default_deterministic_share_analysis_method(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+        return _normalize_sensitive_data_method_for_smb_auth(
+            shell,
+            domain=domain,
+            username=username,
+            selected_method=selected,
+        )
 
     primary_options = [
-        "Deterministic only (manspider + credsweeper) [Recommended]",
+        "Deterministic share analysis",
         "AI-assisted share analysis",
         "Skip sensitive-data analysis",
     ]
@@ -4669,32 +10174,66 @@ def _select_post_mapping_sensitive_data_method(
         default_idx=0,
     )
     if primary_idx == 0:
-        return "deterministic"
+        return _select_deterministic_share_analysis_method(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
     if primary_idx == 2:
         return None
     if primary_idx != 1:
-        return "deterministic"
-
-    mapping_options = [
-        "spider_plus (NetExec) [Recommended]",
-        "CIFS mounted shares",
-        "rclone SMB mapping",
-        "Back",
-    ]
-    mapping_idx = selector(
-        "Select AI share mapping backend:",
-        mapping_options,
-        default_idx=0,
-    )
-    if mapping_idx == 0:
+        selected = _resolve_default_deterministic_share_analysis_method(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+        return _normalize_sensitive_data_method_for_smb_auth(
+            shell,
+            domain=domain,
+            username=username,
+            selected_method=selected,
+        )
+    if _is_null_session_smb_auth(shell, domain=domain, username=username):
+        print_info_debug(
+            "AI post-mapping analysis selected under null-session auth. "
+            "Using spider_plus mapping backend because rclone SMB does not support anonymous logons."
+        )
         return "ai"
-    if mapping_idx == 1:
-        return "ai_cifs"
-    if mapping_idx == 2:
-        return "ai_rclone"
-    if mapping_idx == 3:
-        return "deterministic"
-    return "deterministic"
+    print_info_debug(
+        "AI post-mapping analysis selected. Using rclone mapping backend "
+        "automatically based on benchmark performance."
+    )
+    return "ai_rclone"
+
+
+def _select_deterministic_share_analysis_method(
+    shell: Any,
+    *,
+    domain: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> str | None:
+    """Resolve deterministic SMB share analysis backend without prompting."""
+    selected_method = _resolve_default_deterministic_share_analysis_method(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+    )
+    selected_method = _normalize_sensitive_data_method_for_smb_auth(
+        shell,
+        domain=domain,
+        username=username,
+        selected_method=selected_method,
+    )
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "unknown"
+    print_info_debug(
+        "Deterministic SMB backend selected automatically: "
+        f"workspace_type={workspace_type} method={selected_method}"
+    )
+    return selected_method
 
 
 def _run_post_mapping_ai_triage(
@@ -5922,7 +11461,9 @@ def execute_manspider(
     hosts: list[str] | None = None,
     shares: list[str] | None = None,
     auth_username: str | None = None,
-) -> None:
+    loot_dir: str | None = None,
+    credsweeper_jobs: int | None = None,
+) -> dict[str, Any]:
     """Execute manspider command and process its output based on type.
 
     For type 'passw' it displays the output directly and saves a log,
@@ -5933,6 +11474,11 @@ def execute_manspider(
         command: Full manspider command to execute.
         domain: Target domain name.
         scan_type: Type of scan - 'passw', 'ext', or 'gpp'.
+        loot_dir: Optional loot directory used by manspider downloads.
+        credsweeper_jobs: Optional CredSweeper process count for directory scans.
+
+    Returns:
+        Structured summary with completion state and phase counters.
     """
     try:
         if hosts or shares:
@@ -5954,7 +11500,7 @@ def execute_manspider(
                 print_error(
                     "manspider scan failed before returning any output while searching for possible passwords in shares."
                 )
-                return
+                return {"completed": False, "credential_findings": 0, "artifact_hits": 0}
 
             output_str = completed_process.stdout
             if output_str:
@@ -5986,10 +11532,26 @@ def execute_manspider(
             # Analyze log to extract credentials if manspider completed successfully
             if (
                 completed_process.returncode == 0
-                and output_str
-                and os.path.exists(log_file)
+                and loot_dir
+                and os.path.isdir(loot_dir)
             ):
-                credentials = shell.analyze_log_with_credsweeper(log_file)
+                credsweeper_service = shell._get_credsweeper_service()
+                credentials = credsweeper_service.analyze_path_with_options(
+                    loot_dir,
+                    credsweeper_path=shell.credsweeper_path,
+                    include_custom_rules=True,
+                    custom_ml_threshold="0.0",
+                    jobs=credsweeper_jobs or get_default_credsweeper_jobs(),
+                )
+                shell._get_spidering_service().process_local_structured_files(
+                    root_path=loot_dir,
+                    phase=SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+                    domain=domain,
+                    source_hosts=hosts or [],
+                    source_shares=shares or [],
+                    auth_username=auth_username or "",
+                    apply_actions=True,
+                )
                 if credentials:
                     shell.handle_found_credentials(
                         credentials,
@@ -5997,7 +11559,7 @@ def execute_manspider(
                         source_hosts=hosts,
                         source_shares=shares,
                         auth_username=auth_username,
-                        source_artifact=log_file,
+                        source_artifact=loot_dir,
                     )
                     shell.update_report_field(domain, "smb_share_secrets", True)
                 else:
@@ -6010,6 +11572,14 @@ def execute_manspider(
                     )
                     if current_report in (None, "NS", False):
                         shell.update_report_field(domain, "smb_share_secrets", False)
+                total_findings, files_with_findings = _count_grouped_credential_findings(credentials)
+                return {
+                    "completed": True,
+                    "credential_findings": int(total_findings),
+                    "files_with_findings": int(files_with_findings),
+                    "artifact_hits": 0,
+                }
+            return {"completed": True, "credential_findings": 0, "files_with_findings": 0, "artifact_hits": 0}
 
         else:
             # For other types, maintain original behavior
@@ -6018,13 +11588,19 @@ def execute_manspider(
                 print_error(
                     "manspider scan failed before returning any output while searching for files in shares."
                 )
-                return
+                return {"completed": False, "artifact_hits": 0}
 
             if proc.returncode == 0:
-                output_directory = "smb/spidering"
+                output_directory = loot_dir or "smb/spidering"
                 files_found = []
 
                 # Collect all found files
+                if not os.path.isdir(output_directory):
+                    print_warning_debug(
+                        "Manspider output directory missing after successful run: "
+                        f"{output_directory}"
+                    )
+                    return {"completed": True, "artifact_hits": 0}
                 for filename in os.listdir(output_directory):
                     if filename.endswith(".json"):
                         continue
@@ -6034,7 +11610,7 @@ def execute_manspider(
 
                 if not files_found:
                     print_error("No files found")
-                    return
+                    return {"completed": True, "artifact_hits": 0}
 
                 print_warning("Files found:")
                 for filename, _ in files_found:
@@ -6070,9 +11646,11 @@ def execute_manspider(
                             )
                         else:
                             print_info(f"Skipping {filename}")
+                return {"completed": True, "artifact_hits": len(files_found)}
             else:
                 print_error("Error executing manspider to search for files")
                 print_error(f"Error: {proc.stderr.strip()}")
+                return {"completed": False, "artifact_hits": 0}
 
     except Exception as e:
         telemetry.capture_exception(e)
@@ -6080,5 +11658,7 @@ def execute_manspider(
         error_msg = str(e) if e else "Unknown error"
         error_type = type(e).__name__ if e else "Unknown"
         print_error(f"Error executing manspider: {error_msg}")
+        print_error_debug(f"Manspider exception type: {error_type}")
+        return {"completed": False, "artifact_hits": 0}
         print_error(f"Error type: {error_type}")
         print_exception(exception=e)

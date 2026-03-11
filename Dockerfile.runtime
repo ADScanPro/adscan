@@ -48,6 +48,7 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       git \
+      ripgrep \
       jq \
       bat \
       gosu \
@@ -279,6 +280,7 @@ RUN set -eux; \
     pydantic-ai==1.62.0 \
     python-magic==0.4.27 \
     markitdown==0.1.5 \
+    credsweeper==1.14.1 \
     impacket==0.13.0 \
     pycryptodome==3.23.0 \
     gpp-decrypt==2.0.0 \

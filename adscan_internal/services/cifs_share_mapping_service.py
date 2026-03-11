@@ -12,7 +12,11 @@ from typing import Any
 import os
 
 from adscan_internal.services.base_service import BaseService
-from adscan_internal.workspaces import write_json_file
+from adscan_internal.services.smb_exclusion_policy import (
+    is_globally_excluded_smb_relative_path,
+    prune_excluded_walk_dirs,
+)
+from adscan_internal.workspaces import read_json_file, write_json_file
 
 
 class CIFSShareMappingService(BaseService):
@@ -152,6 +156,78 @@ class CIFSShareMappingService(BaseService):
 
         return None
 
+    def resolve_candidate_local_paths_from_aggregate(
+        self,
+        *,
+        aggregate_map_path: str,
+        mount_root: str,
+        hosts: list[str],
+        shares: list[str],
+        extensions: tuple[str, ...],
+    ) -> list[str]:
+        """Resolve local CIFS candidate paths from a consolidated mapping JSON."""
+        if not aggregate_map_path or not os.path.exists(aggregate_map_path):
+            return []
+        aggregate = read_json_file(aggregate_map_path)
+        if not isinstance(aggregate, dict):
+            return []
+        hosts_bucket = aggregate.get("hosts")
+        if not isinstance(hosts_bucket, dict):
+            return []
+
+        requested_hosts = {
+            str(host).strip().casefold() for host in hosts if str(host).strip()
+        }
+        requested_shares = {
+            str(share).strip().casefold() for share in shares if str(share).strip()
+        }
+        normalized_extensions = {
+            str(extension).strip().casefold()
+            for extension in extensions
+            if str(extension).strip()
+        }
+        if not normalized_extensions:
+            return []
+
+        resolved_paths: list[str] = []
+        seen_paths: set[str] = set()
+        allow_share_root_fallback = len(requested_hosts) <= 1
+        for host_name, host_entry in hosts_bucket.items():
+            if not isinstance(host_name, str) or not isinstance(host_entry, dict):
+                continue
+            if requested_hosts and host_name.casefold() not in requested_hosts:
+                continue
+            shares_bucket = host_entry.get("shares")
+            if not isinstance(shares_bucket, dict):
+                continue
+            for share_name, share_entry in shares_bucket.items():
+                if not isinstance(share_name, str) or not isinstance(share_entry, dict):
+                    continue
+                if requested_shares and share_name.casefold() not in requested_shares:
+                    continue
+                files_bucket = share_entry.get("files")
+                if not isinstance(files_bucket, dict):
+                    continue
+                for remote_path in files_bucket.keys():
+                    if not isinstance(remote_path, str):
+                        continue
+                    if is_globally_excluded_smb_relative_path(remote_path):
+                        continue
+                    if Path(remote_path).suffix.casefold() not in normalized_extensions:
+                        continue
+                    local_path = self.resolve_candidate_local_path(
+                        mount_root=mount_root,
+                        host=host_name,
+                        share=share_name,
+                        remote_path=remote_path,
+                        allow_share_root_fallback=allow_share_root_fallback,
+                    )
+                    if not local_path or local_path in seen_paths:
+                        continue
+                    seen_paths.add(local_path)
+                    resolved_paths.append(local_path)
+        return resolved_paths
+
     def _collect_share_files(
         self,
         *,
@@ -159,7 +235,8 @@ class CIFSShareMappingService(BaseService):
     ) -> dict[str, dict[str, str]]:
         """Collect spider_plus-like file metadata for one mounted share path."""
         files_map: dict[str, dict[str, str]] = {}
-        for dirpath, _, filenames in os.walk(share_root):
+        for dirpath, dirnames, filenames in os.walk(share_root):
+            prune_excluded_walk_dirs(dirnames)
             base_dir = Path(dirpath)
             for filename in filenames:
                 file_path = base_dir / filename
@@ -175,6 +252,8 @@ class CIFSShareMappingService(BaseService):
                 try:
                     relative_path = file_path.relative_to(share_root).as_posix()
                 except ValueError:
+                    continue
+                if is_globally_excluded_smb_relative_path(relative_path):
                     continue
 
                 files_map[relative_path] = {
@@ -252,4 +331,3 @@ class CIFSShareMappingService(BaseService):
         if unit_idx == 0:
             return f"{int(value)} B"
         return f"{value:.2f} {units[unit_idx]}"
-

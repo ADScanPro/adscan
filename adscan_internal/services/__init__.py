@@ -40,6 +40,10 @@ from .credsweeper_service import (
     CredSweeperFinding,
     get_credsweeper_rules_paths,
 )
+from .credsweeper_library_service import (
+    CredSweeperLibraryService,
+    InMemoryCredSweeperTarget,
+)
 from .spidering_service import SpideringService
 from .credential_store_service import (
     CredentialStoreService,
@@ -48,7 +52,21 @@ from .credential_store_service import (
 )
 from .share_mapping_service import ShareMappingService
 from .cifs_share_mapping_service import CIFSShareMappingService
+from .cifs_credsweeper_scan_service import (
+    CIFSCredSweeperScanResult,
+    CIFSCredSweeperScanService,
+)
 from .rclone_share_mapping_service import RcloneShareMappingService
+from .rclone_tuning_service import (
+    RcloneCatTuning,
+    RcloneTuning,
+    choose_rclone_cat_tuning,
+    choose_rclone_tuning,
+)
+from .artifact_processing_tuning_service import (
+    ArtifactProcessingTuning,
+    choose_artifact_processing_tuning,
+)
 from .share_map_ai_triage_service import ShareMapAITriageService
 from .impacket_smb_byte_reader_service import (
     ImpacketSMBByteReaderService,
@@ -83,6 +101,18 @@ from .smb_guest_auth_service import (
     is_guest_alias,
     resolve_smb_guest_username,
 )
+from .smb_sensitive_file_policy import (
+    DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
+    DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS,
+    SMB_SENSITIVE_FILE_PROFILES,
+    SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY,
+    SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS,
+    SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY,
+    TEXT_LIKE_CREDENTIAL_EXTENSIONS,
+    get_manspider_sensitive_extensions,
+    get_sensitive_file_extensions,
+    get_sensitive_file_profile,
+)
 
 __all__ = [
     "BaseService",
@@ -115,6 +145,8 @@ __all__ = [
     "PassTheCertificateResult",
     "CredSweeperService",
     "CredSweeperFinding",
+    "CredSweeperLibraryService",
+    "InMemoryCredSweeperTarget",
     "get_credsweeper_rules_paths",
     "SpideringService",
     "CredentialStoreService",
@@ -122,7 +154,15 @@ __all__ = [
     "LocalCredentialUpdateResult",
     "ShareMappingService",
     "CIFSShareMappingService",
+    "CIFSCredSweeperScanResult",
+    "CIFSCredSweeperScanService",
     "RcloneShareMappingService",
+    "RcloneCatTuning",
+    "RcloneTuning",
+    "choose_rclone_cat_tuning",
+    "choose_rclone_tuning",
+    "ArtifactProcessingTuning",
+    "choose_artifact_processing_tuning",
     "ShareMapAITriageService",
     "ImpacketSMBByteReaderService",
     "SMBByteReadResult",
@@ -145,4 +185,14 @@ __all__ = [
     "DEFAULT_SMB_GUEST_USERNAME",
     "is_guest_alias",
     "resolve_smb_guest_username",
+    "DEFAULT_SMB_SENSITIVE_FILE_PROFILE",
+    "DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS",
+    "SMB_SENSITIVE_FILE_PROFILES",
+    "SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY",
+    "SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS",
+    "SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY",
+    "TEXT_LIKE_CREDENTIAL_EXTENSIONS",
+    "get_manspider_sensitive_extensions",
+    "get_sensitive_file_extensions",
+    "get_sensitive_file_profile",
 ]

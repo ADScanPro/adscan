@@ -664,8 +664,13 @@ def build_adscan_run_command(
     state_host_dir = cfg.workspaces_host_dir.parent / "state"
     cmd.extend(
         [
-            "-v",
-            f"{cfg.workspaces_host_dir}:{cfg.workspaces_container_dir}",
+            "--mount",
+            (
+                "type=bind,"
+                f"src={cfg.workspaces_host_dir},"
+                f"dst={cfg.workspaces_container_dir},"
+                "bind-propagation=rshared"
+            ),
             "-v",
             f"{config_host_dir}:/opt/adscan/.config",
             "-v",

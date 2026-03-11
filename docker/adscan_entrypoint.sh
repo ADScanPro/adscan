@@ -61,7 +61,31 @@ if getent group tty >/dev/null 2>&1; then
 fi
 
 mkdir -p /opt/adscan/workspaces /opt/adscan/logs /opt/adscan/.config
-chown -R "${uid}:${gid}" /opt/adscan/workspaces /opt/adscan/logs /opt/adscan/.config || true
+
+_fix_ownership_same_fs() {
+  local target="$1"
+  local label="$2"
+  if [[ ! -e "${target}" ]]; then
+    return 0
+  fi
+
+  # Important: do not traverse into nested mount points (e.g. CIFS mounts under
+  # workspaces). Those may be read-only and are not owned by the container
+  # runtime to begin with.
+  if ! chown "${uid}:${gid}" "${target}" >/dev/null 2>&1; then
+    _ep_log "ownership fix skipped for ${label} root: ${target}"
+  fi
+
+  if command -v find >/dev/null 2>&1; then
+    if ! find "${target}" -xdev \( ! -uid "${uid}" -o ! -gid "${gid}" \) -exec chown "${uid}:${gid}" {} + >/dev/null 2>&1; then
+      _ep_log "ownership fix encountered non-fatal errors under ${label}: ${target}"
+    fi
+  fi
+}
+
+_fix_ownership_same_fs /opt/adscan/workspaces "workspaces"
+_fix_ownership_same_fs /opt/adscan/logs "logs"
+_fix_ownership_same_fs /opt/adscan/.config "config"
 
 # Fix common TTY settings for interactive prompts.
 # - Rich Prompt.ask relies on the terminal line discipline for editing keys.
@@ -95,7 +119,7 @@ chmod 0664 /etc/hosts >/dev/null 2>&1 || true
 
 # Allow the (unprivileged) ADscan process to update the generated Unbound config snippet.
 mkdir -p /etc/unbound/unbound.conf.d
-chown -R "${uid}:${gid}" /etc/unbound/unbound.conf.d || true
+_fix_ownership_same_fs /etc/unbound/unbound.conf.d "unbound-config"
 
 # Ensure the container resolver uses Unbound first.
 # NOTE: Avoid escaping quotes inside awk programs. Escaped quotes (e.g. \"name\")

@@ -15,6 +15,8 @@ GENERIC_ERROR_RETURN_CODE = 1
 
 _TIMEOUT_SUFFIX = "_COMMAND_TIMEOUT"
 _NO_RESULT_SUFFIX = "_COMMAND_NO_RESULT"
+_LDAP_EXACT_CONNECTION_TIMEOUT_MARKER = "[ADSCAN] NETEXEC_LDAP_EXACT_CONN_TIMEOUT"
+_LDAP_EXACT_CONNECTION_TIMEOUT_SIGNATURE = "TimeoutError: [Errno 110] Connection"
 
 
 def normalize_tool_name(tool_name: str) -> str:
@@ -32,6 +34,11 @@ def timeout_marker(tool_name: str) -> str:
 def no_result_marker(tool_name: str) -> str:
     """Return standardized no-result marker for a tool."""
     return f"[ADSCAN] {normalize_tool_name(tool_name)}{_NO_RESULT_SUFFIX}"
+
+
+def ldap_exact_connection_timeout_marker() -> str:
+    """Return the standardized marker for the exact NetExec LDAP timeout signature."""
+    return _LDAP_EXACT_CONNECTION_TIMEOUT_MARKER
 
 
 def build_timeout_completed_process(
@@ -62,6 +69,26 @@ def build_no_result_completed_process(
     )
 
 
+def build_ldap_exact_connection_timeout_completed_process(
+    command: str | list[str],
+    *,
+    stdout: str = "",
+    stderr: str = "",
+) -> subprocess.CompletedProcess[str]:
+    """Build a synthetic error result for the exact NetExec LDAP timeout signature."""
+    marker = ldap_exact_connection_timeout_marker()
+    stderr_text = stderr or ""
+    if marker not in stderr_text:
+        stderr_text = (stderr_text.rstrip("\n") + "\n") if stderr_text else ""
+        stderr_text += marker + "\n"
+    return subprocess.CompletedProcess(
+        args=command,
+        returncode=GENERIC_ERROR_RETURN_CODE,
+        stdout=stdout,
+        stderr=stderr_text,
+    )
+
+
 def output_has_timeout_marker(output: str, *, tool_name: str | None = None) -> bool:
     """Return True when output contains a timeout marker.
 
@@ -76,6 +103,26 @@ def output_has_timeout_marker(output: str, *, tool_name: str | None = None) -> b
     return _TIMEOUT_SUFFIX in output
 
 
+def output_has_exact_ldap_connection_timeout(output: str) -> bool:
+    """Return True when output contains the exact NetExec LDAP timeout signature."""
+    if not output:
+        return False
+    return (
+        _LDAP_EXACT_CONNECTION_TIMEOUT_SIGNATURE in output
+        or _LDAP_EXACT_CONNECTION_TIMEOUT_MARKER in output
+    )
+
+
+def result_is_exact_ldap_connection_timeout(
+    result: subprocess.CompletedProcess[str] | None,
+) -> bool:
+    """Return True when a completed process matches the exact NetExec LDAP timeout case."""
+    if not isinstance(result, subprocess.CompletedProcess):
+        return False
+    combined = f"{result.stdout or ''}\n{result.stderr or ''}"
+    return output_has_exact_ldap_connection_timeout(combined)
+
+
 def result_is_timeout(
     result: subprocess.CompletedProcess[str] | None, *, tool_name: str | None = None
 ) -> bool:
@@ -86,4 +133,3 @@ def result_is_timeout(
         return True
     combined = f"{result.stdout or ''}\n{result.stderr or ''}"
     return output_has_timeout_marker(combined, tool_name=tool_name)
-

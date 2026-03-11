@@ -167,10 +167,25 @@ def do_enum_configs(self, domain: str) -> None:
     tracker.print_summary()
 
 
+_RELAY_LIST_ENUM_TIMEOUT_SECONDS = 1800
+
+
 def execute_generate_relay_list(self, command: str, domain: str) -> None:
     """Executes the command to generate a relay list."""
     try:
-        completed_process = self._run_netexec(command, domain=domain, timeout=300)
+        completed_process = self._run_netexec(
+            command,
+            domain=domain,
+            timeout=_RELAY_LIST_ENUM_TIMEOUT_SECONDS,
+        )
+        if not completed_process:
+            marked_domain = mark_sensitive(domain, "domain")
+            print_error(
+                "Failed to generate relay list: NetExec did not return a result. "
+                f"Domain: {marked_domain}"
+            )
+            return
+
         errors = completed_process.stderr
         if completed_process.returncode == 0:
             marked_domain = mark_sensitive(domain, "domain")

@@ -142,14 +142,14 @@ def choose_cracking_wordlist(
         option_rows = [
             (
                 "hashmob_medium",
-                "hashmob.net_2025.medium.found (Recommended for audit - ES environments)",
+                "hashmob.net_2025.medium.found (Recommended for real world environments)",
             ),
             (
                 "kaonashi14M",
-                "kaonashi14M.txt (Recommended for audit - ES environments)",
+                "kaonashi14M.txt (Recommended for ES environments)",
             ),
-            ("rockyou", "rockyou.txt (Fast baseline)"),
-            ("kerberoast_pws", "kerberoast_pws (AD service accounts)"),
+            ("rockyou", "rockyou.txt (Recommended for CTFs)"),
+            ("kerberoast_pws", "kerberoast_pws (Specialized for Kerberoasting)"),
             ("other", "Other (custom path)"),
         ]
     else:

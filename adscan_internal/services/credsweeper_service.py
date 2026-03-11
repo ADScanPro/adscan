@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -39,6 +40,37 @@ logger = logging.getLogger(__name__)
 
 
 CommandExecutor = Callable[..., subprocess.CompletedProcess[str] | None]
+
+
+def resolve_credsweeper_drop_ml_none_for_ruleset(
+    *,
+    ruleset_label: str,
+    drop_ml_none: bool | None,
+) -> bool:
+    """Resolve whether one ruleset should discard findings without ML confidence.
+
+    Default service policy is intentionally asymmetric:
+    - primary rules: drop ``ml_probability=None``
+    - custom rules: keep ``ml_probability=None``
+
+    This matches the legacy ``analyze_file()`` behavior that filtered noisy
+    primary-rule findings such as ``UUID`` while preserving custom-rule output.
+
+    Args:
+        ruleset_label: Logical ruleset name, typically ``primary`` or ``custom``.
+        drop_ml_none: Optional caller override. ``True`` drops all ``None``
+            findings, ``False`` preserves all of them, and ``None`` applies the
+            default policy above.
+
+    Returns:
+        Boolean decision for whether findings with ``ml_probability=None`` should
+        be discarded for this ruleset.
+    """
+    if drop_ml_none is True:
+        return True
+    if drop_ml_none is False:
+        return False
+    return str(ruleset_label).strip().lower() == "primary"
 
 
 def _get_credsweeper_config_path() -> Optional[str]:
@@ -125,6 +157,12 @@ def get_credsweeper_rules_paths() -> Tuple[Optional[str], Optional[str]]:
     return primary_rules, custom_rules
 
 
+def get_default_credsweeper_jobs(max_jobs: int = 8) -> int:
+    """Return a conservative default process count for CredSweeper."""
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(int(max_jobs), int(cpu_count)))
+
+
 @dataclass
 class CredSweeperFinding:
     """Single credential-like finding reported by CredSweeper.
@@ -169,11 +207,38 @@ class CredSweeperService(BaseService):
 
     # Public API ---------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_json_output_path(
+        *,
+        file_path: str,
+        output_basename: str,
+        json_output_dir: Optional[str],
+    ) -> str:
+        """Resolve CredSweeper JSON output path.
+
+        By default the JSON is written next to the analyzed file to preserve the
+        legacy manspider workflow. When ``json_output_dir`` is provided, the JSON
+        is instead written under that directory, which is required for read-only
+        mounts such as CIFS.
+        """
+        if not json_output_dir:
+            base_path, _ = os.path.splitext(file_path)
+            return f"{base_path}{output_basename}.json"
+
+        output_dir = os.path.abspath(str(json_output_dir))
+        os.makedirs(output_dir, exist_ok=True)
+        file_name = Path(file_path).name or "credsweeper_input"
+        stem = Path(file_name).stem or "credsweeper_input"
+        safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._") or "input"
+        normalized_basename = output_basename.strip("_") or "result"
+        return os.path.join(output_dir, f"{safe_stem}_{normalized_basename}.json")
+
     def analyze_file(
         self,
         file_path: str,
         *,
         credsweeper_path: Optional[str],
+        json_output_dir: Optional[str] = None,
         timeout: int = 300,
     ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
         """Analyze a text file with CredSweeper and return structured findings.
@@ -195,6 +260,9 @@ class CredSweeperService(BaseService):
             file_path: Path to the file to analyze.
             credsweeper_path: Path to the ``credsweeper`` executable. If ``None``,
                 the analysis is skipped and an empty dict is returned.
+            json_output_dir: Optional writable directory where CredSweeper should
+                store temporary JSON output. When omitted, defaults to the source
+                file directory for legacy compatibility.
             timeout: Optional timeout in seconds for each CredSweeper invocation.
 
         Returns:
@@ -238,8 +306,6 @@ class CredSweeperService(BaseService):
                     "[credsweeper] No custom rules (custom_config.yaml) found for file."
                 )
 
-            base_path, _ = os.path.splitext(file_path)
-
             def _run_ruleset(
                 rules_path: Optional[str],
                 json_suffix: str,
@@ -250,7 +316,11 @@ class CredSweeperService(BaseService):
                 if not rules_path:
                     return
 
-                json_output = f"{base_path}{json_suffix}.json"
+                json_output = self._resolve_json_output_path(
+                    file_path=file_path,
+                    output_basename=json_suffix,
+                    json_output_dir=json_output_dir,
+                )
                 cmd_parts = [
                     shlex.quote(credsweeper_path),
                     "--path",
@@ -428,11 +498,13 @@ class CredSweeperService(BaseService):
         file_path: str,
         *,
         credsweeper_path: Optional[str],
+        json_output_dir: Optional[str] = None,
         rules_path: Optional[str] = None,
         include_custom_rules: bool = False,
-        drop_ml_none: bool = False,
+        drop_ml_none: bool | None = None,
         ml_threshold: str = "0.1",
         doc: bool = False,
+        depth: bool = False,
         no_filters: bool = False,
         timeout: int = 300,
     ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
@@ -447,13 +519,20 @@ class CredSweeperService(BaseService):
         Args:
             file_path: Path to the file to analyze.
             credsweeper_path: Path to the CredSweeper executable.
+            json_output_dir: Optional writable directory where CredSweeper should
+                store temporary JSON output. When omitted, defaults to the source
+                file directory for legacy compatibility.
             rules_path: Optional explicit rules file. When omitted, uses the
                 primary rules from :func:`get_credsweeper_rules_paths`.
             include_custom_rules: When True, runs the custom ruleset in addition
                 to the primary rules and merges results.
-            drop_ml_none: When True, drops results where ``ml_probability`` is missing.
+            drop_ml_none: Optional override for findings where ``ml_probability``
+                is missing. ``None`` applies the default service policy: drop
+                them for primary rules and keep them for custom rules.
             ml_threshold: CredSweeper ML threshold value (string or float-like).
             doc: When True, run CredSweeper in document mode (``--doc``).
+            depth: When True, enable CredSweeper's experimental recursive
+                deep parsing mode (``--depth``).
             no_filters: When True, disable CredSweeper filters (``--no-filters``).
             timeout: Timeout in seconds for the command execution.
 
@@ -484,11 +563,14 @@ class CredSweeperService(BaseService):
             )
             return findings
 
-        base_path, _ = os.path.splitext(file_path)
         all_results: List[Dict[str, Any]] = []
 
         for label, rules in rulesets:
-            json_output = f"{base_path}_{label}.json"
+            json_output = self._resolve_json_output_path(
+                file_path=file_path,
+                output_basename=label,
+                json_output_dir=json_output_dir,
+            )
             cmd_parts = [
                 shlex.quote(credsweeper_path),
                 "--path",
@@ -502,6 +584,8 @@ class CredSweeperService(BaseService):
             ]
             if doc:
                 cmd_parts.append("--doc")
+            if depth:
+                cmd_parts.append("--depth")
             if no_filters:
                 cmd_parts.append("--no-filters")
             command = " ".join(cmd_parts)
@@ -562,7 +646,10 @@ class CredSweeperService(BaseService):
 
             for result in results:
                 ml_probability = result.get("ml_probability")
-                if drop_ml_none and ml_probability is None:
+                if resolve_credsweeper_drop_ml_none_for_ruleset(
+                    ruleset_label=label,
+                    drop_ml_none=drop_ml_none,
+                ) and ml_probability is None:
                     continue
                 all_results.append(result)
 
@@ -614,10 +701,233 @@ class CredSweeperService(BaseService):
 
         return findings
 
+    def analyze_path_with_options(
+        self,
+        path_to_scan: str,
+        *,
+        credsweeper_path: Optional[str],
+        json_output_dir: Optional[str] = None,
+        rules_path: Optional[str] = None,
+        include_custom_rules: bool = False,
+        drop_ml_none: bool | None = None,
+        ml_threshold: str = "0.1",
+        doc: bool = False,
+        no_filters: bool = False,
+        find_by_ext: bool = False,
+        jobs: int | None = None,
+        custom_ml_threshold: str | None = None,
+        depth: bool = False,
+        timeout: int = 300,
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Analyze a file or directory path with CredSweeper using explicit options.
+
+        Args:
+            path_to_scan: File or directory path to analyze.
+            credsweeper_path: Path to the CredSweeper executable.
+            json_output_dir: Optional writable directory where CredSweeper should
+                store temporary JSON output. When omitted, defaults to the source
+                path directory for legacy compatibility.
+            rules_path: Optional explicit rules file. When omitted, uses the
+                primary rules from :func:`get_credsweeper_rules_paths`.
+            include_custom_rules: When True, runs the custom ruleset in addition
+                to the primary rules and merges results.
+            drop_ml_none: Optional override for findings where ``ml_probability``
+                is missing. ``None`` applies the default service policy: drop
+                them for primary rules and keep them for custom rules.
+            ml_threshold: CredSweeper ML threshold value (string or float-like).
+            doc: When True, run CredSweeper in document mode (``--doc``).
+            no_filters: When True, disable CredSweeper filters (``--no-filters``).
+            find_by_ext: When True, enable CredSweeper's native extension-based
+                candidate discovery (``--find-by-ext``).
+            jobs: Optional number of worker processes for CredSweeper ``--jobs``.
+            depth: When True, enable CredSweeper's experimental recursive
+                deep parsing mode (``--depth``) for documents/containers.
+            timeout: Timeout in seconds for the command execution.
+
+        Returns:
+            Findings grouped by rule name.
+        """
+        findings: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
+        if not credsweeper_path:
+            print_info_verbose(
+                "Credential extraction tool not available. Skipping CredSweeper analysis."
+            )
+            return findings
+        if not os.path.exists(path_to_scan):
+            print_warning(
+                f"File or directory not found for CredSweeper analysis: {path_to_scan}"
+            )
+            return findings
+
+        primary_rules, custom_rules = get_credsweeper_rules_paths()
+        selected_primary = rules_path or primary_rules
+        rulesets: list[tuple[str, str]] = []
+        if selected_primary:
+            rulesets.append(("primary", selected_primary))
+        if include_custom_rules and custom_rules:
+            rulesets.append(("custom", custom_rules))
+
+        if not rulesets:
+            print_info_verbose(
+                "No CredSweeper rules available. Skipping CredSweeper analysis."
+            )
+            return findings
+
+        all_results: List[Dict[str, Any]] = []
+
+        for label, rules in rulesets:
+            json_output = self._resolve_json_output_path(
+                file_path=path_to_scan,
+                output_basename=label,
+                json_output_dir=json_output_dir,
+            )
+            effective_ml_threshold = str(ml_threshold)
+            if (
+                label == "custom"
+                and include_custom_rules
+                and custom_ml_threshold is not None
+            ):
+                effective_ml_threshold = str(custom_ml_threshold)
+
+            cmd_parts = [
+                shlex.quote(credsweeper_path),
+                "--path",
+                shlex.quote(path_to_scan),
+                "--save-json",
+                shlex.quote(json_output),
+                "--ml_threshold",
+                effective_ml_threshold,
+                "--rules",
+                shlex.quote(rules),
+            ]
+            if doc:
+                cmd_parts.append("--doc")
+            if no_filters:
+                cmd_parts.append("--no-filters")
+            if find_by_ext:
+                cmd_parts.append("--find-by-ext")
+            if depth:
+                cmd_parts.append("--depth")
+            if jobs is not None and int(jobs) > 0:
+                cmd_parts.extend(["--jobs", str(int(jobs))])
+            command = " ".join(cmd_parts)
+
+            print_info_verbose(
+                "Analyzing path for credentials with CredSweeper "
+                f"({label} rules): {path_to_scan}"
+            )
+            print_info_debug(f"[credsweeper] Command ({label}): {command}")
+
+            completed_process = self._command_executor(
+                command, timeout=timeout, use_clean_env=True
+            )
+
+            if not completed_process or completed_process.returncode != 0:
+                stdout_text = strip_ansi_codes(
+                    (completed_process.stdout or "").strip()
+                    if completed_process
+                    else ""
+                )
+                stderr_text = strip_ansi_codes(
+                    (completed_process.stderr or "").strip()
+                    if completed_process
+                    else ""
+                )
+                print_warning(f"Credential analysis failed for path ({label} rules).")
+                print_warning_debug(
+                    f"[credsweeper] Analysis failed ({label}). "
+                    f"Return code: {getattr(completed_process, 'returncode', 'N/A')}\n"
+                    f"Stdout: {stdout_text or 'No stdout'}\n"
+                    f"Stderr: {stderr_text or 'No stderr'}"
+                )
+                continue
+
+            if not os.path.exists(json_output):
+                print_info_verbose(
+                    f"[credsweeper] No JSON output generated for path ({label} rules)."
+                )
+                continue
+
+            try:
+                with open(json_output, "r", encoding="utf-8") as handle:
+                    results = json.load(handle)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_warning(f"Error parsing CredSweeper JSON ({label} rules): {exc}")
+                continue
+            finally:
+                try:
+                    os.remove(json_output)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if not isinstance(results, list):
+                print_warning_debug(
+                    f"[credsweeper] Unexpected JSON structure for path ({label} rules)."
+                )
+                continue
+
+            for result in results:
+                ml_probability = result.get("ml_probability")
+                if resolve_credsweeper_drop_ml_none_for_ruleset(
+                    ruleset_label=label,
+                    drop_ml_none=drop_ml_none,
+                ) and ml_probability is None:
+                    continue
+                all_results.append(result)
+
+        if not all_results:
+            print_info_verbose("No credentials detected by CredSweeper.")
+            return findings
+
+        seen_credentials: set[Tuple[str, str, int]] = set()
+        for result in all_results:
+            rule_name = result.get("rule", "") or ""
+            ml_probability = result.get("ml_probability")
+            try:
+                if ml_probability is not None:
+                    ml_probability = float(ml_probability)
+            except (ValueError, TypeError):
+                ml_probability = None
+
+            line_data_list = result.get("line_data_list", []) or []
+            findings.setdefault(rule_name, [])
+
+            for line_data in line_data_list:
+                value = line_data.get("value", "")
+                context_line = line_data.get("line", "") or ""
+                line_num = line_data.get("line_num", 0)
+                try:
+                    line_num = int(line_num or 0)
+                except (ValueError, TypeError):
+                    line_num = 0
+
+                file_path_entry = line_data.get("path", path_to_scan) or path_to_scan
+                if not isinstance(file_path_entry, str):
+                    file_path_entry = str(file_path_entry) or path_to_scan
+
+                if value is None:
+                    value = ""
+                if not isinstance(value, str):
+                    value = str(value) if value else ""
+
+                if not value or len(value) < 3:
+                    continue
+
+                dedup_key = (rule_name, value, line_num)
+                if dedup_key in seen_credentials:
+                    continue
+                seen_credentials.add(dedup_key)
+                findings[rule_name].append(
+                    (value, ml_probability, context_line, line_num, file_path_entry)
+                )
+
+        return findings
+
 
 __all__ = [
     "CredSweeperService",
     "CredSweeperFinding",
+    "get_default_credsweeper_jobs",
     "get_credsweeper_rules_paths",
 ]
-

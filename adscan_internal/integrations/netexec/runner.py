@@ -28,6 +28,10 @@ from adscan_internal.command_runner import (
     summarize_execution_result,
 )
 from adscan_internal.execution_outcomes import build_timeout_completed_process
+from adscan_internal.execution_outcomes import (
+    build_ldap_exact_connection_timeout_completed_process,
+    output_has_exact_ldap_connection_timeout,
+)
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
@@ -227,6 +231,13 @@ class NetExecRunner:
         schema_mismatch_cleanup_attempts = 0
         max_schema_mismatch_cleanup_attempts = 2
 
+        def _is_ldap_command(cmd: str) -> bool:
+            try:
+                argv = shlex.split(cmd)
+            except ValueError:
+                return " ldap " in f" {cmd} "
+            return "ldap" in argv
+
         def _should_force_kerberos(cmd: str) -> bool:
             try:
                 argv = shlex.split(cmd)
@@ -304,6 +315,9 @@ class NetExecRunner:
                 proc.stdout = stdout_clean
                 proc.stderr = stderr_clean
                 combined_output = stdout_clean + stderr_clean
+                has_exact_ldap_connection_timeout = _is_ldap_command(
+                    current_command
+                ) and output_has_exact_ldap_connection_timeout(combined_output)
 
                 output_lines = (
                     combined_output.strip().splitlines() if combined_output else []
@@ -397,6 +411,48 @@ class NetExecRunner:
                     print_error(
                         f"No output received after {max_retries} attempts. "
                         "Proceeding with empty result."
+                    )
+
+                if has_exact_ldap_connection_timeout:
+                    print_warning(
+                        "NetExec LDAP hit the exact connection-timeout signature "
+                        "(TimeoutError: [Errno 110] Connection timed out). "
+                        "LDAP appears unstable or unreachable; skipping further "
+                        "NetExec retries/recovery for this command."
+                    )
+                    print_instruction(
+                        "LDAP did not complete successfully. Continue with non-LDAP "
+                        "logic or re-run later when LDAP connectivity is stable."
+                    )
+                    try:
+                        exit_code, stdout_count, stderr_count, duration_text = (
+                            summarize_execution_result(proc)
+                        )
+                        print_info_debug(
+                            "[netexec] Result: "
+                            f"exit_code={exit_code}, "
+                            f"stdout_lines={stdout_count}, "
+                            f"stderr_lines={stderr_count}, "
+                            f"duration={duration_text}"
+                        )
+                        preview_text = build_execution_output_preview(
+                            proc,
+                            stdout_head=20,
+                            stdout_tail=20,
+                            stderr_head=20,
+                            stderr_tail=20,
+                        )
+                        if preview_text:
+                            print_info_debug(
+                                "[netexec] Output preview:\n" + preview_text,
+                                panel=True,
+                            )
+                    except Exception:
+                        pass
+                    return build_ldap_exact_connection_timeout_completed_process(
+                        current_command,
+                        stdout=stdout_clean,
+                        stderr=stderr_clean,
                     )
 
                 # NetExec sometimes wraps error messages across many lines, so we

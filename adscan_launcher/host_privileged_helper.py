@@ -277,6 +277,23 @@ def _safe_resolve_within(base: Path, candidate: Path) -> Path:
     return candidate_resolved
 
 
+def _translate_container_workspace_path(value: Path) -> Path:
+    """Translate container workspace path into host workspace path when needed."""
+    try:
+        value_resolved = value.resolve(strict=False)
+    except OSError:
+        value_resolved = value
+
+    container_root = Path(_CONTAINER_WORKSPACES_DIR)
+    try:
+        rel = value_resolved.relative_to(container_root)
+    except ValueError:
+        return value_resolved
+
+    host_root = (_invoker_adscan_root_dir() / "workspaces").resolve(strict=False)
+    return (host_root / rel).resolve(strict=False)
+
+
 def _copy_file(src: Path, dst: Path) -> None:
     """Copy a file using streaming reads to avoid `shutil` imports."""
 
@@ -347,10 +364,84 @@ def _validate_cifs_mount_root(value: str) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
         raise HostHelperError("mount_root must be absolute")
-    resolved = path.resolve(strict=False)
+    resolved = _translate_container_workspace_path(path)
     workspaces_root = (_invoker_adscan_root_dir() / "workspaces").resolve(strict=False)
     _safe_resolve_within(workspaces_root, resolved)
     return resolved
+
+
+def _cifs_mount_metadata_dir(mount_root: Path) -> Path:
+    """Return metadata directory used to track CIFS mount identity."""
+    return mount_root / ".adscan_mount_metadata"
+
+
+def _cifs_mount_metadata_path(mount_root: Path, host: str, share: str) -> Path:
+    """Return sidecar metadata path for one CIFS mountpoint."""
+    safe_host = re.sub(r"[^A-Za-z0-9._-]+", "_", host).strip("._-") or "host"
+    safe_share = re.sub(r"[^A-Za-z0-9$._-]+", "_", share).strip("._-") or "share"
+    return _cifs_mount_metadata_dir(mount_root) / f"{safe_host}__{safe_share}.json"
+
+
+def _read_cifs_mount_metadata(metadata_path: Path) -> dict[str, Any] | None:
+    """Load persisted CIFS mount metadata if present."""
+    if not metadata_path.exists():
+        return None
+    try:
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _write_cifs_mount_metadata(
+    *,
+    metadata_path: Path,
+    host: str,
+    share: str,
+    username: str,
+    domain: str,
+    read_only: bool,
+) -> None:
+    """Persist CIFS mount identity metadata next to the mount root."""
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "host": host,
+        "share": share,
+        "username": username,
+        "domain": domain,
+        "read_only": bool(read_only),
+        "updated_at": int(time.time()),
+    }
+    metadata_path.write_text(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _remove_cifs_mount_metadata(metadata_path: Path) -> None:
+    """Delete stale CIFS mount metadata sidecar, best effort."""
+    try:
+        metadata_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _cifs_mount_identity_matches(
+    metadata: dict[str, Any] | None,
+    *,
+    username: str,
+    domain: str,
+    read_only: bool,
+) -> bool:
+    """Return whether cached CIFS metadata matches requested auth context."""
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        str(metadata.get("username", "") or "") == username
+        and str(metadata.get("domain", "") or "") == domain
+        and bool(metadata.get("read_only", True)) is bool(read_only)
+    )
 
 
 def _validate_cifs_share_name(value: str) -> str:
@@ -679,18 +770,73 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
         mount_point = (
             validated_mount_root / validated_host / validated_share
         ).resolve(strict=False)
+        metadata_path = _cifs_mount_metadata_path(
+            validated_mount_root,
+            validated_host,
+            validated_share,
+        )
         try:
             _safe_resolve_within(validated_mount_root, mount_point)
         except HostHelperError as exc:
             return HostHelperResponse(False, None, None, None, str(exc))
 
         mount_point.mkdir(parents=True, exist_ok=True)
+        remounted_due_to_identity_change = False
+        if os.path.ismount(mount_point):
+            metadata = _read_cifs_mount_metadata(metadata_path)
+            if _cifs_mount_identity_matches(
+                metadata,
+                username=validated_username,
+                domain=validated_domain,
+                read_only=read_only,
+            ):
+                stdout = json.dumps(
+                    {
+                        "mount_point": str(mount_point),
+                        "already_mounted": True,
+                        "mounted_by_helper": False,
+                        "reuse_status": "reused_same_identity",
+                        "remounted_due_to_identity_change": False,
+                    },
+                    ensure_ascii=False,
+                )
+                return HostHelperResponse(
+                    True,
+                    0,
+                    stdout,
+                    None,
+                    "CIFS share already mounted",
+                )
+
+            umount_bin = shutil_which("umount")
+            if not umount_bin:
+                return HostHelperResponse(
+                    False,
+                    127,
+                    None,
+                    None,
+                    "umount not found for CIFS remount",
+                )
+            unmount_result = _run_cmd([umount_bin, "-l", str(mount_point)], timeout=120)
+            if not unmount_result.ok:
+                return HostHelperResponse(
+                    False,
+                    unmount_result.returncode,
+                    unmount_result.stdout,
+                    unmount_result.stderr,
+                    "Failed to unmount stale CIFS share before remount",
+                )
+            _remove_cifs_mount_metadata(metadata_path)
+            remounted_due_to_identity_change = True
+
         if os.path.ismount(mount_point):
             stdout = json.dumps(
                 {
                     "mount_point": str(mount_point),
                     "already_mounted": True,
                     "mounted_by_helper": False,
+                    "reuse_status": "reused_existing_mount",
+                    "remounted_due_to_identity_change": False,
                 },
                 ensure_ascii=False,
             )
@@ -728,12 +874,39 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
             result = _run_cmd(argv, timeout=120)
             if not result.ok:
                 return result
+            try:
+                _write_cifs_mount_metadata(
+                    metadata_path=metadata_path,
+                    host=validated_host,
+                    share=validated_share,
+                    username=validated_username,
+                    domain=validated_domain,
+                    read_only=read_only,
+                )
+            except Exception as exc:
+                umount_bin = shutil_which("umount")
+                if umount_bin:
+                    _run_cmd([umount_bin, "-l", str(mount_point)], timeout=120)
+                _remove_cifs_mount_metadata(metadata_path)
+                return HostHelperResponse(
+                    False,
+                    None,
+                    None,
+                    str(exc),
+                    "Mounted CIFS share but failed to persist metadata",
+                )
 
             stdout = json.dumps(
                 {
                     "mount_point": str(mount_point),
                     "already_mounted": False,
                     "mounted_by_helper": True,
+                    "reuse_status": (
+                        "remounted_due_to_identity_change"
+                        if remounted_due_to_identity_change
+                        else "mounted_new"
+                    ),
+                    "remounted_due_to_identity_change": remounted_due_to_identity_change,
                 },
                 ensure_ascii=False,
             )
@@ -783,6 +956,12 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
             )
 
         if not os.path.ismount(validated_mount_point):
+            metadata_path = _cifs_mount_metadata_path(
+                validated_root,
+                validated_mount_point.parent.name,
+                validated_mount_point.name,
+            )
+            _remove_cifs_mount_metadata(metadata_path)
             stdout = json.dumps(
                 {
                     "mount_point": str(validated_mount_point),
@@ -809,6 +988,12 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
         result = _run_cmd(argv, timeout=60)
         if not result.ok:
             return result
+        metadata_path = _cifs_mount_metadata_path(
+            validated_root,
+            validated_mount_point.parent.name,
+            validated_mount_point.name,
+        )
+        _remove_cifs_mount_metadata(metadata_path)
         stdout = json.dumps(
             {
                 "mount_point": str(validated_mount_point),

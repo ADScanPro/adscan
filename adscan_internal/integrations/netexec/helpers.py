@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import shlex
 from collections.abc import Callable
 
 
@@ -193,6 +194,30 @@ def redirected_file_has_content(
         return False
 
 
+def build_nxc_plaintext_password_arg(password: str) -> str:
+    """Build a CLI-safe NetExec password argument fragment.
+
+    Args:
+        password: Plaintext password value.
+
+    Returns:
+        Argument fragment suitable for insertion after the username.
+
+    Notes:
+        NetExec/argparse is sensitive to two edge-cases:
+        - empty passwords must remain a separate ``-p ''`` pair
+        - passwords starting with ``-`` must be bound as ``-p=<value>`` so the
+          value is not parsed as another CLI flag
+    """
+
+    quoted_password = shlex.quote(password)
+    if password == "":
+        return f"-p {quoted_password}"
+    if password.startswith("-"):
+        return f"-p={quoted_password}"
+    return f"-p {quoted_password}"
+
+
 def build_auth_nxc(
     username: str,
     password: str,
@@ -221,7 +246,10 @@ def build_auth_nxc(
 
     # Build the authentication part
     auth = f"-u '{username}' "
-    auth += f"-H {password}" if is_hash else f"-p '{password}'"
+    if is_hash:
+        auth += f"-H {password}"
+    else:
+        auth += build_nxc_plaintext_password_arg(password)
 
     # Add the domain if provided
     if domain:

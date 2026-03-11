@@ -28,6 +28,7 @@ from adscan_internal import (
     print_info_verbose,
     print_instruction,
     print_operation_header,
+    print_panel,
     print_results_summary,
     print_scan_status,
     print_warning,
@@ -435,8 +436,6 @@ def run_scan_service(
             workstations_found = getattr(shell, '_detected_workstations', [])
             
             if workstations_found:
-                from adscan_internal import print_panel
-                
                 workstation_list = "\n".join([f"  • {ws}" for ws in workstations_found[:10]])
                 if len(workstations_found) > 10:
                     workstation_list += f"\n  ... and {len(workstations_found) - 10} more"
@@ -548,6 +547,7 @@ def run_scan_service(
                 mode_label="unauth",
             )
             if decision.action == "use" and decision.pdc_ip:
+                selected_domain = decision.domain
                 shell.domains_data.setdefault(selected_domain, {})["pdc"] = (
                     decision.pdc_ip
                 )

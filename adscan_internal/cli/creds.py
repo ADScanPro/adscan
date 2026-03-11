@@ -39,6 +39,11 @@ from adscan_internal.cli.cracking import (
     handle_hash_cracking_batch,
 )
 
+NON_SPRAYABLE_CREDSWEEPER_RULES = {"uuid"}
+UUID_VALUE_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
 
 def normalize_creds_subcommand(subcommand: str) -> tuple[str, bool]:
     """Normalize `creds` subcommand aliases to their canonical form.
@@ -1919,6 +1924,7 @@ def select_password_for_spraying(
         # Create choice string
         choice_text = f"{display_password:<45} [ML: {ml_display:>8}]"
         choices.append(choice_text)
+    choices.append("Skip automated spraying")
 
     try:
         selected_idx = shell._questionary_select(
@@ -1928,6 +1934,8 @@ def select_password_for_spraying(
         )
 
         if selected_idx is None:
+            return None
+        if selected_idx >= len(passwords_sorted):
             return None
 
         return passwords_sorted[selected_idx][0]
@@ -2241,6 +2249,79 @@ def filter_cpassword_credentials(
     return filtered_credentials
 
 
+def normalize_credsweeper_ml_probability(value: Any) -> float | None:
+    """Normalize CredSweeper ML probability values into a bounded float."""
+    if value is None:
+        return None
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return None
+    if normalized < 0.0:
+        return 0.0
+    if normalized > 1.0:
+        return 1.0
+    return normalized
+
+
+def is_sprayable_credsweeper_candidate(rule_name: str, cred_tuple: tuple) -> bool:
+    """Return whether one CredSweeper finding is eligible for automated spraying."""
+    if len(cred_tuple) < 2:
+        return False
+    value = str(cred_tuple[0] or "").strip()
+    if not value:
+        return False
+    normalized_rule = str(rule_name or "").strip().casefold()
+    if normalized_rule in NON_SPRAYABLE_CREDSWEEPER_RULES:
+        return False
+    if UUID_VALUE_RE.fullmatch(value):
+        return False
+    if normalize_credsweeper_ml_probability(cred_tuple[1]) is None:
+        return False
+    return True
+
+
+def deduplicate_credential_entries_for_spraying(
+    credential_entries: list[tuple[str, tuple]],
+) -> list[tuple[str, tuple]]:
+    """Deduplicate findings by value, preferring sprayable/high-confidence entries."""
+    deduplicated: dict[str, tuple[str, tuple]] = {}
+    for rule_name, cred_tuple in credential_entries:
+        value = str(cred_tuple[0] or "").strip()
+        if not value:
+            continue
+        existing = deduplicated.get(value)
+        current_rank = (
+            1 if is_sprayable_credsweeper_candidate(rule_name, cred_tuple) else 0,
+            normalize_credsweeper_ml_probability(cred_tuple[1]) or 0.0,
+        )
+        if existing is None:
+            deduplicated[value] = (rule_name, cred_tuple)
+            continue
+        existing_rule, existing_tuple = existing
+        existing_rank = (
+            1 if is_sprayable_credsweeper_candidate(existing_rule, existing_tuple) else 0,
+            normalize_credsweeper_ml_probability(existing_tuple[1]) or 0.0,
+        )
+        if current_rank > existing_rank:
+            deduplicated[value] = (rule_name, cred_tuple)
+    return list(deduplicated.values())
+
+
+def filter_sprayable_credential_entries(
+    credential_entries: list[tuple[str, tuple]],
+) -> tuple[list[tuple], int]:
+    """Filter one deduplicated finding set down to spraying-eligible credentials."""
+    sprayable: list[tuple] = []
+    skipped = 0
+    for rule_name, cred_tuple in credential_entries:
+        if is_sprayable_credsweeper_candidate(rule_name, cred_tuple):
+            sprayable.append(cred_tuple)
+        else:
+            skipped += 1
+    return sprayable, skipped
+
+
 def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
     """Display all found credentials in a structured, aesthetic format using Rich.
 
@@ -2264,26 +2345,34 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
         if not creds_list:
             continue
 
-        # Sort by ML probability (highest first)
-        # Handle None values by treating them as 0.0 for sorting
-        creds_list_sorted = sorted(
-            creds_list,
-            key=lambda x: float(x[1]) if x[1] is not None else 0.0,
-            reverse=True,
-        )
+        creds_list_sorted = aggregate_credentials_for_display(creds_list)
 
         # Create table for this credential type
+        unique_count = len(creds_list_sorted)
+        total_count = len(creds_list)
+        title = f"{cred_type} ({unique_count} unique)"
+        if total_count != unique_count:
+            title = f"{cred_type} ({total_count} found, {unique_count} unique)"
         table = Table(
-            title=f"{cred_type} ({len(creds_list_sorted)} found)",
+            title=title,
             show_header=True,
             header_style="bold magenta",
         )
         table.add_column("#", style="dim", width=4, justify="right")
         table.add_column("Value", style="cyan", no_wrap=False, max_width=50)
         table.add_column("ML Confidence", style="green", justify="right", width=12)
-        table.add_column("Line", style="dim", justify="right", width=6)
+        table.add_column("Seen", style="magenta", justify="right", width=6)
+        table.add_column("Sources", style="dim", no_wrap=False, max_width=60)
 
-        for idx, (value, ml_prob, context_line, line_num, file_path) in enumerate(
+        for idx, (
+            value,
+            ml_prob,
+            context_line,
+            line_num,
+            file_path,
+            occurrence_count,
+            source_preview,
+        ) in enumerate(
             creds_list_sorted, 1
         ):
             # Truncate value for display
@@ -2305,16 +2394,13 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
                 except (ValueError, TypeError):
                     ml_display = "N/A"
 
-            # Handle line_num safely
-            if line_num is None:
-                line_display = "N/A"
-            else:
-                try:
-                    line_display = str(int(line_num))
-                except (ValueError, TypeError):
-                    line_display = "N/A"
-
-            table.add_row(str(idx), display_value, ml_display, line_display)
+            table.add_row(
+                str(idx),
+                display_value,
+                ml_display,
+                str(occurrence_count),
+                source_preview or "N/A",
+            )
 
         panels.append(Panel(table, border_style="blue"))
 
@@ -2323,6 +2409,98 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
     for panel in panels:
         shell.console.print(panel)
         shell.console.print()
+
+
+def aggregate_credentials_for_display(
+    creds_list: list[tuple[Any, Any, Any, Any, Any]],
+) -> list[tuple[Any, Any, Any, Any, Any, int, str]]:
+    """Aggregate duplicate credential values for table display.
+
+    Duplicates are grouped by credential value. The representative entry keeps
+    the highest ML-confidence occurrence while tracking how many times the same
+    value appeared across files/lines.
+    """
+    aggregated: dict[str, dict[str, Any]] = {}
+    for value, ml_prob, context_line, line_num, file_path in creds_list:
+        normalized_value = str(value or "").strip()
+        if not normalized_value:
+            continue
+        source_desc = build_credential_source_display(file_path, line_num)
+        existing = aggregated.get(normalized_value)
+        if existing is None:
+            aggregated[normalized_value] = {
+                "value": value,
+                "ml_prob": ml_prob,
+                "context_line": context_line,
+                "line_num": line_num,
+                "file_path": file_path,
+                "occurrence_count": 1,
+                "sources": [source_desc] if source_desc else [],
+            }
+            continue
+
+        current_ml = normalize_credsweeper_ml_probability(ml_prob) or 0.0
+        existing_ml = normalize_credsweeper_ml_probability(existing["ml_prob"]) or 0.0
+        existing["occurrence_count"] = int(existing["occurrence_count"]) + 1
+        if source_desc and source_desc not in existing["sources"]:
+            existing["sources"].append(source_desc)
+        if current_ml > existing_ml:
+            existing["value"] = value
+            existing["ml_prob"] = ml_prob
+            existing["context_line"] = context_line
+            existing["line_num"] = line_num
+            existing["file_path"] = file_path
+
+    return sorted(
+        [
+            (
+                item["value"],
+                item["ml_prob"],
+                item["context_line"],
+                item["line_num"],
+                item["file_path"],
+                int(item["occurrence_count"]),
+                summarize_credential_sources(item["sources"]),
+            )
+            for item in aggregated.values()
+        ],
+        key=lambda item: (
+            normalize_credsweeper_ml_probability(item[1]) or 0.0,
+            item[5],
+            str(item[0] or ""),
+        ),
+        reverse=True,
+    )
+
+
+def build_credential_source_display(file_path: Any, line_num: Any) -> str:
+    """Build one compact source string for one credential occurrence."""
+    normalized_path = str(file_path or "").strip()
+    if not normalized_path:
+        return ""
+    if line_num is None:
+        return normalized_path
+    try:
+        return f"{normalized_path}:{int(line_num)}"
+    except (TypeError, ValueError):
+        return normalized_path
+
+
+def summarize_credential_sources(
+    sources: list[str],
+    *,
+    max_items: int = 3,
+) -> str:
+    """Return a compact preview of where one credential value appeared."""
+    normalized_sources = [str(source or "").strip() for source in sources if str(source or "").strip()]
+    if not normalized_sources:
+        return ""
+    preview_items = normalized_sources[:max_items]
+    preview = ", ".join(mark_sensitive(item, "path") for item in preview_items)
+    remaining = len(normalized_sources) - len(preview_items)
+    if remaining > 0:
+        preview = f"{preview}, +{remaining} more"
+    return preview
 
 
 def save_credentials_to_files(
@@ -2463,37 +2641,17 @@ def handle_found_credentials(
             print_info(f"  - {cred_type}: {marked_file_path}")
 
     # Collect all credentials from all types for password spraying
-    all_credentials = []
+    credential_entries: list[tuple[str, tuple]] = []
     for cred_type, creds_list in credentials.items():
         if creds_list:
-            all_credentials.extend(creds_list)
+            credential_entries.extend((cred_type, cred_tuple) for cred_tuple in creds_list)
 
-    # Deduplicate credentials: keep only the one with highest ML Confidence for each value
-    # Structure: (value, ml_probability, context_line, line_num, file_path)
-    credentials_by_value = {}
-    for cred_tuple in all_credentials:
-        value = cred_tuple[0]  # The credential value
-        ml_prob = cred_tuple[1] if cred_tuple[1] is not None else 0.0
-
-        # If we haven't seen this value, or this one has higher confidence, keep it
-        if value not in credentials_by_value:
-            credentials_by_value[value] = cred_tuple
-        else:
-            # Compare ML confidence
-            existing_ml_prob = (
-                credentials_by_value[value][1]
-                if credentials_by_value[value][1] is not None
-                else 0.0
-            )
-            if ml_prob > existing_ml_prob:
-                credentials_by_value[value] = cred_tuple
-
-    # Convert back to list (deduplicated)
-    deduplicated_credentials = list(credentials_by_value.values())
+    deduplicated_entries = deduplicate_credential_entries_for_spraying(credential_entries)
+    deduplicated_credentials = [cred_tuple for _, cred_tuple in deduplicated_entries]
 
     # Inform user if duplicates were removed
-    if len(all_credentials) > len(deduplicated_credentials):
-        duplicates_removed = len(all_credentials) - len(deduplicated_credentials)
+    if len(credential_entries) > len(deduplicated_credentials):
+        duplicates_removed = len(credential_entries) - len(deduplicated_credentials)
         print_info_debug(
             f"Removed {duplicates_removed} duplicate credential(s). "
             f"Keeping {len(deduplicated_credentials)} unique credential(s) with highest ML confidence."
@@ -2509,21 +2667,36 @@ def handle_found_credentials(
         auth_username=auth_username,
     )
 
+    retained_values = {str(item[0] or "").strip() for item in deduplicated_credentials}
+    deduplicated_entries = [
+        (rule_name, cred_tuple)
+        for rule_name, cred_tuple in deduplicated_entries
+        if str(cred_tuple[0] or "").strip() in retained_values
+    ]
+    sprayable_credentials, skipped_non_sprayable = filter_sprayable_credential_entries(
+        deduplicated_entries
+    )
+    if skipped_non_sprayable:
+        print_info_debug(
+            "Excluded non-sprayable credential candidates from automated spraying: "
+            f"count={skipped_non_sprayable}"
+        )
+
     # Handle all credentials for password spraying
-    if deduplicated_credentials:
+    if sprayable_credentials:
         # Get auto_mode from shell
         auto_mode = getattr(shell, "auto", False)
 
         # Select credential for spraying
         selected_credential = select_password_for_spraying(
-            shell, deduplicated_credentials, auto_mode=auto_mode
+            shell, sprayable_credentials, auto_mode=auto_mode
         )
 
         if selected_credential is None:
             print_info("Password spraying cancelled.")
-            if len(deduplicated_credentials) > 1:
+            if len(sprayable_credentials) > 1:
                 print_warning(
-                    f"[!] Multiple credentials found ({len(deduplicated_credentials)} total). "
+                    f"[!] Multiple sprayable credentials found ({len(sprayable_credentials)} total). "
                     f"Only one credential can be used for automated password spraying. "
                     f"All credentials have been saved to smb/spidering/ directory. "
                     f"You can manually perform password spraying with the other credentials later, "
@@ -2538,9 +2711,9 @@ def handle_found_credentials(
             print_warning(
                 f"Domain '{marked_domain}' is not configured. Cannot perform password spraying."
             )
-            if len(deduplicated_credentials) > 1:
+            if len(sprayable_credentials) > 1:
                 print_warning(
-                    f"Multiple credentials found ({len(deduplicated_credentials)} total). "
+                    f"Multiple sprayable credentials found ({len(sprayable_credentials)} total). "
                     f"All credentials have been saved to smb/spidering/ directory. "
                     f"You can manually perform password spraying with them later, "
                     f"but be careful not to lock accounts. Wait at least 1 hour between "
@@ -2555,9 +2728,9 @@ def handle_found_credentials(
             display_credential = selected_credential
         print_info(f"Selected credential for spraying: {display_credential}")
 
-        if len(deduplicated_credentials) > 1:
+        if len(sprayable_credentials) > 1:
             print_warning(
-                f"Note: {len(deduplicated_credentials)} credentials were found. "
+                f"Note: {len(sprayable_credentials)} sprayable credentials were found. "
                 f"Only the selected credential will be used for automated spraying. "
                 f"All credentials have been saved to smb/spidering/ directory. "
                 f"You can manually perform password spraying with the other credentials later, "
@@ -2592,7 +2765,7 @@ def handle_found_credentials(
         else:
             print_info("Password spraying cancelled by user.")
     else:
-        # No credentials found
         print_info(
-            "No credentials found for automated spraying. All credentials have been saved to files."
+            "No sprayable credentials found for automated spraying. "
+            "All findings have been saved to files for manual review."
         )

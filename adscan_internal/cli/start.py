@@ -35,6 +35,7 @@ from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.cli.dns import (
     confirm_domain_pdc_mapping,
     finalize_domain_context,
+    infer_domain_from_candidate_ip,
     infer_domain_from_fqdn,
     offer_a_record_fallback,
     preflight_domain_pdc,
@@ -59,6 +60,29 @@ class _NetworkPreflightCheck:
 _LAB_STRONG_INFERENCE_THRESHOLD = 0.90
 _USER_CONFIRMED_LAB_STATES = {"manual", "accepted_inference"}
 
+_DOMAIN_INFERENCE_METHOD_COPY: dict[str, tuple[str, str, str]] = {
+    "hosts": (
+        "Domain inferred from /etc/hosts.",
+        "Host",
+        "[bold]🧩 Domain Inference[/bold]",
+    ),
+    "ldap": (
+        "Domain inferred from LDAP fingerprinting.",
+        "LDAP result",
+        "[bold]🧩 Domain Inference (LDAP)[/bold]",
+    ),
+    "smb": (
+        "Domain inferred from SMB fingerprinting.",
+        "SMB result",
+        "[bold]🧩 Domain Inference (SMB)[/bold]",
+    ),
+    "ptr": (
+        "Domain inferred from reverse DNS (PTR).",
+        "PTR hostname",
+        "[bold]🧩 Domain Inference[/bold]",
+    ),
+}
+
 
 def _has_explicit_lab_context(shell: Any) -> bool:
     """Return True when the current lab context came from explicit user input.
@@ -73,6 +97,202 @@ def _has_explicit_lab_context(shell: Any) -> bool:
     if getattr(shell, "lab_confirmation_state", None) in _USER_CONFIRMED_LAB_STATES:
         return has_context
     return has_context and not getattr(shell, "lab_inference_source", None)
+
+
+def _infer_domain_from_candidate_ip_with_ux(
+    shell: Any,
+    *,
+    candidate_ip: str,
+    mode_label: str,
+    timeout_seconds: int = 60,
+    interactive: bool | None = None,
+) -> str | None:
+    """Infer a domain from a candidate DC/DNS IP and render consistent UX."""
+    interactive_mode = bool(sys.stdin.isatty()) if interactive is None else interactive
+    marked_ip = mark_sensitive(candidate_ip, "ip")
+    print_info(
+        "Trying automatic domain inference from the DC/DNS IP "
+        "(/etc/hosts -> LDAP -> SMB -> PTR)..."
+    )
+
+    inferred_domain, method, hostname = infer_domain_from_candidate_ip(
+        shell,
+        candidate_ip=candidate_ip,
+        timeout_seconds=timeout_seconds,
+    )
+    if not inferred_domain or not method:
+        return None
+
+    headline, value_label, title = _DOMAIN_INFERENCE_METHOD_COPY.get(
+        method,
+        (
+            "Domain inferred automatically.",
+            "Result",
+            "[bold]🧩 Domain Inference[/bold]",
+        ),
+    )
+
+    marked_domain = mark_sensitive(inferred_domain, "domain")
+    marked_host = mark_sensitive(hostname, "host") if hostname else None
+    value = (
+        f"{marked_domain} (host: {marked_host})"
+        if method in {"ldap", "smb"} and marked_host
+        else marked_host or marked_domain
+    )
+    print_panel(
+        f"[bold]{headline}[/bold]\n\n"
+        f"IP: {marked_ip}\n"
+        f"{value_label}: {value}\n"
+        f"Domain: {marked_domain}\n\n"
+        "[bold]Next:[/bold] Validate the domain/PDC via DNS SRV.",
+        title=title,
+        border_style="green",
+        padding=(1, 2),
+    )
+    telemetry.capture(
+        "domain_inference",
+        properties={
+            "mode": mode_label,
+            "method": method,
+            "result": "success",
+            "interactive": interactive_mode,
+        },
+    )
+
+    if not interactive_mode:
+        return inferred_domain
+
+    if Confirm.ask(
+        Text(f"Use {marked_domain} and validate?", style="cyan"),
+        default=True,
+    ):
+        return inferred_domain
+    return None
+
+
+def _reconcile_hostname_domain_with_ip_fingerprints(
+    shell: Any,
+    *,
+    hostname: str,
+    candidate_ip: str,
+    hostname_domain: str,
+    mode_label: str,
+    timeout_seconds: int = 60,
+    interactive: bool | None = None,
+) -> tuple[str | None, str | None]:
+    """Cross-check hostname-suffix inference against the resolved IP fingerprint."""
+    interactive_mode = bool(sys.stdin.isatty()) if interactive is None else interactive
+    ip_domain, method, discovered_host = infer_domain_from_candidate_ip(
+        shell,
+        candidate_ip=candidate_ip,
+        timeout_seconds=timeout_seconds,
+    )
+    marked_hostname = mark_sensitive(hostname, "host")
+    marked_ip = mark_sensitive(candidate_ip, "ip")
+    marked_hostname_domain = mark_sensitive(hostname_domain, "domain")
+
+    if not ip_domain or not method:
+        print_info_debug(
+            f"[domain_infer] Hostname-only cross-check could not infer a domain from "
+            f"{marked_ip}; keeping hostname-derived domain {marked_hostname_domain} "
+            f"for {marked_hostname}."
+        )
+        telemetry.capture(
+            "hostname_domain_crosscheck",
+            properties={
+                "mode": mode_label,
+                "result": "ip_inference_unavailable",
+            },
+        )
+        return hostname_domain, None
+
+    marked_ip_domain = mark_sensitive(ip_domain, "domain")
+    if ip_domain == hostname_domain:
+        print_info_debug(
+            f"[domain_infer] Hostname-only cross-check matched via {method}: "
+            f"{marked_hostname_domain} for {marked_hostname} -> {marked_ip}"
+        )
+        telemetry.capture(
+            "hostname_domain_crosscheck",
+            properties={
+                "mode": mode_label,
+                "result": "match",
+                "method": method,
+            },
+        )
+        method_label = {
+            "hosts": "/etc/hosts",
+            "ldap": "LDAP",
+            "smb": "SMB",
+            "ptr": "PTR",
+        }.get(method, method.upper())
+        confidence_line = (
+            f"Cross-check: {method_label} confirmed {marked_hostname_domain}"
+        )
+        return hostname_domain, confidence_line
+
+    detail_label = {
+        "hosts": "Resolved host",
+        "ldap": "LDAP fingerprint",
+        "smb": "SMB fingerprint",
+        "ptr": "PTR result",
+    }.get(method, "IP inference")
+    detail_value = (
+        f"{marked_ip_domain} (host: {mark_sensitive(discovered_host, 'host')})"
+        if discovered_host and method in {"ldap", "smb"}
+        else marked_ip_domain
+    )
+    print_panel(
+        "[bold yellow]The hostname suffix and the resolved IP do not point to the same domain.[/bold yellow]\n\n"
+        f"Hostname: {marked_hostname}\n"
+        f"Resolved IP: {marked_ip}\n"
+        f"Hostname-derived domain: {marked_hostname_domain}\n"
+        f"{detail_label}: {detail_value}\n\n"
+        f"[bold]Recommended:[/bold] Use {marked_ip_domain} from the {detail_label.lower()}, "
+        "then validate it via DNS SRV.",
+        title="[bold]🧩 Hostname vs IP Domain Check[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+    print_info_debug(
+        f"[domain_infer] Hostname-only cross-check mismatch: hostname_domain="
+        f"{marked_hostname_domain} ip_domain={marked_ip_domain} method={method} "
+        f"hostname={marked_hostname} ip={marked_ip}"
+    )
+    telemetry.capture(
+        "hostname_domain_crosscheck",
+        properties={
+            "mode": mode_label,
+            "result": "mismatch",
+            "method": method,
+        },
+    )
+
+    if not interactive_mode:
+        print_warning(
+            "Hostname-derived domain did not match the resolved IP fingerprint. "
+            "Using the IP-derived domain for validation."
+        )
+        return ip_domain, None
+
+    if Confirm.ask(
+        Text(
+            f"Use {marked_ip_domain} instead of {marked_hostname_domain}? (recommended)",
+            style="cyan",
+        ),
+        default=True,
+    ):
+        return ip_domain, None
+
+    if Confirm.ask(
+        Text(
+            f"Keep {marked_hostname_domain} from the hostname suffix and continue?",
+            style="cyan",
+        ),
+        default=False,
+    ):
+        return hostname_domain, None
+    return None, None
 
 
 def _current_lab_inference_confidence(shell: Any) -> float | None:
@@ -815,6 +1035,8 @@ def _ensure_unauth_target_list(
         return True
 
     if selected.startswith("Provide host ranges"):
+        from adscan_internal.cli.smb import confirm_large_smb_target_scope
+
         default_hosts = str(getattr(shell, "hosts", "") or pdc_ip or "").strip()
         while True:
             ranges_input = Prompt.ask(
@@ -830,6 +1052,16 @@ def _ensure_unauth_target_list(
             target_tokens = _normalize_guest_target_tokens(ranges_input)
             if not target_tokens:
                 print_warning("No valid SMB targets were provided. Please try again.")
+                continue
+            if not confirm_large_smb_target_scope(
+                shell,
+                targets=target_tokens,
+                prompt_context="Provide SMB targets",
+            ):
+                print_info(
+                    "Large SMB target scope rejected. Enter a narrower scope."
+                )
+                default_hosts = ranges_input
                 continue
             _set_guest_targets(target_tokens)
             shell.hosts = ", ".join(target_tokens)
@@ -922,7 +1154,6 @@ def _domain_context_wizard(
         return None
 
     service = shell._get_dns_discovery_service()
-    from adscan_internal.services.network_discovery import infer_domain_from_smb_banner
 
     fallback_hint = (
         "use host-range discovery"
@@ -1049,74 +1280,13 @@ def _domain_context_wizard(
         ip = _prompt_ip()
         if not ip:
             return None
-        reverse_getent = getattr(service, "_reverse_resolve_via_getent", None)
-        if callable(reverse_getent):
-            fqdn = reverse_getent(ip)
-            inferred_domain = infer_domain_from_fqdn(fqdn or "") if fqdn else None
-            if inferred_domain and fqdn:
-                marked_fqdn = mark_sensitive(fqdn, "host")
-                marked_domain = mark_sensitive(inferred_domain, "domain")
-                marked_ip = mark_sensitive(ip, "ip")
-                print_panel(
-                    "[bold]Domain inferred from /etc/hosts.[/bold]\n\n"
-                    f"IP: {marked_ip}\n"
-                    f"Host: {marked_fqdn}\n"
-                    f"Domain: {marked_domain}\n\n"
-                    "[bold]Next:[/bold] Validate the domain/PDC via DNS SRV.",
-                    title="[bold]🧩 Domain Inference[/bold]",
-                    border_style="green",
-                    padding=(1, 2),
-                )
-                return _confirm_and_preflight(inferred_domain, ip)
-
-        print_info("Trying SMB fingerprinting to infer the domain...")
-        smb_domain, smb_hostname = infer_domain_from_smb_banner(shell, target_ip=ip)
-        if smb_domain:
-            marked_ip = mark_sensitive(ip, "ip")
-            marked_domain = mark_sensitive(smb_domain, "domain")
-            marked_hostname = (
-                mark_sensitive(smb_hostname, "hostname") if smb_hostname else None
-            )
-            smb_line = (
-                f"{marked_domain} (host: {marked_hostname})"
-                if marked_hostname
-                else marked_domain
-            )
-            print_panel(
-                "[bold]Domain inferred from SMB fingerprinting.[/bold]\n\n"
-                f"IP: {marked_ip}\n"
-                f"SMB result: {smb_line}\n\n"
-                "[bold]Next:[/bold] Validate the domain/PDC via DNS SRV.",
-                title="[bold]🧩 Domain Inference (SMB)[/bold]",
-                border_style="green",
-                padding=(1, 2),
-            )
-            telemetry.capture(
-                "domain_inference",
-                properties={"mode": mode_label, "method": "smb", "result": "success"},
-            )
-            return _confirm_and_preflight(smb_domain, ip)
-
-        print_info("SMB inference failed; trying reverse DNS (PTR) as a last resort...")
-        print_info(
-            "[dim]This may take a moment while we try available DNS resolvers.[/dim]"
+        inferred_domain = _infer_domain_from_candidate_ip_with_ux(
+            shell,
+            candidate_ip=ip,
+            mode_label=mode_label,
+            timeout_seconds=60,
         )
-        fqdn = service.reverse_resolve_fqdn_robust(ip, preferred_resolvers=[ip])
-        inferred_domain = infer_domain_from_fqdn(fqdn or "") if fqdn else None
-        if inferred_domain and fqdn:
-            marked_fqdn = mark_sensitive(fqdn, "host")
-            marked_domain = mark_sensitive(inferred_domain, "domain")
-            marked_ip = mark_sensitive(ip, "ip")
-            print_panel(
-                "[bold]Domain inferred from reverse DNS (PTR).[/bold]\n\n"
-                f"IP: {marked_ip}\n"
-                f"PTR hostname: {marked_fqdn}\n"
-                f"Domain: {marked_domain}\n\n"
-                "[bold]Next:[/bold] Validate the domain/PDC via DNS SRV.",
-                title="[bold]🧩 Domain Inference[/bold]",
-                border_style="green",
-                padding=(1, 2),
-            )
+        if inferred_domain:
             return _confirm_and_preflight(inferred_domain, ip)
 
         print_info("Could not infer the domain automatically; requesting input.")
@@ -1183,14 +1353,33 @@ def _domain_context_wizard(
             return None
         chosen_ip = ip_candidates[idx]
 
+    reconciled_domain, crosscheck_line = _reconcile_hostname_domain_with_ip_fingerprints(
+        shell,
+        hostname=hostname,
+        candidate_ip=chosen_ip,
+        hostname_domain=inferred_domain,
+        mode_label=mode_label,
+        timeout_seconds=60,
+        interactive=True,
+    )
+    if not reconciled_domain:
+        return None
+    inferred_domain = reconciled_domain
+
     marked_domain = mark_sensitive(inferred_domain, "domain")
     marked_ip = mark_sensitive(chosen_ip, "ip")
     marked_host = mark_sensitive(hostname, "host")
+    context_lines = [
+        "[bold]We derived domain and IP from the DC hostname.[/bold]",
+        "",
+        f"Hostname: {marked_host}",
+        f"Resolved IP: {marked_ip}",
+        f"Inferred domain: {marked_domain}",
+    ]
+    if crosscheck_line:
+        context_lines.append(crosscheck_line)
     print_panel(
-        "[bold]We derived domain and IP from the DC hostname.[/bold]\n\n"
-        f"Hostname: {marked_host}\n"
-        f"Resolved IP: {marked_ip}\n"
-        f"Inferred domain: {marked_domain}\n",
+        "\n".join(context_lines),
         title="[bold]🧩 Hostname Context[/bold]",
         border_style="green",
         padding=(1, 2),
@@ -1639,7 +1828,7 @@ def run_start_unauth(shell, args: str | None) -> None:
                 panel=True,
                 items=[
                     "Include AD members (workstations/servers)",
-                    "SMB (445) must be reachable",
+                    "LDAP (389) is preferred; SMB (445) is only a fallback",
                     "Single IP or CIDR (e.g., 10.10.10.100 or 10.10.10.0/24)",
                 ],
             )
@@ -1657,12 +1846,8 @@ def run_start_unauth(shell, args: str | None) -> None:
             return
 
         service = shell._get_dns_discovery_service()
-        from adscan_internal.services.network_discovery import (
-            infer_domain_from_smb_banner,
-        )
 
         first = parts[0].strip()
-        inferred_domain: str | None = None
         domain: str | None = None
         candidate_ip: str | None = None
 
@@ -1676,81 +1861,13 @@ def run_start_unauth(shell, args: str | None) -> None:
 
         if is_first_ip and len(parts) == 1:
             candidate_ip = first
-            print_info(
-                "Attempting to infer the domain from the DC/DNS IP via reverse DNS (PTR)..."
+            domain = _infer_domain_from_candidate_ip_with_ux(
+                shell,
+                candidate_ip=candidate_ip,
+                mode_label="unauth",
+                timeout_seconds=60,
+                interactive=bool(sys.stdin.isatty()),
             )
-            print_info(
-                "[dim]This may take a moment while we try available DNS resolvers.[/dim]"
-            )
-            fqdn = service.reverse_resolve_fqdn_robust(
-                candidate_ip, preferred_resolvers=[candidate_ip]
-            )
-            inferred_domain = infer_domain_from_fqdn(fqdn or "") if fqdn else None
-            if inferred_domain and fqdn:
-                print_panel(
-                    "[bold]Domain inferred from reverse DNS (PTR).[/bold]\n\n"
-                    f"IP: {mark_sensitive(candidate_ip, 'ip')}\n"
-                    f"PTR hostname: {mark_sensitive(fqdn, 'host')}\n"
-                    f"Domain: {mark_sensitive(inferred_domain, 'domain')}\n",
-                    title="[bold]🧩 Domain Inference[/bold]",
-                    border_style="green",
-                    padding=(1, 2),
-                )
-                if sys.stdin.isatty():
-                    if Confirm.ask(
-                        Text(
-                            f"Use {mark_sensitive(inferred_domain, 'domain')} and validate?",
-                            style="cyan",
-                        ),
-                        default=True,
-                    ):
-                        domain = inferred_domain
-                else:
-                    domain = inferred_domain
-
-            if not domain:
-                smb_domain, smb_hostname = infer_domain_from_smb_banner(
-                    shell, target_ip=candidate_ip, timeout_seconds=60
-                )
-                if smb_domain:
-                    marked_ip = mark_sensitive(candidate_ip, "ip")
-                    marked_domain = mark_sensitive(smb_domain, "domain")
-                    marked_hostname = (
-                        mark_sensitive(smb_hostname, "hostname")
-                        if smb_hostname
-                        else None
-                    )
-                    smb_line = (
-                        f"{marked_domain} (host: {marked_hostname})"
-                        if marked_hostname
-                        else marked_domain
-                    )
-                    print_panel(
-                        "[bold]Domain inferred from SMB fingerprinting.[/bold]\n\n"
-                        f"IP: {marked_ip}\n"
-                        f"SMB result: {smb_line}\n\n"
-                        "[bold]Next:[/bold] Validate the domain/PDC via DNS SRV.",
-                        title="[bold]🧩 Domain Inference (SMB)[/bold]",
-                        border_style="green",
-                        padding=(1, 2),
-                    )
-                    telemetry.capture(
-                        "domain_inference",
-                        properties={
-                            "mode": "unauth",
-                            "method": "smb",
-                            "result": "success",
-                            "interactive": bool(sys.stdin.isatty()),
-                        },
-                    )
-                    if sys.stdin.isatty():
-                        if Confirm.ask(
-                            Text(f"Use {marked_domain} and validate?", style="cyan"),
-                            default=True,
-                        ):
-                            domain = smb_domain
-                    else:
-                        domain = smb_domain
 
             if not domain:
                 if not sys.stdin.isatty():
@@ -2081,11 +2198,14 @@ def run_start_unauth(shell, args: str | None) -> None:
                     discover_domains_from_candidate_ips,
                     preflight_domain_pdc_from_candidates,
                 )
-                from adscan_internal.cli.nmap import discover_dc_candidates_with_nmap
+                from adscan_internal.cli.nmap import (
+                    discover_dc_candidates_with_nmap_details,
+                )
 
-                candidates = discover_dc_candidates_with_nmap(
+                candidate_port_map = discover_dc_candidates_with_nmap_details(
                     shell, hosts=target, ports=[88, 389, 53]
                 )
+                candidates = sorted(candidate_port_map.keys())
                 if not candidates:
                     marked_target = mark_sensitive(str(target), "host")
                     print_panel(
@@ -2103,7 +2223,9 @@ def run_start_unauth(shell, args: str | None) -> None:
                     continue
 
                 summaries = discover_domains_from_candidate_ips(
-                    shell, candidate_ips=candidates
+                    shell,
+                    candidate_ips=candidates,
+                    candidate_open_ports=candidate_port_map,
                 )
                 if not summaries:
                     print_warning(
@@ -2544,6 +2666,7 @@ def run_start_auth(shell, args: str | None) -> None:
                 mode_label="auth",
             )
             if decision.action == "use" and decision.pdc_ip:
+                domain = decision.domain
                 pdc_ip = decision.pdc_ip
             elif decision.action in {"reenter", "fallback"} and sys.stdin.isatty():
                 print_panel(

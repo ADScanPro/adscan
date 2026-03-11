@@ -12,6 +12,9 @@ from typing import Any
 import os
 
 from adscan_internal.services.base_service import BaseService
+from adscan_internal.services.smb_exclusion_policy import (
+    is_globally_excluded_smb_relative_path,
+)
 from adscan_internal.workspaces import read_json_file, write_json_file
 
 
@@ -200,6 +203,81 @@ class ShareMappingService(BaseService):
             "merged_file_entries": merged_file_entries,
             "run_id": run_id,
         }
+
+    def resolve_candidate_remote_paths_from_aggregate(
+        self,
+        *,
+        aggregate_map_path: str,
+        hosts: list[str],
+        shares: list[str],
+        extensions: tuple[str, ...],
+    ) -> dict[tuple[str, str], list[str]]:
+        """Resolve remote candidate paths grouped by host/share from aggregate JSON."""
+        if not aggregate_map_path or not os.path.exists(aggregate_map_path):
+            return {}
+        aggregate = read_json_file(aggregate_map_path)
+        if not isinstance(aggregate, dict):
+            return {}
+        hosts_bucket = aggregate.get("hosts")
+        if not isinstance(hosts_bucket, dict):
+            return {}
+
+        requested_hosts = {
+            str(host).strip().casefold() for host in hosts if str(host).strip()
+        }
+        requested_shares = {
+            str(share).strip().casefold() for share in shares if str(share).strip()
+        }
+        normalized_extensions = {
+            str(extension).strip().casefold()
+            for extension in extensions
+            if str(extension).strip()
+        }
+        if not normalized_extensions:
+            return {}
+
+        resolved: dict[tuple[str, str], list[str]] = {}
+        seen: dict[tuple[str, str], set[str]] = {}
+
+        for host_name, host_entry in hosts_bucket.items():
+            if not isinstance(host_name, str) or not isinstance(host_entry, dict):
+                continue
+            if requested_hosts and host_name.casefold() not in requested_hosts:
+                continue
+            shares_bucket = host_entry.get("shares")
+            if not isinstance(shares_bucket, dict):
+                continue
+            for share_name, share_entry in shares_bucket.items():
+                if not isinstance(share_name, str) or not isinstance(share_entry, dict):
+                    continue
+                if requested_shares and share_name.casefold() not in requested_shares:
+                    continue
+                files_bucket = share_entry.get("files")
+                if not isinstance(files_bucket, dict):
+                    continue
+                bucket_key = (host_name, share_name)
+                bucket = resolved.get(bucket_key)
+                bucket_seen = seen.get(bucket_key)
+                for remote_path in files_bucket.keys():
+                    if not isinstance(remote_path, str):
+                        continue
+                    normalized_path = remote_path.strip()
+                    if not normalized_path:
+                        continue
+                    if is_globally_excluded_smb_relative_path(normalized_path):
+                        continue
+                    if Path(normalized_path).suffix.casefold() not in normalized_extensions:
+                        continue
+                    if bucket is None:
+                        bucket = resolved.setdefault(bucket_key, [])
+                    if bucket_seen is None:
+                        bucket_seen = seen.setdefault(bucket_key, set())
+                    dedup_key = normalized_path.casefold()
+                    if dedup_key in bucket_seen:
+                        continue
+                    bucket_seen.add(dedup_key)
+                    bucket.append(normalized_path)
+        return resolved
 
     def _load_or_init_aggregate(
         self,
