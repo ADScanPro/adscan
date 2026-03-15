@@ -1151,7 +1151,7 @@ def run_bloodhound_attack_paths(
         print_attack_paths_summary,
     )
     from adscan_internal.cli.attack_path_execution import (
-        offer_attack_paths_for_execution,
+        offer_attack_paths_with_non_high_value_fallback,
     )
 
     if target_domain not in shell.domains:
@@ -1538,6 +1538,7 @@ def run_bloodhound_attack_paths(
                     status="discovered",
                     edge_type="membership_snapshot",
                     log_creation=False,
+                    shell=shell,
                 )
                 added += 1
             if skipped_missing_nodes:
@@ -1729,6 +1730,7 @@ def run_bloodhound_attack_paths(
                 else "bloodhound_ce",
                 notes_by_relation_index=notes_by_relation_index or None,
                 log_creation=False,
+                shell=shell,
             )
             recorded_steps += int(added_edges or 0)
             if added_edges:
@@ -1940,13 +1942,13 @@ def run_bloodhound_attack_paths(
             "Searching for attack paths from owned users in "
             f"{marked_domain} (users: {len(owned_users)})"
         )
-        offer_attack_paths_for_execution(
+        offer_attack_paths_with_non_high_value_fallback(
             shell,
             target_domain,
             start="owned",
             max_depth=max(10, max_depth),
             max_display=20,
-            include_all=False,
+            target_mode="impact",
         )
     else:
         # Fallback: use the global shell-aware domain-path computation so this
@@ -1968,13 +1970,14 @@ def run_bloodhound_attack_paths(
             max_depth=max(max_depth, 10),
             max_paths=20,
             require_high_value_target=True,
-            target_mode="tier0",
+            target_mode="impact",
         )
         if display_paths:
             print_attack_paths_summary(
                 target_domain,
                 display_paths,
                 max_display=20,
+                search_mode_label="High-Value Search",
             )
             is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
             if (
@@ -1993,7 +1996,10 @@ def run_bloodhound_attack_paths(
                     idx = 1
                 idx = max(1, min(max_index, idx))
                 print_attack_path_detail(
-                    target_domain, display_paths[idx - 1], index=idx
+                    target_domain,
+                    display_paths[idx - 1],
+                    index=idx,
+                    search_mode_label="High-Value Search",
                 )
 
     # Track TTFAP (Time To First Attack Path) for case study metrics
@@ -2043,7 +2049,7 @@ def run_show_attack_paths(
     max_display: int = 10,
     max_depth: int = 10,
     include_all: bool = False,
-    include_impact: bool = False,
+    target_mode: str = "impact",
     allow_execution: bool = True,
     max_path_steps: int | None = None,
 ) -> None:
@@ -2064,7 +2070,7 @@ def run_show_attack_paths(
     from adscan_internal.cli.attack_path_execution import execute_selected_attack_path
 
     def _maybe_offer_execution(summary: dict[str, Any]) -> bool:
-        if not allow_execution or not sys.stdin.isatty():
+        if not execution_allowed_for_scope or not sys.stdin.isatty():
             return False
         if not Confirm.ask("Execute this attack path now?", default=True):
             return False
@@ -2134,7 +2140,12 @@ def run_show_attack_paths(
                 return
 
             selected = path_refs[selected_idx]
-            print_attack_path_detail(target_domain, selected, index=selected_idx + 1)
+            print_attack_path_detail(
+                target_domain,
+                selected,
+                index=selected_idx + 1,
+                search_mode_label=summary_search_mode_label,
+            )
             if _maybe_offer_execution(selected):
                 # Refresh summaries after execution to reflect updated statuses.
                 path_refs[:] = _compute_paths()
@@ -2145,6 +2156,7 @@ def run_show_attack_paths(
                     path_refs,
                     max_display=max_display,
                     max_path_steps=max_path_steps,
+                    search_mode_label=summary_search_mode_label,
                 )
 
     if target_domain not in shell.domains:
@@ -2157,8 +2169,22 @@ def run_show_attack_paths(
     cache_before = get_attack_paths_cache_stats(domain=target_domain)
     membership_cache_before = get_membership_snapshot_cache_stats()
 
-    target_mode = "impact" if include_impact else "tier0"
     start_user_norm = (start_user or "").strip().lower()
+    summary_search_mode_label = (
+        "Pivot Search"
+        if include_all
+        else "Tier-0 Search"
+        if str(target_mode or "impact").strip().lower() == "tier0"
+        else "High-Value Search"
+    )
+    domain_auth = (
+        str(getattr(shell, "domains_data", {}).get(target_domain, {}).get("auth") or "")
+        .strip()
+        .lower()
+    )
+    execution_allowed_for_scope = bool(
+        allow_execution and (start_user_norm == "owned" or domain_auth == "pwned")
+    )
     max_paths_compute = _resolve_attack_paths_compute_cap(max_display)
 
     status_order = {
@@ -2203,11 +2229,16 @@ def run_show_attack_paths(
             )
             if not owned_paths:
                 marked_domain = mark_sensitive(target_domain, "domain")
+                scope = (
+                    "Tier-0 targets"
+                    if target_mode == "tier0"
+                    else "high-value targets"
+                )
                 print_warning(
                     "No attack paths found for owned users in "
                     f"{marked_domain} (users: {len(owned_users)}). "
-                    "Try `attack_paths <domain> owned --impact` for high-impact targets, "
-                    "or `--all` to include all targets."
+                    f"Try `attack_paths <domain> owned --all` to include all targets "
+                    f"instead of only {scope.lower()}."
                 )
                 return []
             return _sort_paths(owned_paths)
@@ -2267,6 +2298,7 @@ def run_show_attack_paths(
         path_refs,
         max_display=max_display,
         max_path_steps=max_path_steps,
+        search_mode_label=summary_search_mode_label,
     )
 
     if index is None:
@@ -2278,7 +2310,12 @@ def run_show_attack_paths(
         return
 
     selected = path_refs[index - 1]
-    print_attack_path_detail(target_domain, selected, index=index)
+    print_attack_path_detail(
+        target_domain,
+        selected,
+        index=index,
+        search_mode_label=summary_search_mode_label,
+    )
     _maybe_offer_execution(selected)
 
 

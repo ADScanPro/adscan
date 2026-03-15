@@ -4804,6 +4804,8 @@ def print_attack_paths_summary(
     max_display: int = 5,
     *,
     max_path_steps: int | None = None,
+    search_mode_label: str | None = None,
+    actionable_count: int | None = None,
 ) -> None:
     """Render attack paths in a clear, compact summary."""
     from rich.table import Table
@@ -4821,6 +4823,18 @@ def print_attack_paths_summary(
     summary_text.append("  ")
     summary_text.append("Showing: ", style="bold white")
     summary_text.append(str(show_count), style=f"bold {BRAND_COLORS['info']}")
+    if str(search_mode_label or "").strip():
+        summary_text.append("  ")
+        summary_text.append("Mode: ", style="bold white")
+        summary_text.append(
+            str(search_mode_label).strip(), style=f"bold {BRAND_COLORS['success']}"
+        )
+    if isinstance(actionable_count, int) and actionable_count >= 0:
+        summary_text.append("  ")
+        summary_text.append("Actionable: ", style="bold white")
+        summary_text.append(
+            f"{actionable_count}/{total}", style=f"bold {BRAND_COLORS['warning']}"
+        )
 
     print_panel(
         summary_text,
@@ -4850,6 +4864,7 @@ def print_attack_paths_summary(
     table.add_column("Path", style="cyan", no_wrap=False)
     table.add_column("Affected", style="white", no_wrap=False, width=10)
     table.add_column("Target", style="white", no_wrap=False, width=10)
+    table.add_column("State", style="white", no_wrap=False, width=10)
     table.add_column("Exec", style="white", no_wrap=False, width=10)
     table.add_column("Status", style="magenta", no_wrap=False, width=10)
     table.add_column("Len", justify="right", width=4)
@@ -4948,6 +4963,16 @@ def print_attack_paths_summary(
             )
         return Text("Ready", style=BRAND_COLORS["success"])
 
+    def _format_target_state_cell(meta: dict[str, object] | None) -> Text:
+        if not isinstance(meta, dict):
+            return Text("", style="dim")
+        target_enabled = meta.get("execution_target_enabled")
+        if target_enabled is True:
+            return Text("Enabled", style=BRAND_COLORS["success"])
+        if target_enabled is False:
+            return Text("Disabled", style=BRAND_COLORS["error"])
+        return Text("", style="dim")
+
     for idx, path in enumerate(paths[:show_count], start=1):
         nodes = path.get("nodes", [])
         rels = path.get("relations", [])
@@ -4965,6 +4990,7 @@ def print_attack_paths_summary(
 
         affected_cell = ""
         target_cell = ""
+        state_cell = Text("", style="dim")
         meta = path.get("meta") if isinstance(path, dict) else None
         if isinstance(meta, dict):
             affected_count = meta.get("affected_user_count")
@@ -4973,6 +4999,7 @@ def print_attack_paths_summary(
             target_kind = str(meta.get("execution_support_target_kind") or "").strip()
             if target_kind:
                 target_cell = target_kind
+            state_cell = _format_target_state_cell(meta)
         exec_cell = _format_exec_cell(meta if isinstance(meta, dict) else None)
 
         row = [
@@ -4980,6 +5007,7 @@ def print_attack_paths_summary(
             path_str,
             affected_cell,
             target_cell,
+            state_cell,
             exec_cell,
             status,
             str(length),
@@ -5267,6 +5295,7 @@ def print_attack_path_detail(
     path: Dict[str, object],
     *,
     index: int | None = None,
+    search_mode_label: str | None = None,
 ) -> None:
     """Render a detailed single attack path breakdown."""
     from rich.table import Table
@@ -5312,6 +5341,14 @@ def print_attack_path_detail(
         spacing="both",
     )
 
+    if str(search_mode_label or "").strip():
+        mode_summary = Text()
+        mode_summary.append("Search Mode: ", style="bold white")
+        mode_summary.append(
+            str(search_mode_label).strip(), style=BRAND_COLORS["success"]
+        )
+        _get_console().print(mode_summary)
+
     meta = path.get("meta") if isinstance(path.get("meta"), dict) else {}
     if isinstance(meta, dict):
         execution_scope = str(meta.get("execution_scope") or "").strip()
@@ -5353,6 +5390,13 @@ def print_attack_path_detail(
         execution_support_target_kind = str(
             meta.get("execution_support_target_kind") or ""
         ).strip()
+        execution_context_action = str(
+            meta.get("execution_context_action") or ""
+        ).strip()
+        execution_target_enabled = meta.get("execution_target_enabled")
+        execution_target_enabled_source = str(
+            meta.get("execution_target_enabled_source") or ""
+        ).strip()
         if execution_support_status.lower() == "unsupported":
             support_summary = Text()
             support_summary.append("Execution Support: ", style="bold white")
@@ -5369,6 +5413,42 @@ def print_attack_path_detail(
                     execution_support_reason, style=BRAND_COLORS["warning"]
                 )
             _get_console().print(support_summary)
+        if isinstance(execution_target_enabled, bool):
+            target_state_summary = Text()
+            target_state_summary.append("Target State: ", style="bold white")
+            if execution_target_enabled:
+                target_state_summary.append("Enabled", style=BRAND_COLORS["success"])
+            else:
+                target_state_summary.append("Disabled", style=BRAND_COLORS["error"])
+            if execution_target_enabled_source:
+                target_state_summary.append(" via ", style="dim")
+                target_state_summary.append(
+                    execution_target_enabled_source, style=BRAND_COLORS["info"]
+                )
+            _get_console().print(target_state_summary)
+            if (
+                execution_target_enabled is False
+                and execution_context_action.lower() in {"genericall", "genericwrite"}
+            ):
+                advisory_summary = Text()
+                advisory_summary.append("Execution Advisory: ", style="bold white")
+                target_kind_lower = execution_support_target_kind.lower()
+                if target_kind_lower == "user":
+                    advisory_summary.append(
+                        "ADscan will offer to enable the user before exploitation.",
+                        style=BRAND_COLORS["warning"],
+                    )
+                elif target_kind_lower == "computer":
+                    advisory_summary.append(
+                        "ADscan will offer to enable the computer account before exploitation.",
+                        style=BRAND_COLORS["warning"],
+                    )
+                else:
+                    advisory_summary.append(
+                        "Write access may still be useful even though the target is disabled.",
+                        style=BRAND_COLORS["warning"],
+                    )
+                _get_console().print(advisory_summary)
         if (
             isinstance(execution_ready_count, int)
             and execution_ready_count >= 0

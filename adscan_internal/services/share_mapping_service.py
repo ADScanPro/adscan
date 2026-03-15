@@ -15,6 +15,9 @@ from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.smb_exclusion_policy import (
     is_globally_excluded_smb_relative_path,
 )
+from adscan_internal.services.smb_sensitive_file_policy import (
+    resolve_effective_sensitive_extension,
+)
 from adscan_internal.workspaces import read_json_file, write_json_file
 
 
@@ -266,7 +269,10 @@ class ShareMappingService(BaseService):
                         continue
                     if is_globally_excluded_smb_relative_path(normalized_path):
                         continue
-                    if Path(normalized_path).suffix.casefold() not in normalized_extensions:
+                    if resolve_effective_sensitive_extension(
+                        normalized_path,
+                        allowed_extensions=tuple(normalized_extensions),
+                    ) not in normalized_extensions:
                         continue
                     if bucket is None:
                         bucket = resolved.setdefault(bucket_key, [])

@@ -124,6 +124,25 @@ class ShareFileAnalyzerService(BaseService):
                 findings=findings,
                 notes=notes,
             )
+        if lowered_path.endswith((".kdbx", ".kdb")):
+            return ShareFileAnalyzerResult(
+                handled=True,
+                continue_with_ai=False,
+                summary=(
+                    "Deterministic KeePass artifact analysis will attempt cracking "
+                    "and entry extraction."
+                ),
+                findings=[
+                    ShareFileAnalyzerFinding(
+                        credential_type="keepass_artifact",
+                        username="-",
+                        secret="-",
+                        confidence="high",
+                        evidence="KeePass database",
+                    )
+                ],
+                notes=[],
+            )
         if lowered_path.endswith((".yml", ".yaml")):
             text = file_bytes.decode("utf-8", errors="replace")
             findings, notes = self._analyze_ansible_vault_text(
@@ -253,6 +272,25 @@ class ShareFileAnalyzerService(BaseService):
                 summary=summary,
                 findings=findings,
                 notes=notes,
+            )
+        if lowered_path.endswith((".kdbx", ".kdb")):
+            return ShareFileAnalyzerResult(
+                handled=True,
+                continue_with_ai=False,
+                summary=(
+                    "Deterministic KeePass artifact analysis will attempt cracking "
+                    "and entry extraction."
+                ),
+                findings=[
+                    ShareFileAnalyzerFinding(
+                        credential_type="keepass_artifact",
+                        username="-",
+                        secret="-",
+                        confidence="high",
+                        evidence="KeePass database",
+                    )
+                ],
+                notes=[],
             )
         return ShareFileAnalyzerResult(
             handled=False,

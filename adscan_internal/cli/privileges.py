@@ -10,6 +10,7 @@ from adscan_internal import (
     print_error,
     print_exception,
     print_info,
+    print_info_debug,
     print_info_verbose,
     print_success,
     print_warning,
@@ -20,10 +21,10 @@ from adscan_internal.workspaces import domain_subpath
 from rich.prompt import Confirm
 
 
-def run_enum_all_user_privs(shell: Any, args: str | None) -> None:
-    """Run enum_all_user_privs for all users in a domain.
+def run_enum_all_user_postauth_access(shell: Any, args: str | None) -> None:
+    """Run post-auth user access enumeration for all users in a domain.
 
-    This extracts the logic from do_enum_all_user_privs so orchestration
+    This extracts the logic from the shell wrapper so orchestration
     can live outside ``adscan.py``.
     """
     if not args:
@@ -39,7 +40,9 @@ def run_enum_all_user_privs(shell: Any, args: str | None) -> None:
         return
 
     marked_domain = mark_sensitive(domain, "domain")
-    print_success(f"Enumerating privileges of all users in domain {marked_domain}")
+    print_success(
+        f"Enumerating post-auth access for all users in domain {marked_domain}"
+    )
 
     # Check if credentials are stored
     if (
@@ -70,6 +73,46 @@ def run_enum_all_user_privs(shell: Any, args: str | None) -> None:
         shell.ask_for_user_privs(domain, username, credential, auto)
 
 
+def run_enum_all_user_privs(shell: Any, args: str | None) -> None:
+    """Backward-compatible alias for all-user post-auth access enumeration."""
+    run_enum_all_user_postauth_access(shell, args)
+
+
+def run_netexec_user_postauth_access(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    hosts: list[str] | None = None,
+) -> None:
+    """Enumerate post-auth service access for a user across multiple services."""
+    if domain not in shell.domains_data:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(f"Domain {marked_domain} not found.")
+        return
+
+    marked_username = mark_sensitive(username, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+    response = Confirm.ask(
+        "Do you want to enumerate host/service access for user "
+        f"{marked_username} on various services on hosts? "
+        f"(⚠ WARNING: This will saturate the network if the number of hosts in domain {marked_domain} is very high)"
+    )
+    if not response:
+        return
+
+    run_service_access_sweep(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+        services=["smb", "winrm", "rdp", "mssql"],
+        hosts=hosts,
+        prompt=True,
+    )
+
+
 def run_netexec_user_privs(
     shell: Any,
     *,
@@ -78,22 +121,30 @@ def run_netexec_user_privs(
     password: str,
     hosts: list[str] | None = None,
 ) -> None:
-    """Enumerate user privileges across multiple services using NetExec."""
+    """Backward-compatible alias for post-auth user access enumeration."""
+    run_netexec_user_postauth_access(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+        hosts=hosts,
+    )
+
+
+def run_service_access_sweep(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    services: list[str],
+    hosts: list[str] | None = None,
+    prompt: bool = False,
+) -> None:
+    """Enumerate access across a set of services for one user."""
     if domain not in shell.domains_data:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"Domain {marked_domain} not found.")
-        return
-
-    services = ["smb", "winrm", "rdp", "mssql"]
-
-    marked_username = mark_sensitive(username, "user")
-    marked_domain = mark_sensitive(domain, "domain")
-    response = Confirm.ask(
-        "Do you want to enumerate privileges for user "
-        f"{marked_username} on various services on hosts? "
-        f"(⚠ WARNING: This will saturate the network if the number of hosts in domain {marked_domain} is very high)"
-    )
-    if not response:
         return
 
     for service in services:
@@ -147,32 +198,52 @@ def run_netexec_user_privs(
             print_info(
                 f"Starting {service} privilege enumeration for user {marked_username}"
             )
+            print_info_debug(
+                "[privileges] service access sweep dispatch: "
+                f"domain={marked_domain} user={marked_username} service={service} "
+                f"prompt_on_success={prompt!r} targets={mark_sensitive(str(targets), 'path')}"
+            )
             print_info_verbose(f"Command: {command}")
-            shell.run_service_command(command, domain, service, username, password)
+            shell.run_service_command(
+                command,
+                domain,
+                service,
+                username,
+                password,
+                prompt=prompt,
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error(f"Error processing service {service}.")
             print_exception(show_locals=False, exception=exc)
 
 
-def run_netexec_user_privs_with_orchestration(
+def run_user_postauth_access_with_orchestration(
     shell: Any,
     *,
     domain: str,
     username: str,
     password: str,
     hosts: list[str] | None = None,
+    include_acl_enumeration: bool = True,
 ) -> None:
-    """Enumerate user privileges with full orchestration (ACEs, delegations, ADCS, shares, spraying)."""
+    """Enumerate post-auth user opportunities after attack-path review.
+
+    This flow focuses on service access, delegations, ADCS, shares, and
+    spraying. Low-priv ACL review is intentionally optional and can be skipped
+    by callers such as ``ask_for_user_privs`` because attack paths already
+    surface those routes earlier in the UX.
+    """
     from rich.prompt import Confirm
 
     # First, run the basic privilege enumeration
-    run_netexec_user_privs(
+    run_netexec_user_postauth_access(
         shell, domain=domain, username=username, password=password, hosts=hosts
     )
 
     # Additional orchestration after privilege enumeration
-    shell.ask_for_enumerate_user_aces(domain, username, password)
+    if include_acl_enumeration:
+        shell.ask_for_enumerate_user_aces(domain, username, password)
 
     # Check if the user has Kerberos delegations
     if (
@@ -218,6 +289,26 @@ def run_netexec_user_privs_with_orchestration(
                 shell.spraying_with_password(domain, password)
     marked_username = mark_sensitive(username, "user")
     print_success(f"Complete enumeration for user {marked_username}")
+
+
+def run_netexec_user_privs_with_orchestration(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    hosts: list[str] | None = None,
+    include_acl_enumeration: bool = True,
+) -> None:
+    """Backward-compatible alias for post-auth user access orchestration."""
+    run_user_postauth_access_with_orchestration(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+        hosts=hosts,
+        include_acl_enumeration=include_acl_enumeration,
+    )
 
 
 def run_enum_adcs_privs(

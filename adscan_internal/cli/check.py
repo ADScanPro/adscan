@@ -833,6 +833,10 @@ def check_system_packages(
     )
 
     missing_pkgs = list(package_results.get("missing", []))
+    missing_pkgs = _normalize_missing_system_packages_for_runtime(
+        missing_pkgs=missing_pkgs,
+        deps=deps,
+    )
     if missing_pkgs:
         deps.print_error(f"Missing system packages: {', '.join(missing_pkgs)}")
         deps.print_instruction(
@@ -1054,6 +1058,54 @@ def check_external_binary_tools(
 
     # No fix mode or nothing missing
     return (len(missing_checks) == 0), missing_checks
+
+
+def _normalize_missing_system_packages_for_runtime(
+    *,
+    missing_pkgs: list[str],
+    deps: SystemPackagesCheckDeps,
+) -> list[str]:
+    """Drop false positives for packages replaced by runtime-managed tools.
+
+    Some container/runtime environments intentionally provide tools outside the
+    distro package database. We keep the package in the install config for
+    host-based installs, but during checks we should not fail if a working tool
+    is available via PATH.
+    """
+    normalized_missing = list(missing_pkgs)
+    if "john" not in normalized_missing:
+        return normalized_missing
+
+    john_executable = None
+    preferred_runtime_john = "/opt/adscan/tools/john/run/john"
+    if os.path.exists(preferred_runtime_john):
+        john_executable = preferred_runtime_john
+    else:
+        which_john = shutil.which("john")
+        if which_john:
+            john_executable = os.path.realpath(which_john)
+    if not john_executable:
+        return normalized_missing
+
+    try:
+        result = deps.run_command(
+            [john_executable, "--list=build-info"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001
+        deps.telemetry_capture_exception(exc)
+        return normalized_missing
+
+    if result and getattr(result, "returncode", 1) == 0:
+        deps.print_success(
+            f"John the Ripper is available via PATH ({john_executable})"
+        )
+        normalized_missing.remove("john")
+
+    return normalized_missing
 
 
 # ─── DNS/Unbound Resolver Check ──────────────────────────────────────────────

@@ -17,6 +17,7 @@ import sys
 from adscan_internal import print_warning, print_warning_debug, telemetry
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.credsweeper_service import (
+    CREDSWEEPER_RULES_PROFILE_DEFAULT,
     get_credsweeper_rules_paths,
     resolve_credsweeper_drop_ml_none_for_ruleset,
 )
@@ -80,6 +81,7 @@ class CredSweeperLibraryService(BaseService):
         *,
         rules_path: Optional[str] = None,
         include_custom_rules: bool = False,
+        rules_profile: str = CREDSWEEPER_RULES_PROFILE_DEFAULT,
         drop_ml_none: bool | None = None,
         ml_threshold: str = "0.1",
         doc: bool = False,
@@ -93,7 +95,7 @@ class CredSweeperLibraryService(BaseService):
         if not targets:
             return findings
 
-        primary_rules, custom_rules = get_credsweeper_rules_paths()
+        primary_rules, custom_rules = get_credsweeper_rules_paths(profile=rules_profile)
         selected_primary = rules_path or primary_rules
         rulesets: list[tuple[str, Optional[str], bool, str]] = [
             (

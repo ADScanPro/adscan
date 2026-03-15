@@ -11,10 +11,12 @@ The service layer (adscan_internal.spraying) performs the tool execution and bas
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
 
@@ -22,6 +24,7 @@ from adscan_internal import (
     print_error,
     print_info,
     print_info_debug,
+    print_info_table,
     print_info_verbose,
     print_instruction,
     print_warning,
@@ -438,6 +441,13 @@ class SprayShell(Protocol):
         self, title: str, options: list[str], default_idx: int = 0
     ) -> int | None: ...
 
+    def _questionary_checkbox(
+        self,
+        title: str,
+        options: list[str],
+        default_values: list[str] | None = None,
+    ) -> list[str] | None: ...
+
     def do_sync_clock_with_pdc(self, domain: str, verbose: bool = False) -> bool: ...
 
     def _run_netexec(
@@ -485,6 +495,41 @@ _DOMAIN_SPRAY_FAILURE_CODE_RE = re.compile(
     r"\b(?P<code>(?:STATUS|NT_STATUS|KDC_ERR)_[A-Z0-9_]+)\b"
 )
 _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS = 3
+_DEFAULT_MULTI_SPRAY_RESERVE = 2
+_MAX_MULTI_SPRAY_PREVIEW = 10
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSprayPasswordCandidate:
+    """Persisted password candidate awaiting a later spraying attempt."""
+
+    password: str
+    reason_not_sprayed: str
+    deferred_at: str
+    source: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class DomainReuseValidationCandidate:
+    """One SAM-derived credential variant eligible for domain reuse validation."""
+
+    credential: str
+    credential_type: str
+    accounts: list[str]
+    source_hostnames: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class PendingDomainReuseValidationCandidate:
+    """Persisted SAM-derived credential variant awaiting later domain validation."""
+
+    credential: str
+    credential_type: str
+    accounts: list[str]
+    source_hostnames: list[str]
+    source_scope: str
+    reason_not_validated: str
+    deferred_at: str
 
 
 def _run_netexec_query_with_parse_retry(
@@ -497,10 +542,28 @@ def _run_netexec_query_with_parse_retry(
     timeout: int = 300,
 ) -> subprocess.CompletedProcess[str] | None:
     """Run a NetExec query and retry when output is present but not parseable."""
+    def _drop_kerberos_flag(cmd: str) -> tuple[str, bool]:
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            return cmd, False
+        filtered: list[str] = []
+        removed = False
+        for token in argv:
+            if not removed and token == "-k":
+                removed = True
+                continue
+            filtered.append(token)
+        if not removed:
+            return cmd, False
+        return shlex.join(filtered), True
+
     last_proc: subprocess.CompletedProcess[str] | None = None
+    current_command = command
+    kerberos_fallback_used = False
     for attempt in range(1, _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS + 1):
         proc = shell._run_netexec(
-            command,
+            current_command,
             domain=domain,
             timeout=timeout,
             shell=True,
@@ -516,6 +579,18 @@ def _run_netexec_query_with_parse_retry(
                     f"{attempt}/{_NETEXEC_POLICY_QUERY_MAX_ATTEMPTS}."
                 )
             return proc
+        if not kerberos_fallback_used:
+            ntlm_command, removed_kerberos = _drop_kerberos_flag(current_command)
+            if removed_kerberos:
+                kerberos_fallback_used = True
+                current_command = ntlm_command
+                if attempt < _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS:
+                    print_warning_debug(
+                        f"{query_label} output was empty or not parseable while using "
+                        f"Kerberos (attempt {attempt}/{_NETEXEC_POLICY_QUERY_MAX_ATTEMPTS}). "
+                        "Retrying with NTLM fallback."
+                    )
+                    continue
         if attempt < _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS:
             print_warning_debug(
                 f"{query_label} output was empty or not parseable "
@@ -753,11 +828,37 @@ def _summarize_domain_spray_outcomes(log_text: str) -> tuple[list[str], dict[str
     return sorted(hits_by_user.values(), key=str.lower), outcome_counts
 
 
+def _summarize_outcomes_for_table(
+    outcomes: dict[str, int],
+    *,
+    limit: int = 3,
+    excluded_codes: set[str] | None = None,
+) -> str:
+    """Render compact top-N outcome summary for UX tables."""
+    if not outcomes:
+        return "-"
+    excluded = {str(code).upper() for code in (excluded_codes or set())}
+    normalized: dict[str, int] = {}
+    for raw_code, raw_count in outcomes.items():
+        code = str(raw_code or "").strip().upper()
+        if not code or code in excluded:
+            continue
+        normalized[code] = int(normalized.get(code, 0)) + int(raw_count or 0)
+    if not normalized:
+        return "-"
+    ordered = sorted(normalized.items(), key=lambda item: (-item[1], item[0]))
+    summary = ", ".join(f"{code}={count}" for code, count in ordered[:limit])
+    if len(ordered) > limit:
+        summary += f", +{len(ordered) - limit} more"
+    return summary
+
+
 def validate_domain_reuse_with_ntlm_hash(
     shell: SprayShell,
     *,
     domain: str,
     nt_hash: str,
+    eligibility: SprayEligibilityResult | None = None,
 ) -> dict[str, object]:
     """Validate SAM-derived credential reuse against domain accounts using NTLM hash spray."""
     from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
@@ -787,15 +888,17 @@ def validate_domain_reuse_with_ntlm_hash(
         result["error"] = message
         return result
 
-    eligibility = _build_domain_reuse_eligibility(shell, domain=domain)
-    if eligibility is None:
+    effective_eligibility = eligibility or _build_domain_reuse_eligibility(
+        shell, domain=domain
+    )
+    if effective_eligibility is None:
         result["status"] = "skipped"
         return result
 
-    result["attempted_users"] = len(eligibility.eligible_users)
+    result["attempted_users"] = len(effective_eligibility.eligible_users)
     kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
     temp_users_path = write_temp_users_file(
-        list(eligibility.eligible_users),
+        list(effective_eligibility.eligible_users),
         directory=kerberos_output_dir,
     )
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
@@ -872,6 +975,7 @@ def validate_domain_reuse_with_password(
     *,
     domain: str,
     password: str,
+    eligibility: SprayEligibilityResult | None = None,
 ) -> dict[str, object]:
     """Validate SAM-derived credential reuse against domain accounts using Kerberos spray."""
     from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
@@ -899,15 +1003,17 @@ def validate_domain_reuse_with_password(
         result["error"] = message
         return result
 
-    eligibility = _build_domain_reuse_eligibility(shell, domain=domain)
-    if eligibility is None:
+    effective_eligibility = eligibility or _build_domain_reuse_eligibility(
+        shell, domain=domain
+    )
+    if effective_eligibility is None:
         result["status"] = "skipped"
         return result
-    result["attempted_users"] = len(eligibility.eligible_users)
+    result["attempted_users"] = len(effective_eligibility.eligible_users)
 
     kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
     temp_users_path = write_temp_users_file(
-        list(eligibility.eligible_users),
+        list(effective_eligibility.eligible_users),
         directory=kerberos_output_dir,
     )
     output_file = os.path.join(
@@ -990,6 +1096,121 @@ def validate_domain_reuse_with_password(
             os.remove(temp_users_path)
         except OSError:
             pass
+
+
+def validate_selected_domain_reuse_candidates(
+    shell: SprayShell,
+    *,
+    domain: str,
+    candidates: list[DomainReuseValidationCandidate],
+    eligibility: SprayEligibilityResult,
+) -> tuple[list[dict[str, object]], dict[str, dict[str, object]], list[dict[str, object]]]:
+    """Validate selected SAM-derived credential variants against the domain."""
+    result_rows: list[dict[str, object]] = []
+    domain_results_by_credential: dict[str, dict[str, object]] = {}
+    validated_domain_hits: list[dict[str, object]] = []
+
+    for candidate in candidates:
+        credential = str(candidate.credential or "").strip()
+        credential_type = str(candidate.credential_type or "-")
+        account_values = list(candidate.accounts)
+        if _domain_hit_is_hash(shell, credential):
+            spray_result = validate_domain_reuse_with_ntlm_hash(
+                shell,
+                domain=domain,
+                nt_hash=credential,
+                eligibility=eligibility,
+            )
+        else:
+            spray_result = validate_domain_reuse_with_password(
+                shell,
+                domain=domain,
+                password=credential,
+                eligibility=eligibility,
+            )
+
+        status = str(spray_result.get("status") or "-")
+        hits_raw = spray_result.get("hits")
+        hits = (
+            [str(item).strip() for item in hits_raw if str(item).strip()]
+            if isinstance(hits_raw, list)
+            else []
+        )
+        outcomes_raw = spray_result.get("outcome_counts")
+        outcomes = outcomes_raw if isinstance(outcomes_raw, dict) else {}
+        source_hostnames = list(candidate.source_hostnames)
+        created_graph_steps = 0
+        created_domain_pass_reuse_steps = 0
+        if hits and source_hostnames:
+            try:
+                from adscan_internal.services.attack_graph_service import (
+                    upsert_domain_password_reuse_edges,
+                    upsert_local_cred_to_domain_reuse_edges,
+                )
+
+                created_graph_steps = int(
+                    upsert_local_cred_to_domain_reuse_edges(
+                        shell,
+                        domain,
+                        source_hosts=source_hostnames,
+                        domain_usernames=hits,
+                        credential=credential,
+                        status="discovered",
+                    )
+                    or 0
+                )
+                created_domain_pass_reuse_steps = int(
+                    upsert_domain_password_reuse_edges(
+                        shell,
+                        domain,
+                        source_usernames=hits,
+                        target_usernames=hits,
+                        credential=credential,
+                        status="discovered",
+                        evidence_source="sam_domain_reuse_validation",
+                    )
+                    or 0
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+
+        outcome_summary = _summarize_outcomes_for_table(outcomes, excluded_codes={"SUCCESS"})
+        domain_results_by_credential[credential] = {
+            "status": status,
+            "hits": hits,
+            "outcome_counts": outcomes,
+            "created_graph_steps": created_graph_steps,
+            "created_domain_pass_reuse_steps": created_domain_pass_reuse_steps,
+        }
+        validated_domain_hits.extend(
+            {
+                "username": username,
+                "credential": credential,
+                "is_hash": _domain_hit_is_hash(shell, credential),
+            }
+            for username in hits
+        )
+        result_rows.append(
+            {
+                "Accounts": ", ".join(
+                    mark_sensitive(account, "user") for account in account_values[:2]
+                )
+                + (
+                    f" (+{len(account_values) - 2} more)"
+                    if len(account_values) > 2
+                    else ""
+                ),
+                "Credential Type": credential_type,
+                "Credential": mark_sensitive(credential, "password"),
+                "Status": status,
+                "Domain Hits": len(hits),
+                "Local->Domain Steps": created_graph_steps,
+                "DomainPassReuse": created_domain_pass_reuse_steps,
+                "Outcome Summary": outcome_summary or "-",
+            }
+        )
+
+    return result_rows, domain_results_by_credential, validated_domain_hits
 
 
 def get_spraying_user_list_path(
@@ -1627,6 +1848,677 @@ def print_spraying_eligibility(
             )
 
 
+def _resolve_multi_credential_spray_budget(
+    *,
+    shell: SprayShell,
+    eligibility: SprayEligibilityResult,
+    requested_count: int,
+) -> tuple[int, str]:
+    """Return the safe credential budget for one multi-attempt spray flow."""
+    if requested_count <= 0:
+        return 0, "No sprayable credentials were provided."
+
+    if (
+        eligibility.lockout_threshold is None
+        and any("no lockout enforced" in note.lower() for note in eligibility.notes)
+    ):
+        return requested_count, "Domain reports no account lockout threshold."
+
+    if eligibility.used_policy_data and eligibility.minimum_remaining_attempts is not None:
+        safe_budget = max(
+            0,
+            eligibility.minimum_remaining_attempts
+            - int(eligibility.safe_remaining_threshold),
+        )
+        if safe_budget <= 0:
+            return (
+                0,
+                "Current BadPwdCount values leave no safe room for additional credential "
+                "attempts after applying the reserve margin.",
+            )
+        return safe_budget, (
+            "Safe credential budget derived from lockout policy and the worst eligible "
+            "BadPwdCount value."
+        )
+
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    if workspace_type == "ctf":
+        return 1, (
+            "Lockout threshold could not be determined. Restricting automated multi-credential "
+            "attempts to one credential in CTF mode."
+        )
+    return 1, (
+        "Lockout threshold could not be determined. Restricting automated multi-credential "
+        "attempts to one credential until the policy is known."
+    )
+
+
+def _resolve_multi_password_spray_budget(
+    *,
+    shell: SprayShell,
+    eligibility: SprayEligibilityResult,
+    requested_count: int,
+) -> tuple[int, str]:
+    """Backward-compatible wrapper for password spraying budget resolution."""
+    budget, reason = _resolve_multi_credential_spray_budget(
+        shell=shell,
+        eligibility=eligibility,
+        requested_count=requested_count,
+    )
+    return budget, reason.replace("credential", "password")
+
+
+def _build_password_selection_option(password: str, *, selected: bool = False) -> str:
+    """Return one stable, compact checkbox label for one password."""
+    preview = password if len(password) <= 60 else f"{password[:57]}..."
+    selected_marker = "[selected]" if selected else ""
+    return f"{mark_sensitive(preview, 'password')} {selected_marker}".strip()
+
+
+def _select_values_with_limit(
+    shell: SprayShell,
+    *,
+    values: list[str],
+    max_selectable: int,
+    title: str,
+    option_builder: Callable[[str], str],
+    item_label: str,
+) -> list[str] | None:
+    """Interactively select up to ``max_selectable`` values from a list."""
+    if not values:
+        return []
+    if max_selectable <= 0:
+        return []
+
+    if bool(getattr(shell, "auto", False)):
+        return list(values[:max_selectable])
+
+    options: list[str] = []
+    option_map: dict[str, str] = {}
+    default_values: list[str] = []
+    for index, value in enumerate(values, start=1):
+        option = f"{index:>2}. {option_builder(value)}"
+        options.append(option)
+        option_map[option] = value
+        if index <= max_selectable:
+            default_values.append(option)
+    skip_option = "Skip spraying for now"
+    options.append(skip_option)
+
+    checkbox = getattr(shell, "_questionary_checkbox", None)
+    if not callable(checkbox):
+        return list(values[:max_selectable])
+
+    while True:
+        selected_values = checkbox(
+            title,
+            options,
+            default_values=default_values,
+        )
+        if selected_values is None:
+            return None
+        if skip_option in selected_values:
+            return []
+        selected_items = [option_map[item] for item in selected_values if item in option_map]
+        if len(selected_items) <= max_selectable:
+            return selected_items
+        print_warning(
+            f"You can select at most {max_selectable} {item_label}(s) safely for this spray."
+        )
+        default_values = selected_values[:max_selectable]
+
+
+def _select_passwords_for_spraying(
+    shell: SprayShell,
+    *,
+    passwords: list[str],
+    max_selectable: int,
+    title: str,
+) -> list[str] | None:
+    """Interactively select up to ``max_selectable`` passwords for spraying."""
+    return _select_values_with_limit(
+        shell,
+        values=passwords,
+        max_selectable=max_selectable,
+        title=title,
+        option_builder=_build_password_selection_option,
+        item_label="password",
+    )
+
+
+def _build_domain_reuse_selection_option(candidate: DomainReuseValidationCandidate) -> str:
+    """Return one compact checkbox label for one domain reuse candidate."""
+    preview = (
+        candidate.credential
+        if len(candidate.credential) <= 48
+        else f"{candidate.credential[:45]}..."
+    )
+    accounts = (
+        ", ".join(mark_sensitive(account, "user") for account in candidate.accounts[:2])
+        if candidate.accounts
+        else "N/A"
+    )
+    if len(candidate.accounts) > 2:
+        accounts += f" (+{len(candidate.accounts) - 2} more)"
+    return (
+        f"[{candidate.credential_type}] {mark_sensitive(preview, 'password')} "
+        f"from {accounts}"
+    )
+
+
+def select_domain_reuse_candidates_for_validation(
+    shell: SprayShell,
+    *,
+    domain: str,
+    candidates: list[DomainReuseValidationCandidate],
+    source_scope: str,
+) -> tuple[list[DomainReuseValidationCandidate], SprayEligibilityResult] | None:
+    """Select safe SAM-derived credential variants for domain reuse validation."""
+    if not candidates:
+        return None
+
+    eligibility = _build_domain_reuse_eligibility(shell, domain=domain)
+    if eligibility is None:
+        return None
+
+    budget, budget_reason = _resolve_multi_credential_spray_budget(
+        shell=shell,
+        eligibility=eligibility,
+        requested_count=len(candidates),
+    )
+    print_panel(
+        "\n".join(
+            [
+                f"Credential variants: {len(candidates)}",
+                f"Safe validation budget: {budget}",
+                f"Reason: {budget_reason}",
+                f"Source: {source_scope}",
+            ]
+        ),
+        title="[bold cyan]SAM -> Domain Reuse Validation Plan[/bold cyan]",
+        border_style="cyan",
+        expand=False,
+    )
+    if budget <= 0:
+        deferred_path = _persist_deferred_domain_reuse_candidates(
+            shell,
+            domain=domain,
+            candidates=candidates,
+            source_scope=source_scope,
+            reason=budget_reason,
+        )
+        print_warning(
+            "Automated SAM-to-domain reuse validation was skipped because no safe validation budget remains."
+        )
+        if deferred_path:
+            print_info(
+                "Deferred SAM-to-domain reuse candidates saved to "
+                f"{mark_sensitive(deferred_path, 'path')}."
+            )
+        return None
+
+    option_map: dict[str, DomainReuseValidationCandidate] = {}
+    option_values: list[str] = []
+    for candidate in candidates:
+        option = _build_domain_reuse_selection_option(candidate)
+        option_map[option] = candidate
+        option_values.append(option)
+
+    selected_values = _select_values_with_limit(
+        shell,
+        values=option_values,
+        max_selectable=min(budget, len(option_values)),
+        title=(
+            "Select the SAM-derived credential variants to validate against the domain "
+            f"(max {min(budget, len(option_values))}):"
+        ),
+        option_builder=lambda value: value,
+        item_label="credential variant",
+    )
+    if selected_values is None:
+        _persist_deferred_domain_reuse_candidates(
+            shell,
+            domain=domain,
+            candidates=candidates,
+            source_scope=source_scope,
+            reason="User cancelled SAM-to-domain reuse validation.",
+        )
+        print_info("SAM-to-domain reuse validation cancelled by user.")
+        return None
+    if not selected_values:
+        deferred_path = _persist_deferred_domain_reuse_candidates(
+            shell,
+            domain=domain,
+            candidates=candidates,
+            source_scope=source_scope,
+            reason="User skipped SAM-to-domain reuse validation for now.",
+        )
+        print_info("SAM-to-domain reuse validation skipped for now.")
+        if deferred_path:
+            print_info(
+                "Deferred SAM-to-domain reuse candidates saved to "
+                f"{mark_sensitive(deferred_path, 'path')}."
+            )
+        return None
+
+    selected_candidates = [
+        option_map[value] for value in selected_values if value in option_map
+    ]
+    deferred_candidates = [
+        candidate for candidate in candidates if candidate not in selected_candidates
+    ]
+    deferred_path = _persist_deferred_domain_reuse_candidates(
+        shell,
+        domain=domain,
+        candidates=deferred_candidates,
+        source_scope=source_scope,
+        reason="Deferred by user selection.",
+    )
+    preview_values = [
+        f"{candidate.credential_type}:{mark_sensitive(candidate.credential, 'password')}"
+        for candidate in selected_candidates[:3]
+    ]
+    if len(selected_candidates) > 3:
+        preview_values.append(f"+{len(selected_candidates) - 3} more")
+    print_info(
+        "Selected credential variants for SAM-to-domain validation: "
+        + ", ".join(preview_values)
+    )
+    if deferred_candidates and deferred_path:
+        print_info(
+            f"Deferred {len(deferred_candidates)} SAM-to-domain reuse candidate(s) for later review at "
+            f"{mark_sensitive(deferred_path, 'path')}."
+        )
+    return selected_candidates, eligibility
+
+
+def _sanitize_spraying_context_for_json(
+    source_context: dict[str, object] | None,
+) -> dict[str, object]:
+    """Best-effort JSON-safe serialization of spraying source context."""
+    if not source_context:
+        return {}
+    sanitized: dict[str, object] = {}
+    for key, value in source_context.items():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            sanitized[str(key)] = value
+            continue
+        if isinstance(value, list):
+            sanitized[str(key)] = [
+                item if isinstance(item, (str, int, float, bool)) or item is None else str(item)
+                for item in value
+            ]
+            continue
+        if isinstance(value, dict):
+            sanitized[str(key)] = {
+                str(sub_key): (
+                    sub_value
+                    if isinstance(sub_value, (str, int, float, bool)) or sub_value is None
+                    else str(sub_value)
+                )
+                for sub_key, sub_value in value.items()
+            }
+            continue
+        sanitized[str(key)] = str(value)
+    return sanitized
+
+
+def _get_pending_spraying_passwords_path(shell: SprayShell, *, domain: str) -> str:
+    """Return the workspace path for deferred password spray candidates."""
+    workspace_cwd = shell.current_workspace_dir or os.getcwd()
+    spraying_dir = domain_subpath(workspace_cwd, shell.domains_dir, domain, "spraying")
+    os.makedirs(spraying_dir, exist_ok=True)
+    return os.path.join(spraying_dir, "pending_password_candidates.json")
+
+
+def _load_pending_spraying_password_candidates(
+    shell: SprayShell,
+    *,
+    domain: str,
+) -> list[PendingSprayPasswordCandidate]:
+    """Load deferred spraying passwords for one domain."""
+    pending_path = _get_pending_spraying_passwords_path(shell, domain=domain)
+    if not os.path.exists(pending_path):
+        return []
+    try:
+        with open(pending_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"[spray] Failed to read pending password candidates file at {pending_path}: {exc}"
+        )
+        return []
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("passwords"), list):
+        return []
+
+    candidates: list[PendingSprayPasswordCandidate] = []
+    for entry in payload["passwords"]:
+        if not isinstance(entry, dict):
+            continue
+        password = str(entry.get("password") or "").strip()
+        if not password:
+            continue
+        source = entry.get("source")
+        candidates.append(
+            PendingSprayPasswordCandidate(
+                password=password,
+                reason_not_sprayed=str(entry.get("reason_not_sprayed") or "").strip(),
+                deferred_at=str(entry.get("deferred_at") or "").strip(),
+                source=_sanitize_spraying_context_for_json(source if isinstance(source, dict) else {}),
+            )
+        )
+    return candidates
+
+
+def _save_pending_spraying_password_candidates(
+    shell: SprayShell,
+    *,
+    domain: str,
+    candidates: list[PendingSprayPasswordCandidate],
+) -> str | None:
+    """Persist the full pending-password set for one domain."""
+    pending_path = _get_pending_spraying_passwords_path(shell, domain=domain)
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "passwords": [
+            {
+                "password": candidate.password,
+                "reason_not_sprayed": candidate.reason_not_sprayed,
+                "deferred_at": candidate.deferred_at,
+                "source": candidate.source,
+            }
+            for candidate in candidates
+        ],
+    }
+    try:
+        with open(pending_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+        return pending_path
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning(
+            "Failed to persist deferred password spray candidates for later reuse."
+        )
+        print_info_debug(f"[spray] Deferred password persistence failed: {exc}")
+        return None
+
+
+def _persist_deferred_spraying_passwords(
+    shell: SprayShell,
+    *,
+    domain: str,
+    passwords: list[str],
+    reason: str,
+    source_context: dict[str, object] | None = None,
+) -> str | None:
+    """Persist not-yet-sprayed password candidates for later manual reuse."""
+    if not passwords:
+        return None
+
+    existing_entries = _load_pending_spraying_password_candidates(shell, domain=domain)
+    source_payload = _sanitize_spraying_context_for_json(source_context)
+    existing_keys = {
+        (
+            entry.password,
+            entry.reason_not_sprayed,
+            json.dumps(entry.source, sort_keys=True, ensure_ascii=False),
+        )
+        for entry in existing_entries
+    }
+    now_iso = datetime.now(timezone.utc).isoformat()
+    added = 0
+    for password in passwords:
+        entry = PendingSprayPasswordCandidate(
+            password=password,
+            reason_not_sprayed=reason,
+            deferred_at=now_iso,
+            source=source_payload,
+        )
+        key = (
+            entry.password,
+            entry.reason_not_sprayed,
+            json.dumps(entry.source, sort_keys=True, ensure_ascii=False),
+        )
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        existing_entries.append(entry)
+        added += 1
+    pending_path = _save_pending_spraying_password_candidates(
+        shell,
+        domain=domain,
+        candidates=existing_entries,
+    )
+    if added and pending_path:
+        print_info_debug(
+            f"[spray] Deferred {added} password candidate(s) to {mark_sensitive(pending_path, 'path')}"
+        )
+    return pending_path
+
+
+def _remove_pending_spraying_password_candidates(
+    shell: SprayShell,
+    *,
+    domain: str,
+    passwords: list[str],
+) -> str | None:
+    """Remove sprayed password candidates from the pending file."""
+    if not passwords:
+        return None
+    pending_entries = _load_pending_spraying_password_candidates(shell, domain=domain)
+    if not pending_entries:
+        return _get_pending_spraying_passwords_path(shell, domain=domain)
+    removal_set = {str(password or "").strip() for password in passwords if str(password or "").strip()}
+    retained_entries = [
+        entry for entry in pending_entries if entry.password not in removal_set
+    ]
+    return _save_pending_spraying_password_candidates(
+        shell,
+        domain=domain,
+        candidates=retained_entries,
+    )
+
+
+def _get_pending_domain_reuse_candidates_path(shell: SprayShell, *, domain: str) -> str:
+    """Return the workspace path for deferred SAM->domain reuse candidates."""
+    workspace_cwd = shell.current_workspace_dir or os.getcwd()
+    spraying_dir = domain_subpath(workspace_cwd, shell.domains_dir, domain, "spraying")
+    os.makedirs(spraying_dir, exist_ok=True)
+    return os.path.join(spraying_dir, "pending_domain_reuse_candidates.json")
+
+
+def _load_pending_domain_reuse_candidates(
+    shell: SprayShell,
+    *,
+    domain: str,
+) -> list[PendingDomainReuseValidationCandidate]:
+    """Load deferred SAM->domain reuse validation candidates for one domain."""
+    pending_path = _get_pending_domain_reuse_candidates_path(shell, domain=domain)
+    if not os.path.exists(pending_path):
+        return []
+    try:
+        with open(pending_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"[spray] Failed to read pending domain reuse candidates at {pending_path}: {exc}"
+        )
+        return []
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("candidates"), list):
+        return []
+
+    candidates: list[PendingDomainReuseValidationCandidate] = []
+    for entry in payload["candidates"]:
+        if not isinstance(entry, dict):
+            continue
+        credential = str(entry.get("credential") or "").strip()
+        if not credential:
+            continue
+        accounts_raw = entry.get("accounts")
+        source_hostnames_raw = entry.get("source_hostnames")
+        candidates.append(
+            PendingDomainReuseValidationCandidate(
+                credential=credential,
+                credential_type=str(entry.get("credential_type") or "-").strip() or "-",
+                accounts=(
+                    [str(item).strip() for item in accounts_raw if str(item).strip()]
+                    if isinstance(accounts_raw, list)
+                    else []
+                ),
+                source_hostnames=(
+                    [str(item).strip() for item in source_hostnames_raw if str(item).strip()]
+                    if isinstance(source_hostnames_raw, list)
+                    else []
+                ),
+                source_scope=str(entry.get("source_scope") or "").strip(),
+                reason_not_validated=str(entry.get("reason_not_validated") or "").strip(),
+                deferred_at=str(entry.get("deferred_at") or "").strip(),
+            )
+        )
+    return candidates
+
+
+def _save_pending_domain_reuse_candidates(
+    shell: SprayShell,
+    *,
+    domain: str,
+    candidates: list[PendingDomainReuseValidationCandidate],
+) -> str | None:
+    """Persist deferred SAM->domain reuse candidates for one domain."""
+    pending_path = _get_pending_domain_reuse_candidates_path(shell, domain=domain)
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "candidates": [
+            {
+                "credential": candidate.credential,
+                "credential_type": candidate.credential_type,
+                "accounts": candidate.accounts,
+                "source_hostnames": candidate.source_hostnames,
+                "source_scope": candidate.source_scope,
+                "reason_not_validated": candidate.reason_not_validated,
+                "deferred_at": candidate.deferred_at,
+            }
+            for candidate in candidates
+        ],
+    }
+    try:
+        with open(pending_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+        return pending_path
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning(
+            "Failed to persist deferred SAM-to-domain reuse candidates for later reuse."
+        )
+        print_info_debug(f"[spray] Deferred domain reuse persistence failed: {exc}")
+        return None
+
+
+def _persist_deferred_domain_reuse_candidates(
+    shell: SprayShell,
+    *,
+    domain: str,
+    candidates: list[DomainReuseValidationCandidate],
+    source_scope: str,
+    reason: str,
+) -> str | None:
+    """Persist not-yet-validated SAM->domain reuse candidates for later reuse."""
+    if not candidates:
+        return None
+
+    existing_entries = _load_pending_domain_reuse_candidates(shell, domain=domain)
+    existing_keys = {
+        (
+            entry.credential,
+            entry.credential_type,
+            tuple(entry.accounts),
+            tuple(entry.source_hostnames),
+            entry.source_scope,
+            entry.reason_not_validated,
+        )
+        for entry in existing_entries
+    }
+    now_iso = datetime.now(timezone.utc).isoformat()
+    added = 0
+    for candidate in candidates:
+        entry = PendingDomainReuseValidationCandidate(
+            credential=candidate.credential,
+            credential_type=candidate.credential_type,
+            accounts=list(candidate.accounts),
+            source_hostnames=list(candidate.source_hostnames),
+            source_scope=source_scope,
+            reason_not_validated=reason,
+            deferred_at=now_iso,
+        )
+        key = (
+            entry.credential,
+            entry.credential_type,
+            tuple(entry.accounts),
+            tuple(entry.source_hostnames),
+            entry.source_scope,
+            entry.reason_not_validated,
+        )
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        existing_entries.append(entry)
+        added += 1
+    pending_path = _save_pending_domain_reuse_candidates(
+        shell,
+        domain=domain,
+        candidates=existing_entries,
+    )
+    if added and pending_path:
+        print_info_debug(
+            "[spray] Deferred "
+            f"{added} SAM-to-domain reuse candidate(s) to {mark_sensitive(pending_path, 'path')}"
+        )
+    return pending_path
+
+
+def _remove_pending_domain_reuse_candidates(
+    shell: SprayShell,
+    *,
+    domain: str,
+    candidates: list[DomainReuseValidationCandidate],
+) -> str | None:
+    """Remove executed SAM->domain reuse candidates from the pending file."""
+    if not candidates:
+        return None
+    pending_entries = _load_pending_domain_reuse_candidates(shell, domain=domain)
+    if not pending_entries:
+        return _get_pending_domain_reuse_candidates_path(shell, domain=domain)
+    removal_keys = {
+        (
+            candidate.credential,
+            candidate.credential_type,
+            tuple(candidate.accounts),
+            tuple(candidate.source_hostnames),
+        )
+        for candidate in candidates
+    }
+    retained_entries = [
+        entry
+        for entry in pending_entries
+        if (
+            entry.credential,
+            entry.credential_type,
+            tuple(entry.accounts),
+            tuple(entry.source_hostnames),
+        )
+        not in removal_keys
+    ]
+    return _save_pending_domain_reuse_candidates(
+        shell,
+        domain=domain,
+        candidates=retained_entries,
+    )
+
+
 def _show_lockout_policy_prompt(
     *,
     domain: str,
@@ -1823,9 +2715,17 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         "Username as password in uppercase",
         "Username with a specific password",
     ]
+    pending_candidates = _load_pending_spraying_password_candidates(shell, domain=domain)
+    pending_domain_reuse_candidates = _load_pending_domain_reuse_candidates(
+        shell, domain=domain
+    )
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
     if has_enabled_computer_list(workspace_cwd, shell.domains_dir, domain):
         options.append("Computer accounts (pre2k: hostname as password)")
+    if pending_candidates:
+        options.append("Retry saved password candidates")
+    if pending_domain_reuse_candidates:
+        options.append("Retry saved SAM -> domain reuse candidates")
 
     ctf_mode = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
     default_idx = 0
@@ -1872,6 +2772,12 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     user_transform: str | None = None
     user_as_pass = True
 
+    if current_row == len(options) - 1 and pending_domain_reuse_candidates:
+        retry_pending_domain_reuse_validation(shell, domain)
+        return
+    if current_row == len(options) - 1 - (1 if pending_domain_reuse_candidates else 0) and pending_candidates:
+        retry_pending_password_spraying(shell, domain)
+        return
     if current_row == 0:
         spray_category = "useraspass"
     elif current_row == 1:
@@ -1884,7 +2790,10 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         spray_password = Prompt.ask("Enter the password for spraying")
         spray_category = "password"
         user_as_pass = False
-    elif current_row == 4 and len(options) == 5:
+    elif (
+        current_row == 4
+        and "Computer accounts (pre2k: hostname as password)" in options
+    ):
         spray_category = "computer_pre2k"
         user_as_pass = False
     else:
@@ -2047,16 +2956,13 @@ def spraying_with_password(
         )
         return
 
-    # Ensure kerberos output directory exists for spray logs
     ensure_kerberos_output_dir(shell, domain)
-
     marked_domain = mark_sensitive(domain, "domain")
     auth_mode = shell.domains_data.get(domain, {}).get("auth")
     print_info_debug(
         f"[spray] Starting spraying_with_password for {marked_domain} "
         f"(auth={auth_mode!r}, kerbrute_path={shell.kerbrute_path})"
     )
-
     auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
     requires_auth_users = auth_state in {"auth", "pwned"}
     user_list_file = get_spraying_user_list_path(
@@ -2069,22 +2975,14 @@ def spraying_with_password(
             f"[spray] Aborting spraying_with_password for {marked_domain}: no user list available"
         )
         return
-
     if not _ensure_spraying_clock_sync(shell, domain, source="spraying_with_password"):
         return
-
-    # Check for repeated spraying with the same password in this domain
     if not should_proceed_with_repeated_spraying(shell, domain, "password", password):
         print_info("Password spraying cancelled by user.")
         print_info_debug(
             f"[spray] Aborting spraying_with_password for {marked_domain}: repeated spraying not approved"
         )
         return
-
-    marked_password = mark_sensitive(password, "password")
-    print_info(
-        f"Performing password spraying on domain {marked_domain} with {marked_password} password..."
-    )
 
     eligibility = compute_spraying_eligibility(
         shell,
@@ -2109,10 +3007,47 @@ def spraying_with_password(
         print_info("Password spraying cancelled by user.")
         return
     print_spraying_eligibility(shell, domain, eligibility)
-    file_users = list(eligibility.eligible_users)
+    _execute_single_password_spraying(
+        shell,
+        domain=domain,
+        password=password,
+        eligibility=eligibility,
+        source_context=source_context,
+        source_steps=source_steps,
+        show_intro=True,
+    )
+
+
+def _execute_single_password_spraying(
+    shell: SprayShell,
+    *,
+    domain: str,
+    password: str,
+    eligibility: SprayEligibilityResult,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+    show_intro: bool = False,
+) -> bool:
+    """Execute one custom-password spray using a prevalidated eligibility set."""
+    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
+
+    if not eligibility.eligible_users:
+        print_warning(
+            "No eligible users available for spraying with the current safety rules."
+        )
+        return False
+
+    marked_domain = mark_sensitive(domain, "domain")
+    if show_intro:
+        marked_password = mark_sensitive(password, "password")
+        print_info(
+            f"Performing password spraying on domain {marked_domain} with {marked_password} password..."
+        )
 
     kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
-    temp_users_path = write_temp_users_file(file_users, directory=kerberos_output_dir)
+    temp_users_path = write_temp_users_file(
+        list(eligibility.eligible_users), directory=kerberos_output_dir
+    )
     try:
         output_file = os.path.join(
             "domains",
@@ -2138,11 +3073,367 @@ def spraying_with_password(
             source_context=source_context,
             source_steps=source_steps,
         )
+        return True
     finally:
         try:
             os.remove(temp_users_path)
         except OSError:
             pass
+
+
+def spraying_with_passwords(
+    shell: SprayShell,
+    domain: str,
+    passwords: list[str],
+    *,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+    source_label: str | None = None,
+) -> list[str]:
+    """Safely spray multiple candidate passwords with one centralized UX flow."""
+    if not passwords:
+        return []
+    if domain not in getattr(shell, "domains", []):
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            f"Domain {marked_domain} is not configured. Skipping automated password spraying."
+        )
+        return []
+
+    unique_passwords: list[str] = []
+    seen_passwords: set[str] = set()
+    for password in passwords:
+        normalized = str(password or "").strip()
+        if not normalized or normalized in seen_passwords:
+            continue
+        seen_passwords.add(normalized)
+        unique_passwords.append(normalized)
+    if not unique_passwords:
+        return []
+
+    if str(getattr(shell, "type", "") or "").strip().lower() == "ctf":
+        is_pwned = getattr(shell, "_is_ctf_domain_pwned", None)
+        if callable(is_pwned):
+            try:
+                if bool(is_pwned(domain)):
+                    print_info_debug(
+                        "Skipping multi-password spraying because the CTF domain is already pwned."
+                    )
+                    return []
+            except Exception:  # noqa: BLE001
+                pass
+
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    requires_auth_users = auth_state in {"auth", "pwned"}
+    user_list_file = get_spraying_user_list_path(
+        shell,
+        domain,
+        requires_auth_users=requires_auth_users,
+    )
+    if not user_list_file:
+        return []
+    if not _ensure_spraying_clock_sync(shell, domain, source="spraying_with_passwords"):
+        return []
+
+    eligibility = compute_spraying_eligibility(
+        shell,
+        domain=domain,
+        user_list_file=user_list_file,
+        safe_threshold=2 if auth_state in {"auth", "pwned"} else 0,
+    )
+    if eligibility is None:
+        return []
+    default_mode = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    if not _enforce_lockout_guardrail(
+        domain=domain,
+        eligibility=eligibility,
+        prompt_text="Continue with multi-password spraying using the full user list?",
+        default_confirm=default_mode,
+    ):
+        print_info("Password spraying cancelled by user.")
+        return []
+    print_spraying_eligibility(shell, domain, eligibility)
+
+    budget, budget_reason = _resolve_multi_password_spray_budget(
+        shell=shell,
+        eligibility=eligibility,
+        requested_count=len(unique_passwords),
+    )
+    summary_lines = [
+        f"Candidate passwords: {len(unique_passwords)}",
+        f"Safe spray budget: {budget}",
+        f"Reason: {budget_reason}",
+    ]
+    if source_label:
+        summary_lines.append(f"Source: {source_label}")
+    print_panel(
+        "\n".join(summary_lines),
+        title="[bold cyan]Multi-Password Spraying Plan[/bold cyan]",
+        border_style="cyan",
+        expand=False,
+    )
+
+    if budget <= 0:
+        deferred_path = _persist_deferred_spraying_passwords(
+            shell,
+            domain=domain,
+            passwords=unique_passwords,
+            reason=budget_reason,
+            source_context=source_context,
+        )
+        print_warning(
+            "Automated password spraying was skipped because no safe spraying budget remains."
+        )
+        if deferred_path:
+            print_info(
+                "Deferred password candidates saved to "
+                f"{mark_sensitive(deferred_path, 'path')}."
+            )
+            print_instruction(
+                f"Retry later with `spraying {mark_sensitive(domain, 'domain')}` once the lockout window has reset."
+            )
+        return []
+
+    max_selectable = min(budget, len(unique_passwords))
+    selection_title = (
+        "Select the passwords to spray now "
+        f"(max {max_selectable}; unselected passwords will be deferred):"
+    )
+    selected_passwords = _select_passwords_for_spraying(
+        shell,
+        passwords=unique_passwords,
+        max_selectable=max_selectable,
+        title=selection_title,
+    )
+    if selected_passwords is None:
+        print_info("Password spraying cancelled by user.")
+        return []
+
+    deferred_passwords = [
+        password for password in unique_passwords if password not in selected_passwords
+    ]
+    deferred_reason = (
+        "Deferred by user selection."
+        if selected_passwords
+        else "User skipped automated password spraying for now."
+    )
+    deferred_path = _persist_deferred_spraying_passwords(
+        shell,
+        domain=domain,
+        passwords=deferred_passwords if deferred_passwords else ([] if selected_passwords else unique_passwords),
+        reason=deferred_reason,
+        source_context=source_context,
+    )
+    if not selected_passwords:
+        print_info("Password spraying skipped for now.")
+        if deferred_path:
+            print_info(
+                "Deferred password candidates saved to "
+                f"{mark_sensitive(deferred_path, 'path')}."
+            )
+        return []
+
+    preview_passwords = [
+        mark_sensitive(password, "password")
+        for password in selected_passwords[:_MAX_MULTI_SPRAY_PREVIEW]
+    ]
+    if len(selected_passwords) > _MAX_MULTI_SPRAY_PREVIEW:
+        preview_passwords.append(
+            f"+{len(selected_passwords) - _MAX_MULTI_SPRAY_PREVIEW} more"
+        )
+    print_info(
+        "Selected passwords for spraying now: " + ", ".join(str(item) for item in preview_passwords)
+    )
+    if deferred_passwords and deferred_path:
+        print_info(
+            f"Deferred {len(deferred_passwords)} password(s) for later review at "
+            f"{mark_sensitive(deferred_path, 'path')}."
+        )
+
+    executed_passwords: list[str] = []
+    for index, password in enumerate(selected_passwords, start=1):
+        marked_password = mark_sensitive(password, "password")
+        print_info(
+            f"Spraying password {index}/{len(selected_passwords)} on domain "
+            f"{mark_sensitive(domain, 'domain')}: {marked_password}"
+        )
+        if not should_proceed_with_repeated_spraying(shell, domain, "password", password):
+            print_info(
+                f"Skipping password {marked_password} because repeated spraying was not approved."
+            )
+            continue
+        if _execute_single_password_spraying(
+            shell,
+            domain=domain,
+            password=password,
+            eligibility=eligibility,
+            source_context=source_context,
+            source_steps=source_steps,
+            show_intro=False,
+        ):
+            executed_passwords.append(password)
+
+    result_lines = [
+        f"Sprayed now: {len(executed_passwords)}",
+        f"Deferred: {len(deferred_passwords)}",
+    ]
+    if deferred_path:
+        result_lines.append(f"Deferred file: {mark_sensitive(deferred_path, 'path')}")
+    print_panel(
+        "\n".join(result_lines),
+        title="[bold green]Multi-Password Spraying Result[/bold green]",
+        border_style="green",
+        expand=False,
+    )
+    return executed_passwords
+
+
+def retry_pending_password_spraying(shell: SprayShell, domain: str) -> list[str]:
+    """Resume spraying from deferred password candidates saved in the workspace."""
+    pending_candidates = _load_pending_spraying_password_candidates(shell, domain=domain)
+    if not pending_candidates:
+        print_warning("No saved password spray candidates were found for this domain.")
+        return []
+
+    table = Table(title="Saved Password Spray Candidates", show_lines=False)
+    table.add_column("#", justify="right", style="dim", width=4)
+    table.add_column("Password", style="bold")
+    table.add_column("Deferred", style="dim", width=24)
+    table.add_column("Reason", style="yellow")
+    table.add_column("Source", style="dim")
+    for index, candidate in enumerate(pending_candidates, start=1):
+        source_summary = str(candidate.source.get("artifact") or candidate.source.get("origin") or "N/A")
+        table.add_row(
+            str(index),
+            mark_sensitive(candidate.password, "password"),
+            candidate.deferred_at or "-",
+            candidate.reason_not_sprayed or "-",
+            mark_sensitive(source_summary, "path") if source_summary != "N/A" else source_summary,
+        )
+    print_table(table)
+
+    deduped_passwords: list[str] = []
+    seen_passwords: set[str] = set()
+    for candidate in pending_candidates:
+        if candidate.password in seen_passwords:
+            continue
+        seen_passwords.add(candidate.password)
+        deduped_passwords.append(candidate.password)
+
+    source_context = pending_candidates[0].source if pending_candidates else None
+    executed_passwords = spraying_with_passwords(
+        shell,
+        domain,
+        deduped_passwords,
+        source_context=source_context,
+        source_label="Saved deferred password candidates",
+    )
+    if executed_passwords:
+        pending_path = _remove_pending_spraying_password_candidates(
+            shell,
+            domain=domain,
+            passwords=executed_passwords,
+        )
+        if pending_path:
+            print_info(
+                "Updated deferred password candidate file: "
+                f"{mark_sensitive(pending_path, 'path')}."
+            )
+    return executed_passwords
+
+
+def retry_pending_domain_reuse_validation(shell: SprayShell, domain: str) -> list[str]:
+    """Resume SAM-to-domain reuse validation from deferred credential variants."""
+    pending_candidates = _load_pending_domain_reuse_candidates(shell, domain=domain)
+    if not pending_candidates:
+        print_warning("No saved SAM-to-domain reuse candidates were found for this domain.")
+        return []
+
+    table = Table(title="Saved SAM -> Domain Reuse Candidates", show_lines=False)
+    table.add_column("#", justify="right", style="dim", width=4)
+    table.add_column("Credential", style="bold")
+    table.add_column("Type", style="dim")
+    table.add_column("Accounts", style="yellow")
+    table.add_column("Deferred", style="dim", width=24)
+    table.add_column("Reason", style="dim")
+    for index, candidate in enumerate(pending_candidates, start=1):
+        table.add_row(
+            str(index),
+            mark_sensitive(candidate.credential, "password"),
+            candidate.credential_type or "-",
+            ", ".join(mark_sensitive(account, "user") for account in candidate.accounts[:2])
+            + (f" (+{len(candidate.accounts) - 2} more)" if len(candidate.accounts) > 2 else ""),
+            candidate.deferred_at or "-",
+            candidate.reason_not_validated or "-",
+        )
+    print_table(table)
+
+    candidates = [
+        DomainReuseValidationCandidate(
+            credential=item.credential,
+            credential_type=item.credential_type,
+            accounts=list(item.accounts),
+            source_hostnames=list(item.source_hostnames),
+        )
+        for item in pending_candidates
+    ]
+    source_scope = next(
+        (item.source_scope for item in pending_candidates if item.source_scope),
+        "Saved SAM -> Domain reuse candidates",
+    )
+    selection = select_domain_reuse_candidates_for_validation(
+        shell,
+        domain=domain,
+        candidates=candidates,
+        source_scope=source_scope,
+    )
+    if selection is None:
+        return []
+    selected_candidates, eligibility = selection
+    (
+        result_rows,
+        _domain_results_by_credential,
+        validated_domain_hits,
+    ) = validate_selected_domain_reuse_candidates(
+        shell,
+        domain=domain,
+        candidates=selected_candidates,
+        eligibility=eligibility,
+    )
+    if result_rows:
+        print_info_table(
+            result_rows,
+            [
+                "Accounts",
+                "Credential Type",
+                "Credential",
+                "Status",
+                "Domain Hits",
+                "Local->Domain Steps",
+                "DomainPassReuse",
+                "Outcome Summary",
+            ],
+            title="Saved SAM -> Domain Reuse Validation Results",
+        )
+    auth_state = str(shell.domains_data.get(domain, {}).get("auth", "")).strip().lower()
+    if validated_domain_hits and auth_state != "pwned":
+        handle_validated_domain_hits_followup(
+            shell,
+            domain=domain,
+            hits=validated_domain_hits,
+            discovery_label="validated",
+        )
+    pending_path = _remove_pending_domain_reuse_candidates(
+        shell,
+        domain=domain,
+        candidates=selected_candidates,
+    )
+    if pending_path:
+        print_info(
+            "Updated deferred SAM-to-domain reuse file: "
+            f"{mark_sensitive(pending_path, 'path')}."
+        )
+    return [candidate.credential for candidate in selected_candidates]
 
 
 def spraying_command(

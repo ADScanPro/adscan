@@ -36,6 +36,8 @@ RUN cargo install --locked --version 2.4.1 rusthound-ce
 FROM debian:trixie-slim AS runtime-common
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG JOHN_BLEEDING_JUMBO_COMMIT=d8f5b0138e6f9fe24ab453f886dcaa2abb2e5407
+ARG CREDSWEEPER_VERSION=1.15.1
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ENV ADSCAN_HOME=/opt/adscan \
@@ -85,6 +87,7 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       libncursesw5-dev \
       tk-dev \
       liblzma-dev \
+      libgmp-dev \
       libkrb5-dev \
       libgssapi-krb5-2 \
       libsasl2-2 \
@@ -96,7 +99,6 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       bind9-dnsutils \
       nmap \
       hydra \
-      john \
       hashcat \
       samba \
       samba-common-bin \
@@ -168,7 +170,7 @@ RUN set -eux; \
   \
   python3 -m venv /opt/adscan/tool_venvs/credsweeper/venv; \
   /opt/adscan/tool_venvs/credsweeper/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/credsweeper/venv/bin/python -m pip install --no-cache-dir "credsweeper==1.14.1"; \
+  /opt/adscan/tool_venvs/credsweeper/venv/bin/python -m pip install --no-cache-dir "credsweeper==${CREDSWEEPER_VERSION}"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/pypykatz/venv; \
   /opt/adscan/tool_venvs/pypykatz/venv/bin/python -m pip install --no-cache-dir -U pip; \
@@ -208,6 +210,24 @@ RUN set -eux; \
   python3 -m venv /opt/adscan/tool_venvs/responder/venv; \
   /opt/adscan/tool_venvs/responder/venv/bin/python -m pip install --no-cache-dir -U pip; \
   /opt/adscan/tool_venvs/responder/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/responder/requirements.txt; \
+  \
+  git clone https://github.com/openwall/john.git /opt/adscan/tools/john; \
+  git -C /opt/adscan/tools/john checkout "${JOHN_BLEEDING_JUMBO_COMMIT}"; \
+  ( \
+    cd /opt/adscan/tools/john/src && \
+    ./configure && \
+    make -s clean && \
+    make -sj"$(nproc)" \
+  ); \
+  for tool in john keepass2john keepass2john.py zip2john zip2john.py pfx2john pfx2john.py ansible2john ansible2john.py; do \
+    if [ -e "/opt/adscan/tools/john/run/${tool}" ]; then \
+      chmod +x "/opt/adscan/tools/john/run/${tool}" || true; \
+      ln -sf "/opt/adscan/tools/john/run/${tool}" "/opt/adscan/bin/${tool}"; \
+    fi; \
+  done; \
+  if [ -e "/opt/adscan/tools/john/run/john.conf" ]; then \
+    ln -sf "/opt/adscan/tools/john/run/john.conf" "/opt/adscan/bin/john.conf"; \
+  fi; \
   \
   git clone --depth 1 https://github.com/blechschmidt/massdns.git /opt/adscan/tools/massdns; \
   make -C /opt/adscan/tools/massdns; \
@@ -280,7 +300,8 @@ RUN set -eux; \
     pydantic-ai==1.62.0 \
     python-magic==0.4.27 \
     markitdown==0.1.5 \
-    credsweeper==1.14.1 \
+    credsweeper==${CREDSWEEPER_VERSION} \
+    pykeepass==4.1.1.post1 \
     impacket==0.13.0 \
     pycryptodome==3.23.0 \
     gpp-decrypt==2.0.0 \
@@ -292,7 +313,6 @@ COPY adscan.py /opt/adscan-src/adscan.py
 COPY adscan_core /opt/adscan-src/adscan_core
 COPY adscan_internal /opt/adscan-src/adscan_internal
 COPY adscan_launcher /opt/adscan-src/adscan_launcher
-COPY config.yaml /opt/adscan-src/config.yaml
 COPY custom_config.yaml /opt/adscan-src/custom_config.yaml
 COPY pyproject.toml /opt/adscan-src/pyproject.toml
 

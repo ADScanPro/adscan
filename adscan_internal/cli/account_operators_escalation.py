@@ -325,6 +325,7 @@ def offer_account_operators_escalation(
             relations=rels,
             status="discovered",
             edge_type="bloodhound_ce",
+            shell=shell,
         )
 
         # Ensure the user + account operators nodes exist for display resolution.

@@ -54,6 +54,11 @@ except ImportError:
     KerberosTicketService = None  # type: ignore[assignment, misc]
 
 from adscan_internal.services.hashcat_service import HashcatCrackingService
+from adscan_internal.services.cracking_history_service import (
+    build_cracking_attempt,
+    find_matching_attempt,
+    register_cracking_attempt,
+)
 import rich.box
 from rich.table import Table
 from rich.panel import Panel
@@ -209,6 +214,7 @@ def choose_cracking_wordlist(
                 "hashmob medium": "hashmob_medium",
                 "kaonashi": "kaonashi14M",
                 "kaonashi14m": "kaonashi14M",
+                "kaonashi14m.txt (recommended for audit - es environments)": "kaonashi14M",
             }
             selection = aliases.get(selected_lower)
     if selection is None:
@@ -423,29 +429,13 @@ def run_cracking(
     failed: bool = False,
 ) -> None:
     """High-level cracking entrypoint used by the CLI shell."""
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    should_prompt_wordlist_selector = failed or workspace_type == "audit"
-
-    if should_prompt_wordlist_selector:
-        if workspace_type == "audit" and not failed:
-            print_info(
-                "Audit workspace detected: select a cracking wordlist (rockyou is not forced by default)."
-            )
-        wordlist = choose_cracking_wordlist(shell, hash_type, wordlists_dir)
-    else:
-        print_info("Using rockyou as the default wordlist.")
-        wordlist = os.path.join(wordlists_dir, "rockyou.txt")
-
-    wordlist = _maybe_import_wordlist_from_host(
-        shell,
+    wordlist = resolve_cracking_wordlist(
+        shell=shell,
+        hash_type=hash_type,
         domain=domain,
-        wordlist_path=wordlist,
+        wordlists_dir=wordlists_dir,
+        failed=failed,
     )
-    if wordlist and not os.path.exists(wordlist):
-        marked_wordlist = mark_sensitive(wordlist, "path")
-        print_warning(
-            f"Wordlist not found at {marked_wordlist}. Hashcat may fail; continuing anyway."
-        )
 
     wordlist_name = os.path.basename(wordlist) if wordlist else "N/A"
 
@@ -501,6 +491,43 @@ def run_cracking(
 
     wordlist_name_for_telemetry = os.path.basename(wordlist) if wordlist else None
 
+    attempt_template = build_cracking_attempt(
+        tool="hashcat",
+        crack_type=hash_type,
+        wordlist_name=wordlist_name_for_telemetry,
+        wordlist_path=wordlist,
+        hash_file=hash_file,
+        result="started",
+        cracked_count=0,
+    )
+    previous_attempt = find_matching_attempt(
+        shell,
+        domain=domain,
+        attempt=attempt_template,
+    )
+    if previous_attempt:
+        marked_domain = mark_sensitive(domain, "domain")
+        marked_wordlist = mark_sensitive(
+            wordlist_name_for_telemetry or wordlist or "N/A", "path"
+        )
+        print_warning(
+            f"This cracking attempt appears to have already been run for {marked_domain} using {marked_wordlist}."
+        )
+        print_info_debug(
+            "[cracking] repeated attempt detected: "
+            f"type={hash_type} wordlist={marked_wordlist} previous_result={previous_attempt.get('result')} "
+            f"previous_timestamp={previous_attempt.get('timestamp')}"
+        )
+        if not (getattr(shell, "auto", False) or is_non_interactive(shell=shell)):
+            if not Confirm.ask(
+                "Do you want to continue with this cracking attempt?",
+                default=False,
+            ):
+                print_info(
+                    "Cracking cancelled because the same inputs were already attempted."
+                )
+                return
+
     try:
         properties = {
             "hash_type": hash_type,
@@ -541,6 +568,19 @@ def run_cracking(
         completed_process_initial = shell.run_command(cracking_cmd, timeout=300)
         if completed_process_initial is None:
             print_error("Cracking command failed to execute.")
+            register_cracking_attempt(
+                shell,
+                domain=domain,
+                attempt=build_cracking_attempt(
+                    tool="hashcat",
+                    crack_type=hash_type,
+                    wordlist_name=wordlist_name_for_telemetry,
+                    wordlist_path=wordlist,
+                    hash_file=hash_file,
+                    result="error",
+                    cracked_count=0,
+                ),
+            )
             return
         if getattr(completed_process_initial, "returncode", 0) != 0:
             combined_output = (
@@ -563,17 +603,62 @@ def run_cracking(
                     "memory.",
                 )
 
-    # Second phase: hashcat --show + post-processing
-    # Call execute_cracking to complete the cracking process
-    # Note: command already executed above, so pass empty string to skip re-execution
-    execute_cracking(
+    result = execute_cracking(
         shell,
-        command="",  # Command already executed, only do post-processing
+        command="",
         hash_type=hash_type,
         domain=domain,
         hash=hash_file,
         wordlist_name=wordlist_name_for_telemetry,
     )
+    register_cracking_attempt(
+        shell,
+        domain=domain,
+        attempt=build_cracking_attempt(
+            tool="hashcat",
+            crack_type=hash_type,
+            wordlist_name=wordlist_name_for_telemetry,
+            wordlist_path=wordlist,
+            hash_file=hash_file,
+            result=str((result or {}).get("status") or "unknown"),
+            cracked_count=int((result or {}).get("cracked_count") or 0),
+        ),
+    )
+
+
+def resolve_cracking_wordlist(
+    *,
+    shell: CrackingShell,
+    hash_type: str,
+    domain: str,
+    wordlists_dir: str,
+    failed: bool = False,
+) -> str:
+    """Resolve the effective cracking wordlist using workspace-aware UX rules."""
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    should_prompt_wordlist_selector = failed or workspace_type == "audit"
+
+    if should_prompt_wordlist_selector:
+        if workspace_type == "audit" and not failed:
+            print_info(
+                "Audit workspace detected: select a cracking wordlist (rockyou is not forced by default)."
+            )
+        wordlist = choose_cracking_wordlist(shell, hash_type, wordlists_dir)
+    else:
+        print_info("Using rockyou as the default wordlist.")
+        wordlist = os.path.join(wordlists_dir, "rockyou.txt")
+
+    wordlist = _maybe_import_wordlist_from_host(
+        shell,
+        domain=domain,
+        wordlist_path=wordlist,
+    )
+    if wordlist and not os.path.exists(wordlist):
+        marked_wordlist = mark_sensitive(wordlist, "path")
+        print_warning(
+            f"Wordlist not found at {marked_wordlist}. Hashcat may fail; continuing anyway."
+        )
+    return wordlist
 
 
 def ask_for_cracking(
@@ -963,6 +1048,86 @@ def do_cracking(shell: CrackingShell, args: str) -> None:
     shell.cracking(hash_type, domain, hash_file)
 
 
+def run_cracking_history(
+    shell: CrackingShell,
+    *,
+    domain: str,
+    recent_limit: int = 20,
+) -> None:
+    """Render recent cracking attempts stored in workspace history."""
+    from adscan_internal.services.cracking_history_service import get_cracking_history
+
+    history = get_cracking_history(shell)
+    domain_entry = history.get(domain, {}) if isinstance(history, dict) else {}
+    attempts = domain_entry.get("attempts", []) if isinstance(domain_entry, dict) else []
+    if not isinstance(attempts, list) or not attempts:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_panel(
+            f"[yellow]No cracking history found for {marked_domain}.[/yellow]",
+            title="Cracking History",
+            border_style="yellow",
+        )
+        return
+
+    limited_attempts = attempts[-max(1, int(recent_limit)) :]
+    table = Table(
+        title="Cracking History",
+        show_header=True,
+        header_style="bold magenta",
+        box=rich.box.ROUNDED,
+    )
+    table.add_column("#", style="dim", justify="right", width=4)
+    table.add_column("Tool", style="cyan")
+    table.add_column("Type", style="bold")
+    table.add_column("Wordlist", style="white", overflow="fold")
+    table.add_column("Result", style="bold")
+    table.add_column("Cracked", style="green", justify="right")
+    table.add_column("Targets", style="white", overflow="fold")
+    table.add_column("When", style="dim")
+
+    for idx, attempt in enumerate(reversed(limited_attempts), start=1):
+        if not isinstance(attempt, dict):
+            continue
+        target_users = attempt.get("target_users") or []
+        artifact_paths = attempt.get("artifact_paths") or []
+        targets = ", ".join(str(user) for user in target_users[:3] if str(user).strip())
+        if not targets and artifact_paths:
+            targets = ", ".join(str(path) for path in artifact_paths[:2] if str(path).strip())
+        if len(target_users) > 3:
+            targets = f"{targets}, +{len(target_users) - 3} more"
+        elif not targets:
+            targets = "-"
+
+        wordlist = str(attempt.get("wordlist_name") or attempt.get("wordlist_path") or "-")
+        result = str(attempt.get("result") or "unknown")
+        result_style = {
+            "success": "green",
+            "no_match": "yellow",
+            "error": "red",
+        }.get(result, "white")
+        table.add_row(
+            str(idx),
+            str(attempt.get("tool") or "-"),
+            str(attempt.get("crack_type") or "-"),
+            mark_sensitive(wordlist, "path"),
+            f"[{result_style}]{result}[/{result_style}]",
+            str(int(attempt.get("cracked_count") or 0)),
+            mark_sensitive(targets, "user"),
+            str(attempt.get("timestamp") or "-"),
+        )
+
+    print_operation_header(
+        "Cracking History",
+        details={
+            "Domain": domain,
+            "Entries": len(attempts),
+            "Showing": min(len(attempts), max(1, int(recent_limit))),
+        },
+        icon="🧾",
+    )
+    shell.console.print(table)
+
+
 def execute_cracking(
     shell: CrackingShell,
     command: str,
@@ -970,7 +1135,7 @@ def execute_cracking(
     domain: str,
     hash: str,
     wordlist_name: str | None = None,
-) -> None:
+ ) -> dict[str, object]:
     """Execute the cracking command and process results."""
     from adscan_internal.cli.tools_env import maybe_wrap_hashcat_for_container
     import sys
@@ -983,7 +1148,7 @@ def execute_cracking(
 
             if completed_process_initial is None:
                 print_error("Cracking command failed to execute.")
-                return
+                return {"status": "error", "cracked_count": 0}
 
             if completed_process_initial.returncode != 0:
                 print_warning(
@@ -1181,11 +1346,13 @@ def execute_cracking(
                             )
                         except Exception as exc:  # pragma: no cover
                             telemetry.capture_exception(exc)
+                return {"status": "success", "cracked_count": len(creds)}
             else:
                 print_panel(
                     "[red]No valid credentials were found in the file.[/red]",
                     border_style="red",
                 )
+                return {"status": "no_match", "cracked_count": 0}
         else:
             # Telemetry: track failed hash cracking
             try:
@@ -1255,6 +1422,9 @@ def execute_cracking(
         telemetry.capture_exception(e)
         print_error("Error executing hashcat.")
         print_exception(show_locals=False, exception=e)
+        return {"status": "error", "cracked_count": 0}
+
+    return {"status": "no_match", "cracked_count": 0}
 
 
 __all__ = [

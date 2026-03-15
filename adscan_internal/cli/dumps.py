@@ -21,6 +21,7 @@ is centralized in this module for consistency and maintainability.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 import os
 import re
@@ -49,6 +50,9 @@ from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.workspaces.subpaths import domain_relpath
 
 _NXC_SMB_LINE_RE = re.compile(r"^\s*SMB\s+\S+\s+\d+\s+(?P<host>[A-Za-z0-9_.-]+)\s+")
+_NXC_REMOTE_LINE_RE = re.compile(
+    r"^\s*(?:SMB|WINRM)\s+\S+\s+\d+\s+(?P<host>[A-Za-z0-9_.-]+)\s+"
+)
 _NXC_DUMPED_CREDENTIAL_TOKEN_RE = re.compile(r"(?P<token>[^\s\\]+\\[^\s:]+:[^\s]+)")
 _NXC_DUMPED_UPN_CREDENTIAL_TOKEN_RE = re.compile(
     r"(?P<token>[^\s:@\\]+@[^\s:@\\]+:[^\s]+)"
@@ -77,6 +81,16 @@ _SAM_REUSE_REASON_LABELS = {
     "invalid_hash": "Invalid NTLM hash",
     "not_reused_across_hosts": "Not reused across hosts",
 }
+
+
+@dataclass(frozen=True)
+class ParsedDpapiCredential:
+    """Normalized DPAPI credential parsed from NetExec output."""
+
+    domain: str | None
+    username: str
+    password: str
+    host: str | None
 
 
 def _ensure_pro_for_all_hosts_dump(shell: Any, *, dump_label: str) -> bool:
@@ -130,6 +144,101 @@ def _extract_dumped_credentials_with_hosts(
                     continue
                 seen.add(dedupe_key)
                 results.append((token, current_host))
+
+    return results
+
+
+def _parse_identity_domain_username(identity: str) -> tuple[str | None, str]:
+    """Split a NetExec identity into domain and username components."""
+    identity_clean = str(identity or "").strip()
+    if "\\" in identity_clean:
+        domain_name, username = identity_clean.split("\\", 1)
+        return domain_name.strip() or None, username.strip()
+    if "@" in identity_clean:
+        username, domain_name = identity_clean.split("@", 1)
+        return domain_name.strip() or None, username.strip()
+    return None, identity_clean
+
+
+def _parse_dpapi_credential_from_line(
+    line: str,
+    *,
+    current_host: str | None,
+) -> ParsedDpapiCredential | None:
+    """Parse a DPAPI credential from a single NetExec output line."""
+    if "[CREDENTIAL]" in line:
+        payload = line.split("[CREDENTIAL]", 1)[1].strip()
+        for pattern in (
+            _NXC_DUMPED_CREDENTIAL_TOKEN_RE,
+            _NXC_DUMPED_UPN_CREDENTIAL_TOKEN_RE,
+        ):
+            match = pattern.search(payload)
+            if not match:
+                continue
+            token = str(match.group("token") or "").strip().strip(",;\"'")
+            if not token or ":" not in token:
+                continue
+            identity, password = token.rsplit(":", 1)
+            domain_name, username = _parse_identity_domain_username(identity)
+            if username and password:
+                return ParsedDpapiCredential(
+                    domain=domain_name,
+                    username=username,
+                    password=password,
+                    host=current_host,
+                )
+
+    if "target=" in line and " - " in line:
+        match = re.search(
+            r"(?:Domain|Target):target=(?P<domain>[^\s]+)\s+-\s+(?P<identity>[^\s:]+):(?P<password>\S+)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            domain_name = str(match.group("domain") or "").strip() or None
+            identity = str(match.group("identity") or "").strip()
+            password = str(match.group("password") or "").strip()
+            parsed_domain, username = _parse_identity_domain_username(identity)
+            return ParsedDpapiCredential(
+                domain=parsed_domain or domain_name,
+                username=username,
+                password=password,
+                host=current_host,
+            )
+
+    return None
+
+
+def _extract_dpapi_credentials_with_hosts(output: str) -> list[ParsedDpapiCredential]:
+    """Extract DPAPI credentials from SMB or WinRM NetExec output."""
+    if not output:
+        return []
+
+    current_host: str | None = None
+    seen: set[tuple[str, str, str | None, str | None]] = set()
+    results: list[ParsedDpapiCredential] = []
+
+    for raw_line in output.splitlines():
+        line = strip_ansi_codes(raw_line)
+        host_match = _NXC_REMOTE_LINE_RE.match(line)
+        if host_match:
+            host_candidate = str(host_match.group("host") or "").strip()
+            if host_candidate:
+                current_host = host_candidate
+
+        parsed = _parse_dpapi_credential_from_line(line, current_host=current_host)
+        if parsed is None:
+            continue
+        dedupe_key = (
+            str(parsed.domain or "").lower(),
+            parsed.username.lower(),
+            parsed.password,
+            str(parsed.host or "").lower() or None,
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        results.append(parsed)
 
     return results
 
@@ -863,9 +972,10 @@ def _run_optional_domain_account_reuse_validation(
 ) -> None:
     """Optionally validate whether SAM credentials are also valid domain creds."""
     from adscan_internal.cli.spraying import (
+        DomainReuseValidationCandidate,
         handle_validated_domain_hits_followup,
-        validate_domain_reuse_with_ntlm_hash,
-        validate_domain_reuse_with_password,
+        select_domain_reuse_candidates_for_validation,
+        validate_selected_domain_reuse_candidates,
     )
 
     grouped: dict[str, dict[str, Any]] = {}
@@ -968,134 +1078,47 @@ def _run_optional_domain_account_reuse_validation(
             title="SAM -> Domain Reuse Candidates",
         )
 
-    print_info(
-        f"Running SAM-to-domain reuse validation for {total} credential variant(s) in {marked_domain}."
-    )
-    result_rows: list[dict[str, Any]] = []
-    domain_results_by_credential: dict[str, dict[str, Any]] = {}
-    validated_domain_hits: list[dict[str, Any]] = []
-    for value in grouped.values():
-        credential = str(value.get("credential") or "").strip()
-        credential_type = (
-            "Hash" if _is_hash_credential(shell, credential) else "Password (cracked)"
-        )
-        accounts = value.get("accounts")
-        account_values = (
-            sorted(str(account).strip() for account in accounts if str(account).strip())
-            if isinstance(accounts, list)
-            else []
-        )
-        if _is_hash_credential(shell, credential):
-            spray_result = validate_domain_reuse_with_ntlm_hash(
-                shell,
-                domain=domain,
-                nt_hash=credential,
-            )
-        else:
-            spray_result = validate_domain_reuse_with_password(
-                shell,
-                domain=domain,
-                password=credential,
-            )
-        status = str(spray_result.get("status") or "-")
-        hits_raw = spray_result.get("hits")
-        hits = (
-            [str(item).strip() for item in hits_raw if str(item).strip()]
-            if isinstance(hits_raw, list)
-            else []
-        )
-        outcomes_raw = spray_result.get("outcome_counts")
-        outcomes = outcomes_raw if isinstance(outcomes_raw, dict) else {}
-        source_hostnames_raw = value.get("source_hostnames")
-        source_hostnames = (
-            sorted(
-                str(host).strip()
-                for host in source_hostnames_raw
-                if isinstance(host, str) and str(host).strip()
-            )
-            if isinstance(source_hostnames_raw, set)
-            else []
-        )
-        created_graph_steps = 0
-        created_domain_pass_reuse_steps = 0
-        if hits and source_hostnames:
-            try:
-                from adscan_internal.services.attack_graph_service import (
-                    upsert_domain_password_reuse_edges,
-                    upsert_local_cred_to_domain_reuse_edges,
-                )
-
-                created_graph_steps = int(
-                    upsert_local_cred_to_domain_reuse_edges(
-                        shell,
-                        domain,
-                        source_hosts=source_hostnames,
-                        domain_usernames=hits,
-                        credential=credential,
-                        status="discovered",
-                    )
-                    or 0
-                )
-                created_domain_pass_reuse_steps = int(
-                    upsert_domain_password_reuse_edges(
-                        shell,
-                        domain,
-                        source_usernames=hits,
-                        target_usernames=hits,
-                        credential=credential,
-                        status="discovered",
-                        evidence_source="sam_domain_reuse_validation",
-                    )
-                    or 0
-                )
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                marked_domain = mark_sensitive(domain, "domain")
-                print_warning(
-                    "Failed to persist SAM-to-domain reuse context steps for "
-                    f"{marked_domain}; continuing."
-                )
-        outcome_summary = ", ".join(
-            f"{code}={count}"
-            for code, count in sorted(
-                ((str(code), int(count)) for code, count in outcomes.items()),
-                key=lambda item: (-item[1], item[0]),
-            )[:3]
-        )
-        domain_results_by_credential[credential.lower()] = {
-            "status": status,
-            "hits": len(hits),
-            "outcomes": dict(outcomes),
-            "created_graph_steps": created_graph_steps,
-            "created_domain_pass_reuse_steps": created_domain_pass_reuse_steps,
-        }
-        validated_domain_hits.extend(
-            {
-                "username": username,
-                "credential": credential,
-                "is_hash": _is_hash_credential(shell, credential),
-            }
-            for username in hits
-        )
-        result_rows.append(
-            {
-                "Accounts": ", ".join(
-                    mark_sensitive(account, "user") for account in account_values[:2]
-                )
-                + (
-                    f" (+{len(account_values) - 2} more)"
-                    if len(account_values) > 2
-                    else ""
+    selection = select_domain_reuse_candidates_for_validation(
+        shell,
+        domain=domain,
+        candidates=[
+            DomainReuseValidationCandidate(
+                credential=str(value.get("credential") or "").strip(),
+                credential_type=str(value.get("credential_type") or "-"),
+                accounts=sorted(
+                    str(account).strip()
+                    for account in value.get("accounts", [])
+                    if str(account).strip()
                 ),
-                "Credential Type": credential_type,
-                "Credential": mark_sensitive(credential, "password"),
-                "Status": status,
-                "Domain Hits": len(hits),
-                "Local->Domain Steps": created_graph_steps,
-                "DomainPassReuse": created_domain_pass_reuse_steps,
-                "Outcome Summary": outcome_summary or "-",
-            }
-        )
+                source_hostnames=sorted(
+                    str(host).strip()
+                    for host in value.get("source_hostnames", set())
+                    if str(host).strip()
+                ),
+            )
+            for value in grouped.values()
+            if str(value.get("credential") or "").strip()
+        ],
+        source_scope=source_scope,
+    )
+    if selection is None:
+        return
+    selected_candidates, eligibility = selection
+
+    print_info(
+        "Running SAM-to-domain reuse validation for "
+        f"{len(selected_candidates)} selected credential variant(s) in {marked_domain}."
+    )
+    (
+        result_rows,
+        domain_results_by_credential,
+        validated_domain_hits,
+    ) = validate_selected_domain_reuse_candidates(
+        shell,
+        domain=domain,
+        candidates=selected_candidates,
+        eligibility=eligibility,
+    )
 
     if result_rows:
         print_info_table(
@@ -1272,7 +1295,13 @@ def _print_sam_reuse_combined_summary(
 
         domain_info = domain_results_by_credential.get(key, {})
         domain_status_raw = str(domain_info.get("status") or "not_run").strip().lower()
-        domain_hits = int(domain_info.get("hits", 0) or 0)
+        domain_hits_raw = domain_info.get("hits", 0)
+        if isinstance(domain_hits_raw, list):
+            domain_hits = len(
+                [str(item).strip() for item in domain_hits_raw if str(item).strip()]
+            )
+        else:
+            domain_hits = int(domain_hits_raw or 0)
         domain_graph_steps = int(domain_info.get("created_graph_steps", 0) or 0)
         total_domain_steps += domain_graph_steps
         if domain_status_raw == "success":
@@ -1290,11 +1319,16 @@ def _print_sam_reuse_combined_summary(
         if local_status == "Reused" and domain_status == "Reused":
             both_reused += 1
 
-        domain_outcomes_raw = domain_info.get("outcomes")
+        domain_outcomes_raw = domain_info.get("outcome_counts")
+        if not isinstance(domain_outcomes_raw, dict):
+            domain_outcomes_raw = domain_info.get("outcomes")
         domain_outcomes = (
             domain_outcomes_raw if isinstance(domain_outcomes_raw, dict) else {}
         )
-        domain_outcomes_label = _summarize_outcomes_for_table(domain_outcomes)
+        domain_outcomes_label = _summarize_outcomes_for_table(
+            domain_outcomes,
+            excluded_codes={"SUCCESS"},
+        )
 
         impact_rank = 5
         if local_status == "Reused" and domain_status == "Reused":
@@ -1720,6 +1754,7 @@ def _build_dump_source_steps(
     auth_username: str | None = None,
     credential_username: str | None = None,
     secret: str | None = None,
+    source_protocol: str | None = None,
 ) -> list[object]:
     """Build credential provenance steps for dump-derived credentials."""
     from adscan_internal.principal_utils import normalize_machine_account
@@ -1759,6 +1794,8 @@ def _build_dump_source_steps(
         notes["credential_username"] = str(credential_username).strip()
     if str(secret or "").strip():
         notes["secret"] = str(secret).strip()
+    if str(source_protocol or "").strip():
+        notes["source_protocol"] = str(source_protocol).strip().lower()
 
     # Avoid self-loop provenance edges for machine accounts dumped from themselves
     # (e.g., BRAAVOS$ -> DumpLSA -> BRAAVOS$), which add noise without new context.
@@ -1776,6 +1813,115 @@ def _build_dump_source_steps(
             notes=notes,
         )
     ]
+
+
+def process_dpapi_output(
+    shell: Any,
+    *,
+    output: str,
+    domain: str,
+    host: str,
+    auth_username: str | None = None,
+    source_protocol: str = "smb",
+    prompt_confirmation: bool = True,
+) -> dict[str, Any]:
+    """Process parsed DPAPI credentials and persist them with provenance."""
+    bulk_mode = _is_bulk_dump_target(host)
+    bulk_summary: dict[str, dict[str, Any]] = {}
+    bulk_credentials: dict[tuple[str, str, bool], dict[str, Any]] = {}
+    processed_creds: set[tuple[str, str, str]] = set()
+
+    for entry in _extract_dpapi_credentials_with_hosts(output):
+        username = str(entry.username or "").strip().replace("\x00", "")
+        password = str(entry.password or "").strip().replace("\x00", "")
+        if not username or not password or username.endswith("$"):
+            continue
+
+        step_host = _resolve_step_host(parsed_host=entry.host, requested_host=host)
+        credential_domain = (
+            str(entry.domain or domain).strip().rstrip(".").lower()
+            or str(domain).strip().rstrip(".").lower()
+        )
+        dedupe_key = (credential_domain.lower(), username.lower(), password)
+        if dedupe_key in processed_creds:
+            if bulk_mode:
+                _record_bulk_finding(
+                    bulk_summary,
+                    host=step_host,
+                    username=username,
+                    is_hash=False,
+                )
+                _record_bulk_credential(
+                    bulk_credentials,
+                    username=username,
+                    credential=password,
+                    is_hash=False,
+                    host=step_host,
+                )
+            continue
+
+        marked_username = mark_sensitive(username, "user")
+        marked_password = mark_sensitive(password, "password")
+        marked_host = mark_sensitive(step_host or "unknown host", "hostname")
+
+        print_success(f"Credential found on {marked_host}:")
+        print_warning(f"   User: {marked_username}")
+        print_warning(f"   Password: {marked_password}")
+
+        should_save = True
+        if prompt_confirmation:
+            should_save = Confirm.ask(
+                f"Is this credential correct? User: {marked_username}, Password: {marked_password}",
+                default=True,
+            )
+
+        if not should_save:
+            print_warning("Credential discarded")
+            continue
+
+        if bulk_mode:
+            _record_bulk_finding(
+                bulk_summary,
+                host=step_host,
+                username=username,
+                is_hash=False,
+            )
+            _record_bulk_credential(
+                bulk_credentials,
+                username=username,
+                credential=password,
+                is_hash=False,
+                host=step_host,
+            )
+        else:
+            shell.add_credential(
+                credential_domain,
+                username,
+                password,
+                source_steps=_build_dump_source_steps(
+                    domain=credential_domain,
+                    dump_kind="DPAPI",
+                    host=step_host,
+                    auth_username=auth_username,
+                    credential_username=username,
+                    secret=password,
+                    source_protocol=source_protocol,
+                ),
+            )
+        print_success(f"Credential saved for {marked_username}")
+        processed_creds.add(dedupe_key)
+
+    if bulk_mode:
+        _persist_bulk_credentials(
+            shell,
+            domain=domain,
+            dump_kind="DPAPI",
+            auth_username=auth_username,
+            credentials=bulk_credentials,
+        )
+        _print_bulk_summary(dump_kind="DPAPI", summary=bulk_summary)
+
+    return {"count": len(processed_creds), "bulk_mode": bulk_mode}
 
 
 def _build_delegate_suffix(shell: Any, domain: str, username: str) -> str:
@@ -2741,108 +2887,15 @@ def execute_dump_dpapi(
         errors_output = completed_process.stderr
 
         if completed_process.returncode == 0:
-            bulk_mode = _is_bulk_dump_target(host)
-            bulk_summary: dict[str, dict[str, Any]] = {}
-            bulk_credentials: dict[tuple[str, str, bool], dict[str, Any]] = {}
-            processed_creds = set()
-            current_host: str | None = None
-
-            for line in output.splitlines():
-                host_match = _NXC_SMB_LINE_RE.match(strip_ansi_codes(line))
-                if host_match:
-                    host_candidate = str(host_match.group("host") or "").strip()
-                    if host_candidate:
-                        current_host = host_candidate
-                if "[CREDENTIAL]" in line:
-                    match = re.search(r"\\([^:]+):([^\s]+)", line)
-                    if match:
-                        username = match.group(1).strip().replace("\x00", "")
-                        password = match.group(2).strip().replace("\x00", "")
-
-                        if username.endswith("$"):
-                            continue
-
-                        cred_tuple = (username, password)
-
-                        if cred_tuple in processed_creds:
-                            if bulk_mode:
-                                step_host = _resolve_step_host(
-                                    parsed_host=current_host, requested_host=host
-                                )
-                                _record_bulk_finding(
-                                    bulk_summary,
-                                    host=step_host,
-                                    username=username,
-                                    is_hash=False,
-                                )
-                                _record_bulk_credential(
-                                    bulk_credentials,
-                                    username=username,
-                                    credential=password,
-                                    is_hash=False,
-                                    host=step_host,
-                                )
-                            continue
-
-                        step_host = _resolve_step_host(
-                            parsed_host=current_host, requested_host=host
-                        )
-                        marked_username = mark_sensitive(username, "user")
-                        marked_password = mark_sensitive(password, "password")
-                        marked_host = mark_sensitive(
-                            step_host or "unknown host", "hostname"
-                        )
-
-                        print_success(f"Credential found on {marked_host}:")
-                        print_warning(f"   User: {marked_username}")
-                        print_warning(f"   Password: {marked_password}")
-
-                        if Confirm.ask(
-                            f"Is this credential correct? User: {marked_username}, Password: {marked_password}",
-                            default=True,
-                        ):
-                            if bulk_mode:
-                                _record_bulk_finding(
-                                    bulk_summary,
-                                    host=step_host,
-                                    username=username,
-                                    is_hash=False,
-                                )
-                                _record_bulk_credential(
-                                    bulk_credentials,
-                                    username=username,
-                                    credential=password,
-                                    is_hash=False,
-                                    host=step_host,
-                                )
-                            else:
-                                shell.add_credential(
-                                    domain,
-                                    username,
-                                    password,
-                                    source_steps=_build_dump_source_steps(
-                                        domain=domain,
-                                        dump_kind="DPAPI",
-                                        host=step_host,
-                                        auth_username=auth_username,
-                                        credential_username=username,
-                                        secret=password,
-                                    ),
-                                )
-                            print_success(f"Credential saved for {marked_username}")
-                            processed_creds.add(cred_tuple)
-                        else:
-                            print_warning("Credential discarded")
-
-            if bulk_mode:
-                _persist_bulk_credentials(
-                    shell,
-                    domain=domain,
-                    dump_kind="DPAPI",
-                    auth_username=auth_username,
-                    credentials=bulk_credentials,
-                )
-                _print_bulk_summary(dump_kind="DPAPI", summary=bulk_summary)
+            process_dpapi_output(
+                shell,
+                output=output,
+                domain=domain,
+                host=host,
+                auth_username=auth_username,
+                source_protocol="smb",
+                prompt_confirmation=True,
+            )
             print_info("\nDPAPI dump processing completed")
         else:
             error_message = errors_output.strip() if errors_output else output.strip()

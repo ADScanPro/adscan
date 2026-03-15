@@ -14,6 +14,9 @@ workflows (manspider spidering logs, PowerShell history, transcripts, etc.).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+from importlib import metadata as importlib_metadata
+from importlib import resources as importlib_resources
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import json
@@ -21,12 +24,27 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import time
+import yaml
+
+from rich.markup import escape as rich_escape
 
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.text_utils import strip_ansi_codes
+from adscan_internal.services.smb_sensitive_file_policy import (
+    resolve_effective_sensitive_extension,
+)
+from adscan_internal.services.xml_sanitization_service import (
+    build_sanitized_xml_analysis_copy,
+    build_sanitized_xml_overlay,
+    contains_unescaped_xml_ampersand,
+    create_analysis_temp_root,
+    discover_malformed_xml_candidates,
+)
 from adscan_internal import (
     print_info_verbose,
     print_info_debug,
@@ -40,6 +58,56 @@ logger = logging.getLogger(__name__)
 
 
 CommandExecutor = Callable[..., subprocess.CompletedProcess[str] | None]
+
+
+CREDSWEEPER_RULES_PROFILE_DEFAULT = "default"
+CREDSWEEPER_RULES_PROFILE_FILESYSTEM = "filesystem"
+CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT = "filesystem_text"
+CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC = "filesystem_doc"
+CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION = "ldap_description"
+
+# Generic keyword-only rules are useful for targeted code/config analysis, but
+# they create disproportionate noise in large Windows filesystem crawls.
+FILESYSTEM_RULESET_EXCLUDED_RULE_NAMES = {
+    "API",
+    "Auth",
+    "Credential",
+    "Key",
+    "Nonce",
+    "Password",
+    "Salt",
+    "Secret",
+    "Token",
+}
+
+LDAP_DESCRIPTION_RULESET_ALLOWED_RULE_NAMES = {
+    "DOC_GET",
+    "DOC_CREDENTIALS",
+    "SECRET_PAIR",
+    "PASSWD_PAIR",
+    "IP_ID_PASSWORD_TRIPLE",
+    "ID_PAIR_PASSWD_PAIR",
+    "ID_PASSWD_PAIR",
+}
+
+# Broad filesystem text scans run CredSweeper in ``doc=False`` mode because the
+# inputs are still plain-text files. However, a small subset of upstream
+# document-oriented rules is still valuable for narrative text such as:
+#   "Your default password is: ..."
+# CredSweeper only evaluates ``target=doc`` rules when ``--doc`` is enabled, so
+# for this explicit allowlist we widen the generated profile target to
+# ``['code', 'doc']``. We keep this list intentionally small to avoid
+# reintroducing the noisy keyword-style document rules into large filesystem
+# crawls.
+FILESYSTEM_TEXT_NARRATIVE_RULE_NAMES = {
+    "DOC_GET",
+    "DOC_CREDENTIALS",
+    "SECRET_PAIR",
+    "PASSWD_PAIR",
+    "IP_ID_PASSWORD_TRIPLE",
+    "ID_PAIR_PASSWD_PAIR",
+    "ID_PASSWD_PAIR",
+}
 
 
 def resolve_credsweeper_drop_ml_none_for_ruleset(
@@ -73,13 +141,27 @@ def resolve_credsweeper_drop_ml_none_for_ruleset(
     return str(ruleset_label).strip().lower() == "primary"
 
 
+def _get_installed_credsweeper_config_path() -> Optional[str]:
+    """Return the primary rules file shipped by the installed CredSweeper package."""
+
+    try:
+        package_root = importlib_resources.files("credsweeper")
+        config_resource = package_root / "rules" / "config.yaml"
+        if config_resource.is_file():
+            return str(config_resource)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _get_credsweeper_config_path() -> Optional[str]:
     """Return path to the primary CredSweeper rules file (``config.yaml``), if any.
 
     Priority:
     1. User override in ``$ADSCAN_HOME/credsweeper_config.yaml``
-    2. Bundled config inside PyInstaller (``_MEIPASS/config.yaml``)
-    3. Project root ``config.yaml`` (development mode)
+    2. Installed CredSweeper package rules
+    3. Bundled config inside PyInstaller (legacy compatibility)
+    4. Vendored upstream snapshot under ``external_tools``
     """
 
     # 1) User override in ADscan base directory
@@ -87,7 +169,11 @@ def _get_credsweeper_config_path() -> Optional[str]:
     if override_path.is_file():
         return str(override_path)
 
-    # 2) PyInstaller bundle: config.yaml is bundled via --add-data
+    installed_config = _get_installed_credsweeper_config_path()
+    if installed_config:
+        return installed_config
+
+    # 3) PyInstaller bundle: config.yaml is bundled via --add-data
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         meipass = getattr(sys, "_MEIPASS", None)  # type: ignore[attr-defined]
         if meipass:
@@ -102,14 +188,58 @@ def _get_credsweeper_config_path() -> Optional[str]:
                 if nested_path.exists():
                     return str(nested_path)
 
-    # 3) Development mode: config.yaml in project root
-    # This service lives under adscan_internal/services/, so project root is two levels up.
-    project_root = Path(__file__).resolve().parents[2]
-    root_config = project_root / "config.yaml"
-    if root_config.is_file():
-        return str(root_config)
+    return _get_upstream_credsweeper_config_path()
 
+
+def _get_upstream_credsweeper_config_path() -> Optional[str]:
+    """Return the vendored upstream CredSweeper primary rules file when present."""
+
+    installed_config = _get_installed_credsweeper_config_path()
+    if installed_config:
+        return installed_config
+    project_root = Path(__file__).resolve().parents[2]
+    upstream_config = (
+        project_root / "external_tools" / "CredSweeper" / "credsweeper" / "rules" / "config.yaml"
+    )
+    if upstream_config.is_file():
+        return str(upstream_config)
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        meipass = getattr(sys, "_MEIPASS", None)  # type: ignore[attr-defined]
+        if meipass:
+            bundled_path = Path(meipass) / "config.yaml"
+            if bundled_path.is_file():
+                return str(bundled_path)
+            if bundled_path.is_dir():
+                nested_path = bundled_path / "config.yaml"
+                if nested_path.exists():
+                    return str(nested_path)
     return None
+
+
+def _get_vendored_credsweeper_version() -> Optional[str]:
+    """Return the vendored CredSweeper source version when available."""
+
+    project_root = Path(__file__).resolve().parents[2]
+    init_path = project_root / "external_tools" / "CredSweeper" / "credsweeper" / "__init__.py"
+    if not init_path.is_file():
+        return None
+    try:
+        init_text = init_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', init_text)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _get_installed_credsweeper_version() -> Optional[str]:
+    """Return the installed CredSweeper package version when available."""
+
+    try:
+        return importlib_metadata.version("credsweeper")
+    except importlib_metadata.PackageNotFoundError:
+        return None
 
 
 def _get_credsweeper_custom_rules_path() -> Optional[str]:
@@ -144,7 +274,149 @@ def _get_credsweeper_custom_rules_path() -> Optional[str]:
     return None
 
 
-def get_credsweeper_rules_paths() -> Tuple[Optional[str], Optional[str]]:
+def _normalize_credsweeper_targets(target_value: Any) -> set[str]:
+    """Return normalized CredSweeper target names from YAML rule payload."""
+
+    if isinstance(target_value, str):
+        return {target_value.strip().lower()} if target_value.strip() else set()
+    if isinstance(target_value, list):
+        return {
+            str(item).strip().lower()
+            for item in target_value
+            if str(item).strip()
+        }
+    return set()
+
+
+def _rule_targets_profile(rule: dict[str, Any], profile: str) -> bool:
+    """Return whether one upstream rule should stay in the requested profile."""
+
+    targets = _normalize_credsweeper_targets(rule.get("target"))
+    if profile in {
+        CREDSWEEPER_RULES_PROFILE_FILESYSTEM,
+    }:
+        return "code" in targets
+    if profile == CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT:
+        if "code" in targets:
+            return True
+        rule_name = str(rule.get("name", "")).strip()
+        return (
+            "doc" in targets
+            and rule_name in FILESYSTEM_TEXT_NARRATIVE_RULE_NAMES
+        )
+    if profile == CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC:
+        return "doc" in targets
+    if profile == CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION:
+        return "doc" in targets
+    return True
+
+
+def _transform_profiled_rule(rule: dict[str, Any], profile: str) -> dict[str, Any]:
+    """Return one profile-adjusted CredSweeper rule payload.
+
+    For broad filesystem text scans we keep a small subset of document-oriented
+    rules, but CredSweeper only executes them when their target includes
+    ``code`` in non-``--doc`` mode. We therefore widen those specific rules to
+    ``['code', 'doc']`` in the generated profile.
+    """
+
+    if profile != CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT:
+        return dict(rule)
+
+    rule_name = str(rule.get("name", "")).strip()
+    if rule_name not in FILESYSTEM_TEXT_NARRATIVE_RULE_NAMES:
+        return dict(rule)
+
+    targets = _normalize_credsweeper_targets(rule.get("target"))
+    if "doc" not in targets:
+        return dict(rule)
+
+    transformed_rule = dict(rule)
+    transformed_rule["target"] = ["code", "doc"]
+    return transformed_rule
+
+
+def _build_profiled_rules_variant(
+    source_rules_path: str,
+    *,
+    profile: str,
+) -> Optional[str]:
+    """Return a generated CredSweeper rules profile derived from one source YAML."""
+
+    try:
+        source_path = Path(source_rules_path).resolve()
+        source_text = source_path.read_text(encoding="utf-8")
+        digest = sha256(f"{profile}:{source_text}".encode("utf-8")).hexdigest()[:12]
+        output_dir = get_adscan_home() / "generated" / "credsweeper"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{source_path.stem}_{profile}_{digest}.yaml"
+        if output_path.is_file():
+            return str(output_path)
+
+        parsed_rules = yaml.safe_load(source_text)
+        if not isinstance(parsed_rules, list):
+            logger.warning(
+                "CredSweeper rules file %s is not a YAML list; using original rules.",
+                source_rules_path,
+            )
+            return source_rules_path
+
+        filtered_rules: list[dict[str, Any]] = []
+        excluded_rule_names: set[str] = set()
+        for rule in parsed_rules:
+            if not isinstance(rule, dict):
+                continue
+            rule_name = str(rule.get("name", "")).strip()
+            if not _rule_targets_profile(rule, profile):
+                excluded_rule_names.add(rule_name)
+                continue
+            if profile in {
+                CREDSWEEPER_RULES_PROFILE_FILESYSTEM,
+                CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
+                CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
+            } and rule_name in FILESYSTEM_RULESET_EXCLUDED_RULE_NAMES:
+                excluded_rule_names.add(rule_name)
+                continue
+            if (
+                profile == CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION
+                and rule_name not in LDAP_DESCRIPTION_RULESET_ALLOWED_RULE_NAMES
+            ):
+                excluded_rule_names.add(rule_name)
+                continue
+            filtered_rules.append(_transform_profiled_rule(rule, profile))
+        output_path.write_text(
+            yaml.safe_dump(
+                filtered_rules,
+                sort_keys=False,
+                allow_unicode=True,
+                width=120,
+            ),
+            encoding="utf-8",
+        )
+        print_info_debug(
+            "[credsweeper] Generated rules profile: "
+            f"source={source_rules_path} output={output_path} "
+            f"profile={profile} excluded_rules={sorted(rule for rule in excluded_rule_names if rule)}"
+        )
+        return str(output_path)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        logger.exception(
+            "Failed to build CredSweeper rules variant for profile %s from %s",
+            profile,
+            source_rules_path,
+        )
+        print_warning_debug(
+            f"[credsweeper] Failed to build rules profile {profile} from {source_rules_path}: "
+            f"{type(exc).__name__}"
+        )
+        return source_rules_path
+
+
+def get_credsweeper_rules_paths(
+    *,
+    profile: str = CREDSWEEPER_RULES_PROFILE_DEFAULT,
+) -> Tuple[Optional[str], Optional[str]]:
     """Return both primary and custom CredSweeper rules file paths.
 
     Returns:
@@ -154,6 +426,33 @@ def get_credsweeper_rules_paths() -> Tuple[Optional[str], Optional[str]]:
 
     primary_rules = _get_credsweeper_config_path()
     custom_rules = _get_credsweeper_custom_rules_path()
+    installed_version = _get_installed_credsweeper_version()
+    vendored_version = _get_vendored_credsweeper_version()
+    if profile in {
+        CREDSWEEPER_RULES_PROFILE_FILESYSTEM,
+        CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
+        CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
+        CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION,
+    }:
+        base_rules = _get_upstream_credsweeper_config_path() or primary_rules
+        if base_rules:
+            primary_rules = _build_profiled_rules_variant(base_rules, profile=profile)
+            print_info_debug(
+                "[credsweeper] Rules profile source selected: "
+                f"profile={profile} source=vendored_upstream "
+                f"base_rules={base_rules} generated_rules={primary_rules} "
+                f"installed_version={installed_version or 'unknown'} "
+                f"vendored_version={vendored_version or 'unknown'}"
+            )
+    else:
+        print_info_debug(
+            "[credsweeper] Rules profile source selected: "
+            f"profile={profile} source=runtime_default "
+            f"primary_rules={primary_rules or 'missing'} "
+            f"custom_rules={custom_rules or 'missing'} "
+            f"installed_version={installed_version or 'unknown'} "
+            f"vendored_version={vendored_version or 'unknown'}"
+        )
     return primary_rules, custom_rules
 
 
@@ -208,6 +507,13 @@ class CredSweeperService(BaseService):
     # Public API ---------------------------------------------------------------
 
     @staticmethod
+    def _count_total_grouped_findings(
+        findings: Dict[str, List[Tuple[str, Optional[float], str, int, str]]]
+    ) -> int:
+        """Count total grouped findings across all CredSweeper rule buckets."""
+        return sum(len(items) for items in findings.values())
+
+    @staticmethod
     def _resolve_json_output_path(
         *,
         file_path: str,
@@ -232,6 +538,139 @@ class CredSweeperService(BaseService):
         safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._") or "input"
         normalized_basename = output_basename.strip("_") or "result"
         return os.path.join(output_dir, f"{safe_stem}_{normalized_basename}.json")
+
+    @staticmethod
+    def _merge_grouped_findings(
+        left: Dict[str, List[Tuple[str, Optional[float], str, int, str]]],
+        right: Dict[str, List[Tuple[str, Optional[float], str, int, str]]],
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Merge grouped findings while deduplicating exact tuples."""
+        merged: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {
+            key: list(values) for key, values in left.items()
+        }
+        for rule_name, entries in right.items():
+            existing = set(merged.get(rule_name, []))
+            for entry in entries:
+                if entry in existing:
+                    continue
+                merged.setdefault(rule_name, []).append(entry)
+                existing.add(entry)
+        return merged
+
+    @staticmethod
+    def _remap_grouped_finding_paths(
+        findings: Dict[str, List[Tuple[str, Optional[float], str, int, str]]],
+        path_aliases: dict[str, str],
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Replace temporary analysis paths with original evidence paths."""
+        if not path_aliases:
+            return findings
+
+        remapped: Dict[str, List[Tuple[str, Optional[float], str, int, str]]] = {}
+        for rule_name, entries in findings.items():
+            remapped_entries: List[Tuple[str, Optional[float], str, int, str]] = []
+            for value, ml_probability, context_line, line_num, file_path in entries:
+                remapped_entries.append(
+                    (
+                        value,
+                        ml_probability,
+                        context_line,
+                        line_num,
+                        path_aliases.get(str(file_path), str(file_path)),
+                    )
+                )
+            remapped[rule_name] = remapped_entries
+        return remapped
+
+    @staticmethod
+    def _needs_xml_sanitized_analysis(file_path: str) -> bool:
+        """Return whether one file path should be sanitized before analysis."""
+        effective_extension = resolve_effective_sensitive_extension(
+            Path(file_path).name,
+            allowed_extensions={".xml"},
+        )
+        if effective_extension != ".xml":
+            return False
+        try:
+            text = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return False
+        return contains_unescaped_xml_ampersand(text)
+
+    def _analyze_sanitized_xml_overlay(
+        self,
+        *,
+        root_path: str,
+        credsweeper_path: str,
+        json_output_dir: Optional[str],
+        rules_path: Optional[str],
+        include_custom_rules: bool,
+        rules_profile: str,
+        drop_ml_none: bool | None,
+        ml_threshold: str,
+        no_filters: bool,
+        jobs: int | None,
+        custom_ml_threshold: str | None,
+        timeout: int,
+    ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
+        """Run a supplementary pass on malformed XML files using sanitized copies."""
+        root = Path(root_path)
+        if not root.is_dir():
+            return {}
+
+        candidate_paths = discover_malformed_xml_candidates(root)
+        if not candidate_paths:
+            return {}
+
+        preview = ", ".join(str(path) for path in candidate_paths[:3])
+        remaining = len(candidate_paths) - min(len(candidate_paths), 3)
+        if remaining > 0:
+            preview = f"{preview}, +{remaining} more"
+        print_info_debug(
+            "[credsweeper] XML sanitization supplementary pass selected: "
+            f"root={root_path} candidate_files={len(candidate_paths)} "
+            f"preview=\\[{rich_escape(preview)}]"
+        )
+        overlay = build_sanitized_xml_overlay(
+            candidate_paths=candidate_paths,
+            temp_parent=root,
+        )
+        if overlay is None:
+            return {}
+
+        overlay_root, path_aliases = overlay
+        try:
+            supplemental_findings = self.analyze_path_with_options(
+                str(overlay_root),
+                credsweeper_path=credsweeper_path,
+                json_output_dir=json_output_dir,
+                rules_path=rules_path,
+                include_custom_rules=include_custom_rules,
+                rules_profile=rules_profile,
+                drop_ml_none=drop_ml_none,
+                ml_threshold=ml_threshold,
+                doc=False,
+                no_filters=no_filters,
+                find_by_ext=False,
+                jobs=jobs,
+                custom_ml_threshold=custom_ml_threshold,
+                depth=False,
+                timeout=timeout,
+                _enable_xml_sanitization_pass=False,
+            )
+            remapped_findings = self._remap_grouped_finding_paths(
+                supplemental_findings,
+                path_aliases,
+            )
+            print_info_debug(
+                "[credsweeper] XML sanitization supplementary pass completed: "
+                f"root={root_path} candidate_files={len(candidate_paths)} "
+                f"grouped_rules={len(remapped_findings)} "
+                f"total_findings={self._count_total_grouped_findings(remapped_findings)}"
+            )
+            return remapped_findings
+        finally:
+            shutil.rmtree(overlay_root, ignore_errors=True)
 
     def analyze_file(
         self,
@@ -281,6 +720,34 @@ class CredSweeperService(BaseService):
             print_warning(f"File not found for CredSweeper analysis: {file_path}")
             return findings
 
+        analysis_target = str(file_path)
+        path_aliases: dict[str, str] = {}
+        cleanup_dir: str | None = None
+        if self._needs_xml_sanitized_analysis(str(file_path)):
+            try:
+                temp_root = create_analysis_temp_root(
+                    prefix=".adscan_xml_file_",
+                    preferred_parent=Path(file_path).resolve().parent,
+                )
+                cleanup_dir = str(temp_root)
+                text = Path(file_path).read_text(encoding="utf-8", errors="replace")
+                sanitized_path = build_sanitized_xml_analysis_copy(
+                    source_path=str(file_path),
+                    text=text,
+                    temp_root=temp_root,
+                )
+                analysis_target = str(sanitized_path)
+                path_aliases[str(sanitized_path)] = str(file_path)
+                print_info_debug(
+                    "[credsweeper] Using sanitized XML analysis copy: "
+                    f"source={file_path} analysis_target={analysis_target}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_warning_debug(
+                    f"[credsweeper] Failed to prepare sanitized XML copy for {file_path}: {type(exc).__name__}"
+                )
+
         try:
             # Run CredSweeper twice with two rulesets:
             # - Primary rules (config.yaml): drop entries with ml_probability=None
@@ -317,14 +784,14 @@ class CredSweeperService(BaseService):
                     return
 
                 json_output = self._resolve_json_output_path(
-                    file_path=file_path,
+                    file_path=analysis_target,
                     output_basename=json_suffix,
                     json_output_dir=json_output_dir,
                 )
                 cmd_parts = [
                     shlex.quote(credsweeper_path),
                     "--path",
-                    shlex.quote(file_path),
+                    shlex.quote(analysis_target),
                     "--save-json",
                     shlex.quote(json_output),
                     "--ml_threshold",
@@ -339,9 +806,11 @@ class CredSweeperService(BaseService):
                 )
                 print_info_debug(f"[credsweeper] Command ({label}): {command}")
 
+                ruleset_started_at = time.perf_counter()
                 completed_process = self._command_executor(
                     command, timeout=timeout, use_clean_env=True
                 )
+                ruleset_duration_seconds = time.perf_counter() - ruleset_started_at
 
                 if not completed_process or completed_process.returncode != 0:
                     stdout_text = strip_ansi_codes(
@@ -361,7 +830,8 @@ class CredSweeperService(BaseService):
                         f"[credsweeper] Analysis failed ({label}). "
                         f"Return code: {getattr(completed_process, 'returncode', 'N/A')}\n"
                         f"Stdout: {stdout_text or 'No stdout'}\n"
-                        f"Stderr: {stderr_text or 'No stderr'}"
+                        f"Stderr: {stderr_text or 'No stderr'}\n"
+                        f"Duration: {ruleset_duration_seconds:.2f}s"
                     )
                     return
 
@@ -398,6 +868,11 @@ class CredSweeperService(BaseService):
                     if drop_ml_none and ml_probability is None:
                         continue
                     all_results.append(result)
+                print_info_debug(
+                    "[credsweeper] Ruleset completed: "
+                        f"label={label} path={analysis_target} duration_seconds={ruleset_duration_seconds:.2f} "
+                    f"raw_results={len(results)} accumulated_results={len(all_results)}"
+                )
 
             # Primary rules: drop ml_probability=None
             _run_ruleset(
@@ -455,11 +930,12 @@ class CredSweeperService(BaseService):
                     except (ValueError, TypeError):
                         line_num = 0
 
-                    file_path_entry = line_data.get("path", file_path)
+                    file_path_entry = line_data.get("path", analysis_target)
                     if file_path_entry is None:
-                        file_path_entry = file_path
+                        file_path_entry = analysis_target
                     if not isinstance(file_path_entry, str):
-                        file_path_entry = str(file_path_entry) or file_path
+                        file_path_entry = str(file_path_entry) or analysis_target
+                    file_path_entry = path_aliases.get(file_path_entry, file_path_entry)
 
                     # Ensure value is a string and not None
                     if value is None:
@@ -490,7 +966,15 @@ class CredSweeperService(BaseService):
             telemetry.capture_exception(exc)
             print_warning("Error analyzing file for credentials with CredSweeper.")
             logger.exception("Error in CredSweeperService.analyze_file: %s", exc)
+        finally:
+            if cleanup_dir:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
 
+        print_info_debug(
+            "[credsweeper] Analysis summary: "
+            f"target={file_path} grouped_rules={len(findings)} "
+            f"total_findings={self._count_total_grouped_findings(findings)}"
+        )
         return findings
 
     def analyze_file_with_options(
@@ -501,6 +985,7 @@ class CredSweeperService(BaseService):
         json_output_dir: Optional[str] = None,
         rules_path: Optional[str] = None,
         include_custom_rules: bool = False,
+        rules_profile: str = CREDSWEEPER_RULES_PROFILE_DEFAULT,
         drop_ml_none: bool | None = None,
         ml_threshold: str = "0.1",
         doc: bool = False,
@@ -526,6 +1011,9 @@ class CredSweeperService(BaseService):
                 primary rules from :func:`get_credsweeper_rules_paths`.
             include_custom_rules: When True, runs the custom ruleset in addition
                 to the primary rules and merges results.
+            rules_profile: Optional primary rules profile. Broad filesystem
+                contexts should use ``filesystem_text`` or ``filesystem_doc``;
+                targeted scans should keep the default profile.
             drop_ml_none: Optional override for findings where ``ml_probability``
                 is missing. ``None`` applies the default service policy: drop
                 them for primary rules and keep them for custom rules.
@@ -549,7 +1037,35 @@ class CredSweeperService(BaseService):
             print_warning(f"File not found for CredSweeper analysis: {file_path}")
             return findings
 
-        primary_rules, custom_rules = get_credsweeper_rules_paths()
+        analysis_target = str(file_path)
+        path_aliases: dict[str, str] = {}
+        cleanup_dir: str | None = None
+        if self._needs_xml_sanitized_analysis(str(file_path)):
+            try:
+                temp_root = create_analysis_temp_root(
+                    prefix=".adscan_xml_file_",
+                    preferred_parent=Path(file_path).resolve().parent,
+                )
+                cleanup_dir = str(temp_root)
+                text = Path(file_path).read_text(encoding="utf-8", errors="replace")
+                sanitized_path = build_sanitized_xml_analysis_copy(
+                    source_path=str(file_path),
+                    text=text,
+                    temp_root=temp_root,
+                )
+                analysis_target = str(sanitized_path)
+                path_aliases[str(sanitized_path)] = str(file_path)
+                print_info_debug(
+                    "[credsweeper] Using sanitized XML analysis copy: "
+                    f"source={file_path} analysis_target={analysis_target}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_warning_debug(
+                    f"[credsweeper] Failed to prepare sanitized XML copy for {file_path}: {type(exc).__name__}"
+                )
+
+        primary_rules, custom_rules = get_credsweeper_rules_paths(profile=rules_profile)
         selected_primary = rules_path or primary_rules
         rulesets: list[tuple[str, str]] = []
         if selected_primary:
@@ -564,17 +1080,18 @@ class CredSweeperService(BaseService):
             return findings
 
         all_results: List[Dict[str, Any]] = []
+        analysis_started_at = time.perf_counter()
 
         for label, rules in rulesets:
             json_output = self._resolve_json_output_path(
-                file_path=file_path,
+                file_path=analysis_target,
                 output_basename=label,
                 json_output_dir=json_output_dir,
             )
             cmd_parts = [
                 shlex.quote(credsweeper_path),
                 "--path",
-                shlex.quote(file_path),
+                shlex.quote(analysis_target),
                 "--save-json",
                 shlex.quote(json_output),
                 "--ml_threshold",
@@ -595,9 +1112,11 @@ class CredSweeperService(BaseService):
             )
             print_info_debug(f"[credsweeper] Command ({label}): {command}")
 
+            ruleset_started_at = time.perf_counter()
             completed_process = self._command_executor(
                 command, timeout=timeout, use_clean_env=True
             )
+            ruleset_duration_seconds = time.perf_counter() - ruleset_started_at
 
             if not completed_process or completed_process.returncode != 0:
                 stdout_text = strip_ansi_codes(
@@ -615,7 +1134,8 @@ class CredSweeperService(BaseService):
                     f"[credsweeper] Analysis failed ({label}). "
                     f"Return code: {getattr(completed_process, 'returncode', 'N/A')}\n"
                     f"Stdout: {stdout_text or 'No stdout'}\n"
-                    f"Stderr: {stderr_text or 'No stderr'}"
+                    f"Stderr: {stderr_text or 'No stderr'}\n"
+                    f"Duration: {ruleset_duration_seconds:.2f}s"
                 )
                 continue
 
@@ -652,6 +1172,11 @@ class CredSweeperService(BaseService):
                 ) and ml_probability is None:
                     continue
                 all_results.append(result)
+            print_info_debug(
+                "[credsweeper] Ruleset completed: "
+                    f"label={label} path={analysis_target} duration_seconds={ruleset_duration_seconds:.2f} "
+                f"raw_results={len(results)} accumulated_results={len(all_results)}"
+            )
 
         if not all_results:
             print_info_verbose("No credentials detected by CredSweeper.")
@@ -679,9 +1204,10 @@ class CredSweeperService(BaseService):
                 except (ValueError, TypeError):
                     line_num = 0
 
-                file_path_entry = line_data.get("path", file_path) or file_path
+                file_path_entry = line_data.get("path", analysis_target) or analysis_target
                 if not isinstance(file_path_entry, str):
-                    file_path_entry = str(file_path_entry) or file_path
+                    file_path_entry = str(file_path_entry) or analysis_target
+                file_path_entry = path_aliases.get(file_path_entry, file_path_entry)
 
                 if value is None:
                     value = ""
@@ -699,7 +1225,16 @@ class CredSweeperService(BaseService):
                     (value, ml_probability, context_line, line_num, file_path_entry)
                 )
 
-        return findings
+        try:
+            print_info_debug(
+                "[credsweeper] Analysis summary: "
+                f"target={file_path} duration_seconds={time.perf_counter() - analysis_started_at:.2f} "
+                f"grouped_rules={len(findings)} total_findings={self._count_total_grouped_findings(findings)}"
+            )
+            return findings
+        finally:
+            if cleanup_dir:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
 
     def analyze_path_with_options(
         self,
@@ -709,6 +1244,7 @@ class CredSweeperService(BaseService):
         json_output_dir: Optional[str] = None,
         rules_path: Optional[str] = None,
         include_custom_rules: bool = False,
+        rules_profile: str = CREDSWEEPER_RULES_PROFILE_DEFAULT,
         drop_ml_none: bool | None = None,
         ml_threshold: str = "0.1",
         doc: bool = False,
@@ -718,6 +1254,7 @@ class CredSweeperService(BaseService):
         custom_ml_threshold: str | None = None,
         depth: bool = False,
         timeout: int = 300,
+        _enable_xml_sanitization_pass: bool = True,
     ) -> Dict[str, List[Tuple[str, Optional[float], str, int, str]]]:
         """Analyze a file or directory path with CredSweeper using explicit options.
 
@@ -731,6 +1268,9 @@ class CredSweeperService(BaseService):
                 primary rules from :func:`get_credsweeper_rules_paths`.
             include_custom_rules: When True, runs the custom ruleset in addition
                 to the primary rules and merges results.
+            rules_profile: Optional primary rules profile. Broad filesystem
+                contexts should use ``filesystem_text`` or ``filesystem_doc``;
+                targeted scans should keep the default profile.
             drop_ml_none: Optional override for findings where ``ml_probability``
                 is missing. ``None`` applies the default service policy: drop
                 them for primary rules and keep them for custom rules.
@@ -759,7 +1299,7 @@ class CredSweeperService(BaseService):
             )
             return findings
 
-        primary_rules, custom_rules = get_credsweeper_rules_paths()
+        primary_rules, custom_rules = get_credsweeper_rules_paths(profile=rules_profile)
         selected_primary = rules_path or primary_rules
         rulesets: list[tuple[str, str]] = []
         if selected_primary:
@@ -774,6 +1314,7 @@ class CredSweeperService(BaseService):
             return findings
 
         all_results: List[Dict[str, Any]] = []
+        analysis_started_at = time.perf_counter()
 
         for label, rules in rulesets:
             json_output = self._resolve_json_output_path(
@@ -818,9 +1359,11 @@ class CredSweeperService(BaseService):
             )
             print_info_debug(f"[credsweeper] Command ({label}): {command}")
 
+            ruleset_started_at = time.perf_counter()
             completed_process = self._command_executor(
                 command, timeout=timeout, use_clean_env=True
             )
+            ruleset_duration_seconds = time.perf_counter() - ruleset_started_at
 
             if not completed_process or completed_process.returncode != 0:
                 stdout_text = strip_ansi_codes(
@@ -838,7 +1381,8 @@ class CredSweeperService(BaseService):
                     f"[credsweeper] Analysis failed ({label}). "
                     f"Return code: {getattr(completed_process, 'returncode', 'N/A')}\n"
                     f"Stdout: {stdout_text or 'No stdout'}\n"
-                    f"Stderr: {stderr_text or 'No stderr'}"
+                    f"Stderr: {stderr_text or 'No stderr'}\n"
+                    f"Duration: {ruleset_duration_seconds:.2f}s"
                 )
                 continue
 
@@ -875,57 +1419,90 @@ class CredSweeperService(BaseService):
                 ) and ml_probability is None:
                     continue
                 all_results.append(result)
+            print_info_debug(
+                "[credsweeper] Ruleset completed: "
+                f"label={label} path={path_to_scan} duration_seconds={ruleset_duration_seconds:.2f} "
+                f"raw_results={len(results)} accumulated_results={len(all_results)}"
+            )
 
-        if not all_results:
+        if all_results:
+            seen_credentials: set[Tuple[str, str, int]] = set()
+            for result in all_results:
+                rule_name = result.get("rule", "") or ""
+                ml_probability = result.get("ml_probability")
+                try:
+                    if ml_probability is not None:
+                        ml_probability = float(ml_probability)
+                except (ValueError, TypeError):
+                    ml_probability = None
+
+                line_data_list = result.get("line_data_list", []) or []
+                findings.setdefault(rule_name, [])
+
+                for line_data in line_data_list:
+                    value = line_data.get("value", "")
+                    context_line = line_data.get("line", "") or ""
+                    line_num = line_data.get("line_num", 0)
+                    try:
+                        line_num = int(line_num or 0)
+                    except (ValueError, TypeError):
+                        line_num = 0
+
+                    file_path_entry = line_data.get("path", path_to_scan) or path_to_scan
+                    if not isinstance(file_path_entry, str):
+                        file_path_entry = str(file_path_entry) or path_to_scan
+
+                    if value is None:
+                        value = ""
+                    if not isinstance(value, str):
+                        value = str(value) if value else ""
+
+                    if not value or len(value) < 3:
+                        continue
+
+                    dedup_key = (rule_name, value, line_num)
+                    if dedup_key in seen_credentials:
+                        continue
+                    seen_credentials.add(dedup_key)
+                    findings[rule_name].append(
+                        (value, ml_probability, context_line, line_num, file_path_entry)
+                    )
+
+        if _enable_xml_sanitization_pass and os.path.isdir(path_to_scan) and not doc:
+            supplemental_findings = self._analyze_sanitized_xml_overlay(
+                root_path=path_to_scan,
+                credsweeper_path=credsweeper_path,
+                json_output_dir=json_output_dir,
+                rules_path=rules_path,
+                include_custom_rules=include_custom_rules,
+                rules_profile=rules_profile,
+                drop_ml_none=drop_ml_none,
+                ml_threshold=ml_threshold,
+                no_filters=no_filters,
+                jobs=jobs,
+                custom_ml_threshold=custom_ml_threshold,
+                timeout=timeout,
+            )
+            findings = self._merge_grouped_findings(findings, supplemental_findings)
+
+        if not findings:
             print_info_verbose("No credentials detected by CredSweeper.")
             return findings
 
-        seen_credentials: set[Tuple[str, str, int]] = set()
-        for result in all_results:
-            rule_name = result.get("rule", "") or ""
-            ml_probability = result.get("ml_probability")
-            try:
-                if ml_probability is not None:
-                    ml_probability = float(ml_probability)
-            except (ValueError, TypeError):
-                ml_probability = None
-
-            line_data_list = result.get("line_data_list", []) or []
-            findings.setdefault(rule_name, [])
-
-            for line_data in line_data_list:
-                value = line_data.get("value", "")
-                context_line = line_data.get("line", "") or ""
-                line_num = line_data.get("line_num", 0)
-                try:
-                    line_num = int(line_num or 0)
-                except (ValueError, TypeError):
-                    line_num = 0
-
-                file_path_entry = line_data.get("path", path_to_scan) or path_to_scan
-                if not isinstance(file_path_entry, str):
-                    file_path_entry = str(file_path_entry) or path_to_scan
-
-                if value is None:
-                    value = ""
-                if not isinstance(value, str):
-                    value = str(value) if value else ""
-
-                if not value or len(value) < 3:
-                    continue
-
-                dedup_key = (rule_name, value, line_num)
-                if dedup_key in seen_credentials:
-                    continue
-                seen_credentials.add(dedup_key)
-                findings[rule_name].append(
-                    (value, ml_probability, context_line, line_num, file_path_entry)
-                )
-
+        print_info_debug(
+            "[credsweeper] Analysis summary: "
+            f"target={path_to_scan} duration_seconds={time.perf_counter() - analysis_started_at:.2f} "
+            f"grouped_rules={len(findings)} total_findings={self._count_total_grouped_findings(findings)}"
+        )
         return findings
 
 
 __all__ = [
+    "CREDSWEEPER_RULES_PROFILE_DEFAULT",
+    "CREDSWEEPER_RULES_PROFILE_FILESYSTEM",
+    "CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT",
+    "CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC",
+    "CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION",
     "CredSweeperService",
     "CredSweeperFinding",
     "get_default_credsweeper_jobs",

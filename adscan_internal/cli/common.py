@@ -7,7 +7,8 @@ circular dependencies and duplicate code.
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+import inspect
+from typing import Any, Callable, Literal
 
 from adscan_core.lab_context import (
     build_lab_telemetry_fields,
@@ -26,6 +27,138 @@ from rich.text import Text
 import os
 
 SECRET_MODE: bool = os.getenv("ADSCAN_SECRET_MODE") == "1"  # pylint: disable=invalid-name
+
+DomainContextPolicy = Literal[
+    "auto_by_signature",
+    "exempt",
+    "requires_initialized_domain",
+]
+
+_DOMAIN_CONTEXT_PARAM_NAMES = {"domain", "target_domain", "domain_name"}
+_COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
+    "ask": "exempt",
+    "add_auths": "exempt",
+    "attack_paths": "requires_initialized_domain",
+    "attack_steps": "requires_initialized_domain",
+    "bloodhound_attack_paths": "requires_initialized_domain",
+    "cat": "exempt",
+    "cd": "exempt",
+    "check_dns": "exempt",
+    "clear": "exempt",
+    "clear_all": "exempt",
+    "clear_auths": "exempt",
+    "clear_creds_and_auths": "exempt",
+    "clear_responder_db": "exempt",
+    "cp": "exempt",
+    "cracking": "requires_initialized_domain",
+    "cracking_history": "exempt",
+    "creds": "exempt",
+    "dcsync": "requires_initialized_domain",
+    "download": "exempt",
+    "dump_dpapi": "requires_initialized_domain",
+    "dump_host": "requires_initialized_domain",
+    "dump_lsa": "requires_initialized_domain",
+    "dump_registries": "requires_initialized_domain",
+    "dump_sam": "requires_initialized_domain",
+    "enum_adcs_privs": "requires_initialized_domain",
+    "enum_all_user_postauth_access": "requires_initialized_domain",
+    "enum_all_user_privs": "requires_initialized_domain",
+    "enumerate_user_aces": "requires_initialized_domain",
+    "exit": "exempt",
+    "export": "exempt",
+    "generate_report": "exempt",
+    "get_flags": "requires_initialized_domain",
+    "help": "exempt",
+    "info": "exempt",
+    "initialize_report": "exempt",
+    "is_computer_dc": "requires_initialized_domain",
+    "is_user_dc": "requires_initialized_domain",
+    "kerberoast_preauth": "requires_initialized_domain",
+    "ls": "exempt",
+    "mkdir": "exempt",
+    "mssql_check_impersonate": "requires_initialized_domain",
+    "mssql_impersonate": "requires_initialized_domain",
+    "mssql_steal_ntlmv2": "requires_initialized_domain",
+    "mv": "exempt",
+    "netexec_auth_shares": "requires_initialized_domain",
+    "netexec_cve_all": "requires_initialized_domain",
+    "netexec_cve_dcs": "requires_initialized_domain",
+    "netexec_user_postauth_access": "requires_initialized_domain",
+    "netexec_user_privs": "requires_initialized_domain",
+    "quit": "exempt",
+    "raise_child": "requires_initialized_domain",
+    "responder": "exempt",
+    "rm": "exempt",
+    "session": "exempt",
+    "set": "exempt",
+    "smb_guest_benchmark": "exempt",
+    "smb_map_benchmark": "exempt",
+    "smb_map_benchmark_history": "exempt",
+    "smb_sensitive_benchmark": "exempt",
+    "start_auth": "exempt",
+    "start_unauth": "exempt",
+    "stop_responder": "exempt",
+    "system": "exempt",
+    "unauth_scan": "requires_initialized_domain",
+    "update": "exempt",
+    "update_domain_data": "exempt",
+    "update_resolv_conf": "exempt",
+    "upload": "exempt",
+    "validate_attack_graph": "requires_initialized_domain",
+    "workspace": "exempt",
+}
+_AUTH_INIT_RECOMMENDED_COMMANDS = {
+    "bloodhound_collector",
+    "check_autologon",
+    "check_firefox_credentials",
+    "check_powershell_transcripts",
+    "dcsync",
+    "dump_dpapi",
+    "dump_lsa",
+    "dump_registries",
+    "dump_sam",
+    "enum_authenticated",
+    "enum_configs",
+    "enum_delegations",
+    "enum_domain_auth",
+    "enum_domain_auth_phase1",
+    "generate_relay_list",
+    "mssql_check_impersonate",
+    "mssql_impersonate",
+    "mssql_steal_ntlmv2",
+    "netexec_auth_shares",
+    "netexec_gpp_autologin",
+    "netexec_gpp_passwords",
+    "netexec_smb_descriptions",
+    "search_adcs",
+    "secretsdump_registries",
+    "show_powershell_history",
+}
+_UNAUTH_INIT_RECOMMENDED_COMMANDS = {
+    "asreproast",
+    "enum_with_users",
+    "kerberoast",
+    "kerberoast_preauth",
+    "kerberos_enum_users",
+    "ldap_anonymous",
+    "netexec_guest",
+    "netexec_null_general",
+    "netexec_null_shares",
+    "rid_cycling",
+    "smb_scan",
+    "spraying",
+    "unauth_scan",
+}
+_COMMAND_INITIALIZER_RECOMMENDATIONS: dict[str, str] = {
+    **{
+        command_name: "start_auth"
+        for command_name in _AUTH_INIT_RECOMMENDED_COMMANDS
+    },
+    **{
+        command_name: "start_unauth"
+        for command_name in _UNAUTH_INIT_RECOMMENDED_COMMANDS
+    },
+}
 
 
 def build_telemetry_context(
@@ -273,6 +406,224 @@ def normalize_command_alias(
         return command_name, args_list, False
 
     return mapped_split, args_list[1:], True
+
+
+def classify_command_domain_context_policy(
+    command_name: str,
+    command_method: Callable[..., Any] | None,
+) -> tuple[DomainContextPolicy, str]:
+    """Classify how a command should participate in domain-context gating.
+
+    Args:
+        command_name: Canonical CLI command name.
+        command_method: Resolved ``do_*`` method for that command.
+
+    Returns:
+        Tuple ``(policy, source)`` where ``policy`` is one of:
+        ``exempt``, ``requires_initialized_domain``, or ``auto_by_signature``.
+        ``source`` explains whether the result came from explicit policy or
+        method-signature inference.
+    """
+    normalized = str(command_name or "").strip().lower()
+    explicit_policy = _COMMAND_DOMAIN_CONTEXT_POLICIES.get(normalized)
+    if explicit_policy is not None:
+        return explicit_policy, "explicit"
+    if command_method is None:
+        return "exempt", "fallback"
+
+    try:
+        signature = inspect.signature(command_method)
+    except (TypeError, ValueError):
+        return "exempt", "fallback"
+
+    positional_params = [
+        param
+        for param in signature.parameters.values()
+        if param.name != "self"
+        and param.kind
+        in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+    ]
+    if not positional_params:
+        return "exempt", "fallback"
+
+    if positional_params[0].name in _DOMAIN_CONTEXT_PARAM_NAMES:
+        return "auto_by_signature", "signature"
+
+    return "exempt", "fallback"
+
+
+def command_requires_initialized_domain_context(
+    command_name: str,
+    command_method: Callable[..., Any] | None,
+) -> bool:
+    """Return whether a CLI command depends on a pre-initialized domain context.
+
+    Args:
+        command_name: Canonical CLI command name.
+        command_method: Resolved ``do_*`` method for that command.
+
+    Returns:
+        ``True`` when the command should only run after ``start_unauth`` or
+        ``start_auth`` initialized the domain in ``domains_data``.
+    """
+    policy, _source = classify_command_domain_context_policy(command_name, command_method)
+    return policy in {"auto_by_signature", "requires_initialized_domain"}
+
+
+def is_domain_context_initialized(shell: Any, domain: str | None) -> bool:
+    """Return whether the given domain already has the minimum initialized state.
+
+    Args:
+        shell: Active shell instance with ``domains_data``.
+        domain: Domain name to validate.
+
+    Returns:
+        ``True`` when the domain exists in ``domains_data`` and includes the
+        critical fields created by ``start_unauth``/``start_auth``.
+    """
+    if not domain:
+        return False
+
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        return False
+
+    domain_state = domains_data.get(domain)
+    if not isinstance(domain_state, dict):
+        return False
+
+    return bool(domain_state.get("pdc")) and bool(domain_state.get("dir"))
+
+
+def _recommended_domain_initializer(command_name: str) -> str | None:
+    """Return the best start command to suggest for a blocked domain command."""
+    normalized = str(command_name or "").strip().lower()
+    return _COMMAND_INITIALIZER_RECOMMENDATIONS.get(normalized)
+
+
+def ensure_initialized_domain_context_for_command(
+    shell: Any,
+    *,
+    command_name: str,
+    args_list: list[str],
+    command_method: Callable[..., Any] | None,
+) -> bool:
+    """Block domain commands until a domain was initialized by ``start_*``.
+
+    Args:
+        shell: Active shell instance.
+        command_name: Canonical CLI command name.
+        args_list: Parsed CLI arguments.
+        command_method: Resolved ``do_*`` method for the command.
+
+    Returns:
+        ``True`` when the command may continue, ``False`` when execution should
+        stop because the domain context has not been initialized yet.
+    """
+    if not command_requires_initialized_domain_context(command_name, command_method):
+        return True
+
+    domain, domain_source = resolve_command_context_domain(
+        shell=shell,
+        command_name=command_name,
+        args_list=args_list,
+    )
+    if is_domain_context_initialized(shell, domain):
+        return True
+
+    marked_domain = mark_sensitive(str(domain or "Not resolved"), "domain")
+    recommended_start_command = _recommended_domain_initializer(command_name)
+    if recommended_start_command == "start_auth":
+        starter_guidance = (
+            "Run `start_auth` first to initialize the domain, validate DNS/DC, "
+            "and verify credentials for this workflow."
+        )
+    elif recommended_start_command == "start_unauth":
+        starter_guidance = (
+            "Run `start_unauth` first to initialize the domain, discover the PDC, "
+            "and create the per-domain workspace context."
+        )
+    else:
+        starter_guidance = (
+            "Run `start_unauth` first for unauthenticated initialization, or "
+            "`start_auth` if you already have valid domain credentials."
+        )
+
+    print_panel(
+        "\n".join(
+            [
+                "⚠️ Domain context not initialized in this workspace.",
+                f"Command: {command_name}",
+                f"Domain: {marked_domain}",
+                f"Resolution source: {domain_source}",
+                "",
+                "This command depends on the domain entry, PDC, and subworkspace "
+                "created by `start_unauth` / `start_auth`.",
+                "",
+                "Recommended workflow:",
+                f"1) {starter_guidance}",
+                f"2) Re-run `{command_name}` once the domain appears in `info` / `domains_data`.",
+            ]
+        ),
+        title="[bold yellow]Initialize Domain First[/bold yellow]",
+        border_style="yellow",
+        expand=False,
+    )
+
+    from adscan_internal import print_instruction, telemetry
+    from adscan_internal.interaction import is_non_interactive
+
+    print_instruction(
+        "Initialize the target first with `start_unauth` or `start_auth`, then rerun this command."
+    )
+    if recommended_start_command:
+        print_instruction(f"Recommended next step: `{recommended_start_command}`")
+
+    try:
+        properties: dict[str, Any] = {
+            "command": command_name,
+            "domain": domain,
+            "domain_source": domain_source,
+            "recommended_start_command": recommended_start_command,
+            "workspace_type": getattr(shell, "type", None),
+            "auto_mode": getattr(shell, "auto", False),
+            "scan_mode": getattr(shell, "scan_mode", None),
+        }
+        properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+        telemetry.capture("domain_command_requires_initialization", properties)
+    except Exception as exc:  # pragma: no cover - telemetry best effort
+        telemetry.capture_exception(exc)
+
+    if is_non_interactive(shell=shell):
+        return False
+
+    if not recommended_start_command:
+        return False
+
+    from rich.prompt import Confirm
+
+    if not Confirm.ask(
+        f"Do you want to run `{recommended_start_command}` now?",
+        default=True,
+    ):
+        return False
+
+    try:
+        start_method = getattr(shell, f"do_{recommended_start_command}", None)
+        if callable(start_method):
+            print_info_debug(
+                f"[cli] Launching recommended initializer {recommended_start_command} "
+                f"for blocked command {command_name}"
+            )
+            start_method("")
+    except Exception as exc:  # pragma: no cover - best effort handoff
+        telemetry.capture_exception(exc)
+        raise
+
+    return False
 
 
 def load_bloodhound_ce_display_config() -> tuple[str, str, str]:

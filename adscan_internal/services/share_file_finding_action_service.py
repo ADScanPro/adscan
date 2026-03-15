@@ -19,6 +19,9 @@ CPasswordCallback = Callable[
     [str, str, str, list[str] | None, list[str] | None, str | None], bool
 ]
 CertipyCallback = Callable[[str, str], bool]
+KeePassArtifactCallback = Callable[
+    [str, str, list[str] | None, list[str] | None, str | None], int
+]
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,7 @@ class ShareFileFindingActionService(BaseService):
         file2john_callback: File2JohnCallback | None = None,
         cpassword_callback: CPasswordCallback | None = None,
         certipy_callback: CertipyCallback | None = None,
+        keepass_artifact_callback: KeePassArtifactCallback | None = None,
     ) -> None:
         """Initialize callbacks used to apply deterministic findings."""
         super().__init__()
@@ -47,6 +51,7 @@ class ShareFileFindingActionService(BaseService):
         self._file2john_callback = file2john_callback
         self._cpassword_callback = cpassword_callback
         self._certipy_callback = certipy_callback
+        self._keepass_artifact_callback = keepass_artifact_callback
 
     def apply_pfx_artifact(
         self,
@@ -67,6 +72,30 @@ class ShareFileFindingActionService(BaseService):
             hash_file = f"domains/{domain}/smb/manspider/{filename}.hash"
             self._file2john_callback(domain, source_path, hash_file, "pfx")
         return False
+
+    def apply_keepass_artifact(
+        self,
+        *,
+        domain: str,
+        source_path: str,
+        source_hosts: list[str] | None = None,
+        source_shares: list[str] | None = None,
+        auth_username: str | None = None,
+    ) -> int:
+        """Process one KeePass artifact through the configured callback."""
+        if not self._keepass_artifact_callback:
+            print_warning("No KeePass callback configured; skipping KeePass artifact processing.")
+            return 0
+        return int(
+            self._keepass_artifact_callback(
+                domain,
+                source_path,
+                source_hosts,
+                source_shares,
+                auth_username,
+            )
+            or 0
+        )
 
     def apply_findings(
         self,

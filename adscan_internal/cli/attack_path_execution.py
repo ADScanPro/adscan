@@ -44,6 +44,7 @@ from adscan_internal.rich_output import (
     print_attack_paths_summary,
 )
 from adscan_internal.services.attack_graph_service import (
+    infer_directory_object_enabled_state,
     get_node_by_label,
     get_attack_path_summaries,
     get_owned_domain_usernames_for_attack_paths,
@@ -54,6 +55,7 @@ from adscan_internal.services.attack_graph_service import (
 )
 from adscan_internal.services.attack_graph_runtime_service import (
     clear_attack_path_execution,
+    set_attack_path_step_context,
     set_attack_path_execution,
 )
 from adscan_internal.cli.roasting_execution import (
@@ -66,11 +68,13 @@ from adscan_internal.cli.ace_step_execution import (
     describe_ace_relation_support,
     describe_ace_step_support,
     execute_ace_step,
+    get_last_ace_execution_outcome,
     resolve_execution_user as _shared_resolve_execution_user,
 )
 from adscan_internal.cli.attack_step_followups import (
+    build_followups_for_execution_outcome,
     build_followups_for_step,
-    render_followup_actions_panel,
+    execute_guided_followup_actions,
 )
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
@@ -219,6 +223,8 @@ def _execution_readiness_meta(
     to_label = str(details.get("to") or "")
     stored_creds = _get_stored_credential_map(shell, domain)
     target_kind = ""
+    target_enabled: bool | None = None
+    target_enabled_source = "unknown"
     if action in ACL_ACE_RELATIONS and to_label:
         to_node = get_node_by_label(shell, domain, label=to_label)
         if isinstance(to_node, dict):
@@ -227,6 +233,13 @@ def _execution_readiness_meta(
                 target_kind = str(kind[0])
             elif isinstance(kind, str):
                 target_kind = kind
+            target_enabled, target_enabled_source = infer_directory_object_enabled_state(
+                shell,
+                domain=domain,
+                principal_name=to_label,
+                principal_kind=target_kind,
+                node=to_node,
+            )
         supported, support_reason = describe_ace_relation_support(action, target_kind)
         if not supported:
             return {
@@ -234,6 +247,8 @@ def _execution_readiness_meta(
                 "execution_support_status": "unsupported",
                 "execution_support_reason": support_reason or "Unsupported target type",
                 "execution_support_target_kind": target_kind or "Unknown",
+                "execution_target_enabled": target_enabled,
+                "execution_target_enabled_source": target_enabled_source,
                 "execution_ready_count": 0,
                 "execution_candidate_count": 0,
                 "execution_candidate_source": "unsupported",
@@ -251,6 +266,8 @@ def _execution_readiness_meta(
             "execution_context_required": True,
             "execution_support_status": "supported",
             "execution_support_target_kind": target_kind or "",
+            "execution_target_enabled": target_enabled,
+            "execution_target_enabled_source": target_enabled_source,
             "execution_ready_count": 1 if ready else 0,
             "execution_candidate_count": 1,
             "execution_candidate_source": "context_username",
@@ -276,6 +293,8 @@ def _execution_readiness_meta(
             "execution_context_required": True,
             "execution_support_status": "supported",
             "execution_support_target_kind": target_kind or "",
+            "execution_target_enabled": target_enabled,
+            "execution_target_enabled_source": target_enabled_source,
             "execution_ready_count": 1,
             "execution_candidate_count": 1,
             "execution_candidate_source": "from_label_credential",
@@ -287,6 +306,8 @@ def _execution_readiness_meta(
             "execution_context_required": True,
             "execution_support_status": "supported",
             "execution_support_target_kind": target_kind or "",
+            "execution_target_enabled": target_enabled,
+            "execution_target_enabled_source": target_enabled_source,
             "execution_ready_count": 0,
             "execution_candidate_count": 1,
             "execution_candidate_source": "from_label_user_node",
@@ -310,6 +331,8 @@ def _execution_readiness_meta(
             "execution_context_required": True,
             "execution_support_status": "supported",
             "execution_support_target_kind": target_kind or "",
+            "execution_target_enabled": target_enabled,
+            "execution_target_enabled_source": target_enabled_source,
             "execution_ready_count": len(ready_users),
             "execution_candidate_count": affected_count or len(affected_users),
             "execution_candidate_source": "affected_users",
@@ -326,6 +349,8 @@ def _execution_readiness_meta(
             "execution_context_required": True,
             "execution_support_status": "supported",
             "execution_support_target_kind": target_kind or "",
+            "execution_target_enabled": target_enabled,
+            "execution_target_enabled_source": target_enabled_source,
             "execution_ready_count": len(stored_creds),
             "execution_candidate_count": len(stored_creds),
             "execution_candidate_source": "all_stored_credentials_fallback",
@@ -337,6 +362,8 @@ def _execution_readiness_meta(
         "execution_context_required": True,
         "execution_support_status": "supported",
         "execution_support_target_kind": target_kind or "",
+        "execution_target_enabled": target_enabled,
+        "execution_target_enabled_source": target_enabled_source,
         "execution_ready_count": 0,
         "execution_candidate_count": 0,
         "execution_candidate_source": "unresolved",
@@ -394,6 +421,89 @@ def _path_is_supported_for_execution(summary: dict[str, Any]) -> bool:
     if not isinstance(meta, dict):
         return True
     return str(meta.get("execution_support_status") or "").strip().lower() != "unsupported"
+
+
+def _path_is_actionable_for_execution_prompt(
+    summary: dict[str, Any],
+    *,
+    desired_statuses: set[str] | None,
+) -> bool:
+    """Return True when a path is worth re-prompting for execution."""
+    status = str(summary.get("status") or "theoretical").strip().lower()
+    if desired_statuses is not None and not _status_allowed_by_filter(
+        status, desired_statuses
+    ):
+        return False
+    if status not in {"theoretical", "attempted"}:
+        return False
+    if not _path_is_supported_for_execution(summary):
+        return False
+    if not _path_has_ready_execution_context(summary):
+        return False
+    return True
+
+
+def _summarize_non_actionable_paths(
+    summaries: list[dict[str, Any]],
+    *,
+    desired_statuses: set[str] | None,
+) -> tuple[int, dict[str, int]]:
+    """Return count and reason buckets for non-actionable path summaries."""
+    reasons = {
+        "exploited": 0,
+        "blocked": 0,
+        "unsupported": 0,
+        "unavailable": 0,
+        "needs_context": 0,
+        "status_filtered": 0,
+        "other": 0,
+    }
+    for summary in summaries:
+        status = str(summary.get("status") or "theoretical").strip().lower()
+        if desired_statuses is not None and not _status_allowed_by_filter(
+            status, desired_statuses
+        ):
+            reasons["status_filtered"] += 1
+            continue
+        if status == "exploited":
+            reasons["exploited"] += 1
+            continue
+        if status == "blocked":
+            reasons["blocked"] += 1
+            continue
+        if status == "unsupported":
+            reasons["unsupported"] += 1
+            continue
+        if status == "unavailable":
+            reasons["unavailable"] += 1
+            continue
+        if not _path_is_supported_for_execution(summary):
+            reasons["unsupported"] += 1
+            continue
+        if not _path_has_ready_execution_context(summary):
+            reasons["needs_context"] += 1
+            continue
+        reasons["other"] += 1
+    return sum(reasons.values()), reasons
+
+
+def _format_non_actionable_reason_summary(reasons: dict[str, int]) -> str:
+    """Return a compact visible breakdown of non-actionable path reasons."""
+    parts: list[str] = []
+    labels = (
+        ("exploited", "exploited"),
+        ("blocked", "blocked"),
+        ("unsupported", "unsupported"),
+        ("unavailable", "unavailable"),
+        ("needs_context", "needs_context"),
+        ("status_filtered", "filtered"),
+        ("other", "other"),
+    )
+    for key, label in labels:
+        count = int(reasons.get(key, 0) or 0)
+        if count > 0:
+            parts.append(f"{label}={count}")
+    return ", ".join(parts) if parts else "none"
 
 
 def _choose_custom_attack_path_start_step(
@@ -1593,6 +1703,7 @@ def execute_selected_attack_path(
     summary: dict[str, Any],
     context_username: str | None = None,
     context_password: str | None = None,
+    search_mode_label: str | None = None,
 ) -> bool:
     """Execute a selected attack path (best-effort).
 
@@ -1604,6 +1715,8 @@ def execute_selected_attack_path(
     """
     set_attack_path_execution(shell)
     try:
+        is_pivot_search = str(search_mode_label or "").strip().lower() == "pivot search"
+
         non_executable_actions = CONTEXT_ONLY_RELATIONS
         dangerous_actions = POLICY_BLOCKED_RELATIONS
         supported_actions = SUPPORTED_RELATION_NOTES
@@ -1889,6 +2002,92 @@ def execute_selected_attack_path(
         if resume_from_step_idx is None:
             return False
 
+        def _run_runtime_followups(
+            *,
+            step_action: str,
+            target_label_value: str,
+            initial_followups: list[Any] | None = None,
+            last_outcome: dict[str, Any] | None = None,
+        ) -> None:
+            """Render and execute runtime follow-ups for a successful terminal step."""
+            followups = list(initial_followups or [])
+            outcome_followups: list[Any] = []
+            effective_outcome = (
+                dict(last_outcome)
+                if isinstance(last_outcome, dict)
+                else (get_last_ace_execution_outcome(shell) or {})
+            )
+            marked_outcome_domain = mark_sensitive(domain, "domain")
+            print_info_debug(
+                "[attack_paths] outcome follow-up evaluation: "
+                f"domain={marked_outcome_domain} pivot={is_pivot_search!r} "
+                f"outcome_key={mark_sensitive(str(effective_outcome.get('key') or 'none'), 'detail')}"
+            )
+            if is_pivot_search:
+                if (
+                    str(effective_outcome.get("key") or "").strip().lower()
+                    != "user_credential_obtained"
+                ):
+                    outcome_followups = build_followups_for_execution_outcome(
+                        shell,
+                        outcome=effective_outcome,
+                    )
+                print_info_debug(
+                    "[attack_paths] outcome follow-ups resolved: "
+                    f"domain={marked_outcome_domain} count={len(outcome_followups)}"
+                )
+            if outcome_followups:
+                mandatory_outcome_followups = [
+                    item for item in outcome_followups if item.key == "refresh_ticket"
+                ]
+                optional_outcome_followups = [
+                    item for item in outcome_followups if item.key != "refresh_ticket"
+                ]
+                for item in mandatory_outcome_followups:
+                    item.handler()
+                followups.extend(optional_outcome_followups)
+            if not followups:
+                return
+
+            execute_guided_followup_actions(
+                shell,
+                step_action=step_action,
+                target_label=target_label_value,
+                followups=followups,
+            )
+
+        def _apply_execution_outcome_context_handoff(
+            outcome: dict[str, Any] | None,
+        ) -> None:
+            """Update the in-path execution context after obtaining a new user credential."""
+            nonlocal context_username, context_password
+
+            if not isinstance(outcome, dict):
+                return
+            if str(outcome.get("key") or "").strip().lower() != "user_credential_obtained":
+                return
+
+            compromised_user = _normalize_account(
+                str(outcome.get("compromised_user") or "")
+            )
+            credential = str(outcome.get("credential") or "").strip()
+            if not compromised_user or not credential:
+                print_info_debug(
+                    "[attack_paths] skipping execution-context handoff for user outcome "
+                    "(missing compromised_user or credential)."
+                )
+                return
+
+            previous_user = _normalize_account(context_username or "")
+            context_username = compromised_user
+            context_password = credential
+            marked_user = mark_sensitive(compromised_user, "user")
+            print_info_debug(
+                "[attack_paths] execution context handed off to newly compromised user: "
+                f"previous_user={mark_sensitive(previous_user or 'none', 'detail')} "
+                f"new_user={marked_user}"
+            )
+
         for idx, step in enumerate(steps, start=1):
             if not isinstance(step, dict):
                 continue
@@ -1902,6 +2101,12 @@ def execute_selected_attack_path(
             if key in dangerous_actions:
                 # High-risk step intentionally disabled.
                 return execution_started
+            set_attack_path_step_context(
+                shell,
+                search_mode_label=search_mode_label,
+                step_index=idx,
+                last_executable_idx=last_executable_idx,
+            )
             details = (
                 step.get("details") if isinstance(step.get("details"), dict) else {}
             )
@@ -2192,6 +2397,8 @@ def execute_selected_attack_path(
                             )
 
                         ace_result = execute_ace_step(shell, context=exec_context)
+                        last_outcome = get_last_ace_execution_outcome(shell) or {}
+                        _apply_execution_outcome_context_handoff(last_outcome)
                         offer_followups = (
                             idx == last_executable_idx and ace_result is True
                         )
@@ -2259,38 +2466,12 @@ def execute_selected_attack_path(
                         target_domain=exec_context.target_domain,
                         target_sam_or_label=exec_context.target_sam_or_label,
                     )
-                    if followups:
-                        render_followup_actions_panel(
-                            step_action=action,
-                            target_label=to_label or exec_context.target_sam_or_label,
-                            followups=followups,
-                        )
-                        if hasattr(shell, "_questionary_select"):
-                            options = (
-                                ["Execute all recommended"]
-                                + [f.title for f in followups]
-                                + ["Skip"]
-                            )
-                            while True:
-                                choice = shell._questionary_select(  # type: ignore[attr-defined]
-                                    "Select a follow-up action to execute:",
-                                    options,
-                                    default_idx=0,
-                                )
-                                if choice is None:
-                                    break
-                                if choice == 0:
-                                    for item in followups:
-                                        item.handler()
-                                    break
-                                if choice >= len(options) - 1:
-                                    break
-                                followups[choice - 1].handler()
-                        else:
-                            # Non-interactive fallback: be explicit and skip.
-                            print_info_verbose(
-                                "Skipping follow-up actions (non-interactive environment)."
-                            )
+                    _run_runtime_followups(
+                        step_action=action,
+                        target_label_value=to_label or exec_context.target_sam_or_label,
+                        initial_followups=followups,
+                        last_outcome=last_outcome,
+                    )
 
                 continue
 
@@ -2325,6 +2506,14 @@ def execute_selected_attack_path(
                         f"{action} did not recover credentials for {marked_user}. Stopping this path."
                     )
                     return True
+                last_outcome = get_last_ace_execution_outcome(shell) or {}
+                _apply_execution_outcome_context_handoff(last_outcome)
+                if idx == last_executable_idx:
+                    _run_runtime_followups(
+                        step_action=action,
+                        target_label_value=to_label or target_user,
+                        last_outcome=last_outcome,
+                    )
                 # If cracking succeeded, downstream steps can use the stored credential.
                 continue
 
@@ -3577,6 +3766,7 @@ def offer_attack_paths_for_execution(
     max_depth: int = 10,
     max_display: int = 20,
     include_all: bool = False,
+    target_mode: str = "impact",
     context_username: str | None = None,
     context_password: str | None = None,
     allow_execute_all: bool = False,
@@ -3601,33 +3791,14 @@ def offer_attack_paths_for_execution(
     """
     start_norm = (start or "").strip().lower()
     require_high_value_target = not include_all
-
-    def _compute_summaries() -> list[dict[str, Any]]:
-        if start_norm == "owned":
-            owned_users = get_owned_domain_usernames_for_attack_paths(shell, domain)
-            if not owned_users:
-                return []
-            owned_summaries = get_attack_path_summaries(
-                shell,
-                domain,
-                scope="owned",
-                max_depth=max_depth,
-                max_paths=None,
-                require_high_value_target=require_high_value_target,
-            )
-            return owned_summaries
-        marked_domain = mark_sensitive(domain, "domain")
-        marked_user = mark_sensitive(start, "user")
-        print_info(f"Searching attack paths for {marked_user} in {marked_domain}...")
-        return get_attack_path_summaries(
-            shell,
-            domain,
-            scope="user",
-            username=start,
-            max_depth=max_depth,
-            max_paths=None,
-            require_high_value_target=require_high_value_target,
-        )
+    _compute_summaries = _build_attack_path_summary_provider(
+        shell,
+        domain=domain,
+        start=start,
+        max_depth=max_depth,
+        include_all=include_all,
+        target_mode=target_mode,
+    )
 
     try:
         summaries = _compute_summaries()
@@ -3641,19 +3812,13 @@ def offer_attack_paths_for_execution(
         )
         return False
     if not summaries:
-        if start_norm == "owned":
-            marked_domain = mark_sensitive(domain, "domain")
-            scope = "high-value targets" if require_high_value_target else "all targets"
-            print_warning(
-                f"No attack paths found from owned users to {scope} for {marked_domain}."
-            )
-        else:
-            marked_domain = mark_sensitive(domain, "domain")
-            marked_user = mark_sensitive(start, "user")
-            scope = "high-value targets" if require_high_value_target else "all targets"
-            print_warning(
-                f"No attack paths found for {marked_user} to {scope} in {marked_domain}."
-            )
+        _print_no_attack_paths_warning(
+            domain=domain,
+            start=start,
+            start_norm=start_norm,
+            require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
+        )
         return False
 
     return offer_attack_paths_for_execution_summaries(
@@ -3661,6 +3826,9 @@ def offer_attack_paths_for_execution(
         domain,
         summaries=summaries,
         max_display=max_display,
+        search_mode_label=_target_search_mode_label(
+            include_all=include_all, target_mode=target_mode
+        ),
         context_username=context_username,
         context_password=context_password,
         allow_execute_all=allow_execute_all,
@@ -3668,6 +3836,261 @@ def offer_attack_paths_for_execution(
         execute_only_statuses=execute_only_statuses,
         retry_attempted=retry_attempted,
         recompute_summaries=_compute_summaries,
+    )
+
+
+def _target_scope_label(*, require_high_value_target: bool, target_mode: str) -> str:
+    """Return a user-facing label for the current target filtering mode."""
+    if not require_high_value_target:
+        return "all targets"
+    if str(target_mode or "impact").strip().lower() == "tier0":
+        return "Tier-0 targets"
+    return "high-value targets"
+
+
+def _target_search_mode_label(*, include_all: bool, target_mode: str) -> str:
+    """Return a compact label describing the current attack-path search mode."""
+    if include_all:
+        return "Pivot Search"
+    if str(target_mode or "impact").strip().lower() == "tier0":
+        return "Tier-0 Search"
+    return "High-Value Search"
+
+
+def _print_no_attack_paths_warning(
+    *,
+    domain: str,
+    start: str,
+    start_norm: str,
+    require_high_value_target: bool,
+    target_mode: str,
+) -> None:
+    """Emit a consistent warning when no attack paths are available."""
+    marked_domain = mark_sensitive(domain, "domain")
+    scope = _target_scope_label(
+        require_high_value_target=require_high_value_target,
+        target_mode=target_mode,
+    )
+    if start_norm == "owned":
+        print_warning(
+            f"No attack paths found from owned users to {scope} for {marked_domain}."
+        )
+        return
+    marked_user = mark_sensitive(start, "user")
+    print_warning(
+        f"No attack paths found for {marked_user} to {scope} in {marked_domain}."
+    )
+
+
+def _build_attack_path_summary_provider(
+    shell: Any,
+    *,
+    domain: str,
+    start: str,
+    max_depth: int,
+    include_all: bool,
+    target_mode: str,
+) -> Callable[[], list[dict[str, Any]]]:
+    """Build a reusable summary provider for a specific attack-path scope."""
+    start_norm = (start or "").strip().lower()
+    require_high_value_target = not include_all
+
+    def _compute_summaries() -> list[dict[str, Any]]:
+        if start_norm == "owned":
+            owned_users = get_owned_domain_usernames_for_attack_paths(shell, domain)
+            if not owned_users:
+                return []
+            return get_attack_path_summaries(
+                shell,
+                domain,
+                scope="owned",
+                max_depth=max_depth,
+                max_paths=None,
+                require_high_value_target=require_high_value_target,
+                target_mode=target_mode,
+            )
+
+        marked_domain = mark_sensitive(domain, "domain")
+        marked_user = mark_sensitive(start, "user")
+        print_info(f"Searching attack paths for {marked_user} in {marked_domain}...")
+        return get_attack_path_summaries(
+            shell,
+            domain,
+            scope="user",
+            username=start,
+            max_depth=max_depth,
+            max_paths=None,
+            require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
+        )
+
+    return _compute_summaries
+
+
+def offer_attack_paths_with_non_high_value_fallback(
+    shell: Any,
+    domain: str,
+    *,
+    start: str,
+    max_depth: int = 10,
+    max_display: int = 20,
+    target_mode: str = "impact",
+    context_username: str | None = None,
+    context_password: str | None = None,
+    allow_execute_all: bool = False,
+    default_execute_all: bool = False,
+    execute_only_statuses: set[str] | None = None,
+    retry_attempted: bool = False,
+) -> bool:
+    """Offer high-value paths first, then optionally broaden to all targets.
+
+    Behavior:
+        - In `ctf` mode, when no Tier-0/high-value paths exist, automatically
+          broadens to all reachable targets.
+        - In `audit` mode, the operator is prompted before broadening.
+    """
+    start_norm = (start or "").strip().lower()
+    primary_compute = _build_attack_path_summary_provider(
+        shell,
+        domain=domain,
+        start=start,
+        max_depth=max_depth,
+        include_all=False,
+        target_mode=target_mode,
+    )
+    try:
+        primary_summaries = primary_compute()
+    except RecursionError as exc:
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            "Attack-path computation failed while expanding nested group memberships "
+            f"for {marked_domain}. The environment appears to have deep or cyclic "
+            "group nesting."
+        )
+        return False
+
+    if primary_summaries:
+        return offer_attack_paths_for_execution_summaries(
+            shell,
+            domain,
+            summaries=primary_summaries,
+            max_display=max_display,
+            search_mode_label=_target_search_mode_label(
+                include_all=False, target_mode=target_mode
+            ),
+            context_username=context_username,
+            context_password=context_password,
+            allow_execute_all=allow_execute_all,
+            default_execute_all=default_execute_all,
+            execute_only_statuses=execute_only_statuses,
+            retry_attempted=retry_attempted,
+            recompute_summaries=primary_compute,
+        )
+
+    _print_no_attack_paths_warning(
+        domain=domain,
+        start=start,
+        start_norm=start_norm,
+        require_high_value_target=True,
+        target_mode=target_mode,
+    )
+
+    fallback_default = str(getattr(shell, "type", "")).strip().lower() == "ctf"
+    marked_domain = mark_sensitive(domain, "domain")
+    subject = (
+        "owned users" if start_norm == "owned" else mark_sensitive(start, "user")
+    )
+
+    message = Text()
+    message.append(
+        "No paths to Tier-0 or high-value targets were discovered from the current foothold.\n\n",
+        style="bold yellow",
+    )
+    message.append("Scope: ", style="bold")
+    message.append(f"{subject}\n")
+    message.append("Domain: ", style="bold")
+    message.append(f"{marked_domain}\n\n")
+    message.append(
+        "ADscan can broaden the search to non-high-value targets to identify "
+        "pivot opportunities, intermediate control points, and lower-privilege "
+        "expansion paths.",
+        style="yellow",
+    )
+
+    title = (
+        "Broadening Attack Path Search"
+        if fallback_default
+        else "Optional Pivot Path Enumeration"
+    )
+    print_panel(message, title=title, border_style="yellow", expand=False)
+
+    broaden_search = fallback_default
+    if not fallback_default:
+        if is_non_interactive(shell=shell):
+            print_info_debug(
+                "[attack_paths] non-high-value fallback skipped: "
+                f"domain={marked_domain} scope={mark_sensitive(start_norm or start, 'text')}"
+            )
+            broaden_search = False
+        else:
+            broaden_search = Confirm.ask(
+                "Do you want to broaden the search to non-high-value targets now?",
+                default=False,
+            )
+    else:
+        print_info(
+            "CTF mode active: broadening attack-path search to all reachable targets."
+        )
+
+    if not broaden_search:
+        return False
+
+    fallback_compute = _build_attack_path_summary_provider(
+        shell,
+        domain=domain,
+        start=start,
+        max_depth=max_depth,
+        include_all=True,
+        target_mode=target_mode,
+    )
+    try:
+        fallback_summaries = fallback_compute()
+    except RecursionError as exc:
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            "Attack-path computation failed while expanding nested group memberships "
+            f"for {marked_domain}. The environment appears to have deep or cyclic "
+            "group nesting."
+        )
+        return False
+
+    if not fallback_summaries:
+        _print_no_attack_paths_warning(
+            domain=domain,
+            start=start,
+            start_norm=start_norm,
+            require_high_value_target=False,
+            target_mode=target_mode,
+        )
+        return False
+
+    return offer_attack_paths_for_execution_summaries(
+        shell,
+        domain,
+        summaries=fallback_summaries,
+        max_display=max_display,
+        search_mode_label=_target_search_mode_label(
+            include_all=True, target_mode=target_mode
+        ),
+        context_username=context_username,
+        context_password=context_password,
+        allow_execute_all=allow_execute_all,
+        default_execute_all=default_execute_all,
+        execute_only_statuses=execute_only_statuses,
+        retry_attempted=retry_attempted,
+        recompute_summaries=fallback_compute,
     )
 
 
@@ -3679,6 +4102,7 @@ def offer_attack_paths_for_execution_for_principals(
     max_depth: int = 10,
     max_display: int = 20,
     include_all: bool = False,
+    target_mode: str = "impact",
     context_username: str | None = None,
     context_password: str | None = None,
     allow_execute_all: bool = False,
@@ -3702,6 +4126,7 @@ def offer_attack_paths_for_execution_for_principals(
             max_depth=max_depth,
             max_paths=None,
             require_high_value_target=require_high_value_target,
+            target_mode=target_mode,
         )
 
     try:
@@ -3737,6 +4162,7 @@ def offer_attack_paths_for_execution_summaries(
     *,
     summaries: list[dict[str, Any]] | None,
     max_display: int = 20,
+    search_mode_label: str | None = None,
     context_username: str | None = None,
     context_password: str | None = None,
     allow_execute_all: bool = False,
@@ -3804,15 +4230,6 @@ def offer_attack_paths_for_execution_summaries(
             return False
         return domain_data.get("auth") == "pwned"
 
-    summaries = _refresh_summaries()
-    print_info_debug(
-        f"[attack_paths] summaries refreshed: domain={marked_domain} count={len(summaries)}"
-    )
-    print_attack_paths_summary(
-        domain, summaries, max_display=min(max_display, len(summaries))
-    )
-
-    executed = False
     desired_statuses = (
         {str(s).strip().lower() for s in execute_only_statuses}
         if execute_only_statuses
@@ -3821,6 +4238,57 @@ def offer_attack_paths_for_execution_summaries(
     desired_statuses_set = (
         desired_statuses if isinstance(desired_statuses, set) else None
     )
+
+    summaries = _refresh_summaries()
+    print_info_debug(
+        f"[attack_paths] summaries refreshed: domain={marked_domain} count={len(summaries)}"
+    )
+    actionable_paths = [
+        summary
+        for summary in summaries
+        if _path_is_actionable_for_execution_prompt(
+            summary, desired_statuses=desired_statuses_set
+        )
+    ]
+    print_attack_paths_summary(
+        domain,
+        summaries,
+        max_display=min(max_display, len(summaries)),
+        search_mode_label=search_mode_label,
+        actionable_count=len(actionable_paths),
+    )
+    if not actionable_paths:
+        non_actionable_total, reasons = _summarize_non_actionable_paths(
+            summaries,
+            desired_statuses=desired_statuses_set,
+        )
+        reason_summary = _format_non_actionable_reason_summary(reasons)
+        if reasons["needs_context"] > 0 and non_actionable_total == reasons["needs_context"]:
+            print_warning(
+                "No actionable attack paths are currently executable because the "
+                "available paths have no usable execution credential context."
+            )
+        elif reasons["unsupported"] > 0 and non_actionable_total == reasons["unsupported"]:
+            print_warning(
+                "No actionable attack paths are currently executable because the "
+                "available paths are not implemented for execution."
+            )
+        else:
+            print_info(
+                "No actionable attack paths are currently executable. "
+                "You can still inspect the discovered paths."
+            )
+        print_info(f"Current path summary: {reason_summary}")
+        print_info_debug(
+            "[attack_paths] initial list has no actionable paths; keeping detail UX enabled: "
+            f"domain={marked_domain} non_actionable={non_actionable_total} "
+            f"exploited={reasons['exploited']} blocked={reasons['blocked']} "
+            f"unsupported={reasons['unsupported']} unavailable={reasons['unavailable']} "
+            f"needs_context={reasons['needs_context']} filtered={reasons['status_filtered']} "
+            f"other={reasons['other']}"
+        )
+
+    executed = False
 
     # In non-interactive contexts, we run a single selection cycle and return.
     # The selection logic is the same as interactive: the default option is applied
@@ -3995,6 +4463,7 @@ def offer_attack_paths_for_execution_summaries(
                         summary=summary,
                         context_username=context_username,
                         context_password=context_password,
+                        search_mode_label=search_mode_label,
                     )
                     executed = executed or attempted
                     if attempted and not was_pwned_at_start and _domain_now_pwned():
@@ -4010,7 +4479,12 @@ def offer_attack_paths_for_execution_summaries(
             return executed
 
         selected = summaries[selected_idx]
-        print_attack_path_detail(domain, selected, index=selected_idx + 1)
+        print_attack_path_detail(
+            domain,
+            selected,
+            index=selected_idx + 1,
+            search_mode_label=search_mode_label,
+        )
 
         status = str(selected.get("status") or "theoretical").lower()
         selected_meta = selected.get("meta") if isinstance(selected.get("meta"), dict) else {}
@@ -4120,6 +4594,7 @@ def offer_attack_paths_for_execution_summaries(
             summary=selected,
             context_username=context_username,
             context_password=context_password,
+            search_mode_label=search_mode_label,
         )
         if executed:
             if not was_pwned_at_start and _domain_now_pwned():
@@ -4153,15 +4628,53 @@ def offer_attack_paths_for_execution_summaries(
                 "(this can take longer on large domains)."
             )
             summaries = _refresh_summaries()
-            if summaries:
+            actionable_paths = [
+                summary
+                for summary in summaries
+                if _path_is_actionable_for_execution_prompt(
+                    summary, desired_statuses=desired_statuses_set
+                )
+            ]
+            if actionable_paths:
                 print_info_debug(
                     "[attack_paths] re-prompting after execution: "
-                    f"domain={marked_domain} remaining={len(summaries)}"
+                    f"domain={marked_domain} remaining={len(summaries)} actionable={len(actionable_paths)}"
                 )
                 print_attack_paths_summary(
-                    domain, summaries, max_display=min(max_display, len(summaries))
+                    domain,
+                    summaries,
+                    max_display=min(max_display, len(summaries)),
+                    search_mode_label=search_mode_label,
+                    actionable_count=len(actionable_paths),
                 )
                 continue
+            if summaries:
+                non_actionable_total, reasons = _summarize_non_actionable_paths(
+                    summaries,
+                    desired_statuses=desired_statuses_set,
+                )
+                reason_summary = _format_non_actionable_reason_summary(reasons)
+                if reasons["exploited"] == non_actionable_total and non_actionable_total > 0:
+                    print_info(
+                        "Execution completed. No further actionable attack paths remain "
+                        "because the remaining paths are already exploited."
+                    )
+                else:
+                    print_info(
+                        "Execution completed. No further actionable attack paths remain. "
+                        "Any remaining paths are already exploited, blocked, unsupported, "
+                        "or missing execution context."
+                    )
+                print_info(f"Remaining path summary: {reason_summary}")
+                print_info_debug(
+                    "[attack_paths] stopping after execution: "
+                    f"domain={marked_domain} reason=no_actionable_paths "
+                    f"remaining={non_actionable_total} exploited={reasons['exploited']} "
+                    f"blocked={reasons['blocked']} unsupported={reasons['unsupported']} "
+                    f"unavailable={reasons['unavailable']} needs_context={reasons['needs_context']} "
+                    f"filtered={reasons['status_filtered']} other={reasons['other']}"
+                )
+                return True
             print_info_debug(
                 f"[attack_paths] stopping after execution: domain={marked_domain} reason=no_remaining_paths"
             )

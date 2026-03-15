@@ -34,7 +34,10 @@ from adscan_internal.services.attack_graph_service import (
 from adscan_internal.workspaces import domain_subpath
 
 _EMPTY_NTLM_HASH = "31d6cfe0d16ae931b73c59d7e0c089c0"
-_MACHINE_HASH_RE = re.compile(r"\$MACHINE\.ACC:\s*[0-9a-fA-F]{32}:([0-9a-fA-F]{32})")
+_MACHINE_HASH_RE = re.compile(
+    r"(?:^|\s)(?:[A-Za-z0-9_.-]+\\)?([A-Za-z0-9_.-]+\$):"
+    r"([0-9a-fA-F]{32}):([0-9a-fA-F]{32})(?:::|$)"
+)
 _HOSTNAME_RE = re.compile(r"\\(name:([A-Za-z0-9_.-]+)\\)", re.IGNORECASE)
 _SYSVOL_ARTIFACT_RE = re.compile(
     r"\\\\[\\w\\.-]+\\\\SYSVOL\\\\(SAM|SYSTEM|SECURITY)", re.IGNORECASE
@@ -59,14 +62,43 @@ def _extract_dc_hostname(output: str) -> str | None:
     return None
 
 
-def _extract_machine_nt_hash(output: str) -> str | None:
+def _extract_machine_nt_hash(output: str, dc_hostname: str | None = None) -> str | None:
+    expected_machine_account = (
+        f"{str(dc_hostname).strip().upper()}$" if dc_hostname else None
+    )
+    fallback_nt_hash: str | None = None
     for line in output.splitlines():
         match = _MACHINE_HASH_RE.search(line)
         if match:
-            nt_hash = match.group(1).strip()
-            if nt_hash and nt_hash.lower() != _EMPTY_NTLM_HASH:
+            account_name = match.group(1).strip().upper()
+            nt_hash = match.group(3).strip()
+            if not nt_hash or nt_hash.lower() == _EMPTY_NTLM_HASH:
+                print_info_debug(
+                    "[backup-ops] Ignoring empty machine NTLM hash candidate "
+                    f"for {mark_sensitive(account_name, 'user')}."
+                )
+                continue
+            print_info_debug(
+                "[backup-ops] Machine NTLM candidate detected: "
+                f"account={mark_sensitive(account_name, 'user')}"
+            )
+            if expected_machine_account and account_name == expected_machine_account:
+                print_info_debug(
+                    "[backup-ops] Selected machine NTLM candidate matching parsed DC hostname."
+                )
                 return nt_hash
-    return None
+            if fallback_nt_hash is None:
+                fallback_nt_hash = nt_hash
+    if fallback_nt_hash and expected_machine_account:
+        print_info_debug(
+            "[backup-ops] No machine NTLM candidate matched parsed DC hostname; "
+            "using first non-empty machine account hash as fallback."
+        )
+    elif not fallback_nt_hash:
+        print_info_debug(
+            "[backup-ops] No non-empty machine NTLM hash candidates were found in module output."
+        )
+    return fallback_nt_hash
 
 
 def _should_mark_sysvol_cleanup(output: str) -> bool:
@@ -547,7 +579,7 @@ def offer_backup_operators_escalation(
         else:
             print_info_debug(f"[backup-ops] Parsed DC hostname: {dc_hostname}")
 
-        nt_hash = _extract_machine_nt_hash(output)
+        nt_hash = _extract_machine_nt_hash(output, dc_hostname=dc_hostname)
         if not nt_hash:
             print_warning(
                 "Backup Operators module did not return a usable machine NTLM hash."

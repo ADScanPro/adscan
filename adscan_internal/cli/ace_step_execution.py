@@ -24,20 +24,54 @@ from adscan_internal.rich_output import (
     print_info_debug,
     print_panel,
     print_info_verbose,
+    strip_sensitive_markers,
 )
 from adscan_internal.services.attack_graph_service import (
     get_node_by_label,
+    infer_directory_object_enabled_state,
     resolve_netexec_target_for_node_label,
 )
 
 
+def set_last_execution_outcome(shell: Any, outcome: dict[str, Any] | None) -> None:
+    """Persist the last execution outcome on the shell for follow-up UX."""
+    setattr(shell, "_last_ace_execution_outcome", outcome)
+
+
+def _set_last_ace_execution_outcome(
+    shell: Any, outcome: dict[str, Any] | None
+) -> None:
+    """Backwards-compatible wrapper for ACE-specific callers."""
+    set_last_execution_outcome(shell, outcome)
+
+
+def get_last_execution_outcome(shell: Any) -> dict[str, Any] | None:
+    """Return and clear the last execution outcome stored on the shell."""
+    outcome = getattr(shell, "_last_ace_execution_outcome", None)
+    if isinstance(outcome, dict):
+        setattr(shell, "_last_ace_execution_outcome", None)
+        return dict(outcome)
+    setattr(shell, "_last_ace_execution_outcome", None)
+    return None
+
+
+def get_last_ace_execution_outcome(shell: Any) -> dict[str, Any] | None:
+    """Backwards-compatible wrapper for ACE-specific callers."""
+    return get_last_execution_outcome(shell)
+
+
 def _normalize_account(value: str) -> str:
-    name = (value or "").strip()
+    name = strip_sensitive_markers(str(value or "")).strip()
     if "\\" in name:
         name = name.split("\\", 1)[1]
     if "@" in name:
         name = name.split("@", 1)[0]
     return name.strip().lower()
+
+
+def _sanitize_prompt_account(value: str) -> str:
+    """Normalize an account value captured from interactive prompts."""
+    return strip_sensitive_markers(str(value or "")).strip()
 
 
 def _node_kind(node: dict[str, Any] | None) -> str:
@@ -58,12 +92,36 @@ def _node_props(node: dict[str, Any] | None) -> dict[str, Any]:
     return props if isinstance(props, dict) else {}
 
 
-def _node_enabled(node: dict[str, Any] | None) -> bool | None:
-    props = _node_props(node)
-    enabled = props.get("enabled")
-    if isinstance(enabled, bool):
-        return enabled
-    return None
+def _infer_target_enabled(
+    shell: Any,
+    *,
+    domain: str,
+    target_kind: str,
+    to_node: dict[str, Any] | None,
+    to_label: str,
+) -> tuple[bool | None, str]:
+    """Infer whether a target is enabled using node metadata plus workspace fallbacks."""
+    try:
+        return infer_directory_object_enabled_state(
+            shell,
+            domain=domain,
+            principal_name=_node_sam_or_label(to_node, to_label),
+            principal_kind=target_kind,
+            node=to_node,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        marked_target = mark_sensitive(
+            _normalize_account(_node_sam_or_label(to_node, to_label)) or to_label,
+            "user",
+        )
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            "[ace-context] enabled-state fallback failed: "
+            f"domain={marked_domain} target={marked_target} "
+            f"reason={mark_sensitive(str(exc), 'detail')}"
+        )
+        return None, "fallback_error"
 
 
 def _node_domain(node: dict[str, Any] | None) -> str | None:
@@ -481,7 +539,13 @@ def build_ace_step_context(
 
     target_domain = _node_domain(to_node) or domain
     target_kind = _node_kind(to_node)
-    target_enabled = _node_enabled(to_node)
+    target_enabled, target_enabled_source = _infer_target_enabled(
+        shell,
+        domain=target_domain,
+        target_kind=target_kind,
+        to_node=to_node,
+        to_label=to_label,
+    )
     target_sam_or_label = _node_sam_or_label(to_node, to_label)
     marked_domain = mark_sensitive(domain, "domain")
     marked_from = mark_sensitive(from_label, "node")
@@ -497,7 +561,9 @@ def build_ace_step_context(
         f"credential_source={mark_sensitive(credential_source, 'detail')} "
         f"user_source={mark_sensitive(exec_user_source, 'detail')} "
         f"target_kind={mark_sensitive(target_kind, 'detail')} "
-        f"target_domain={mark_sensitive(target_domain, 'domain')}"
+        f"target_domain={mark_sensitive(target_domain, 'domain')} "
+        f"target_enabled={mark_sensitive(str(target_enabled), 'detail')} "
+        f"target_enabled_source={mark_sensitive(target_enabled_source, 'detail')}"
     )
 
     return AceStepContext(
@@ -525,10 +591,10 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         success via the active-step mechanism.
     """
     relation = context.relation.strip().lower()
+    set_last_execution_outcome(shell, None)
     if relation not in ACL_ACE_RELATIONS:
         return None
 
-    marked_user = mark_sensitive(context.exec_username, "user")
     marked_to = mark_sensitive(context.to_label, "node")
 
     target_kind = context.target_kind.strip().lower()
@@ -580,10 +646,28 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
 
     if relation in {"genericall", "genericwrite"}:
         if target_kind in {"user", "computer"}:
-            if context.target_enabled is False:
+            if context.target_enabled is False and target_kind == "user":
                 print_warning(f"Target {marked_to} is disabled.")
                 if Confirm.ask("Do you want to try to enable it first?", default=True):
                     if not shell.enable_user(
+                        context.domain,
+                        context.exec_username,
+                        context.exec_password,
+                        context.target_sam_or_label,
+                    ):
+                        print_warning(
+                            f"Could not enable {marked_to}. Skipping exploitation."
+                        )
+                        return False
+                else:
+                    print_warning(
+                        f"Skipping exploitation for disabled target {marked_to}."
+                    )
+                    return False
+            if context.target_enabled is False and target_kind == "computer":
+                print_warning(f"Target {marked_to} is disabled.")
+                if Confirm.ask("Do you want to try to enable it first?", default=True):
+                    if not shell.enable_computer(
                         context.domain,
                         context.exec_username,
                         context.exec_password,
@@ -622,9 +706,10 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         if target_kind == "group":
             changed_username = Prompt.ask(
                 "Enter the user you want to add",
-                default=str(marked_user),
+                default=context.exec_username,
             )
-            return shell.exploit_add_member(
+            changed_username = _sanitize_prompt_account(changed_username)
+            result = shell.exploit_add_member(
                 context.domain,
                 context.exec_username,
                 context.exec_password,
@@ -633,6 +718,20 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 context.target_domain,
                 enumerate_aces_after=False,
             )
+            if result is True:
+                _set_last_ace_execution_outcome(
+                    shell,
+                    {
+                        "key": "group_membership_changed",
+                        "domain": context.domain,
+                        "target_domain": context.target_domain,
+                        "target_group": context.target_sam_or_label,
+                        "added_user": changed_username,
+                        "exec_username": context.exec_username,
+                        "exec_password": context.exec_password,
+                    },
+                )
+            return result
 
         print_warning(
             f"GenericAll/GenericWrite exploitation not supported for target type {context.target_kind}."
@@ -640,7 +739,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         return False
 
     if relation == "addself":
-        return shell.exploit_add_member(
+        result = shell.exploit_add_member(
             context.domain,
             context.exec_username,
             context.exec_password,
@@ -649,13 +748,28 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             context.target_domain,
             enumerate_aces_after=False,
         )
+        if result is True:
+            _set_last_ace_execution_outcome(
+                shell,
+                {
+                    "key": "group_membership_changed",
+                    "domain": context.domain,
+                    "target_domain": context.target_domain,
+                    "target_group": context.target_sam_or_label,
+                    "added_user": context.exec_username,
+                    "exec_username": context.exec_username,
+                    "exec_password": context.exec_password,
+                },
+            )
+        return result
 
     if relation == "addmember":
         changed_username = Prompt.ask(
             "Enter the user you want to add",
-            default=str(marked_user),
+            default=context.exec_username,
         )
-        return shell.exploit_add_member(
+        changed_username = _sanitize_prompt_account(changed_username)
+        result = shell.exploit_add_member(
             context.domain,
             context.exec_username,
             context.exec_password,
@@ -664,6 +778,20 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             context.target_domain,
             enumerate_aces_after=False,
         )
+        if result is True:
+            _set_last_ace_execution_outcome(
+                shell,
+                {
+                    "key": "group_membership_changed",
+                    "domain": context.domain,
+                    "target_domain": context.target_domain,
+                    "target_group": context.target_sam_or_label,
+                    "added_user": changed_username,
+                    "exec_username": context.exec_username,
+                    "exec_password": context.exec_password,
+                },
+            )
+        return result
 
     if relation == "writedacl":
         target_type = (

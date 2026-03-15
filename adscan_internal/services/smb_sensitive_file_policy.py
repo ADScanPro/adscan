@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Final
 
 
@@ -57,6 +58,15 @@ HEAVY_ARTIFACT_EXTENSIONS: tuple[str, ...] = (
     ".dmp",
     ".pcap",
     ".vdi",
+)
+
+SENSITIVE_FILE_WRAPPER_EXTENSIONS: tuple[str, ...] = (
+    ".bak",
+    ".backup",
+    ".old",
+    ".orig",
+    ".tmp",
+    ".save",
 )
 
 SMB_SENSITIVE_FILE_PROFILE_TEXT_ONLY: Final[str] = "text_only"
@@ -193,6 +203,35 @@ def get_production_sensitive_scan_phase_sequence() -> tuple[str, ...]:
     )
 
 
+def resolve_effective_sensitive_extension(
+    path: str,
+    *,
+    allowed_extensions: tuple[str, ...] | set[str] | None = None,
+) -> str:
+    """Resolve the meaningful extension for backup-like filenames.
+
+    Examples:
+        ``Groups.xml`` -> ``.xml``
+        ``Groups.xml.bak`` -> ``.xml``
+        ``vault.kdbx.old`` -> ``.kdbx``
+        ``report.txt`` -> ``.txt``
+    """
+    suffixes = [suffix.casefold() for suffix in Path(str(path or "")).suffixes]
+    if not suffixes:
+        return ""
+    normalized_allowed = {
+        str(extension).strip().casefold()
+        for extension in (allowed_extensions or ())
+        if str(extension).strip()
+    }
+    for suffix in reversed(suffixes):
+        if normalized_allowed and suffix in normalized_allowed:
+            return suffix
+        if suffix not in SENSITIVE_FILE_WRAPPER_EXTENSIONS:
+            return suffix
+    return suffixes[-1]
+
+
 def get_sensitive_benchmark_profile(scope: str) -> str:
     """Map a benchmark scope into one shared CredSweeper profile."""
     normalized = str(scope or "").strip().lower()
@@ -210,6 +249,7 @@ __all__ = [
     "DIRECT_SECRET_ARTIFACT_EXTENSIONS",
     "DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS",
     "HEAVY_ARTIFACT_EXTENSIONS",
+    "SENSITIVE_FILE_WRAPPER_EXTENSIONS",
     "SMB_SENSITIVE_FILE_PROFILES",
     "SMB_SENSITIVE_FILE_PROFILE_DOCUMENTS_ONLY",
     "SMB_SENSITIVE_FILE_PROFILE_TEXT_AND_DOCUMENTS",
@@ -228,6 +268,7 @@ __all__ = [
     "get_manspider_sensitive_extensions",
     "get_sensitive_benchmark_profile",
     "get_production_sensitive_scan_phase_sequence",
+    "resolve_effective_sensitive_extension",
     "get_sensitive_phase_definition",
     "get_sensitive_phase_extensions",
     "get_sensitive_file_extensions",

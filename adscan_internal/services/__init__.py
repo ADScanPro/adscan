@@ -67,6 +67,28 @@ from .artifact_processing_tuning_service import (
     ArtifactProcessingTuning,
     choose_artifact_processing_tuning,
 )
+from .john_artifact_cracking_service import (
+    JohnArtifactCrackingResult,
+    JohnArtifactCrackingService,
+)
+from .keepass_artifact_service import (
+    KeePassArtifactProcessResult,
+    KeePassArtifactService,
+    KeePassEntryRecord,
+)
+from .winrm_exclusion_policy import (
+    WINRM_GLOBAL_EXCLUDED_DIRECTORY_NAMES,
+    WINRM_GLOBAL_EXCLUDED_PATH_PREFIXES,
+    WINRM_ROOT_STRATEGY_AUTO,
+    get_winrm_excluded_directory_names,
+    get_winrm_excluded_path_prefixes,
+)
+from .winrm_file_mapping_service import (
+    WinRMFileMapEntry,
+    WinRMFileMappingService,
+)
+from .winrm_backend_service import WinRMExecutionBackend, build_winrm_backend
+from .winrm_psrp_service import WinRMPSRPError, WinRMPSRPExecutionResult, WinRMPSRPService
 from .share_map_ai_triage_service import ShareMapAITriageService
 from .impacket_smb_byte_reader_service import (
     ImpacketSMBByteReaderService,
@@ -163,6 +185,23 @@ __all__ = [
     "choose_rclone_tuning",
     "ArtifactProcessingTuning",
     "choose_artifact_processing_tuning",
+    "JohnArtifactCrackingResult",
+    "JohnArtifactCrackingService",
+    "KeePassArtifactProcessResult",
+    "KeePassArtifactService",
+    "KeePassEntryRecord",
+    "WINRM_GLOBAL_EXCLUDED_DIRECTORY_NAMES",
+    "WINRM_GLOBAL_EXCLUDED_PATH_PREFIXES",
+    "WINRM_ROOT_STRATEGY_AUTO",
+    "WinRMFileMapEntry",
+    "WinRMFileMappingService",
+    "WinRMExecutionBackend",
+    "build_winrm_backend",
+    "get_winrm_excluded_directory_names",
+    "get_winrm_excluded_path_prefixes",
+    "WinRMPSRPError",
+    "WinRMPSRPExecutionResult",
+    "WinRMPSRPService",
     "ShareMapAITriageService",
     "ImpacketSMBByteReaderService",
     "SMBByteReadResult",

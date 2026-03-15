@@ -40,6 +40,8 @@ class SprayEligibilityResult:
         excluded_users: Excluded users with reasons (in file order).
         lockout_threshold: Parsed domain lockout threshold (if available).
         safe_remaining_threshold: Safety threshold used for eligibility.
+        minimum_remaining_attempts: Minimum remaining attempts across eligible
+            principals after considering current BadPwdCount values.
         used_policy_data: True when lockout policy/badpwd counts were used.
         notes: Human-readable notes about fallbacks/limitations.
     """
@@ -49,6 +51,7 @@ class SprayEligibilityResult:
     excluded_users: list[ExcludedUser]
     lockout_threshold: Optional[int]
     safe_remaining_threshold: int
+    minimum_remaining_attempts: Optional[int]
     used_policy_data: bool
     notes: list[str]
 
@@ -300,6 +303,7 @@ def compute_spray_eligibility(
             excluded_users=[],
             lockout_threshold=lockout_threshold,
             safe_remaining_threshold=safe_remaining_threshold,
+            minimum_remaining_attempts=None,
             used_policy_data=False,
             notes=notes,
         )
@@ -325,12 +329,14 @@ def compute_spray_eligibility(
             excluded_users=[],
             lockout_threshold=lockout_threshold,
             safe_remaining_threshold=safe_remaining_threshold,
+            minimum_remaining_attempts=None,
             used_policy_data=False,
             notes=notes,
         )
 
     assert lockout_threshold is not None
     assert badpwd_by_user is not None
+    minimum_remaining_attempts: int | None = None
 
     for user in file_users:
         norm_user = normalize_username(user)
@@ -349,6 +355,10 @@ def compute_spray_eligibility(
         remaining = lockout_threshold - badpwd
         if remaining > safe_remaining_threshold:
             eligible.append(user)
+            if minimum_remaining_attempts is None:
+                minimum_remaining_attempts = remaining
+            else:
+                minimum_remaining_attempts = min(minimum_remaining_attempts, remaining)
         else:
             excluded.append(
                 ExcludedUser(
@@ -365,6 +375,7 @@ def compute_spray_eligibility(
         excluded_users=excluded,
         lockout_threshold=lockout_threshold,
         safe_remaining_threshold=safe_remaining_threshold,
+        minimum_remaining_attempts=minimum_remaining_attempts,
         used_policy_data=True,
         notes=notes,
     )

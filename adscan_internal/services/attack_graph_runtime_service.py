@@ -173,10 +173,17 @@ def active_step(
 __all__ = [
     "ActiveAttackGraphStep",
     "active_step",
+    "active_step_followup",
+    "clear_attack_path_step_context",
     "clear_active_step",
     "clear_attack_path_execution",
+    "clear_attack_path_followup_context",
+    "get_attack_path_followup_context",
+    "get_attack_path_step_context",
     "is_attack_path_execution_active",
     "set_attack_path_execution",
+    "set_attack_path_followup_context",
+    "set_attack_path_step_context",
     "set_active_step",
     "update_active_step_status",
 ]
@@ -200,8 +207,87 @@ def clear_attack_path_execution(shell: Any) -> None:
     except Exception:
         pass
     setattr(shell, "_attack_path_execution_active", False)
+    setattr(shell, "_attack_path_step_context", None)
+    setattr(shell, "_attack_path_followup_context", None)
 
 
 def is_attack_path_execution_active(shell: Any) -> bool:
     """Return True when an attack path execution is active."""
     return bool(getattr(shell, "_attack_path_execution_active", False))
+
+
+def set_attack_path_step_context(
+    shell: Any,
+    *,
+    search_mode_label: str | None,
+    step_index: int,
+    last_executable_idx: int,
+) -> None:
+    """Persist lightweight runtime metadata for the current attack-path step."""
+    setattr(
+        shell,
+        "_attack_path_step_context",
+        {
+            "search_mode_label": str(search_mode_label or "").strip(),
+            "step_index": int(step_index),
+            "last_executable_idx": int(last_executable_idx),
+        },
+    )
+
+
+def set_attack_path_followup_context(
+    shell: Any,
+    *,
+    source: str,
+    title: str,
+) -> None:
+    """Persist lightweight runtime metadata for a nested attack-path follow-up."""
+    setattr(
+        shell,
+        "_attack_path_followup_context",
+        {
+            "source": str(source or "").strip(),
+            "title": str(title or "").strip(),
+        },
+    )
+
+
+def clear_attack_path_followup_context(shell: Any) -> None:
+    """Clear runtime metadata for a nested attack-path follow-up."""
+    setattr(shell, "_attack_path_followup_context", None)
+
+
+def get_attack_path_followup_context(shell: Any) -> dict[str, object]:
+    """Return runtime metadata for a nested attack-path follow-up."""
+    payload = getattr(shell, "_attack_path_followup_context", None)
+    if isinstance(payload, dict):
+        return dict(payload)
+    return {}
+
+
+@contextmanager
+def active_step_followup(
+    shell: Any,
+    *,
+    source: str,
+    title: str,
+) -> Iterator[None]:
+    """Context manager that marks a nested attack-path follow-up as active."""
+    set_attack_path_followup_context(shell, source=source, title=title)
+    try:
+        yield None
+    finally:
+        clear_attack_path_followup_context(shell)
+
+
+def clear_attack_path_step_context(shell: Any) -> None:
+    """Clear runtime metadata for the current attack-path step."""
+    setattr(shell, "_attack_path_step_context", None)
+
+
+def get_attack_path_step_context(shell: Any) -> dict[str, object]:
+    """Return runtime metadata for the current attack-path step."""
+    payload = getattr(shell, "_attack_path_step_context", None)
+    if isinstance(payload, dict):
+        return dict(payload)
+    return {}

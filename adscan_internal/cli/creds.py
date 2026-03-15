@@ -14,7 +14,7 @@ import sys
 from typing import Any
 
 from rich.panel import Panel
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
@@ -539,26 +539,21 @@ def handle_auth_and_optional_privs(
     print_info_debug(
         f"[creds] handle_auth_and_optional_privs post-enum: auth={updated_auth_status!r}"
     )
-    if not prompt_for_user_privs_after:
-        print_info_debug(
-            "[creds] skipping ask_for_user_privs "
-            f"(auth={updated_auth_status!r}, prompt={prompt_for_user_privs_after})"
-        )
-        return
-    if updated_auth_status == "pwned":
-        print_info_debug(
-            "[creds] skipping ask_for_user_privs "
-            "(auth='pwned')"
-        )
-        return
-
     try:
         from adscan_internal.services.attack_graph_runtime_service import (
             ActiveAttackGraphStep,
+            get_attack_path_followup_context,
+            get_attack_path_step_context,
             is_attack_path_execution_active,
         )
     except Exception:  # noqa: BLE001
         ActiveAttackGraphStep = object  # type: ignore[misc,assignment]
+
+        def get_attack_path_step_context(_shell: Any) -> dict[str, object]:
+            return {}
+
+        def get_attack_path_followup_context(_shell: Any) -> dict[str, object]:
+            return {}
 
         def is_attack_path_execution_active(_shell: Any) -> bool:
             return False
@@ -567,6 +562,32 @@ def handle_auth_and_optional_privs(
         is_user_tier0_or_high_value,
         normalize_samaccountname,
     )
+
+    def _is_terminal_pivot_attack_step() -> bool:
+        """Return True when the active step is the final actionable pivot step."""
+        context = get_attack_path_step_context(shell)
+        search_mode = str(context.get("search_mode_label") or "").strip().lower()
+        try:
+            step_index = int(context.get("step_index") or 0)
+            last_executable_idx = int(context.get("last_executable_idx") or 0)
+        except (TypeError, ValueError):
+            print_info_debug(
+                "[creds] terminal pivot check: invalid attack-path step context "
+                f"context={mark_sensitive(str(context), 'detail')}"
+            )
+            return False
+        is_terminal_pivot = (
+            search_mode == "pivot search"
+            and step_index > 0
+            and step_index == last_executable_idx
+        )
+        print_info_debug(
+            "[creds] terminal pivot check: "
+            f"search_mode={mark_sensitive(search_mode or 'none', 'detail')} "
+            f"step_index={step_index} last_executable_idx={last_executable_idx} "
+            f"result={is_terminal_pivot!r}"
+        )
+        return is_terminal_pivot
 
     def _resolve_active_step_execution_user() -> str | None:
         """Best-effort extraction of the 'execution user' for the active step."""
@@ -592,10 +613,122 @@ def handle_auth_and_optional_privs(
                 return normalized
         return None
 
+    def _run_terminal_pivot_user_followups(user: str, credential: str) -> bool:
+        """Offer lightweight follow-ups for user creds gained at the end of a pivot path."""
+        attack_path_active = is_attack_path_execution_active(shell)
+        if not attack_path_active:
+            print_info_debug(
+                "[creds] terminal pivot follow-up gate: disabled "
+                "(attack path execution inactive)"
+            )
+            return False
+        followup_context = get_attack_path_followup_context(shell)
+        if followup_context:
+            print_info_debug(
+                "[creds] terminal pivot follow-up gate: disabled "
+                "(nested attack-path follow-up active) "
+                f"context={mark_sensitive(str(followup_context), 'detail')}"
+            )
+            return False
+        if not _is_terminal_pivot_attack_step():
+            print_info_debug(
+                "[creds] terminal pivot follow-up gate: disabled "
+                "(active step is not the terminal pivot step)"
+            )
+            return False
+
+        normalized_user = normalize_samaccountname(user)
+        active_step_user = _resolve_active_step_execution_user()
+        step_context = get_attack_path_step_context(shell)
+        print_info_debug(
+            "[creds] terminal pivot follow-up evaluation: "
+            f"user={mark_sensitive(normalized_user or user, 'user')} "
+            f"active_step_user={mark_sensitive(active_step_user or 'N/A', 'user')} "
+            f"step_context={mark_sensitive(str(step_context), 'detail')}"
+        )
+        if not normalized_user:
+            print_info_debug(
+                "[creds] terminal pivot follow-up gate: disabled "
+                "(credential user could not be normalized)"
+            )
+            return False
+        if active_step_user and normalized_user == active_step_user:
+            print_info_debug(
+                "[creds] skipping terminal pivot user follow-ups "
+                "(credential belongs to active step execution user)"
+            )
+            return False
+
+        try:
+            from adscan_internal.cli.attack_step_followups import (
+                build_followups_for_execution_outcome,
+                execute_guided_followup_actions,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_verbose(
+                f"Failed to load pivot follow-up helpers for {mark_sensitive(user, 'user')}: {exc}"
+            )
+            return False
+
+        followups = build_followups_for_execution_outcome(
+            shell,
+            outcome={
+                "key": "user_credential_obtained",
+                "domain": domain,
+                "target_domain": domain,
+                "compromised_user": user,
+                "credential": credential,
+                "credential_type": (
+                    "hash"
+                    if callable(getattr(shell, "is_hash", None))
+                    and bool(shell.is_hash(credential))
+                    else "password"
+                ),
+            },
+        )
+        if not followups:
+            print_info_debug(
+                "[creds] terminal pivot follow-up gate: disabled "
+                "(no follow-ups resolved for runtime outcome)"
+            )
+            return False
+
+        print_info_debug(
+            "[creds] terminal pivot follow-up gate: enabled "
+            f"(resolved_followups={len(followups)})"
+        )
+        execute_guided_followup_actions(
+            shell,
+            step_action="Credential Added",
+            target_label=f"{normalized_user}@{domain}",
+            followups=followups,
+        )
+        return True
+
+    should_offer_standard_user_privs = (
+        prompt_for_user_privs_after and updated_auth_status != "pwned"
+    )
+    if not should_offer_standard_user_privs:
+        if not prompt_for_user_privs_after:
+            print_info_debug(
+                "[creds] standard ask_for_user_privs disabled by caller "
+                f"(auth={updated_auth_status!r}, prompt={prompt_for_user_privs_after})"
+            )
+        elif updated_auth_status == "pwned":
+            print_info_debug(
+                "[creds] standard ask_for_user_privs disabled because domain is pwned"
+            )
+
     for user, cred in users_with_creds:
         if not user or not cred:
             continue
         try:
+            if _run_terminal_pivot_user_followups(user, cred):
+                continue
+            if not should_offer_standard_user_privs:
+                continue
+
             attack_path_active = is_attack_path_execution_active(shell)
             active_step_user = _resolve_active_step_execution_user()
             normalized_user = normalize_samaccountname(user)
@@ -724,6 +857,11 @@ def add_credential(
     )
 
     store_service = CredentialStoreService()
+    normalized_domain = str(domain or "").strip().rstrip(".").lower()
+    if not normalized_domain:
+        print_error("Domain credential cannot be stored without a valid domain name.")
+        return
+    domain = normalized_domain
 
     if not skip_hash_cracking and not ui_silent:
         # Professional credential addition header
@@ -2357,12 +2495,13 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
             title=title,
             show_header=True,
             header_style="bold magenta",
+            expand=True,
         )
         table.add_column("#", style="dim", width=4, justify="right")
-        table.add_column("Value", style="cyan", no_wrap=False, max_width=50)
+        table.add_column("Value", style="cyan", no_wrap=False, max_width=72, overflow="ellipsis")
         table.add_column("ML Confidence", style="green", justify="right", width=12)
         table.add_column("Seen", style="magenta", justify="right", width=6)
-        table.add_column("Sources", style="dim", no_wrap=False, max_width=60)
+        table.add_column("Sources", style="dim", no_wrap=False, max_width=96, overflow="fold")
 
         for idx, (
             value,
@@ -2371,19 +2510,16 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
             line_num,
             file_path,
             occurrence_count,
-            source_preview,
+            sources,
         ) in enumerate(
             creds_list_sorted, 1
         ):
-            # Truncate value for display
             if value is None:
                 display_value = ""
             elif isinstance(value, str):
-                display_value = value[:47] + "..." if len(value) > 50 else value
+                display_value = value
             else:
-                display_value = (
-                    str(value)[:47] + "..." if len(str(value)) > 50 else str(value)
-                )
+                display_value = str(value)
 
             # Handle ml_prob safely (can be None or non-numeric)
             if ml_prob is None:
@@ -2399,7 +2535,7 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
                 display_value,
                 ml_display,
                 str(occurrence_count),
-                source_preview or "N/A",
+                summarize_credential_sources(shell, sources) or "N/A",
             )
 
         panels.append(Panel(table, border_style="blue"))
@@ -2413,7 +2549,7 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
 
 def aggregate_credentials_for_display(
     creds_list: list[tuple[Any, Any, Any, Any, Any]],
-) -> list[tuple[Any, Any, Any, Any, Any, int, str]]:
+) -> list[tuple[Any, Any, Any, Any, Any, int, list[tuple[str, int | None]]]]:
     """Aggregate duplicate credential values for table display.
 
     Duplicates are grouped by credential value. The representative entry keeps
@@ -2460,7 +2596,7 @@ def aggregate_credentials_for_display(
                 item["line_num"],
                 item["file_path"],
                 int(item["occurrence_count"]),
-                summarize_credential_sources(item["sources"]),
+                list(item["sources"]),
             )
             for item in aggregated.values()
         ],
@@ -2473,26 +2609,126 @@ def aggregate_credentials_for_display(
     )
 
 
-def build_credential_source_display(file_path: Any, line_num: Any) -> str:
-    """Build one compact source string for one credential occurrence."""
+def build_credential_source_display(
+    file_path: Any,
+    line_num: Any,
+) -> tuple[str, int | None] | None:
+    """Build one normalized source tuple for one credential occurrence."""
     normalized_path = str(file_path or "").strip()
     if not normalized_path:
-        return ""
+        return None
     if line_num is None:
-        return normalized_path
+        return (normalized_path, None)
     try:
-        return f"{normalized_path}:{int(line_num)}"
+        return (normalized_path, int(line_num))
     except (TypeError, ValueError):
-        return normalized_path
+        return (normalized_path, None)
+
+
+def _get_workspace_root(shell: Any) -> str:
+    """Return the current workspace root when available."""
+    workspace_root = str(getattr(shell, "current_workspace_dir", "") or "").strip()
+    if workspace_root:
+        return os.path.abspath(workspace_root)
+    workspace_cwd_getter = getattr(shell, "_get_workspace_cwd", None)
+    if callable(workspace_cwd_getter):
+        workspace_root = str(workspace_cwd_getter() or "").strip()
+    return os.path.abspath(workspace_root) if workspace_root else ""
+
+
+def _relativize_credential_loot_path(shell: Any, file_path: str) -> str:
+    """Return a workspace-relative loot path when possible."""
+    normalized_path = os.path.abspath(str(file_path or "").strip())
+    workspace_root = _get_workspace_root(shell)
+    if workspace_root:
+        try:
+            common = os.path.commonpath([workspace_root, normalized_path])
+        except ValueError:
+            common = ""
+        if common == workspace_root:
+            return os.path.relpath(normalized_path, workspace_root)
+    return normalized_path
+
+
+def _derive_credential_origin_path(file_path: str) -> str:
+    """Derive a logical remote/source path from a local loot path when possible."""
+    raw_path = str(file_path or "").strip()
+    normalized = raw_path.replace("\\", "/")
+    if not normalized:
+        return ""
+
+    if "!/" in normalized:
+        outer_path, internal_path = normalized.split("!/", 1)
+        outer_origin = _derive_credential_origin_path(outer_path)
+        if outer_origin:
+            return f"{outer_origin}!/{internal_path}"
+        return f"{outer_path}!/{internal_path}"
+
+    if "/winrm/sensitive/" in normalized and "/loot/" in normalized:
+        relative = normalized.split("/loot/", 1)[1].strip("/")
+        parts = [part for part in relative.split("/") if part]
+        if parts:
+            drive = ""
+            remainder = parts
+            if parts[0].endswith("_drive"):
+                drive = parts[0].split("_drive", 1)[0].upper() + ":"
+                remainder = parts[1:]
+            remote_tail = "\\".join(remainder)
+            if drive and remote_tail:
+                return f"WinRM {drive}\\{remote_tail}"
+            if drive:
+                return f"WinRM {drive}\\"
+
+    if "/smb/rclone/" in normalized and "/loot/" in normalized:
+        relative = normalized.split("/loot/", 1)[1].strip("/")
+        parts = [part for part in relative.split("/") if part]
+        if len(parts) >= 2:
+            host, share = parts[0], parts[1]
+            remote_tail = "/".join(parts[2:])
+            if remote_tail:
+                return f"SMB {host}/{share}/{remote_tail}"
+            return f"SMB {host}/{share}"
+
+    if "/smb/cifs/mounts/" in normalized:
+        relative = normalized.split("/smb/cifs/mounts/", 1)[1].strip("/")
+        parts = [part for part in relative.split("/") if part]
+        if len(parts) >= 2:
+            host, share = parts[0], parts[1]
+            remote_tail = "/".join(parts[2:])
+            if remote_tail:
+                return f"SMB {host}/{share}/{remote_tail}"
+            return f"SMB {host}/{share}"
+
+    return ""
+
+
+def _format_credential_source(
+    shell: Any,
+    *,
+    file_path: str,
+    line_num: int | None,
+) -> str:
+    """Format one credential source for display."""
+    line_suffix = f":{line_num}" if isinstance(line_num, int) and line_num > 0 else ""
+    origin = _derive_credential_origin_path(file_path)
+    if origin:
+        return f"{origin}{line_suffix}"
+    relative_path = _relativize_credential_loot_path(shell, file_path)
+    return f"{relative_path}{line_suffix}"
 
 
 def summarize_credential_sources(
-    sources: list[str],
+    shell: Any,
+    sources: list[tuple[str, int | None]],
     *,
     max_items: int = 3,
 ) -> str:
     """Return a compact preview of where one credential value appeared."""
-    normalized_sources = [str(source or "").strip() for source in sources if str(source or "").strip()]
+    normalized_sources = [
+        _format_credential_source(shell, file_path=path, line_num=line_num)
+        for path, line_num in sources
+        if str(path or "").strip()
+    ]
     if not normalized_sources:
         return ""
     preview_items = normalized_sources[:max_items]
@@ -2684,86 +2920,32 @@ def handle_found_credentials(
 
     # Handle all credentials for password spraying
     if sprayable_credentials:
-        # Get auto_mode from shell
-        auto_mode = getattr(shell, "auto", False)
-
-        # Select credential for spraying
-        selected_credential = select_password_for_spraying(
-            shell, sprayable_credentials, auto_mode=auto_mode
-        )
-
-        if selected_credential is None:
-            print_info("Password spraying cancelled.")
-            if len(sprayable_credentials) > 1:
-                print_warning(
-                    f"[!] Multiple sprayable credentials found ({len(sprayable_credentials)} total). "
-                    f"Only one credential can be used for automated password spraying. "
-                    f"All credentials have been saved to smb/spidering/ directory. "
-                    f"You can manually perform password spraying with the other credentials later, "
-                    f"but be careful not to lock accounts. Wait at least 1 hour between "
-                    f"password spraying attempts (or as specified in the password policy)."
-                )
-            return
-
-        # Ask user if they want to perform password spraying
         if domain not in shell.domains:
             marked_domain = mark_sensitive(domain, "domain")
             print_warning(
                 f"Domain '{marked_domain}' is not configured. Cannot perform password spraying."
             )
-            if len(sprayable_credentials) > 1:
-                print_warning(
-                    f"Multiple sprayable credentials found ({len(sprayable_credentials)} total). "
-                    f"All credentials have been saved to smb/spidering/ directory. "
-                    f"You can manually perform password spraying with them later, "
-                    f"but be careful not to lock accounts. Wait at least 1 hour between "
-                    f"password spraying attempts (or as specified in the password policy)."
-                )
             return
 
-        # Show selected credential (truncated)
-        if len(selected_credential) > 50:
-            display_credential = selected_credential[:50] + "..."
-        else:
-            display_credential = selected_credential
-        print_info(f"Selected credential for spraying: {display_credential}")
+        from adscan_internal.services.share_credential_provenance_service import (
+            ShareCredentialProvenanceService,
+        )
 
-        if len(sprayable_credentials) > 1:
-            print_warning(
-                f"Note: {len(sprayable_credentials)} sprayable credentials were found. "
-                f"Only the selected credential will be used for automated spraying. "
-                f"All credentials have been saved to smb/spidering/ directory. "
-                f"You can manually perform password spraying with the other credentials later, "
-                f"but be careful not to lock accounts. Wait at least 1 hour between "
-                f"password spraying attempts (or as specified in the password policy)."
-            )
-
-        marked_domain = mark_sensitive(domain, "domain")
-        if Confirm.ask(
-            f"Do you want to perform password spraying on domain {marked_domain} using the selected credential?",
-            default=True,
-        ):
-            from adscan_internal.services.share_credential_provenance_service import (
-                ShareCredentialProvenanceService,
-            )
-
-            provenance_service = ShareCredentialProvenanceService()
-            source_context = provenance_service.build_source_context(
-                hosts=source_hosts,
-                shares=source_shares,
-                artifact=source_artifact,
-                auth_username=auth_username,
-                origin="share_spidering",
-                include_origin_without_fields=False,
-            )
-            # Perform password spraying with the selected credential
-            shell.spraying_with_password(
-                domain,
-                selected_credential,
-                source_context=source_context,
-            )
-        else:
-            print_info("Password spraying cancelled by user.")
+        provenance_service = ShareCredentialProvenanceService()
+        source_context = provenance_service.build_source_context(
+            hosts=source_hosts,
+            shares=source_shares,
+            artifact=source_artifact,
+            auth_username=auth_username,
+            origin="share_spidering",
+            include_origin_without_fields=False,
+        )
+        shell.spraying_with_passwords(
+            domain,
+            [str(credential or "").strip() for credential, *_ in sprayable_credentials],
+            source_context=source_context,
+            source_label="CredSweeper share findings",
+        )
     else:
         print_info(
             "No sprayable credentials found for automated spraying. "

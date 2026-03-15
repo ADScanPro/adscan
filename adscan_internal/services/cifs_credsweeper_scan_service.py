@@ -16,6 +16,10 @@ from adscan_internal import print_info_debug, print_info_verbose
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.cifs_share_mapping_service import CIFSShareMappingService
 from adscan_internal.services.credsweeper_service import CredSweeperService
+from adscan_internal.services.credsweeper_service import (
+    CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
+    CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
+)
 from adscan_internal.services.smb_exclusion_policy import (
     is_globally_excluded_smb_relative_path,
     prune_excluded_walk_dirs,
@@ -23,6 +27,7 @@ from adscan_internal.services.smb_exclusion_policy import (
 from adscan_internal.services.smb_sensitive_file_policy import (
     DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
     get_sensitive_file_profile,
+    resolve_effective_sensitive_extension,
 )
 
 
@@ -274,6 +279,7 @@ class CIFSCredSweeperScanService(BaseService):
                     credsweeper_path=credsweeper_path,
                     json_output_dir=json_output_dir,
                     include_custom_rules=True,
+                    rules_profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
                     doc=True,
                     depth=document_depth,
                 )
@@ -281,10 +287,12 @@ class CIFSCredSweeperScanService(BaseService):
             print_info_verbose(
                 f"Analyzing mounted text file with CredSweeper: {file_path_str}"
             )
-            return credsweeper_service.analyze_file(
+            return credsweeper_service.analyze_file_with_options(
                 file_path_str,
                 credsweeper_path=credsweeper_path,
                 json_output_dir=json_output_dir,
+                include_custom_rules=True,
+                rules_profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
             )
         except Exception:
             self.logger.exception(
@@ -299,7 +307,10 @@ class CIFSCredSweeperScanService(BaseService):
         profile_groups = get_sensitive_file_profile(profile or CIFSCredSweeperScanService.DEFAULT_PROFILE)
         text_extensions = set(profile_groups["text_like"])
         document_extensions = set(profile_groups["document_like"])
-        suffix = file_path.suffix.lower()
+        suffix = resolve_effective_sensitive_extension(
+            str(file_path),
+            allowed_extensions=tuple(text_extensions | document_extensions),
+        )
         if suffix in text_extensions:
             return "text"
         if suffix in document_extensions:

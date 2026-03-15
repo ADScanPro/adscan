@@ -15,12 +15,16 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import logging
 import os
 import subprocess
 from pathlib import Path
 import shlex
 import shutil
+import zipfile
+
+from rich.markup import escape as rich_escape
 
 from adscan_internal import (
     print_info_verbose,
@@ -34,7 +38,12 @@ from adscan_internal import (
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.services.base_service import BaseService
-from adscan_internal.services.credsweeper_service import CredSweeperService
+from adscan_internal.services.credsweeper_service import (
+    CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
+    CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
+    CredSweeperService,
+    get_default_credsweeper_jobs,
+)
 from adscan_internal.services.share_file_analyzer_service import (
     ShareFileAnalyzerService,
 )
@@ -46,9 +55,15 @@ from adscan_internal.services.smb_exclusion_policy import (
     prune_excluded_walk_dirs,
 )
 from adscan_internal.services.smb_sensitive_file_policy import (
+    DIRECT_SECRET_ARTIFACT_EXTENSIONS,
+    DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS,
+    SENSITIVE_FILE_WRAPPER_EXTENSIONS,
     SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
     SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+    TEXT_LIKE_CREDENTIAL_EXTENSIONS,
+    resolve_effective_sensitive_extension,
 )
+from adscan_internal.services.xml_sanitization_service import create_analysis_temp_root
 from adscan_internal import telemetry
 
 
@@ -56,6 +71,26 @@ logger = logging.getLogger(__name__)
 
 
 CommandExecutor = Callable[..., subprocess.CompletedProcess[str] | None]
+HandleFoundCredentialsCallback = Callable[
+    [dict, str, list[str] | None, list[str] | None, str | None, str | None], None
+]
+_ZIP_SELECTIVE_MAX_SUPPORTED_ENTRIES = 256
+_ZIP_SELECTIVE_MAX_TOTAL_BYTES = 200 * 1024 * 1024
+_ZIP_SELECTIVE_PREVIEW_LIMIT = 5
+_ZIP_SELECTIVE_MAX_DEPTH = 1
+
+
+@dataclass(frozen=True)
+class ArtifactProcessingRecord:
+    """Structured outcome for one artifact or structured file processed locally."""
+
+    path: str
+    filename: str
+    artifact_type: str
+    status: str
+    note: str
+    manual_review: bool = False
+    details: dict[str, object] | None = None
 
 
 class SpideringService(BaseService):
@@ -88,6 +123,12 @@ class SpideringService(BaseService):
             [str, str, str, list[str] | None, list[str] | None, str | None], bool
         ]
         | None = None,
+        keepass_artifact_callback: Callable[
+            [str, str, list[str] | None, list[str] | None, str | None], int
+        ]
+        | None = None,
+        handle_found_credentials_callback: HandleFoundCredentialsCallback | None = None,
+        credsweeper_path: str | None = None,
         pypykatz_path: str | None = None,
         share_file_analyzer_service: ShareFileAnalyzerService | None = None,
         share_file_finding_action_service: ShareFileFindingActionService | None = None,
@@ -109,6 +150,9 @@ class SpideringService(BaseService):
         self._extract_zip_callback = extract_zip_callback
         self._add_credential_callback = add_credential_callback
         self._cpassword_callback = cpassword_callback
+        self._keepass_artifact_callback = keepass_artifact_callback
+        self._handle_found_credentials_callback = handle_found_credentials_callback
+        self._credsweeper_path = str(credsweeper_path or "").strip()
         self._pypykatz_path = pypykatz_path
         self._share_file_analyzer_service = (
             share_file_analyzer_service
@@ -124,6 +168,7 @@ class SpideringService(BaseService):
                 file2john_callback=self._file2john_callback,
                 cpassword_callback=self._cpassword_callback,
                 certipy_callback=self._certipy_callback,
+                keepass_artifact_callback=self._keepass_artifact_callback,
             )
         )
 
@@ -300,7 +345,7 @@ class SpideringService(BaseService):
                 )
                 print_info_debug(
                     "Deterministic structured XML candidates selected via ripgrep: "
-                    f"phase={phase} count={len(xml_candidates)} preview=[{preview}]"
+                    f"phase={phase} count={len(xml_candidates)} preview=[{rich_escape(preview)}]"
                 )
 
         for dirpath, dirnames, filenames in os.walk(root):
@@ -314,7 +359,12 @@ class SpideringService(BaseService):
                     continue
                 if is_globally_excluded_smb_relative_path(relative_path):
                     continue
-                scan_type = remaining_suffixes.get(file_path.suffix.casefold())
+                scan_type = remaining_suffixes.get(
+                    resolve_effective_sensitive_extension(
+                        str(file_path),
+                        allowed_extensions=tuple(remaining_suffixes.keys()),
+                    )
+                )
                 if scan_type:
                     candidates.append((str(file_path), scan_type))
 
@@ -361,13 +411,16 @@ class SpideringService(BaseService):
             return None
 
         command = " ".join(
-            [
-                shlex.quote(rg_path),
-                "-l",
-                "-0",
-                "-i",
-                "--iglob",
-                shlex.quote("*.xml"),
+            [shlex.quote(rg_path), "-l", "-0", "-i"]
+            + [
+                part
+                for glob in (
+                    ["*.xml"]
+                    + [f"*.xml{wrapper}" for wrapper in SENSITIVE_FILE_WRAPPER_EXTENSIONS]
+                )
+                for part in ("--iglob", shlex.quote(glob))
+            ]
+            + [
                 shlex.quote(r"cpassword\s*="),
                 shlex.quote(str(root)),
             ]
@@ -425,13 +478,16 @@ class SpideringService(BaseService):
         auth_username: str | None = None,
         enable_legacy_zip_callbacks: bool = True,
         apply_actions: bool = True,
-    ) -> None:
-        """Process a manspider-discovered file according to its extension."""
+        zip_depth: int = 0,
+    ) -> ArtifactProcessingRecord:
+        """Process one discovered file and return a structured result."""
         filename = os.path.basename(file_path)
         filename_lower = filename.lower()
+        effective_suffix = resolve_effective_sensitive_extension(filename_lower)
+        artifact_type = effective_suffix.lstrip(".") or (Path(filename_lower).suffix.lstrip(".") or "file")
 
-        if filename_lower.endswith(".xml") and scan_type == "gpp":
-            self._process_gpp_xml_file(
+        if effective_suffix == ".xml" and scan_type == "gpp":
+            return self._process_gpp_xml_file(
                 file_path=file_path,
                 domain=domain,
                 filename=filename,
@@ -440,50 +496,79 @@ class SpideringService(BaseService):
                 auth_username=auth_username,
                 apply_actions=apply_actions,
             )
-            return
 
-        if filename_lower.endswith((".yml", ".yaml")) and scan_type == "gpp":
-            self._process_yml_file(
+        if effective_suffix in {".yml", ".yaml"} and scan_type == "gpp":
+            return self._process_yml_file(
                 file_path=file_path,
                 domain=domain,
                 filename=filename,
                 apply_actions=apply_actions,
             )
-            return
 
-        if filename_lower.endswith(".xlsm") and scan_type == "ext":
-            self._process_xlsm_file(
+        if effective_suffix == ".xlsm" and scan_type == "ext":
+            return self._process_xlsm_file(
                 file_path=file_path,
                 domain=domain,
                 filename=filename,
                 apply_actions=apply_actions,
             )
-            return
 
-        if filename_lower.endswith(".dmp") and scan_type == "ext":
+        if effective_suffix == ".dmp" and scan_type == "ext":
             print_warning(f"Memory dump file found: {filename}")
-            self._process_dmp_file(file_path, domain, apply_actions=apply_actions)
-            return
+            return self._process_dmp_file(file_path, domain, apply_actions=apply_actions)
 
-        if filename_lower.endswith(".pfx") and scan_type == "ext":
+        if effective_suffix == ".pfx" and scan_type == "ext":
             print_info_verbose(f"Found .pfx file: {filename}")
-            self._process_pfx_file(
+            return self._process_pfx_file(
                 file_path=file_path,
                 domain=domain,
                 apply_actions=apply_actions,
             )
-            return
 
-        if filename_lower.endswith(".zip") and scan_type == "ext":
+        if effective_suffix in {".kdbx", ".kdb"} and scan_type == "ext":
+            print_info_verbose(f"Found KeePass artifact: {filename}")
+            return self._process_keepass_file(
+                file_path=file_path,
+                domain=domain,
+                source_hosts=source_hosts,
+                source_shares=source_shares,
+                auth_username=auth_username,
+                apply_actions=apply_actions,
+            )
+
+        if effective_suffix == ".zip" and scan_type == "ext":
             print_info_verbose(f"Found .zip file: {filename}")
             if enable_legacy_zip_callbacks and self._list_zip_callback:
                 self._list_zip_callback(file_path)
             if enable_legacy_zip_callbacks and self._extract_zip_callback:
                 self._extract_zip_callback(file_path, domain)
-            self._process_zip_file(file_path, domain, apply_actions=apply_actions)
-            return
+            return self._process_zip_file(
+                file_path,
+                domain,
+                source_hosts=source_hosts,
+                source_shares=source_shares,
+                auth_username=auth_username,
+                apply_actions=apply_actions,
+                zip_depth=zip_depth,
+            )
 
-        print_warning(f"No interesting information found in {scan_type}")
+        manual_review_note = (
+            "ADscan does not have deterministic support for this artifact type yet. "
+            "Review the saved loot path manually."
+        )
+        marked_path = mark_sensitive(file_path, "path")
+        print_warning(
+            f"Unsupported artifact requires manual review: {marked_path} "
+            f"({mark_sensitive(filename, 'path')})"
+        )
+        return ArtifactProcessingRecord(
+            path=file_path,
+            filename=filename,
+            artifact_type=artifact_type,
+            status="manual_review",
+            note=manual_review_note,
+            manual_review=True,
+        )
 
     def process_found_files_batch(
         self,
@@ -497,7 +582,7 @@ class SpideringService(BaseService):
         enable_legacy_zip_callbacks: bool = True,
         apply_actions: bool = True,
         max_workers: int = 1,
-    ) -> None:
+    ) -> list[ArtifactProcessingRecord]:
         """Process multiple found files, optionally in parallel.
 
         Parallel execution is only enabled for the safe, analysis-only case
@@ -507,7 +592,7 @@ class SpideringService(BaseService):
             str(path or "").strip() for path in file_paths if str(path or "").strip()
         ]
         if not normalized_paths:
-            return
+            return []
 
         workers = max(1, int(max_workers or 1))
         allow_parallel = (
@@ -516,26 +601,30 @@ class SpideringService(BaseService):
             and not enable_legacy_zip_callbacks
         )
         if not allow_parallel:
+            records: list[ArtifactProcessingRecord] = []
             for file_path in normalized_paths:
-                self.process_found_file(
-                    file_path,
-                    domain,
-                    scan_type,
-                    source_hosts=source_hosts,
-                    source_shares=source_shares,
-                    auth_username=auth_username,
-                    enable_legacy_zip_callbacks=enable_legacy_zip_callbacks,
-                    apply_actions=apply_actions,
-                )
-            return
+                records.append(
+                        self.process_found_file(
+                            file_path,
+                            domain,
+                            scan_type,
+                        source_hosts=source_hosts,
+                        source_shares=source_shares,
+                        auth_username=auth_username,
+                            enable_legacy_zip_callbacks=enable_legacy_zip_callbacks,
+                            apply_actions=apply_actions,
+                            zip_depth=0,
+                        )
+                    )
+            return records
 
         print_info_debug(
             "Processing artifact batch in parallel: "
             f"files={len(normalized_paths)} workers={workers} scan_type={scan_type}"
         )
 
-        def _process(file_path: str) -> None:
-            self.process_found_file(
+        def _process(file_path: str) -> ArtifactProcessingRecord:
+            return self.process_found_file(
                 file_path,
                 domain,
                 scan_type,
@@ -544,12 +633,15 @@ class SpideringService(BaseService):
                 auth_username=auth_username,
                 enable_legacy_zip_callbacks=enable_legacy_zip_callbacks,
                 apply_actions=apply_actions,
+                zip_depth=0,
             )
 
+        records: list[ArtifactProcessingRecord] = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(_process, file_path) for file_path in normalized_paths]
             for future in as_completed(futures):
-                future.result()
+                records.append(future.result())
+        return records
 
     def _process_gpp_xml_file(
         self,
@@ -561,10 +653,10 @@ class SpideringService(BaseService):
         source_shares: list[str] | None,
         auth_username: str | None,
         apply_actions: bool,
-    ) -> None:
+    ) -> ArtifactProcessingRecord:
         """Process GPP XML files using shared deterministic analyzer."""
+        marked_file_path = mark_sensitive(file_path, "path")
         try:
-            marked_file_path = mark_sensitive(file_path, "path")
             print_info_debug(
                 "Processing deterministic GPP XML candidate: "
                 f"path={marked_file_path} apply_actions={apply_actions}"
@@ -601,9 +693,31 @@ class SpideringService(BaseService):
                 "Deterministic GPP XML action result: "
                 f"path={marked_file_path} findings={len(result.findings)} applied={applied}"
             )
+            if result.findings:
+                return ArtifactProcessingRecord(
+                    path=file_path,
+                    filename=filename,
+                    artifact_type="xml",
+                    status="processed",
+                    note=f"Detected {len(result.findings)} cpassword candidate(s).",
+                )
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=filename,
+                artifact_type="xml",
+                status="processed_no_findings",
+                note="No cpassword candidates detected.",
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_warning("Error processing GPP XML file.")
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=filename,
+                artifact_type="xml",
+                status="failed",
+                note=f"GPP XML processing failed: {type(exc).__name__}.",
+            )
 
     def _process_yml_file(
         self,
@@ -612,7 +726,7 @@ class SpideringService(BaseService):
         domain: str,
         filename: str,
         apply_actions: bool,
-    ) -> None:
+    ) -> ArtifactProcessingRecord:
         """Process YAML files with Ansible Vault blocks via deterministic analyzer."""
         print_success(f"Found .yml file: {filename}")
         try:
@@ -630,9 +744,31 @@ class SpideringService(BaseService):
                 )
             if apply_actions and stats and stats.by_type.get("ansible_vault", 0) == 0:
                 print_warning(f"No Ansible Vault hashes found in {filename}")
+            if result.findings:
+                return ArtifactProcessingRecord(
+                    path=file_path,
+                    filename=filename,
+                    artifact_type=Path(filename).suffix.lstrip(".") or "yml",
+                    status="processed",
+                    note=f"Detected {len(result.findings)} Ansible Vault block(s).",
+                )
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=filename,
+                artifact_type=Path(filename).suffix.lstrip(".") or "yml",
+                status="processed_no_findings",
+                note="No Ansible Vault content detected.",
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error("Error processing yml file.")
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=filename,
+                artifact_type=Path(filename).suffix.lstrip(".") or "yml",
+                status="failed",
+                note=f"YAML processing failed: {type(exc).__name__}.",
+            )
 
     def _process_xlsm_file(
         self,
@@ -641,7 +777,7 @@ class SpideringService(BaseService):
         domain: str,
         filename: str,
         apply_actions: bool,
-    ) -> None:
+    ) -> ArtifactProcessingRecord:
         """Process XLSM files via shared deterministic analyzer."""
         print_success(f"Found .xlsm file: {filename}")
         try:
@@ -659,9 +795,31 @@ class SpideringService(BaseService):
                 )
             if apply_actions and stats and stats.by_type.get("macro_password", 0) == 0:
                 print_warning(f"No credential-related words found in {filename}")
+            if result.findings:
+                return ArtifactProcessingRecord(
+                    path=file_path,
+                    filename=filename,
+                    artifact_type="xlsm",
+                    status="processed",
+                    note=f"Detected {len(result.findings)} macro credential candidate(s).",
+                )
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=filename,
+                artifact_type="xlsm",
+                status="processed_no_findings",
+                note="No credential-related words detected in macros.",
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error(f"Error executing olevba on {filename}.")
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=filename,
+                artifact_type="xlsm",
+                status="failed",
+                note=f"XLSM processing failed: {type(exc).__name__}.",
+            )
 
     def _process_dmp_file(
         self,
@@ -669,7 +827,7 @@ class SpideringService(BaseService):
         domain: str,
         *,
         apply_actions: bool,
-    ) -> None:
+    ) -> ArtifactProcessingRecord:
         """Process a .DMP file through the shared deterministic analyzer."""
         try:
             result = self._share_file_analyzer_service.analyze_local_file(
@@ -679,7 +837,14 @@ class SpideringService(BaseService):
                 print_info_verbose(note)
             if not result.handled:
                 print_warning("Deterministic analyzer did not handle this DMP file.")
-                return
+                return ArtifactProcessingRecord(
+                    path=dmp_file,
+                    filename=Path(dmp_file).name,
+                    artifact_type="dmp",
+                    status="manual_review",
+                    note="DMP analyzer could not handle this dump. Review manually.",
+                    manual_review=True,
+                )
             stats = None
             if apply_actions:
                 stats = self._share_file_finding_action_service.apply_findings(
@@ -689,26 +854,71 @@ class SpideringService(BaseService):
                 )
             if apply_actions and stats and stats.by_type.get("ntlm_hash", 0) == 0:
                 print_warning("No valid credentials found in the dump file")
+            if result.findings:
+                return ArtifactProcessingRecord(
+                    path=dmp_file,
+                    filename=Path(dmp_file).name,
+                    artifact_type="dmp",
+                    status="processed",
+                    note=f"Detected {len(result.findings)} dump credential candidate(s).",
+                )
+            return ArtifactProcessingRecord(
+                path=dmp_file,
+                filename=Path(dmp_file).name,
+                artifact_type="dmp",
+                status="processed_no_findings",
+                note="DMP analyzed successfully but no valid credentials were extracted.",
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error("Error processing DMP file.")
+            return ArtifactProcessingRecord(
+                path=dmp_file,
+                filename=Path(dmp_file).name,
+                artifact_type="dmp",
+                status="failed",
+                note=f"DMP processing failed: {type(exc).__name__}.",
+            )
 
     def _process_zip_file(
         self,
         zip_file: str,
         domain: str,
         *,
+        source_hosts: list[str] | None = None,
+        source_shares: list[str] | None = None,
+        auth_username: str | None = None,
         apply_actions: bool,
-    ) -> None:
-        """Process ZIP artifacts through the shared deterministic analyzer."""
+        zip_depth: int = 0,
+    ) -> ArtifactProcessingRecord:
+        """Process ZIP artifacts through shared deterministic local handlers."""
         try:
+            selective_result = self._process_zip_file_selectively(
+                zip_file=zip_file,
+                domain=domain,
+                source_hosts=source_hosts,
+                source_shares=source_shares,
+                auth_username=auth_username,
+                apply_actions=apply_actions,
+                zip_depth=zip_depth,
+            )
+            if selective_result is not None:
+                return selective_result
+
             result = self._share_file_analyzer_service.analyze_local_file(
                 source_path=zip_file
             )
             for note in result.notes:
                 print_info_verbose(note)
             if not result.handled:
-                return
+                return ArtifactProcessingRecord(
+                    path=zip_file,
+                    filename=Path(zip_file).name,
+                    artifact_type="zip",
+                    status="manual_review",
+                    note="ZIP analyzer did not handle this archive. Review manually.",
+                    manual_review=True,
+                )
             stats = None
             if apply_actions:
                 stats = self._share_file_finding_action_service.apply_findings(
@@ -718,9 +928,492 @@ class SpideringService(BaseService):
                 )
             if apply_actions and stats and stats.by_type.get("ntlm_hash", 0) == 0:
                 print_info_verbose("No deterministic credential findings in ZIP file.")
+            if result.findings:
+                return ArtifactProcessingRecord(
+                    path=zip_file,
+                    filename=Path(zip_file).name,
+                    artifact_type="zip",
+                    status="processed",
+                    note=f"ZIP analysis produced {len(result.findings)} credential candidate(s).",
+                )
+            if result.continue_with_ai:
+                return ArtifactProcessingRecord(
+                    path=zip_file,
+                    filename=Path(zip_file).name,
+                    artifact_type="zip",
+                    status="manual_review",
+                    note=result.summary or "ZIP requires manual review.",
+                    manual_review=True,
+                )
+            return ArtifactProcessingRecord(
+                path=zip_file,
+                filename=Path(zip_file).name,
+                artifact_type="zip",
+                status="processed_no_findings",
+                note="ZIP analyzed successfully but no credentials were extracted.",
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error("Error processing ZIP file.")
+            return ArtifactProcessingRecord(
+                path=zip_file,
+                filename=Path(zip_file).name,
+                artifact_type="zip",
+                status="failed",
+                note=f"ZIP processing failed: {type(exc).__name__}.",
+            )
+
+    def _process_zip_file_selectively(
+        self,
+        *,
+        zip_file: str,
+        domain: str,
+        source_hosts: list[str] | None,
+        source_shares: list[str] | None,
+        auth_username: str | None,
+        apply_actions: bool,
+        zip_depth: int,
+    ) -> ArtifactProcessingRecord | None:
+        """Selectively extract/process supported ZIP entries before fallback logic."""
+        zip_path = Path(zip_file)
+        if not zip_path.is_file():
+            return ArtifactProcessingRecord(
+                path=zip_file,
+                filename=zip_path.name,
+                artifact_type="zip",
+                status="failed",
+                note="ZIP file not found for processing.",
+            )
+
+        supported_text_suffixes = set(TEXT_LIKE_CREDENTIAL_EXTENSIONS)
+        supported_document_suffixes = set(DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS)
+        supported_artifact_suffixes = set(DIRECT_SECRET_ARTIFACT_EXTENSIONS).union(
+            {".dmp", ".pcap", ".vdi"}
+        )
+        allow_nested_zip = zip_depth < _ZIP_SELECTIVE_MAX_DEPTH
+        if allow_nested_zip:
+            supported_artifact_suffixes.add(".zip")
+        supported_suffixes = (
+            supported_text_suffixes
+            | supported_document_suffixes
+            | supported_artifact_suffixes
+        )
+
+        with zipfile.ZipFile(zip_path) as archive:
+            all_supported_entries = [
+                info
+                for info in archive.infolist()
+                if not info.is_dir()
+                and resolve_effective_sensitive_extension(
+                    info.filename,
+                    allowed_extensions=supported_suffixes,
+                ) in supported_suffixes
+            ]
+            if not all_supported_entries:
+                return None
+
+            supported_entries: list[zipfile.ZipInfo] = []
+            skipped_due_limits = 0
+            accumulated_supported_bytes = 0
+            for info in all_supported_entries:
+                entry_size = int(getattr(info, "file_size", 0) or 0)
+                next_size = accumulated_supported_bytes + max(0, entry_size)
+                if len(supported_entries) >= _ZIP_SELECTIVE_MAX_SUPPORTED_ENTRIES:
+                    skipped_due_limits += 1
+                    continue
+                if next_size > _ZIP_SELECTIVE_MAX_TOTAL_BYTES:
+                    skipped_due_limits += 1
+                    continue
+                supported_entries.append(info)
+                accumulated_supported_bytes = next_size
+
+            extracted_text = 0
+            extracted_documents = 0
+            extracted_artifacts = 0
+            skipped_entries = 0
+            processed_internal_paths: list[str] = []
+            skipped_internal_paths: list[str] = []
+            nested_zip_entries = 0
+            zip_entry_path_aliases: dict[str, str] = {}
+            temp_root = create_analysis_temp_root(
+                prefix=".adscan_zip_",
+                preferred_parent=zip_path.parent,
+            )
+            try:
+                text_root = temp_root / "text"
+                document_root = temp_root / "documents"
+                artifact_root = temp_root / "artifacts"
+                for root in (text_root, document_root, artifact_root):
+                    root.mkdir(parents=True, exist_ok=True)
+
+                for info in supported_entries:
+                    entry_suffix = resolve_effective_sensitive_extension(
+                        info.filename,
+                        allowed_extensions=supported_suffixes,
+                    )
+                    if entry_suffix in supported_text_suffixes:
+                        bucket_root = text_root
+                        extracted_text += 1
+                    elif entry_suffix in supported_document_suffixes:
+                        bucket_root = document_root
+                        extracted_documents += 1
+                    else:
+                        bucket_root = artifact_root
+                        extracted_artifacts += 1
+
+                    destination = self._resolve_safe_zip_entry_destination(
+                        bucket_root=bucket_root,
+                        entry_name=info.filename,
+                    )
+                    if destination is None:
+                        skipped_entries += 1
+                        skipped_internal_paths.append(str(info.filename))
+                        continue
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        with archive.open(info, "r") as source_handle, destination.open(
+                            "wb"
+                        ) as destination_handle:
+                            shutil.copyfileobj(source_handle, destination_handle)
+                        processed_internal_paths.append(str(info.filename))
+                        zip_entry_path_aliases[str(destination)] = self._build_zip_entry_origin_path(
+                            zip_file=str(zip_path),
+                            internal_path=str(info.filename),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                        skipped_entries += 1
+                        skipped_internal_paths.append(str(info.filename))
+
+                grouped_findings: dict[
+                    str, list[tuple[str, float | None, str, int, str]]
+                ] = {}
+                structured_processed = 0
+                artifact_records: list[ArtifactProcessingRecord] = []
+
+                if any(text_root.rglob("*")):
+                    grouped_findings = self._scan_zip_credsweeper_bucket(
+                        root_path=text_root,
+                        document_mode=False,
+                        path_aliases=zip_entry_path_aliases,
+                    )
+                    structured_stats = self.process_local_structured_files(
+                        root_path=str(text_root),
+                        phase=SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
+                        domain=domain,
+                        source_hosts=source_hosts,
+                        source_shares=source_shares,
+                        auth_username=auth_username,
+                        apply_actions=apply_actions,
+                    )
+                    structured_processed += int(
+                        structured_stats.get("processed_files", 0)
+                    )
+
+                if any(document_root.rglob("*")):
+                    document_findings = self._scan_zip_credsweeper_bucket(
+                        root_path=document_root,
+                        document_mode=True,
+                        path_aliases=zip_entry_path_aliases,
+                    )
+                    grouped_findings = self._merge_grouped_credential_findings(
+                        grouped_findings,
+                        document_findings,
+                    )
+                    structured_stats = self.process_local_structured_files(
+                        root_path=str(document_root),
+                        phase=SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+                        domain=domain,
+                        source_hosts=source_hosts,
+                        source_shares=source_shares,
+                        auth_username=auth_username,
+                        apply_actions=apply_actions,
+                    )
+                    structured_processed += int(
+                        structured_stats.get("processed_files", 0)
+                    )
+
+                artifact_paths = sorted(
+                    str(path) for path in artifact_root.rglob("*") if path.is_file()
+                )
+                for artifact_path in artifact_paths:
+                    if Path(artifact_path).suffix.casefold() == ".zip":
+                        nested_zip_entries += 1
+                    artifact_records.append(
+                        self.process_found_file(
+                            artifact_path,
+                            domain,
+                            "ext",
+                            source_hosts=source_hosts,
+                            source_shares=source_shares,
+                            auth_username=auth_username,
+                            enable_legacy_zip_callbacks=False,
+                            apply_actions=apply_actions,
+                            zip_depth=zip_depth + 1,
+                        )
+                    )
+
+                if (
+                    grouped_findings
+                    and apply_actions
+                    and self._handle_found_credentials_callback is not None
+                ):
+                    self._handle_found_credentials_callback(
+                        grouped_findings,
+                        domain,
+                        source_hosts=source_hosts,
+                        source_shares=source_shares,
+                        auth_username=auth_username,
+                        source_artifact=f"zip artifact analysis ({zip_path.name})",
+                    )
+
+                grouped_finding_count = sum(
+                    len(entries) for entries in grouped_findings.values()
+                )
+                artifact_successes = sum(
+                    1
+                    for record in artifact_records
+                    if record.status in {"processed", "processed_no_findings"}
+                )
+                processed_entry_count = (
+                    extracted_text + extracted_documents + len(artifact_paths)
+                )
+                processed_preview = self._format_zip_internal_path_preview(
+                    processed_internal_paths
+                )
+                skipped_preview = self._format_zip_internal_path_preview(
+                    skipped_internal_paths
+                )
+                print_info_debug(
+                    "ZIP selective processing summary: "
+                    f"zip={mark_sensitive(str(zip_path), 'path')} "
+                    f"supported_entries_total={len(all_supported_entries)} "
+                    f"selected_entries={len(supported_entries)} "
+                    f"processed_entry_count={processed_entry_count} "
+                    f"skipped_entries={skipped_entries} "
+                    f"skipped_due_limits={skipped_due_limits} "
+                    f"nested_zip_entries={nested_zip_entries} "
+                    f"processed_preview={processed_preview}"
+                )
+                if grouped_finding_count or structured_processed or artifact_successes:
+                    notes: list[str] = []
+                    notes.append(
+                        "supported_entries="
+                        f"{len(supported_entries)}/{len(all_supported_entries)}"
+                    )
+                    if grouped_finding_count:
+                        notes.append(f"CredSweeper findings={grouped_finding_count}")
+                    if structured_processed:
+                        notes.append(f"structured_files={structured_processed}")
+                    if artifact_successes:
+                        notes.append(f"artifact_entries={artifact_successes}")
+                    if nested_zip_entries:
+                        notes.append(f"nested_zip_entries={nested_zip_entries}")
+                    if skipped_entries:
+                        notes.append(f"skipped_entries={skipped_entries}")
+                    if skipped_due_limits:
+                        notes.append(f"limit_skips={skipped_due_limits}")
+                    if processed_preview:
+                        notes.append(f"processed_entries={processed_preview}")
+                    if skipped_preview:
+                        notes.append(f"skipped_entries={skipped_preview}")
+                    return ArtifactProcessingRecord(
+                        path=zip_file,
+                        filename=zip_path.name,
+                        artifact_type="zip",
+                        status="processed",
+                        note=(
+                            "ZIP selective analysis processed supported embedded entries: "
+                            + ", ".join(notes)
+                            + "."
+                        ),
+                        details={
+                            "supported_entries_total": len(all_supported_entries),
+                            "selected_entries": len(supported_entries),
+                            "text_entries": extracted_text,
+                            "document_entries": extracted_documents,
+                            "artifact_entries": len(artifact_paths),
+                            "nested_zip_entries": nested_zip_entries,
+                            "cred_sweeper_findings": grouped_finding_count,
+                            "structured_processed_files": structured_processed,
+                            "artifact_successes": artifact_successes,
+                            "skipped_entries": skipped_entries,
+                            "limit_skips": skipped_due_limits,
+                            "processed_preview": processed_internal_paths[:_ZIP_SELECTIVE_PREVIEW_LIMIT],
+                            "skipped_preview": skipped_internal_paths[:_ZIP_SELECTIVE_PREVIEW_LIMIT],
+                        },
+                    )
+
+                if processed_entry_count > 0:
+                    notes: list[str] = [
+                        f"supported_entries={len(supported_entries)}/{len(all_supported_entries)}",
+                        f"text_entries={extracted_text}",
+                        f"document_entries={extracted_documents}",
+                        f"artifact_entries={len(artifact_paths)}",
+                    ]
+                    if nested_zip_entries:
+                        notes.append(f"nested_zip_entries={nested_zip_entries}")
+                    if skipped_entries:
+                        notes.append(f"skipped_entries={skipped_entries}")
+                    if skipped_due_limits:
+                        notes.append(f"limit_skips={skipped_due_limits}")
+                    if processed_preview:
+                        notes.append(f"processed_entries={processed_preview}")
+                    if skipped_preview:
+                        notes.append(f"skipped_entries={skipped_preview}")
+                    return ArtifactProcessingRecord(
+                        path=zip_file,
+                        filename=zip_path.name,
+                        artifact_type="zip",
+                        status="processed_no_findings",
+                        note=(
+                            "ZIP selective analysis processed supported embedded entries "
+                            "but found no deterministic credentials: "
+                            + ", ".join(notes)
+                            + "."
+                        ),
+                        details={
+                            "supported_entries_total": len(all_supported_entries),
+                            "selected_entries": len(supported_entries),
+                            "text_entries": extracted_text,
+                            "document_entries": extracted_documents,
+                            "artifact_entries": len(artifact_paths),
+                            "nested_zip_entries": nested_zip_entries,
+                            "skipped_entries": skipped_entries,
+                            "limit_skips": skipped_due_limits,
+                            "processed_preview": processed_internal_paths[:_ZIP_SELECTIVE_PREVIEW_LIMIT],
+                            "skipped_preview": skipped_internal_paths[:_ZIP_SELECTIVE_PREVIEW_LIMIT],
+                        },
+                    )
+
+                if skipped_entries:
+                    return ArtifactProcessingRecord(
+                        path=zip_file,
+                        filename=zip_path.name,
+                        artifact_type="zip",
+                        status="manual_review",
+                        note=(
+                            "ZIP contained supported embedded entries but automatic "
+                            "processing did not yield findings and some entries were "
+                            f"skipped ({skipped_entries}). Review manually. "
+                            f"Supported={len(supported_entries)}/{len(all_supported_entries)}. "
+                            f"processed_entries={processed_preview or processed_entry_count}. "
+                            f"skipped_entries={skipped_preview or skipped_entries}."
+                        ),
+                        manual_review=True,
+                        details={
+                            "supported_entries_total": len(all_supported_entries),
+                            "selected_entries": len(supported_entries),
+                            "skipped_entries": skipped_entries,
+                            "limit_skips": skipped_due_limits,
+                            "processed_preview": processed_internal_paths[:_ZIP_SELECTIVE_PREVIEW_LIMIT],
+                            "skipped_preview": skipped_internal_paths[:_ZIP_SELECTIVE_PREVIEW_LIMIT],
+                        },
+                    )
+            finally:
+                shutil.rmtree(temp_root, ignore_errors=True)
+        return None
+
+    @staticmethod
+    def _resolve_safe_zip_entry_destination(
+        *,
+        bucket_root: Path,
+        entry_name: str,
+    ) -> Path | None:
+        """Return a safe extraction path for one ZIP entry or ``None`` on traversal."""
+        normalized_parts = [
+            part
+            for part in Path(str(entry_name or "").replace("\\", "/")).parts
+            if part not in {"", ".", ".."}
+        ]
+        if not normalized_parts:
+            return None
+        destination = bucket_root.joinpath(*normalized_parts).resolve(strict=False)
+        try:
+            destination.relative_to(bucket_root.resolve(strict=False))
+        except ValueError:
+            return None
+        return destination
+
+    def _scan_zip_credsweeper_bucket(
+        self,
+        *,
+        root_path: Path,
+        document_mode: bool,
+        path_aliases: dict[str, str] | None = None,
+    ) -> dict[str, list[tuple[str, float | None, str, int, str]]]:
+        """Run CredSweeper against one extracted ZIP bucket when configured."""
+        if not self._credsweeper_path or not root_path.exists():
+            return {}
+        findings = self._credsweeper_service.analyze_path_with_options(
+            str(root_path),
+            credsweeper_path=self._credsweeper_path,
+            json_output_dir=str(root_path.parent / f".credsweeper_{root_path.name}"),
+            include_custom_rules=True,
+            rules_profile=(
+                CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC
+                if document_mode
+                else CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT
+            ),
+            custom_ml_threshold="0.0",
+            doc=document_mode,
+            jobs=get_default_credsweeper_jobs(),
+        )
+        if not path_aliases:
+            return findings
+        remapped: dict[str, list[tuple[str, float | None, str, int, str]]] = {}
+        for rule_name, entries in findings.items():
+            remapped_entries: list[tuple[str, float | None, str, int, str]] = []
+            for value, ml_probability, context_line, line_num, file_path in entries:
+                remapped_entries.append(
+                    (
+                        value,
+                        ml_probability,
+                        context_line,
+                        line_num,
+                        path_aliases.get(str(file_path), str(file_path)),
+                    )
+                )
+            remapped[rule_name] = remapped_entries
+        return remapped
+
+    @staticmethod
+    def _merge_grouped_credential_findings(
+        left: dict[str, list[tuple[str, float | None, str, int, str]]],
+        right: dict[str, list[tuple[str, float | None, str, int, str]]],
+    ) -> dict[str, list[tuple[str, float | None, str, int, str]]]:
+        """Merge two grouped CredSweeper result dictionaries."""
+        merged: dict[str, list[tuple[str, float | None, str, int, str]]] = {
+            key: list(value) for key, value in left.items()
+        }
+        for rule_name, entries in right.items():
+            merged.setdefault(rule_name, []).extend(entries)
+        return merged
+
+    @staticmethod
+    def _format_zip_internal_path_preview(paths: list[str], limit: int = _ZIP_SELECTIVE_PREVIEW_LIMIT) -> str:
+        """Return a compact preview of internal ZIP paths."""
+        normalized_paths = [str(path or "").strip() for path in paths if str(path or "").strip()]
+        if not normalized_paths:
+            return ""
+        preview_items = normalized_paths[:limit]
+        preview = ", ".join(preview_items)
+        remaining = len(normalized_paths) - len(preview_items)
+        if remaining > 0:
+            preview = f"{preview}, +{remaining} more"
+        return preview
+
+    @staticmethod
+    def _build_zip_entry_origin_path(
+        *,
+        zip_file: str,
+        internal_path: str,
+    ) -> str:
+        """Build a logical origin path for one embedded ZIP entry."""
+        normalized_internal = str(internal_path or "").replace("\\", "/").lstrip("/")
+        if not normalized_internal:
+            return str(zip_file)
+        return f"{zip_file}!/{normalized_internal}"
 
     def _process_pfx_file(
         self,
@@ -728,19 +1421,98 @@ class SpideringService(BaseService):
         file_path: str,
         domain: str,
         apply_actions: bool,
-    ) -> None:
+    ) -> ArtifactProcessingRecord:
         """Process PFX artifacts via shared action dispatcher."""
         try:
             if apply_actions:
-                self._share_file_finding_action_service.apply_pfx_artifact(
+                handled = self._share_file_finding_action_service.apply_pfx_artifact(
                     domain=domain,
                     source_path=file_path,
                 )
+                note = (
+                    "PFX processed successfully."
+                    if handled
+                    else "PFX requires password cracking or manual review."
+                )
+                status = "processed" if handled else "manual_review"
+                return ArtifactProcessingRecord(
+                    path=file_path,
+                    filename=Path(file_path).name,
+                    artifact_type="pfx",
+                    status=status,
+                    note=note,
+                    manual_review=not handled,
+                )
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=Path(file_path).name,
+                artifact_type="pfx",
+                status="skipped",
+                note="PFX analysis skipped because follow-up actions are disabled.",
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error("Error processing PFX file.")
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=Path(file_path).name,
+                artifact_type="pfx",
+                status="failed",
+                note=f"PFX processing failed: {type(exc).__name__}.",
+            )
+
+    def _process_keepass_file(
+        self,
+        *,
+        file_path: str,
+        domain: str,
+        source_hosts: list[str] | None,
+        source_shares: list[str] | None,
+        auth_username: str | None,
+        apply_actions: bool,
+    ) -> ArtifactProcessingRecord:
+        """Process KeePass artifacts via shared action dispatcher."""
+        try:
+            if apply_actions:
+                extracted = self._share_file_finding_action_service.apply_keepass_artifact(
+                    domain=domain,
+                    source_path=file_path,
+                    source_hosts=source_hosts,
+                    source_shares=source_shares,
+                    auth_username=auth_username,
+                )
+                note = (
+                    f"KeePass artifact processed and yielded {extracted} extracted credential(s)."
+                    if extracted > 0
+                    else "KeePass artifact processed but no credentials were extracted automatically."
+                )
+                return ArtifactProcessingRecord(
+                    path=file_path,
+                    filename=Path(file_path).name,
+                    artifact_type=Path(file_path).suffix.lstrip(".") or "kdbx",
+                    status="processed" if extracted > 0 else "processed_no_findings",
+                    note=note,
+                )
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=Path(file_path).name,
+                artifact_type=Path(file_path).suffix.lstrip(".") or "kdbx",
+                status="skipped",
+                note="KeePass analysis skipped because follow-up actions are disabled.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_error("Error processing KeePass artifact.")
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=Path(file_path).name,
+                artifact_type=Path(file_path).suffix.lstrip(".") or "kdbx",
+                status="failed",
+                note=f"KeePass processing failed: {type(exc).__name__}.",
+            )
 
 
 __all__ = [
+    "ArtifactProcessingRecord",
     "SpideringService",
 ]

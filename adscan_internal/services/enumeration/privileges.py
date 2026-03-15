@@ -27,14 +27,14 @@ class PrivilegeEnumerationMixin:
     such as :meth:`PentestShell.ask_for_user_privs`.
     """
 
-    def enumerate_all_user_privs(
+    def enumerate_all_user_postauth_access(
         self,
         domain: str,
         credentials: Dict[str, str],
         *,
         auto_mode: bool = False,
     ) -> List[UserPrivileges]:
-        """Enumerate privileges for all users in a domain.
+        """Enumerate post-auth access opportunities for all users in a domain.
 
         Args:
             domain: Domain name.
@@ -53,7 +53,7 @@ class PrivilegeEnumerationMixin:
         results: List[UserPrivileges] = []
         marked_domain = mark_sensitive(domain, "domain")
         print_success(
-            f"Enumerating privileges of all users in domain {marked_domain}"
+            f"Enumerating post-auth access for all users in domain {marked_domain}"
         )
 
         for username, credential in credentials.items():
@@ -76,4 +76,17 @@ class PrivilegeEnumerationMixin:
 
         return results
 
+    def enumerate_all_user_privs(
+        self,
+        domain: str,
+        credentials: Dict[str, str],
+        *,
+        auto_mode: bool = False,
+    ) -> List[UserPrivileges]:
+        """Backward-compatible alias for all-user post-auth access enumeration."""
+        return self.enumerate_all_user_postauth_access(
+            domain,
+            credentials,
+            auto_mode=auto_mode,
+        )
 

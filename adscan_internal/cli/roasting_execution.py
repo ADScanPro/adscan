@@ -16,7 +16,14 @@ from typing import Any
 import os
 import re
 
-from adscan_internal import print_error, print_info, print_warning, telemetry
+from adscan_internal import (
+    print_error,
+    print_info,
+    print_info_debug,
+    print_warning,
+    telemetry,
+)
+from adscan_internal.cli.ace_step_execution import set_last_execution_outcome
 from adscan_internal.cli import cracking as cracking_cli
 from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import mark_sensitive
@@ -87,6 +94,68 @@ def _has_domain_credential(shell: Any, domain: str, username: str) -> bool:
         ):
             return True
     return False
+
+
+def _get_domain_credential(shell: Any, domain: str, username: str) -> str | None:
+    """Return a stored credential for a domain user using case-insensitive matching."""
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        return None
+    domain_data = domains_data.get(domain)
+    if not isinstance(domain_data, dict):
+        return None
+    creds = domain_data.get("credentials")
+    if not isinstance(creds, dict):
+        return None
+    target_normalized = str(username or "").strip().lower()
+    if not target_normalized:
+        return None
+    for stored_user, stored_credential in creds.items():
+        if str(stored_user or "").strip().lower() != target_normalized:
+            continue
+        candidate = str(stored_credential or "").strip()
+        return candidate or None
+    return None
+
+
+def _record_user_credential_outcome(
+    shell: Any,
+    *,
+    domain: str,
+    target_user: str,
+) -> None:
+    """Store a runtime outcome when roasting recovers a usable credential."""
+    credential = _get_domain_credential(shell, domain, target_user)
+    marked_user = mark_sensitive(target_user, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+    if not credential:
+        print_info_debug(
+            "[roasting-exec] no stored credential available for post-roast follow-up: "
+            f"user={marked_user} domain={marked_domain}"
+        )
+        return
+
+    credential_type = (
+        "hash"
+        if len(credential) == 32
+        and all(char in "0123456789abcdef" for char in credential.lower())
+        else "password"
+    )
+    set_last_execution_outcome(
+        shell,
+        {
+            "key": "user_credential_obtained",
+            "domain": domain,
+            "target_domain": domain,
+            "compromised_user": target_user,
+            "credential": credential,
+            "credential_type": credential_type,
+        },
+    )
+    print_info_debug(
+        "[roasting-exec] recorded credential outcome after roasting: "
+        f"user={marked_user} domain={marked_domain} type={credential_type}"
+    )
 
 
 def _ensure_impacket_script_dir(shell: Any, *, script_name: str) -> bool:
@@ -278,7 +347,10 @@ def run_kerberoast_for_user(
         wordlists_dir=wordlists_dir,
         failed=False,
     )
-    return _has_domain_credential(shell, domain, target_user)
+    recovered = _has_domain_credential(shell, domain, target_user)
+    if recovered:
+        _record_user_credential_outcome(shell, domain=domain, target_user=target_user)
+    return recovered
 
 
 def run_asreproast_for_user(
@@ -369,4 +441,7 @@ def run_asreproast_for_user(
         wordlists_dir=wordlists_dir,
         failed=False,
     )
-    return _has_domain_credential(shell, domain, target_user)
+    recovered = _has_domain_credential(shell, domain, target_user)
+    if recovered:
+        _record_user_credential_outcome(shell, domain=domain, target_user=target_user)
+    return recovered

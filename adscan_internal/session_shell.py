@@ -35,6 +35,8 @@ from . import telemetry
 from .agent_ng_manager import get_agent_ng_local_path
 from .runascs_manager import get_runascs_local_path
 from .rich_output import print_info, print_warning, print_error, print_success
+from .services.winrm_backend_service import build_winrm_backend
+from .services.winrm_psrp_service import WinRMPSRPError
 
 
 logger = logging.getLogger("adscan.session_shell")
@@ -84,6 +86,8 @@ class SessionShell:
         self._prompt_session = PromptSession()
 
         self._print_banner()
+        if self._is_winrm_session():
+            self._print_winrm_helper_banner()
 
         while True:
             try:
@@ -154,27 +158,30 @@ class SessionShell:
                 break
             if command in {"help", "?"}:
                 self._print_help()
+            elif command == "winrm-help":
+                self._print_winrm_helper_help()
             elif command == "info":
                 self.parent_shell.do_session(f"info {self.session.id}")
             elif command == "interact":
                 self.parent_shell.do_session(f"interact {self.session.id}")
             elif command == "run":
                 agent = self._get_agent_client()
-                if agent is None:
-                    continue
                 if not args:
                     self.console.print(
                         "[red]Usage:[/red] run <command to execute on remote host>"
                     )
                     continue
                 cmd_to_send = " ".join(args)
-                logger.debug(
-                    "[session_shell] sending run command to agent: %r",
-                    cmd_to_send,
-                )
-                output = agent.exec_command(cmd_to_send)
-                if output:
-                    self.console.print(output)
+                if agent is not None:
+                    logger.debug(
+                        "[session_shell] sending run command to agent: %r",
+                        cmd_to_send,
+                    )
+                    output = agent.exec_command(cmd_to_send)
+                    if output:
+                        self.console.print(output)
+                elif not self._run_via_winrm_backend(cmd_to_send):
+                    continue
             elif command == "download":
                 if not args:
                     self.console.print(
@@ -210,8 +217,11 @@ class SessionShell:
                             f"[red]Failed to save downloaded file:[/red] {exc}"
                         )
                 else:
-                    arg_str = " ".join(args)
-                    self.parent_shell.do_session(f"download {arg_str}")
+                    remote_path = args[0]
+                    local_dir = args[1] if len(args) >= 2 else os.getcwd()
+                    if not self._download_via_winrm_backend(remote_path, local_dir):
+                        arg_str = " ".join(args)
+                        self.parent_shell.do_session(f"download {arg_str}")
             elif command == "upload":
                 if len(args) < 2:
                     self.console.print(
@@ -248,8 +258,11 @@ class SessionShell:
                             f"[red]Agent upload failed for[/red] {remote_path}"
                         )
                 else:
-                    arg_str = " ".join(args)
-                    self.parent_shell.do_session(f"upload {arg_str}")
+                    local_path = args[0]
+                    remote_path = args[1]
+                    if not self._upload_via_winrm_backend(local_path, remote_path):
+                        arg_str = " ".join(args)
+                        self.parent_shell.do_session(f"upload {arg_str}")
             elif command == "system":
                 if not args:
                     self.console.print(
@@ -257,6 +270,16 @@ class SessionShell:
                     )
                     continue
                 self.parent_shell.do_system(" ".join(args))
+            elif command == "autologon":
+                self._invoke_winrm_helper("check_autologon")
+            elif command == "history":
+                self._invoke_winrm_helper("show_powershell_history")
+            elif command == "transcripts":
+                self._invoke_winrm_helper("check_powershell_transcripts")
+            elif command == "firefox":
+                self._invoke_winrm_helper("check_firefox_credentials")
+            elif command == "sensitive":
+                self._invoke_winrm_helper("run_winrm_sensitive_data_scan")
             elif command == "upgrade":
                 self._upgrade_to_interactive()
             elif command == "sessions":
@@ -312,6 +335,30 @@ class SessionShell:
             "Execute a command on the remote host via agent (if attached).",
         )
         table.add_row(
+            "autologon",
+            "Run the centralized WinRM autologon check for this session.",
+        )
+        table.add_row(
+            "history",
+            "Analyze PowerShell history through the centralized WinRM workflow.",
+        )
+        table.add_row(
+            "transcripts",
+            "Analyze PowerShell transcript files through the centralized WinRM workflow.",
+        )
+        table.add_row(
+            "firefox",
+            "Search Firefox credential files through the centralized WinRM workflow.",
+        )
+        table.add_row(
+            "sensitive",
+            "Run the deterministic WinRM sensitive-data workflow for this session.",
+        )
+        table.add_row(
+            "winrm-help",
+            "Show the focused WinRM helper commands available in this session.",
+        )
+        table.add_row(
             "system <cmd>",
             "Run a local system command on the operator host.",
         )
@@ -324,6 +371,45 @@ class SessionShell:
             "List all known sessions in the current workspace.",
         )
         table.add_row("back / exit", "Return to the main ADscan shell.")
+
+        self.console.print(table)
+
+    def _print_winrm_helper_banner(self) -> None:
+        """Print a small contextual hint when the session is WinRM-backed."""
+        from rich.panel import Panel
+
+        panel = Panel(
+            "This session is backed by WinRM metadata. You can use the centralized "
+            "helpers directly from here:\n"
+            "- autologon\n"
+            "- history\n"
+            "- transcripts\n"
+            "- firefox\n"
+            "- sensitive\n"
+            "- winrm-help",
+            title="WinRM Helpers",
+            border_style="magenta",
+        )
+        self.console.print(panel)
+
+    def _print_winrm_helper_help(self) -> None:
+        """Show only the WinRM helper commands relevant to this session."""
+        from rich.table import Table
+
+        table = Table(
+            title="WinRM Helper Commands",
+            show_header=True,
+            header_style="bold magenta",
+            border_style="magenta",
+        )
+        table.add_column("Command", style="bold")
+        table.add_column("Purpose")
+
+        table.add_row("autologon", "Query Winlogon autologon credentials via the centralized WinRM workflow.")
+        table.add_row("history", "Download and analyze PowerShell history for the session user.")
+        table.add_row("transcripts", "Download and analyze PowerShell transcript files.")
+        table.add_row("firefox", "Search for Firefox credential artifacts on the target.")
+        table.add_row("sensitive", "Run deterministic WinRM file analysis with the PSRP mapping backend.")
 
         self.console.print(table)
 
@@ -352,6 +438,142 @@ class SessionShell:
                 "helpers."
             )
             return None
+
+    def _is_winrm_session(self) -> bool:
+        """Return True when the current session has WinRM metadata."""
+        return str(self.session.metadata.get("service") or "").strip().lower() == "winrm"
+
+    def _get_winrm_backend(self):
+        """Return the reusable WinRM backend for sessions backed by WinRM."""
+        meta = self.session.metadata
+        if str(meta.get("service") or "").strip().lower() != "winrm":
+            return None
+        domain = str(meta.get("domain") or "")
+        host = str(meta.get("host") or "")
+        username = str(meta.get("username") or "")
+        password = str(meta.get("password") or "")
+        if not (host and username and password):
+            return None
+        try:
+            return build_winrm_backend(
+                domain=domain,
+                host=host,
+                username=username,
+                password=password,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            telemetry.capture_exception(exc)
+            self.console.print(
+                f"[red]Failed to build WinRM backend from session metadata:[/red] {exc}"
+            )
+            return None
+
+    def _run_via_winrm_backend(self, command: str) -> bool:
+        """Execute one PowerShell command via the reusable WinRM backend."""
+        backend = self._get_winrm_backend()
+        if backend is None:
+            self.console.print(
+                "[yellow]No agent attached and no WinRM backend available for this session.[/yellow]"
+            )
+            return False
+        try:
+            result = backend.execute_powershell(command)
+        except WinRMPSRPError as exc:
+            telemetry.capture_exception(exc)
+            self.console.print(f"[red]WinRM backend execution failed:[/red] {exc}")
+            return False
+        if result.stdout:
+            self.console.print(result.stdout)
+        if result.stderr:
+            self.console.print(f"[yellow]{result.stderr}[/yellow]")
+        return True
+
+    def _download_via_winrm_backend(self, remote_path: str, local_dir: str) -> bool:
+        """Download one file via the reusable WinRM backend."""
+        backend = self._get_winrm_backend()
+        if backend is None:
+            return False
+        os.makedirs(local_dir, exist_ok=True)
+        local_path = os.path.join(local_dir, os.path.basename(remote_path))
+        try:
+            backend.fetch_file(remote_path, local_path)
+        except WinRMPSRPError as exc:
+            telemetry.capture_exception(exc)
+            self.console.print(f"[red]WinRM backend download failed:[/red] {exc}")
+            return False
+        self.console.print(f"[green]Downloaded via WinRM backend to[/green] {local_path}")
+        return True
+
+    def _upload_via_winrm_backend(self, local_path: str, remote_path: str) -> bool:
+        """Upload one file via the reusable WinRM backend."""
+        backend = self._get_winrm_backend()
+        if backend is None:
+            return False
+        try:
+            ok = backend.upload_file(local_path, remote_path)
+        except WinRMPSRPError as exc:
+            telemetry.capture_exception(exc)
+            self.console.print(f"[red]WinRM backend upload failed:[/red] {exc}")
+            return False
+        if ok:
+            self.console.print(f"[green]Uploaded via WinRM backend to[/green] {remote_path}")
+        else:
+            self.console.print(
+                "[yellow]WinRM backend upload finished without remote verification metadata.[/yellow]"
+            )
+        return True
+
+    def _get_winrm_session_context(self) -> tuple[str, str, str, str] | None:
+        """Return the WinRM metadata tuple required by centralized helpers."""
+        meta = self.session.metadata
+        if str(meta.get("service") or "").strip().lower() != "winrm":
+            self.console.print(
+                "[yellow]This helper is only available for WinRM-backed sessions.[/yellow]"
+            )
+            return None
+        domain = str(meta.get("domain") or "")
+        host = str(meta.get("host") or "")
+        username = str(meta.get("username") or "")
+        password = str(meta.get("password") or "")
+        if not (host and username and password):
+            self.console.print(
+                "[red]This session is missing WinRM metadata required to run the helper.[/red]"
+            )
+            return None
+        return domain, host, username, password
+
+    def _invoke_winrm_helper(self, helper_name: str) -> bool:
+        """Invoke one centralized WinRM helper using the session context."""
+        context = self._get_winrm_session_context()
+        if context is None:
+            return False
+        domain, host, username, password = context
+        try:
+            from adscan_internal.cli import winrm as winrm_cli
+
+            helper = getattr(winrm_cli, helper_name)
+        except Exception as exc:  # pragma: no cover - defensive
+            telemetry.capture_exception(exc)
+            self.console.print(
+                f"[red]Failed to resolve WinRM helper '{helper_name}':[/red] {exc}"
+            )
+            return False
+
+        try:
+            helper(
+                self.parent_shell,
+                domain=domain,
+                host=host,
+                username=username,
+                password=password,
+            )
+            return True
+        except Exception as exc:  # pragma: no cover - defensive
+            telemetry.capture_exception(exc)
+            self.console.print(
+                f"[red]WinRM helper '{helper_name}' failed:[/red] {exc}"
+            )
+            return False
 
         try:
             from adscan_internal import AgentSession, SessionType

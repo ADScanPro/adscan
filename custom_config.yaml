@@ -13,3 +13,18 @@
   target:
     - code
     - doc
+- name: DOC Password To
+  severity: medium
+  confidence: moderate
+  type: pattern
+  values:
+    - (?i:(?:set|reset|change|changed|update|updated|assign|assigned|use|using|initial|temporary|temp|default|new|login|logon|first)\b[\w\s,/-]{0,40})?\bpassw?o?r?d\b[\w\s,/-]{0,20}\bto\b\s*(?P<quote>["'`]{0,3})(?P<value>(?-i:(?P<a>[A-Z])|(?P<b>[a-z])|(?P<c>[0-9_+=~!@#$%^&*;:?-])){8,80}(?(a)(?(b)(?(c)(\S|$)|(?!x)x)|(?!x)x)|(?!x)x))(?(quote)(?P=quote))
+  filter_type: GeneralKeyword
+  use_ml: true
+  required_substrings:
+    - pass
+    - to
+  min_line_len: 16
+  target:
+    - code
+    - doc

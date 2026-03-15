@@ -1965,85 +1965,33 @@ def _get_template_path():
 
 
 def _get_credsweeper_config_path() -> Optional[str]:
-    """Get path to the primary CredSweeper rules file (config.yaml), if available.
+    """Return the effective primary CredSweeper rules path.
 
-    Priority:
-    1. User override in ~/.adscan/credsweeper_config.yaml
-    2. Bundled config inside PyInstaller (_MEIPASS/config.yaml)
-    3. Project root config.yaml (development mode)
-
-    Returns:
-        str | None: Path to config file or None if not found.
+    This wrapper exists for legacy callers in ``adscan.py`` and delegates to the
+    centralized CredSweeper service resolution logic so the monolith does not
+    maintain a divergent view of runtime/build-time rules sources.
     """
-    # 1) User override in ADscan base directory
-    override_path = os.path.join(ADSCAN_BASE_DIR, "credsweeper_config.yaml")
-    if os.path.exists(override_path):
-        return override_path
+    from adscan_internal.services.credsweeper_service import (
+        _get_credsweeper_config_path as _service_get_credsweeper_config_path,
+    )
 
-    # 2) PyInstaller bundle: config.yaml is bundled via --add-data
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        meipass = getattr(sys, "_MEIPASS", None)  # pylint: disable=no-member
-        if meipass:
-            bundled_path = os.path.join(meipass, "config.yaml")
-            # Depending on how --add-data is interpreted, config.yaml may be:
-            # - A direct file: <_MEIPASS>/config.yaml
-            # - A directory containing the file: <_MEIPASS>/config.yaml/config.yaml
-            if os.path.isfile(bundled_path):
-                return bundled_path
-            if os.path.isdir(bundled_path):
-                nested_path = os.path.join(bundled_path, "config.yaml")
-                if os.path.exists(nested_path):
-                    return nested_path
-
-    # 3) Development mode: config.yaml in project root (next to adscan.py)
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    root_config = os.path.join(current_dir, "config.yaml")
-    if os.path.exists(root_config):
-        return root_config
-
-    return None
+    return _service_get_credsweeper_config_path()
 
 
 def _get_credsweeper_custom_rules_path() -> Optional[str]:
-    """Get path to the secondary/custom CredSweeper rules file (custom_config.yaml)."""
-    # 1) User override in ADscan base directory
-    override_path = os.path.join(ADSCAN_BASE_DIR, "custom_config.yaml")
-    if os.path.exists(override_path):
-        return override_path
+    """Return the effective secondary/custom CredSweeper rules path."""
+    from adscan_internal.services.credsweeper_service import (
+        _get_credsweeper_custom_rules_path as _service_get_credsweeper_custom_rules_path,
+    )
 
-    # 2) PyInstaller bundle: custom_config.yaml is bundled via --add-data
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        meipass = getattr(sys, "_MEIPASS", None)  # pylint: disable=no-member
-        if meipass:
-            bundled_path = os.path.join(meipass, "custom_config.yaml")
-            # Depending on how --add-data is interpreted, custom_config.yaml may be:
-            # - A direct file: <_MEIPASS>/custom_config.yaml
-            # - A directory containing the file: <_MEIPASS>/custom_config.yaml/custom_config.yaml
-            if os.path.isfile(bundled_path):
-                return bundled_path
-            if os.path.isdir(bundled_path):
-                nested_path = os.path.join(bundled_path, "custom_config.yaml")
-                if os.path.exists(nested_path):
-                    return nested_path
-
-    # 3) Development mode: custom_config.yaml in project root (next to adscan.py)
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    root_config = os.path.join(current_dir, "custom_config.yaml")
-    if os.path.exists(root_config):
-        return root_config
-
-    return None
+    return _service_get_credsweeper_custom_rules_path()
 
 
 def _get_credsweeper_rules_paths() -> Tuple[Optional[str], Optional[str]]:
-    """Return both primary and custom CredSweeper rules file paths.
+    """Return the effective primary/custom CredSweeper rules paths."""
+    from adscan_internal.services.credsweeper_service import get_credsweeper_rules_paths
 
-    Returns:
-        Tuple[Optional[str], Optional[str]]: (primary_rules_path, custom_rules_path)
-    """
-    primary_rules = _get_credsweeper_config_path()
-    custom_rules = _get_credsweeper_custom_rules_path()
-    return primary_rules, custom_rules
+    return get_credsweeper_rules_paths()
 
 
 # Global system packages configuration - shared between handle_install and handle_check
@@ -3061,7 +3009,7 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         # "extra_specs": ["python-magic==0.4.27"],
     },
     "credsweeper": {
-        "spec": "credsweeper==1.14.1",
+        "spec": "credsweeper==1.15.1",
         "check_target": "credsweeper",
         "check_type": "executable",
         "exe_name": "credsweeper",
@@ -3756,6 +3704,7 @@ def is_venv():
 
 # Import from common module to avoid circular dependencies
 from adscan_internal.cli.common import (  # noqa: E402
+    ensure_initialized_domain_context_for_command,
     is_first_run,
     mark_first_run_complete,
     show_first_run_helper,
@@ -10413,10 +10362,64 @@ class PentestShell:
             extract_zip_callback=self.extract_zip,
             add_credential_callback=self.add_credential,
             cpassword_callback=self._process_cpassword_text,
+            keepass_artifact_callback=self._process_keepass_artifact,
+            handle_found_credentials_callback=self.handle_found_credentials,
+            credsweeper_path=getattr(self, "credsweeper_path", None),
             pypykatz_path=self.pypykatz_path,
         )
         self._spidering_service = spider_service
         return spider_service
+
+    def _get_john_artifact_cracking_service(self):
+        """Get or create a cached John artifact cracking service."""
+        existing = getattr(self, "_john_artifact_cracking_service", None)
+        if existing is not None:
+            return existing
+
+        from adscan_internal.services import JohnArtifactCrackingService
+
+        service = JohnArtifactCrackingService(
+            command_executor=self.run_command,
+            john_path=JohnArtifactCrackingService.resolve_john_path(),
+        )
+        self._john_artifact_cracking_service = service
+        return service
+
+    def _get_keepass_artifact_service(self):
+        """Get or create a cached KeePass artifact service."""
+        existing = getattr(self, "_keepass_artifact_service", None)
+        if existing is not None:
+            return existing
+
+        from adscan_internal.services import KeePassArtifactService
+
+        service = KeePassArtifactService(
+            john_service=self._get_john_artifact_cracking_service()
+        )
+        self._keepass_artifact_service = service
+        return service
+
+    @staticmethod
+    def _resolve_keepass2john_path() -> str | None:
+        """Return the preferred keepass2john converter path."""
+        from adscan_internal.services import JohnArtifactCrackingService
+
+        return JohnArtifactCrackingService.resolve_converter_path("keepass2john")
+
+    @staticmethod
+    def _normalize_keepass_entry_username(username: str, domain: str) -> str:
+        """Normalize KeePass usernames before domain credential validation."""
+        normalized = str(username or "").strip()
+        normalized_domain = str(domain or "").strip().casefold()
+        if "\\" in normalized:
+            prefix, suffix = normalized.split("\\", 1)
+            if prefix.strip().casefold() in {normalized_domain, normalized_domain.split(".")[0]}:
+                return suffix.strip()
+        if "@" in normalized:
+            local_part, realm = normalized.split("@", 1)
+            if realm.strip().casefold() == normalized_domain:
+                return local_part.strip()
+        return normalized
 
     def _get_ai_service(self):
         """Get or create a cached AIService instance.
@@ -13225,6 +13228,13 @@ class PentestShell:
                 cmd_method = self.commands.get(command_name)
                 if cmd_method:
                     try:
+                        if not ensure_initialized_domain_context_for_command(
+                            self,
+                            command_name=command_name,
+                            args_list=args_list,
+                            command_method=cmd_method,
+                        ):
+                            continue
                         # `system` needs the raw string to preserve pipes/quotes.
                         if command_name == "system":
                             cmd_method(raw_arg_string)
@@ -16132,6 +16142,37 @@ class PentestShell:
             csv_output_path=csv_output_path,
         )
 
+    def do_cracking_history(self, args):
+        """Show historical cracking attempts stored in the workspace.
+
+        Usage:
+            cracking_history <domain>
+            cracking_history <domain> <recent_limit>
+        """
+        import shlex
+
+        from adscan_internal import print_error
+        from adscan_internal.cli.cracking import run_cracking_history
+
+        parts = shlex.split(str(args or ""))
+        if not parts:
+            print_error("Usage: cracking_history <domain> [recent_limit]")
+            return
+
+        domain = parts[0]
+        recent_limit = 20
+        if len(parts) >= 2:
+            try:
+                recent_limit = int(parts[1])
+            except Exception:
+                print_error("Invalid recent_limit. Usage: cracking_history <domain> [recent_limit]")
+                return
+            if recent_limit <= 0:
+                print_error("Invalid recent_limit. It must be > 0.")
+                return
+
+        return run_cracking_history(self, domain=domain, recent_limit=recent_limit)
+
     def gpp_passwords(self, domain, username, password, share):
         from adscan_internal.rich_output import mark_sensitive
 
@@ -16703,299 +16744,17 @@ class PentestShell:
         local_path: str,
         remote_path: str,
     ) -> bool:
-        """Upload a local file to a remote host over WinRM using pypsrp.
+        """Upload a local file to a remote host over WinRM."""
+        from adscan_internal.cli.winrm import winrm_upload
 
-        This implementation is inspired by evil-winrm-py's chunked uploader
-        and uses a custom PowerShell script invoked over PSRP to stream the
-        file in base64-encoded chunks. This avoids the ``Client.copy`` helper,
-        which can be fragile on some endpoints, while still providing robust
-        checksum verification and user-visible progress.
-
-        Args:
-            domain: AD domain used for authentication.
-            host: Target host (IP or FQDN).
-            username: Username for WinRM authentication.
-            password: Password or NT hash.
-            local_path: Path to the local file to upload.
-            remote_path: Full destination path on the remote host.
-
-        Returns:
-            True if the upload command appears to have succeeded, False otherwise.
-        """
-        from adscan_internal.rich_output import mark_sensitive
-        import base64
-        import hashlib
-        import json
-        import os
-        import re
-        from pathlib import Path
-
-        try:
-            from pypsrp.client import Client  # type: ignore[import]
-            from pypsrp.complex_objects import PSInvocationState  # type: ignore[import]
-            from pypsrp.powershell import PowerShell, RunspacePool  # type: ignore[import]
-        except Exception as exc:  # pragma: no cover - defensive
-            telemetry.capture_exception(exc)
-            print_error(
-                "pypsrp is not available; unable to perform WinRM upload. "
-                "Install pypsrp or fall back to alternative upload methods."
-            )
-            return False
-
-        if not os.path.exists(local_path) or not os.path.isfile(local_path):
-            print_error(f"Local file '{local_path}' does not exist or is not a file.")
-            return False
-
-        # Build a username suitable for WinRM (DOMAIN\\user when a domain is
-        # present). The password may be a clear-text password or an NT hash;
-        # for NT hashes we follow evil-winrm-py's convention of
-        # 000...00:NT_HASH so requests-ntlm performs pass-the-hash.
-        if domain:
-            full_username = f"{domain}\\{username}"
-        else:
-            full_username = username
-
-        # Normalise password/hash for pypsrp. If the secret looks like a bare
-        # 32-character hex string, treat it as an NT hash and construct the
-        # LM:NT form expected by requests-ntlm.
-        secret = password
-        if secret and re.fullmatch(r"[0-9A-Fa-f]{32}", secret):
-            secret = f"{'0' * 32}:{secret}"
-
-        # Prefer HTTP/5985 for lab environments unless configuration dictates
-        # otherwise. NetExec uses the same defaults when port is not
-        # specified, so this should match existing behaviour.
-        winrm_port = 5985
-        use_ssl = False
-        from adscan_internal.rich_output import create_progress_simple
-
-        marked_host = mark_sensitive(host, "hostname")
-        print_info_verbose(
-            f"Uploading '{local_path}' to '{remote_path}' on {marked_host} via WinRM/pypsrp."
+        return winrm_upload(
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+            local_path=local_path,
+            remote_path=remote_path,
         )
-
-        try:
-            client = Client(
-                host,
-                username=full_username,
-                password=secret,
-                ssl=use_ssl,
-                port=winrm_port,
-                auth="ntlm",
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            telemetry.capture_exception(exc)
-            marked_host = mark_sensitive(host, "hostname")
-            print_error(
-                f"Failed to initialise WinRM client for upload to {marked_host}: {exc}"
-            )
-            return False
-
-        file_path = Path(local_path)
-        try:
-            file_size = file_path.stat().st_size
-        except OSError as exc:  # pragma: no cover - defensive
-            telemetry.capture_exception(exc)
-            print_error("Unable to read local file size for '{local_path}'.")
-            print_exception(show_locals=False, exception=exc)
-            return False
-
-        # Calculate MD5 hash to verify integrity on the remote side, matching
-        # the behaviour of the original evil-winrm-py uploader.
-        try:
-            with file_path.open("rb") as f:
-                hexdigest = hashlib.md5(f.read()).hexdigest().upper()
-        except OSError as exc:  # pragma: no cover - defensive
-            telemetry.capture_exception(exc)
-            print_error("Unable to hash local file '{local_path}'.")
-            print_exception(show_locals=False, exception=exc)
-            return False
-
-        # PowerShell helper script adapted from evil-winrm-py's send.ps1.
-        send_ps_script = r"""
-param (
-    [Parameter(Mandatory=$true, Position=0)]
-    [string]$Base64Chunk,
-    [Parameter(Mandatory=$true, Position=1)]
-    [int]$ChunkType = 0,
-    [Parameter(Mandatory=$false, Position=2)]
-    [string]$TempFilePath,
-    [Parameter(Mandatory=$false, Position=3)]
-    [string]$FilePath,
-    [Parameter(Mandatory=$false, Position=4)]
-    [string]$FileHash
-)
-
-$fileStream = $null
-
-if ($ChunkType -eq 0 -or $ChunkType -eq 3) {
-    $TempFilePath = [System.IO.Path]::Combine(
-        [System.IO.Path]::GetTempPath(),
-        [System.IO.Path]::GetRandomFileName()
-    )
-
-    [PSCustomObject]@{
-        Type         = "Metadata"
-        TempFilePath = $TempFilePath
-    } | ConvertTo-Json -Compress | Write-Output
-}
-
-try {
-    $chunkBytes = [System.Convert]::FromBase64String($Base64Chunk)
-
-    $fileStream = New-Object System.IO.FileStream(
-        $TempFilePath,
-        [System.IO.FileMode]::Append,
-        [System.IO.FileAccess]::Write
-    )
-
-    $fileStream.Write($chunkBytes, 0, $chunkBytes.Length)
-    $fileStream.Close()
-} catch {
-    $msg = "$($_.Exception.GetType().FullName): $($_.Exception.Message)"
-    [PSCustomObject]@{
-        Type    = "Error"
-        Message = "Error processing chunk or writing to file: $msg"
-    } | ConvertTo-Json -Compress | Write-Output
-} finally {
-    if ($fileStream) {
-        $fileStream.Dispose()
-    }
-}
-
-if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
-    try {
-        if ($TempFilePath) {
-            $calculatedHash = (Get-FileHash -Path $TempFilePath -Algorithm MD5).Hash
-            if ($calculatedHash -eq $FileHash) {
-                [System.IO.File]::Delete($FilePath)
-                [System.IO.File]::Move($TempFilePath, $FilePath)
-
-                $fileInfo = Get-Item -Path $FilePath
-                $fileSize = $fileInfo.Length
-                $fileHash = (Get-FileHash -Path $FilePath -Algorithm MD5).Hash
-
-                [PSCustomObject]@{
-                    Type     = "Metadata"
-                    FilePath = $FilePath
-                    FileSize = $fileSize
-                    FileHash = $fileHash
-                    FileName = $fileInfo.Name
-                } | ConvertTo-Json -Compress | Write-Output
-            } else {
-                [PSCustomObject]@{
-                    Type    = "Error"
-                    Message = "File hash mismatch. Expected: $FileHash, Calculated: $calculatedHash"
-                } | ConvertTo-Json -Compress | Write-Output
-            }
-        } else {
-            [PSCustomObject]@{
-                Type    = "Error"
-                Message = "File hash not provided for verification."
-            } | ConvertTo-Json -Compress | Write-Output
-        }
-    } catch {
-        $msg = "$($_.Exception.GetType().FullName): $($_.Exception.Message)"
-        [PSCustomObject]@{
-            Type    = "Error"
-            Message = "Error processing chunk or writing to file: $msg"
-        } | ConvertTo-Json -Compress | Write-Output
-    }
-}
-"""
-
-        # Use a 64 KiB chunk size to balance throughput and memory usage.
-        chunk_size = 65536
-        total_chunks = (file_size + chunk_size - 1) // chunk_size
-
-        progress, task_id = create_progress_simple(
-            total=file_size if file_size > 0 else 1,
-            description=f"[cyan]Uploading {file_path.name} via WinRM...",
-        )
-
-        try:
-            with RunspacePool(client.wsman) as pool:
-                temp_file_path: str = ""
-                metadata: dict | None = None
-
-                with progress:
-                    with file_path.open("rb") as src:
-                        for index in range(total_chunks):
-                            chunk = src.read(chunk_size)
-                            if not chunk:
-                                break
-
-                            if total_chunks == 1:
-                                chunk_type = 3  # single chunk (create + hash)
-                            elif index == 0:
-                                chunk_type = 0  # first
-                            elif index == total_chunks - 1:
-                                chunk_type = 1  # last
-                            else:
-                                chunk_type = 2  # intermediate
-
-                            base64_chunk = base64.b64encode(chunk).decode("utf-8")
-
-                            ps = PowerShell(pool)
-                            ps.add_script(send_ps_script)
-                            ps.add_parameter("Base64Chunk", base64_chunk)
-                            ps.add_parameter("ChunkType", chunk_type)
-
-                            if chunk_type in (1, 2) and temp_file_path:
-                                ps.add_parameter("TempFilePath", temp_file_path)
-
-                            if chunk_type in (1, 3):
-                                ps.add_parameter("FilePath", remote_path)
-                                ps.add_parameter("FileHash", hexdigest)
-
-                            ps.begin_invoke()
-                            while ps.state == PSInvocationState.RUNNING:
-                                ps.poll_invoke()
-
-                            for line in ps.output:
-                                try:
-                                    data = json.loads(str(line))
-                                except Exception:
-                                    continue
-
-                                if data.get("Type") == "Metadata":
-                                    metadata = data
-                                    if "TempFilePath" in data:
-                                        temp_file_path = data["TempFilePath"]
-                                elif data.get("Type") == "Error":
-                                    msg = data.get(
-                                        "Message", "Unknown error during WinRM upload."
-                                    )
-                                    print_error(msg)
-                                    return False
-
-                            if ps.had_errors and ps.streams.error:
-                                # Surface the first error to the user.
-                                first_err = ps.streams.error[0]
-                                print_error(str(first_err))
-                                return False
-
-                            progress.update(task_id, advance=len(chunk))
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            marked_host = mark_sensitive(host, "hostname")
-            print_error(
-                f"WinRM upload failed while copying '{local_path}' to "
-                f"'{remote_path}' on {marked_host}: {exc}"
-            )
-            return False
-
-        if not metadata or metadata.get("FileHash") != hexdigest:
-            print_error(
-                "WinRM upload completed but remote hash did not match the local "
-                "file. The uploaded file may be corrupted."
-            )
-            return False
-
-        print_success_verbose(
-            f"WinRM upload completed for '{local_path}' to '{metadata.get('FilePath', remote_path)}'."
-        )
-        return True
 
     def extract_firefox_passwords(self, domain, host, firefox_dir):
         """
@@ -17090,6 +16849,18 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         from adscan_internal.cli.winrm import check_powershell_transcripts
 
         check_powershell_transcripts(
+            self,
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+        )
+
+    def do_check_winrm_sensitive_data(self, domain, host, username, password):
+        """Run deterministic sensitive-data analysis on a WinRM-accessible host."""
+        from adscan_internal.cli.winrm import run_winrm_sensitive_data_scan
+
+        run_winrm_sensitive_data_scan(
             self,
             domain=domain,
             host=host,
@@ -20279,6 +20050,282 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             auth_username=auth_username,
         )
 
+    def _render_keepass_entries_table(
+        self,
+        *,
+        source_path: str,
+        entries: list[object],
+    ) -> None:
+        """Render a compact KeePass entry preview table."""
+        from rich.panel import Panel
+        from rich.table import Table
+
+        table = Table(
+            title=f"KeePass Entries ({len(entries)})",
+            show_header=True,
+            header_style="bold magenta",
+        )
+        table.add_column("#", style="dim", width=4, justify="right")
+        table.add_column("Group", style="cyan", no_wrap=False, max_width=24)
+        table.add_column("Title", style="cyan", no_wrap=False, max_width=24)
+        table.add_column("Username", style="green", no_wrap=False, max_width=24)
+        table.add_column("Password", style="magenta", no_wrap=False, max_width=28)
+        table.add_column("URL", style="dim", no_wrap=False, max_width=28)
+
+        preview_limit = 12
+        for idx, entry in enumerate(entries[:preview_limit], start=1):
+            group_path = mark_sensitive(
+                str(getattr(entry, "group_path", "") or "-"),
+                "path",
+            )
+            title = mark_sensitive(str(getattr(entry, "title", "") or "-"), "text")
+            username = mark_sensitive(
+                str(getattr(entry, "username", "") or "-"),
+                "user",
+            )
+            password = mark_sensitive(
+                str(getattr(entry, "password", "") or "-"),
+                "password",
+            )
+            url = mark_sensitive(str(getattr(entry, "url", "") or "-"), "path")
+            table.add_row(
+                str(idx),
+                group_path,
+                title,
+                username,
+                password,
+                url,
+            )
+
+        self.console.print(Panel(table, border_style="blue"))
+        if len(entries) > preview_limit:
+            print_info(
+                f"KeePass entry preview truncated to first {preview_limit} rows."
+            )
+        print_info(
+            "Review the persisted KeePass entries report for the complete dataset."
+        )
+        print_info(
+            f"Source KeePass artifact: {mark_sensitive(source_path, 'path')}"
+        )
+
+    def _select_keepass_entries_to_validate(
+        self,
+        *,
+        entries: list[object],
+    ) -> list[object]:
+        """Select which KeePass entries should be validated as credentials."""
+        if not entries:
+            return []
+        if bool(getattr(self, "auto", False)) or _should_disable_interactive_prompts(self):
+            return list(entries)
+
+        options = [
+            "Validate and store all username+password entries",
+            "Validate and store one selected entry",
+            "Skip validation for now",
+        ]
+        selector = getattr(self, "_questionary_select", None)
+        selected_idx = 0
+        if callable(selector):
+            idx = selector(
+                "Choose how to handle extracted KeePass credentials:",
+                options,
+                default_idx=0,
+            )
+            if idx is None:
+                return []
+            selected_idx = idx
+        if selected_idx == 2:
+            return []
+        if selected_idx == 1:
+            row_options = []
+            for entry in entries:
+                username = str(getattr(entry, "username", "") or "").strip() or "-"
+                title = str(getattr(entry, "title", "") or "").strip() or "-"
+                group_path = str(getattr(entry, "group_path", "") or "").strip() or "-"
+                row_options.append(f"{username} | {title} | {group_path}")
+            if callable(selector):
+                idx = selector(
+                    "Select one KeePass entry to validate and store:",
+                    row_options,
+                    default_idx=0,
+                )
+                if idx is None:
+                    return []
+                if 0 <= idx < len(entries):
+                    return [entries[idx]]
+            return []
+        return list(entries)
+
+    def _offer_keepass_password_spraying(
+        self,
+        *,
+        domain: str,
+        passwords: list[str],
+        source_path: str,
+        source_hosts: list[str] | None = None,
+        source_shares: list[str] | None = None,
+        auth_username: str | None = None,
+    ) -> None:
+        """Offer centralized multi-password spraying for extracted KeePass passwords."""
+        unique_passwords: list[str] = []
+        seen_passwords: set[str] = set()
+        for password in passwords:
+            normalized = str(password or "").strip()
+            if not normalized or normalized in seen_passwords:
+                continue
+            seen_passwords.add(normalized)
+            unique_passwords.append(normalized)
+        if not unique_passwords or domain not in getattr(self, "domains", []):
+            return
+        if self.type == "ctf" and self._is_ctf_domain_pwned(domain):
+            print_info_debug(
+                "Skipping KeePass spraying prompt because the CTF domain is already pwned."
+            )
+            return
+        try:
+            from adscan_internal.services.share_credential_provenance_service import (
+                ShareCredentialProvenanceService,
+            )
+
+            provenance_service = ShareCredentialProvenanceService()
+            source_context = provenance_service.build_source_context(
+                hosts=source_hosts,
+                shares=source_shares,
+                artifact=source_path,
+                auth_username=auth_username,
+                origin="share_spidering",
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            source_context = None
+        self.spraying_with_passwords(
+            domain,
+            unique_passwords,
+            source_context=source_context,
+            source_label=f"KeePass artifact {source_path}",
+        )
+
+    def _process_keepass_artifact(
+        self,
+        domain: str,
+        source_path: str,
+        source_hosts: list[str] | None = None,
+        source_shares: list[str] | None = None,
+        auth_username: str | None = None,
+    ) -> int:
+        """Crack and extract one KeePass artifact using reusable services."""
+        from adscan_internal.cli.cracking import resolve_cracking_wordlist
+        from adscan_internal.services.share_credential_provenance_service import (
+            ShareCredentialProvenanceService,
+        )
+
+        marked_source = mark_sensitive(source_path, "path")
+        keepass2john_path = self._resolve_keepass2john_path()
+        if not keepass2john_path:
+            print_warning(
+                f"KeePass artifact found at {marked_source}, but keepass2john is not available."
+            )
+            return 0
+
+        print_operation_header(
+            "KeePass Artifact Analysis",
+            details={
+                "Domain": mark_sensitive(domain, "domain"),
+                "Artifact": marked_source,
+                "Tooling": "keepass2john + john + pykeepass",
+            },
+            icon="🔐",
+        )
+        wordlist_path = resolve_cracking_wordlist(
+            shell=self,
+            hash_type="keepass",
+            domain=domain,
+            wordlists_dir=WORDLISTS_INSTALL_DIR,
+            failed=False,
+        )
+        report_dir = os.path.join("domains", domain, "smb", "keepass")
+        result = self._get_keepass_artifact_service().process_local_artifact(
+            domain=domain,
+            source_path=source_path,
+            wordlist_path=wordlist_path,
+            keepass2john_path=keepass2john_path,
+            python_executable="python3",
+            report_dir=report_dir,
+        )
+        if result.hash_file:
+            print_info(f"KeePass John hash saved to {mark_sensitive(result.hash_file, 'path')}.")
+        if result.cracked_password:
+            print_success(
+                "KeePass master password cracked successfully: "
+                f"{mark_sensitive(result.cracked_password, 'password')}"
+            )
+        if result.error_message:
+            print_warning(result.error_message)
+        if result.entries_report_path:
+            print_info(
+                "KeePass entries report saved to "
+                f"{mark_sensitive(result.entries_report_path, 'path')}."
+            )
+        if not result.entries:
+            return 1 if result.cracked_password else 0
+
+        self._render_keepass_entries_table(
+            source_path=source_path,
+            entries=result.entries,
+        )
+
+        entries_to_validate = [
+            entry
+            for entry in result.entries
+            if str(getattr(entry, "username", "") or "").strip()
+            and str(getattr(entry, "password", "") or "").strip()
+        ]
+        selected_entries = self._select_keepass_entries_to_validate(
+            entries=entries_to_validate
+        )
+        provenance_service = ShareCredentialProvenanceService()
+        for entry in selected_entries:
+            normalized_username = self._normalize_keepass_entry_username(
+                str(getattr(entry, "username", "") or "").strip(),
+                domain,
+            )
+            password = str(getattr(entry, "password", "") or "").strip()
+            if not normalized_username or not password:
+                continue
+            source_steps = provenance_service.build_credential_source_steps(
+                relation="PasswordInKeePass",
+                edge_type="share_password",
+                source="keepass_database",
+                secret=password,
+                hosts=source_hosts,
+                shares=source_shares,
+                artifact=source_path,
+                auth_username=auth_username,
+                origin="share_spidering",
+            )
+            self.add_credential(
+                domain,
+                normalized_username,
+                password,
+                source_steps=source_steps,
+                prompt_for_user_privs_after=False,
+            )
+
+        self._offer_keepass_password_spraying(
+            domain=domain,
+            passwords=[
+                str(getattr(entry, "password", "") or "").strip()
+                for entry in result.entries
+            ],
+            source_path=source_path,
+            source_hosts=source_hosts,
+            source_shares=source_shares,
+            auth_username=auth_username,
+        )
+        return len(result.entries)
+
     @staticmethod
     def _looks_like_cpassword_value(value: str | None) -> bool:
         """Heuristic check to determine if a string resembles a cpassword."""
@@ -20368,136 +20415,15 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         source_shares: list[str] | None = None,
         auth_username: str | None = None,
     ):
-        """Processes a found file according to its extension"""
-        from adscan_internal.rich_output import mark_sensitive
-
-        filename = os.path.basename(file_path)
-
-        if filename.endswith(".xml") and type == "gpp":
-            with open(file_path, "r", encoding="utf-8") as file:
-                content = file.read()
-            if not self._process_cpassword_text(
-                content,
-                domain,
-                filename,
-                source_hosts=source_hosts,
-                source_shares=source_shares,
-                auth_username=auth_username,
-            ):
-                print_warning("No cpasswords found")
-
-        elif filename.endswith(".yml") and type == "gpp":
-            print_success(f"Found .yml file: {filename}")
-            try:
-                with open(file_path, "r", encoding="utf-8") as file:
-                    content = file.read()
-                    # Search for all Ansible Vault blocks
-                    vault_pattern = r"(?:!vault \|(?:\n[\s]+\$ANSIBLE_VAULT;[^\n]*(?:\n[\s]+[0-9a-f]+)+)+)"
-                    vault_matches = re.findall(vault_pattern, content, re.MULTILINE)
-
-                    if vault_matches:
-                        print_warning(
-                            f"Found {len(vault_matches)} Ansible Vault hashes in {filename}"
-                        )
-                        vault_files = []  # List to store the vault file paths
-
-                        # Create individual files for each vault
-                        for i, vault_content in enumerate(vault_matches, 1):
-                            vault_lines = vault_content.split("\n")[1:]
-                            vault_lines = [line.strip() for line in vault_lines]
-                            vault_text = "\n".join(vault_lines)
-
-                            vault_file = f"domains/{domain}/smb/manspider/{filename}_vault_{i}.txt"
-                            with open(vault_file, "w", encoding="utf-8") as f:
-                                f.write(vault_text)
-                            vault_files.append(vault_file)
-
-                        # Process all vaults together
-                        if vault_files:
-                            hash_file = f"domains/{domain}/smb/manspider/{filename}.ansible.hash"
-                            self.file2john(domain, vault_files, hash_file, "ansible")
-                    else:
-                        print_warning(f"No Ansible Vault hashes found in {filename}")
-            except Exception as e:
-                telemetry.capture_exception(e)
-                print_error("Error processing yml file.")
-                print_exception(show_locals=False, exception=e)
-
-        elif filename.endswith(".xlsm") and type == "ext":
-            print_success(f"Found .xlsm file: {filename}")
-            olevba_command = f'olevba "{file_path}"'
-            try:
-                olevba_proc = self.run_command(olevba_command, timeout=300)
-                if olevba_proc.returncode == 0:
-                    olevba_output = olevba_proc.stdout
-
-                    password_pattern = re.compile(
-                        r"(password|pass|passwd|pwd|contraseña|pasahitza)\s*=\s*['\"]?([^\s'\"]+)",
-                        re.IGNORECASE,
-                    )
-                    password_matches = password_pattern.findall(olevba_output)
-
-                    user_pattern = re.compile(
-                        r"(Uid|user|username|usuario)\s*=\s*['\"]?([^;'\"\s]+)",
-                        re.IGNORECASE,
-                    )
-                    user_matches = user_pattern.findall(olevba_output)
-
-                    if password_matches or user_matches:
-                        print_warning(f"Possible credentials found in {filename}:")
-                        for line in olevba_output.splitlines():
-                            if re.search(
-                                r"(password|pass|passwd|pwd|Uid|user|username|usuario)",
-                                line,
-                                re.IGNORECASE,
-                            ):
-                                self.console.print(f" - {line.strip()}")
-
-                        for match in password_matches:
-                            password = match[1]
-                            marked_password = mark_sensitive(password, "password")
-                            print_warning(f"Extracted password: {marked_password}")
-                            self.password = password
-
-                        for match in user_matches:
-                            username = match[1]
-                            marked_username = mark_sensitive(username, "user")
-                            print_warning(f"Extracted username: {marked_username}")
-                            self.username = username
-                        self.add_credential(domain, username, password)
-                        self.update_report_field(domain, "smb_share_secrets", True)
-
-                    else:
-                        print_warning(
-                            f"No credential-related words found in {filename}"
-                        )
-                else:
-                    print_error(f"Error executing olevba on {filename}")
-                    print_error(olevba_proc.stderr.strip())
-            except Exception as e:
-                telemetry.capture_exception(e)
-                print_error("Error executing olevba on {filename}.")
-                print_exception(show_locals=False, exception=e)
-
-        elif filename.endswith(".DMP") and type == "ext":
-            print_warning(f"Memory dump file found: {filename}")
-            self.process_dmp_file(file_path, domain)
-
-        elif filename.endswith(".pfx") and type == "ext":
-            print_info_verbose(f"Found .pfx file: {filename}")
-            # Attempt to extract TGT without a password
-            success = self.ptc_certipy(domain, file_path)
-            if not success:
-                print_warning("PFX is password protected")
-                hash_file = f"domains/{domain}/smb/manspider/{filename}.hash"
-                self.file2john(domain, file_path, hash_file, "pfx")
-
-        elif filename.endswith(".zip") and type == "ext":
-            print_info_verbose(f"Found .zip file: {filename}")
-            self.list_zip(file_path)
-            self.extract_zip(file_path, domain)
-        else:
-            print_warning(f"No interesting information found in {type}")
+        """Process a found file through the shared spidering service."""
+        return self._get_spidering_service().process_found_file(
+            file_path,
+            domain,
+            type,
+            source_hosts=source_hosts,
+            source_shares=source_shares,
+            auth_username=auth_username,
+        )
 
     def process_dmp_file(self, dmp_file, domain):
         """Processes a .DMP file using pypykatz to extract MSV credentials."""
@@ -20724,300 +20650,79 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             source_steps=source_steps,
         )
 
+    def spraying_with_passwords(
+        self,
+        domain,
+        passwords,
+        *,
+        source_context: dict[str, object] | None = None,
+        source_steps: list[object] | None = None,
+        source_label: str | None = None,
+    ):
+        """Perform centralized multi-password spraying with threshold-aware limits."""
+        from adscan_internal.cli.spraying import spraying_with_passwords
+
+        return spraying_with_passwords(
+            self,
+            domain,
+            passwords,
+            source_context=source_context,
+            source_steps=source_steps,
+            source_label=source_label,
+        )
+
     def list_zip(self, zip_file):
-        try:
-            from adscan_internal.services.zip_processing_service import (
-                ZipProcessingService,
-            )
+        from adscan_internal.cli.artifact_cracking import list_zip
 
-            print_info(f"Listing contents of {zip_file}")
-            service = ZipProcessingService()
-            inspection = service.inspect_zip_file(zip_path=str(zip_file))
-            if inspection.success:
-                self.console.print(
-                    f"Entries: {len(inspection.entries)} "
-                    f"(encrypted={inspection.encrypted_entries})"
-                )
-                preview_limit = 200
-                for entry in inspection.entries[:preview_limit]:
-                    if entry.is_dir:
-                        continue
-                    marker = "[enc]" if entry.is_encrypted else "[clr]"
-                    self.console.print(f"{marker} {entry.file_size:>10} {entry.name}")
-                if len(inspection.entries) > preview_limit:
-                    print_warning(
-                        f"ZIP listing preview truncated to first {preview_limit} entries."
-                    )
-                return
-
-            command = f"unzip -l {shlex.quote(str(zip_file))}"
-            proc = self.run_command(command, timeout=300)
-            if proc.returncode == 0:
-                self.console.print(proc.stdout)
-            else:
-                print_error(f"Error listing contents: {proc.stderr.strip()}")
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error.")
-            print_exception(show_locals=False, exception=e)
+        list_zip(self, zip_file=zip_file)
 
     def extract_zip(self, zip_file, domain):
-        try:
-            print_info(f"Attempting to extract ZIP file: {zip_file}")
-            from adscan_internal.services.zip_processing_service import (
-                ZipProcessingService,
-            )
+        from adscan_internal.cli.artifact_cracking import extract_zip
 
-            service = ZipProcessingService()
-            inspection = service.inspect_zip_file(zip_path=str(zip_file))
-
-            # Use unzip without interaction (-t to test file)
-            is_encrypted = False  # Default to not encrypted
-            if inspection.success:
-                is_encrypted = inspection.is_password_protected
-                print_info_debug(
-                    f"ZIP inspection result: entries={len(inspection.entries)} "
-                    f"encrypted={inspection.encrypted_entries}"
-                )
-            else:
-                try:
-                    # Fallback legacy probe when ZIP inspection fails.
-                    test_cmd = f'unzip -P "" -t {shlex.quote(str(zip_file))}'
-                    completed_process = self.run_command(test_cmd, timeout=5)
-                    if completed_process is None or (
-                        hasattr(completed_process, "returncode")
-                        and completed_process.returncode != 0
-                    ):
-                        is_encrypted = True
-                except subprocess.TimeoutExpired as e:
-                    telemetry.capture_exception(e)
-                    is_encrypted = True
-                except Exception as e:
-                    telemetry.capture_exception(e)
-                    print_error("Error testing zip file {zip_file}.")
-                    print_exception(show_locals=False, exception=e)
-                    return
-
-            if is_encrypted:
-                print_warning("ZIP file is password protected")
-                hash_file = f"{zip_file}.hash"
-                self.file2john(domain, zip_file, hash_file, "zip")
-            else:
-                # ZIP not protected, extract without interaction
-                print_success("ZIP file is not protected, extracting...")
-                output_dir = f"domains/{domain}/smb/manspider/extracted"
-                os.makedirs(output_dir, exist_ok=True)
-                command = (
-                    f"unzip -q -n {shlex.quote(str(zip_file))} "
-                    f"-d {shlex.quote(output_dir)}"
-                )
-                proc = self.run_command(command, timeout=300)
-
-                if proc.returncode == 0:
-                    print_success(f"ZIP extracted successfully in {output_dir}")
-                    # Process each extracted file
-                    for root, dirs, files in os.walk(output_dir):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            print_info(f"Processing extracted file: {file}")
-                            self.process_found_file(file_path, domain, "ext")
-                else:
-                    print_error(f"Error extracting ZIP: {proc.stderr}")
-
-        except subprocess.TimeoutExpired as e:
-            telemetry.capture_exception(e)
-            print_error("Timeout reached while processing the ZIP")
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error processing ZIP.")
-            print_exception(show_locals=False, exception=e)
-            print_error("Full error details: {type(e).__name__}.")
-            print_exception(show_locals=False, exception=e)
-            import traceback
-
-            traceback.print_exc()
+        extract_zip(self, zip_file=zip_file, domain=domain)
 
     def file2john(self, domain, input_files, hash_file, file_type):
         """Converts files to John hash format"""
-        from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.cli.artifact_cracking import run_file2john_artifact_flow
 
-        try:
-            # For ansible, input_files can be a list of files
-            if file_type == "ansible":
-                files_str = " ".join(shlex.quote(str(path)) for path in input_files)
-            else:
-                files_str = shlex.quote(str(input_files))
-            command = (
-                f"{shlex.quote(f'{file_type}2john')} {files_str} > "
-                f"{shlex.quote(str(hash_file))}"
-            )
-            print_info_verbose(f"Generating hash with {file_type}2john: {command}")
-            proc = self.run_command(command, timeout=300)
-
-            if os.path.exists(hash_file):
-                print_success_verbose(f"Hash saved in {hash_file}")
-                print_warning(
-                    f"Cracking {file_type} file. Please be patient, this can take a while."
-                )
-                print_info("Using rockyou as the default wordlist.")
-                wordlist = os.path.join(WORDLISTS_INSTALL_DIR, "rockyou.txt")
-                if os.path.exists(wordlist):
-                    password = self.john(hash_file, wordlist, domain, input_files)
-                    if password:
-                        if file_type == "pfx":
-                            self.ptc_certipy(domain, input_files, pfx_password=password)
-                        elif file_type == "ansible":
-                            # Attempt to decrypt each vault
-                            marked_password = mark_sensitive(password, "password")
-                            print_info(
-                                f"Attempting to decrypt vaults with password: {marked_password}"
-                            )
-                            pass_file = (
-                                f"domains/{domain}/smb/manspider/cracked_vault_pass.txt"
-                            )
-                            with open(pass_file, "w", encoding="utf-8") as f:
-                                f.write(password)
-                            # print_success(f"Password saved in {pass_file}")
-                            for vault_file in input_files:
-                                command = (
-                                    f"cat {shlex.quote(str(vault_file))} "
-                                    "| ansible-vault decrypt "
-                                    f"--vault-password-file {shlex.quote(pass_file)}; echo"
-                                )
-                                try:
-                                    proc = self.run_command(command, timeout=300)
-                                    print_info(
-                                        f"Attempting to decrypt {vault_file}: {command}"
-                                    )
-                                    if "successful" in proc.stdout:
-                                        decrypted = proc.stdout.split(
-                                            "Decryption successful\n", 1
-                                        )[1].strip()
-                                        print_success(
-                                            f"Decrypted content of {vault_file}:"
-                                        )
-                                        self.console.print(decrypted)
-                                except Exception as e:
-                                    telemetry.capture_exception(e)
-                                    print_error(
-                                        f"Error decrypting {vault_file}: {str(e)}"
-                                    )
-                        elif file_type == "zip":
-                            self.extract_protected_zip(input_files, password, domain)
-            else:
-                print_error(f"Error generating hash with {file_type}2john")
-
-        except subprocess.CalledProcessError as e:
-            telemetry.capture_exception(e)
-            print_error(f"Error executing {file_type}2john: {e.stderr.strip()}")
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error in {file_type}2john.")
-            print_exception(show_locals=False, exception=e)
+        run_file2john_artifact_flow(
+            self,
+            domain=domain,
+            input_files=input_files,
+            hash_file=hash_file,
+            file_type=file_type,
+            wordlists_dir=WORDLISTS_INSTALL_DIR,
+            original_file=input_files,
+        )
 
     def john(self, hash_file, wordlist, domain, original_file):
         """Starts cracking with John"""
-        try:
-            command = (
-                f"john --wordlist={shlex.quote(str(wordlist))} "
-                f"{shlex.quote(str(hash_file))}"
-            )
-            print_info_verbose("Starting john the ripper")
-            proc = self.run_command(command, timeout=300)
+        from adscan_internal.cli.artifact_cracking import run_john_cracking
 
-            if proc.returncode == 0:
-                print_success_verbose("Cracking with john completed")
-                file_type = os.path.basename(hash_file).split(".")[-2]  # zip, pfx, etc
-                return self.check_john_result(
-                    hash_file, file_type, domain, original_file
-                )
-            print_error(f"Error executing john: {proc.stderr.strip()}")
-            return None
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error in john.")
-            print_exception(show_locals=False, exception=e)
-            return None
+        return run_john_cracking(
+            self,
+            hash_file=hash_file,
+            wordlist=wordlist,
+            domain=domain,
+            original_file=original_file,
+        )
 
     def check_john_result(self, hash_file, file_type, domain, original_file):
         """Checks john's result using --show"""
-        from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.cli.artifact_cracking import check_john_result
 
-        try:
-            command = f"john --show {shlex.quote(str(hash_file))}"
-            proc = self.run_command(command, timeout=300)
-
-            if proc.returncode == 0 and proc.stdout:
-                output_lines = proc.stdout.strip().split("\n")
-                if not output_lines:
-                    print_warning("Password not found")
-                    return None
-                first_line = output_lines[0]
-
-                # For ZIP and PFX files, take the second field after splitting by ':'
-                if ":" in first_line:
-                    parts = first_line.split(":")
-                    password = parts[1] if len(parts) > 1 else None
-                else:
-                    password = first_line.split()[-1] if first_line.split() else None
-                if password:
-                    marked_password = mark_sensitive(password, "password")
-                    print_warning(f"Password found: {marked_password}")
-
-                    return password
-
-                print_warning("Password not found")
-                return None
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error checking result.")
-            print_exception(show_locals=False, exception=e)
-            print_error("Full error details: {type(e).__name__}.")
-            print_exception(show_locals=False, exception=e)
-            import traceback
-
-            traceback.print_exc()
-            return None
+        return check_john_result(self, hash_file=hash_file)
 
     def extract_protected_zip(self, zip_file, password, domain):
         """Extracts a password-protected ZIP file"""
-        try:
-            print_info(
-                f"Attempting to extract protected ZIP with found password: {zip_file}"
-            )
-            output_dir = f"domains/{domain}/smb/manspider/extracted"
-            os.makedirs(output_dir, exist_ok=True)
+        from adscan_internal.cli.artifact_cracking import extract_protected_zip
 
-            # Escape special characters in the password
-            escaped_password = shlex.quote(password)
-
-            # Use unzip with the password
-            command = (
-                f"unzip -P {escaped_password} -d {shlex.quote(output_dir)} "
-                f"{shlex.quote(str(zip_file))}"
-            )
-            proc = self.run_command(command, timeout=300)
-            time.sleep(5)
-            if proc.returncode == 0:
-                print_success(f"ZIP extracted successfully in {output_dir}")
-                # Process each extracted file
-                for root, dirs, files in os.walk(output_dir):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        print_info(f"Processing extracted file: {file}")
-                        self.process_found_file(file_path, domain, "ext")
-            else:
-                print_error(f"Error extracting ZIP: {proc.stderr.strip()}")
-
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error extracting protected ZIP.")
-            print_exception(show_locals=False, exception=e)
-            print_error("Full error details: {type(e).__name__}.")
-            print_exception(show_locals=False, exception=e)
-            import traceback
-
-            traceback.print_exc()
+        extract_protected_zip(
+            self,
+            zip_file=zip_file,
+            password=password,
+            domain=domain,
+        )
 
     def do_extract_base_dn(self, domain):
         """
@@ -21404,10 +21109,16 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         return auth
 
     def do_enum_all_user_privs(self, args):
-        """Wrapper for enum_all_user_privs command."""
-        from adscan_internal.cli.privileges import run_enum_all_user_privs
+        """Backward-compatible wrapper for enum_all_user_postauth_access command."""
+        from adscan_internal.cli.privileges import run_enum_all_user_postauth_access
 
-        run_enum_all_user_privs(self, args=args)
+        run_enum_all_user_postauth_access(self, args=args)
+
+    def do_enum_all_user_postauth_access(self, args):
+        """Enumerate post-auth access opportunities for all stored domain users."""
+        from adscan_internal.cli.privileges import run_enum_all_user_postauth_access
+
+        run_enum_all_user_postauth_access(self, args=args)
 
     def check_privileged_groups(
         self,
@@ -21426,6 +21137,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         queries, and then to BloodHound as a last resort.
         """
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.cli.ldap import peek_exact_ldap_connection_timeout_state
 
         try:
             marked_username = mark_sensitive(username, "user")
@@ -21440,6 +21152,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 )
             privileged_groups = None
             source = "unknown"
+            skip_further_live_ldap = False
 
             if prefer_live_ldap:
                 print_info_debug(
@@ -21450,6 +21163,13 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                     domain, username, password
                 )
                 source = "ldap-live"
+                skip_further_live_ldap = peek_exact_ldap_connection_timeout_state(self)
+                if skip_further_live_ldap:
+                    print_info_debug(
+                        "[priv-groups] live LDAP lookup hit the exact LDAP "
+                        f"connection-timeout signature for {marked_username}@{marked_domain}; "
+                        "skipping any further live LDAP fallbacks in this privilege check."
+                    )
 
             if privileged_groups is None:
                 from adscan_internal.services.attack_graph_service import (
@@ -21498,14 +21218,22 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                         privileged_groups=privileged_groups,
                     )
                 else:
-                    print_info_debug(
-                        "[priv-groups] group lookup returned no results for "
-                        f"{marked_username}@{marked_domain} (source={source}); falling back to LDAP."
-                    )
-                    privileged_groups = self._check_privileged_groups_with_ldap(
-                        domain, username, password
-                    )
-                    source = "LDAP"
+                    if skip_further_live_ldap:
+                        print_info_debug(
+                            "[priv-groups] group lookup returned no results for "
+                            f"{marked_username}@{marked_domain} (source={source}); "
+                            "skipping additional LDAP fallback because live LDAP already "
+                            "hit the exact connection-timeout signature."
+                        )
+                    else:
+                        print_info_debug(
+                            "[priv-groups] group lookup returned no results for "
+                            f"{marked_username}@{marked_domain} (source={source}); falling back to LDAP."
+                        )
+                        privileged_groups = self._check_privileged_groups_with_ldap(
+                            domain, username, password
+                        )
+                        source = "LDAP"
 
             if privileged_groups is None:
                 print_info_verbose(
@@ -21830,6 +21558,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             from adscan_internal.cli.ldap import (
                 clear_exact_ldap_connection_timeout_state,
                 consume_exact_ldap_connection_timeout_state,
+                mark_exact_ldap_connection_timeout_state,
                 get_recursive_user_groups_in_chain,
                 get_recursive_principal_group_sids_in_chain,
                 run_ldap_groupmembership_privileged,
@@ -21853,6 +21582,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 result["groups"] = []
                 return result
             if consume_exact_ldap_connection_timeout_state(self):
+                mark_exact_ldap_connection_timeout_state(self)
                 marked_user = mark_sensitive(username, "user")
                 marked_domain = mark_sensitive(domain, "domain")
                 print_info_debug(
@@ -21882,6 +21612,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 raw_text = "\n".join(f"{group}@{domain}" for group in groups)
                 return self._parse_privileged_group_output(raw_text)
             if consume_exact_ldap_connection_timeout_state(self):
+                mark_exact_ldap_connection_timeout_state(self)
                 marked_user = mark_sensitive(username, "user")
                 marked_domain = mark_sensitive(domain, "domain")
                 print_info_debug(
@@ -22119,7 +21850,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             mark_sensitive,
         )
         from adscan_internal.cli.attack_path_execution import (
-            offer_attack_paths_for_execution,
+            offer_attack_paths_with_non_high_value_fallback,
         )
 
         if self.domains_data[domain]["auth"] == "pwned" and self.type == "ctf":
@@ -22129,13 +21860,12 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         def _offer_attack_paths() -> None:
             # Reuse the centralized UX: show paths, allow inspecting details, and
             # optionally execute one (step mapping is handled by the helper).
-            offer_attack_paths_for_execution(
+            offer_attack_paths_with_non_high_value_fallback(
                 self,
                 domain,
                 start=username,
                 max_depth=10,
                 max_display=20,
-                include_all=False,
                 context_username=username,
                 context_password=password,
             )
@@ -22190,20 +21920,20 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                     if auto_mode:
                         marked_username = mark_sensitive(username, "user")
                         print_success(
-                            f"Automatically enumerating privileges for user {marked_username}"
+                            f"Automatically enumerating post-auth service access for user {marked_username}"
                         )
-                        self.netexec_user_privs(domain, username, password)
+                        self.netexec_user_postauth_access(domain, username, password)
                     else:
                         marked_username = mark_sensitive(username, "user")
                         if Confirm.ask(
-                            f"Do you want to enumerate privileges for user {marked_username}?",
+                            f"Do you want to enumerate post-auth service access for user {marked_username}?",
                             default=True,
                         ):
-                            self.netexec_user_privs(domain, username, password)
+                            self.netexec_user_postauth_access(domain, username, password)
                         else:
                             marked_username = mark_sensitive(username, "user")
                             print_info_verbose(
-                                f"Privilege enumeration for user {marked_username} has been cancelled."
+                                f"Post-auth service enumeration for user {marked_username} has been cancelled."
                             )
             else:
                 live_membership = self.check_privileged_groups(
@@ -22246,44 +21976,80 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
                 if auto_mode:
                     print_success(
-                        f"Automatically enumerating privileges for user {marked_username}"
+                        f"Automatically enumerating post-auth service access for user {marked_username}"
                     )
-                    self.netexec_user_privs(domain, username, password)
+                    self.netexec_user_postauth_access(domain, username, password)
                 else:
                     marked_username = mark_sensitive(username, "user")
                     respuesta = Confirm.ask(
-                        f"Do you want to enumerate privileges for user {marked_username}?"
+                        f"Do you want to enumerate post-auth service access for user {marked_username}?"
                     )
                     if respuesta:  # Prompt.ask for (y/n) returns boolean
-                        self.netexec_user_privs(domain, username, password)
+                        self.netexec_user_postauth_access(domain, username, password)
                     else:
                         marked_username = mark_sensitive(username, "user")
                         print_info_verbose(
-                            f"Privilege enumeration for user {marked_username} has been cancelled."
+                            f"Post-auth service enumeration for user {marked_username} has been cancelled."
                         )
+
+    def netexec_user_postauth_access(
+        self, domain, username, password, hosts: list[str] | None = None
+    ):
+        """Wrapper for post-auth user access orchestration used by ask_for_user_privs.
+
+        This flow intentionally skips ACL enumeration because low-priv ACL paths
+        are already covered by the attack-path UX shown earlier in
+        ``ask_for_user_privs``.
+        """
+        from adscan_internal.cli.privileges import (
+            run_user_postauth_access_with_orchestration,
+        )
+
+        run_user_postauth_access_with_orchestration(
+            self,
+            domain=domain,
+            username=username,
+            password=password,
+            hosts=hosts,
+            include_acl_enumeration=False,
+        )
 
     def netexec_user_privs(
         self, domain, username, password, hosts: list[str] | None = None
     ):
-        """Wrapper for netexec_user_privs operation with full orchestration."""
-        from adscan_internal.cli.privileges import (
-            run_netexec_user_privs_with_orchestration,
-        )
-
-        run_netexec_user_privs_with_orchestration(
-            self, domain=domain, username=username, password=password, hosts=hosts
+        """Backward-compatible alias for post-auth user access orchestration."""
+        self.netexec_user_postauth_access(
+            domain,
+            username,
+            password,
+            hosts=hosts,
         )
 
     def do_netexec_user_privs(self, args):
-        """Wrapper for netexec_user_privs command."""
-        from adscan_internal.cli.privileges import run_netexec_user_privs
+        """Backward-compatible wrapper for netexec_user_postauth_access command."""
+        from adscan_internal.cli.privileges import run_netexec_user_postauth_access
 
         args = args.split()
         if len(args) != 3:
             self.console.print("Usage: netexec_user_privs <domain> <user> <password>")
             return
         domain, username, password = args
-        run_netexec_user_privs(
+        run_netexec_user_postauth_access(
+            self, domain=domain, username=username, password=password
+        )
+
+    def do_netexec_user_postauth_access(self, args):
+        """Enumerate post-auth host/service access for a domain user."""
+        from adscan_internal.cli.privileges import run_netexec_user_postauth_access
+
+        args = args.split()
+        if len(args) != 3:
+            self.console.print(
+                "Usage: netexec_user_postauth_access <domain> <user> <password>"
+            )
+            return
+        domain, username, password = args
+        run_netexec_user_postauth_access(
             self, domain=domain, username=username, password=password
         )
 
@@ -22606,6 +22372,65 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             marked_target_username = mark_sensitive(target_username, "user")
             print_error(
                 f"An exception occurred while trying to enable user {marked_target_username}: {e}"
+            )
+            return False
+
+    def enable_computer(self, domain, username, password, target_computer):
+        """Enables a disabled computer account using BloodyAD."""
+        from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.services.exploitation import ExploitationService
+        from adscan_internal.integrations.bloody import resolve_bloody_host
+
+        try:
+            marked_target_computer = mark_sensitive(target_computer, "hostname")
+            print_info_verbose(
+                f"Attempting to enable disabled computer account: {marked_target_computer}"
+            )
+            pdc_ip = self.domains_data[domain]["pdc"]
+            pdc_hostname = self.domains_data[domain].get("pdc_hostname")
+            pdc_host = (
+                resolve_bloody_host(
+                    pdc_ip=pdc_ip,
+                    pdc_hostname=pdc_hostname,
+                    domain=domain,
+                    kerberos=True,
+                )
+                or pdc_ip
+            )
+            marked_pdc = mark_sensitive(pdc_host, "ip")
+            print_info_verbose(
+                f"Using PDC {marked_pdc} to enable computer {marked_target_computer}"
+            )
+
+            service = ExploitationService()
+            success = service.acl.enable_computer(
+                pdc_host=pdc_host,
+                bloody_path=self.bloodyad_path,
+                username=username,
+                password=password,
+                domain=domain,
+                target_computer=target_computer,
+                kerberos=True,
+                timeout=120,
+            )
+
+            if success:
+                print_success(
+                    f"Successfully enabled computer account: {marked_target_computer}"
+                )
+            else:
+                print_error(
+                    f"Failed to enable computer account {marked_target_computer}. "
+                    "Check logs for BloodyAD output details."
+                )
+            return success
+
+        except Exception as e:
+            telemetry.capture_exception(e)
+            marked_target_computer = mark_sensitive(target_computer, "hostname")
+            print_error(
+                "An exception occurred while trying to enable computer account "
+                f"{marked_target_computer}: {e}"
             )
             return False
 
@@ -23600,7 +23425,14 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         )
 
     def run_service_command(
-        self, command, domain, service, username, password, return_boolean=False
+        self,
+        command,
+        domain,
+        service,
+        username,
+        password,
+        return_boolean=False,
+        prompt=True,
     ):
         from adscan_internal.rich_output import mark_sensitive
 
@@ -23716,8 +23548,18 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                                         )
                                 except Exception as exc:  # noqa: BLE001
                                     telemetry.capture_exception(exc)
-                                func = getattr(self, f"ask_for_{service}_access")
-                                func(domain, host, username, password)
+                                if prompt:
+                                    print_info_debug(
+                                        "[service-access] launching service follow-up prompt: "
+                                        f"service={service} user={marked_username} host={marked_host}"
+                                    )
+                                    func = getattr(self, f"ask_for_{service}_access")
+                                    func(domain, host, username, password)
+                                else:
+                                    print_info_debug(
+                                        "[service-access] service follow-up prompt suppressed: "
+                                        f"service={service} user={marked_username} host={marked_host}"
+                                    )
 
                     if not privileged_hosts:
                         marked_username = mark_sensitive(username, "user")
@@ -23820,11 +23662,10 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
 
         This command reads `domains/<domain>/attack_graph.json`, computes maximal
         paths, and displays a table of the shortest paths. By default, it only
-        shows paths whose terminal node is a Tier-0 target (domain-compromise),
-        based on BloodHound `isTierZero` / `admin_tier_0` tagging. Use `--impact`
-        to include "high impact" targets (BloodHound `highvalue` + privileged
-        group heuristics). Use `--all` to include every path regardless of the
-        target.
+        shows paths whose terminal node is a high-value target, based on
+        BloodHound `highvalue` plus Tier-0 / privileged-group heuristics. Use
+        `--tier0-only` to restrict results to Tier-0 targets only. Use `--all`
+        to include every path regardless of the target.
 
         Usage:
             attack_paths <domain> [user|owned] [index] [--max N] [--depth N] [--path-steps N] [--all]
@@ -23840,11 +23681,12 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             --max N: Max number of paths shown in the summary (default: 20)
             --depth N: Max path length to compute (default: 10)
             --path-steps N: Max number of steps shown inline per path in the summary table (default: unlimited)
-            --impact: Include paths that terminate on high-impact (non Tier-0) targets
+            --tier0-only: Restrict paths to Tier-0 targets only
             --all: Include paths whose target is not high value
 
         Examples:
             attack_paths north.sevenkingdoms.local
+            attack_paths north.sevenkingdoms.local --tier0-only
             attack_paths north.sevenkingdoms.local --all
             attack_paths north.sevenkingdoms.local --max 20 --depth 6
             attack_paths north.sevenkingdoms.local --path-steps 2
@@ -23860,7 +23702,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         if not domain:
             print_instruction(
                 "Usage: attack_paths <domain> [user|owned] [index] [--max N] [--depth N] "
-                "[--path-steps N] [--impact] [--all]"
+                "[--path-steps N] [--tier0-only] [--all]"
             )
             return
 
@@ -23870,7 +23712,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         max_depth = 10
         max_path_steps: int | None = None
         include_all = False
-        include_impact = False
+        target_mode = "impact"
 
         # Parse flags first: --max N, --depth N (and remove them from positional parsing).
         positionals: list[str] = []
@@ -23881,8 +23723,12 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                 include_all = True
                 i += 1
                 continue
+            if token in {"--tier0-only", "--tierzero-only", "--tier0"}:
+                target_mode = "tier0"
+                i += 1
+                continue
             if token in {"--impact", "--highvalue"}:
-                include_impact = True
+                # Backward-compatible alias for the current default.
                 i += 1
                 continue
             if token == "--max" and i + 1 < len(parts):
@@ -23943,7 +23789,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                     if not third.isdigit():
                         print_instruction(
                             "Usage: attack_paths <domain> [user|owned] [index] [--max N] [--depth N] "
-                            "[--path-steps N] [--impact] [--all]"
+                            "[--path-steps N] [--tier0-only] [--all]"
                         )
                         return
                     index = int(third)
@@ -23957,7 +23803,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             max_depth=max_depth,
             max_path_steps=max_path_steps,
             include_all=include_all,
-            include_impact=include_impact,
+            target_mode=target_mode,
             allow_execution=True,
         )
 
@@ -27403,7 +27249,10 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
             ],
             "Spraying": ["spraying", "netexec_pass_policy"],
             "Cracking": ["cracking"],
-            "Privileges": ["enum_all_user_privs", "netexec_user_privs"],
+            "Privileges": [
+                "enum_all_user_postauth_access",
+                "netexec_user_postauth_access",
+            ],
             "BloodHound": [
                 "bloodhound_users",
                 "bloodhound_all_users",

@@ -26,6 +26,7 @@ import threading
 import time
 import traceback
 import rich
+from rich.markup import escape as rich_escape
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
@@ -66,6 +67,10 @@ from adscan_internal.services.smb_guest_auth_service import (
     is_guest_alias,
     resolve_smb_guest_username,
 )
+from adscan_internal.services.credsweeper_service import (
+    CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
+    CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
+)
 from adscan_internal.services.smb_exclusion_policy import (
     GLOBAL_SMB_EXCLUDE_FILTER_TOKENS,
     GLOBAL_SMB_HEAVY_ARTIFACT_MAX_FILESIZE_MB,
@@ -96,6 +101,7 @@ from adscan_internal.services.smb_sensitive_file_policy import (
     get_sensitive_phase_definition,
     get_sensitive_phase_extensions,
     get_sensitive_file_extensions,
+    resolve_effective_sensitive_extension,
 )
 from adscan_internal.services.credsweeper_service import get_default_credsweeper_jobs
 from adscan_internal.services.rclone_tuning_service import (
@@ -107,6 +113,7 @@ from adscan_internal.services.rclone_tuning_service import (
 from adscan_internal.services.artifact_processing_tuning_service import (
     choose_artifact_processing_tuning,
 )
+from adscan_internal.services.spidering_service import ArtifactProcessingRecord
 from adscan_internal.workspaces.subpaths import domain_path, domain_relpath
 
 _SMB_HOST_IDENTITY_RE = re.compile(
@@ -118,6 +125,112 @@ _SMB_GUEST_SESSION_RE = re.compile(
     re.IGNORECASE,
 )
 _SMB_TARGET_SCOPE_WARNING_THRESHOLD = 2048
+
+
+def _artifact_status_label(status: str) -> str:
+    """Return a user-friendly label for one artifact processing status."""
+    normalized = str(status or "").strip().lower()
+    mapping = {
+        "processed": "Processed",
+        "processed_no_findings": "Processed (no findings)",
+        "manual_review": "Manual review",
+        "failed": "Processing failed",
+        "skipped": "Skipped",
+    }
+    return mapping.get(normalized, normalized.replace("_", " ").title() or "Unknown")
+
+
+def _persist_artifact_processing_report(
+    *,
+    phase_root_abs: str,
+    records: list[ArtifactProcessingRecord],
+) -> str:
+    """Persist one artifact processing report as JSON and return its absolute path."""
+    normalized_records = [item for item in records if item is not None]
+    report_path = os.path.join(phase_root_abs, "artifact_processing_report.json")
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    payload = {
+        "records": [
+            {
+                "path": item.path,
+                "filename": item.filename,
+                "artifact_type": item.artifact_type,
+                "status": item.status,
+                "note": item.note,
+                "manual_review": bool(item.manual_review),
+                "details": dict(item.details or {}),
+            }
+            for item in normalized_records
+        ]
+    }
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    return report_path
+
+
+def _render_artifact_processing_summary(
+    shell: Any,
+    *,
+    phase_label: str,
+    records: list[ArtifactProcessingRecord],
+    report_path: str,
+) -> None:
+    """Render one compact artifact processing summary with paths and statuses."""
+    if not records:
+        return
+
+    normalized_records = [item for item in records if item is not None]
+    if not normalized_records:
+        return
+
+    ordered_records = sorted(
+        normalized_records,
+        key=lambda item: (
+            0 if item.status == "manual_review" else 1 if item.status == "failed" else 2,
+            item.filename.lower(),
+            item.path.lower(),
+        ),
+    )
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("File", style=BRAND_COLORS["warning"])
+    table.add_column("Type", style=BRAND_COLORS["info"], no_wrap=True)
+    table.add_column("Status", style=BRAND_COLORS["success"], no_wrap=True)
+    table.add_column("Path")
+    table.add_column("Notes")
+
+    workspace_cwd = (
+        shell._get_workspace_cwd()
+        if callable(getattr(shell, "_get_workspace_cwd", None))
+        else os.getcwd()
+    )
+    for item in ordered_records:
+        try:
+            display_path = os.path.relpath(item.path, workspace_cwd)
+        except ValueError:
+            display_path = item.path
+        table.add_row(
+            mark_sensitive(item.filename, "path"),
+            mark_sensitive(item.artifact_type, "text"),
+            _artifact_status_label(item.status),
+            mark_sensitive(display_path, "path"),
+            rich_escape(str(item.note or "")),
+        )
+
+    print_panel_with_table(
+        table,
+        border_style=BRAND_COLORS["warning"],
+        title=f"{phase_label} Artifact Review Summary",
+    )
+
+    manual_review_count = sum(1 for item in normalized_records if item.manual_review)
+    failed_count = sum(1 for item in normalized_records if item.status == "failed")
+    print_info(
+        "Artifact review summary: "
+        f"processed={len(normalized_records) - manual_review_count - failed_count} "
+        f"manual_review={manual_review_count} "
+        f"failed={failed_count} "
+        f"report={mark_sensitive(os.path.relpath(report_path, workspace_cwd), 'path')}"
+    )
 
 
 def _is_globally_excluded_mapping_share(share_name: str) -> bool:
@@ -4442,7 +4555,10 @@ def _count_files_under_path_with_extensions(
                 continue
             if is_globally_excluded_smb_relative_path(relative_path):
                 continue
-            if file_path.suffix.casefold() in suffixes:
+            if resolve_effective_sensitive_extension(
+                str(file_path),
+                allowed_extensions=tuple(suffixes),
+            ) in suffixes:
                 total += 1
     return total
 
@@ -5030,17 +5146,20 @@ def _run_credsweeper_path_scan_with_scope(
         "credsweeper_path": credsweeper_path,
         "json_output_dir": json_output_dir,
         "include_custom_rules": True,
+        "rules_profile": CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
         "custom_ml_threshold": "0.0",
         "jobs": jobs,
         "find_by_ext": find_by_ext,
     }
     if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY:
+        common_kwargs["rules_profile"] = CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC
         return credsweeper_service.analyze_path_with_options(
             path_to_scan,
             doc=True,
             **common_kwargs,
         )
     if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_DOCUMENTS_DEPTH_EXPERIMENTAL:
+        common_kwargs["rules_profile"] = CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC
         return credsweeper_service.analyze_path_with_options(
             path_to_scan,
             doc=True,
@@ -5053,6 +5172,7 @@ def _run_credsweeper_path_scan_with_scope(
             doc=False,
             **common_kwargs,
         )
+        common_kwargs["rules_profile"] = CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC
         doc_findings = credsweeper_service.analyze_path_with_options(
             path_to_scan,
             doc=True,
@@ -5103,12 +5223,14 @@ def _run_credsweeper_library_benchmark_target_scan(
     if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_BINARY_ONLY:
         return library_service.analyze_targets_with_options(
             targets,
+            rules_profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
             doc=True,
             **common_kwargs,
         )
     if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_DOCUMENTS_DEPTH_EXPERIMENTAL:
         return library_service.analyze_targets_with_options(
             targets,
+            rules_profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
             doc=True,
             depth=True,
             **common_kwargs,
@@ -5116,17 +5238,20 @@ def _run_credsweeper_library_benchmark_target_scan(
     if benchmark_scope == SMB_SENSITIVE_BENCHMARK_SCOPE_ALL_SUPPORTED:
         text_findings = library_service.analyze_targets_with_options(
             targets,
+            rules_profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
             doc=False,
             **common_kwargs,
         )
         doc_findings = library_service.analyze_targets_with_options(
             targets,
+            rules_profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
             doc=True,
             **common_kwargs,
         )
         return _merge_grouped_credential_findings(text_findings, doc_findings)
     return library_service.analyze_targets_with_options(
         targets,
+        rules_profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
         doc=False,
         **common_kwargs,
     )
@@ -9722,8 +9847,9 @@ def _run_post_mapping_deterministic_rclone_artifact_scan(
 
     artifact_files = _list_files_under_path(loot_dir)
     spidering_service = shell._get_spidering_service()
+    artifact_records: list[ArtifactProcessingRecord] = []
     for file_path in artifact_files:
-        spidering_service.process_found_file(
+        artifact_records.append(spidering_service.process_found_file(
             file_path,
             domain,
             "ext",
@@ -9732,10 +9858,21 @@ def _run_post_mapping_deterministic_rclone_artifact_scan(
             auth_username=username,
             enable_legacy_zip_callbacks=False,
             apply_actions=True,
-        )
+        ))
     loot_rel = os.path.relpath(loot_dir, shell._get_workspace_cwd())
     if not artifact_files:
         print_info(f"No artifact candidates were detected for phase {phase_label}.")
+    else:
+        report_path = _persist_artifact_processing_report(
+            phase_root_abs=phase_root_abs,
+            records=artifact_records,
+        )
+        _render_artifact_processing_summary(
+            shell,
+            phase_label=phase_label,
+            records=artifact_records,
+            report_path=report_path,
+        )
     print_info(
         "Deterministic rclone artifact summary: "
         f"phase={mark_sensitive(phase_label, 'text')} "
@@ -9915,6 +10052,15 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
     phase: str,
 ) -> dict[str, Any]:
     """Run one local CIFS-backed artifact phase using the shared spidering service."""
+    phase_root_abs = domain_path(
+        getattr(shell, "domains_dir", None),
+        domain,
+        "smb",
+        "cifs",
+        "deterministic",
+        phase,
+    )
+    os.makedirs(phase_root_abs, exist_ok=True)
     effective_mount_root = str(
         cifs_mount_root or ""
     ).strip() or _resolve_cifs_mount_root(
@@ -9957,6 +10103,7 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
     )
 
     artifact_hits = 0
+    artifact_records: list[ArtifactProcessingRecord] = []
     try:
         spidering_service = shell._get_spidering_service()
         for file_path in _iter_cifs_phase_candidate_files(
@@ -9970,7 +10117,7 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
             ),
         ):
             artifact_hits += 1
-            spidering_service.process_found_file(
+            artifact_records.append(spidering_service.process_found_file(
                 file_path,
                 domain,
                 "ext",
@@ -9978,7 +10125,7 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
                 source_shares=shares,
                 auth_username=username,
                 enable_legacy_zip_callbacks=False,
-            )
+            ))
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_warning("CIFS artifact phase failed unexpectedly.")
@@ -9998,6 +10145,17 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
 
     if artifact_hits == 0:
         print_info(f"No artifact candidates were detected for phase {phase_label}.")
+    else:
+        report_path = _persist_artifact_processing_report(
+            phase_root_abs=phase_root_abs,
+            records=artifact_records,
+        )
+        _render_artifact_processing_summary(
+            shell,
+            phase_label=phase_label,
+            records=artifact_records,
+            report_path=report_path,
+        )
     return {"completed": True, "artifact_hits": artifact_hits, "phase": phase}
 
 
@@ -10071,7 +10229,10 @@ def _iter_cifs_extension_candidate_files(
                         continue
                     if is_globally_excluded_smb_relative_path(relative_path):
                         continue
-                    if file_path.suffix.casefold() in suffixes:
+                    if resolve_effective_sensitive_extension(
+                        str(file_path),
+                        allowed_extensions=tuple(suffixes),
+                    ) in suffixes:
                         candidates.append(str(file_path))
     return candidates
 
@@ -10814,6 +10975,46 @@ def _run_ai_prioritized_file_analysis(
                     f"{marked_path}: {pipeline_result.deterministic_summary}"
                 )
             if pipeline_result.deterministic_findings:
+                keepass_findings = [
+                    finding
+                    for finding in pipeline_result.deterministic_findings
+                    if str(getattr(finding, "credential_type", "") or "").strip().lower()
+                    == "keepass_artifact"
+                ]
+                if keepass_findings:
+                    persisted_artifact = _persist_prioritized_artifact_bytes(
+                        shell=shell,
+                        domain=domain,
+                        candidate=candidate,
+                        file_bytes=read_result.data,
+                    )
+                    try:
+                        extracted_entries = int(
+                            shell._process_keepass_artifact(
+                                domain,
+                                persisted_artifact,
+                                [host] if host else None,
+                                [share] if share else None,
+                                read_username,
+                            )
+                            or 0
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                        extracted_entries = 0
+                        print_warning(
+                            f"Could not process KeePass artifact {marked_path} deterministically."
+                        )
+                        print_warning_debug(
+                            "Deterministic KeePass artifact handling failed: "
+                            f"host={marked_host} share={marked_share} path={marked_path} "
+                            f"error={type(exc).__name__}: {exc}"
+                        )
+                    finding_count = max(1, extracted_entries)
+                    deterministic_findings += finding_count
+                    flagged_files += 1
+                    flagged_credentials += finding_count
+                    continue
                 finding_count = len(pipeline_result.deterministic_findings)
                 deterministic_findings += finding_count
                 flagged_files += 1
@@ -11150,6 +11351,39 @@ def _handle_prioritized_findings_actions(
                 print_warning("Password spraying from discovered secret failed.")
                 print_exception(exception=exc)
     return True
+
+
+def _persist_prioritized_artifact_bytes(
+    *,
+    shell: Any,
+    domain: str,
+    candidate: Any,
+    file_bytes: bytes,
+) -> str:
+    """Persist AI-prioritized artifact bytes to a workspace-scoped path."""
+    host = str(getattr(candidate, "host", "") or "").strip() or "unknown_host"
+    share = str(getattr(candidate, "share", "") or "").strip() or "unknown_share"
+    remote_path = str(getattr(candidate, "path", "") or "").strip()
+    filename = Path(remote_path or "artifact.bin").name or "artifact.bin"
+    workspace_cwd = shell._get_workspace_cwd()
+    artifact_root = domain_path(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        shell.smb_dir,
+        "ai_prioritized_artifacts",
+        _slugify_token(host),
+        _slugify_token(share),
+    )
+    os.makedirs(artifact_root, exist_ok=True)
+    target_path = os.path.join(artifact_root, filename)
+    with open(target_path, "wb") as handle:
+        handle.write(file_bytes)
+    print_info_debug(
+        "Persisted prioritized SMB artifact bytes: "
+        f"path={mark_sensitive(target_path, 'path')}"
+    )
+    return target_path
 
 
 def _select_action_index(
@@ -11540,6 +11774,7 @@ def execute_manspider(
                     loot_dir,
                     credsweeper_path=shell.credsweeper_path,
                     include_custom_rules=True,
+                    rules_profile=CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
                     custom_ml_threshold="0.0",
                     jobs=credsweeper_jobs or get_default_credsweeper_jobs(),
                 )
@@ -11613,20 +11848,27 @@ def execute_manspider(
                     return {"completed": True, "artifact_hits": 0}
 
                 print_warning("Files found:")
-                for filename, _ in files_found:
-                    shell.console.print(f"- {filename}")
+                for filename, file_path in files_found:
+                    marked_file = mark_sensitive(filename, "path")
+                    marked_path = mark_sensitive(
+                        os.path.relpath(file_path, shell._get_workspace_cwd()),
+                        "path",
+                    )
+                    shell.console.print(f"- {marked_file} ({marked_path})")
+
+                artifact_records: list[ArtifactProcessingRecord] = []
 
                 if scan_type == "gpp":
                     # For GPP files, process all automatically
                     for filename, file_path in files_found:
-                        shell.process_found_file(
+                        artifact_records.append(shell.process_found_file(
                             file_path,
                             domain,
                             scan_type,
                             source_hosts=hosts,
                             source_shares=shares,
                             auth_username=auth_username,
-                        )
+                        ))
                 else:
                     # For other types, ask for each file
                     print_info_verbose("Starting analysis process...")
@@ -11636,16 +11878,35 @@ def execute_manspider(
                         )
                         if respuesta:
                             print_info_verbose(f"Processing {filename}...")
-                            shell.process_found_file(
+                            artifact_records.append(shell.process_found_file(
                                 file_path,
                                 domain,
                                 scan_type,
                                 source_hosts=hosts,
                                 source_shares=shares,
                                 auth_username=auth_username,
-                            )
+                            ))
                         else:
                             print_info(f"Skipping {filename}")
+                            artifact_records.append(
+                                ArtifactProcessingRecord(
+                                    path=file_path,
+                                    filename=filename,
+                                    artifact_type=Path(filename).suffix.lstrip(".") or "file",
+                                    status="skipped",
+                                    note="Skipped by user.",
+                                )
+                            )
+                report_path = _persist_artifact_processing_report(
+                    phase_root_abs=os.path.dirname(output_directory),
+                    records=artifact_records,
+                )
+                _render_artifact_processing_summary(
+                    shell,
+                    phase_label=str(scan_type).upper(),
+                    records=artifact_records,
+                    report_path=report_path,
+                )
                 return {"completed": True, "artifact_hits": len(files_found)}
             else:
                 print_error("Error executing manspider to search for files")

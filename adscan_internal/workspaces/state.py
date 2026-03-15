@@ -37,6 +37,7 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
         "lab_inference_source": getattr(shell, "lab_inference_source", None),
         "lab_inference_confidence": getattr(shell, "lab_inference_confidence", None),
         "password_spraying_history": getattr(shell, "password_spraying_history", {}),
+        "cracking_history": getattr(shell, "cracking_history", {}),
     }
 
     domains_data = workspace_vars.get("domains_data")
@@ -115,6 +116,7 @@ def apply_workspace_variables_to_shell(shell: Any, variables: dict[str, Any]) ->
         "lab_inference_source": None,
         "lab_inference_confidence": None,
         "password_spraying_history": {},
+        "cracking_history": {},
     }
 
     for key, default in defaults.items():

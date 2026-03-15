@@ -20,6 +20,7 @@ from adscan_internal.rich_output import (
     print_exception,
 )
 from adscan_internal.workspaces import domain_subpath, read_json_file, write_json_file
+from adscan_internal.workspaces.computers import load_enabled_computer_samaccounts
 
 from adscan_internal.services import attack_paths_core
 from adscan_internal.services.attack_step_support_registry import (
@@ -255,6 +256,156 @@ def get_enabled_users_for_domain(
         )
         return users
     return None
+
+
+def get_enabled_computers_for_domain(
+    shell: object,
+    domain: str,
+) -> set[str] | None:
+    """Return enabled computer sAMAccountNames for a domain using workspace data."""
+    try:
+        workspace_cwd = (
+            shell._get_workspace_cwd()  # type: ignore[attr-defined]
+            if hasattr(shell, "_get_workspace_cwd")
+            else getattr(shell, "current_workspace_dir", os.getcwd())
+        )
+        domains_dir = getattr(shell, "domains_dir", "domains")
+        computers = load_enabled_computer_samaccounts(
+            workspace_cwd, domains_dir, domain
+        )
+    except OSError:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            f"[membership] enabled computers file missing/unreadable for {marked_domain}"
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            f"[membership] enabled computers load failed for {marked_domain}: {exc}"
+        )
+        return None
+
+    enabled_computers = {
+        str(computer).strip().lower()
+        for computer in computers
+        if isinstance(computer, str) and str(computer).strip()
+    }
+    if enabled_computers:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            f"[membership] enabled computers loaded for {marked_domain}: count={len(enabled_computers)}"
+        )
+        return enabled_computers
+    return None
+
+
+def infer_directory_object_enabled_state(
+    shell: object,
+    *,
+    domain: str,
+    principal_name: str,
+    principal_kind: str,
+    node: dict[str, Any] | None = None,
+) -> tuple[bool | None, str]:
+    """Infer whether a user or computer object is enabled.
+
+    The resolution order is:
+    1. BloodHound node ``properties.enabled`` when present.
+    2. Workspace enabled-user/enabled-computer inventories.
+
+    Args:
+        shell: Active CLI shell/runtime object.
+        domain: Domain owning the target object.
+        principal_name: Target sAMAccountName or label.
+        principal_kind: BloodHound object kind (User/Computer/...).
+        node: Optional BloodHound node to inspect directly.
+
+    Returns:
+        Tuple ``(enabled_state, source)`` where ``enabled_state`` may be
+        ``None`` when no reliable data is available.
+    """
+    domain = str(domain or "").strip().lower()
+    props = node.get("properties") if isinstance(node, dict) else {}
+    if isinstance(props, dict):
+        direct_enabled = props.get("enabled")
+        if isinstance(direct_enabled, bool):
+            return direct_enabled, "node_properties.enabled"
+
+        samaccountname = props.get("samaccountname")
+        if isinstance(samaccountname, str) and samaccountname.strip():
+            principal_name = samaccountname
+
+    normalized_name = _normalize_account(str(principal_name or ""))
+    if not normalized_name:
+        return None, "unknown"
+
+    kind = str(principal_kind or "").strip().lower()
+    if kind == "user":
+        enabled_principals = get_enabled_users_for_domain(shell, domain)
+        source = "enabled_users"
+    elif kind == "computer":
+        enabled_principals = get_enabled_computers_for_domain(shell, domain)
+        source = "enabled_computers"
+    else:
+        return None, "unknown"
+
+    if not enabled_principals:
+        return None, f"{source}_unavailable"
+    return normalized_name in enabled_principals, source
+
+
+def _enrich_node_enabled_metadata(
+    shell: object | None,
+    graph: dict[str, Any],
+    node: dict[str, Any],
+) -> dict[str, Any]:
+    """Best-effort enrich BloodHound node metadata with persisted enabled state."""
+    if shell is None or not isinstance(node, dict):
+        return node
+
+    kind = _node_kind(node)
+    if kind not in {"User", "Computer"}:
+        return node
+
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    if isinstance(props.get("enabled"), bool):
+        return node
+
+    domain = str(
+        props.get("domain") or node.get("domain") or graph.get("domain") or ""
+    ).strip()
+    if not domain:
+        return node
+
+    principal_name = str(
+        props.get("samaccountname")
+        or props.get("name")
+        or node.get("samaccountname")
+        or node.get("name")
+        or node.get("label")
+        or ""
+    ).strip()
+    if not principal_name:
+        return node
+
+    enabled, source = infer_directory_object_enabled_state(
+        shell,
+        domain=domain,
+        principal_name=principal_name,
+        principal_kind=kind,
+        node=node,
+    )
+    if not isinstance(enabled, bool):
+        return node
+
+    updated = dict(node)
+    updated_props = dict(props)
+    updated_props["enabled"] = enabled
+    updated_props.setdefault("enabled_source", source)
+    updated["properties"] = updated_props
+    return updated
 
 
 def filter_enabled_domain_users(
@@ -4011,6 +4162,7 @@ def add_bloodhound_path_edges(
     edge_type: str = "bloodhound_ce",
     notes_by_relation_index: dict[int, dict[str, Any]] | None = None,
     log_creation: bool = True,
+    shell: object | None = None,
 ) -> int:
     """Add edges for a BloodHound-derived path (nodes + relations).
 
@@ -4024,14 +4176,17 @@ def add_bloodhound_path_edges(
     """
     if not nodes or not relations:
         return 0
-    upsert_nodes(graph, nodes)
+    enriched_nodes = [
+        _enrich_node_enabled_metadata(shell, graph, node) for node in nodes
+    ]
+    upsert_nodes(graph, enriched_nodes)
 
     created = 0
     for idx, rel in enumerate(relations):
-        if idx + 1 >= len(nodes):
+        if idx + 1 >= len(enriched_nodes):
             break
-        from_id = _node_id(nodes[idx])
-        to_id = _node_id(nodes[idx + 1])
+        from_id = _node_id(enriched_nodes[idx])
+        to_id = _node_id(enriched_nodes[idx + 1])
         edge = upsert_edge(
             graph,
             from_id=from_id,
