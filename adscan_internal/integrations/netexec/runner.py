@@ -292,6 +292,84 @@ class NetExecRunner:
             upper = output.upper()
             return any(token in upper for token in patterns)
 
+        def _resolve_domain_info(known_domain: str | None) -> dict[str, object]:
+            domains_data = getattr(ctx.state_owner, "domains_data", {}) or {}
+            if not isinstance(domains_data, dict) or not known_domain:
+                return {}
+
+            normalized = str(known_domain).strip().casefold()
+            if not normalized:
+                return {}
+
+            for domain_key, domain_info in domains_data.items():
+                if str(domain_key).strip().casefold() != normalized:
+                    continue
+                if isinstance(domain_info, dict):
+                    return domain_info
+                break
+            return {}
+
+        def _build_no_output_kerberos_fallback_command(cmd: str) -> str | None:
+            try:
+                argv = shlex.split(cmd)
+            except ValueError:
+                return None
+
+            if "-k" not in argv:
+                return None
+
+            fallback_argv = [part for part in argv if part != "-k"]
+            services = {
+                "smb",
+                "ldap",
+                "mssql",
+                "winrm",
+                "ssh",
+                "rdp",
+                "vnc",
+                "ftp",
+                "http",
+                "https",
+            }
+
+            service_idx = next(
+                (idx for idx, token in enumerate(fallback_argv) if token in services),
+                None,
+            )
+            if service_idx is None or service_idx + 1 >= len(fallback_argv):
+                return shlex.join(fallback_argv)
+
+            target_idx = service_idx + 1
+            target = str(fallback_argv[target_idx]).strip()
+            domain_info = _resolve_domain_info(effective_domain)
+            pdc_ip = str(domain_info.get("pdc") or "").strip()
+            pdc_hostname = str(domain_info.get("pdc_hostname") or "").strip().casefold()
+            fqdn_candidates = {
+                pdc_hostname,
+                f"{pdc_hostname}.{str(effective_domain).strip().casefold()}"
+                if pdc_hostname and effective_domain
+                else "",
+            }
+
+            try:
+                ipaddress.ip_address(target)
+                target_is_ip = True
+            except Exception:
+                target_is_ip = False
+
+            if (
+                pdc_ip
+                and not target_is_ip
+                and target
+                and "/" not in target
+                and "\\" not in target
+                and not target.endswith(".txt")
+                and target.casefold() in fqdn_candidates
+            ):
+                fallback_argv[target_idx] = pdc_ip
+
+            return shlex.join(fallback_argv)
+
         if _should_force_kerberos(current_command):
             kerberos_forced = True
             kerberos_fallback_command = current_command
@@ -408,6 +486,31 @@ class NetExecRunner:
                     )
                     continue
                 if has_empty_output and retry_attempt >= max_retries:
+                    no_output_kerberos_fallback_attempted = getattr(
+                        ctx.state_owner,
+                        "_netexec_no_output_kerberos_fallback_attempted",
+                        False,
+                    )
+                    fallback_command = _build_no_output_kerberos_fallback_command(
+                        current_command
+                    )
+                    if fallback_command and not no_output_kerberos_fallback_attempted:
+                        setattr(
+                            ctx.state_owner,
+                            "_netexec_no_output_kerberos_fallback_attempted",
+                            True,
+                        )
+                        print_warning(
+                            "Kerberos NetExec command produced no output after repeated retries. "
+                            "Retrying once with NTLM fallback."
+                        )
+                        if fallback_command != current_command:
+                            print_info_debug(
+                                f"[netexec] No-output NTLM fallback command: {fallback_command}"
+                            )
+                        current_command = fallback_command
+                        needs_retry = True
+                        break
                     print_error(
                         f"No output received after {max_retries} attempts. "
                         "Proceeding with empty result."

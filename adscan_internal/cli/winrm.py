@@ -13,6 +13,7 @@ import os
 import re
 import base64
 import time
+import ipaddress
 from datetime import datetime, timezone
 from datetime import timedelta
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any, Iterable
 
 from rich.markup import escape as rich_escape
 from rich.prompt import Confirm
+from rich.table import Table
 
 from adscan_internal import (
     print_error,
@@ -35,6 +37,16 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.cli.ntlm_hash_finding_flow import (
+    render_ntlm_hash_findings_flow,
+)
+from adscan_internal.cli.scan_outcome_flow import (
+    artifact_records_extracted_nothing,
+    persist_artifact_processing_report,
+    render_artifact_processing_summary,
+    render_no_extracted_findings_preview,
+)
+from adscan_internal.services.pivot_service import orchestrate_ligolo_pivot_tunnel
 from adscan_internal.services.smb_sensitive_file_policy import (
     SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
     SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
@@ -95,6 +107,18 @@ class WinRMPhaseFetchResult:
     auth_invalid_reason: str | None = None
 
 
+@dataclass(slots=True)
+class WinRMPivotTarget:
+    """Candidate no-response IP selected for one WinRM pivot reachability check."""
+
+    ip: str
+    hostname_candidates: list[str]
+    classification: str
+    prefix_hint: str | None
+    ports: list[int]
+    selection_reason: str
+
+
 def _apply_winrm_phase_candidate_exclusions(
     *,
     phase: str,
@@ -148,16 +172,27 @@ def _is_winrm_ctf_auth_invalid_error(message: str) -> bool:
 
 
 def _execute_powershell_via_psrp(
-    *, domain: str, host: str, username: str, password: str, script: str
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    script: str,
+    operation_name: str | None = None,
+    require_logon_bypass: bool = False,
 ) -> str:
-    """Execute PowerShell over PSRP and return stdout."""
-    service = _build_winrm_psrp_service(
+    """Execute PowerShell over the reusable WinRM backend and return stdout."""
+    service = build_winrm_reusable_backend(
         domain=domain,
         host=host,
         username=username,
         password=password,
     )
-    result = service.execute_powershell(script)
+    result = service.execute_powershell(
+        script,
+        operation_name=operation_name,
+        require_logon_bypass=require_logon_bypass,
+    )
     if result.had_errors and not result.stdout:
         raise WinRMPSRPError(result.stderr or "PowerShell execution reported errors.")
     if result.stderr:
@@ -178,6 +213,633 @@ def _parse_psrp_path_list(stdout: str) -> list[str]:
     return []
 
 
+def _load_workspace_network_reachability_report(
+    shell: Any, *, domain: str
+) -> dict[str, Any] | None:
+    """Load the persisted current-vantage reachability report for one domain."""
+    report_path = os.path.join(
+        shell.current_workspace_dir or "",
+        shell.domains_dir,
+        domain,
+        "network_reachability_report.json",
+    )
+    if not report_path or not os.path.exists(report_path):
+        return None
+    try:
+        with open(report_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _build_winrm_network_inventory_script() -> str:
+    """Return a PowerShell script that inventories IPv4 interfaces and routes.
+
+    This intentionally relies on ``ipconfig`` and ``route print -4`` because
+    those commands work under WinRM network-logon contexts, including hash-only
+    sessions, where CIM-based cmdlets often fail with access denied.
+    """
+    return r"""
+function Convert-SubnetMaskToPrefixLength {
+    param([string]$Mask)
+    if (-not $Mask) { return $null }
+    $bits = 0
+    foreach ($octet in $Mask.Split('.')) {
+        if ($octet -notmatch '^\d+$') { return $null }
+        $bits += ([Convert]::ToString([int]$octet, 2).ToCharArray() | Where-Object { $_ -eq '1' }).Count
+    }
+    return $bits
+}
+$interfaces = @()
+$routes = @()
+$interfaceSource = "ipconfig"
+$routeSource = "route print -4"
+$ipconfigOutput = (ipconfig | Out-String)
+$routePrintOutput = (route print -4 | Out-String)
+$currentInterface = ""
+$pendingIPv4 = $null
+foreach ($line in ($ipconfigOutput -split "`r?`n")) {
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    if ($line -match '^\S.*:$') {
+        $currentInterface = $line.Trim().TrimEnd(':')
+        $pendingIPv4 = $null
+        continue
+    }
+    if ($line -match 'IPv4 Address[^\:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)') {
+        $pendingIPv4 = $Matches[1]
+        continue
+    }
+    if ($pendingIPv4 -and $line -match 'Subnet Mask[^\:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)') {
+        $prefixLength = Convert-SubnetMaskToPrefixLength -Mask $Matches[1]
+        if ($pendingIPv4 -ne '127.0.0.1' -and $pendingIPv4 -notlike '169.254.*') {
+            $interfaces += [PSCustomObject]@{
+                IPAddress = $pendingIPv4
+                PrefixLength = $prefixLength
+                InterfaceAlias = $currentInterface
+            }
+        }
+        $pendingIPv4 = $null
+    }
+}
+$interfaceAliasByIp = @{}
+foreach ($entry in $interfaces) {
+    if ($entry.IPAddress) {
+        $interfaceAliasByIp[$entry.IPAddress] = $entry.InterfaceAlias
+    }
+}
+$activeRoutes = $false
+foreach ($line in ($routePrintOutput -split "`r?`n")) {
+    if ($line -match '^\s*Active Routes:\s*$') {
+        $activeRoutes = $true
+        continue
+    }
+    if (-not $activeRoutes) { continue }
+    if ($line -match '^\s*(Persistent Routes:|====)') { break }
+    if ($line -match '^\s*Network Destination\s+Netmask\s+Gateway\s+Interface\s+Metric\s*$') {
+        continue
+    }
+    if ($line -match '^\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+(\S+)\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+([0-9]+)\s*$') {
+        $destination = $Matches[1]
+        $mask = $Matches[2]
+        $gateway = $Matches[3]
+        $interfaceIp = $Matches[4]
+        $metric = [int]$Matches[5]
+        $prefixLength = Convert-SubnetMaskToPrefixLength -Mask $mask
+        if ($null -eq $prefixLength) { continue }
+        $alias = $interfaceAliasByIp[$interfaceIp]
+        if (-not $alias) { $alias = $interfaceIp }
+        $routes += [PSCustomObject]@{
+            DestinationPrefix = ("{0}/{1}" -f $destination, $prefixLength)
+            NextHop = $gateway
+            InterfaceAlias = $alias
+            RouteMetric = $metric
+        }
+    }
+}
+[PSCustomObject]@{
+    interfaces = @($interfaces)
+    routes = @($routes)
+    interface_source = $interfaceSource
+    route_source = $routeSource
+} | ConvertTo-Json -Depth 6 -Compress
+"""
+
+
+def _build_winrm_windows_architecture_script() -> str:
+    """Return a PowerShell script that detects the remote Windows architecture."""
+    return r"""
+$rawArchitecture = $env:PROCESSOR_ARCHITEW6432
+if (-not $rawArchitecture) {
+    $rawArchitecture = $env:PROCESSOR_ARCHITECTURE
+}
+$normalizedArchitecture = "unknown"
+if ($rawArchitecture) {
+    switch -Regex ($rawArchitecture.ToUpperInvariant()) {
+        '^AMD64$' { $normalizedArchitecture = "amd64"; break }
+        '^X86$' { $normalizedArchitecture = "386"; break }
+        '^ARM64$' { $normalizedArchitecture = "arm64"; break }
+        '^ARM$' { $normalizedArchitecture = "armv7"; break }
+    }
+}
+[PSCustomObject]@{
+    architecture = $normalizedArchitecture
+    raw_architecture = $rawArchitecture
+    is_64bit_os = [Environment]::Is64BitOperatingSystem
+    is_64bit_process = [Environment]::Is64BitProcess
+} | ConvertTo-Json -Compress
+"""
+
+
+def detect_winrm_windows_architecture(
+    *, domain: str, host: str, username: str, password: str
+) -> str | None:
+    """Detect the remote Windows architecture over WinRM without CIM dependencies."""
+    output = _execute_powershell_via_psrp(
+        domain=domain,
+        host=host,
+        username=username,
+        password=password,
+        script=_build_winrm_windows_architecture_script(),
+        operation_name="windows_architecture_detect",
+    )
+    payload = json.loads(output or "{}")
+    if not isinstance(payload, dict):
+        return None
+    normalized_arch = str(payload.get("architecture") or "").strip().lower()
+    if not normalized_arch or normalized_arch == "unknown":
+        return None
+    return normalized_arch
+
+
+def _normalize_ipv4_network(address: str, prefix_length: int | None) -> str | None:
+    """Return a normalized IPv4 network string or None when invalid."""
+    try:
+        if prefix_length is None:
+            return None
+        network = ipaddress.ip_network(f"{address}/{int(prefix_length)}", strict=False)
+    except (ValueError, TypeError):
+        return None
+    if network.version != 4:
+        return None
+    return str(network)
+
+
+def _select_winrm_pivot_targets(
+    *,
+    payload: dict[str, Any],
+    remote_interfaces: list[dict[str, Any]],
+    remote_routes: list[dict[str, Any]],
+    max_targets: int = 25,
+) -> list[WinRMPivotTarget]:
+    """Select no-response IPs that look reachable from one compromised WinRM host."""
+    ip_entries = payload.get("ips", []) if isinstance(payload.get("ips"), list) else []
+    ports_scanned = []
+    context = payload.get("context", {})
+    if isinstance(context, dict):
+        ports_scanned = [int(port) for port in context.get("ports_scanned", []) if str(port).isdigit()]
+    route_networks: list[ipaddress.IPv4Network] = []
+    for route in remote_routes:
+        destination_prefix = str(route.get("DestinationPrefix") or "").strip()
+        if not destination_prefix or destination_prefix == "0.0.0.0/0":
+            continue
+        try:
+            network = ipaddress.ip_network(destination_prefix, strict=False)
+        except ValueError:
+            continue
+        if network.version == 4:
+            route_networks.append(network)
+
+    interface_network_map: dict[str, list[str]] = {}
+    interface_networks: list[ipaddress.IPv4Network] = []
+    for interface in remote_interfaces:
+        network_text = _normalize_ipv4_network(
+            str(interface.get("IPAddress") or "").strip(),
+            int(interface.get("PrefixLength")) if str(interface.get("PrefixLength") or "").strip().isdigit() else None,
+        )
+        if not network_text:
+            continue
+        network = ipaddress.ip_network(network_text, strict=False)
+        interface_networks.append(network)
+        interface_network_map.setdefault(network_text, []).append(
+            str(interface.get("InterfaceAlias") or "").strip() or "unknown"
+        )
+
+    selected: list[WinRMPivotTarget] = []
+    for entry in ip_entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "").strip() != "no_response_from_current_vantage":
+            continue
+        ip_text = str(entry.get("ip") or "").strip()
+        if not ip_text:
+            continue
+        try:
+            ip_value = ipaddress.ip_address(ip_text)
+        except ValueError:
+            continue
+        if ip_value.version != 4:
+            continue
+
+        selection_reason = ""
+        prefix_hint = str(entry.get("prefix_hint") or "").strip() or None
+        matching_interfaces: list[str] = []
+        for network in interface_networks:
+            if ip_value in network:
+                matching_interfaces.extend(interface_network_map.get(str(network), []))
+        if matching_interfaces:
+            unique_interfaces = sorted({item for item in matching_interfaces if item})
+            selection_reason = "same_subnet:" + ",".join(unique_interfaces)
+        elif any(ip_value in network for network in route_networks):
+            selection_reason = "explicit_route"
+        else:
+            continue
+
+        selected.append(
+            WinRMPivotTarget(
+                ip=ip_text,
+                hostname_candidates=[
+                    str(item).strip()
+                    for item in entry.get("hostname_candidates", [])
+                    if str(item).strip()
+                ],
+                classification=str(entry.get("classification") or "").strip(),
+                prefix_hint=prefix_hint,
+                ports=ports_scanned,
+                selection_reason=selection_reason,
+            )
+        )
+        if len(selected) >= max_targets:
+            break
+    return selected
+
+
+def _build_winrm_pivot_probe_script(targets: list[WinRMPivotTarget]) -> str:
+    """Return a PowerShell script that probes selected candidate IPs via TCP."""
+    targets_payload = [
+        {
+            "ip": target.ip,
+            "ports": list(target.ports),
+            "selection_reason": target.selection_reason,
+            "hostname_candidates": list(target.hostname_candidates),
+            "classification": target.classification,
+            "prefix_hint": target.prefix_hint,
+        }
+        for target in targets
+    ]
+    encoded_targets = json.dumps(targets_payload)
+    return rf"""
+$targets = ConvertFrom-Json @'
+{encoded_targets}
+'@
+function Test-TcpPort {{
+    param(
+        [string]$TargetIp,
+        [int]$Port,
+        [int]$TimeoutMs = 600
+    )
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {{
+        $iar = $client.BeginConnect($TargetIp, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {{
+            return $false
+        }}
+        $client.EndConnect($iar) | Out-Null
+        return $true
+    }} catch {{
+        return $false
+    }} finally {{
+        $client.Close()
+    }}
+}}
+$results = @()
+foreach ($target in $targets) {{
+    $reachablePorts = @()
+    foreach ($port in @($target.ports)) {{
+        if (Test-TcpPort -TargetIp $target.ip -Port ([int]$port)) {{
+            $reachablePorts += [int]$port
+        }}
+    }}
+    $results += [PSCustomObject]@{{
+        ip = $target.ip
+        reachable_ports = @($reachablePorts)
+        hostname_candidates = @($target.hostname_candidates)
+        selection_reason = $target.selection_reason
+        original_classification = $target.classification
+        prefix_hint = $target.prefix_hint
+    }}
+}}
+[PSCustomObject]@{{ targets = @($results) }} | ConvertTo-Json -Depth 6 -Compress
+"""
+
+
+def _persist_winrm_pivot_reachability_report(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    payload: dict[str, Any],
+) -> str | None:
+    """Persist one WinRM pivot reachability report under the host workspace."""
+    report_path = os.path.join(
+        shell.current_workspace_dir or "",
+        shell.domains_dir,
+        domain,
+        "winrm",
+        f"{host}_pivot_reachability_report.json",
+    )
+    try:
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=False)
+            handle.write("\n")
+    except OSError:
+        return None
+    return report_path
+
+
+def _summarize_winrm_pivot_inventory(entries: list[dict[str, Any]], *, route_mode: bool = False) -> str:
+    """Return a short debug summary for WinRM pivot inventory entries."""
+    preview: list[str] = []
+    for entry in entries[:5]:
+        if route_mode:
+            destination = str(entry.get("DestinationPrefix") or "").strip()
+            next_hop = str(entry.get("NextHop") or "").strip()
+            interface_alias = str(entry.get("InterfaceAlias") or "").strip()
+            preview.append(f"{destination}|{next_hop}|{interface_alias}")
+        else:
+            address = str(entry.get("IPAddress") or "").strip()
+            prefix_length = str(entry.get("PrefixLength") or "").strip()
+            interface_alias = str(entry.get("InterfaceAlias") or "").strip()
+            preview.append(f"{address}/{prefix_length}|{interface_alias}")
+    if len(entries) > 5:
+        preview.append(f"... +{len(entries) - 5} more")
+    return ", ".join(preview) if preview else "none"
+
+
+def check_pivot_reachability_via_winrm(
+    shell: Any, *, domain: str, host: str, username: str, password: str
+) -> None:
+    """Check whether a compromised WinRM host can reach IPs hidden from the original vantage."""
+    reachability_payload = _load_workspace_network_reachability_report(shell, domain=domain)
+    if not reachability_payload:
+        print_info_debug(
+            "Skipping WinRM pivot reachability check: no current-vantage reachability report is available."
+        )
+        return
+    ip_entries = reachability_payload.get("ips", [])
+    if not isinstance(ip_entries, list):
+        print_info_debug(
+            "Skipping WinRM pivot reachability check: reachability report has no usable IP entries."
+        )
+        return
+    no_response_count = sum(
+        1
+        for entry in ip_entries
+        if isinstance(entry, dict) and str(entry.get("status") or "").strip() == "no_response_from_current_vantage"
+    )
+    if no_response_count == 0:
+        print_info_debug(
+            "Skipping WinRM pivot reachability check: no hidden/no-response IPs exist in the current-vantage report."
+        )
+        return
+
+    try:
+        print_operation_header(
+            "WinRM Pivot Reachability Check",
+            details={
+                "Domain": domain,
+                "Pivot Host": host,
+                "Username": username,
+                "Previously Hidden IPs": str(no_response_count),
+                "Protocol": "WinRM PSRP",
+            },
+            icon="🧭",
+        )
+        print_info(
+            "Assessing whether this WinRM host can reach IPs that produced no response from the original vantage."
+        )
+        inventory_stdout = _execute_powershell_via_psrp(
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+            script=_build_winrm_network_inventory_script(),
+            operation_name="pivot_network_inventory",
+        )
+        inventory_payload = json.loads(inventory_stdout or "{}")
+        if not isinstance(inventory_payload, dict):
+            print_warning("WinRM network inventory returned an unexpected payload; skipping pivot reachability check.")
+            return
+        remote_interfaces = inventory_payload.get("interfaces", [])
+        remote_routes = inventory_payload.get("routes", [])
+        interface_source = str(inventory_payload.get("interface_source") or "").strip() or "none"
+        route_source = str(inventory_payload.get("route_source") or "").strip() or "none"
+        if not isinstance(remote_interfaces, list):
+            remote_interfaces = []
+        if not isinstance(remote_routes, list):
+            remote_routes = []
+        normalized_interfaces = [entry for entry in remote_interfaces if isinstance(entry, dict)]
+        normalized_routes = [entry for entry in remote_routes if isinstance(entry, dict)]
+        print_info_debug(
+            "WinRM pivot inventory summary: "
+            f"interface_source={mark_sensitive(interface_source, 'text')} "
+            f"interfaces={len(normalized_interfaces)} "
+            f"preview={mark_sensitive(_summarize_winrm_pivot_inventory(normalized_interfaces), 'text')} "
+            f"route_source={mark_sensitive(route_source, 'text')} "
+            f"routes={len(normalized_routes)} "
+            f"route_preview={mark_sensitive(_summarize_winrm_pivot_inventory(normalized_routes, route_mode=True), 'text')}"
+        )
+
+        selected_targets = _select_winrm_pivot_targets(
+            payload=reachability_payload,
+            remote_interfaces=normalized_interfaces,
+            remote_routes=normalized_routes,
+        )
+        if not selected_targets:
+            hidden_targets = [
+                str(entry.get("ip") or "").strip()
+                for entry in ip_entries
+                if isinstance(entry, dict)
+                and str(entry.get("status") or "").strip() == "no_response_from_current_vantage"
+                and str(entry.get("ip") or "").strip()
+            ]
+            debug_hidden_targets = ", ".join(hidden_targets) if hidden_targets else "none"
+            report_path = _persist_winrm_pivot_reachability_report(
+                shell,
+                domain=domain,
+                host=host,
+                payload={
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "domain": domain,
+                    "pivot_host": host,
+                    "pivot_username": username,
+                    "interfaces": normalized_interfaces,
+                    "routes": normalized_routes,
+                    "interface_source": interface_source,
+                    "route_source": route_source,
+                    "summary": {
+                        "hidden_target_count": no_response_count,
+                        "candidate_count": 0,
+                        "confirmed_reachable_count": 0,
+                        "same_subnet_no_response_count": 0,
+                        "no_connectivity_confirmed_count": 0,
+                    },
+                    "skip_reason": "no_matching_subnet_or_route",
+                    "hidden_targets": hidden_targets,
+                    "targets": [],
+                },
+            )
+            print_info_debug(
+                "Skipping WinRM pivot reachability probing: "
+                f"hidden_targets={mark_sensitive(debug_hidden_targets, 'text')} "
+                "this host has no matching subnet or explicit route to previously hidden IPs."
+            )
+            if report_path:
+                print_info_debug(
+                    "WinRM pivot skip diagnostics saved to "
+                    f"{mark_sensitive(report_path, 'path')}."
+                )
+            return
+
+        subnet_candidates = sum(
+            1 for target in selected_targets if str(target.selection_reason).startswith("same_subnet:")
+        )
+        routed_candidates = len(selected_targets) - subnet_candidates
+        debug_selected_targets = ", ".join(
+            f"{target.ip}:{target.selection_reason}" for target in selected_targets
+        )
+        print_info_debug(
+            "WinRM pivot candidate selection: "
+            f"selected={len(selected_targets)} "
+            f"preview={mark_sensitive(debug_selected_targets, 'text')}"
+        )
+        print_info(
+            f"This host may be a useful pivot for {len(selected_targets)} previously hidden target(s) "
+            f"({subnet_candidates} same-subnet, {routed_candidates} routed)."
+        )
+
+        default_confirm = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+        if not Confirm.ask(
+            (
+                f"Do you want to probe {len(selected_targets)} likely pivot target(s) from "
+                f"{mark_sensitive(host, 'hostname')}?"
+            ),
+            default=default_confirm,
+        ):
+            print_info("Skipping WinRM pivot reachability probing by user choice.")
+            return
+
+        probe_stdout = _execute_powershell_via_psrp(
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+            script=_build_winrm_pivot_probe_script(selected_targets),
+            operation_name="pivot_tcp_probe",
+        )
+        probe_payload = json.loads(probe_stdout or "{}")
+        targets_payload = probe_payload.get("targets", []) if isinstance(probe_payload, dict) else []
+        if not isinstance(targets_payload, list):
+            print_warning("WinRM pivot probe returned an unexpected payload; skipping report rendering.")
+            return
+
+        confirmed_reachable: list[dict[str, Any]] = []
+        same_subnet_no_response: list[dict[str, Any]] = []
+        no_connectivity_confirmed: list[dict[str, Any]] = []
+        for entry in targets_payload:
+            if not isinstance(entry, dict):
+                continue
+            reachable_ports = [
+                int(port) for port in entry.get("reachable_ports", []) if str(port).isdigit()
+            ]
+            reason = str(entry.get("selection_reason") or "").strip()
+            if reachable_ports:
+                confirmed_reachable.append(entry)
+            elif reason.startswith("same_subnet:"):
+                same_subnet_no_response.append(entry)
+            else:
+                no_connectivity_confirmed.append(entry)
+
+        summary_payload: dict[str, Any] = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "domain": domain,
+            "pivot_host": host,
+            "pivot_username": username,
+            "interfaces": remote_interfaces,
+            "routes": remote_routes,
+            "interface_source": interface_source,
+            "route_source": route_source,
+            "summary": {
+                "candidate_count": len(selected_targets),
+                "confirmed_reachable_count": len(confirmed_reachable),
+                "same_subnet_no_response_count": len(same_subnet_no_response),
+                "no_connectivity_confirmed_count": len(no_connectivity_confirmed),
+            },
+            "targets": targets_payload,
+        }
+        report_path = _persist_winrm_pivot_reachability_report(
+            shell,
+            domain=domain,
+            host=host,
+            payload=summary_payload,
+        )
+
+        if confirmed_reachable:
+            print_success(
+                f"{len(confirmed_reachable)} previously hidden IP(s) appear reachable from {mark_sensitive(host, 'hostname')}."
+            )
+            if getattr(shell, "console", None):
+                table = Table(title="Confirmed Pivot Reachability", box=None)
+                table.add_column("IP")
+                table.add_column("Hostname(s)")
+                table.add_column("Reachable Ports")
+                table.add_column("Reason")
+                for entry in confirmed_reachable[:10]:
+                    table.add_row(
+                        mark_sensitive(str(entry.get("ip") or ""), "ip"),
+                        ", ".join(
+                            mark_sensitive(str(item), "hostname")
+                            for item in entry.get("hostname_candidates", [])
+                        )
+                        or "-",
+                        ", ".join(str(port) for port in entry.get("reachable_ports", [])) or "-",
+                        mark_sensitive(str(entry.get("selection_reason") or ""), "text"),
+                    )
+                shell.console.print(table)
+        if same_subnet_no_response:
+            print_info(
+                f"{len(same_subnet_no_response)} target(s) are on-link from the pivot host but still gave no TCP response; they may simply be down/offline."
+            )
+        if no_connectivity_confirmed:
+            print_warning(
+                f"{len(no_connectivity_confirmed)} routed target(s) still showed no confirmed TCP reachability from the pivot host."
+            )
+        if report_path:
+            print_info(
+                f"Detailed WinRM pivot reachability report saved to {mark_sensitive(report_path, 'path')}."
+            )
+        if confirmed_reachable:
+            upload_helper = getattr(shell, "winrm_upload", None) or winrm_upload
+            orchestrate_ligolo_pivot_tunnel(
+                shell,
+                domain=domain,
+                pivot_host=host,
+                username=username,
+                password=password,
+                confirmed_targets=confirmed_reachable,
+                detect_remote_architecture=detect_winrm_windows_architecture,
+                upload_agent=upload_helper,
+                execute_remote_script=_execute_powershell_via_psrp,
+                remote_agent_os="windows",
+            )
+    except (WinRMPSRPError, json.JSONDecodeError) as exc:
+        telemetry.capture_exception(exc)
+        print_warning(
+            f"WinRM pivot reachability check failed on {mark_sensitive(host, 'hostname')}: {rich_escape(str(exc))}"
+        )
+
+
 def ask_for_winrm_access(
     shell: Any, *, domain: str, host: str, username: str, password: str
 ) -> None:
@@ -194,6 +856,16 @@ def ask_for_winrm_access(
             (
                 "dpapi",
                 lambda: check_dpapi(
+                    shell,
+                    domain=domain,
+                    host=host,
+                    username=username,
+                    password=password,
+                ),
+            ),
+            (
+                "pivot_reachability",
+                lambda: check_pivot_reachability_via_winrm(
                     shell,
                     domain=domain,
                     host=host,
@@ -351,6 +1023,7 @@ def check_autologon(
                 username=username,
                 password=password,
                 script=autologon_script,
+                operation_name="autologon_registry_query",
             )
             data = json.loads(output) if output.strip() else {}
             default_user_name = str(data.get("DefaultUserName") or "").strip()
@@ -529,8 +1202,19 @@ def show_powershell_history(
         credentials = shell.analyze_log_with_credsweeper(history_local_path)
 
         if not credentials:
-            print_info_verbose(
-                "No credentials detected in PowerShell history with CredSweeper."
+            render_no_extracted_findings_preview(
+                loot_dir=os.path.dirname(history_local_path),
+                loot_rel=os.path.relpath(
+                    os.path.dirname(history_local_path),
+                    shell._get_workspace_cwd(),
+                ),
+                analyzed_count=1,
+                category="credential",
+                phase_label="PowerShell history review",
+                candidate_paths=[os.path.basename(history_local_path)],
+                report_root_abs=os.path.dirname(history_local_path),
+                scope_label="WinRM PowerShell history",
+                preview_limit=5,
             )
             return
 
@@ -585,8 +1269,19 @@ def show_powershell_history(
                 f"Added {found_count} potential credential(s) from PowerShell history for user {marked_username}."
             )
         else:
-            print_info_verbose(
-                "CredSweeper did not return any usable passwords from PowerShell history."
+            render_no_extracted_findings_preview(
+                loot_dir=os.path.dirname(history_local_path),
+                loot_rel=os.path.relpath(
+                    os.path.dirname(history_local_path),
+                    shell._get_workspace_cwd(),
+                ),
+                analyzed_count=1,
+                category="credential",
+                phase_label="PowerShell history review",
+                candidate_paths=[os.path.basename(history_local_path)],
+                report_root_abs=os.path.dirname(history_local_path),
+                scope_label="WinRM PowerShell history",
+                preview_limit=5,
             )
 
     except Exception as exc:  # pragma: no cover - defensive
@@ -653,6 +1348,7 @@ def check_powershell_transcripts(
                 username=username,
                 password=password,
                 script=search_script,
+                operation_name="powershell_transcript_search",
             )
             transcript_paths = _parse_psrp_path_list(search_output)
         except (WinRMPSRPError, json.JSONDecodeError) as exc:
@@ -773,8 +1469,23 @@ def check_powershell_transcripts(
                 f"for user {marked_username} on host {marked_host}."
             )
         else:
-            print_info_verbose(
-                "CredSweeper did not return any usable passwords from PowerShell transcripts."
+            render_no_extracted_findings_preview(
+                loot_dir=transcripts_download_dir,
+                loot_rel=os.path.relpath(
+                    transcripts_download_dir,
+                    shell._get_workspace_cwd(),
+                ),
+                analyzed_count=len(downloaded_files),
+                category="credential",
+                phase_label="PowerShell transcript review",
+                candidate_paths=[
+                    os.path.relpath(path, transcripts_download_dir)
+                    for path in downloaded_files
+                    if str(path).strip()
+                ],
+                report_root_abs=transcripts_download_dir,
+                scope_label="WinRM PowerShell transcripts",
+                preview_limit=5,
             )
 
     except Exception as exc:  # pragma: no cover - defensive
@@ -1044,6 +1755,7 @@ def check_firefox_credentials(
                 username=username,
                 password=password,
                 script=search_script,
+                operation_name="firefox_credentials_search",
             )
             paths = _parse_psrp_path_list(output)
         except (WinRMPSRPError, json.JSONDecodeError) as exc:
@@ -1388,10 +2100,8 @@ def _render_winrm_artifact_processing_summary(
     records: list[ArtifactProcessingRecord],
     report_path: str,
 ) -> None:
-    """Reuse the SMB artifact summary renderer for WinRM artifact phases."""
-    from adscan_internal.cli.smb import _render_artifact_processing_summary
-
-    _render_artifact_processing_summary(
+    """Render one shared artifact summary for WinRM artifact phases."""
+    render_artifact_processing_summary(
         shell,
         phase_label=phase_label,
         records=records,
@@ -1404,10 +2114,8 @@ def _persist_winrm_artifact_processing_report(
     phase_root_abs: str,
     records: list[ArtifactProcessingRecord],
 ) -> str:
-    """Reuse the SMB artifact report persistence helper for WinRM phases."""
-    from adscan_internal.cli.smb import _persist_artifact_processing_report
-
-    return _persist_artifact_processing_report(
+    """Persist one shared artifact report for WinRM phases."""
+    return persist_artifact_processing_report(
         phase_root_abs=phase_root_abs,
         records=records,
     )
@@ -1615,7 +2323,7 @@ def _run_winrm_sensitive_scan_phase(
             doc=phase == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
             jobs=get_default_credsweeper_jobs(),
         )
-        shell._get_spidering_service().process_local_structured_files(
+        structured_stats = shell._get_spidering_service().process_local_structured_files(
             root_path=loot_dir,
             phase=phase,
             domain=domain,
@@ -1626,6 +2334,10 @@ def _run_winrm_sensitive_scan_phase(
         )
         analysis_duration_seconds = time.perf_counter() - analysis_started_at
         total_findings, files_with_findings = _count_grouped_credential_findings(findings)
+        structured_files_with_findings = int(
+            structured_stats.get("files_with_findings", 0) or 0
+        )
+        ntlm_hash_findings = structured_stats.get("ntlm_hash_findings")
         if findings:
             shell.handle_found_credentials(
                 findings,
@@ -1634,6 +2346,21 @@ def _run_winrm_sensitive_scan_phase(
                 source_shares=["winrm"],
                 auth_username=username,
                 source_artifact="winrm deterministic file scan",
+            )
+        loot_rel = os.path.relpath(loot_dir, shell._get_workspace_cwd())
+        if isinstance(ntlm_hash_findings, list) and ntlm_hash_findings:
+            render_ntlm_hash_findings_flow(
+                shell,
+                domain=domain,
+                loot_dir=loot_dir,
+                loot_rel=loot_rel,
+                phase_label=phase_label,
+                ntlm_hash_findings=[
+                    item for item in ntlm_hash_findings if isinstance(item, dict)
+                ],
+                source_scope=f"WinRM file NTLM hash findings from {phase_label}",
+                fallback_source_hosts=[host],
+                fallback_source_shares=["winrm"],
             )
         print_info(
             "Deterministic WinRM phase summary: "
@@ -1646,15 +2373,24 @@ def _run_winrm_sensitive_scan_phase(
             f"fetch_skipped_access_denied={fetch_skip_summary['access_denied']} "
             f"fetch_skipped_file_in_use={fetch_skip_summary['file_in_use']} "
             f"fetch_skipped_other={fetch_skip_summary['other']} "
-            f"files_with_findings={files_with_findings} "
+            f"files_with_findings={files_with_findings + structured_files_with_findings} "
             f"credential_like_findings={total_findings} "
-            f"loot={mark_sensitive(os.path.relpath(loot_dir, shell._get_workspace_cwd()), 'path')} "
+            f"loot={mark_sensitive(loot_rel, 'path')} "
             f"fetch_report={mark_sensitive(os.path.relpath(fetch_report_path, shell._get_workspace_cwd()), 'path')}"
         )
+        if not findings and structured_files_with_findings == 0:
+            render_no_extracted_findings_preview(
+                loot_dir=loot_dir,
+                loot_rel=loot_rel,
+                analyzed_count=len(downloaded_files),
+                category="credential",
+                phase_label=phase_label,
+                preview_limit=5,
+            )
         return {
             "completed": True,
             "credential_findings": int(total_findings),
-            "files_with_findings": int(files_with_findings),
+            "files_with_findings": int(files_with_findings + structured_files_with_findings),
             "candidate_files": len(selected_entries),
             "phase_excluded_candidates": phase_excluded_total,
             "fetched_files": len(downloaded_files),
@@ -1692,6 +2428,24 @@ def _run_winrm_sensitive_scan_phase(
             phase_label=phase_label,
             records=artifact_records,
             report_path=report_path,
+        )
+        if artifact_records_extracted_nothing(artifact_records):
+            render_no_extracted_findings_preview(
+                loot_dir=loot_dir,
+                loot_rel=os.path.relpath(loot_dir, shell._get_workspace_cwd()),
+                analyzed_count=len(downloaded_files),
+                category="artifact",
+                phase_label=phase_label,
+                preview_limit=5,
+            )
+    elif downloaded_files:
+        render_no_extracted_findings_preview(
+            loot_dir=loot_dir,
+            loot_rel=os.path.relpath(loot_dir, shell._get_workspace_cwd()),
+            analyzed_count=len(downloaded_files),
+            category="artifact",
+            phase_label=phase_label,
+            preview_limit=5,
         )
     print_info(
         "Deterministic WinRM artifact summary: "
@@ -2027,6 +2781,7 @@ def _run_winrm_ai_sensitive_data_scan(
     read_failures = 0
     flagged_files = 0
     flagged_credentials = 0
+    review_candidate_paths: list[str] = []
     continue_after_findings: bool | None = None
     analysis_started_at = time.perf_counter()
     for candidate in prioritized_files:
@@ -2111,6 +2866,8 @@ def _run_winrm_ai_sensitive_data_scan(
                         continue_after_findings = _should_continue_after_winrm_ai_findings(shell=shell, domain=domain)
                     if continue_after_findings is False:
                         break
+            else:
+                review_candidate_paths.append(f"{host}/winrm/{remote_path}")
         if pipeline_result.error_message:
             read_failures += 1
             print_warning_debug(
@@ -2144,7 +2901,21 @@ def _run_winrm_ai_sensitive_data_scan(
                     continue_after_findings = _should_continue_after_winrm_ai_findings(shell=shell, domain=domain)
                 if continue_after_findings is False:
                     break
+            else:
+                review_candidate_paths.append(f"{host}/winrm/{remote_path}")
     analysis_duration_seconds = time.perf_counter() - analysis_started_at
+    if flagged_files == 0 and review_candidate_paths:
+        render_no_extracted_findings_preview(
+            loot_dir=loot_dir,
+            loot_rel=os.path.relpath(loot_dir, shell._get_workspace_cwd()),
+            analyzed_count=len(review_candidate_paths),
+            category="mixed",
+            phase_label="AI prioritized file analysis",
+            candidate_paths=review_candidate_paths,
+            report_root_abs=phase_root_abs,
+            scope_label="AI prioritized WinRM files",
+            preview_limit=5,
+        )
     print_info(
         "WinRM AI analysis summary: "
         f"prioritized_files={len(prioritized_files)} analyzed={analyzed} deterministic_handled={deterministic_handled} "

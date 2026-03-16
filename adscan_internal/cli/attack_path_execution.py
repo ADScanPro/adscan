@@ -1041,6 +1041,17 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     return value
 
 
+def _extract_password_spray_step_metadata(
+    details: dict[str, Any],
+) -> tuple[str | None, str | None, str | None]:
+    """Return spray metadata persisted in one PasswordSpray path step."""
+    spray_type = str(details.get("spray_type") or "").strip() or None
+    spray_category = str(details.get("spray_category") or "").strip() or None
+    password_value = details.get("password")
+    password = password_value if isinstance(password_value, str) else None
+    return spray_type, spray_category, password
+
+
 def _sanitize_filename_token(value: str, *, fallback: str) -> str:
     """Return a filesystem-safe token for log file names."""
     token = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or "").strip())
@@ -2473,6 +2484,151 @@ def execute_selected_attack_path(
                         last_outcome=last_outcome,
                     )
 
+                continue
+
+            if key == "passwordspray":
+                if not to_label:
+                    print_warning("Cannot execute PasswordSpray: missing target principal.")
+                    return execution_started
+
+                target_user = _normalize_account(to_label)
+                if not target_user:
+                    print_warning("Cannot execute PasswordSpray: invalid target principal.")
+                    return execution_started
+
+                spray_type, spray_category, spray_password = (
+                    _extract_password_spray_step_metadata(details)
+                )
+                effective_spray_type = spray_category or spray_type
+                marked_target = mark_sensitive(target_user, "user")
+                marked_spray_type = mark_sensitive(
+                    str(effective_spray_type or "N/A"),
+                    "detail",
+                )
+
+                execution_started = True
+                with _active_step_context(
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "target_user": target_user,
+                        "spray_type": effective_spray_type or "",
+                    },
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="attempted",
+                            notes={
+                                "target_user": target_user,
+                                "spray_type": effective_spray_type or "",
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    spray_runner = getattr(shell, "execute_password_spray_attack_step", None)
+                    if callable(spray_runner):
+                        attempted = bool(
+                            spray_runner(
+                                domain,
+                                spray_type=effective_spray_type,
+                                password=spray_password,
+                                entry_label=from_label or None,
+                            )
+                        )
+                    else:
+                        from adscan_internal.cli.spraying import (
+                            execute_password_spray_attack_step,
+                        )
+
+                        attempted = bool(
+                            execute_password_spray_attack_step(
+                                shell,
+                                domain,
+                                spray_type=effective_spray_type,
+                                password=spray_password,
+                                entry_label=from_label or None,
+                            )
+                        )
+
+                    if not attempted:
+                        print_warning(
+                            "Cannot execute PasswordSpray: spray mode "
+                            f"{marked_spray_type} could not be started."
+                        )
+                        _mark_blocked_step(
+                            action,
+                            from_label,
+                            to_label,
+                            kind="unavailable",
+                            reason="Spray mode could not be started",
+                        )
+                        return execution_started
+
+                    recovered_credential = _get_stored_domain_credential_for_user(
+                        shell,
+                        domain=domain,
+                        username=target_user,
+                    )
+                    if not recovered_credential:
+                        if hasattr(shell, "_update_active_attack_graph_step_status"):
+                            try:
+                                shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                                    domain=domain,
+                                    status="failed",
+                                    notes={
+                                        "target_user": target_user,
+                                        "spray_type": effective_spray_type or "",
+                                    },
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                telemetry.capture_exception(exc)
+                        print_warning(
+                            "PasswordSpray did not recover credentials for "
+                            f"{marked_target}. Stopping this path."
+                        )
+                        return True
+
+                    context_username = target_user
+                    context_password = recovered_credential
+                    print_info_debug(
+                        "[attack_paths] execution context handed off after PasswordSpray: "
+                        f"user={marked_target} "
+                        f"spray_type={marked_spray_type}"
+                    )
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="success",
+                            notes={
+                                "target_user": target_user,
+                                "spray_type": effective_spray_type or "",
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    if hasattr(shell, "_update_active_attack_graph_step_status"):
+                        try:
+                            shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                                domain=domain,
+                                status="success",
+                                notes={
+                                    "target_user": target_user,
+                                    "spray_type": effective_spray_type or "",
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
                 continue
 
             if key in {"kerberoasting", "asreproasting"}:

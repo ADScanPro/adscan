@@ -3,12 +3,13 @@
 This module extracts the DNS discovery helpers from the monolithic `adscan.py`.
 It is intentionally focused on discovery primitives used across multiple flows:
 
-- SRV record discovery via `dig` (robust parsing)
-- IPv4 address resolution (dig with nslookup fallback)
-- PDC discovery via a specific resolver (dig SRV with UDP→TCP fallback)
+- SRV record discovery via direct DNS queries
+- IPv4 address resolution with layered resolver fallbacks
+- PDC discovery via a specific resolver with UDP→TCP fallback
 
 The service is CLI-friendly: it uses `adscan_internal.rich_output` for debug
-messages and must never inject markers into executed commands.
+messages and centralizes DNS transport through dnspython instead of shelling out
+to external CLI resolvers.
 """
 
 from __future__ import annotations
@@ -19,6 +20,15 @@ import ipaddress
 import re
 import socket
 import time
+
+import dns.exception
+import dns.flags
+import dns.message
+import dns.name
+import dns.query
+import dns.rcode
+import dns.reversename
+import dns.rdatatype
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -44,6 +54,15 @@ class DNSDiscoveryRuntime:
     """Runtime configuration and helpers for DNSDiscoveryService."""
 
     dig_compat_flags: str
+
+
+@dataclass(frozen=True)
+class DNSQueryResult:
+    """Structured DNS query result used internally by the discovery service."""
+
+    answers: list[str]
+    error: str | None = None
+    rcode: str | None = None
 
 
 def is_dns_resolution_error(error_output: str) -> bool:
@@ -209,6 +228,151 @@ class DNSDiscoveryService:
         self._host = host
         self._rt = runtime
 
+    def _resolve_query_nameservers(self, resolver: str | None) -> list[str]:
+        """Return resolver IPs to use for a DNS query in priority order."""
+        if resolver:
+            return [resolver]
+        return self._get_resolv_conf_nameservers(include_loopback=True)
+
+    def _extract_dns_answers(
+        self,
+        response: dns.message.Message,
+        *,
+        rdtype: str,
+    ) -> list[str]:
+        """Extract normalized answers from a dnspython response."""
+        normalized_rdtype = rdtype.upper()
+        answers: list[str] = []
+
+        for rrset in response.answer:
+            if dns.rdatatype.to_text(rrset.rdtype).upper() != normalized_rdtype:
+                continue
+            for item in rrset:
+                if normalized_rdtype == "SRV":
+                    value = item.target.to_text().rstrip(".")
+                elif normalized_rdtype == "A":
+                    value = item.address
+                elif normalized_rdtype == "PTR":
+                    value = item.target.to_text().rstrip(".")
+                else:
+                    value = item.to_text().strip()
+                if value and value not in answers:
+                    answers.append(value)
+
+        return answers
+
+    def _query_dns_records(
+        self,
+        *,
+        qname: str,
+        rdtype: str,
+        resolver: str | None = None,
+        tcp: bool = False,
+        timeout_seconds: int = 2,
+        tries: int = 1,
+        checking_disabled: bool = False,
+    ) -> DNSQueryResult:
+        """Query DNS records directly with dnspython and return structured results."""
+        normalized_qname = (qname or "").strip().rstrip(".")
+        if not normalized_qname:
+            return DNSQueryResult(answers=[], error="invalid_name")
+
+        try:
+            query_name = dns.name.from_text(normalized_qname)
+        except Exception:
+            return DNSQueryResult(answers=[], error="invalid_name")
+
+        try:
+            rdtype_value = dns.rdatatype.from_text(rdtype.upper())
+        except Exception:
+            return DNSQueryResult(answers=[], error="invalid_type")
+
+        nameservers = self._resolve_query_nameservers(resolver)
+        if not nameservers:
+            return DNSQueryResult(answers=[], error="no_servers")
+
+        last_error: str | None = "no_servers"
+        last_rcode: str | None = None
+
+        for nameserver in nameservers:
+            if not nameserver:
+                continue
+            marked_nameserver = mark_sensitive(nameserver, "ip")
+            for _attempt in range(max(1, tries)):
+                try:
+                    message = dns.message.make_query(
+                        query_name,
+                        rdtype_value,
+                        use_edns=False,
+                    )
+                    if checking_disabled:
+                        message.flags |= dns.flags.CD
+
+                    if tcp:
+                        response = dns.query.tcp(
+                            message,
+                            where=nameserver,
+                            timeout=timeout_seconds,
+                        )
+                    else:
+                        response = dns.query.udp(
+                            message,
+                            where=nameserver,
+                            timeout=timeout_seconds,
+                            ignore_unexpected=True,
+                        )
+                except dns.exception.Timeout:
+                    last_error = "timeout"
+                    continue
+                except OSError as exc:
+                    last_error = "no_servers"
+                    print_info_debug(
+                        f"[dns] Query transport failure via {marked_nameserver}: {exc}"
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    last_error = "command_failed"
+                    print_info_debug(
+                        f"[dns] Query failure for {mark_sensitive(normalized_qname, 'domain')} "
+                        f"via {marked_nameserver}: {exc}"
+                    )
+                    continue
+
+                rcode_text = dns.rcode.to_text(response.rcode()).lower()
+                last_rcode = rcode_text
+                if response.rcode() == dns.rcode.NOERROR:
+                    return DNSQueryResult(
+                        answers=self._extract_dns_answers(response, rdtype=rdtype),
+                        error=None,
+                        rcode=rcode_text,
+                    )
+                if response.rcode() == dns.rcode.NXDOMAIN:
+                    return DNSQueryResult(
+                        answers=[],
+                        error="nxdomain",
+                        rcode=rcode_text,
+                    )
+                if response.rcode() == dns.rcode.SERVFAIL:
+                    return DNSQueryResult(
+                        answers=[],
+                        error="servfail",
+                        rcode=rcode_text,
+                    )
+                if response.rcode() == dns.rcode.REFUSED:
+                    return DNSQueryResult(
+                        answers=[],
+                        error="refused",
+                        rcode=rcode_text,
+                    )
+                return DNSQueryResult(
+                    answers=[],
+                    error=f"rcode_{rcode_text}",
+                    rcode=rcode_text,
+                )
+
+        return DNSQueryResult(answers=[], error=last_error, rcode=last_rcode)
+
     def dig_srv_records(
         self,
         *,
@@ -218,85 +382,25 @@ class DNSDiscoveryService:
         timeout_seconds: int = 2,
         tries: int = 1,
     ) -> tuple[list[str], str | None]:
-        """Query SRV records with dig and return target hostnames.
-
-        This is robust against dig error output accidentally being parsed as hostnames
-        (e.g. "communications error ... timed out" -> "out").
-        """
+        """Query SRV records and return target hostnames."""
         normalized_srv = (srv_name or "").strip().rstrip(".")
         if not normalized_srv:
             return [], "invalid_srv_name"
-
-        dig_args: list[str] = [
-            "dig",
-            f"+time={timeout_seconds}",
-            f"+tries={tries}",
-            self._rt.dig_compat_flags,
-            "+noall",
-            "+answer",
-        ]
-        if tcp:
-            dig_args.append("+tcp")
-        if resolver:
-            dig_args.append(f"@{resolver}")
-        dig_args.extend([normalized_srv, "SRV"])
-
-        cmd = " ".join(dig_args)
-        result = self._host.run_command(cmd, timeout=30, ignore_errors=True)
-        if result is None:
-            last_error = getattr(self._host, "_last_run_command_error", None)
-            if isinstance(last_error, tuple) and last_error:
-                error_kind = next(iter(last_error), None)
-                if error_kind:
-                    return [], str(error_kind)
-            return [], "command_failed"
-
-        combined = "\n".join([(result.stdout or ""), (result.stderr or "")]).lower()
-        if (
-            "no servers could be reached" in combined
-            or "communications error" in combined
-            or "connection timed out" in combined
-        ):
-            return [], "no_servers"
-
-        targets: list[str] = []
-        # Expected answer format:
-        # _ldap._tcp.dc._msdcs.example.local. 600 IN SRV 0 100 389 dc01.example.local.
-        pattern = re.compile(
-            r"\sIN\s+SRV\s+\d+\s+\d+\s+\d+\s+(\S+)\s*$",
-            re.IGNORECASE,
+        query_result = self._query_dns_records(
+            qname=normalized_srv,
+            rdtype="SRV",
+            resolver=resolver,
+            tcp=tcp,
+            timeout_seconds=timeout_seconds,
+            tries=tries,
         )
-        for line in (result.stdout or "").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            match = pattern.search(line)
-            if not match:
-                continue
-            target = match.group(1).strip()
-            if target:
-                targets.append(target)
-
-        if not targets:
-            stdout_text = result.stdout or ""
-            if " IN " in stdout_text and " SRV " in stdout_text:
-                marked_srv = mark_sensitive(normalized_srv, "domain")
-                preview_lines: list[str] = []
-                for raw_line in stdout_text.splitlines():
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    if " SRV " not in line:
-                        continue
-                    preview_lines.append(line)
-                    if len(preview_lines) >= 2:
-                        break
-                print_info_debug(
-                    f"[dns] dig returned SRV-looking answers for {marked_srv} but none were parsed "
-                    f"(preview_lines={len(preview_lines)})."
-                )
-
-        return targets, None
+        if query_result.error == "invalid_name":
+            return [], "invalid_srv_name"
+        if query_result.error in {"timeout", "no_servers"}:
+            return [], "no_servers"
+        if query_result.error == "command_failed":
+            return [], "command_failed"
+        return query_result.answers, None
 
     def dig_srv_records_robust(
         self,
@@ -392,69 +496,24 @@ class DNSDiscoveryService:
         *,
         tcp: bool = False,
     ) -> list[str]:
-        """Resolve IPv4 addresses for a hostname using dig (fallback to nslookup)."""
+        """Resolve IPv4 addresses for a hostname via direct DNS queries."""
         marked_fqdn = mark_sensitive(fqdn, "domain")
         print_info_debug(
             f"[_resolve_ipv4_addresses] Resolving IPv4 for FQDN: {marked_fqdn}, resolver: {resolver}"
         )
-        candidates: list[str] = []
-        tcp_flag = "+tcp " if tcp else ""
-        dig_cmd = f"dig {self._rt.dig_compat_flags} {tcp_flag}+short {fqdn} A"
-        if resolver:
-            dig_cmd = (
-                f"dig {self._rt.dig_compat_flags} {tcp_flag}+short @{resolver} {fqdn} A"
-            )
-
-        display_dig_cmd = dig_cmd.replace(fqdn, marked_fqdn)
-        print_info_debug(
-            f"[_resolve_ipv4_addresses] Trying dig command: {display_dig_cmd}"
+        query_result = self._query_dns_records(
+            qname=fqdn,
+            rdtype="A",
+            resolver=resolver,
+            tcp=tcp,
+            timeout_seconds=30,
+            tries=1,
         )
-
-        try:
-            result = self._host.run_command(dig_cmd, timeout=120)
-            if result:
-                if result.returncode == 0:
-                    for line in (result.stdout or "").splitlines():
-                        candidate = line.strip()
-                        if candidate and _is_valid_ipv4(candidate):
-                            if candidate not in candidates:
-                                candidates.append(candidate)
-                else:
-                    print_info_debug(
-                        f"[_resolve_ipv4_addresses] dig failed with returncode {result.returncode}"
-                    )
-            else:
-                print_warning_debug(
-                    "[_resolve_ipv4_addresses] dig command returned None"
-                )
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_info_debug(
-                f"[_resolve_ipv4_addresses] dig exception: {exc}, falling back to nslookup"
-            )
-
-        if not candidates:
-            lookup_cmd = f"nslookup {fqdn}"
-            if resolver:
-                lookup_cmd = f"nslookup {fqdn} {resolver}"
-
-            display_lookup_cmd = lookup_cmd.replace(fqdn, marked_fqdn)
-            print_info_debug(
-                f"[_resolve_ipv4_addresses] Trying nslookup command: {display_lookup_cmd}"
-            )
-            if tcp:
-                result = None
-            else:
-                result = self._host.run_command(lookup_cmd, timeout=120)
-            if result and result.returncode == 0:
-                matches = re.findall(r"Address:\s+([\d.]+)", result.stdout or "")
-                for match in matches:
-                    if not _is_valid_ipv4(match):
-                        continue
-                    if _is_loopback_ip(match):
-                        continue
-                    if match not in candidates:
-                        candidates.append(match)
+        candidates = [
+            candidate
+            for candidate in query_result.answers
+            if candidate and _is_valid_ipv4(candidate) and not _is_loopback_ip(candidate)
+        ]
 
         candidates = [
             c for c in candidates if c and _is_valid_ipv4(c) and not _is_loopback_ip(c)
@@ -530,7 +589,7 @@ class DNSDiscoveryService:
         Args:
             ip: IPv4 address to reverse-resolve.
             resolver: Optional resolver IP to use (e.g. ADscan's local Unbound).
-            tcp: Use TCP for dig lookups when needed.
+            tcp: Use TCP for DNS lookups when needed.
 
         Returns:
             Resolved hostname/FQDN without a trailing dot, or None if the PTR
@@ -545,81 +604,28 @@ class DNSDiscoveryService:
             f"[dns_reverse] Resolving PTR for IP: {marked_ip}, resolver: {resolver}"
         )
 
-        tcp_flag = "+tcp " if tcp else ""
-        dig_cmd = f"dig {self._rt.dig_compat_flags} {tcp_flag}+short -x {ip_clean}"
-        if resolver:
-            dig_cmd = f"dig {self._rt.dig_compat_flags} {tcp_flag}+short @{resolver} -x {ip_clean}"
-
         try:
-            result = self._host.run_command(dig_cmd, timeout=30, ignore_errors=True)
-            if result and result.returncode == 0:
-                for raw in (result.stdout or "").splitlines():
-                    candidate = raw.strip().rstrip(".")
-                    if not candidate:
-                        continue
-                    lower_candidate = candidate.lower()
-                    if lower_candidate.startswith(";;"):
-                        continue
-                    if "communications error" in lower_candidate or "timed out" in lower_candidate:
-                        print_info_debug(
-                            f"[dns_reverse] dig PTR ignored error output for {marked_ip}: {candidate}"
-                        )
-                        continue
-                    if "server can't find" in lower_candidate or "nxdomain" in lower_candidate:
-                        continue
-                    if not re.match(r"^[a-z0-9.-]+$", lower_candidate):
-                        print_info_debug(
-                            f"[dns_reverse] dig PTR ignored invalid hostname for {marked_ip}: {candidate}"
-                        )
-                        continue
-                    marked_candidate = mark_sensitive(candidate, "host")
-                    print_info_debug(
-                        f"[dns_reverse] dig PTR resolved {marked_ip} -> {marked_candidate}"
-                    )
-                    return candidate
-            print_info_debug(
-                f"[dns_reverse] dig PTR failed for {marked_ip} (rc={getattr(result, 'returncode', None)})"
+            reverse_name = dns.reversename.from_address(ip_clean).to_text().rstrip(".")
+            query_result = self._query_dns_records(
+                qname=reverse_name,
+                rdtype="PTR",
+                resolver=resolver,
+                tcp=tcp,
+                timeout_seconds=30,
+                tries=1,
             )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_info_debug(f"[dns_reverse] dig PTR exception for {marked_ip}: {exc}")
-
-        # Fallback to nslookup (PTR)
-        lookup_cmd = f"nslookup -type=ptr {ip_clean}"
-        if resolver:
-            lookup_cmd = f"nslookup -type=ptr {ip_clean} {resolver}"
-
-        try:
-            result = self._host.run_command(lookup_cmd, timeout=30, ignore_errors=True)
-            if result and result.returncode == 0:
-                for raw in (result.stdout or "").splitlines():
-                    line = raw.strip()
-                    if "name =" not in line.lower():
-                        continue
-                    parts = line.split("=", 1)
-                    if len(parts) != 2:
-                        continue
-                    candidate = parts[1].strip().rstrip(".")
-                    if not candidate:
-                        continue
-                    lower_candidate = candidate.lower()
-                    if "communications error" in lower_candidate or "timed out" in lower_candidate:
-                        print_info_debug(
-                            f"[dns_reverse] nslookup PTR ignored error output for {marked_ip}: {candidate}"
-                        )
-                        continue
-                    if "server can't find" in lower_candidate or "nxdomain" in lower_candidate:
-                        continue
-                    if not re.match(r"^[a-z0-9.-]+$", lower_candidate):
-                        print_info_debug(
-                            f"[dns_reverse] nslookup PTR ignored invalid hostname for {marked_ip}: {candidate}"
-                        )
-                        continue
-                    marked_candidate = mark_sensitive(candidate, "host")
+            for candidate in query_result.answers:
+                lower_candidate = candidate.lower()
+                if not re.match(r"^[a-z0-9.-]+$", lower_candidate):
                     print_info_debug(
-                        f"[dns_reverse] nslookup PTR resolved {marked_ip} -> {marked_candidate}"
+                        f"[dns_reverse] PTR ignored invalid hostname for {marked_ip}: {candidate}"
                     )
-                    return candidate
+                    continue
+                marked_candidate = mark_sensitive(candidate, "host")
+                print_info_debug(
+                    f"[dns_reverse] PTR resolved {marked_ip} -> {marked_candidate}"
+                )
+                return candidate
             print_info_verbose(
                 f"[dns_reverse] PTR lookup failed for {marked_ip}; no hostname could be resolved."
             )
@@ -818,7 +824,7 @@ class DNSDiscoveryService:
     def find_pdc_via_resolver(self, *, domain: str, resolver_ip: str) -> str | None:
         """Resolve the PDC IP for a domain using a specific resolver.
 
-        Uses dig for SRV lookup and supports TCP fallback (useful when UDP/53 is blocked).
+        Uses direct SRV lookups and supports TCP fallback (useful when UDP/53 is blocked).
         Returns the first resolved IPv4 address for the SRV target.
         """
         normalized_domain = (domain or "").strip().rstrip(".")
@@ -831,9 +837,8 @@ class DNSDiscoveryService:
         srv_name = f"_ldap._tcp.pdc._msdcs.{normalized_domain}"
         marked_srv = f"_ldap._tcp.pdc._msdcs.{marked_domain}"
 
-        marked_dig_udp_cmd = f"dig {self._rt.dig_compat_flags} +time=2 +tries=1 +short @{marked_ip} {marked_srv} SRV"
         print_info_debug(
-            f"[dns_find_pdc_resolv] Executing PDC SRV query: {marked_dig_udp_cmd}"
+            f"[dns_find_pdc_resolv] Executing PDC SRV query for {marked_srv} via {marked_ip}"
         )
 
         srv_targets, _ = self.dig_srv_records_robust(
@@ -921,9 +926,8 @@ class DNSDiscoveryService:
         marked_srv = f"_ldap._tcp.pdc._msdcs.{marked_domain}"
 
         srv_targets: list[str] = []
-        marked_dig_udp_cmd = f"dig {self._rt.dig_compat_flags} +time=2 +tries=1 +short @{marked_ip} {marked_srv} SRV"
         print_info_debug(
-            f"[dns_find_pdc_resolv] Executing PDC SRV query: {marked_dig_udp_cmd}"
+            f"[dns_find_pdc_resolv] Executing PDC SRV query for {marked_srv} via {marked_ip}"
         )
 
         srv_targets, _ = self.dig_srv_records_robust(
@@ -943,30 +947,6 @@ class DNSDiscoveryService:
                 tcp=True,
                 allow_fallback=False,
             )
-
-        # Fallback to nslookup
-        if not srv_targets:
-            nslookup_cmd = f"nslookup -type=srv {srv_name} {resolver_ip}"
-            marked_nslookup_cmd = (
-                f"nslookup -type=srv _ldap._tcp.pdc._msdcs.{marked_domain} {marked_ip}"
-            )
-            print_info_debug(
-                f"[dns_find_pdc_resolv] Falling back to nslookup for SRV: {marked_nslookup_cmd}"
-            )
-            ns_result = self._host.run_command(
-                nslookup_cmd, timeout=30, ignore_errors=True
-            )
-            if ns_result and (ns_result.stdout or "").strip():
-                match = re.search(r"service = \d+ \d+ \d+ ([\w.-]+)", ns_result.stdout)
-                if match:
-                    srv_targets.append(match.group(1))
-            if not srv_targets and ns_result:
-                stderr_preview = (ns_result.stderr or "").strip().splitlines()[:3]
-                stdout_preview = (ns_result.stdout or "").strip().splitlines()[:6]
-                print_info_debug(
-                    f"[dns_find_pdc_resolv] nslookup returned rc={ns_result.returncode} "
-                    f"stdout_preview={stdout_preview!r} stderr_preview={stderr_preview!r}"
-                )
 
         if not srv_targets:
             print_warning_debug(
@@ -1034,22 +1014,21 @@ class DNSDiscoveryService:
         )
 
         srv_name = f"_ldap._tcp.dc._msdcs.{normalized_domain}"
-        marked_dig_short_cmd = (
-            f"dig +noall +answer _ldap._tcp.dc._msdcs.{marked_domain} SRV"
-        )
         if pdc_ip:
-            marked_dig_short_cmd = (
-                f"dig +noall +answer @{mark_sensitive(pdc_ip, 'ip')} "
-                f"_ldap._tcp.dc._msdcs.{marked_domain} SRV"
+            print_info_debug(
+                f"[dns_find_dcs] Executing SRV query for _ldap._tcp.dc._msdcs.{marked_domain} via {mark_sensitive(pdc_ip, 'ip')}"
             )
-        print_info_debug(f"[dns_find_dcs] Executing SRV query: {marked_dig_short_cmd}")
+        else:
+            print_info_debug(
+                f"[dns_find_dcs] Executing SRV query for _ldap._tcp.dc._msdcs.{marked_domain}"
+            )
 
         dc_hostnames, srv_error = self.dig_srv_records_robust(
             srv_name=srv_name, resolver=pdc_ip, tcp=False
         )
         if srv_error:
             print_info_debug(
-                f"[dns_find_dcs] dig SRV query returned no results for {marked_domain}: error={srv_error}"
+                f"[dns_find_dcs] SRV query returned no results for {marked_domain}: error={srv_error}"
             )
         print_info_debug(
             f"[dns_find_dcs] Found {len(dc_hostnames)} DC hostname(s): {dc_hostnames}"
@@ -1106,7 +1085,7 @@ class DNSDiscoveryService:
         domain: str,
         preferred_ips: list[str | None] | None = None,
     ) -> tuple[str | None, str | None]:
-        """Discover PDC for a domain using nslookup SRV query.
+        """Discover PDC for a domain using SRV queries.
 
         Args:
             domain: Domain name to query
@@ -1197,67 +1176,66 @@ class DNSDiscoveryService:
 
         # Try SRV records first
         for srv_name in srv_names:
-            dig_cmd = (
-                f"dig {self._rt.dig_compat_flags} @{resolver_ip} +short {srv_name} SRV"
+            srv_result = self._query_dns_records(
+                qname=srv_name,
+                rdtype="SRV",
+                resolver=resolver_ip,
+                tcp=False,
+                timeout_seconds=15,
+                tries=1,
             )
-            result = self._host.run_command(dig_cmd, timeout=15, ignore_errors=True)
-
-            if result is None:
-                last_error = getattr(self._host, "_last_run_command_error", None)
-                error_kind = None
-                if isinstance(last_error, tuple):
-                    error_kind = next(iter(last_error), None)
-                if error_kind == "timeout":
-                    print_warning(
-                        f"Local DNS resolver did not respond in time while verifying {marked_domain}."
-                    )
-                    return False, "timeout"
-
-            if result and (result.stdout or "").strip():
+            if srv_result.answers:
                 return True, None
-
-        # As a last resort, try resolving the domain itself (may still be NXDOMAIN in AD labs)
-        dig_apex_cmd = f"dig {self._rt.dig_compat_flags} @{resolver_ip} +short {normalized_domain} A"
-        dig_apex = self._host.run_command(dig_apex_cmd, timeout=10, ignore_errors=True)
-
-        if dig_apex is None:
-            last_error = getattr(self._host, "_last_run_command_error", None)
-            error_kind = None
-            if isinstance(last_error, tuple):
-                error_kind = next(iter(last_error), None)
-            if error_kind == "timeout":
+            if srv_result.error == "timeout":
                 print_warning(
                     f"Local DNS resolver did not respond in time while verifying {marked_domain}."
                 )
                 return False, "timeout"
 
-        if dig_apex and (dig_apex.stdout or "").strip():
+        # As a last resort, try resolving the domain itself (may still be NXDOMAIN in AD labs)
+        apex_result = self._query_dns_records(
+            qname=normalized_domain,
+            rdtype="A",
+            resolver=resolver_ip,
+            tcp=False,
+            timeout_seconds=10,
+            tries=1,
+        )
+        if apex_result.error == "timeout":
+            print_warning(
+                f"Local DNS resolver did not respond in time while verifying {marked_domain}."
+            )
+            return False, "timeout"
+
+        if apex_result.answers:
             return True, None
 
-        # Check for SERVFAIL in verbose output
+        # Check for SERVFAIL and detect whether checking-disabled queries would succeed.
         for srv_name in srv_names:
-            dig_verbose_cmd = (
-                f"dig {self._rt.dig_compat_flags} @{resolver_ip} {srv_name} SRV"
+            verbose_result = self._query_dns_records(
+                qname=srv_name,
+                rdtype="SRV",
+                resolver=resolver_ip,
+                tcp=False,
+                timeout_seconds=15,
+                tries=1,
             )
-            dig_verbose = self._host.run_command(
-                dig_verbose_cmd, timeout=15, ignore_errors=True
+            if verbose_result.error != "servfail":
+                continue
+            print_info_debug(
+                f"[dns] SRV status for {marked_domain}: SERVFAIL"
             )
-            if dig_verbose and dig_verbose.stdout:
-                for line in dig_verbose.stdout.splitlines():
-                    if "status:" in line and "HEADER" in line:
-                        if "status: SERVFAIL" in line:
-                            print_info_debug(
-                                f"[dns] dig SRV status for {marked_domain}: {line.strip()}"
-                            )
-                            # Check if +cd (checking disabled) returns an answer
-                            dig_cd_cmd = f"dig {self._rt.dig_compat_flags} @{resolver_ip} +cd +short {srv_name} SRV"
-                            dig_cd = self._host.run_command(
-                                dig_cd_cmd, timeout=15, ignore_errors=True
-                            )
-                            if dig_cd and (dig_cd.stdout or "").strip():
-                                # DNSSEC validation failure - caller should trigger auto-healing
-                                return False, "servfail"
-                        break
+            cd_result = self._query_dns_records(
+                qname=srv_name,
+                rdtype="SRV",
+                resolver=resolver_ip,
+                tcp=False,
+                timeout_seconds=15,
+                tries=1,
+                checking_disabled=True,
+            )
+            if cd_result.answers:
+                return False, "servfail"
 
         return False, "no_answer"
 
@@ -1376,12 +1354,8 @@ class DNSDiscoveryService:
         srv_name = f"_ldap._tcp.dc._msdcs.{normalized_domain}"
 
         # Query SRV records using system resolver (validates what the rest of the tooling will use)
-        marked_dig_short_cmd = (
-            f"dig {self._rt.dig_compat_flags} +noall +answer "
-            f"_ldap._tcp.dc._msdcs.{marked_domain} SRV"
-        )
         print_info_debug(
-            f"[check_dns_resolution] Executing SRV query: {marked_dig_short_cmd}"
+            f"[check_dns_resolution] Executing SRV query for _ldap._tcp.dc._msdcs.{marked_domain}"
         )
 
         srv_targets, srv_error = self.dig_srv_records_robust(
@@ -1395,11 +1369,11 @@ class DNSDiscoveryService:
         error_found = srv_error in {"timeout", "command_failed", "invalid_srv_name"}
 
         print_info_debug(
-            f"[check_dns_resolution] dig srv_targets={len(srv_targets)}, srv_error={srv_error}"
-        )
+                f"[check_dns_resolution] SRV targets={len(srv_targets)}, srv_error={srv_error}"
+            )
 
         if not srv_targets:
-            # A successful dig invocation can still return an empty answer set.
+            # A successful DNS invocation can still return an empty answer set.
             # For AD domains, missing SRV records typically means conditional forwarding isn't active.
             print_warning_debug(
                 f"[check_dns_resolution] SRV query returned no targets for {marked_domain} "

@@ -42,7 +42,7 @@ from adscan_internal.rich_output import (
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.cli.common import build_lab_event_fields
-from adscan_internal.cli.dns import finalize_domain_context
+from adscan_internal.cli.dns import finalize_domain_context, persist_pdc_preflight_result
 from adscan_internal.cli.nmap import _read_text_file_best_effort
 
 
@@ -463,7 +463,7 @@ def run_scan_service(
                 "Check that the specified IP range/network is correct",
                 "Ensure network connectivity to the target hosts",
                 "Verify firewall rules allow SMB traffic (port 445)",
-                "Verify DNS SRV queries work (UDP/53 may be blocked; try TCP/53 with dig +tcp)",
+                "Verify DNS SRV queries work (UDP/53 may be blocked; TCP/53 may still behave differently)",
                 "Try scanning a different subnet or expanding the IP range",
                 "Check that target systems are powered on and accessible",
             ]
@@ -548,6 +548,7 @@ def run_scan_service(
             )
             if decision.action == "use" and decision.pdc_ip:
                 selected_domain = decision.domain
+                persist_pdc_preflight_result(shell, decision)
                 shell.domains_data.setdefault(selected_domain, {})["pdc"] = (
                     decision.pdc_ip
                 )

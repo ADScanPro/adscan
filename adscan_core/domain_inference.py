@@ -6,18 +6,21 @@ the user these questions at workspace creation time.
 
 Inference hierarchy (highest → lowest confidence)
 ---------------------------------------------------
-1. **TLD rules** — ``.htb`` → HackTheBox (confidence 1.0),
-   ``.thm`` → TryHackMe (1.0), ``.pg`` → Proving Grounds (0.95).
-2. **GOAD domain patterns** — ``sevenkingdoms.local``, ``essos.local``, etc.
-   (confidence 0.98).
-2.5. **Exact domain map** — ``scrm.local`` → Scrambled, ``egotistical-bank.local``
-   → Sauna, ``fabricorp.local`` → Fuse, etc. (confidence 0.90).  Only domains
-   that are *unique* to one machine in the catalog are listed — ambiguous domains
+1. **Exact domain map** — ``sequel.htb`` → Escape, ``scrm.local`` →
+   Scrambled, ``egotistical-bank.local`` → Sauna, ``fabricorp.local`` →
+   Fuse, etc. (confidence 1.0 for platform-domain overrides such as
+   ``.htb``/``.thm``/``.pg``, 0.90 otherwise). Only domains that are *unique*
+   to one machine in the catalog are listed — ambiguous domains
    (``htb.local``, ``megabank.local``) are handled by the PDC hostname rule.
    See :func:`lab_catalog.get_machine_domain_index`.
-3. **Workspace name matching** — workspace name equals a whitelisted lab name
+2. **TLD rules** — ``.htb`` → HackTheBox (confidence 1.0),
+   ``.vl`` → HackTheBox/VulnLab (1.0), ``.thm`` → TryHackMe (1.0),
+   ``.pg`` → Proving Grounds (0.95).
+3. **GOAD domain patterns** — ``sevenkingdoms.local``, ``essos.local``, etc.
+   (confidence 0.98).
+4. **Workspace name matching** — workspace name equals a whitelisted lab name
    from the catalog (confidence 0.70).
-4. **Default fallback** — ``ctf`` workspace with no provider (confidence 0.10),
+5. **Default fallback** — ``ctf`` workspace with no provider (confidence 0.10),
    reflecting that ≈95 % of real-world workspaces are CTF sessions.
 
 CTF-only supplementary rules (only invoked when ``type == "ctf"``)
@@ -50,8 +53,8 @@ Example usage::
 
     result = infer_from_domain("sequel.htb", workspace_name="my_htb")
     # DomainInferenceResult(workspace_type='ctf', lab_provider='hackthebox',
-    #   lab_name='sequel', lab_name_whitelisted=True,
-    #   confidence=1.0, source=<InferenceSource.DOMAIN_TLD: 'domain_tld'>)
+    #   lab_name='escape', lab_name_whitelisted=True,
+    #   confidence=1.0, source=<InferenceSource.EXACT_DOMAIN: 'exact_domain'>)
 
     result = infer_from_domain("dc.north.sevenkingdoms.local")
     # DomainInferenceResult(workspace_type='ctf', lab_provider='goad', ...)
@@ -131,6 +134,7 @@ class DomainInferenceResult:
 # Add new CTF platforms here; order is irrelevant (all TLDs are checked).
 _TLD_RULES: Final[dict[str, tuple[str, float]]] = {
     ".htb": ("hackthebox", 1.0),
+    ".vl": ("hackthebox", 1.0),  # VulnLab machines (re-hosted on HTB)
     ".thm": ("tryhackme", 1.0),
     ".pg": ("proving_grounds", 0.95),
 }
@@ -154,7 +158,7 @@ _GOAD_ROOT_DOMAINS: Final[frozenset[str]] = frozenset(
 # practice environments (VulnHub, OSCP-style, custom CTF labs).
 # Used by infer_from_domain_sld — NOT applied to audit workspaces.
 _GENERIC_INTERNAL_TLDS: Final[frozenset[str]] = frozenset(
-    {".local", ".corp", ".lan", ".internal", ".home", ".lab", ".vl"}
+    {".local", ".corp", ".lan", ".internal", ".home", ".lab"}
 )
 
 # Regex matching common DC hostname suffixes (case-insensitive).
@@ -273,6 +277,50 @@ def _strip_dc_suffix(hostname_label_lower: str) -> str | None:
     return None
 
 
+def _infer_from_exact_domain(domain_lower: str) -> DomainInferenceResult | None:
+    """Resolve a known exact domain fingerprint, including platform overrides.
+
+    Exact-domain matches are checked before generic TLD parsing because some
+    CTF platforms expose a stable FQDN whose visible label is not the actual
+    machine name (for example ``sequel.htb`` maps to HTB ``Escape``).
+
+    Args:
+        domain_lower: Lowercased FQDN to match. Subdomains are supported by
+            progressively stripping leftmost labels.
+
+    Returns:
+        A :class:`DomainInferenceResult` when a fingerprint matches, or
+        ``None`` when the domain is unknown.
+    """
+    domain_index = get_machine_domain_index()
+    domain_candidate = domain_lower
+
+    while domain_candidate:
+        lab_entry = domain_index.get(domain_candidate)
+        if lab_entry:
+            entry_provider, entry_lab = lab_entry
+            confidence = 0.90
+            for tld, (_, tld_confidence) in _TLD_RULES.items():
+                if domain_candidate.endswith(tld):
+                    confidence = max(confidence, tld_confidence)
+                    break
+
+            return DomainInferenceResult(
+                workspace_type="ctf",
+                lab_provider=entry_provider,
+                lab_name=normalize_lab_name(entry_lab),
+                lab_name_whitelisted=is_lab_whitelisted(entry_provider, entry_lab),
+                confidence=confidence,
+                source=InferenceSource.EXACT_DOMAIN,
+            )
+
+        if "." not in domain_candidate:
+            break
+        domain_candidate = domain_candidate.split(".", 1)[1]
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -329,7 +377,12 @@ def infer_from_domain(
 
     domain_lower = domain.strip().lower()
 
-    # --- Rule 1: TLD-based inference (confidence 0.95–1.0) -----------------
+    # --- Rule 1: Exact domain-to-lab map (confidence 0.90–1.0) -------------
+    exact_domain_result = _infer_from_exact_domain(domain_lower)
+    if exact_domain_result is not None:
+        return exact_domain_result
+
+    # --- Rule 2: TLD-based inference (confidence 0.95–1.0) -----------------
     for tld, (provider, confidence) in _TLD_RULES.items():
         if not domain_lower.endswith(tld):
             continue
@@ -346,7 +399,7 @@ def infer_from_domain(
             source=InferenceSource.DOMAIN_TLD,
         )
 
-    # --- Rule 2: GOAD domain patterns (confidence 0.98) --------------------
+    # --- Rule 3: GOAD domain patterns (confidence 0.98) --------------------
     if _is_goad_domain(domain_lower):
         return DomainInferenceResult(
             workspace_type="ctf",
@@ -357,28 +410,7 @@ def infer_from_domain(
             source=InferenceSource.GOAD_DOMAIN,
         )
 
-    # --- Rule 2.5: Exact domain-to-lab map (confidence 0.90) ----------------
-    # Strips leading labels one by one to support subdomains (e.g. DC1.scrm.local).
-    _domain_index = get_machine_domain_index()
-    _domain_candidate = domain_lower
-    while _domain_candidate:
-        _lab_entry = _domain_index.get(_domain_candidate)
-        if _lab_entry:
-            _entry_provider, _entry_lab = _lab_entry
-            return DomainInferenceResult(
-                workspace_type="ctf",
-                lab_provider=_entry_provider,
-                lab_name=normalize_lab_name(_entry_lab),
-                lab_name_whitelisted=is_lab_whitelisted(_entry_provider, _entry_lab),
-                confidence=0.90,
-                source=InferenceSource.EXACT_DOMAIN,
-            )
-        # Strip the leftmost label and retry (dc.scrm.local → scrm.local).
-        if "." not in _domain_candidate:
-            break
-        _domain_candidate = _domain_candidate.split(".", 1)[1]
-
-    # --- Rule 3: Workspace name matches a whitelisted lab name (0.70) -------
+    # --- Rule 4: Workspace name matches a whitelisted lab name (0.70) -------
     if workspace_name:
         workspace_lower = workspace_name.strip().lower()
         # Extend this tuple when new providers with name-based labs are added.
@@ -401,7 +433,7 @@ def infer_from_domain(
                         source=InferenceSource.WORKSPACE_NAME,
                     )
 
-        # --- Rule 3b: Provider-prefixed workspace name (confidence 0.65) ----
+        # --- Rule 4b: Provider-prefixed workspace name (confidence 0.65) ----
         # e.g. "htb_forest" → strip "htb_" → look up "forest" in HTB only.
         # The prefix both identifies the provider and narrows the search,
         # making false positives extremely unlikely.
@@ -428,7 +460,7 @@ def infer_from_domain(
                     )
             break  # Prefix matched — don't test other prefixes
 
-    # --- Rule 4: Default fallback -------------------------------------------
+    # --- Rule 5: Default fallback -------------------------------------------
     return _default
 
 

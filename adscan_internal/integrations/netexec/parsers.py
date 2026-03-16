@@ -175,6 +175,14 @@ class NetexecExecStatus:
     not_found: list[str]
 
 
+@dataclass(frozen=True)
+class ParsedTimeroastHash:
+    """Parsed Timeroast hash entry emitted by NetExec."""
+
+    rid: int
+    hash_value: str
+
+
 def parse_netexec_exec_status(output: str) -> NetexecExecStatus:
     """Parse NetExec output for remote command execution status."""
     normalized = normalize_cli_output(output or "")
@@ -189,6 +197,35 @@ def parse_netexec_exec_status(output: str) -> NetexecExecStatus:
         method=method,
         not_found=[entry.strip() for entry in not_found if entry.strip()],
     )
+
+
+def parse_netexec_timeroast_hashes(output: str) -> list[ParsedTimeroastHash]:
+    """Parse NetExec ``timeroast`` output into RID/hash pairs."""
+    if not output:
+        return []
+
+    normalized = normalize_cli_output(output)
+    pattern = re.compile(
+        r"(?P<rid>\d+):(?P<hash>\$sntp-ms\$[^\s]+)",
+        re.IGNORECASE,
+    )
+
+    parsed: list[ParsedTimeroastHash] = []
+    seen: set[tuple[int, str]] = set()
+    for match in pattern.finditer(normalized):
+        try:
+            rid = int(match.group("rid"))
+        except ValueError:
+            continue
+        hash_value = str(match.group("hash") or "").strip()
+        if not hash_value:
+            continue
+        key = (rid, hash_value.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        parsed.append(ParsedTimeroastHash(rid=rid, hash_value=hash_value))
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -836,8 +873,6 @@ def parse_netexec_ldap_query_objects(output: str) -> list[dict[str, object]]:
 
     flush_current()
     return objects
-
-
 
 
 def parse_netexec_computer_badpwd(output: str) -> dict[str, int]:

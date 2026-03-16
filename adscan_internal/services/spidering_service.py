@@ -25,6 +25,7 @@ import shutil
 import zipfile
 
 from rich.markup import escape as rich_escape
+import re
 
 from adscan_internal import (
     print_info_verbose,
@@ -74,6 +75,10 @@ CommandExecutor = Callable[..., subprocess.CompletedProcess[str] | None]
 HandleFoundCredentialsCallback = Callable[
     [dict, str, list[str] | None, list[str] | None, str | None, str | None], None
 ]
+_NTLM_HASH_DUMP_RG_PATTERN = (
+    r"^[^:\r\n]{1,256}:[0-9]{1,10}:[0-9A-Fa-f]{32}:[0-9A-Fa-f]{32}:::"
+)
+_NTLM_HASH_DUMP_LINE_RE = re.compile(_NTLM_HASH_DUMP_RG_PATTERN)
 _ZIP_SELECTIVE_MAX_SUPPORTED_ENTRIES = 256
 _ZIP_SELECTIVE_MAX_TOTAL_BYTES = 200 * 1024 * 1024
 _ZIP_SELECTIVE_PREVIEW_LIMIT = 5
@@ -318,7 +323,7 @@ class SpideringService(BaseService):
         source_shares: list[str] | None = None,
         auth_username: str | None = None,
         apply_actions: bool = True,
-    ) -> dict[str, int]:
+    ) -> dict[str, object]:
         """Process deterministic structured files under one local loot root.
 
         This is the shared backend-agnostic path for structured findings such as
@@ -327,11 +332,21 @@ class SpideringService(BaseService):
         """
         suffix_to_scan_type = self._structured_suffix_to_scan_type_for_phase(phase)
         if not suffix_to_scan_type:
-            return {"candidate_files": 0, "processed_files": 0}
+            return {
+                "candidate_files": 0,
+                "processed_files": 0,
+                "files_with_findings": 0,
+                "ntlm_hash_findings": [],
+            }
 
         root = Path(str(root_path or "")).expanduser().resolve(strict=False)
         if not root.is_dir():
-            return {"candidate_files": 0, "processed_files": 0}
+            return {
+                "candidate_files": 0,
+                "processed_files": 0,
+                "files_with_findings": 0,
+                "ntlm_hash_findings": [],
+            }
 
         candidates: list[tuple[str, str]] = []
         remaining_suffixes = dict(suffix_to_scan_type)
@@ -347,6 +362,18 @@ class SpideringService(BaseService):
                     "Deterministic structured XML candidates selected via ripgrep: "
                     f"phase={phase} count={len(xml_candidates)} preview=[{rich_escape(preview)}]"
                 )
+        ntlm_hash_candidates = self._find_ntlm_hash_dump_candidates(root, phase)
+        ntlm_hash_prefilter_available = ntlm_hash_candidates is not None
+        if ntlm_hash_candidates:
+            candidates.extend((file_path, "hashdump") for file_path in ntlm_hash_candidates)
+            preview = ", ".join(
+                mark_sensitive(path, "path") for path in ntlm_hash_candidates[:3]
+            )
+            print_info_debug(
+                "Deterministic NTLM dump candidates selected via ripgrep: "
+                f"phase={phase} count={len(ntlm_hash_candidates)} "
+                f"preview=[{rich_escape(preview)}]"
+            )
 
         for dirpath, dirnames, filenames in os.walk(root):
             prune_excluded_walk_dirs(dirnames)
@@ -358,6 +385,14 @@ class SpideringService(BaseService):
                 except ValueError:
                     continue
                 if is_globally_excluded_smb_relative_path(relative_path):
+                    continue
+                if (
+                    phase == SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS
+                    and not ntlm_hash_prefilter_available
+                    and file_path.suffix.lower() in {".txt", ".log", ".csv"}
+                    and self._looks_like_ntlm_hash_dump_candidate(file_path)
+                ):
+                    candidates.append((str(file_path), "hashdump"))
                     continue
                 scan_type = remaining_suffixes.get(
                     resolve_effective_sensitive_extension(
@@ -380,8 +415,10 @@ class SpideringService(BaseService):
         candidates = deduped_candidates
 
         processed = 0
+        files_with_findings = 0
+        ntlm_hash_findings: list[dict[str, str]] = []
         for file_path, scan_type in candidates:
-            self.process_found_file(
+            record = self.process_found_file(
                 file_path,
                 domain,
                 scan_type,
@@ -392,13 +429,40 @@ class SpideringService(BaseService):
                 apply_actions=apply_actions,
             )
             processed += 1
+            if str(getattr(record, "status", "") or "").strip() == "processed":
+                files_with_findings += 1
+            details = getattr(record, "details", None)
+            if isinstance(details, dict):
+                raw_ntlm_hashes = details.get("ntlm_hash_findings")
+                if isinstance(raw_ntlm_hashes, list):
+                    for item in raw_ntlm_hashes:
+                        if not isinstance(item, dict):
+                            continue
+                        username = str(item.get("username") or "").strip()
+                        ntlm_hash = str(item.get("ntlm_hash") or "").strip()
+                        source_path = str(item.get("source_path") or "").strip()
+                        if not username or not ntlm_hash or not source_path:
+                            continue
+                        ntlm_hash_findings.append(
+                            {
+                                "username": username,
+                                "ntlm_hash": ntlm_hash,
+                                "source_path": source_path,
+                            }
+                        )
 
         print_info_debug(
             "Deterministic structured-file post-scan completed: "
             f"phase={phase} candidate_files={len(candidates)} processed_files={processed} "
+            f"files_with_findings={files_with_findings} "
             f"root={root}"
         )
-        return {"candidate_files": len(candidates), "processed_files": processed}
+        return {
+            "candidate_files": len(candidates),
+            "processed_files": processed,
+            "files_with_findings": files_with_findings,
+            "ntlm_hash_findings": ntlm_hash_findings,
+        }
 
     def _find_xml_cpassword_candidates(self, root: Path) -> list[str] | None:
         """Return XML files containing ``cpassword=`` using ``rg`` when available.
@@ -467,6 +531,85 @@ class SpideringService(BaseService):
         )
         return candidates
 
+    def _find_ntlm_hash_dump_candidates(
+        self,
+        root: Path,
+        phase: str,
+    ) -> list[str] | None:
+        """Return text files containing secretsdump/SAM-style NTLM hash lines."""
+        if str(phase or "").strip() != SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS:
+            return []
+
+        rg_path = shutil.which("rg")
+        if not rg_path:
+            return None
+
+        command = " ".join(
+            [shlex.quote(rg_path), "-l", "-0", "-i"]
+            + [
+                part
+                for glob in ("*.txt", "*.log", "*.csv")
+                for part in ("--iglob", shlex.quote(glob))
+            ]
+            + [
+                shlex.quote(_NTLM_HASH_DUMP_RG_PATTERN),
+                shlex.quote(str(root)),
+            ]
+        )
+        completed_process = self._command_executor(
+            command,
+            timeout=120,
+            use_clean_env=True,
+        )
+        if completed_process is None:
+            return None
+
+        return_code = int(getattr(completed_process, "returncode", 1))
+        if return_code not in (0, 1):
+            print_warning_debug(
+                "ripgrep NTLM hash prefilter failed unexpectedly. "
+                f"Skipping NTLM dump prefilter. rc={return_code}"
+            )
+            return None
+
+        stdout_text = str(getattr(completed_process, "stdout", "") or "")
+        if not stdout_text.strip("\0\r\n\t "):
+            return []
+
+        candidates: list[str] = []
+        for raw_path in stdout_text.split("\0"):
+            normalized_path = str(raw_path or "").strip()
+            if not normalized_path:
+                continue
+            file_path = Path(normalized_path).resolve(strict=False)
+            if not file_path.is_file():
+                continue
+            try:
+                relative_path = file_path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if is_globally_excluded_smb_relative_path(relative_path):
+                continue
+            candidates.append(str(file_path))
+
+        print_info_debug(
+            "ripgrep NTLM hash prefilter completed: "
+            f"root={root} candidate_files={len(candidates)}"
+        )
+        return candidates
+
+    @staticmethod
+    def _looks_like_ntlm_hash_dump_candidate(file_path: Path) -> bool:
+        """Return True when a text file contains one secretsdump/SAM-style hash line."""
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if _NTLM_HASH_DUMP_LINE_RE.search(line):
+                        return True
+        except OSError:
+            return False
+        return False
+
     def process_found_file(
         self,
         file_path: str,
@@ -499,6 +642,14 @@ class SpideringService(BaseService):
 
         if effective_suffix in {".yml", ".yaml"} and scan_type == "gpp":
             return self._process_yml_file(
+                file_path=file_path,
+                domain=domain,
+                filename=filename,
+                apply_actions=apply_actions,
+            )
+
+        if effective_suffix in {".txt", ".log", ".csv"} and scan_type == "hashdump":
+            return self._process_ntlm_hash_dump_file(
                 file_path=file_path,
                 domain=domain,
                 filename=filename,
@@ -768,6 +919,73 @@ class SpideringService(BaseService):
                 artifact_type=Path(filename).suffix.lstrip(".") or "yml",
                 status="failed",
                 note=f"YAML processing failed: {type(exc).__name__}.",
+            )
+
+    def _process_ntlm_hash_dump_file(
+        self,
+        *,
+        file_path: str,
+        domain: str,
+        filename: str,
+        apply_actions: bool,
+    ) -> ArtifactProcessingRecord:
+        """Process secretsdump/SAM-style NTLM hash dump text files."""
+        try:
+            result = self._share_file_analyzer_service.analyze_local_file(
+                source_path=file_path
+            )
+            for note in result.notes:
+                print_info_verbose(note)
+            stats = None
+            if apply_actions:
+                stats = self._share_file_finding_action_service.apply_findings(
+                    domain=domain,
+                    source_path=file_path,
+                    findings=result.findings,
+                )
+            if result.findings:
+                applied = 0
+                if stats:
+                    applied = int(stats.by_type.get("ntlm_hash", 0))
+                ntlm_hash_details = [
+                    {
+                        "username": str(getattr(finding, "username", "") or "").strip(),
+                        "ntlm_hash": str(getattr(finding, "secret", "") or "").strip(),
+                        "source_path": str(file_path),
+                    }
+                    for finding in result.findings
+                    if str(getattr(finding, "username", "") or "").strip()
+                    and str(getattr(finding, "secret", "") or "").strip()
+                ]
+                print_info_debug(
+                    "Deterministic NTLM hash dump action result: "
+                    f"path={mark_sensitive(file_path, 'path')} "
+                    f"findings={len(result.findings)} applied={applied}"
+                )
+                return ArtifactProcessingRecord(
+                    path=file_path,
+                    filename=filename,
+                    artifact_type=Path(filename).suffix.lstrip(".") or "text",
+                    status="processed",
+                    note=f"Detected {len(result.findings)} NTLM hash candidate(s).",
+                    details={"ntlm_hash_findings": ntlm_hash_details},
+                )
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=filename,
+                artifact_type=Path(filename).suffix.lstrip(".") or "text",
+                status="processed_no_findings",
+                note="No NTLM hash candidates detected.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning("Error processing NTLM hash dump file.")
+            return ArtifactProcessingRecord(
+                path=file_path,
+                filename=filename,
+                artifact_type=Path(filename).suffix.lstrip(".") or "text",
+                status="failed",
+                note=f"NTLM hash dump processing failed: {type(exc).__name__}.",
             )
 
     def _process_xlsm_file(

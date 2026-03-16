@@ -4,6 +4,7 @@ BloodHound Legacy (Neo4j) implementation
 
 # pylint: skip-file
 from typing import List, Dict, Optional
+import time
 from neo4j import GraphDatabase
 from .base import BloodHoundClient
 
@@ -244,6 +245,67 @@ class BloodHoundLegacyClient(BloodHoundClient):
             """
             params = {"domain": domain}
         return self.execute_query(query, **params)
+
+    def get_timeroast_candidates(
+        self, domain: str, max_results: int = 250
+    ) -> List[Dict]:
+        """Return enabled computer accounts matching Timeroast heuristics."""
+        month_seconds = 30 * 24 * 60 * 60
+        min_gap_seconds = 5 * 60
+        current_epoch = int(time.time())
+        query = f"""
+        MATCH (c:Computer)
+        WHERE c.enabled = true
+          AND toLower(coalesce(c.domain, "")) = toLower($domain)
+          AND coalesce(c.pwdlastset, 0) > 0
+          AND coalesce(c.whencreated, 0) > 0
+          AND (
+            (
+              c.pwdlastset <> c.whencreated
+              AND c.pwdlastset > c.whencreated
+              AND (c.pwdlastset - c.whencreated) >= {min_gap_seconds}
+              AND (c.pwdlastset - c.whencreated) < {month_seconds}
+            )
+            OR
+            (
+              c.pwdlastset > c.whencreated
+              AND (c.pwdlastset - c.whencreated) >= {min_gap_seconds}
+              AND
+              ($current_epoch - c.pwdlastset) > {month_seconds}
+            )
+          )
+        RETURN c
+        ORDER BY c.pwdlastset ASC
+        LIMIT $max_results
+        """
+        results = self.execute_query(
+            query,
+            domain=domain,
+            current_epoch=current_epoch,
+            max_results=max(1, int(max_results or 250)),
+        )
+        candidates: List[Dict] = []
+        for row in results:
+            if not isinstance(row, dict):
+                continue
+            node_properties = row.get("c") if isinstance(row.get("c"), dict) else row
+            if not isinstance(node_properties, dict):
+                continue
+            samaccountname = node_properties.get("samaccountname") or ""
+            if samaccountname and "@" in samaccountname:
+                samaccountname = samaccountname.split("@")[0]
+            candidates.append(
+                {
+                    "samaccountname": samaccountname,
+                    "name": node_properties.get("name"),
+                    "dnshostname": node_properties.get("dnshostname"),
+                    "objectid": node_properties.get("objectid"),
+                    "pwdlastset": node_properties.get("pwdlastset"),
+                    "whencreated": node_properties.get("whencreated"),
+                    "operatingsystem": node_properties.get("operatingsystem"),
+                }
+            )
+        return candidates
 
     def get_critical_aces(
         self,

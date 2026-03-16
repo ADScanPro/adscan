@@ -38,6 +38,7 @@ from adscan_internal.cli.dns import (
     infer_domain_from_candidate_ip,
     infer_domain_from_fqdn,
     offer_a_record_fallback,
+    persist_pdc_preflight_result,
     preflight_domain_pdc,
     prompt_known_domain_and_pdc_interactive,
 )
@@ -2018,6 +2019,7 @@ def run_start_unauth(shell, args: str | None) -> None:
             known_domain, known_pdc_ip = decision.domain, decision.pdc_ip
             skip_domain_discovery = True
             if known_pdc_ip:
+                persist_pdc_preflight_result(shell, decision)
                 shell.hosts = known_pdc_ip
                 shell.domains_data.setdefault(known_domain, {})["pdc"] = known_pdc_ip
                 finalize_domain_context(
@@ -2258,6 +2260,7 @@ def run_start_unauth(shell, args: str | None) -> None:
                     candidate_ips=selected_summary.candidate_ips,
                     interactive=bool(sys.stdin.isatty()),
                     mode_label="unauth",
+                    candidate_open_ports=candidate_port_map,
                 )
                 if decision.action != "use" or not decision.pdc_ip:
                     if decision.action == "reenter":
@@ -2278,6 +2281,7 @@ def run_start_unauth(shell, args: str | None) -> None:
                     shell.domains.append(known_domain)
                     shell.create_sub_workspace_for_domain(known_domain, known_pdc_ip)
 
+                persist_pdc_preflight_result(shell, decision)
                 finalize_domain_context(
                     shell,
                     domain=known_domain,
@@ -2666,6 +2670,7 @@ def run_start_auth(shell, args: str | None) -> None:
                 mode_label="auth",
             )
             if decision.action == "use" and decision.pdc_ip:
+                persist_pdc_preflight_result(shell, decision)
                 domain = decision.domain
                 pdc_ip = decision.pdc_ip
             elif decision.action in {"reenter", "fallback"} and sys.stdin.isatty():

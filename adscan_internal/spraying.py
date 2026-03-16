@@ -16,7 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
-from adscan_internal.integrations.netexec.helpers import build_auth_nxc
+from adscan_internal.integrations.netexec.helpers import (
+    build_auth_nxc,
+    build_nxc_plaintext_password_arg,
+)
 from adscan_internal.text_utils import normalize_cli_output
 
 
@@ -292,10 +295,14 @@ def compute_spray_eligibility(
     eligible: list[str] = []
     excluded: list[ExcludedUser] = []
 
-    if no_lockout_enforced:
+    if no_lockout_enforced or lockout_threshold == 0:
+        note = (
+            "Account lockout threshold is 0 (no lockout enforced)"
+            if lockout_threshold == 0
+            else "Account lockout threshold is None (no lockout enforced)"
+        )
         notes.append(
-            "Account lockout threshold is None (no lockout enforced). All users are "
-            "eligible; spraying cannot lock accounts, but use caution."
+            f"{note}. All users are eligible; spraying cannot lock accounts, but use caution."
         )
         return SprayEligibilityResult(
             input_users=list(file_users),
@@ -421,7 +428,7 @@ def build_netexec_pass_pol_command(
     """Build a NetExec command to query password policy (`--pass-pol`)."""
     auth = build_auth_nxc(username, password, domain, kerberos=kerberos)
     return (
-        f"{shlex.quote(nxc_path)} smb {shlex.quote(dc_ip)} "
+        f"{shlex.quote(nxc_path)} ldap {shlex.quote(dc_ip)} "
         f"{auth} --pass-pol"
     )
 
@@ -459,6 +466,37 @@ def build_netexec_computers_query_command(
     return (
         f"{shlex.quote(nxc_path)} ldap {shlex.quote(dc_ip)} "
         f"{auth} --query {shlex.quote(query)} {shlex.quote(attrs)}"
+    )
+
+
+def build_netexec_password_spray_command(
+    *,
+    nxc_path: str,
+    dc_ip: str,
+    users_file: str,
+    password: str,
+    domain: str,
+    log_file: str | None = None,
+) -> str:
+    """Build a NetExec SMB password spray command for a user list.
+
+    Args:
+        nxc_path: Path to the NetExec binary.
+        dc_ip: Domain controller IP or hostname.
+        users_file: Path to the file containing usernames to test.
+        password: Password candidate to spray.
+        domain: Target domain name.
+        log_file: Optional NetExec ``--log`` path.
+
+    Returns:
+        A fully-formed NetExec SMB command.
+    """
+    password_arg = build_nxc_plaintext_password_arg(password)
+    log_part = f" --log {shlex.quote(log_file)}" if log_file else ""
+    return (
+        f"{shlex.quote(nxc_path)} smb {shlex.quote(dc_ip)} "
+        f"-u {shlex.quote(users_file)} {password_arg} -d {shlex.quote(domain)}"
+        f"{log_part}"
     )
 
 

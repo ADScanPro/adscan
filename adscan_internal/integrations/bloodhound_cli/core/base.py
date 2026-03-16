@@ -64,6 +64,13 @@ class BloodHoundClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_timeroast_candidates(
+        self, domain: str, max_results: int = 250
+    ) -> List[Dict]:
+        """Get enabled computer accounts that match Timeroast heuristics."""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_critical_aces(
         self,
         source_domain: str,

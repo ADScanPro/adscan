@@ -18,7 +18,12 @@
   confidence: moderate
   type: pattern
   values:
-    - (?i:(?:set|reset|change|changed|update|updated|assign|assigned|use|using|initial|temporary|temp|default|new|login|logon|first)\b[\w\s,/-]{0,40})?\bpassw?o?r?d\b[\w\s,/-]{0,20}\bto\b\s*(?P<quote>["'`]{0,3})(?P<value>(?-i:(?P<a>[A-Z])|(?P<b>[a-z])|(?P<c>[0-9_+=~!@#$%^&*;:?-])){8,80}(?(a)(?(b)(?(c)(\S|$)|(?!x)x)|(?!x)x)|(?!x)x))(?(quote)(?P=quote))
+    # Catches "password to VALUE" — optional action-verb prefix before "password"
+    # e.g. "reset password to Admin123!", "set default password to P@ssw0rd"
+    # Uses \S{8,80} (stops at whitespace naturally) instead of the old quality-check
+    # conditional, which required (\S|$) after the value and broke when the value
+    # was followed by sentence punctuation (" .", " ,", etc.).
+    - (?i:(?:set|reset|change|changed|update|updated|assign|assigned|use|using|initial|temporary|temp|default|new|login|logon|first)\b[\w\s,/-]{0,40})?\bpassw?o?r?d\b[\w\s,/-]{0,20}\bto\b\s*(?P<quote>["'`]{0,3})(?P<value>\S{8,80})(?(quote)(?P=quote))
   filter_type: GeneralKeyword
   use_ml: true
   required_substrings:
@@ -27,4 +32,21 @@
   min_line_len: 16
   target:
     - code
+    - doc
+- name: DOC Password Inline
+  severity: medium
+  confidence: moderate
+  type: pattern
+  values:
+    # Catches plain-space "password VALUE" in natural language — no structural separator.
+    # e.g. "and password GuestUserCantWrite1 .", "password Admin123!"
+    # Requires optional "and"/"or" connector to reduce false positives in prose.
+    # Uses \S{8,80}: stops at whitespace, no (\S|$) end-anchor issue.
+    - (?i:(?:and|or)\s+)?\bpassw?o?r?d\b\s+(?P<quote>["'`]{0,3})(?P<value>\S{8,80})(?(quote)(?P=quote))
+  filter_type: GeneralKeyword
+  use_ml: true
+  required_substrings:
+    - pass
+  min_line_len: 12
+  target:
     - doc

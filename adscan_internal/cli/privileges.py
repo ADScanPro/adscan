@@ -18,6 +18,7 @@ from adscan_internal import (
 )
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.workspaces import domain_subpath
+from adscan_internal.workspaces.computers import ensure_enabled_computer_ip_file
 from rich.prompt import Confirm
 
 
@@ -180,12 +181,20 @@ def run_service_access_sweep(
                             handle.write(entry + "\n")
                     targets = targets_path
             else:
-                default_hosts_file = domain_subpath(
-                    workspace_cwd, domains_dir, domain, "enabled_computers_ips.txt"
+                default_hosts_file, source = ensure_enabled_computer_ip_file(
+                    workspace_cwd,
+                    domains_dir,
+                    domain,
+                    shell.domains_data.get(domain, {}),
                 )
-                if not os.path.exists(default_hosts_file):
+                if not default_hosts_file:
                     continue
                 targets = default_hosts_file
+                print_info_debug(
+                    f"[privileges] using domain target file source={source} "
+                    f"for {mark_sensitive(domain, 'domain')}: "
+                    f"{mark_sensitive(str(targets), 'path')}"
+                )
 
             auth_str = shell.build_auth_nxc(username, password, domain, kerberos=False)
             marked_domain = mark_sensitive(domain, "domain")

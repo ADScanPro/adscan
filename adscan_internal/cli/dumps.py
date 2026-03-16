@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 import os
 import re
+import shlex
 
 from rich.prompt import Confirm
 
@@ -47,6 +48,7 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.text_utils import strip_ansi_codes
+from adscan_internal.workspaces.computers import ensure_enabled_computer_ip_file
 from adscan_internal.workspaces.subpaths import domain_relpath
 
 _NXC_SMB_LINE_RE = re.compile(r"^\s*SMB\s+\S+\s+\d+\s+(?P<host>[A-Za-z0-9_.-]+)\s+")
@@ -81,6 +83,31 @@ _SAM_REUSE_REASON_LABELS = {
     "invalid_hash": "Invalid NTLM hash",
     "not_reused_across_hosts": "Not reused across hosts",
 }
+
+
+def _resolve_bulk_hosts_target(
+    shell: Any,
+    *,
+    domain: str,
+    requested_host: str,
+) -> str | None:
+    """Resolve the best host target for multi-host dump operations."""
+    if _is_hosts_file_target(requested_host):
+        return str(requested_host).strip()
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
+    hosts_file, source = ensure_enabled_computer_ip_file(
+        workspace_dir,
+        shell.domains_dir,
+        domain,
+        shell.domains_data.get(domain, {}),
+    )
+    if hosts_file:
+        print_info_debug(
+            f"[dumps] using domain target file source={source} "
+            f"for {mark_sensitive(domain, 'domain')}: "
+            f"{mark_sensitive(hosts_file, 'path')}"
+        )
+    return hosts_file
 
 
 @dataclass(frozen=True)
@@ -2111,14 +2138,17 @@ def run_dump_lsa(
         auth_str = shell.build_auth_nxc(username, password, domain)
         delegate_suffix = _build_delegate_suffix(shell, domain, username)
         if is_multi_host_target:
-            hosts_file = domain_relpath(
-                shell.domains_dir, domain, "enabled_computers_ips.txt"
+            hosts_file = _resolve_bulk_hosts_target(
+                shell,
+                domain=domain,
+                requested_host=host,
             )
-            if _is_hosts_file_target(host):
-                hosts_file = str(host).strip()
+            if not hosts_file:
+                print_warning("No multi-host targets are available for this domain.")
+                return
             log_file = dump_output
             command = (
-                f"{shell.netexec_path} smb {hosts_file} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
+                f"{shell.netexec_path} smb {shlex.quote(hosts_file)} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
                 f"--log {log_file} --lsa{delegate_suffix}"
             )
         elif host != "All":
@@ -2183,14 +2213,17 @@ def run_dump_sam(
         auth_str = shell.build_auth_nxc(username, password, domain)
         delegate_suffix = _build_delegate_suffix(shell, domain, username)
         if is_multi_host_target:
-            hosts_file = domain_relpath(
-                shell.domains_dir, domain, "enabled_computers_ips.txt"
+            hosts_file = _resolve_bulk_hosts_target(
+                shell,
+                domain=domain,
+                requested_host=host,
             )
-            if _is_hosts_file_target(host):
-                hosts_file = str(host).strip()
+            if not hosts_file:
+                print_warning("No multi-host targets are available for this domain.")
+                return
             log_file = dump_output
             command = (
-                f"{shell.netexec_path} smb {hosts_file} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
+                f"{shell.netexec_path} smb {shlex.quote(hosts_file)} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
                 f"--log {log_file} --sam{delegate_suffix}"
             )
             print_info_debug(f"Command: {command}")
@@ -2218,14 +2251,19 @@ def run_dump_sam_winrm(
     auth_str = shell.build_auth_nxc(username, password, domain)
     if host == "All":
         marked_domain = mark_sensitive(domain, "domain")
-        hosts_file = domain_relpath(
-            shell.domains_dir, domain, "enabled_computers_ips.txt"
+        hosts_file = _resolve_bulk_hosts_target(
+            shell,
+            domain=domain,
+            requested_host=host,
         )
+        if not hosts_file:
+            print_warning("No multi-host targets are available for this domain.")
+            return
         log_file = domain_relpath(
             shell.domains_dir, domain, "winrm", "dump_all_sam.txt"
         )
         command = (
-            f"{shell.netexec_path} winrm {hosts_file} "
+            f"{shell.netexec_path} winrm {shlex.quote(hosts_file)} "
             f"{auth_str} -t 16 --log {log_file} "
             "--sam --dump-method powershell | awk '{print $5}' | "
             "grep -a -vE '\\]|Guest|Invitado|DefaultAccount|WDAGUtilityAccount' | awk 'NF'"
@@ -2293,13 +2331,16 @@ def run_dump_dpapi(
         auth_str = shell.build_auth_nxc(username, password, domain)
         delegate_suffix = _build_delegate_suffix(shell, domain, username)
         if is_multi_host_target:
-            hosts_target = domain_relpath(
-                shell.domains_dir, domain, "enabled_computers_ips.txt"
+            hosts_target = _resolve_bulk_hosts_target(
+                shell,
+                domain=domain,
+                requested_host=host,
             )
-            if _is_hosts_file_target(host):
-                hosts_target = str(host).strip()
+            if not hosts_target:
+                print_warning("No multi-host targets are available for this domain.")
+                return
             command = (
-                f"{shell.netexec_path} smb {hosts_target} "
+                f"{shell.netexec_path} smb {shlex.quote(hosts_target)} "
                 f"{auth_str} -t 1 --timeout 60 --smb-timeout 30 --log "
                 f"{dump_output} --dpapi{delegate_suffix} "
             )

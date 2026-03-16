@@ -34,15 +34,12 @@ if ! getent passwd "${uid}" >/dev/null 2>&1; then
   useradd -u "${uid}" -g "${gid}" -d /opt/adscan -s /bin/bash adscan >/dev/null 2>&1 || true
 fi
 
-# Allow the unprivileged ADscan user to run specific commands as root inside the
-# container without prompting for a password. This is used for tools like
-# hashcat/OpenCL which can be unstable when executed as a non-root UID in some
-# container environments.
+# Allow the unprivileged ADscan user to run specific host-style maintenance
+# commands as root inside the container without prompting for a password.
 if command -v sudo >/dev/null 2>&1; then
   {
     echo "Defaults:adscan !requiretty"
-    echo "Defaults:adscan env_keep += \"HOME XDG_CONFIG_HOME ADSCAN_HOME\""
-    echo "adscan ALL=(root) NOPASSWD: /usr/bin/hashcat"
+    echo "Defaults:adscan env_keep += \"HOME XDG_CONFIG_HOME XDG_CACHE_HOME ADSCAN_HOME\""
     echo "adscan ALL=(root) NOPASSWD: /usr/bin/nmap"
     echo "adscan ALL=(root) NOPASSWD: /usr/sbin/ntpdate"
     echo "adscan ALL=(root) NOPASSWD: /usr/bin/ntpdig"
@@ -60,7 +57,7 @@ if getent group tty >/dev/null 2>&1; then
   usermod -a -G tty adscan >/dev/null 2>&1 || true
 fi
 
-mkdir -p /opt/adscan/workspaces /opt/adscan/logs /opt/adscan/.config
+mkdir -p /opt/adscan/workspaces /opt/adscan/logs /opt/adscan/.config /opt/adscan/.cache
 
 _fix_ownership_same_fs() {
   local target="$1"
@@ -86,6 +83,19 @@ _fix_ownership_same_fs() {
 _fix_ownership_same_fs /opt/adscan/workspaces "workspaces"
 _fix_ownership_same_fs /opt/adscan/logs "logs"
 _fix_ownership_same_fs /opt/adscan/.config "config"
+_fix_ownership_same_fs /opt/adscan/.cache "cache"
+
+# Hashcat writes compiled OpenCL kernels under its own `kernels/` directory.
+# If that tree was previously touched by root, later runs as the unprivileged
+# ADscan user fail with `*.kernel: Permission denied`.
+if [[ -d /opt/adscan/tools ]]; then
+  for hashcat_dir in /opt/adscan/tools/hashcat-*; do
+    if [[ -d "${hashcat_dir}" ]]; then
+      mkdir -p "${hashcat_dir}/kernels" >/dev/null 2>&1 || true
+      _fix_ownership_same_fs "${hashcat_dir}/kernels" "hashcat kernels"
+    fi
+  done
+fi
 
 # Fix common TTY settings for interactive prompts.
 # - Rich Prompt.ask relies on the terminal line discipline for editing keys.

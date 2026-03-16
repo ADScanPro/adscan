@@ -645,6 +645,18 @@ def build_adscan_run_command(
     # This is intentionally narrower than `--privileged` but still grants the
     # ability to change the system time (CAP_SYS_TIME).
     cmd.extend(["--cap-add", "SYS_TIME"])
+    host_tun_device = Path("/dev/net/tun")
+    if host_tun_device.exists():
+        cmd.extend(["--cap-add", "NET_ADMIN"])
+        cmd.extend(["--device", f"{host_tun_device}:{host_tun_device}"])
+        print_info_debug(
+            "[docker] enabling ligolo TUN support: "
+            "--cap-add NET_ADMIN --device /dev/net/tun"
+        )
+    else:
+        print_info_debug(
+            "[docker] host /dev/net/tun not available; ligolo TUN support disabled"
+        )
     if cfg.extra_run_args:
         cmd.extend(list(cfg.extra_run_args))
 
@@ -723,6 +735,8 @@ def build_adscan_run_command(
             "HOME=/opt/adscan",
             "-e",
             "XDG_CONFIG_HOME=/opt/adscan/.config",
+            "-e",
+            "XDG_CACHE_HOME=/opt/adscan/.cache",
             "-e",
             "ADSCAN_STATE_DIR=/opt/adscan/state",
             "-e",

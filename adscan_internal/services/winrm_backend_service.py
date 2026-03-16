@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Iterable, Protocol
 
+from adscan_internal.services.winrm_logon_bypass_service import WinRMLogonBypassService
 from adscan_internal.services.winrm_psrp_service import (
     WinRMPSRPExecutionResult,
     WinRMPSRPService,
@@ -13,7 +14,13 @@ from adscan_internal.services.winrm_psrp_service import (
 class WinRMExecutionBackend(Protocol):
     """Contract for WinRM backends shared by automatic and manual flows."""
 
-    def execute_powershell(self, script: str) -> WinRMPSRPExecutionResult:
+    def execute_powershell(
+        self,
+        script: str,
+        *,
+        operation_name: str | None = None,
+        require_logon_bypass: bool = False,
+    ) -> WinRMPSRPExecutionResult:
         """Execute one PowerShell script remotely."""
 
     def fetch_file(self, remote_path: str, save_path: str) -> str:
@@ -35,15 +42,22 @@ def build_winrm_backend(
 ) -> WinRMExecutionBackend:
     """Return the default reusable WinRM backend implementation.
 
-    This currently returns the PSRP-backed service. The factory keeps the
-    contract stable so a future agent-backed backend can slot in without
-    changing the higher-level WinRM workflows.
+    This currently returns a PSRP-backed service wrapped with an optional
+    RunasCs logon-bypass layer. The factory keeps the contract stable so
+    future backends can slot in without changing the higher-level workflows.
     """
-    return WinRMPSRPService(
+    psrp_service = WinRMPSRPService(
         domain=domain,
         host=host,
         username=username,
         password=password,
+    )
+    return WinRMLogonBypassService(
+        domain=domain,
+        host=host,
+        username=username,
+        password=password,
+        psrp_service=psrp_service,
     )
 
 

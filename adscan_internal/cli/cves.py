@@ -8,9 +8,12 @@ the interactive shell.
 from __future__ import annotations
 
 from typing import Any
+import os
+import shlex
 
 from adscan_internal import print_error, print_info, print_info_debug
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.workspaces.computers import ensure_enabled_computer_ip_file
 
 
 def run_netexec_cve_dcs(shell: Any, *, cve: str, target_domain: str) -> None:
@@ -60,12 +63,31 @@ def run_netexec_cve_all(shell: Any, *, cve: str, target_domain: str) -> None:
             shell.domain,
         )
 
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or os.getcwd()
+    domains_dir = getattr(shell, "domains_dir", "domains")
+    targets_file, source = ensure_enabled_computer_ip_file(
+        workspace_dir,
+        domains_dir,
+        target_domain,
+        domain_credentials,
+    )
+    if not targets_file:
+        marked_target_domain = mark_sensitive(target_domain, "domain")
+        print_error(
+            f"No host targets are available for domain {marked_target_domain}."
+        )
+        return
+
     command = (
-        f"{shell.netexec_path} smb domains/{target_domain}/enabled_computers_ips.txt "
+        f"{shell.netexec_path} smb {shlex.quote(targets_file)} "
         f"{auth} -t 20 --timeout 30 --smb-timeout 10 --log domains/{target_domain}/smb/{cve}.log -M {cve}"
     )
     marked_target_domain = mark_sensitive(target_domain, "domain")
     print_info(f"Checking for {cve} on all hosts in domain {marked_target_domain}")
+    print_info_debug(
+        f"[cves] using domain target file source={source} "
+        f"for {marked_target_domain}: {mark_sensitive(targets_file, 'path')}"
+    )
     print_info_debug(f"Command: {command}")
 
     if cve == "coerce_plus":

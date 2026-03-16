@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable
 import os
 
-from adscan_internal import print_info, print_warning
+from adscan_internal import print_info, print_info_debug, print_warning
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.share_file_analyzer_service import ShareFileAnalyzerFinding
@@ -174,22 +174,21 @@ class ShareFileFindingActionService(BaseService):
         source_path: str,
         findings: list[ShareFileAnalyzerFinding],
     ) -> int:
-        """Apply NTLM hash findings by printing and storing credentials."""
-        marked_source_path = mark_sensitive(source_path, "path")
-        print_warning(f"Credentials found in {marked_source_path}:")
+        """Apply NTLM hash findings by storing credentials for later UX flows."""
         applied = 0
         for finding in findings:
             username = str(getattr(finding, "username", "") or "").strip()
             nt_hash = str(getattr(finding, "secret", "") or "").strip()
             if not username or not nt_hash:
                 continue
-            marked_username = mark_sensitive(username, "user")
-            marked_nt_hash = mark_sensitive(nt_hash, "password")
-            print_warning(f"User: {marked_username}")
-            print_warning(f"NT Hash: {marked_nt_hash}")
             if self._add_credential_callback:
                 self._add_credential_callback(domain, username, nt_hash)
             applied += 1
+        if applied:
+            print_info_debug(
+                "Deterministic NTLM hash findings persisted: "
+                f"path={mark_sensitive(source_path, 'path')} count={applied}"
+            )
         return applied
 
     def _apply_macro_password_findings(

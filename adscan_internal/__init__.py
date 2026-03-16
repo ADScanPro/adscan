@@ -62,6 +62,14 @@ from .sessions import SessionManager, SessionType, RemoteSession
 from .agent_protocol import AgentSession
 from .agent_payload import build_python_agent_one_liner
 from .agent_ng_manager import get_agent_ng_local_path
+from .ligolo_manager import (
+    get_current_ligolo_proxy_target,
+    get_ligolo_agent_local_path,
+    get_ligolo_checksums_url,
+    get_ligolo_proxy_local_path,
+    get_ligolo_release_asset_name,
+    get_ligolo_release_download_url,
+)
 from .runascs_manager import get_runascs_local_path
 from .session_shell import SessionShell
 from . import sudo_utils
@@ -126,6 +134,12 @@ __all__ = [
     "AgentSession",
     "build_python_agent_one_liner",
     "get_agent_ng_local_path",
+    "get_current_ligolo_proxy_target",
+    "get_ligolo_agent_local_path",
+    "get_ligolo_checksums_url",
+    "get_ligolo_proxy_local_path",
+    "get_ligolo_release_asset_name",
+    "get_ligolo_release_download_url",
     "get_runascs_local_path",
     "SessionShell",
     "sudo_utils",

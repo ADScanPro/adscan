@@ -14,9 +14,18 @@ import json
 from pathlib import Path
 import os
 import re
+import subprocess
 import tempfile
+import time
 from typing import Iterable
 import zipfile
+
+from adscan_internal import print_info_debug
+from adscan_internal.command_runner import (
+    build_execution_output_preview,
+    summarize_execution_result,
+)
+from adscan_internal.rich_output import mark_sensitive
 
 
 class WinRMPSRPError(RuntimeError):
@@ -100,15 +109,82 @@ class WinRMPSRPService:
                 ) from exc
         return self._client
 
-    def execute_powershell(self, script: str) -> WinRMPSRPExecutionResult:
+    def _log_execution_debug(
+        self,
+        *,
+        script: str,
+        stdout: str,
+        stderr: str,
+        had_errors: bool,
+        duration_seconds: float,
+        operation_name: str | None = None,
+    ) -> None:
+        """Emit one Rich debug summary for a PSRP execution result."""
+        try:
+            print_info_debug(
+                "[winrm_psrp] Command:\n" + mark_sensitive(script or "", "text"),
+                panel=True,
+            )
+            synthetic_result = subprocess.CompletedProcess(
+                args="[winrm_psrp]",
+                returncode=1 if had_errors else 0,
+                stdout=stdout or "",
+                stderr=stderr or "",
+            )
+            setattr(synthetic_result, "_adscan_elapsed_seconds", duration_seconds)
+            exit_code, stdout_count, stderr_count, duration_text = (
+                summarize_execution_result(synthetic_result)
+            )
+            script_hash = hashlib.sha1((script or "").encode("utf-8")).hexdigest()[:12]
+            script_lines = len([line for line in (script or "").splitlines() if line.strip()])
+            print_info_debug(
+                "[winrm_psrp] Result: "
+                f"host={mark_sensitive(self.host, 'hostname')}, "
+                f"user={mark_sensitive(self.username, 'user')}, "
+                f"operation={mark_sensitive(operation_name or 'winrm_powershell', 'text')}, "
+                f"script_sha1={script_hash}, "
+                f"script_lines={script_lines}, "
+                f"exit_code={exit_code}, "
+                f"stdout_lines={stdout_count}, "
+                f"stderr_lines={stderr_count}, "
+                f"had_errors={had_errors}, "
+                f"duration={duration_text}"
+            )
+
+            preview_text = build_execution_output_preview(
+                synthetic_result,
+                stdout_head=12,
+                stdout_tail=12,
+                stderr_head=12,
+                stderr_tail=12,
+            )
+            if preview_text:
+                print_info_debug(
+                    "[winrm_psrp] Output preview:\n"
+                    + mark_sensitive(preview_text, "text"),
+                    panel=True,
+                )
+        except Exception:
+            return
+
+    def execute_powershell(
+        self,
+        script: str,
+        *,
+        operation_name: str | None = None,
+        require_logon_bypass: bool = False,
+    ) -> WinRMPSRPExecutionResult:
         """Execute PowerShell over PSRP and return structured output."""
+        _ = require_logon_bypass
         client = self._get_client()
+        started_at = time.perf_counter()
         try:
             stdout, streams, had_errors = client.execute_ps(script)
         except Exception as exc:  # pragma: no cover - network/runtime specific
             raise WinRMPSRPError(
                 f"WinRM PSRP PowerShell execution failed on {self.host}: {exc}"
             ) from exc
+        duration_seconds = time.perf_counter() - started_at
 
         stderr_parts: list[str] = []
         for stream_name in ("error", "warning", "verbose", "debug"):
@@ -117,9 +193,19 @@ class WinRMPSRPService:
                 continue
             stderr_parts.extend(str(item) for item in stream if str(item).strip())
 
+        stderr_text = "\n".join(stderr_parts).strip()
+        self._log_execution_debug(
+            script=script,
+            stdout=stdout or "",
+            stderr=stderr_text,
+            had_errors=bool(had_errors),
+            duration_seconds=duration_seconds,
+            operation_name=operation_name,
+        )
+
         return WinRMPSRPExecutionResult(
             stdout=stdout or "",
-            stderr="\n".join(stderr_parts).strip(),
+            stderr=stderr_text,
             had_errors=bool(had_errors),
         )
 

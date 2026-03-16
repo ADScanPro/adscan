@@ -88,7 +88,17 @@ from .winrm_file_mapping_service import (
     WinRMFileMappingService,
 )
 from .winrm_backend_service import WinRMExecutionBackend, build_winrm_backend
+from .winrm_logon_bypass_service import WinRMLogonBypassService
 from .winrm_psrp_service import WinRMPSRPError, WinRMPSRPExecutionResult, WinRMPSRPService
+from .ligolo_service import LigoloProxyService
+from .pivot_service import (
+    PivotReachableSubnetSummary,
+    build_ligolo_agent_keepalive_script,
+    build_ligolo_agent_start_script,
+    orchestrate_ligolo_pivot_tunnel,
+    probe_ligolo_routed_targets,
+    summarize_confirmed_pivot_subnets,
+)
 from .share_map_ai_triage_service import ShareMapAITriageService
 from .impacket_smb_byte_reader_service import (
     ImpacketSMBByteReaderService,
@@ -196,6 +206,14 @@ __all__ = [
     "WinRMFileMapEntry",
     "WinRMFileMappingService",
     "WinRMExecutionBackend",
+    "WinRMLogonBypassService",
+    "LigoloProxyService",
+    "PivotReachableSubnetSummary",
+    "build_ligolo_agent_keepalive_script",
+    "build_ligolo_agent_start_script",
+    "orchestrate_ligolo_pivot_tunnel",
+    "probe_ligolo_routed_targets",
+    "summarize_confirmed_pivot_subnets",
     "build_winrm_backend",
     "get_winrm_excluded_directory_names",
     "get_winrm_excluded_path_prefixes",

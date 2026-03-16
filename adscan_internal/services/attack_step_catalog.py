@@ -392,6 +392,22 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="Steal or Forge Kerberos Tickets: AS-REP Roasting",
         detection_event_ids=("4768",),
     ),
+    _entry(
+        "timeroasting",
+        support_kind="supported",
+        support_reason="Extract and crack MS-SNTP machine-account material",
+        category="credential_access",
+        description="Offline crack MS-SNTP challenge material from machine accounts",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Keep automatic machine-account password rotation enabled. Reset or rejoin "
+            "computer accounts that were manually assigned weak passwords, and "
+            "investigate stale machine passwords that have not rotated in 30 days."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1110.002",
+        mitre_technique_name="Brute Force: Password Cracking",
+    ),
     # ── Lateral movement / execution ────────────────────────────────────────
     _entry(
         "adminto",
@@ -1153,8 +1169,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "passwordspray",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason="Executable via built-in password spraying workflows",
         category="entry_vector",
         description="Password spraying entry vector",
         remediation_complexity="medium",

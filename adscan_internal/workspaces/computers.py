@@ -68,3 +68,49 @@ def load_enabled_computer_samaccounts(
         results.append(sam)
 
     return results
+
+
+def ensure_enabled_computer_ip_file(
+    workspace_dir: str,
+    domains_dir: str,
+    domain: str,
+    domain_data: dict[str, object] | None = None,
+) -> tuple[str | None, str]:
+    """Return a usable `enabled_computers_ips.txt` path, repairing it if needed.
+
+    Resolution order:
+    1. Existing non-empty `enabled_computers_ips.txt`
+    2. Existing non-empty `dcs.txt`
+    3. Persisted `pdc` from `domain_data`, written into `enabled_computers_ips.txt`
+
+    Returns:
+        Tuple of `(absolute_path_or_none, source_label)`.
+    """
+    domain_info = domain_data or {}
+    ip_file = Path(domain_subpath(workspace_dir, domains_dir, domain, "enabled_computers_ips.txt"))
+    dcs_file = Path(domain_subpath(workspace_dir, domains_dir, domain, "dcs.txt"))
+
+    try:
+        if ip_file.exists() and ip_file.stat().st_size > 0:
+            return str(ip_file), "enabled_computers_ips"
+    except OSError:
+        pass
+
+    try:
+        if dcs_file.exists() and dcs_file.stat().st_size > 0:
+            ip_file.parent.mkdir(parents=True, exist_ok=True)
+            ip_file.write_text(dcs_file.read_text(encoding="utf-8"), encoding="utf-8")
+            return str(ip_file), "dcs_fallback"
+    except OSError:
+        pass
+
+    pdc_ip = str(domain_info.get("pdc") or "").strip()
+    if not pdc_ip:
+        return None, "none"
+
+    try:
+        ip_file.parent.mkdir(parents=True, exist_ok=True)
+        ip_file.write_text(f"{pdc_ip}\n", encoding="utf-8")
+    except OSError:
+        return None, "none"
+    return str(ip_file), "pdc_fallback"

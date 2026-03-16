@@ -273,6 +273,29 @@ def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> b
     return True
 
 
+def _launcher_version_matches(ctx: UpdateContext, expected_version: str | None) -> bool:
+    """Return whether the installed launcher version matches the expected target."""
+    if not expected_version:
+        return False
+    try:
+        installed_version = str(ctx.get_installed_version() or "").strip()
+    except Exception as exc:  # pragma: no cover - defensive guard
+        ctx.telemetry_capture_exception(exc)
+        ctx.print_info_debug(f"[update] Failed to re-read installed version: {exc}")
+        return False
+    if installed_version == str(expected_version).strip():
+        return True
+    ctx.print_warning(
+        "Launcher update command finished, but the installed launcher version did not change."
+    )
+    ctx.print_info_debug(
+        "[update] Launcher version mismatch after update attempt: "
+        f"expected={expected_version}, installed={installed_version}"
+    )
+    ctx.print_instruction("Rerun `adscan update` from the host after fixing launcher install permissions/state.")
+    return False
+
+
 def _update_docker_image(
     ctx: UpdateContext,
     image: str,
@@ -421,9 +444,15 @@ def run_update_command(ctx: UpdateContext) -> bool:
 
     ok = True
     updated_launcher = False
+    launcher_restart_ready = False
     if launcher_info.get("is_newer"):
         updated_launcher = _update_launcher(ctx, str(launcher_info.get("latest") or ""))
         ok = ok and bool(updated_launcher)
+        if updated_launcher:
+            launcher_restart_ready = _launcher_version_matches(
+                ctx, str(launcher_info.get("latest") or "")
+            )
+            ok = ok and launcher_restart_ready
     else:
         ctx.print_info("Launcher already up-to-date.")
 
@@ -433,7 +462,7 @@ def run_update_command(ctx: UpdateContext) -> bool:
     else:
         ctx.print_info("Docker image already up-to-date.")
 
-    if updated_launcher:
+    if updated_launcher and launcher_restart_ready:
         ctx.print_success("Updates completed, restarting...")
         os.execv(sys.executable, [sys.executable] + sys.argv)
     return ok

@@ -13,6 +13,7 @@ results; this module:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol
 from pathlib import Path
 import os
@@ -64,6 +65,30 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from adscan_internal.interaction import is_non_interactive
+
+_MINIMUM_TIMEROAST_HASHCAT_VERSION = (7, 1, 2)
+_GRAPH_TRACKED_ROAST_HASH_TYPES = {"asreproast", "kerberoast", "timeroast"}
+_HASHCAT_NO_DEVICE_TEXT = "No devices found/left"
+_HASHCAT_EXHAUSTED_EXIT_CODE = 1
+_HASHCAT_FATAL_ERROR_PATTERNS = (
+    "Kernel /",
+    "build failed",
+    ".kernel: Permission denied",
+)
+_HASHCAT_BENIGN_STDERR_PATTERNS = (
+    "nvmlDeviceGetFanSpeed(): Not Supported",
+    "Mixing --show with --username or --dynamic-x can cause exponential delay in output.",
+)
+
+
+@dataclass(frozen=True)
+class HashcatBackendSelection:
+    """Resolved hashcat backend strategy for the current runtime."""
+
+    args: tuple[str, ...]
+    label: str
+    is_available: bool
+    probe_output: str = ""
 
 
 class CrackingShell(Protocol):
@@ -333,26 +358,29 @@ def _maybe_import_wordlist_from_host(
 
 
 def _hashcat_device_args(shell: CrackingShell) -> list[str]:
-    """Return hashcat device selection args (best-effort).
+    """Return hashcat device selection args for the current runtime."""
 
-    In Docker, GPU passthrough may not be configured for many users. We prefer a
-    robust default that works everywhere: use CPU OpenCL when no GPU devices
-    are detected. If a GPU is present, let hashcat pick it by default.
+    return list(_select_hashcat_backend(shell).args)
+
+
+def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
+    """Choose the best available hashcat backend.
+
+    Preference order:
+    1. GPU/CUDA/OpenCL backends exposed to the container
+    2. CPU OpenCL fallback
+    3. Unavailable when hashcat cannot see any compute device
     """
 
-    cached = getattr(shell, "_hashcat_device_args_cache", None)
-    if isinstance(cached, list):
+    cached = getattr(shell, "_hashcat_backend_selection_cache", None)
+    if isinstance(cached, HashcatBackendSelection):
         return cached
 
-    force_cpu = os.getenv("ADSCAN_HASHCAT_FORCE_CPU", "").strip() in {
+    force_cpu = os.getenv("ADSCAN_HASHCAT_FORCE_CPU", "").strip().lower() in {
         "1",
         "true",
         "yes",
     }
-    if force_cpu:
-        args = ["-D", "1", "--opencl-device-types", "1"]
-        setattr(shell, "_hashcat_device_args_cache", args)
-        return args
 
     from adscan_internal.cli.tools_env import maybe_wrap_hashcat_for_container
 
@@ -361,20 +389,67 @@ def _hashcat_device_args(shell: CrackingShell) -> list[str]:
         probe = shell.run_command(probe_cmd, timeout=30)
         if probe is None:
             raise RuntimeError("hashcat -I probe returned no result")
+
         output = (
             (getattr(probe, "stdout", "") or "")
             + "\n"
             + (getattr(probe, "stderr", "") or "")
+        ).strip()
+        has_gpu = bool(
+            re.search(r"Type\s*\.+?:\s*(GPU|Accelerator)\b", output, re.IGNORECASE)
         )
-        if re.search(r"Type\s*\.+?:\s*(GPU|Accelerator)\b", output, re.IGNORECASE):
-            args = []
-        else:
-            args = ["-D", "1", "--opencl-device-types", "1"]
-    except Exception:  # noqa: BLE001
-        args = ["-D", "1", "--opencl-device-types", "1"]
+        has_cpu_opencl = bool(
+            re.search(r"Type\s*\.+?:\s*CPU\b", output, re.IGNORECASE)
+        )
+        no_devices = _HASHCAT_NO_DEVICE_TEXT.lower() in output.lower()
 
-    setattr(shell, "_hashcat_device_args_cache", args)
-    return args
+        if force_cpu and has_cpu_opencl:
+            selection = HashcatBackendSelection(
+                args=("-D", "1", "--opencl-device-types", "1"),
+                label="CPU OpenCL (forced)",
+                is_available=True,
+                probe_output=output,
+            )
+        elif has_gpu:
+            selection = HashcatBackendSelection(
+                args=(),
+                label="GPU auto-select",
+                is_available=True,
+                probe_output=output,
+            )
+        elif has_cpu_opencl:
+            selection = HashcatBackendSelection(
+                args=("-D", "1", "--opencl-device-types", "1"),
+                label="CPU OpenCL fallback",
+                is_available=True,
+                probe_output=output,
+            )
+        elif no_devices:
+            selection = HashcatBackendSelection(
+                args=(),
+                label="Unavailable",
+                is_available=False,
+                probe_output=output,
+            )
+        else:
+            selection = HashcatBackendSelection(
+                args=(),
+                label="Unavailable",
+                is_available=False,
+                probe_output=output,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"[cracking] hashcat backend probe failed: {exc}")
+        selection = HashcatBackendSelection(
+            args=(),
+            label="Unavailable",
+            is_available=False,
+            probe_output=str(exc),
+        )
+
+    setattr(shell, "_hashcat_backend_selection_cache", selection)
+    setattr(shell, "_hashcat_device_args_cache", list(selection.args))
+    return selection
 
 
 def _build_hashcat_cmd(
@@ -398,6 +473,104 @@ def _build_hashcat_cmd(
         wordlist,
     ]
     return " ".join(shlex.quote(a) for a in argv)
+
+
+def _resolve_hashcat_mode_and_description(hash_type: str) -> tuple[str, str]:
+    """Return the hashcat mode and human-readable description for a hash type."""
+
+    hash_details = {
+        "asreproast": ("18200", "Kerberos 5 AS-REP etype 23"),
+        "kerberoast": ("13100", "Kerberos 5 TGS-REP etype 23"),
+        "timeroast": ("31300", "MS-SNTP Timeroast"),
+    }
+    if "NTLMv2" in hash_type:
+        return "5600", "NetNTLMv2"
+    return hash_details.get(hash_type, ("Unknown", hash_type))
+
+
+def _hashcat_no_device_guidance() -> str:
+    """Return a user-facing hint when no hashcat backend is available."""
+
+    if os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1":
+        return (
+            "This ADscan container does not currently expose a usable hashcat device. "
+            "For NVIDIA hosts, relaunch with ADSCAN_DOCKER_GPU=nvidia (or auto) and "
+            "ensure nvidia-container-toolkit is installed on the host."
+        )
+    return (
+        "The local runtime does not expose any usable hashcat compute device. "
+        "Check OpenCL/CUDA availability with `hashcat -I`."
+    )
+
+
+def _is_fatal_hashcat_runtime_error(output: str) -> bool:
+    """Return True when hashcat failed before any useful cracking work began."""
+
+    lowered = output.lower()
+    return any(pattern.lower() in lowered for pattern in _HASHCAT_FATAL_ERROR_PATTERNS)
+
+
+def _is_benign_hashcat_stderr(stderr: str) -> bool:
+    """Return True when stderr only contains known non-fatal hashcat warnings."""
+
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    return all(
+        any(pattern.lower() in line.lower() for pattern in _HASHCAT_BENIGN_STDERR_PATTERNS)
+        for line in lines
+    )
+
+
+def _is_nonfatal_hashcat_exit_code(returncode: int | None) -> bool:
+    """Return True for hashcat exit codes that are not operational failures."""
+
+    return int(returncode or 0) in {0, _HASHCAT_EXHAUSTED_EXIT_CODE}
+
+
+def _parse_hashcat_version(output: str) -> tuple[int, int, int] | None:
+    """Extract a semantic version tuple from ``hashcat --version`` output."""
+
+    match = re.search(r"\bv?(\d+)\.(\d+)\.(\d+)\b", output)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _ensure_timeroast_hashcat_support(shell: CrackingShell) -> bool:
+    """Return ``True`` when the installed hashcat version supports Timeroast."""
+
+    from adscan_internal.cli.tools_env import maybe_wrap_hashcat_for_container
+
+    minimum = ".".join(str(part) for part in _MINIMUM_TIMEROAST_HASHCAT_VERSION)
+    try:
+        version_cmd = maybe_wrap_hashcat_for_container("hashcat --version")
+        result = shell.run_command(version_cmd, timeout=15)
+        if result is None:
+            raise RuntimeError("hashcat --version returned no result")
+
+        output = (
+            (getattr(result, "stdout", "") or "")
+            + "\n"
+            + (getattr(result, "stderr", "") or "")
+        ).strip()
+        parsed_version = _parse_hashcat_version(output)
+        if parsed_version is None:
+            raise ValueError(f"Unable to parse hashcat version from: {output!r}")
+        if parsed_version < _MINIMUM_TIMEROAST_HASHCAT_VERSION:
+            print_error(
+                f"Timeroast cracking requires hashcat >= {minimum}. "
+                f"Detected version: {'.'.join(str(part) for part in parsed_version)}"
+            )
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error(
+            "Unable to confirm the local hashcat version required for Timeroast."
+        )
+        print_exception(exc)
+        return False
 
 
 def _extract_hash_users(hash_file: str) -> list[str]:
@@ -429,6 +602,26 @@ def run_cracking(
     failed: bool = False,
 ) -> None:
     """High-level cracking entrypoint used by the CLI shell."""
+    if hash_type == "timeroast" and not _ensure_timeroast_hashcat_support(shell):
+        return
+
+    hashcat_mode, hash_description = _resolve_hashcat_mode_and_description(hash_type)
+    backend_selection = (
+        _select_hashcat_backend(shell)
+        if hashcat_mode != "Unknown"
+        else HashcatBackendSelection(args=(), label="N/A", is_available=True)
+    )
+    if hashcat_mode != "Unknown" and not backend_selection.is_available:
+        print_error(
+            "hashcat could not find a usable compute device for cracking."
+        )
+        print_warning(_hashcat_no_device_guidance())
+        print_info_debug(
+            "hashcat -I output (first 40 lines):\n"
+            + "\n".join(backend_selection.probe_output.splitlines()[:40])
+        )
+        return
+
     wordlist = resolve_cracking_wordlist(
         shell=shell,
         hash_type=hash_type,
@@ -439,25 +632,13 @@ def run_cracking(
 
     wordlist_name = os.path.basename(wordlist) if wordlist else "N/A"
 
-    hash_details = {
-        "asreproast": ("18200", "Kerberos 5 AS-REP etype 23"),
-        "kerberoast": ("13100", "Kerberos 5 TGS-REP etype 23"),
-    }
-    if "NTLMv2" in hash_type:
-        hashcat_mode = "5600"
-        hash_description = "NetNTLMv2"
-    else:
-        hashcat_mode, hash_description = hash_details.get(
-            hash_type,
-            ("Unknown", hash_type),
-        )
-
     print_operation_header(
         "Hash Cracking Operation",
         details={
             "Domain": domain,
             "Hash Type": hash_description,
             "Hashcat Mode": hashcat_mode,
+            "Backend": backend_selection.label,
             "Wordlist": wordlist_name,
             "Retry Attempt": "Yes" if failed else "No",
             "Hash File": hash_file,
@@ -470,12 +651,18 @@ def run_cracking(
         command = _build_hashcat_cmd(hash_file, wordlist, "18200", shell)
     elif hash_type == "kerberoast":
         command = _build_hashcat_cmd(hash_file, wordlist, "13100", shell)
+    elif hash_type == "timeroast":
+        command = _build_hashcat_cmd(hash_file, wordlist, "31300", shell)
     elif "NTLMv2" in hash_type:
         command = _build_hashcat_cmd(hash_file, wordlist, "5600", shell)
 
     print_warning(
         f"Cracking {hash_type} hashes. Please be patient (this may take a while)"
     )
+    if hashcat_mode != "Unknown":
+        print_info_debug(
+            f"[cracking] hashcat backend selected: {backend_selection.label}"
+        )
     if command:
         marked_command = command
         try:
@@ -561,51 +748,9 @@ def run_cracking(
         except Exception as exc:  # pragma: no cover
             telemetry.capture_exception(exc)
 
-    if command:
-        from adscan_internal.cli.tools_env import maybe_wrap_hashcat_for_container
-
-        cracking_cmd = maybe_wrap_hashcat_for_container(command)
-        completed_process_initial = shell.run_command(cracking_cmd, timeout=300)
-        if completed_process_initial is None:
-            print_error("Cracking command failed to execute.")
-            register_cracking_attempt(
-                shell,
-                domain=domain,
-                attempt=build_cracking_attempt(
-                    tool="hashcat",
-                    crack_type=hash_type,
-                    wordlist_name=wordlist_name_for_telemetry,
-                    wordlist_path=wordlist,
-                    hash_file=hash_file,
-                    result="error",
-                    cracked_count=0,
-                ),
-            )
-            return
-        if getattr(completed_process_initial, "returncode", 0) != 0:
-            combined_output = (
-                (getattr(completed_process_initial, "stdout", "") or "")
-                + "\n"
-                + (getattr(completed_process_initial, "stderr", "") or "")
-            )
-            print_warning(
-                "Initial cracking command may have failed. "
-                f"Return code: {getattr(completed_process_initial, 'returncode', 'N/A')}",
-            )
-            if getattr(completed_process_initial, "stderr", None):
-                print_error(
-                    f"Error output: {getattr(completed_process_initial, 'stderr', '')}"
-                )
-            if "No devices found/left" in combined_output:
-                print_warning(
-                    "hashcat could not find a usable compute device (OpenCL backend). "
-                    "This can happen in containers/VMs with limited OpenCL support or "
-                    "memory.",
-                )
-
     result = execute_cracking(
         shell,
-        command="",
+        command=command or "",
         hash_type=hash_type,
         domain=domain,
         hash=hash_file,
@@ -1059,7 +1204,9 @@ def run_cracking_history(
 
     history = get_cracking_history(shell)
     domain_entry = history.get(domain, {}) if isinstance(history, dict) else {}
-    attempts = domain_entry.get("attempts", []) if isinstance(domain_entry, dict) else []
+    attempts = (
+        domain_entry.get("attempts", []) if isinstance(domain_entry, dict) else []
+    )
     if not isinstance(attempts, list) or not attempts:
         marked_domain = mark_sensitive(domain, "domain")
         print_panel(
@@ -1092,13 +1239,17 @@ def run_cracking_history(
         artifact_paths = attempt.get("artifact_paths") or []
         targets = ", ".join(str(user) for user in target_users[:3] if str(user).strip())
         if not targets and artifact_paths:
-            targets = ", ".join(str(path) for path in artifact_paths[:2] if str(path).strip())
+            targets = ", ".join(
+                str(path) for path in artifact_paths[:2] if str(path).strip()
+            )
         if len(target_users) > 3:
             targets = f"{targets}, +{len(target_users) - 3} more"
         elif not targets:
             targets = "-"
 
-        wordlist = str(attempt.get("wordlist_name") or attempt.get("wordlist_path") or "-")
+        wordlist = str(
+            attempt.get("wordlist_name") or attempt.get("wordlist_path") or "-"
+        )
         result = str(attempt.get("result") or "unknown")
         result_style = {
             "success": "green",
@@ -1120,8 +1271,8 @@ def run_cracking_history(
         "Cracking History",
         details={
             "Domain": domain,
-            "Entries": len(attempts),
-            "Showing": min(len(attempts), max(1, int(recent_limit))),
+            "Entries": str(len(attempts)),
+            "Showing": str(min(len(attempts), max(1, int(recent_limit)))),
         },
         icon="🧾",
     )
@@ -1135,10 +1286,12 @@ def execute_cracking(
     domain: str,
     hash: str,
     wordlist_name: str | None = None,
- ) -> dict[str, object]:
+) -> dict[str, object]:
     """Execute the cracking command and process results."""
     from adscan_internal.cli.tools_env import maybe_wrap_hashcat_for_container
     import sys
+
+    hashcat_mode, _hash_description = _resolve_hashcat_mode_and_description(hash_type)
 
     try:
         # First phase: execute the initial cracking command
@@ -1150,22 +1303,29 @@ def execute_cracking(
                 print_error("Cracking command failed to execute.")
                 return {"status": "error", "cracked_count": 0}
 
-            if completed_process_initial.returncode != 0:
+            combined_output = (
+                (completed_process_initial.stdout or "")
+                + "\n"
+                + (completed_process_initial.stderr or "")
+            )
+            initial_stderr = completed_process_initial.stderr or ""
+            if not _is_nonfatal_hashcat_exit_code(completed_process_initial.returncode):
                 print_warning(
                     f"Initial cracking command may have failed. Return code: {completed_process_initial.returncode}"
                 )
-                combined_output = (
-                    (completed_process_initial.stdout or "")
-                    + "\n"
-                    + (completed_process_initial.stderr or "")
-                )
-                if completed_process_initial.stderr:
-                    print_error(f"Error output: {completed_process_initial.stderr}")
-                if "No devices found/left" in combined_output:
-                    print_warning(
-                        "hashcat could not find a usable compute device (OpenCL backend). "
-                        "This can happen in containers/VMs with limited OpenCL support or memory."
+                if initial_stderr and not _is_benign_hashcat_stderr(initial_stderr):
+                    print_error(f"Error output: {initial_stderr}")
+                elif initial_stderr:
+                    print_info_debug(
+                        "Non-fatal hashcat stderr during initial cracking run:\n"
+                        f"{initial_stderr}"
                     )
+                if _HASHCAT_NO_DEVICE_TEXT in combined_output:
+                    print_warning(
+                        "hashcat could not find a usable compute device (CUDA/OpenCL backend). "
+                        "This can happen in containers/VMs with limited GPU or OpenCL support."
+                    )
+                    print_warning(_hashcat_no_device_guidance())
                     try:
                         probe_cmd = maybe_wrap_hashcat_for_container("hashcat -I")
                         probe = shell.run_command(probe_cmd, timeout=30)
@@ -1180,6 +1340,22 @@ def execute_cracking(
                         print_info_debug(
                             "hashcat -I probe failed while diagnosing devices."
                         )
+                    return {"status": "unavailable", "cracked_count": 0}
+                if _is_fatal_hashcat_runtime_error(combined_output):
+                    print_warning(
+                        "hashcat hit a fatal runtime error before cracking could begin."
+                    )
+                    return {"status": "error", "cracked_count": 0}
+            elif completed_process_initial.returncode == _HASHCAT_EXHAUSTED_EXIT_CODE:
+                print_info_debug(
+                    "hashcat finished with exit code 1 (candidate space exhausted). "
+                    "Checking the potfile for recovered credentials."
+                )
+                if initial_stderr and not _is_benign_hashcat_stderr(initial_stderr):
+                    print_info_debug(
+                        "hashcat emitted additional stderr during the exhausted run:\n"
+                        f"{initial_stderr}"
+                    )
 
         # Second phase: hashcat --show to extract cracked passwords
         file_name = f"cracked_{hash_type}.txt"
@@ -1192,14 +1368,18 @@ def execute_cracking(
         os.makedirs(cracking_directory, exist_ok=True)
         file_path = os.path.join(cracking_directory, file_name)
 
-        show_argv = [
-            "hashcat",
-            "--username",
-            "--outfile-format",
-            "2",
-            hash,
-            "--show",
-        ]
+        show_argv = ["hashcat"]
+        if hashcat_mode != "Unknown":
+            show_argv.extend(["-m", hashcat_mode])
+        show_argv.extend(
+            [
+                "--username",
+                "--outfile-format",
+                "2",
+                hash,
+                "--show",
+            ]
+        )
         show_cmd = " ".join(shlex.quote(str(a)) for a in show_argv)
         show_cmd = maybe_wrap_hashcat_for_container(show_cmd)
         print_info_debug(f"Executing hashcat show command: {show_cmd}")
@@ -1211,8 +1391,26 @@ def execute_cracking(
             print_warning(
                 f"'hashcat --show' command may have failed. Return code: {completed_process_show.returncode}"
             )
-            if completed_process_show.stderr:
+            if completed_process_show.stderr and not _is_benign_hashcat_stderr(
+                completed_process_show.stderr
+            ):
                 print_error(f"Error output: {completed_process_show.stderr}")
+            elif completed_process_show.stderr:
+                print_info_debug(
+                    "Non-fatal hashcat stderr during '--show':\n"
+                    f"{completed_process_show.stderr}"
+                )
+        elif completed_process_show.stderr:
+            if _is_benign_hashcat_stderr(completed_process_show.stderr):
+                print_info_debug(
+                    "Non-fatal hashcat stderr during '--show':\n"
+                    f"{completed_process_show.stderr}"
+                )
+            else:
+                print_warning_debug(
+                    "Unexpected hashcat stderr during '--show':\n"
+                    f"{completed_process_show.stderr}"
+                )
 
         show_stdout = ""
         if completed_process_show is not None and completed_process_show.stdout:
@@ -1306,7 +1504,7 @@ def execute_cracking(
                 attempted_users = set(_extract_hash_users(hash))
                 cracked_users = set(creds.keys())
                 for username, password in creds.items():
-                    if hash_type in {"asreproast", "kerberoast"}:
+                    if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES:
                         try:
                             from adscan_internal.services.attack_graph_service import (
                                 update_roast_entry_edge_status,
@@ -1325,7 +1523,7 @@ def execute_cracking(
                     shell.add_credential(domain, username, password)
 
                 # Mark remaining attempted users as failed for this wordlist.
-                if hash_type in {"asreproast", "kerberoast"}:
+                if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES:
                     remaining = sorted(
                         (attempted_users - cracked_users),
                         key=str.lower,
@@ -1371,7 +1569,7 @@ def execute_cracking(
                 telemetry.capture_exception(e)
 
             print_panel("[red]Hash not cracked[/red]", border_style="red")
-            if hash_type in {"asreproast", "kerberoast"}:
+            if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES:
                 try:
                     from adscan_internal.services.attack_graph_service import (
                         update_roast_entry_edge_status,
@@ -1418,6 +1616,18 @@ def execute_cracking(
                     )
                 ):
                     shell.cracking("kerberoast", domain, hash, failed=True)
+            if hash_type == "timeroast":
+                marked_domain = mark_sensitive(domain, "domain")
+                is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
+                if (
+                    sys.stdin.isatty()
+                    and not is_ci
+                    and Confirm.ask(
+                        f"Do you want to crack the timeroast hashes for domain {marked_domain} with another wordlist?",
+                        default=False,
+                    )
+                ):
+                    shell.cracking("timeroast", domain, hash, failed=True)
     except Exception as e:
         telemetry.capture_exception(e)
         print_error("Error executing hashcat.")

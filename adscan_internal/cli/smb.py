@@ -26,7 +26,6 @@ import threading
 import time
 import traceback
 import rich
-from rich.markup import escape as rich_escape
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
@@ -57,6 +56,16 @@ from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.cli.target_scope_warning import (
     confirm_large_target_scope,
+)
+from adscan_internal.cli.ntlm_hash_finding_flow import (
+    render_ntlm_hash_findings_flow,
+)
+from adscan_internal.cli.scan_outcome_flow import (
+    artifact_records_extracted_nothing,
+    collect_loot_file_preview,
+    persist_artifact_processing_report as _persist_artifact_processing_report,
+    render_artifact_processing_summary as _render_artifact_processing_summary,
+    render_no_extracted_findings_preview,
 )
 from adscan_internal.rich_output import (
     BRAND_COLORS,
@@ -114,6 +123,7 @@ from adscan_internal.services.artifact_processing_tuning_service import (
     choose_artifact_processing_tuning,
 )
 from adscan_internal.services.spidering_service import ArtifactProcessingRecord
+from adscan_internal.workspaces.computers import ensure_enabled_computer_ip_file
 from adscan_internal.workspaces.subpaths import domain_path, domain_relpath
 
 _SMB_HOST_IDENTITY_RE = re.compile(
@@ -125,112 +135,6 @@ _SMB_GUEST_SESSION_RE = re.compile(
     re.IGNORECASE,
 )
 _SMB_TARGET_SCOPE_WARNING_THRESHOLD = 2048
-
-
-def _artifact_status_label(status: str) -> str:
-    """Return a user-friendly label for one artifact processing status."""
-    normalized = str(status or "").strip().lower()
-    mapping = {
-        "processed": "Processed",
-        "processed_no_findings": "Processed (no findings)",
-        "manual_review": "Manual review",
-        "failed": "Processing failed",
-        "skipped": "Skipped",
-    }
-    return mapping.get(normalized, normalized.replace("_", " ").title() or "Unknown")
-
-
-def _persist_artifact_processing_report(
-    *,
-    phase_root_abs: str,
-    records: list[ArtifactProcessingRecord],
-) -> str:
-    """Persist one artifact processing report as JSON and return its absolute path."""
-    normalized_records = [item for item in records if item is not None]
-    report_path = os.path.join(phase_root_abs, "artifact_processing_report.json")
-    os.makedirs(os.path.dirname(report_path), exist_ok=True)
-    payload = {
-        "records": [
-            {
-                "path": item.path,
-                "filename": item.filename,
-                "artifact_type": item.artifact_type,
-                "status": item.status,
-                "note": item.note,
-                "manual_review": bool(item.manual_review),
-                "details": dict(item.details or {}),
-            }
-            for item in normalized_records
-        ]
-    }
-    with open(report_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
-    return report_path
-
-
-def _render_artifact_processing_summary(
-    shell: Any,
-    *,
-    phase_label: str,
-    records: list[ArtifactProcessingRecord],
-    report_path: str,
-) -> None:
-    """Render one compact artifact processing summary with paths and statuses."""
-    if not records:
-        return
-
-    normalized_records = [item for item in records if item is not None]
-    if not normalized_records:
-        return
-
-    ordered_records = sorted(
-        normalized_records,
-        key=lambda item: (
-            0 if item.status == "manual_review" else 1 if item.status == "failed" else 2,
-            item.filename.lower(),
-            item.path.lower(),
-        ),
-    )
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("File", style=BRAND_COLORS["warning"])
-    table.add_column("Type", style=BRAND_COLORS["info"], no_wrap=True)
-    table.add_column("Status", style=BRAND_COLORS["success"], no_wrap=True)
-    table.add_column("Path")
-    table.add_column("Notes")
-
-    workspace_cwd = (
-        shell._get_workspace_cwd()
-        if callable(getattr(shell, "_get_workspace_cwd", None))
-        else os.getcwd()
-    )
-    for item in ordered_records:
-        try:
-            display_path = os.path.relpath(item.path, workspace_cwd)
-        except ValueError:
-            display_path = item.path
-        table.add_row(
-            mark_sensitive(item.filename, "path"),
-            mark_sensitive(item.artifact_type, "text"),
-            _artifact_status_label(item.status),
-            mark_sensitive(display_path, "path"),
-            rich_escape(str(item.note or "")),
-        )
-
-    print_panel_with_table(
-        table,
-        border_style=BRAND_COLORS["warning"],
-        title=f"{phase_label} Artifact Review Summary",
-    )
-
-    manual_review_count = sum(1 for item in normalized_records if item.manual_review)
-    failed_count = sum(1 for item in normalized_records if item.status == "failed")
-    print_info(
-        "Artifact review summary: "
-        f"processed={len(normalized_records) - manual_review_count - failed_count} "
-        f"manual_review={manual_review_count} "
-        f"failed={failed_count} "
-        f"report={mark_sensitive(os.path.relpath(report_path, workspace_cwd), 'path')}"
-    )
 
 
 def _is_globally_excluded_mapping_share(share_name: str) -> bool:
@@ -752,11 +656,15 @@ def _resolve_guest_smb_targets(shell: Any, *, domain: str) -> tuple[list[str], s
     if tokens:
         return tokens, "configured"
 
-    enabled_computers = domain_relpath(
-        shell.domains_dir, domain, "enabled_computers_ips.txt"
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or os.getcwd()
+    enabled_computers, enabled_source = ensure_enabled_computer_ip_file(
+        workspace_dir,
+        shell.domains_dir,
+        domain,
+        domain_data,
     )
-    if os.path.exists(enabled_computers):
-        return [enabled_computers], "enabled_computers_file"
+    if enabled_computers:
+        return [enabled_computers], enabled_source
 
     smb_ips = domain_relpath(shell.domains_dir, domain, "smb", "ips.txt")
     if os.path.exists(smb_ips):
@@ -1491,14 +1399,31 @@ def run_auth_shares(
     log_path = domain_relpath(
         shell.domains_dir, domain, "smb", f"smb_{username}_shares.log"
     )
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or os.getcwd()
+    targets_file, source = ensure_enabled_computer_ip_file(
+        workspace_dir,
+        shell.domains_dir,
+        domain,
+        shell.domains_data.get(domain, {}),
+    )
+    if not targets_file:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"No host targets are available for domain {marked_domain}."
+        )
+        return
     command = (
-        f"{shell.netexec_path} smb enabled_computers_ips.txt {auth} "
+        f"{shell.netexec_path} smb {shlex.quote(targets_file)} {auth} "
         f"-t 10 --timeout 60 --smb-timeout 30 --shares --log "
         f"{log_path} "
     )
     marked_domain = mark_sensitive(domain, "domain")
     print_info(
         f"Checking shares access as user {marked_username} in domain {marked_domain}"
+    )
+    print_info_debug(
+        f"[smb] using domain target file source={source} "
+        f"for {marked_domain}: {mark_sensitive(targets_file, 'path')}"
     )
     print_info_debug(f"Command: {command}")
     execute_netexec_shares(
@@ -1760,10 +1685,15 @@ def run_pass_policy(shell: Any, *, domain: str) -> None:
         kerberos=use_kerberos,
     )
 
+    pdc_target = shell.domains_data[domain]["pdc"]
+    pdc_hostname = str(shell.domains_data[domain].get("pdc_hostname") or "").strip()
+    if use_kerberos and pdc_hostname:
+        pdc_target = f"{pdc_hostname}.{domain}"
+
     marked_domain = mark_sensitive(domain, "domain")
     command = (
-        f"{shell.netexec_path} smb {shell.domains_data[domain]['pdc']} {auth} "
-        f"--pass-pol --log domains/{marked_domain}/smb/pass_policy.log"
+        f"{shell.netexec_path} ldap {pdc_target} {auth} "
+        f"--pass-pol --log domains/{marked_domain}/ldap/pass_policy.log"
     )
     print_info_verbose(f"Displaying password policy for domain {marked_domain}")
     execute_netexec_pass_policy(shell, command=command, domain=domain)
@@ -2188,13 +2118,28 @@ def run_local_cred_reuse(
     )
 
     auth_str = shell.build_auth_nxc(username, credential)
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or os.getcwd()
+    targets_file, source = ensure_enabled_computer_ip_file(
+        workspace_dir,
+        shell.domains_dir,
+        domain,
+        shell.domains_data.get(domain, {}),
+    )
+    if not targets_file:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(f"No host targets are available for domain {marked_domain}.")
+        return None
     command = (
-        f"{shell.netexec_path} smb enabled_computers_ips.txt {auth_str} "
+        f"{shell.netexec_path} smb {shlex.quote(targets_file)} {auth_str} "
         f"-t 20 --timeout 30 --smb-timeout 10 --local-auth --log "
         f"domains/{domain}/smb/{username}_cred_reuse.txt"
     )
     print_info(
         "Checking for local admin creds reuse (Please be patient, this might take a while on large domains)"
+    )
+    print_info_debug(
+        f"[smb] using domain target file source={source} "
+        f"for {mark_sensitive(domain, 'domain')}: {mark_sensitive(targets_file, 'path')}"
     )
     try:
         return shell.execute_local_cred_reuse(
@@ -2313,10 +2258,26 @@ def run_smb_relay_targets(shell: Any, *, domain: str) -> None:
         shell.domain,
     )
     marked_domain = mark_sensitive(domain, "domain")
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or os.getcwd()
+    targets_file, source = ensure_enabled_computer_ip_file(
+        workspace_dir,
+        shell.domains_dir,
+        domain,
+        shell.domains_data.get(domain, {}),
+    )
+    if not targets_file:
+        print_error(
+            f"No host targets are available for domain {marked_domain}."
+        )
+        return
     command = (
-        f"{shell.netexec_path} smb domains/{marked_domain}/enabled_computers_ips.txt "
+        f"{shell.netexec_path} smb {shlex.quote(targets_file)} "
         f"{auth} -t 20 --timeout 30 --smb-timeout 10 --log domains/{marked_domain}/smb/relay.log "
         f"--gen-relay-list domains/{marked_domain}/smb/relay_targets.txt"
+    )
+    print_info_debug(
+        f"[smb] using domain target file source={source} "
+        f"for {marked_domain}: {mark_sensitive(targets_file, 'path')}"
     )
 
     username = shell.domains_data.get(shell.domain, {}).get("username", "N/A")
@@ -3002,15 +2963,17 @@ def _enumerate_readable_share_context_for_mapping(
         username=username,
         password=password,
     )
-    enabled_computers = domain_relpath(
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or os.getcwd()
+    enabled_computers, _ = ensure_enabled_computer_ip_file(
+        workspace_dir,
         shell.domains_dir,
         domain,
-        "enabled_computers_ips.txt",
+        shell.domains_data.get(domain, {}),
     )
     smb_ips = domain_relpath(shell.domains_dir, domain, "smb", "ips.txt")
-    target_path = enabled_computers if os.path.exists(enabled_computers) else smb_ips
+    target_path = enabled_computers if enabled_computers else smb_ips
     command = (
-        f"{shell.netexec_path} smb {target_path} {auth_args} --smb-timeout 30 --shares"
+        f"{shell.netexec_path} smb {shlex.quote(target_path)} {auth_args} --smb-timeout 30 --shares"
     )
     completed_process = shell._run_netexec(
         command,
@@ -9744,7 +9707,7 @@ def _run_post_mapping_deterministic_rclone_credsweeper_scan(
     )
     total_findings, files_with_findings = _count_grouped_credential_findings(findings)
     candidate_files = _count_files_under_path(loot_dir)
-    shell._get_spidering_service().process_local_structured_files(
+    structured_stats = shell._get_spidering_service().process_local_structured_files(
         root_path=loot_dir,
         phase=phase,
         domain=domain,
@@ -9763,6 +9726,24 @@ def _run_post_mapping_deterministic_rclone_credsweeper_scan(
             source_artifact="rclone deterministic share scan",
         )
     loot_rel = os.path.relpath(loot_dir, shell._get_workspace_cwd())
+    ntlm_hash_findings = structured_stats.get("ntlm_hash_findings")
+    if isinstance(ntlm_hash_findings, list) and ntlm_hash_findings:
+        render_ntlm_hash_findings_flow(
+            shell,
+            domain=domain,
+            loot_dir=loot_dir,
+            loot_rel=loot_rel,
+            phase_label=str(get_sensitive_phase_definition(phase).get("label", phase)),
+            ntlm_hash_findings=[
+                item for item in ntlm_hash_findings if isinstance(item, dict)
+            ],
+            source_scope=(
+                "SMB file NTLM hash findings from "
+                f"{str(get_sensitive_phase_definition(phase).get('label', phase))}"
+            ),
+            fallback_source_hosts=hosts,
+            fallback_source_shares=shares,
+        )
     print_info(
         "Deterministic rclone phase summary: "
         f"phase={marked_phase_label} candidate_files={candidate_files} "
@@ -9770,16 +9751,51 @@ def _run_post_mapping_deterministic_rclone_credsweeper_scan(
         f"credential_like_findings={total_findings} "
         f"loot={mark_sensitive(loot_rel, 'path')}"
     )
-    if not findings:
-        print_info("No credential-like findings were detected in this rclone phase.")
+    structured_files_with_findings = int(structured_stats.get("files_with_findings", 0) or 0)
+    total_files_with_findings = int(files_with_findings) + structured_files_with_findings
+    if not findings and structured_files_with_findings == 0:
+        _print_analyzed_no_findings_preview(
+            loot_dir=loot_dir,
+            loot_rel=loot_rel,
+            candidate_files=candidate_files,
+            phase_label=str(get_sensitive_phase_definition(phase).get("label", phase)),
+            preview_limit=5,
+        )
     return {
         "completed": True,
         "credential_findings": int(total_findings),
-        "files_with_findings": int(files_with_findings),
+        "files_with_findings": int(total_files_with_findings),
         "candidate_files": int(candidate_files),
         "phase": phase,
         "loot_dir": loot_dir,
     }
+
+
+def _print_analyzed_no_findings_preview(
+    *,
+    loot_dir: str,
+    loot_rel: str,
+    candidate_files: int,
+    phase_label: str | None = None,
+    preview_limit: int = 5,
+) -> None:
+    """Print a compact preview of analyzed files when no credentials were extracted."""
+    render_no_extracted_findings_preview(
+        loot_dir=loot_dir,
+        loot_rel=loot_rel,
+        analyzed_count=int(candidate_files or 0),
+        category="credential",
+        phase_label=phase_label,
+        preview_limit=preview_limit,
+    )
+
+
+def _collect_loot_file_preview(*, loot_dir: str, preview_limit: int = 5) -> list[str]:
+    """Return a deterministic preview of files downloaded for one loot phase."""
+    return collect_loot_file_preview(
+        loot_dir=loot_dir,
+        preview_limit=preview_limit,
+    )
 
 
 def _run_post_mapping_deterministic_rclone_artifact_scan(
@@ -9873,6 +9889,15 @@ def _run_post_mapping_deterministic_rclone_artifact_scan(
             records=artifact_records,
             report_path=report_path,
         )
+        if artifact_records_extracted_nothing(artifact_records):
+            render_no_extracted_findings_preview(
+                loot_dir=loot_dir,
+                loot_rel=loot_rel,
+                analyzed_count=len(artifact_files),
+                category="artifact",
+                phase_label=phase_label,
+                preview_limit=5,
+            )
     print_info(
         "Deterministic rclone artifact summary: "
         f"phase={mark_sensitive(phase_label, 'text')} "
@@ -9991,7 +10016,7 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
             f"credential_like_findings={scan_result.total_findings}"
         )
 
-        shell._get_spidering_service().process_local_structured_files(
+        structured_stats = shell._get_spidering_service().process_local_structured_files(
             root_path=effective_mount_root,
             phase=phase,
             domain=domain,
@@ -10000,6 +10025,29 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
             auth_username=username,
             apply_actions=True,
         )
+        structured_files_with_findings = int(
+            structured_stats.get("files_with_findings", 0) or 0
+        )
+        ntlm_hash_findings = structured_stats.get("ntlm_hash_findings")
+        if isinstance(ntlm_hash_findings, list) and ntlm_hash_findings:
+            loot_rel = os.path.relpath(effective_mount_root, shell._get_workspace_cwd())
+            render_ntlm_hash_findings_flow(
+                shell,
+                domain=domain,
+                loot_dir=effective_mount_root,
+                loot_rel=loot_rel,
+                phase_label=str(get_sensitive_phase_definition(phase).get("label", phase)),
+                ntlm_hash_findings=[
+                    item for item in ntlm_hash_findings if isinstance(item, dict)
+                ],
+                source_scope=(
+                    "SMB file NTLM hash findings from "
+                    f"{str(get_sensitive_phase_definition(phase).get('label', phase))}"
+                ),
+                fallback_source_hosts=hosts,
+                fallback_source_shares=shares,
+            )
+        total_files_with_findings = int(scan_result.files_with_findings) + structured_files_with_findings
 
         if scan_result.findings:
             shell.handle_found_credentials(
@@ -10010,12 +10058,19 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
                 auth_username=username,
                 source_artifact="CIFS mounted share scan",
             )
-        else:
-            print_info("No credential-like findings were detected in mounted CIFS shares.")
+        elif structured_files_with_findings == 0:
+            loot_rel = os.path.relpath(effective_mount_root, shell._get_workspace_cwd())
+            _print_analyzed_no_findings_preview(
+                loot_dir=effective_mount_root,
+                loot_rel=loot_rel,
+                candidate_files=int(scan_result.candidate_files),
+                phase_label=str(get_sensitive_phase_definition(phase).get("label", phase)),
+                preview_limit=5,
+            )
         return {
             "completed": True,
             "credential_findings": int(scan_result.total_findings),
-            "files_with_findings": int(scan_result.files_with_findings),
+            "files_with_findings": int(total_files_with_findings),
             "candidate_files": int(scan_result.candidate_files),
             "phase": phase,
         }
@@ -10156,6 +10211,15 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
             records=artifact_records,
             report_path=report_path,
         )
+        if artifact_records_extracted_nothing(artifact_records):
+            render_no_extracted_findings_preview(
+                loot_dir=effective_mount_root,
+                loot_rel=os.path.relpath(effective_mount_root, shell._get_workspace_cwd()),
+                analyzed_count=artifact_hits,
+                category="artifact",
+                phase_label=phase_label,
+                preview_limit=5,
+            )
     return {"completed": True, "artifact_hits": artifact_hits, "phase": phase}
 
 
@@ -10627,6 +10691,7 @@ def _run_post_mapping_ai_triage(
         read_domain=domain if effective_username else None,
         read_backend=read_backend,
         cifs_mount_root=cifs_mount_root,
+        report_root_abs=os.path.join(os.path.dirname(aggregate_map_abs), "ai_prioritized"),
     )
     return True
 
@@ -10683,6 +10748,7 @@ def _run_ai_prioritized_file_analysis(
     read_domain: str | None = None,
     read_backend: str = "smb_impacket",
     cifs_mount_root: str | None = None,
+    report_root_abs: str | None = None,
 ) -> None:
     """Analyze prioritized SMB files with AI using configured file-read backend."""
     from adscan_internal.services.cifs_share_mapping_service import (
@@ -10726,6 +10792,7 @@ def _run_ai_prioritized_file_analysis(
     skipped_oversized = 0
     forced_oversized = 0
     oversized_rows: list[tuple[str, str, str, str, str]] = []
+    review_candidate_paths: list[str] = []
     continue_after_findings: bool | None = None
     local_reads = 0
     local_to_smb_fallbacks = 0
@@ -11044,6 +11111,8 @@ def _run_ai_prioritized_file_analysis(
                         "by user choice."
                     )
                     break
+            else:
+                review_candidate_paths.append(f"{host}/{share}{path}")
         if pipeline_result.error_message:
             read_failures += 1
             print_warning(
@@ -11104,6 +11173,7 @@ def _run_ai_prioritized_file_analysis(
                     )
                     break
             else:
+                review_candidate_paths.append(f"{host}/{share}{path}")
                 print_info_debug(
                     "AI file analysis returned no credential-like findings for "
                     f"{host}/{share}:{path}."
@@ -11137,6 +11207,18 @@ def _run_ai_prioritized_file_analysis(
     )
     if oversized_rows:
         _render_ai_oversized_skips_table(rows=oversized_rows)
+    if flagged_files == 0 and review_candidate_paths:
+        render_no_extracted_findings_preview(
+            loot_dir="",
+            loot_rel="",
+            analyzed_count=len(review_candidate_paths),
+            category="mixed",
+            phase_label="AI prioritized file analysis",
+            candidate_paths=review_candidate_paths,
+            report_root_abs=report_root_abs,
+            scope_label="AI prioritized SMB files",
+            preview_limit=5,
+        )
 
 
 def _render_file_credentials_table(
@@ -11778,7 +11860,7 @@ def execute_manspider(
                     custom_ml_threshold="0.0",
                     jobs=credsweeper_jobs or get_default_credsweeper_jobs(),
                 )
-                shell._get_spidering_service().process_local_structured_files(
+                structured_stats = shell._get_spidering_service().process_local_structured_files(
                     root_path=loot_dir,
                     phase=SMB_SENSITIVE_SCAN_PHASE_TEXT_CREDENTIALS,
                     domain=domain,
@@ -11787,6 +11869,25 @@ def execute_manspider(
                     auth_username=auth_username or "",
                     apply_actions=True,
                 )
+                structured_files_with_findings = int(
+                    structured_stats.get("files_with_findings", 0) or 0
+                )
+                ntlm_hash_findings = structured_stats.get("ntlm_hash_findings")
+                if isinstance(ntlm_hash_findings, list) and ntlm_hash_findings:
+                    loot_rel = os.path.relpath(loot_dir, shell._get_workspace_cwd())
+                    render_ntlm_hash_findings_flow(
+                        shell,
+                        domain=domain,
+                        loot_dir=loot_dir,
+                        loot_rel=loot_rel,
+                        phase_label="Text credential scan",
+                        ntlm_hash_findings=[
+                            item for item in ntlm_hash_findings if isinstance(item, dict)
+                        ],
+                        source_scope="SMB file NTLM hash findings from Text credential scan",
+                        fallback_source_hosts=hosts or [],
+                        fallback_source_shares=shares or [],
+                    )
                 if credentials:
                     shell.handle_found_credentials(
                         credentials,
@@ -11808,10 +11909,20 @@ def execute_manspider(
                     if current_report in (None, "NS", False):
                         shell.update_report_field(domain, "smb_share_secrets", False)
                 total_findings, files_with_findings = _count_grouped_credential_findings(credentials)
+                total_files_with_findings = int(files_with_findings) + structured_files_with_findings
+                if not credentials and structured_files_with_findings == 0:
+                    loot_rel = os.path.relpath(loot_dir, shell._get_workspace_cwd())
+                    _print_analyzed_no_findings_preview(
+                        loot_dir=loot_dir,
+                        loot_rel=loot_rel,
+                        candidate_files=_count_files_under_path(loot_dir),
+                        phase_label="Text credential scan",
+                        preview_limit=5,
+                    )
                 return {
                     "completed": True,
                     "credential_findings": int(total_findings),
-                    "files_with_findings": int(files_with_findings),
+                    "files_with_findings": int(total_files_with_findings),
                     "artifact_hits": 0,
                 }
             return {"completed": True, "credential_findings": 0, "files_with_findings": 0, "artifact_hits": 0}
@@ -11907,6 +12018,15 @@ def execute_manspider(
                     records=artifact_records,
                     report_path=report_path,
                 )
+                if artifact_records_extracted_nothing(artifact_records):
+                    render_no_extracted_findings_preview(
+                        loot_dir=output_directory,
+                        loot_rel=os.path.relpath(output_directory, shell._get_workspace_cwd()),
+                        analyzed_count=len(files_found),
+                        category="artifact",
+                        phase_label=str(scan_type).upper(),
+                        preview_limit=5,
+                    )
                 return {"completed": True, "artifact_hits": len(files_found)}
             else:
                 print_error("Error executing manspider to search for files")

@@ -8,6 +8,7 @@ import os
 from json import JSONDecodeError
 from typing import List, Dict, Optional
 from pathlib import Path
+import time
 import requests
 from .base import BloodHoundClient
 from .logging_utils import get_logger
@@ -843,6 +844,65 @@ class BloodHoundCEClient(BloodHoundClient):
 
             return password_info
 
+        except Exception:
+            return []
+
+    def get_timeroast_candidates(
+        self, domain: str, max_results: int = 250
+    ) -> List[Dict]:
+        """Return enabled computer accounts matching Timeroast heuristics."""
+        try:
+            domain_value = str(domain or "").strip().replace("'", "\\'")
+            current_epoch = int(time.time())
+            max_results_value = max(1, int(max_results or 250))
+            month_seconds = 30 * 24 * 60 * 60
+            min_gap_seconds = 5 * 60
+
+            cypher_query = f"""
+            MATCH (c:Computer)
+            WHERE c.enabled = true
+              AND toLower(coalesce(c.domain, "")) = toLower('{domain_value}')
+              AND coalesce(c.pwdlastset, 0) > 0
+              AND coalesce(c.whencreated, 0) > 0
+              AND (
+                (
+                  c.pwdlastset <> c.whencreated
+                  AND c.pwdlastset > c.whencreated
+                  AND (c.pwdlastset - c.whencreated) >= {min_gap_seconds}
+                  AND (c.pwdlastset - c.whencreated) < {month_seconds}
+                )
+                OR
+                (
+                  c.pwdlastset > c.whencreated
+                  AND (c.pwdlastset - c.whencreated) >= {min_gap_seconds}
+                  AND
+                  ({current_epoch} - c.pwdlastset) > {month_seconds}
+                )
+              )
+            RETURN c
+            ORDER BY c.pwdlastset ASC
+            LIMIT {max_results_value}
+            """
+            result = self.execute_query(cypher_query)
+            candidates: List[Dict] = []
+            for node_properties in result:
+                if not isinstance(node_properties, dict):
+                    continue
+                samaccountname = node_properties.get("samaccountname") or ""
+                if samaccountname and "@" in samaccountname:
+                    samaccountname = samaccountname.split("@")[0]
+                candidates.append(
+                    {
+                        "samaccountname": samaccountname,
+                        "name": node_properties.get("name"),
+                        "dnshostname": node_properties.get("dnshostname"),
+                        "objectid": node_properties.get("objectid"),
+                        "pwdlastset": node_properties.get("pwdlastset"),
+                        "whencreated": node_properties.get("whencreated"),
+                        "operatingsystem": node_properties.get("operatingsystem"),
+                    }
+                )
+            return candidates
         except Exception:
             return []
 
@@ -2074,9 +2134,7 @@ class BloodHoundCEClient(BloodHoundClient):
                         self.logger.warning(
                             "could not fetch job details", file_upload_job_id=job_id
                         )
-                        self._last_error = (
-                            f"Upload wait failed: timeout fetching job details (job_id={job_id})."
-                        )
+                        self._last_error = f"Upload wait failed: timeout fetching job details (job_id={job_id})."
                         print_error("Timeout: Could not get job details")
                         return False
                 else:
@@ -2098,7 +2156,9 @@ class BloodHoundCEClient(BloodHoundClient):
                     if status in [-1, 2, 3, 4, 5, 8]:
                         if status == 2:
                             self._last_error = None
-                            print_success("Upload and processing completed successfully")
+                            print_success(
+                                "Upload and processing completed successfully"
+                            )
                             self.logger.info(
                                 "upload complete",
                                 file_upload_job_id=job_id,
@@ -2139,9 +2199,7 @@ class BloodHoundCEClient(BloodHoundClient):
                         file_upload_job_id=job_id,
                         timeout_seconds=timeout_seconds,
                     )
-                    self._last_error = (
-                        f"Upload wait timed out after {timeout_seconds}s for job_id={job_id}."
-                    )
+                    self._last_error = f"Upload wait timed out after {timeout_seconds}s for job_id={job_id}."
                     print_error(f"Timeout after {timeout_seconds} seconds")
                     return False
 

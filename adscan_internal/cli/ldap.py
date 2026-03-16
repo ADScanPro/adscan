@@ -40,6 +40,9 @@ from adscan_internal import (
 )
 from adscan_internal.core import AuthMode
 from adscan_internal.cli.common import SECRET_MODE, build_lab_event_fields
+from adscan_internal.cli.ntlm_hash_finding_flow import (
+    render_ntlm_hash_findings_flow,
+)
 from adscan_internal.cli.tools_env import TOOLS_INSTALL_DIR
 from adscan_internal.cli.host_file_picker import (
     is_full_container_runtime,
@@ -68,6 +71,7 @@ from adscan_internal.services.attack_graph_service import (
     CredentialSourceStep,
     resolve_group_members_by_rid,
 )
+from adscan_internal.integrations.impacket.parsers import parse_secretsdump_output
 from adscan_internal.workspaces import domain_relpath, domain_subpath
 
 
@@ -3013,6 +3017,68 @@ def _extract_password_candidates_from_credsweeper_findings(
     return list(merged.values())
 
 
+_LDAP_DESCRIPTION_NTLM_KEYWORD_RE = re.compile(
+    r"(?ix)"
+    r"\b(?:ntlm\s*hash|nt\s*hash|nthash)\b"
+    r"[^\r\n]{0,24}?"
+    r"(?:\:|=|\bis\b|\bto\b)\s*"
+    r"([0-9a-f]{32})\b"
+)
+
+
+def _extract_ntlm_hash_candidates_from_descriptions(
+    user_descriptions: dict[str, str],
+    *,
+    source_path: str,
+) -> list[dict[str, str]]:
+    """Return deterministic NTLM hash candidates anchored to LDAP descriptions."""
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for owner_username, description in sorted(user_descriptions.items()):
+        description_text = str(description or "").strip()
+        if not description_text:
+            continue
+
+        parsed_hashes = parse_secretsdump_output(description_text)
+        for parsed in parsed_hashes:
+            username = str(getattr(parsed, "username", "") or "").strip() or str(
+                owner_username or ""
+            ).strip()
+            ntlm_hash = str(getattr(parsed, "ntlm_hash", "") or "").strip().lower()
+            if not username or not ntlm_hash:
+                continue
+            key = (username.lower(), ntlm_hash, str(source_path))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                {
+                    "username": username,
+                    "ntlm_hash": ntlm_hash,
+                    "source_path": str(source_path),
+                }
+            )
+
+        for match in _LDAP_DESCRIPTION_NTLM_KEYWORD_RE.finditer(description_text):
+            ntlm_hash = str(match.group(1) or "").strip().lower()
+            username = str(owner_username or "").strip()
+            if not username or not ntlm_hash:
+                continue
+            key = (username.lower(), ntlm_hash, str(source_path))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                {
+                    "username": username,
+                    "ntlm_hash": ntlm_hash,
+                    "source_path": str(source_path),
+                }
+            )
+
+    return candidates
+
+
 def _analyze_descriptions_for_passwords(
     shell: LdapShell,
     descriptions_file: str,
@@ -3051,10 +3117,46 @@ def _analyze_descriptions_for_passwords(
             timeout=300,
         )
 
+        ntlm_hash_candidates = _extract_ntlm_hash_candidates_from_descriptions(
+            user_descriptions,
+            source_path=descriptions_file,
+        )
+        if ntlm_hash_candidates:
+            for item in ntlm_hash_candidates:
+                username_norm = str(item["username"]).strip().lower()
+                ntlm_hash = str(item["ntlm_hash"]).strip().lower()
+                shell.add_credential(
+                    domain,
+                    username_norm,
+                    ntlm_hash,
+                    source_steps=_build_user_description_source_steps(
+                        username=username_norm,
+                        anonymous=anonymous,
+                        secret=ntlm_hash,
+                    ),
+                )
+
+            descriptions_dir = os.path.dirname(descriptions_file) or "."
+            try:
+                workspace_cwd = shell.current_workspace_dir or os.getcwd()
+                loot_rel = os.path.relpath(descriptions_dir, workspace_cwd)
+            except Exception:  # noqa: BLE001
+                loot_rel = descriptions_dir
+            render_ntlm_hash_findings_flow(
+                shell,
+                domain=domain,
+                loot_dir=descriptions_dir,
+                loot_rel=loot_rel,
+                phase_label="LDAP description scan",
+                ntlm_hash_findings=ntlm_hash_candidates,
+                source_scope="LDAP description NTLM hash findings",
+                fallback_source_shares=["ldap"],
+            )
+
         candidates = _extract_password_candidates_from_credsweeper_findings(
             findings, user_descriptions
         )
-        if not candidates:
+        if not candidates and not ntlm_hash_candidates:
             print_info_verbose("No passwords detected in LDAP descriptions.")
             return
 

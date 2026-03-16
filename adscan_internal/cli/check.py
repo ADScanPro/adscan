@@ -12,11 +12,89 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import os
+import re
 import shutil
 import subprocess
 import sys
 import signal
 from typing import Any, Dict, List
+
+from adscan_core.linux_capabilities import (
+    CAP_NET_ADMIN_BIT as _CAP_NET_ADMIN_BIT,
+    CAP_NET_BIND_SERVICE_BIT as _CAP_NET_BIND_SERVICE_BIT,
+    binary_has_capability,
+    get_binary_capabilities,
+    process_has_capability,
+)
+from adscan_internal.ligolo_manager import (
+    LIGOLO_NG_VERSION,
+    get_current_ligolo_proxy_target,
+    get_ligolo_agent_local_path,
+    get_ligolo_proxy_local_path,
+)
+
+
+_MINIMUM_HASHCAT_VERSION = (7, 1, 2)
+@dataclass(frozen=True)
+class CheckFailureRecoveryGuidance:
+    """User-facing recovery guidance for failed `adscan check` runs."""
+
+    status_message: str
+    instruction: str
+    follow_up_message: str | None = None
+    interactive_prompt: str | None = None
+
+
+def get_check_failure_recovery_guidance(
+    *, full_container_runtime: bool
+) -> CheckFailureRecoveryGuidance:
+    """Return the best recovery guidance for a failed check session.
+
+    Args:
+        full_container_runtime: Whether the check ran inside the ADscan Docker
+            runtime rather than on the host launcher.
+
+    Returns:
+        Structured guidance for summary panels and interactive recovery prompts.
+    """
+    if full_container_runtime:
+        return CheckFailureRecoveryGuidance(
+            status_message=(
+                "This check ran inside the ADscan Docker runtime. "
+                "Run 'adscan update' on the host to refresh the launcher and "
+                "runtime image, then rerun this command."
+            ),
+            instruction="Run on the host: adscan update",
+            follow_up_message=(
+                "Do not run `adscan check --fix` inside the container for this case."
+            ),
+        )
+
+    return CheckFailureRecoveryGuidance(
+        status_message=(
+            "Some components are missing. Run 'adscan check --fix' to attempt "
+            "automatic repairs."
+        ),
+        instruction="Try: adscan check --fix",
+        interactive_prompt="Try to fix automatically now (runs `adscan check --fix`)?",
+    )
+
+
+def should_offer_interactive_check_repair(
+    *,
+    args: Any | None,
+    ci_env: str | None,
+    stdin_isatty: bool,
+    guidance: CheckFailureRecoveryGuidance,
+) -> bool:
+    """Return whether interactive repair should be offered to the user."""
+    return (
+        guidance.interactive_prompt is not None
+        and args is not None
+        and getattr(args, "command", None) == "check"
+        and not ci_env
+        and stdin_isatty
+    )
 
 
 @dataclass(frozen=True)
@@ -468,6 +546,8 @@ def check_go_toolchain(
         all_ok = False
 
     return all_ok
+
+
 @dataclass(frozen=True)
 class ExternalToolsCheckConfig:
     """Configuration for checking external Python tools in isolated venvs."""
@@ -612,9 +692,7 @@ def check_external_tools(
                         f"{tool_dir_name}: reinstalled; re-run `adscan check` to verify."
                     )
                 else:
-                    missing_tools.append(
-                        f"{tool_dir_name} ({check_target} executable)"
-                    )
+                    missing_tools.append(f"{tool_dir_name} ({check_target} executable)")
                 all_ok = False
                 tool_failed = True
         elif check_type == "module":
@@ -657,12 +735,13 @@ def check_external_tools(
                             pass
 
                 error_message = str(exc)
-                if isinstance(exc, subprocess.CalledProcessError) and exc.returncode < 0:
+                if (
+                    isinstance(exc, subprocess.CalledProcessError)
+                    and exc.returncode < 0
+                ):
                     try:
                         signal_name = signal.Signals(-exc.returncode).name
-                        error_message = (
-                            f"Command died with <Signals.{signal_name}: {-exc.returncode}>."
-                        )
+                        error_message = f"Command died with <Signals.{signal_name}: {-exc.returncode}>."
                     except Exception:  # noqa: BLE001
                         error_message = f"Command died with signal {-exc.returncode}."
 
@@ -833,7 +912,7 @@ def check_system_packages(
     )
 
     missing_pkgs = list(package_results.get("missing", []))
-    missing_pkgs = _normalize_missing_system_packages_for_runtime(
+    missing_pkgs, package_issues = _normalize_missing_system_packages_for_runtime(
         missing_pkgs=missing_pkgs,
         deps=deps,
     )
@@ -895,7 +974,9 @@ def check_system_packages(
                 return True, []
             except subprocess.CalledProcessError as exc:
                 deps.telemetry_capture_exception(exc)
-                deps.print_error("Failed to install missing system packages with --fix.")
+                deps.print_error(
+                    "Failed to install missing system packages with --fix."
+                )
                 deps.print_exception(show_locals=False, exception=exc)
                 return False, missing_pkgs
             except Exception as exc:  # noqa: BLE001
@@ -906,6 +987,15 @@ def check_system_packages(
                 deps.print_exception(show_locals=False, exception=exc)
                 return False, missing_pkgs
         return False, missing_pkgs
+
+    if package_issues:
+        deps.print_error("System package validation issues detected:")
+        for issue in package_issues:
+            deps.print_error(f"  - {issue}")
+        deps.print_instruction(
+            "Install a working hashcat binary via PATH (>= 7.1.2), for example from the official release."
+        )
+        return False, []
 
     deps.print_success("Essential system packages seem to be installed.")
     return True, []
@@ -993,9 +1083,11 @@ def check_external_binary_tools(
         # Multiple check paths (e.g., PKINITtools)
         if "check_paths" in tool_cfg:
             for check_path in tool_cfg["check_paths"]:
-                check_name = f"{tool_name}_{check_path.split('/')[-1].replace('.py', '')}"
-                external_tools_to_verify[check_name] = (
-                    os.path.join(config.tools_install_dir, check_path)
+                check_name = (
+                    f"{tool_name}_{check_path.split('/')[-1].replace('.py', '')}"
+                )
+                external_tools_to_verify[check_name] = os.path.join(
+                    config.tools_install_dir, check_path
                 )
                 external_tool_check_to_base[check_name] = tool_name
         elif "check_path" in tool_cfg:
@@ -1030,12 +1122,17 @@ def check_external_binary_tools(
             deps.print_success(f"{tool_check_name} found at {tool_path}")
             continue
         missing_checks.append(tool_check_name)
-        missing_bases.add(external_tool_check_to_base.get(tool_check_name, tool_check_name))
+        missing_bases.add(
+            external_tool_check_to_base.get(tool_check_name, tool_check_name)
+        )
 
     if missing_checks and config.fix_mode:
         deps.print_info("Attempting to install missing external tools (--fix)...")
         github_ok = deps.preflight_install_dns(
-            ["github.com"], attempts=2, backoff_seconds=2, context_label="check --fix external tools"
+            ["github.com"],
+            attempts=2,
+            backoff_seconds=2,
+            context_label="check --fix external tools",
         )
         for base_tool in sorted(missing_bases):
             tool_cfg = config.external_tools_config.get(base_tool)
@@ -1043,7 +1140,9 @@ def check_external_binary_tools(
                 continue
             deps.print_info(f"Repairing external tool: {base_tool} (--fix)...")
             # setup_external_tool(name, config, github_dns_ok, force_reinstall)
-            deps.setup_external_tool(base_tool, tool_cfg, github_dns_ok=github_ok, force_reinstall=False)
+            deps.setup_external_tool(
+                base_tool, tool_cfg, github_dns_ok=github_ok, force_reinstall=False
+            )
 
         # Re-check after fix attempt
         still_missing: list[str] = []
@@ -1052,7 +1151,9 @@ def check_external_binary_tools(
             if tool_path and os.path.exists(tool_path):
                 deps.print_success(f"{tool_check_name} found at {tool_path}")
             else:
-                deps.print_error(f"{tool_check_name} not found at {tool_path}. Try reinstalling.")
+                deps.print_error(
+                    f"{tool_check_name} not found at {tool_path}. Try reinstalling."
+                )
                 still_missing.append(tool_check_name)
         return (len(still_missing) == 0), still_missing
 
@@ -1064,7 +1165,7 @@ def _normalize_missing_system_packages_for_runtime(
     *,
     missing_pkgs: list[str],
     deps: SystemPackagesCheckDeps,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Drop false positives for packages replaced by runtime-managed tools.
 
     Some container/runtime environments intentionally provide tools outside the
@@ -1073,39 +1174,226 @@ def _normalize_missing_system_packages_for_runtime(
     is available via PATH.
     """
     normalized_missing = list(missing_pkgs)
-    if "john" not in normalized_missing:
-        return normalized_missing
+    issues: list[str] = []
 
-    john_executable = None
-    preferred_runtime_john = "/opt/adscan/tools/john/run/john"
-    if os.path.exists(preferred_runtime_john):
-        john_executable = preferred_runtime_john
-    else:
-        which_john = shutil.which("john")
-        if which_john:
-            john_executable = os.path.realpath(which_john)
-    if not john_executable:
-        return normalized_missing
+    if "john" in normalized_missing:
+        john_executable = None
+        preferred_runtime_john = "/opt/adscan/tools/john/run/john"
+        if os.path.exists(preferred_runtime_john):
+            john_executable = preferred_runtime_john
+        else:
+            which_john = shutil.which("john")
+            if which_john:
+                john_executable = os.path.realpath(which_john)
 
-    try:
-        result = deps.run_command(
-            [john_executable, "--list=build-info"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=60,
+        if john_executable:
+            try:
+                result = deps.run_command(
+                    [john_executable, "--list=build-info"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except Exception as exc:  # noqa: BLE001
+                deps.telemetry_capture_exception(exc)
+            else:
+                if result and getattr(result, "returncode", 1) == 0:
+                    deps.print_success(
+                        f"John the Ripper is available via PATH ({john_executable})"
+                    )
+                    normalized_missing.remove("john")
+
+    if "hashcat" in normalized_missing:
+        hashcat_executable = shutil.which("hashcat")
+        if hashcat_executable:
+            hashcat_executable = os.path.realpath(hashcat_executable)
+            try:
+                result = deps.run_command(
+                    [hashcat_executable, "--version"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except Exception as exc:  # noqa: BLE001
+                deps.telemetry_capture_exception(exc)
+            else:
+                combined_output = "\n".join(
+                    [
+                        getattr(result, "stdout", "") or "",
+                        getattr(result, "stderr", "") or "",
+                    ]
+                ).strip()
+                parsed_version = _parse_hashcat_version(combined_output)
+                if (
+                    result
+                    and getattr(result, "returncode", 1) == 0
+                    and parsed_version is not None
+                    and parsed_version >= _MINIMUM_HASHCAT_VERSION
+                ):
+                    version_text = ".".join(str(part) for part in parsed_version)
+                    deps.print_success(
+                        f"Hashcat is available via PATH ({hashcat_executable}, v{version_text})"
+                    )
+                    normalized_missing.remove("hashcat")
+                else:
+                    minimum = ".".join(str(part) for part in _MINIMUM_HASHCAT_VERSION)
+                    detected_version = (
+                        ".".join(str(part) for part in parsed_version)
+                        if parsed_version is not None
+                        else "unknown"
+                    )
+                    issues.append(
+                        "hashcat is available via PATH "
+                        f"({hashcat_executable}) but version {detected_version} does not meet "
+                        f"the minimum required version {minimum}"
+                    )
+                    normalized_missing.remove("hashcat")
+
+    return normalized_missing, issues
+
+
+def _parse_hashcat_version(output: str) -> tuple[int, int, int] | None:
+    """Extract a semantic version tuple from ``hashcat --version`` output."""
+
+    match = re.search(r"\bv?(\d+)\.(\d+)\.(\d+)\b", output)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _process_has_cap_net_admin() -> bool:
+    """Return whether the current process has CAP_NET_ADMIN in its effective set."""
+
+    return process_has_capability(_CAP_NET_ADMIN_BIT)
+
+
+def _process_has_cap_net_bind_service() -> bool:
+    """Return whether the current process has CAP_NET_BIND_SERVICE in its effective set."""
+
+    return process_has_capability(_CAP_NET_BIND_SERVICE_BIT)
+
+
+def _get_binary_capabilities(binary_path: str) -> str:
+    """Return the raw `getcap` output for one binary, if available."""
+
+    return get_binary_capabilities(binary_path)
+
+
+def _binary_has_cap_net_admin(binary_path: str) -> bool:
+    """Return whether one binary carries `cap_net_admin` file capabilities."""
+
+    return binary_has_capability(binary_path, "cap_net_admin")
+
+
+def _binary_has_cap_net_bind_service(binary_path: str) -> bool:
+    """Return whether one binary carries `cap_net_bind_service` file capabilities."""
+
+    return binary_has_capability(binary_path, "cap_net_bind_service")
+
+
+def check_ligolo_ng_runtime_tooling(*, full_container_runtime: bool, deps: Any) -> bool:
+    """Check the ligolo-ng binaries managed by the ADscan runtime.
+
+    The Docker runtime should provide the local proxy binary. Windows agents
+    can be cached ahead of time or fetched on demand later, so missing agent
+    caches are informational rather than fatal.
+    """
+    deps.print_info("Checking ligolo-ng pivot tooling...")
+    local_os, local_arch = get_current_ligolo_proxy_target()
+    proxy_path = get_ligolo_proxy_local_path(target_os=local_os, arch=local_arch)
+    if proxy_path is None:
+        deps.print_error(
+            f"ligolo-ng proxy v{LIGOLO_NG_VERSION} not found for {local_os}/{local_arch}."
         )
-    except Exception as exc:  # noqa: BLE001
-        deps.telemetry_capture_exception(exc)
-        return normalized_missing
+        if full_container_runtime:
+            deps.print_instruction(
+                "Update or rebuild the ADscan runtime image so the pinned ligolo-ng proxy is present."
+            )
+        else:
+            deps.print_instruction(
+                "Set ADSCAN_LIGOLO_PROXY_PATH or place the pinned ligolo-ng proxy under ~/.adscan/tools/ligolo-ng/."
+            )
+        return False
 
-    if result and getattr(result, "returncode", 1) == 0:
+    if not os.access(proxy_path, os.X_OK):
+        deps.print_error(f"ligolo-ng proxy is present but not executable: {proxy_path}")
+        deps.print_instruction(f"Run: chmod +x {proxy_path}")
+        return False
+
+    deps.print_success(
+        f"ligolo-ng proxy v{LIGOLO_NG_VERSION} available at {proxy_path} ({local_os}/{local_arch})"
+    )
+
+    if full_container_runtime:
+        if not os.path.exists("/dev/net/tun"):
+            deps.print_error(
+                "ligolo-ng runtime support is incomplete: /dev/net/tun is not available in the container."
+            )
+            deps.print_instruction(
+                "Update the launcher/runtime so docker runs include --device /dev/net/tun."
+            )
+            return False
+        process_has_cap_net_admin = _process_has_cap_net_admin()
+        process_has_cap_net_bind_service = _process_has_cap_net_bind_service()
+        binary_capabilities = _get_binary_capabilities(str(proxy_path))
+        binary_has_cap_net_admin = _binary_has_cap_net_admin(str(proxy_path))
+        binary_has_cap_net_bind_service = _binary_has_cap_net_bind_service(str(proxy_path))
+        print_info_debug = getattr(deps, "print_info_debug", None)
+        if callable(print_info_debug):
+            print_info_debug(
+                "Ligolo capability diagnostics: "
+                f"process_cap_net_admin={process_has_cap_net_admin} "
+                f"process_cap_net_bind_service={process_has_cap_net_bind_service} "
+                f"proxy_binary_capabilities={binary_capabilities or 'none'}"
+            )
+        if not process_has_cap_net_admin and not binary_has_cap_net_admin:
+            deps.print_error(
+                "ligolo-ng runtime support is incomplete: neither the ADscan process nor the ligolo-ng proxy binary has CAP_NET_ADMIN."
+            )
+            deps.print_instruction(
+                "Update the launcher/runtime so docker runs include --cap-add NET_ADMIN or rebuild the runtime image with setcap cap_net_admin+ep on the ligolo proxy binary."
+            )
+            return False
+        if not process_has_cap_net_bind_service and not binary_has_cap_net_bind_service:
+            deps.print_error(
+                "ligolo-ng runtime support is incomplete: neither the ADscan process nor the ligolo-ng proxy binary has CAP_NET_BIND_SERVICE."
+            )
+            deps.print_instruction(
+                "Update the launcher/runtime so docker runs include --cap-add NET_BIND_SERVICE or rebuild the runtime image with "
+                "setcap cap_net_admin,cap_net_bind_service+ep on the ligolo proxy binary."
+            )
+            return False
+        if binary_has_cap_net_admin:
+            deps.print_success(
+                f"ligolo-ng proxy binary carries CAP_NET_ADMIN file capabilities ({binary_capabilities})."
+            )
+        elif process_has_cap_net_admin:
+            deps.print_success(
+                "ADscan process already has CAP_NET_ADMIN in its effective capability set."
+            )
+        if binary_has_cap_net_bind_service:
+            deps.print_success(
+                "ligolo-ng proxy binary carries CAP_NET_BIND_SERVICE file capabilities."
+            )
+        elif process_has_cap_net_bind_service:
+            deps.print_success(
+                "ADscan process already has CAP_NET_BIND_SERVICE in its effective capability set."
+            )
+
+    cached_windows_agent = get_ligolo_agent_local_path(target_os="windows", arch="amd64")
+    if cached_windows_agent is not None:
         deps.print_success(
-            f"John the Ripper is available via PATH ({john_executable})"
+            "ligolo-ng Windows agent cache available at "
+            f"{cached_windows_agent} (windows/amd64)"
         )
-        normalized_missing.remove("john")
-
-    return normalized_missing
+    else:
+        deps.print_info(
+            "ligolo-ng Windows agent cache is empty. ADscan will need to stage the required "
+            "agent architecture before creating a pivot."
+        )
+    return True
 
 
 # ─── DNS/Unbound Resolver Check ──────────────────────────────────────────────
@@ -1228,7 +1516,9 @@ def check_dns_resolver(
                     "skipping automatic DNS service management."
                 )
             elif config.fix_mode:
-                deps.print_warning("Unbound service is not active (local DNS may not work).")
+                deps.print_warning(
+                    "Unbound service is not active (local DNS may not work)."
+                )
                 deps.print_info_verbose("Attempting to start Unbound...")
 
                 # Proactively stop known conflicting DNS resolvers in --fix.
@@ -1276,7 +1566,10 @@ def check_dns_resolver(
                         )
                     else:
                         deps.run_command(
-                            (deps.sudo_prefix_args() + ["systemctl", "enable", "unbound"])
+                            (
+                                deps.sudo_prefix_args()
+                                + ["systemctl", "enable", "unbound"]
+                            )
                             if os.geteuid() != 0
                             else ["systemctl", "enable", "unbound"],
                             check=False,
@@ -1285,7 +1578,10 @@ def check_dns_resolver(
                             env=unbound_env if os.geteuid() != 0 else None,
                         )
                         deps.run_command(
-                            (deps.sudo_prefix_args() + ["systemctl", "start", "unbound"])
+                            (
+                                deps.sudo_prefix_args()
+                                + ["systemctl", "start", "unbound"]
+                            )
                             if os.geteuid() != 0
                             else ["systemctl", "start", "unbound"],
                             check=False,
@@ -1308,7 +1604,9 @@ def check_dns_resolver(
                 if unbound_ok:
                     deps.print_success("Unbound service is active and ready")
                 else:
-                    deps.print_warning("Unbound service could not be started automatically.")
+                    deps.print_warning(
+                        "Unbound service could not be started automatically."
+                    )
                     if listeners:
                         deps.print_info_verbose(
                             f"[dns] Port 53 listeners after start attempt:\n{listeners}"
@@ -1325,14 +1623,18 @@ def check_dns_resolver(
                         )
                     all_ok = False
             else:
-                deps.print_warning("Unbound service is not active (local DNS may not work).")
+                deps.print_warning(
+                    "Unbound service is not active (local DNS may not work)."
+                )
                 deps.print_instruction(
                     "Run: adscan check --fix (attempts to start Unbound and resolve conflicts)"
                 )
                 all_ok = False
     except Exception as e:
         deps.telemetry_capture_exception(e)
-        deps.print_info_debug("[dns] Could not fully verify local DNS resolver services.")
+        deps.print_info_debug(
+            "[dns] Could not fully verify local DNS resolver services."
+        )
 
     return all_ok
 
@@ -1462,7 +1764,9 @@ def check_docker_compose(
     # Check bloodhound-cli installation
     deps.print_info("Checking bloodhound-cli installation...")
     bloodhound_cli_path = os.path.join(config.bloodhound_ce_dir, "bloodhound-ce-cli")
-    if deps.path_exists(bloodhound_cli_path) and deps.path_access(bloodhound_cli_path, os.X_OK):
+    if deps.path_exists(bloodhound_cli_path) and deps.path_access(
+        bloodhound_cli_path, os.X_OK
+    ):
         deps.print_success(f"bloodhound-cli found at: {bloodhound_cli_path}")
     else:
         deps.print_warning("bloodhound-cli not found or not executable")
@@ -1574,9 +1878,7 @@ class GoToolsCheckDeps:
     print_warning: Callable[[str], None]
 
 
-def check_go_tools(
-    *, config: GoToolsCheckConfig, deps: GoToolsCheckDeps
-) -> bool:
+def check_go_tools(*, config: GoToolsCheckConfig, deps: GoToolsCheckDeps) -> bool:
     """Check Go toolchain and htb-cli (CI-only) status."""
 
     all_ok = True
@@ -1647,6 +1949,7 @@ def check_go_tools(
 
     return all_ok
 
+
 # ─── Rust Tools Check (rusthound-ce) ──────────────────────────────────────
 
 
@@ -1678,9 +1981,7 @@ class RustToolsCheckDeps:
     print_error: Callable[[str], None]
 
 
-def check_rust_tools(
-    *, config: RustToolsCheckConfig, deps: RustToolsCheckDeps
-) -> bool:
+def check_rust_tools(*, config: RustToolsCheckConfig, deps: RustToolsCheckDeps) -> bool:
     """Check Rust toolchain and rusthound-ce installation.
 
     Returns:
@@ -1704,9 +2005,7 @@ def check_rust_tools(
             deps.configure_cargo_path()
 
         # Check rustup availability first (recommended installation method)
-        rustup_available, rustup_version = deps.is_rustup_available(
-            deps.os_environ
-        )
+        rustup_available, rustup_version = deps.is_rustup_available(deps.os_environ)
         if rustup_available:
             deps.print_success(f"rustup found: {rustup_version}")
             deps.print_info("Using official Rust installer (recommended)")
@@ -1716,12 +2015,12 @@ def check_rust_tools(
             deps.print_info(
                 "   Install with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
             )
-            deps.print_info("   Or run: adscan install (will install rustup automatically)")
+            deps.print_info(
+                "   Or run: adscan install (will install rustup automatically)"
+            )
 
         # Use the unified verification function with current environment
-        rusthound_status = deps.get_rusthound_verification_status(
-            env=deps.os_environ
-        )
+        rusthound_status = deps.get_rusthound_verification_status(env=deps.os_environ)
         if (
             not isinstance(rusthound_status, dict)
             or "verification_results" not in rusthound_status
@@ -1851,18 +2150,14 @@ class PyenvCheckDeps:
     telemetry_capture_exception: Callable[[BaseException], None]
 
 
-def check_pyenv_status(
-    *, config: PyenvCheckConfig, deps: PyenvCheckDeps
-) -> bool:
+def check_pyenv_status(*, config: PyenvCheckConfig, deps: PyenvCheckDeps) -> bool:
     """Check pyenv and Python version management status.
 
     Returns:
         bool: True if pyenv checks pass, False otherwise.
     """
     if config.full_container_runtime:
-        deps.print_info_verbose(
-            "Skipping pyenv verification (running in container)."
-        )
+        deps.print_info_verbose("Skipping pyenv verification (running in container).")
         return True
 
     deps.print_info("Checking pyenv and Python version management...")
@@ -1910,14 +2205,11 @@ def check_pyenv_status(
             if config.fix_mode:
                 deps.print_info("Installing pyenv (--fix)...")
                 deps.print_instruction(
-                    "Please install pyenv manually: "
-                    "curl https://pyenv.run | bash"
+                    "Please install pyenv manually: curl https://pyenv.run | bash"
                 )
                 return False
             else:
-                deps.print_instruction(
-                    "Install pyenv: curl https://pyenv.run | bash"
-                )
+                deps.print_instruction("Install pyenv: curl https://pyenv.run | bash")
                 return False
 
         if pyenv_status.get("shims_need_rehash"):
@@ -2116,9 +2408,13 @@ def run_check(
     all_ok = True
     full_container_runtime = deps.is_full_adscan_container_runtime()
     session_env = deps.determine_session_environment()
-    fix_mode = bool(getattr(config.args, "fix", False)) if config.args is not None else False
+    fix_mode = (
+        bool(getattr(config.args, "fix", False)) if config.args is not None else False
+    )
     fix_trigger = (
-        getattr(config.args, "fix_trigger", None) if config.args is not None and fix_mode else None
+        getattr(config.args, "fix_trigger", None)
+        if config.args is not None and fix_mode
+        else None
     )
     pre_fix_failed = (
         bool(getattr(config.args, "pre_fix_failed", False))
@@ -2208,10 +2504,12 @@ def run_check(
                 py, pkg, env=deps.get_clean_env_for_compilation()
             ),
             assess_version_compliance=deps.assess_version_compliance,
-            get_installed_vcs_reference=lambda py, pkg: deps.get_installed_vcs_reference(
+            get_installed_vcs_reference=lambda py,
+            pkg: deps.get_installed_vcs_reference(
                 py, pkg, env=deps.get_clean_env_for_compilation()
             ),
-            get_installed_vcs_reference_by_url=lambda py, url: deps.get_installed_vcs_reference_by_url(  # noqa: E501
+            get_installed_vcs_reference_by_url=lambda py,
+            url: deps.get_installed_vcs_reference_by_url(  # noqa: E501
                 py, url, env=deps.get_clean_env_for_compilation()
             ),
             normalize_vcs_repo_url=deps.normalize_vcs_repo_url,
@@ -2277,6 +2575,7 @@ def run_check(
         SystemPackagesCheckConfig,
         SystemPackagesCheckDeps,
     )
+
     bh_mode = deps.get_bloodhound_mode()
     system_packages_to_verify = config.system_packages_config.copy()
     if bh_mode == "ce":
@@ -2357,6 +2656,7 @@ def run_check(
         ExternalBinaryToolsCheckConfig,
         ExternalBinaryToolsCheckDeps,
     )
+
     eb_ok, eb_missing = deps.check_external_binary_tools(
         config=ExternalBinaryToolsCheckConfig(
             external_tools_config=config.external_tools_config,
@@ -2378,7 +2678,15 @@ def run_check(
     if not eb_ok:
         all_ok = False
 
-    # 6. Check Wordlists (delegated to WordlistService)
+    # 6. Check ligolo-ng runtime tooling used for pivot tunnels.
+    ligolo_ok = check_ligolo_ng_runtime_tooling(
+        full_container_runtime=full_container_runtime,
+        deps=deps,
+    )
+    if not ligolo_ok:
+        all_ok = False
+
+    # 7. Check Wordlists (delegated to WordlistService)
     deps.print_info("Checking for wordlists...")
     wordlist_service = deps.WordlistService(wordlists_dir=config.wordlists_install_dir)
     w_all_ok, w_details = wordlist_service.verify_all(fix=fix_mode)
@@ -2392,7 +2700,7 @@ def run_check(
     if not w_all_ok:
         all_ok = False
 
-    # 7. Check Docker and Docker Compose (if BloodHound CE is used) - delegated helper
+    # 8. Check Docker and Docker Compose (if BloodHound CE is used) - delegated helper
     from adscan_internal.cli.check import (
         DockerComposeCheckConfig,
         DockerComposeCheckDeps,
@@ -2429,7 +2737,7 @@ def run_check(
     if not docker_ok:
         all_ok = False
 
-    # 8. Check Rust tools (rusthound-ce) - delegated helper
+    # 9. Check Rust tools (rusthound-ce) - delegated helper
     from adscan_internal.cli.check import (
         RustToolsCheckConfig,
         RustToolsCheckDeps,
@@ -2455,7 +2763,7 @@ def run_check(
     if not rust_ok:
         all_ok = False
 
-    # 9. Check Go toolchain (always) and htb-cli (CI-only) - delegated helper
+    # 10. Check Go toolchain (always) and htb-cli (CI-only) - delegated helper
     from adscan_internal.cli.check import (
         GoToolchainCheckConfig,
         GoToolchainCheckDeps,
@@ -2486,7 +2794,7 @@ def run_check(
     if not go_ok:
         all_ok = False
 
-    # 10. Check pyenv and Python version management - delegated helper
+    # 11. Check pyenv and Python version management - delegated helper
     from adscan_internal.cli.check import (
         PyenvCheckConfig,
         PyenvCheckDeps,
@@ -2521,7 +2829,9 @@ def run_check(
         all_ok = False
 
     if all_ok:
-        deps.print_success("All checks passed! adscan installation appears to be complete.")
+        deps.print_success(
+            "All checks passed! adscan installation appears to be complete."
+        )
         deps.print_instruction("Now you can start the tool with adscan start")
 
         # Final consolidated summary table
@@ -2567,8 +2877,13 @@ def run_check(
             )
         return all_ok
     else:
+        recovery_guidance = get_check_failure_recovery_guidance(
+            full_container_runtime=full_container_runtime
+        )
         deps.print_error("Some checks failed. Please review the messages above.")
-        deps.print_instruction("Try: adscan check --fix")
+        deps.print_instruction(recovery_guidance.instruction)
+        if recovery_guidance.follow_up_message:
+            deps.print_info(recovery_guidance.follow_up_message)
         docs_url = "https://www.adscanpro.com/docs/guides/troubleshooting?utm_source=cli&utm_medium=check_failed"
         deps.print_info(
             f"💡 Troubleshooting guide: [link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
@@ -2617,11 +2932,11 @@ def run_check(
         )
 
         # Offer to run `--fix` interactively when possible.
-        offer_fix = (
-            config.args is not None
-            and getattr(config.args, "command", None) == "check"
-            and not deps.os_getenv("CI")
-            and deps.sys_stdin_isatty()
+        offer_fix = should_offer_interactive_check_repair(
+            args=config.args,
+            ci_env=deps.os_getenv("CI"),
+            stdin_isatty=deps.sys_stdin_isatty(),
+            guidance=recovery_guidance,
         )
         if offer_fix:
             deps.telemetry_capture(
@@ -2634,7 +2949,7 @@ def run_check(
             )
             deps.print_warning("Some issues can often be fixed automatically.")
             proceed = deps.confirm_ask(
-                "Try to fix automatically now (runs `adscan check --fix`)?",
+                str(recovery_guidance.interactive_prompt),
                 default=True,
             )
             if proceed:

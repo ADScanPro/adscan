@@ -15,6 +15,7 @@ import ipaddress
 import os
 import re
 import sys
+import tempfile
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -355,6 +356,49 @@ class PdcPreflightResult:
     action: Literal["use", "reenter", "fallback"]
     domain: str
     pdc_ip: str | None = None
+    best_effort: bool = False
+    pdc_hostname: str | None = None
+
+
+def persist_pdc_preflight_result(shell: Any, result: PdcPreflightResult | None) -> None:
+    """Persist preflight metadata for later DNS/hosts finalization.
+
+    The start/scan flows often pass around only ``(domain, pdc_ip)`` tuples after the
+    preflight. Persisting the richer decision here keeps the best-effort DNS mode and
+    the resolved PDC hostname available to ``finalize_domain_context`` without forcing
+    every caller to thread extra return values through the whole CLI.
+    """
+    action = getattr(result, "action", None)
+    pdc_ip = getattr(result, "pdc_ip", None)
+    domain = getattr(result, "domain", None)
+    if not result or action != "use" or not pdc_ip or not domain:
+        return
+
+    try:
+        domain_info = shell.domains_data.setdefault(domain, {})
+    except Exception:
+        return
+
+    domain_info["pdc"] = pdc_ip
+    domain_info["dns_validation_mode"] = (
+        "best_effort" if bool(getattr(result, "best_effort", False)) else "validated"
+    )
+
+    hostname = _normalize_hostname_label(getattr(result, "pdc_hostname", None))
+    if hostname:
+        domain_info["pdc_hostname"] = hostname
+
+
+def is_domain_best_effort_mode(shell: Any, domain: str) -> bool:
+    """Return True when the domain is operating in DNS best-effort mode."""
+    try:
+        domain_info = shell.domains_data.get(domain, {})
+    except Exception:
+        return False
+    return (
+        str(domain_info.get("dns_validation_mode", "")).strip().lower()
+        == "best_effort"
+    )
 
 
 @dataclass(frozen=True)
@@ -386,6 +430,54 @@ class CandidateIpFingerprintEvidence:
     hostname: str | None
 
 
+@dataclass(frozen=True)
+class CandidateDcPortEvidence:
+    """Best-effort AD/DC port evidence gathered for a candidate IP."""
+
+    ip: str
+    open_tcp_ports: tuple[int, ...]
+    dc_likely: bool
+    source: str
+
+
+@dataclass(frozen=True)
+class BestEffortPromptPolicy:
+    """Workspace-aware UX policy for offering best-effort continuation."""
+
+    prompt: str
+    default: bool
+    confirmation_copy: str
+    recommendation_copy: str
+    show_risk_panel: bool = False
+
+
+def _candidate_dc_port_evidence_from_open_ports(
+    *,
+    candidate_ip: str,
+    open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None,
+    source: str,
+) -> CandidateDcPortEvidence | None:
+    """Build DC port evidence from already-known port hints."""
+    ip_clean = (candidate_ip or "").strip()
+    if not ip_clean:
+        return None
+    normalized_ports = tuple(sorted({int(port) for port in (open_tcp_ports or [])}))
+    if not normalized_ports:
+        return CandidateDcPortEvidence(
+            ip=ip_clean,
+            open_tcp_ports=(),
+            dc_likely=False,
+            source=source,
+        )
+    dc_likely = 389 in normalized_ports and (53 in normalized_ports or 88 in normalized_ports)
+    return CandidateDcPortEvidence(
+        ip=ip_clean,
+        open_tcp_ports=normalized_ports,
+        dc_likely=dc_likely,
+        source=source,
+    )
+
+
 def _candidate_domains_for_dns_validation(domain: str) -> list[str]:
     """Return progressively broader domain candidates for strict DNS validation."""
     normalized = (domain or "").strip().rstrip(".").lower()
@@ -399,6 +491,47 @@ def _candidate_domains_for_dns_validation(domain: str) -> list[str]:
         if parent_domain and parent_domain not in candidates:
             candidates.append(parent_domain)
     return candidates
+
+
+def _build_best_effort_prompt_policy(shell: Any, *, candidate_ip: str) -> BestEffortPromptPolicy:
+    """Return workspace-aware UX for best-effort continuation offers."""
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    marked_candidate = mark_sensitive(candidate_ip, "ip")
+    if workspace_type == "audit":
+        return BestEffortPromptPolicy(
+            prompt=(
+                f"Continue in best-effort mode with {marked_candidate} as the DC/PDC target "
+                "for this audit? (not recommended)"
+            ),
+            default=False,
+            confirmation_copy=(
+                "Continuing in best-effort mode for an audit workspace. "
+                "ADscan will rely on the explicit DC/IP and /etc/hosts where possible, "
+                "but DNS-dependent results may be incomplete."
+            ),
+            recommendation_copy=(
+                "This is an audit workspace. Best-effort mode should only be used if you "
+                "have independently verified that this DC/IP is correct and accept that "
+                "some DNS-dependent coverage may be incomplete."
+            ),
+            show_risk_panel=True,
+        )
+    return BestEffortPromptPolicy(
+        prompt=(
+            f"Continue in best-effort mode with {marked_candidate} as the DC/PDC target? "
+            "(recommended for broken-lab DNS)"
+        ),
+        default=True,
+        confirmation_copy=(
+            "Continuing in best-effort mode with the provided DC/PDC target. "
+            "ADscan will rely on the explicit DC/IP and /etc/hosts where possible."
+        ),
+        recommendation_copy=(
+            "This host still looks like a Domain Controller candidate. You can continue in "
+            "best-effort mode with this DC/IP, or re-enter a different DC/DNS IP."
+        ),
+        show_risk_panel=False,
+    )
 
 
 def _validate_domain_with_resolver_fallbacks(
@@ -509,6 +642,104 @@ def _inspect_dc_like_candidate_ip(
     )
 
 
+def _normalize_hostname_label(value: str | None) -> str | None:
+    """Normalize a hostname/FQDN to a short hostname label."""
+    cleaned = str(value or "").strip().rstrip(".")
+    if not cleaned:
+        return None
+    return cleaned.split(".")[0] or None
+
+
+def _probe_dc_candidate_ports(
+    shell: Any,
+    *,
+    candidate_ip: str,
+    known_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
+    timeout_seconds: int = 120,
+) -> CandidateDcPortEvidence | None:
+    """Probe a candidate IP for AD-related TCP ports using the DC discovery path."""
+    ip_clean = (candidate_ip or "").strip()
+    if not ip_clean:
+        return None
+
+    if known_open_tcp_ports is not None:
+        evidence = _candidate_dc_port_evidence_from_open_ports(
+            candidate_ip=ip_clean,
+            open_tcp_ports=known_open_tcp_ports,
+            source="nmap_cached",
+        )
+        if evidence is not None:
+            print_info_debug(
+                f"[pdc_preflight] cached DC probe for {mark_sensitive(ip_clean, 'ip')}: "
+                f"open_ports={evidence.open_tcp_ports}, dc_likely={evidence.dc_likely}"
+            )
+        return evidence
+
+    marked_ip = mark_sensitive(ip_clean, "ip")
+    try:
+        from adscan_internal.cli.nmap import discover_dc_candidates_with_nmap_details
+
+        with tempfile.NamedTemporaryFile(suffix=".gnmap", delete=False) as handle:
+            output_path = handle.name
+        try:
+            port_map = discover_dc_candidates_with_nmap_details(
+                shell,
+                hosts=ip_clean,
+                ports=[53, 88, 389, 445],
+                output_path=output_path,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+
+        open_ports = tuple(sorted(port_map.get(ip_clean, set())))
+        dc_likely = 389 in open_ports and (53 in open_ports or 88 in open_ports)
+        print_info_debug(
+            f"[pdc_preflight] nmap DC probe for {marked_ip}: "
+            f"open_ports={open_ports}, dc_likely={dc_likely}"
+        )
+        return CandidateDcPortEvidence(
+            ip=ip_clean,
+            open_tcp_ports=open_ports,
+            dc_likely=dc_likely,
+            source="nmap",
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[pdc_preflight] nmap DC probe failed for {marked_ip}: {exc}"
+        )
+
+    try:
+        reachability = assess_target_reachability(
+            shell,
+            target_ip=ip_clean,
+            expected_interface=getattr(shell, "interface", None),
+            tcp_ports=(53, 88, 389, 445),
+        )
+        open_ports = tuple(sorted(reachability.open_ports))
+        dc_likely = 389 in open_ports and (53 in open_ports or 88 in open_ports)
+        print_info_debug(
+            f"[pdc_preflight] socket DC probe for {marked_ip}: "
+            f"open_ports={open_ports}, dc_likely={dc_likely}"
+        )
+        return CandidateDcPortEvidence(
+            ip=ip_clean,
+            open_tcp_ports=open_ports,
+            dc_likely=dc_likely,
+            source="reachability",
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[pdc_preflight] reachability DC probe failed for {marked_ip}: {exc}"
+        )
+        return None
+
+
 def _format_candidate_ip_evidence_lines(
     *,
     evidence: CandidateIpFingerprintEvidence | None,
@@ -551,12 +782,41 @@ def _format_candidate_ip_evidence_lines(
     return lines
 
 
+def _format_candidate_port_probe_lines(
+    port_evidence: CandidateDcPortEvidence | None,
+) -> list[str]:
+    """Render extra diagnosis lines from an AD/DC port probe."""
+    if port_evidence is None:
+        return []
+
+    if port_evidence.open_tcp_ports:
+        open_ports = ", ".join(str(port) for port in port_evidence.open_tcp_ports)
+    else:
+        open_ports = "none"
+
+    lines = [
+        "[bold]Additional port evidence:[/bold]",
+        f"• {port_evidence.source.upper()} AD ports open: {open_ports}",
+    ]
+    if port_evidence.dc_likely:
+        lines.append(
+            "• The host still looks like a Domain Controller candidate based on AD-related ports."
+        )
+    return lines
+
+
 def _build_domain_validation_next_step(
     *,
     validation: DomainValidationOutcome,
     fingerprint_evidence: CandidateIpFingerprintEvidence | None,
+    port_evidence: CandidateDcPortEvidence | None = None,
 ) -> str:
     """Return the most actionable next-step guidance for DNS validation failures."""
+    if port_evidence and port_evidence.dc_likely:
+        return (
+            "This host still looks like a Domain Controller candidate. "
+            "You can continue in best-effort mode with this DC/IP, or re-enter a different DC/DNS IP."
+        )
     if fingerprint_evidence:
         marked_evidence_domain = mark_sensitive(fingerprint_evidence.domain, "domain")
         if fingerprint_evidence.domain == validation.selected_domain:
@@ -587,6 +847,7 @@ def _capture_domain_validation_telemetry(
     mode_label: str,
     validation: DomainValidationOutcome,
     fingerprint_evidence: CandidateIpFingerprintEvidence | None = None,
+    port_evidence: CandidateDcPortEvidence | None = None,
 ) -> None:
     """Capture a compact telemetry event for strict DNS validation attempts."""
     used_parent = validation.selected_domain != validation.requested_domain
@@ -618,6 +879,13 @@ def _capture_domain_validation_telemetry(
             "fingerprint_domain_matches_selected": bool(
                 fingerprint_evidence
                 and fingerprint_evidence.domain == validation.selected_domain
+            ),
+            "dc_probe_source": port_evidence.source if port_evidence else None,
+            "dc_probe_open_ports": (
+                list(port_evidence.open_tcp_ports) if port_evidence else None
+            ),
+            "dc_probe_likely": (
+                bool(port_evidence.dc_likely) if port_evidence else False
             ),
         },
     )
@@ -875,6 +1143,7 @@ def preflight_domain_pdc_noninteractive(
     domain: str,
     candidate_ip: str,
     mode_label: str,
+    candidate_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
 ) -> PdcPreflightResult:
     """Best-effort DC/PDC preflight without prompting."""
     marked_domain = mark_sensitive(domain, "domain")
@@ -888,15 +1157,22 @@ def preflight_domain_pdc_noninteractive(
     dns_error = validation.error
     effective_domain = validation.selected_domain
     fingerprint_evidence = None
+    port_evidence = None
     if not dns_ok:
         fingerprint_evidence = _inspect_dc_like_candidate_ip(
             shell,
             candidate_ip=candidate_ip,
         )
+        port_evidence = _probe_dc_candidate_ports(
+            shell,
+            candidate_ip=candidate_ip,
+            known_open_tcp_ports=candidate_open_tcp_ports,
+        )
     _capture_domain_validation_telemetry(
         mode_label=mode_label,
         validation=validation,
         fingerprint_evidence=fingerprint_evidence,
+        port_evidence=port_evidence,
     )
     if effective_domain != domain:
         print_info(
@@ -930,6 +1206,7 @@ def preflight_domain_pdc_noninteractive(
         next_step = _build_domain_validation_next_step(
             validation=validation,
             fingerprint_evidence=fingerprint_evidence,
+            port_evidence=port_evidence,
         )
         if dns_error:
             print_info_verbose(
@@ -946,8 +1223,18 @@ def preflight_domain_pdc_noninteractive(
             selected_domain=validation.selected_domain,
         ):
             print_info(f"{evidence_line}")
+        for evidence_line in _format_candidate_port_probe_lines(port_evidence):
+            print_info(f"{evidence_line}")
         print_info(f"[bold]Next:[/bold] {next_step}")
-        return PdcPreflightResult(action="use", domain=domain, pdc_ip=candidate_ip)
+        return PdcPreflightResult(
+            action="use",
+            domain=domain,
+            pdc_ip=candidate_ip,
+            best_effort=bool(port_evidence and port_evidence.dc_likely),
+            pdc_hostname=_normalize_hostname_label(
+                fingerprint_evidence.hostname if fingerprint_evidence else None
+            ),
+        )
 
     selection = _select_reachable_dc_resolver(
         shell,
@@ -988,6 +1275,7 @@ def preflight_domain_pdc_interactive(
     domain: str,
     candidate_ip: str,
     mode_label: str,
+    candidate_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
 ) -> PdcPreflightResult:
     """Validate (domain, candidate_ip) and ask user to confirm corrections."""
     if not sys.stdin.isatty():
@@ -1006,15 +1294,22 @@ def preflight_domain_pdc_interactive(
     dns_ok = validation.ok
     dns_error = validation.error
     fingerprint_evidence = None
+    port_evidence = None
     if not dns_ok:
         fingerprint_evidence = _inspect_dc_like_candidate_ip(
             shell,
             candidate_ip=candidate_ip,
         )
+        port_evidence = _probe_dc_candidate_ports(
+            shell,
+            candidate_ip=candidate_ip,
+            known_open_tcp_ports=candidate_open_tcp_ports,
+        )
     _capture_domain_validation_telemetry(
         mode_label=mode_label,
         validation=validation,
         fingerprint_evidence=fingerprint_evidence,
+        port_evidence=port_evidence,
     )
     if validation.selected_domain != domain:
         parent_domain = validation.selected_domain
@@ -1069,10 +1364,19 @@ def preflight_domain_pdc_interactive(
             requested_domain=validation.requested_domain,
             selected_domain=validation.selected_domain,
         )
+        port_lines = _format_candidate_port_probe_lines(port_evidence)
         next_step = _build_domain_validation_next_step(
             validation=validation,
             fingerprint_evidence=fingerprint_evidence,
+            port_evidence=port_evidence,
         )
+        best_effort_policy = (
+            _build_best_effort_prompt_policy(shell, candidate_ip=candidate_ip)
+            if port_evidence and port_evidence.dc_likely
+            else None
+        )
+        if best_effort_policy is not None:
+            next_step = best_effort_policy.recommendation_copy
         print_panel(
             "[bold]We couldn't validate the DC/PDC IP.[/bold]\n\n"
             f"Domain: {marked_domain}\n"
@@ -1080,6 +1384,7 @@ def preflight_domain_pdc_interactive(
             "[yellow]The host resolved, but it did not answer DNS SRV queries for the tested domain namespace.[/yellow]\n\n"
             + "\n".join(attempt_lines)
             + ("\n\n" + "\n".join(evidence_lines) if evidence_lines else "")
+            + ("\n\n" + "\n".join(port_lines) if port_lines else "")
             + f"\n\n[bold]Next:[/bold] {next_step}",
             title="[bold]🧭 Domain Validation Failed[/bold]",
             border_style="red",
@@ -1097,6 +1402,12 @@ def preflight_domain_pdc_interactive(
                     "[pdc_preflight] candidate IP still looks AD-related via "
                     f"{fingerprint_evidence.method}: "
                     f"{mark_sensitive(fingerprint_evidence.domain, 'domain')}"
+                )
+            if port_evidence:
+                print_info_debug(
+                    "[pdc_preflight] candidate IP AD port probe via "
+                    f"{port_evidence.source}: open_ports={port_evidence.open_tcp_ports} "
+                    f"dc_likely={port_evidence.dc_likely}"
                 )
         if (
             fingerprint_evidence
@@ -1128,6 +1439,38 @@ def preflight_domain_pdc_interactive(
                 candidate_ip=candidate_ip,
                 mode_label=mode_label,
             )
+        if port_evidence and port_evidence.dc_likely and best_effort_policy is not None:
+            if best_effort_policy.show_risk_panel:
+                print_panel(
+                    "[bold yellow]This workspace is configured as an audit.[/bold yellow]\n\n"
+                    f"{best_effort_policy.recommendation_copy}",
+                    title="[bold]⚠ Best-Effort Mode[/bold]",
+                    border_style="yellow",
+                    padding=(1, 2),
+                )
+            if Confirm.ask(
+                Text(best_effort_policy.prompt, style="cyan"),
+                default=best_effort_policy.default,
+            ):
+                telemetry.capture(
+                    "pdc_preflight_confirmed",
+                    properties={
+                        "mode": mode_label,
+                        "action": "use_best_effort_dc",
+                        "dc_probe_source": port_evidence.source,
+                        "workspace_type": str(getattr(shell, "type", "") or "").strip().lower(),
+                    },
+                )
+                print_info(best_effort_policy.confirmation_copy)
+                return PdcPreflightResult(
+                    action="use",
+                    domain=domain,
+                    pdc_ip=candidate_ip,
+                    best_effort=True,
+                    pdc_hostname=_normalize_hostname_label(
+                        fingerprint_evidence.hostname if fingerprint_evidence else None
+                    ),
+                )
         if Confirm.ask(
             Text("Re-enter the domain and DC/PDC IP?", style="cyan"),
             default=True,
@@ -1319,14 +1662,23 @@ def preflight_domain_pdc(
     candidate_ip: str,
     interactive: bool,
     mode_label: str,
+    candidate_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
 ) -> PdcPreflightResult:
     """Preflight wrapper that avoids interactive prompts when not desired."""
     if interactive:
         return preflight_domain_pdc_interactive(
-            shell, domain=domain, candidate_ip=candidate_ip, mode_label=mode_label
+            shell,
+            domain=domain,
+            candidate_ip=candidate_ip,
+            mode_label=mode_label,
+            candidate_open_tcp_ports=candidate_open_tcp_ports,
         )
     return preflight_domain_pdc_noninteractive(
-        shell, domain=domain, candidate_ip=candidate_ip, mode_label=mode_label
+        shell,
+        domain=domain,
+        candidate_ip=candidate_ip,
+        mode_label=mode_label,
+        candidate_open_tcp_ports=candidate_open_tcp_ports,
     )
 
 
@@ -1337,6 +1689,7 @@ def preflight_domain_pdc_from_candidates(
     candidate_ips: list[str],
     interactive: bool,
     mode_label: str,
+    candidate_open_ports: dict[str, set[int]] | None = None,
 ) -> PdcPreflightResult:
     """Run DC/PDC preflight over a list of candidate IPs.
 
@@ -1376,6 +1729,7 @@ def preflight_domain_pdc_from_candidates(
             candidate_ip=ip,
             interactive=interactive,
             mode_label=mode_label,
+            candidate_open_tcp_ports=(candidate_open_ports or {}).get(ip),
         )
         if decision.action == "use" and decision.pdc_ip:
             return decision
@@ -1459,6 +1813,7 @@ def prompt_known_domain_and_pdc_interactive(
         )
 
         if decision.action == "use" and decision.pdc_ip:
+            persist_pdc_preflight_result(shell, decision)
             return decision.domain, decision.pdc_ip
 
         if decision.action == "reenter":
@@ -1479,19 +1834,25 @@ def confirm_domain_pdc_mapping(
     interactive: bool,
     mode_label: str,
     on_reenter: Callable[[], tuple[str, str] | None] | None = None,
+    candidate_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
 ) -> tuple[str, str] | None:
     """Confirm/validate a domain ↔ PDC mapping with shared UX."""
     current_domain = domain
     current_ip = candidate_ip
     while True:
+        current_port_hints = (
+            candidate_open_tcp_ports if current_ip == candidate_ip else None
+        )
         decision = preflight_domain_pdc(
             shell,
             domain=current_domain,
             candidate_ip=current_ip,
             interactive=interactive,
             mode_label=mode_label,
+            candidate_open_tcp_ports=current_port_hints,
         )
         if decision.action == "use" and decision.pdc_ip:
+            persist_pdc_preflight_result(shell, decision)
             return decision.domain, decision.pdc_ip
         if decision.action == "reenter" and on_reenter:
             updated = on_reenter()
@@ -1608,6 +1969,39 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
     """
     marked_domain = mark_sensitive(domain, "domain")
     marked_ip = mark_sensitive(ip, "ip") if ip else None
+    if is_domain_best_effort_mode(shell, domain):
+        try:
+            domain_info = shell.domains_data.setdefault(domain, {})
+        except Exception:
+            domain_info = {}
+
+        effective_pdc_ip = (ip or domain_info.get("pdc") or getattr(shell, "pdc", None) or "").strip()
+        hostname = _normalize_hostname_label(
+            domain_info.get("pdc_hostname") or getattr(shell, "pdc_hostname", None)
+        )
+        if effective_pdc_ip:
+            shell.pdc = effective_pdc_ip
+            domain_info["pdc"] = effective_pdc_ip
+        if hostname:
+            shell.pdc_hostname = hostname
+            domain_info["pdc_hostname"] = hostname
+            try:
+                shell.add_to_hosts(domain)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[check_dns] Failed to refresh /etc/hosts for best-effort domain "
+                    f"{marked_domain}: {exc}"
+                )
+        print_info_verbose(
+            f"Best-effort DNS mode active for {marked_domain}; skipping strict DNS validation."
+        )
+        print_info_debug(
+            f"[check_dns] Skipping strict DNS validation for {marked_domain}: "
+            f"best_effort=True ip={marked_ip}"
+        )
+        return True
+
     local_resolver_ip = shell.get_local_resolver_ip()
     marked_local_resolver_ip = mark_sensitive(local_resolver_ip, "ip")
     print_info_debug(
@@ -1948,12 +2342,55 @@ def resolve_pdc_hostname(
     return None
 
 
+def resolve_pdc_hostname_best_effort(
+    shell: DNSShell,
+    *,
+    domain: str,
+    pdc_ip: str,
+    hostname_hint: str | None = None,
+) -> str | None:
+    """Resolve a short PDC hostname with best-effort fallbacks.
+
+    Order:
+    1. caller-provided hint
+    2. strict DNS-based hostname discovery
+    3. LDAP/SMB fingerprinting for the candidate IP
+    4. PTR reverse lookup
+    """
+    normalized_hint = _normalize_hostname_label(hostname_hint)
+    if normalized_hint:
+        return normalized_hint
+
+    hostname = resolve_pdc_hostname(shell, domain=domain, pdc_ip=pdc_ip)
+    if hostname:
+        return _normalize_hostname_label(hostname)
+
+    evidence = _inspect_dc_like_candidate_ip(shell, candidate_ip=pdc_ip)
+    if evidence and evidence.hostname:
+        return _normalize_hostname_label(evidence.hostname)
+
+    try:
+        service = shell._get_dns_discovery_service()
+        fqdn = service.reverse_resolve_fqdn_robust(pdc_ip, resolver=pdc_ip)
+        if fqdn:
+            return _normalize_hostname_label(fqdn)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[dns] Failed best-effort hostname lookup for {mark_sensitive(pdc_ip, 'ip')}: {exc}"
+        )
+
+    return None
+
+
 def finalize_domain_context(
     shell: DNSShell,
     *,
     domain: str,
     pdc_ip: str,
     interactive: bool,
+    best_effort: bool | None = None,
+    pdc_hostname_hint: str | None = None,
 ) -> None:
     """Finalize DNS + /etc/hosts setup after confirming a domain and PDC/DC IP."""
     if not domain or not pdc_ip:
@@ -1961,9 +2398,26 @@ def finalize_domain_context(
 
     marked_domain = mark_sensitive(domain, "domain")
     marked_ip = mark_sensitive(pdc_ip, "ip")
-    print_info_debug(
-        f"[dns] Finalizing domain context: domain={marked_domain}, pdc_ip={marked_ip}"
+    domain_info = (
+        shell.domains_data.setdefault(domain, {})
+        if hasattr(shell, "domains_data")
+        else {}
     )
+    if best_effort is None:
+        best_effort = str(domain_info.get("dns_validation_mode", "")).strip().lower() == "best_effort"
+    if pdc_hostname_hint is None:
+        pdc_hostname_hint = domain_info.get("pdc_hostname")
+    print_info_debug(
+        f"[dns] Finalizing domain context: domain={marked_domain}, pdc_ip={marked_ip}, "
+        f"best_effort={best_effort}"
+    )
+
+    try:
+        domain_info["pdc"] = pdc_ip
+        domain_info["dns_validation_mode"] = "best_effort" if best_effort else "validated"
+    except Exception:
+        pass
+    shell.pdc = pdc_ip
 
     required_helpers = [
         "dns_find_pdc_resolv",
@@ -1977,7 +2431,15 @@ def finalize_domain_context(
         "_configure_system_dns_for_unbound",
         "_verify_dns_resolution",
     ]
-    if all(hasattr(shell, name) for name in required_helpers):
+    if best_effort:
+        print_info(
+            "Skipping local DNS resolver reconfiguration because this domain is "
+            "running in best-effort mode."
+        )
+        print_info_debug(
+            f"[dns] Skipping resolver update for {marked_domain}: best-effort mode"
+        )
+    elif all(hasattr(shell, name) for name in required_helpers):
         try:
             if not update_resolver_for_domain(shell, domain, pdc_ip):
                 print_warning(
@@ -1995,13 +2457,20 @@ def finalize_domain_context(
         )
 
     hostname = (
-        getattr(shell, "pdc_hostname", None)
-        or shell.domains_data.get(domain, {}).get("pdc_hostname")
-        if getattr(shell, "domains_data", None)
-        else None
+        _normalize_hostname_label(pdc_hostname_hint)
+        or _normalize_hostname_label(getattr(shell, "pdc_hostname", None))
+        or _normalize_hostname_label(domain_info.get("pdc_hostname"))
     )
     if not hostname:
-        hostname = resolve_pdc_hostname(shell, domain=domain, pdc_ip=pdc_ip)
+        if best_effort:
+            hostname = resolve_pdc_hostname_best_effort(
+                shell,
+                domain=domain,
+                pdc_ip=pdc_ip,
+                hostname_hint=pdc_hostname_hint,
+            )
+        else:
+            hostname = resolve_pdc_hostname(shell, domain=domain, pdc_ip=pdc_ip)
 
     if not hostname and interactive:
         print_panel(
@@ -2027,8 +2496,8 @@ def finalize_domain_context(
         shell.pdc = pdc_ip
         shell.pdc_hostname = hostname
         try:
-            shell.domains_data.setdefault(domain, {})["pdc_hostname"] = hostname
-            shell.domains_data.setdefault(domain, {})["pdc"] = pdc_ip
+            domain_info["pdc_hostname"] = hostname
+            domain_info["pdc"] = pdc_ip
         except Exception:
             pass
 

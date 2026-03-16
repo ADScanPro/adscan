@@ -18,10 +18,12 @@ import subprocess
 import zipfile
 
 from adscan_internal.file_content_type import detect_file_content_type
+from adscan_internal.integrations.impacket.parsers import parse_secretsdump_output
 from adscan_internal.services.base_service import BaseService
 
 
 CommandExecutor = Callable[..., subprocess.CompletedProcess[str] | None]
+_NTLM_HASH_DUMP_TEXT_EXTENSIONS = (".txt", ".log", ".csv")
 
 
 @dataclass(frozen=True)
@@ -162,6 +164,31 @@ class ShareFileAnalyzerService(BaseService):
                 findings=findings,
                 notes=notes,
             )
+        if lowered_path.endswith(_NTLM_HASH_DUMP_TEXT_EXTENSIONS):
+            text = file_bytes.decode("utf-8", errors="replace")
+            findings, notes = self._analyze_ntlm_hash_dump_text(
+                source_path=effective_source_path,
+                text=text,
+            )
+            if not findings:
+                return ShareFileAnalyzerResult(
+                    handled=False,
+                    continue_with_ai=True,
+                    summary="",
+                    findings=[],
+                    notes=notes,
+                )
+            summary = (
+                "Deterministic NTLM dump analysis found "
+                f"{len(findings)} credential candidate(s)."
+            )
+            return ShareFileAnalyzerResult(
+                handled=True,
+                continue_with_ai=not bool(findings),
+                summary=summary,
+                findings=findings,
+                notes=notes,
+            )
 
         return ShareFileAnalyzerResult(
             handled=False,
@@ -258,6 +285,40 @@ class ShareFileAnalyzerService(BaseService):
                 findings=findings,
                 notes=notes,
             )
+        if lowered_path.endswith(_NTLM_HASH_DUMP_TEXT_EXTENSIONS):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception as exc:  # noqa: BLE001
+                return ShareFileAnalyzerResult(
+                    handled=True,
+                    continue_with_ai=True,
+                    summary="Deterministic NTLM dump analysis failed; falling back to AI.",
+                    findings=[],
+                    notes=[f"Text read failure: {type(exc).__name__}."],
+                )
+            findings, notes = self._analyze_ntlm_hash_dump_text(
+                source_path=str(path),
+                text=text,
+            )
+            if not findings:
+                return ShareFileAnalyzerResult(
+                    handled=False,
+                    continue_with_ai=True,
+                    summary="",
+                    findings=[],
+                    notes=notes,
+                )
+            summary = (
+                "Deterministic NTLM dump analysis found "
+                f"{len(findings)} credential candidate(s)."
+            )
+            return ShareFileAnalyzerResult(
+                handled=True,
+                continue_with_ai=not bool(findings),
+                summary=summary,
+                findings=findings,
+                notes=notes,
+            )
         if lowered_path.endswith(".xlsm"):
             findings, notes = self._analyze_xlsm_path(source_path=str(path))
             summary = (
@@ -299,6 +360,31 @@ class ShareFileAnalyzerService(BaseService):
             findings=[],
             notes=[],
         )
+
+    def _analyze_ntlm_hash_dump_text(
+        self,
+        *,
+        source_path: str,
+        text: str,
+    ) -> tuple[list[ShareFileAnalyzerFinding], list[str]]:
+        """Parse secretsdump/SAM-style NTLM hash dumps from text files."""
+        parsed_hashes = parse_secretsdump_output(text)
+        findings: list[ShareFileAnalyzerFinding] = []
+        for parsed_hash in parsed_hashes:
+            username = str(getattr(parsed_hash, "username", "") or "").strip()
+            ntlm_hash = str(getattr(parsed_hash, "ntlm_hash", "") or "").strip()
+            if not username or not ntlm_hash:
+                continue
+            findings.append(
+                ShareFileAnalyzerFinding(
+                    credential_type="ntlm_hash",
+                    username=username,
+                    secret=ntlm_hash,
+                    confidence="high",
+                    evidence=f"secretsdump-format line in {source_path}",
+                )
+            )
+        return findings, []
 
     def _analyze_zip_archive(
         self,

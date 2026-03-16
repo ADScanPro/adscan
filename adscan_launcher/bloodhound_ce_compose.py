@@ -21,6 +21,11 @@ from importlib import resources
 from pathlib import Path
 from typing import Callable
 
+from adscan_core.port_diagnostics import (
+    is_tcp_port_listening as _is_tcp_port_listening,
+    list_listening_tcp_pids,
+    terminate_pids,
+)
 from adscan_launcher import telemetry
 from adscan_launcher.docker_runtime import (
     docker_available,
@@ -1207,41 +1212,6 @@ def _replace_bloodhound_ce_stack(
     return True
 
 
-def _is_tcp_port_listening(port: int) -> bool:
-    """Return True if any process is listening on the given TCP port (localhost or any)."""
-    # Prefer ss; fall back to lsof if available.
-    try:
-        proc = subprocess.run(
-            ["ss", "-ltnp", f"sport = :{port}"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        )
-        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        # If a LISTEN line exists, the port is in use.
-        if "LISTEN" in out.upper():
-            return True
-        # Some builds omit LISTEN label in filtered output; consider any match with :port.
-        return f":{port}" in out
-    except Exception:
-        pass
-
-    if shutil.which("lsof"):
-        try:
-            proc = subprocess.run(
-                ["lsof", "-iTCP:%d" % port, "-sTCP:LISTEN", "-Pn"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=2,
-            )
-            return bool((proc.stdout or "").strip())
-        except Exception:
-            return False
-    return False
-
-
 def _maybe_free_host_port_for_bloodhound_ce(port: int) -> bool:
     """Offer (or auto-accept in CI) to free a host port for BloodHound CE."""
     is_ci = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
@@ -1316,47 +1286,26 @@ def _listening_pids_for_tcp_port(
     port: int, *, require_noninteractive_sudo: bool
 ) -> list[str]:
     """Return PIDs listening on TCP port, best-effort (uses lsof/ss)."""
-    if shutil.which("lsof"):
-        try:
-            proc = _run_with_sudo(
-                ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-Pn"],
-                require_noninteractive=require_noninteractive_sudo,
-            )
-            if proc.returncode == 0 and proc.stdout:
-                return sorted(
-                    {line.strip() for line in proc.stdout.splitlines() if line.strip()}
-                )
-        except Exception:
-            pass
-    try:
-        proc = _run_with_sudo(
-            ["ss", "-ltnp", f"sport = :{port}"],
+    pids = list_listening_tcp_pids(
+        port,
+        run_command=lambda argv: _run_with_sudo(
+            argv,
             require_noninteractive=require_noninteractive_sudo,
-        )
-        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        return sorted({m.group(1) for m in re.finditer(r"pid=(\d+)", out)})
-    except Exception:
-        return []
+        ),
+    )
+    return [str(pid) for pid in pids]
 
 
 def _kill_pids(pids: list[str], *, require_noninteractive_sudo: bool) -> bool:
     """Terminate PIDs with TERM then KILL if needed."""
-    if not pids:
-        return True
-    for pid in pids:
-        proc = _run_with_sudo(
-            ["kill", "-TERM", pid], require_noninteractive=require_noninteractive_sudo
-        )
-        if proc.returncode not in (0, 1):
-            return False
-    time.sleep(1)
-    for pid in pids:
-        proc = _run_with_sudo(
-            ["kill", "-KILL", pid], require_noninteractive=require_noninteractive_sudo
-        )
-        if proc.returncode not in (0, 1):
-            return False
-    return True
+    return terminate_pids(
+        [int(pid) for pid in pids if str(pid).isdigit()],
+        run_command=lambda argv: _run_with_sudo(
+            argv,
+            require_noninteractive=require_noninteractive_sudo,
+        ),
+        grace_period_seconds=1.0,
+    )
 
 
 def _free_host_port_for_bloodhound_ce(

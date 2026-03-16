@@ -1942,9 +1942,7 @@ def _apply_affected_user_metadata(
         for node in nodes_map.values():
             if not isinstance(node, dict):
                 continue
-            canonical = _canonical_membership_label(
-                domain, _canonical_node_label(node)
-            )
+            canonical = _canonical_membership_label(domain, _canonical_node_label(node))
             if canonical:
                 label_kind_map[canonical] = _node_kind(node)
 
@@ -2039,7 +2037,9 @@ def _apply_affected_user_metadata(
                 affected_count = len(affected_users)
                 affected_source = fallback_domain_users_source
             elif has_users:
-                affected_users = sorted(group_members.get(scope_label, set()), key=str.lower)
+                affected_users = sorted(
+                    group_members.get(scope_label, set()), key=str.lower
+                )
                 affected_count = len(affected_users)
                 if affected_count > 0:
                     affected_source = "snapshot_group_members"
@@ -2086,7 +2086,11 @@ def _derive_execution_scope_metadata(
         return {}
 
     relations = record.get("relations")
-    first_relation = str(relations[0] or "").strip() if isinstance(relations, list) and relations else ""
+    first_relation = (
+        str(relations[0] or "").strip()
+        if isinstance(relations, list) and relations
+        else ""
+    )
     relation_key = _normalize_relation_key(first_relation)
 
     if normalized_source == "ANONYMOUS LOGON":
@@ -5606,7 +5610,10 @@ def upsert_local_admin_password_reuse_edges(
                     if anchor_id
                     else None,
                     **(
-                        {"credential": credential_clean, "credential_type": credential_type}
+                        {
+                            "credential": credential_clean,
+                            "credential_type": credential_type,
+                        }
                         if credential_clean
                         else {}
                     ),
@@ -6436,20 +6443,37 @@ def upsert_roast_entry_edge(
     username: str,
     status: str,
     notes: dict[str, Any] | None = None,
-    entry_label: str = "Domain Users",
+    entry_label: str | None = None,
 ) -> bool:
     """Upsert an entry-vector edge for roasting: Entry -> roast_type -> username."""
     roast_type_norm = (roast_type or "").strip().lower()
-    if roast_type_norm not in {"kerberoast", "asreproast"}:
+    relation_map = {
+        "kerberoast": ("Kerberoasting", "user", "Domain Users"),
+        "asreproast": ("ASREPRoasting", "user", "Domain Users"),
+        "timeroast": ("Timeroasting", "computer", "ANONYMOUS LOGON"),
+    }
+    relation_info = relation_map.get(roast_type_norm)
+    if relation_info is None:
         return False
+    relation, principal_kind, default_entry_label = relation_info
     graph = load_attack_graph(shell, domain)
-    entry_id = ensure_entry_node_for_domain(shell, domain, graph, label=entry_label)
-    user_id = ensure_user_node_for_domain(shell, domain, graph, username=username)
-    relation = "Kerberoasting" if roast_type_norm == "kerberoast" else "ASREPRoasting"
+    entry_id = ensure_entry_node_for_domain(
+        shell,
+        domain,
+        graph,
+        label=entry_label or default_entry_label,
+    )
+    principal_id = ensure_principal_node_for_domain(
+        shell,
+        domain,
+        graph,
+        principal=username,
+        principal_kind=principal_kind,
+    )
     upsert_edge(
         graph,
         from_id=entry_id,
-        to_id=user_id,
+        to_id=principal_id,
         relation=relation,
         edge_type="entry_vector",
         status=status,
@@ -6493,6 +6517,7 @@ def upsert_password_spray_entry_edge(
     username: str,
     password: str,
     spray_type: str | None = None,
+    spray_category: str | None = None,
     status: str = "success",
     entry_label: str = "Domain Users",
 ) -> bool:
@@ -6507,6 +6532,7 @@ def upsert_password_spray_entry_edge(
         username: User compromised via spraying.
         password: Password that was accepted for the user.
         spray_type: Human-friendly spray mode label (optional).
+        spray_category: Stable internal spray mode key (optional).
         status: Edge status (default: success).
         entry_label: Label for the entry node (default: "Domain Users").
 
@@ -6536,6 +6562,8 @@ def upsert_password_spray_entry_edge(
     }
     if spray_type:
         notes["spray_type"] = str(spray_type)
+    if spray_category:
+        notes["spray_category"] = str(spray_category)
 
     upsert_edge(
         graph,
@@ -6589,7 +6617,7 @@ def update_roast_entry_edge_status(
     username: str,
     status: str,
     wordlist: str | None = None,
-    entry_label: str = "Domain Users",
+    entry_label: str | None = None,
 ) -> bool:
     """Update the roasting entry edge status and append wordlist attempt notes.
 
@@ -6597,13 +6625,30 @@ def update_roast_entry_edge_status(
     relying on any cached "attack path" structures.
     """
     roast_type_norm = (roast_type or "").strip().lower()
-    if roast_type_norm not in {"kerberoast", "asreproast"}:
+    relation_map = {
+        "kerberoast": ("Kerberoasting", "user", "Domain Users"),
+        "asreproast": ("ASREPRoasting", "user", "Domain Users"),
+        "timeroast": ("Timeroasting", "computer", "ANONYMOUS LOGON"),
+    }
+    relation_info = relation_map.get(roast_type_norm)
+    if relation_info is None:
         return False
+    relation, principal_kind, default_entry_label = relation_info
 
     graph = load_attack_graph(shell, domain)
-    entry_id = ensure_entry_node_for_domain(shell, domain, graph, label=entry_label)
-    user_id = ensure_user_node_for_domain(shell, domain, graph, username=username)
-    relation = "Kerberoasting" if roast_type_norm == "kerberoast" else "ASREPRoasting"
+    entry_id = ensure_entry_node_for_domain(
+        shell,
+        domain,
+        graph,
+        label=entry_label or default_entry_label,
+    )
+    principal_id = ensure_principal_node_for_domain(
+        shell,
+        domain,
+        graph,
+        principal=username,
+        principal_kind=principal_kind,
+    )
 
     now = _utc_now_iso()
     edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
@@ -6612,7 +6657,7 @@ def update_roast_entry_edge_status(
             continue
         if (
             str(edge.get("from") or "") != entry_id
-            or str(edge.get("to") or "") != user_id
+            or str(edge.get("to") or "") != principal_id
             or str(edge.get("relation") or "") != relation
         ):
             continue
@@ -6645,7 +6690,7 @@ def update_roast_entry_edge_status(
     upsert_edge(
         graph,
         from_id=entry_id,
-        to_id=user_id,
+        to_id=principal_id,
         relation=relation,
         edge_type="entry_vector",
         status=status,
@@ -7305,9 +7350,7 @@ def compute_display_paths_for_user(
     )
     cached = _attack_paths_cache_get(cache_key, domain=domain, scope="user")
     if cached is not None:
-        cached = _filter_zero_length_display_paths(
-            cached, domain=domain, scope="user"
-        )
+        cached = _filter_zero_length_display_paths(cached, domain=domain, scope="user")
         cached = _apply_affected_user_metadata(shell, domain, cached)
         _log_attack_path_compute_timing(
             domain=domain,

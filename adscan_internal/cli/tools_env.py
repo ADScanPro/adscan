@@ -8,7 +8,6 @@ callers (e.g., adscan.py) provide the concrete values.
 from __future__ import annotations
 
 import os
-import shutil
 from typing import Any, Dict, Mapping, Optional, Callable
 
 from adscan_internal.path_utils import get_adscan_home
@@ -22,7 +21,7 @@ def build_venv_exec_env(
     python_executable: str,
 ) -> Dict[str, str]:
     """Build a clean environment for executing commands inside an isolated venv.
-    
+
     Args:
         get_clean_env_for_compilation: Callable that returns a clean base env.
         venv_path: Path to the venv directory.
@@ -76,7 +75,7 @@ TOOLS_INSTALL_DIR = os.path.join(str(get_adscan_home()), "tools")
 
 def _is_full_adscan_container_runtime() -> bool:
     """Return True when running inside the ADscan FULL runtime container.
-    
+
     This is distinct from "Docker is installed on the host". In this mode, ADscan
     is already bundled with its dependencies under `/opt/adscan`, and we must
     avoid recursive Docker-mode execution (Docker-in-Docker is not supported).
@@ -95,40 +94,21 @@ def _is_full_adscan_container_runtime() -> bool:
 
 
 def maybe_wrap_hashcat_for_container(command: str) -> str:
-    """Return a hashcat command wrapped for Docker runtime compatibility.
-    
-    Hashcat's OpenCL backend (PoCL) can crash or fail to enumerate devices when
-    executed as a non-root UID inside some container environments. In the ADscan
-    FULL runtime container we prefer to run hashcat as root via sudo (NOPASSWD)
-    while keeping the rest of the CLI unprivileged.
-    
+    """Return the provided hashcat command unchanged.
+
+    Hashcat runs unprivileged in ADscan. We intentionally avoid wrapping it
+    with ``sudo`` because that can redirect potfiles/artifacts into
+    ``/root/.hashcat`` and create permission/ownership problems for later
+    cracking workflows.
+
     Args:
         command: Command string (shell form).
-    
+
     Returns:
-        Possibly wrapped command string.
+        Unchanged command string.
     """
-    if not isinstance(command, str) or not command.strip():
-        return command
-    if not _is_full_adscan_container_runtime():
-        return command
-    # If we're already root in the container, no wrapper needed.
-    if os.geteuid() == 0:
-        return command
-    # Only wrap hashcat invocations.
-    if not command.lstrip().startswith("hashcat "):
-        if command.lstrip() != "hashcat" and not command.lstrip().startswith(
-            "hashcat\t"
-        ):
-            return command
-    if not shutil.which("sudo"):
-        return command
-    # Avoid double-wrapping.
-    if command.lstrip().startswith("sudo "):
-        return command
-    return f"sudo -n {command}"
+    return command
 
 
 # Alias for backward compatibility with adscan.py
 _maybe_wrap_hashcat_for_container = maybe_wrap_hashcat_for_container
-

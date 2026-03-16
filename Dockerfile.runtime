@@ -38,6 +38,8 @@ FROM debian:trixie-slim AS runtime-common
 ARG DEBIAN_FRONTEND=noninteractive
 ARG JOHN_BLEEDING_JUMBO_COMMIT=d8f5b0138e6f9fe24ab453f886dcaa2abb2e5407
 ARG CREDSWEEPER_VERSION=1.15.1
+ARG HASHCAT_VERSION=7.1.2
+ARG LIGOLO_NG_VERSION=0.8.3
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ENV ADSCAN_HOME=/opt/adscan \
@@ -55,6 +57,7 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       bat \
       gosu \
       sudo \
+      libcap2-bin \
       net-tools \
       iputils-ping \
       iproute2 \
@@ -96,10 +99,9 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       libssl3t64 \
       libldap2 \
       libldns-dev \
-      bind9-dnsutils \
       nmap \
       hydra \
-      hashcat \
+      pocl-opencl-icd \
       samba \
       samba-common-bin \
       mono-devel \
@@ -121,6 +123,8 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       unbound \
       unbound-anchor \
       dns-root-data \
+    && mkdir -p /etc/OpenCL/vendors \
+    && printf '%s\n' 'libnvidia-opencl.so.1' > /etc/OpenCL/vendors/nvidia.icd \
     && rm -rf /var/lib/apt/lists/*
 
 # Codex CLI (official ChatGPT plan sign-in path for Plus/Pro subscriptions).
@@ -181,6 +185,13 @@ RUN set -eux; \
 # External tools (git/curl)
 RUN set -eux; \
   mkdir -p /opt/adscan/tools; \
+  curl -fsSL "https://hashcat.net/files/hashcat-${HASHCAT_VERSION}.7z" -o /tmp/hashcat.7z; \
+  7z x /tmp/hashcat.7z -o/opt/adscan/tools >/dev/null; \
+  test -x "/opt/adscan/tools/hashcat-${HASHCAT_VERSION}/hashcat.bin"; \
+  ln -sf "/opt/adscan/tools/hashcat-${HASHCAT_VERSION}/hashcat.bin" /opt/adscan/bin/hashcat; \
+  /opt/adscan/bin/hashcat --version | grep -F "v${HASHCAT_VERSION}"; \
+  rm -f /tmp/hashcat.7z; \
+  \
   git clone --depth 1 https://github.com/Greenwolf/ntlm_theft.git /opt/adscan/tools/ntlm_theft; \
   mkdir -p /opt/adscan/tools/firepwd; \
   curl -fsSL https://raw.githubusercontent.com/lclevy/firepwd/refs/heads/master/firepwd.py -o /opt/adscan/tools/firepwd/firepwd.py; \
@@ -205,6 +216,23 @@ RUN set -eux; \
   mkdir -p /opt/adscan/tools/kerbrute; \
   curl -fsSL https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_amd64 -o /opt/adscan/tools/kerbrute/kerbrute; \
   chmod +x /opt/adscan/tools/kerbrute/kerbrute; \
+  \
+  mkdir -p /opt/adscan/tools/ligolo-ng/proxy/linux-amd64; \
+  curl -fsSL \
+    "https://github.com/nicocha30/ligolo-ng/releases/download/v${LIGOLO_NG_VERSION}/ligolo-ng_proxy_${LIGOLO_NG_VERSION}_linux_amd64.tar.gz" \
+    -o /tmp/ligolo_proxy.tar.gz; \
+  tar -xzf /tmp/ligolo_proxy.tar.gz -C /opt/adscan/tools/ligolo-ng/proxy/linux-amd64 proxy; \
+  chmod +x /opt/adscan/tools/ligolo-ng/proxy/linux-amd64/proxy; \
+  setcap cap_net_admin,cap_net_bind_service+ep /opt/adscan/tools/ligolo-ng/proxy/linux-amd64/proxy; \
+  ln -sf /opt/adscan/tools/ligolo-ng/proxy/linux-amd64/proxy /opt/adscan/bin/ligolo-proxy; \
+  rm -f /tmp/ligolo_proxy.tar.gz; \
+  \
+  mkdir -p /opt/adscan/tools/ligolo-ng/agent/windows-amd64; \
+  curl -fsSL \
+    "https://github.com/nicocha30/ligolo-ng/releases/download/v${LIGOLO_NG_VERSION}/ligolo-ng_agent_${LIGOLO_NG_VERSION}_windows_amd64.zip" \
+    -o /tmp/ligolo_agent_windows_amd64.zip; \
+  unzip -q /tmp/ligolo_agent_windows_amd64.zip agent.exe -d /opt/adscan/tools/ligolo-ng/agent/windows-amd64; \
+  rm -f /tmp/ligolo_agent_windows_amd64.zip; \
   \
   git clone --depth 1 https://github.com/lgandx/Responder.git /opt/adscan/tools/responder; \
   python3 -m venv /opt/adscan/tool_venvs/responder/venv; \

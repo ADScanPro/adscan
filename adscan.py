@@ -1892,9 +1892,8 @@ DEFAULT_LICENSE_MODE = "LITE"
 
 # DNS tooling compatibility
 #
-# Some AD lab DNS servers reply FORMERR to dig queries that include EDNS or DNS cookies
-# (seen in HTB). nslookup typically works in those cases. Prefer disabling EDNS/cookies
-# for dig to improve compatibility.
+# Legacy DNS compatibility flags kept in the runtime config for backward-compatible
+# service construction. DNS queries now use dnspython directly with EDNS disabled.
 _DIG_COMPAT_FLAGS = "+noedns +nocookie"
 
 
@@ -2003,7 +2002,6 @@ SYSTEM_PACKAGES_CONFIG = {
     "bat": "batcat",
     "samba": "smbclient",
     "samba-common-bin": "net",
-    "bind9-dnsutils": "nslookup",
     "mono-devel": "mono",
     "mingw-w64": "x86_64-w64-mingw32-gcc",
     "git": "git",
@@ -3907,11 +3905,13 @@ def _maybe_ask_attribution(shell) -> None:
 
     try:
         shell.console.print()
-        print_info("[dim]Quick question (optional) — helps us show up where pentesters actually look:[/dim]")
+        print_info(
+            "[dim]Quick question (optional) — helps us show up where pentesters actually look:[/dim]"
+        )
         idx = questionary_select_index(
             title="How did you first hear about ADscan?",
             options=options,
-            default_idx=5,   # default → "Other / Prefer not to say"
+            default_idx=5,  # default → "Other / Prefer not to say"
             shell=shell,
         )
     except Exception:
@@ -3924,7 +3924,9 @@ def _maybe_ask_attribution(shell) -> None:
 
     source = _ATTR_KEYS[idx] if 0 <= idx < len(_ATTR_KEYS) else "other"
     try:
-        telemetry.capture("attribution_source", {"source": source, "source_label": options[idx]})
+        telemetry.capture(
+            "attribution_source", {"source": source, "source_label": options[idx]}
+        )
     except Exception:
         pass
 
@@ -4064,7 +4066,9 @@ def _resolve_session_attack_paths_for_summary(
         return 0
 
     try:
-        from adscan_internal.services.attack_graph_service import compute_attack_path_metrics
+        from adscan_internal.services.attack_graph_service import (
+            compute_attack_path_metrics,
+        )
 
         workspace_cwd = (
             shell._get_workspace_cwd()
@@ -4082,7 +4086,9 @@ def _resolve_session_attack_paths_for_summary(
             domain = str(domain_name or "").strip()
             if not domain:
                 continue
-            graph_path = domain_subpath(workspace_cwd, domains_dir, domain, "attack_graph.json")
+            graph_path = domain_subpath(
+                workspace_cwd, domains_dir, domain, "attack_graph.json"
+            )
             if not os.path.exists(graph_path):
                 continue
             metrics = compute_attack_path_metrics(shell, domain, max_depth=10)
@@ -8289,7 +8295,6 @@ def _verify_system_packages(packages_config, mode="check"):
     PACKAGE_FALLBACKS = {  # pylint: disable=invalid-name
         "freerdp3-x11": "freerdp2-x11",
         "ntpsec-ntpdate": "ntpdate",
-        "bind9-dnsutils": "dnsutils",
         "libncursesw5-dev": "libncurses-dev",  # Kali and some Debian variants use libncurses-dev
         "libmagic1": "libmagic1t64",
     }
@@ -10413,7 +10418,10 @@ class PentestShell:
         normalized_domain = str(domain or "").strip().casefold()
         if "\\" in normalized:
             prefix, suffix = normalized.split("\\", 1)
-            if prefix.strip().casefold() in {normalized_domain, normalized_domain.split(".")[0]}:
+            if prefix.strip().casefold() in {
+                normalized_domain,
+                normalized_domain.split(".")[0],
+            }:
                 return suffix.strip()
         if "@" in normalized:
             local_part, realm = normalized.split("@", 1)
@@ -10814,6 +10822,14 @@ class PentestShell:
                 if stderr_lines:
                     preview.append("STDERR (head):")
                     preview.extend(stderr_lines[:10])
+                    stderr_tail = (
+                        stderr_lines[-10:]
+                        if len(stderr_lines) > 20
+                        else stderr_lines[10:]
+                    )
+                    if stderr_tail:
+                        preview.append("STDERR (tail):")
+                        preview.extend(stderr_tail)
 
                 if preview:
                     print_info_debug(
@@ -14129,7 +14145,9 @@ class PentestShell:
         filename = f"{prefix}_{safe_user}{extension}"
 
         if self.current_workspace_dir:
-            log_dir = os.path.join(self.current_workspace_dir, "domains", domain_name, "smb")
+            log_dir = os.path.join(
+                self.current_workspace_dir, "domains", domain_name, "smb"
+            )
             os.makedirs(log_dir, exist_ok=True)
             return os.path.join(log_dir, filename)
 
@@ -14219,8 +14237,8 @@ class PentestShell:
 
         print_info_verbose("Executing password change for password-must-change account")
         print_info_debug(
-            f'{self.netexec_path} smb {pdc_fqdn} {change_auth_string} '
-            f'-M change-password -o NEWPASS={mark_sensitive(new_password, "password")} '
+            f"{self.netexec_path} smb {pdc_fqdn} {change_auth_string} "
+            f"-M change-password -o NEWPASS={mark_sensitive(new_password, 'password')} "
             f'--log "{change_log_file_path}"'
         )
 
@@ -14263,7 +14281,10 @@ class PentestShell:
         )
 
         domain_data = self.domains_data.setdefault(domain_name, {})
-        if str(domain_data.get("username") or "").strip().lower() == user.strip().lower():
+        if (
+            str(domain_data.get("username") or "").strip().lower()
+            == user.strip().lower()
+        ):
             domain_data["password"] = new_password
 
         ticket_path = store_service.get_kerberos_ticket(
@@ -14328,6 +14349,7 @@ class PentestShell:
         ensure_fresh_kerberos_ticket: bool = True,
         force_authenticated_enumeration: bool = False,
         prompt_when_already_authenticated: bool = False,
+        allow_empty_credential: bool = False,
     ):
         """Add a credential (domain or local) delegating to the CLI helper for reuse."""
         from adscan_internal.cli.creds import add_credential
@@ -14350,6 +14372,7 @@ class PentestShell:
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
             force_authenticated_enumeration=force_authenticated_enumeration,
             prompt_when_already_authenticated=prompt_when_already_authenticated,
+            allow_empty_credential=allow_empty_credential,
         )
 
     def add_credentials_batch(
@@ -14484,7 +14507,7 @@ class PentestShell:
                     "PDC FQDN": pdc_fqdn,
                     "Username": user,
                     cred_type: cred_value,
-                    "Protocol": "SMB",
+                    "Protocol": "LDAP",
                 },
                 icon="✓",
             )
@@ -14499,7 +14522,7 @@ class PentestShell:
 
         if self.current_workspace_dir:
             log_dir = os.path.join(
-                self.current_workspace_dir, "domains", domain_name, "smb"
+                self.current_workspace_dir, "domains", domain_name, "ldap"
             )
             try:
                 os.makedirs(log_dir, exist_ok=True)
@@ -14533,7 +14556,7 @@ class PentestShell:
 
         print_info_verbose("Executing credential verification")
         print_info_debug(
-            f'{self.netexec_path} smb {pdc_fqdn} {auth_string} --log "{log_file_path}"'
+            f'{self.netexec_path} ldap {pdc_fqdn} {auth_string} --log "{log_file_path}"'
         )
 
         service = self._get_credential_service()
@@ -15266,7 +15289,16 @@ class PentestShell:
         )
 
         step_num = 1
-        total_quickwin_steps = 1 + (2 if self.type == "audit" else 0)
+        total_quickwin_steps = 2 + (2 if self.type == "audit" else 0)
+
+        if _run_step(
+            "Timeroast Candidate Check",
+            lambda: self.ask_for_timeroast(domain),
+            step_number=step_num,
+            total_steps=total_quickwin_steps,
+        ):
+            return
+        step_num += 1
 
         if _run_step(
             "LDAP Description Parsing",
@@ -15585,7 +15617,9 @@ class PentestShell:
         # Perceived Likelihood when 0 findings (transparency builds credibility)
         _scan_attack_paths = getattr(self, "_session_attack_paths_count", 0)
         _scan_mode = getattr(self, "scan_mode", None)
-        if _scan_attack_paths > 0 and should_show_victory_hint("scan_complete_report", "subtle"):
+        if _scan_attack_paths > 0 and should_show_victory_hint(
+            "scan_complete_report", "subtle"
+        ):
             _reports_url = mark_passthrough("https://adscanpro.com/reports")
             self.console.print()
             print_info(
@@ -15902,18 +15936,37 @@ class PentestShell:
         Args:
             target_domain (str): The name of the domain to enumerate.
         """
+        from adscan_internal.workspaces.computers import ensure_enabled_computer_ip_file
+
         auth = self.build_auth_impacket(
             self.domains_data[self.domain]["username"],
             self.domains_data[self.domain]["password"],
             self.domain,
         )
-        target_file = shlex.quote(f"domains/{target_domain}/enabled_computers_ips.txt")
+        target_file_path, source = ensure_enabled_computer_ip_file(
+            getattr(self, "current_workspace_dir", None) or os.getcwd(),
+            getattr(self, "domains_dir", "domains"),
+            target_domain,
+            self.domains_data.get(target_domain, {}),
+        )
+        if not target_file_path:
+            marked_target_domain = mark_sensitive(target_domain, "domain")
+            print_error(
+                f"No host targets are available for domain {marked_target_domain}."
+            )
+            return
+        target_file = shlex.quote(target_file_path)
         command = (
             f"drop_the_mic_scan.py -vuln all -target {auth} -target-file {target_file}"
         )
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_info(
             f"Performing scan for vulnerabilities associated with Drop-The-Mic for domain {marked_target_domain}"
+        )
+        print_info_debug(
+            "[drop_the_mic] using domain target file "
+            f"source={source} for {marked_target_domain}: "
+            f"{mark_sensitive(target_file_path, 'path')}"
         )
         completed_process = self.run_command(command, timeout=300)
 
@@ -16033,9 +16086,7 @@ class PentestShell:
 
         parts = shlex.split(str(args or ""))
         if not parts or len(parts) > 2:
-            print_error(
-                "Usage: smb_sensitive_benchmark <domain> [credential_username]"
-            )
+            print_error("Usage: smb_sensitive_benchmark <domain> [credential_username]")
             return
 
         domain = parts[0]
@@ -16165,13 +16216,136 @@ class PentestShell:
             try:
                 recent_limit = int(parts[1])
             except Exception:
-                print_error("Invalid recent_limit. Usage: cracking_history <domain> [recent_limit]")
+                print_error(
+                    "Invalid recent_limit. Usage: cracking_history <domain> [recent_limit]"
+                )
                 return
             if recent_limit <= 0:
                 print_error("Invalid recent_limit. It must be > 0.")
                 return
 
         return run_cracking_history(self, domain=domain, recent_limit=recent_limit)
+
+    def do_massdns_report(self, args):
+        """Show a saved massdns hostname resolution report from the workspace.
+
+        Usage:
+            massdns_report <domain>
+            massdns_report <domain> <resolved_limit>
+            massdns_report <domain> <resolved_limit> <unresolved_limit>
+            massdns_report <domain> [resolved_limit] [unresolved_limit] [--only resolved|unresolved] [--sort hostname|ip-count|status] [--csv [path]]
+        """
+        import shlex
+
+        from adscan_internal import print_error
+        from adscan_internal.cli.nmap import run_massdns_report
+
+        parts = shlex.split(str(args or ""))
+        if not parts:
+            print_error(
+                "Usage: massdns_report <domain> [resolved_limit] [unresolved_limit]"
+            )
+            return
+
+        domain = parts[0]
+        resolved_limit = 20
+        unresolved_limit = 20
+        csv_output_path: str | None = None
+        only: str | None = None
+        sort_by: str | None = None
+        positionals: list[str] = []
+        idx = 1
+        while idx < len(parts):
+            token = parts[idx]
+            if token == "--csv":
+                if idx + 1 < len(parts) and not parts[idx + 1].startswith("--"):
+                    csv_output_path = parts[idx + 1]
+                    idx += 2
+                else:
+                    csv_output_path = ""
+                    idx += 1
+                continue
+            if token == "--only":
+                if idx + 1 >= len(parts):
+                    print_error(
+                        "Missing value for --only. Use: --only resolved|unresolved"
+                    )
+                    return
+                only = parts[idx + 1].strip().lower()
+                if only not in {"resolved", "unresolved"}:
+                    print_error(
+                        "Invalid value for --only. Use: resolved or unresolved."
+                    )
+                    return
+                idx += 2
+                continue
+            if token == "--sort":
+                if idx + 1 >= len(parts):
+                    print_error(
+                        "Missing value for --sort. Use: --sort hostname|ip-count|status"
+                    )
+                    return
+                sort_by = parts[idx + 1].strip().lower()
+                if sort_by not in {"hostname", "ip-count", "status"}:
+                    print_error(
+                        "Invalid value for --sort. Use: hostname, ip-count, or status."
+                    )
+                    return
+                idx += 2
+                continue
+            if token.startswith("--"):
+                print_error(
+                    "Unknown argument. Usage: massdns_report <domain> [resolved_limit] [unresolved_limit] [--only resolved|unresolved] [--sort hostname|ip-count|status] [--csv [path]]"
+                )
+                return
+            positionals.append(token)
+            idx += 1
+
+        if len(positionals) >= 1:
+            try:
+                resolved_limit = int(positionals[0])
+            except Exception:
+                print_error(
+                    "Invalid resolved_limit. Usage: massdns_report <domain> [resolved_limit] [unresolved_limit] [--only resolved|unresolved] [--sort hostname|ip-count|status] [--csv [path]]"
+                )
+                return
+            if resolved_limit <= 0:
+                print_error("Invalid resolved_limit. It must be > 0.")
+                return
+
+        if len(positionals) >= 2:
+            try:
+                unresolved_limit = int(positionals[1])
+            except Exception:
+                print_error(
+                    "Invalid unresolved_limit. Usage: massdns_report <domain> [resolved_limit] [unresolved_limit] [--only resolved|unresolved] [--sort hostname|ip-count|status] [--csv [path]]"
+                )
+                return
+            if unresolved_limit <= 0:
+                print_error("Invalid unresolved_limit. It must be > 0.")
+                return
+
+        if len(positionals) > 2:
+            print_error(
+                "Usage: massdns_report <domain> [resolved_limit] [unresolved_limit] [--only resolved|unresolved] [--sort hostname|ip-count|status] [--csv [path]]"
+            )
+            return
+
+        return run_massdns_report(
+            self,
+            domain=domain,
+            resolved_limit=resolved_limit,
+            unresolved_limit=unresolved_limit,
+            csv_output_path=csv_output_path,
+            only=only,
+            sort_by=sort_by,
+        )
+
+    def do_ligolo(self, args):
+        """Manage the workspace-scoped ligolo-ng proxy."""
+        from adscan_internal.cli.ligolo import run_ligolo_command
+
+        return run_ligolo_command(self, args)
 
     def gpp_passwords(self, domain, username, password, share):
         from adscan_internal.rich_output import mark_sensitive
@@ -16526,6 +16700,12 @@ class PentestShell:
         from adscan_internal.cli.kerberos import ask_for_kerberoast
 
         ask_for_kerberoast(self, target_domain, auto_crack=auto_crack)
+
+    def ask_for_timeroast(self, target_domain):
+        """Prompt user to perform Timeroasting against BloodHound candidates."""
+        from adscan_internal.cli.timeroast import run_timeroast_quick_win
+
+        return run_timeroast_quick_win(self, target_domain)
 
     def ask_for_kerberoast_preauth(self, domain, user):
         """Prompt user to perform pre-authenticated Kerberoasting."""
@@ -17813,6 +17993,29 @@ class PentestShell:
 
         do_spraying(self, domain)
 
+    def execute_password_spray_attack_step(
+        self,
+        domain: str,
+        *,
+        spray_type: str | None,
+        password: str | None = None,
+        entry_label: str | None = None,
+        source_context: dict[str, object] | None = None,
+        source_steps: list[object] | None = None,
+    ) -> bool:
+        """Execute a PasswordSpray attack-path step from recorded graph metadata."""
+        from adscan_internal.cli.spraying import execute_password_spray_attack_step
+
+        return execute_password_spray_attack_step(
+            self,
+            domain,
+            spray_type=spray_type,
+            password=password,
+            entry_label=entry_label,
+            source_context=source_context,
+            source_steps=source_steps,
+        )
+
     def spraying_command(
         self,
         command,
@@ -17963,7 +18166,7 @@ class PentestShell:
         Usage: cracking <type> <domain> <hash>
 
         Where:
-        - <type> is the type of hash to crack (asreproast, kerberoast, NTLMv2)
+        - <type> is the type of hash to crack (asreproast, kerberoast, timeroast, NTLMv2)
         - <domain> is the Active Directory domain of the hash
         - <hash> is the hash to crack
 
@@ -17987,6 +18190,25 @@ class PentestShell:
         from adscan_internal.cli.kerberos import run_asreproast
 
         return run_asreproast(self, target_domain, auto_crack=auto_crack)
+
+    def do_timeroast(self, target_domain):
+        """
+        Executes a Timeroasting attack against BloodHound-selected computer accounts.
+
+        Usage:
+            timeroast <domain>
+
+        Example:
+            timeroast example.local
+
+        This command queries BloodHound for enabled computer accounts whose
+        password lifecycle suggests they may not be using the default monthly
+        machine-password rotation, then offers to Timeroast and crack only the
+        matching high-value candidates.
+        """
+        from adscan_internal.cli.timeroast import run_timeroast_quick_win
+
+        return run_timeroast_quick_win(self, target_domain)
 
     def do_netexec_gpp_autologin(self, target_domain):
         """
@@ -18106,31 +18328,36 @@ class PentestShell:
             output_subdir = "heavy_artifacts"
         elif phase == SMB_SENSITIVE_SCAN_PHASE_DIRECT_SECRET_ARTIFACTS:
             output_subdir = "direct_secret_artifacts"
-        spider_output_dir = os.path.join(workspace_path, "smb", "spidering", output_subdir)
+        spider_output_dir = os.path.join(
+            workspace_path, "smb", "spidering", output_subdir
+        )
         os.makedirs(spider_output_dir, exist_ok=True)
         spider_output_arg = shlex.quote(spider_output_dir)
         manspider_bin = shlex.quote(str(self.manspider_path))
         hosts_str = " ".join(shlex.quote(str(host)) for host in hosts)
         exclusion_args = build_manspider_exclusion_args()
-        selected_extensions = list(extensions or [
-            "pfx",
-            "vdi",
-            "kdbx",
-            "kdb",
-            "conf",
-            "rsa",
-            "key",
-            "pem",
-            "psd1",
-            "psm1",
-            "pub",
-            "config",
-            "xlsm",
-            "zip",
-            "pcap",
-            "DMP",
-            "xlsx",
-        ])
+        selected_extensions = list(
+            extensions
+            or [
+                "pfx",
+                "vdi",
+                "kdbx",
+                "kdb",
+                "conf",
+                "rsa",
+                "key",
+                "pem",
+                "psd1",
+                "psm1",
+                "pub",
+                "config",
+                "xlsm",
+                "zip",
+                "pcap",
+                "DMP",
+                "xlsx",
+            ]
+        )
         extensions_arg = " ".join(shlex.quote(str(ext)) for ext in selected_extensions)
         if self.domains_data[target_domain]["auth"] == "auth":
             auth = self.build_auth_nxc(
@@ -18210,7 +18437,9 @@ class PentestShell:
         output_subdir = "passw"
         if phase == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS:
             output_subdir = "document_credentials"
-        spider_output_dir = os.path.join(workspace_path, "smb", "spidering", output_subdir)
+        spider_output_dir = os.path.join(
+            workspace_path, "smb", "spidering", output_subdir
+        )
         os.makedirs(spider_output_dir, exist_ok=True)
         spider_output_arg = shlex.quote(spider_output_dir)
         manspider_bin = shlex.quote(str(self.manspider_path))
@@ -18666,6 +18895,7 @@ class PentestShell:
         pre_with_users_callback = None
         pre_with_users_step = None
         if self.domains_data[domain]["auth"] == "null":
+
             def _run_smb_descriptions() -> None:
                 self.ask_for_smb_descriptions(domain)
 
@@ -20105,9 +20335,7 @@ class PentestShell:
         print_info(
             "Review the persisted KeePass entries report for the complete dataset."
         )
-        print_info(
-            f"Source KeePass artifact: {mark_sensitive(source_path, 'path')}"
-        )
+        print_info(f"Source KeePass artifact: {mark_sensitive(source_path, 'path')}")
 
     def _select_keepass_entries_to_validate(
         self,
@@ -20117,7 +20345,9 @@ class PentestShell:
         """Select which KeePass entries should be validated as credentials."""
         if not entries:
             return []
-        if bool(getattr(self, "auto", False)) or _should_disable_interactive_prompts(self):
+        if bool(getattr(self, "auto", False)) or _should_disable_interactive_prompts(
+            self
+        ):
             return list(entries)
 
         options = [
@@ -20255,7 +20485,9 @@ class PentestShell:
             report_dir=report_dir,
         )
         if result.hash_file:
-            print_info(f"KeePass John hash saved to {mark_sensitive(result.hash_file, 'path')}.")
+            print_info(
+                f"KeePass John hash saved to {mark_sensitive(result.hash_file, 'path')}."
+            )
         if result.cracked_password:
             print_success(
                 "KeePass master password cracked successfully: "
@@ -21406,7 +21638,9 @@ class PentestShell:
                 )
                 mark_victory_hint_shown("github_star")
                 try:
-                    telemetry.capture("star_cta_shown", {"trigger": "domain_compromise"})
+                    telemetry.capture(
+                        "star_cta_shown", {"trigger": "domain_compromise"}
+                    )
                 except Exception:
                     pass
 
@@ -21690,7 +21924,9 @@ class PentestShell:
             "domain_admin": bool((privileged_groups or {}).get("domain_admin")),
             "Administrators": bool((privileged_groups or {}).get("Administrators")),
             "backup_operators": bool((privileged_groups or {}).get("backup_operators")),
-            "account_operators": bool((privileged_groups or {}).get("account_operators")),
+            "account_operators": bool(
+                (privileged_groups or {}).get("account_operators")
+            ),
         }
         print_info_debug(
             "[priv-groups] resolved membership for "
@@ -21929,7 +22165,9 @@ class PentestShell:
                             f"Do you want to enumerate post-auth service access for user {marked_username}?",
                             default=True,
                         ):
-                            self.netexec_user_postauth_access(domain, username, password)
+                            self.netexec_user_postauth_access(
+                                domain, username, password
+                            )
                         else:
                             marked_username = mark_sensitive(username, "user")
                             print_info_verbose(
@@ -23501,9 +23739,8 @@ class PentestShell:
 
                     for line in output.splitlines():
                         if (
-                            "admin" in line
-                            or "RDP Access Granted" in line
-                            or "Pwn3d!" in line
+                            "RDP Access Granted" in line
+                            or "(Pwn3d!)" in line
                         ):
                             match_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
                             match_hostname = re.search(
@@ -25426,6 +25663,10 @@ class PentestShell:
         """
         from adscan_internal.rich_output import mark_sensitive, print_info_verbose
         from adscan_internal.workspaces import domain_subpath
+        from adscan_internal.cli.dns import (
+            is_domain_best_effort_mode,
+            resolve_pdc_hostname_best_effort,
+        )
 
         normalized_domain = (domain or "").strip().rstrip(".")
         if not normalized_domain:
@@ -25433,19 +25674,93 @@ class PentestShell:
 
         marked_domain = mark_sensitive(normalized_domain, "domain")
 
+        domains_data_pdc = None
+        domain_info = {}
+        try:
+            if self.domains_data and domain in self.domains_data:
+                domain_info = self.domains_data[domain]
+                domains_data_pdc = domain_info.get("pdc")
+        except Exception:
+            domains_data_pdc = None
+            domain_info = {}
+
+        if is_domain_best_effort_mode(self, normalized_domain):
+            fallback_pdc_ip = pdc_ip or domains_data_pdc or getattr(self, "pdc", None)
+            if not fallback_pdc_ip:
+                print_warning_debug(
+                    f"[dns_find_dcs] Best-effort domain {marked_domain} has no PDC IP; aborting DC discovery"
+                )
+                return
+
+            hostname_hint = domain_info.get("pdc_hostname")
+            best_effort_hostname = resolve_pdc_hostname_best_effort(
+                self,
+                domain=normalized_domain,
+                pdc_ip=fallback_pdc_ip,
+                hostname_hint=hostname_hint,
+            )
+            self.dcs = [fallback_pdc_ip]
+            self.pdc = fallback_pdc_ip
+            self.pdc_hostname = best_effort_hostname
+
+            if self.domains_data is None:
+                self.domains_data = CaseInsensitiveDict()
+            if domain not in self.domains_data:
+                self.domains_data[domain] = {}
+            self.domains_data[domain]["dcs"] = [fallback_pdc_ip]
+            self.domains_data[domain]["pdc"] = fallback_pdc_ip
+            if best_effort_hostname:
+                self.domains_data[domain]["pdc_hostname"] = best_effort_hostname
+                self.domains_data[domain]["dcs_hostnames"] = [best_effort_hostname.lower()]
+            else:
+                self.domains_data[domain]["dcs_hostnames"] = []
+
+            workspace_cwd = self.current_workspace_dir or os.getcwd()
+            domain_path = domain_subpath(workspace_cwd, self.domains_dir, domain)
+            dcs_path = (
+                domain_subpath(workspace_cwd, self.domains_dir, domain, "dcs.txt")
+                if os.path.exists(domain_path)
+                else "dcs.txt"
+            )
+            with open(dcs_path, "w", encoding="utf-8") as f:
+                f.write(f"{fallback_pdc_ip}\n")
+
+            marked_pdc = mark_sensitive(fallback_pdc_ip, "ip")
+            marked_hostname = (
+                mark_sensitive(best_effort_hostname, "hostname")
+                if best_effort_hostname
+                else None
+            )
+            print_info_verbose(
+                f"Best-effort DC context for {marked_domain}: "
+                f"{marked_pdc}"
+                + (
+                    f" with hostname {marked_hostname}"
+                    if marked_hostname
+                    else " (hostname unresolved)"
+                )
+            )
+            try:
+                self.add_to_hosts(domain)
+            except Exception:
+                pass
+
+            try:
+                from adscan_internal.cli.start import (  # noqa: PLC0415
+                    _maybe_upgrade_inference_from_pdc,
+                )
+
+                _maybe_upgrade_inference_from_pdc(self, domain)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
         # First check if DNS resolution is working
         if not self.do_check_dns(domain, pdc_ip):
             print_warning_debug(
                 f"[dns_find_dcs] DNS check failed for domain {marked_domain}, aborting DC discovery"
             )
             return
-
-        domains_data_pdc = None
-        try:
-            if self.domains_data and domain in self.domains_data:
-                domains_data_pdc = self.domains_data[domain].get("pdc")
-        except Exception:
-            domains_data_pdc = None
 
         preferred_ips = [pdc_ip, domains_data_pdc, getattr(self, "pdc", None)]
         preferred_ips = [ip for ip in preferred_ips if ip]
@@ -25525,11 +25840,9 @@ class PentestShell:
                     host_helper = getattr(self, "_host", None)
                     if host_helper is None or not hasattr(host_helper, "run_command"):
                         raise AttributeError("Host helper not available")
-                    result = host_helper.run_command(
-                        f"dig +short -x {pdc_ip}", timeout=10
-                    )
-                    if result and result.returncode == 0 and result.stdout:
-                        hostname = result.stdout.strip().rstrip(".")
+                    dns_service = self._get_dns_discovery_service()
+                    hostname = dns_service.reverse_resolve_fqdn_robust(pdc_ip)
+                    if hostname:
                         self.pdc_hostname = (
                             hostname.split(".")[0] if "." in hostname else hostname
                         )
@@ -25571,6 +25884,7 @@ class PentestShell:
             from adscan_internal.cli.start import (  # noqa: PLC0415
                 _maybe_upgrade_inference_from_pdc,
             )
+
             _maybe_upgrade_inference_from_pdc(self, domain)
         except Exception:  # noqa: BLE001
             pass
@@ -25690,6 +26004,10 @@ class PentestShell:
     def dns_find_pdc(self, domain):
         """Discover PDC for a domain using DNSDiscoveryService."""
         from adscan_internal.rich_output import mark_sensitive, print_success
+        from adscan_internal.cli.dns import (
+            is_domain_best_effort_mode,
+            resolve_pdc_hostname_best_effort,
+        )
 
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(
@@ -25704,6 +26022,40 @@ class PentestShell:
             getattr(self, "pdc", None),
         ]
         preferred_ips = [ip for ip in preferred_ips if ip]
+
+        if is_domain_best_effort_mode(self, domain):
+            fallback_ip = preferred_ips[0] if preferred_ips else None
+            if not fallback_ip:
+                print_warning_debug(
+                    f"[dns_find_pdc] Best-effort domain {marked_domain} has no persisted PDC IP"
+                )
+                return
+            hostname_hint = (
+                self.domains_data.get(domain, {}).get("pdc_hostname")
+                if self.domains_data and domain in self.domains_data
+                else None
+            )
+            pdc_hostname = resolve_pdc_hostname_best_effort(
+                self,
+                domain=domain,
+                pdc_ip=fallback_ip,
+                hostname_hint=hostname_hint,
+            )
+            self.pdc = fallback_ip
+            self.pdc_hostname = pdc_hostname
+            if self.domains_data and domain in self.domains_data and pdc_hostname:
+                self.domains_data[domain]["pdc_hostname"] = pdc_hostname
+            marked_pdc = mark_sensitive(self.pdc, "ip")
+            marked_pdc_hostname = (
+                mark_sensitive(self.pdc_hostname, "hostname")
+                if self.pdc_hostname
+                else "[unknown]"
+            )
+            print_success(
+                f"PDC found: {marked_pdc} with hostname: {marked_pdc_hostname}"
+            )
+            self.add_to_hosts(domain)
+            return
 
         # Use DNSDiscoveryService to discover PDC
         service = self._get_dns_discovery_service()
@@ -26143,7 +26495,7 @@ class PentestShell:
         """Verify local DNS resolution for an Active Directory domain.
 
         AD domains often do not have an apex A record (e.g. ``darkzero.htb``), so checking
-        ``dig <domain> A`` can produce false negatives. Instead we validate that the local
+        the domain apex A record can produce false negatives. Instead we validate that the local
         resolver can retrieve AD SRV records through our conditional forwarding setup.
         """
         from adscan_internal.rich_output import mark_sensitive
@@ -26157,7 +26509,7 @@ class PentestShell:
             marked_domain = mark_sensitive(domain, "domain")
             local_resolver_ip = _get_adscan_local_resolver_ip()
             marked_local_resolver_ip = mark_sensitive(local_resolver_ip, "ip")
-            # Fast check: ensure something is listening on the local resolver IP so dig doesn't hang.
+            # Fast check: ensure something is listening on the local resolver IP so the DNS check doesn't hang.
             try:
                 if not _is_unbound_listening_local(resolver_ip=local_resolver_ip):
                     print_warning(
@@ -26170,128 +26522,60 @@ class PentestShell:
                 telemetry.capture_exception(exc)
                 print_info_debug("[dns] Failed to probe local port 53 listeners.")
 
-            srv_names = [
-                f"_ldap._tcp.dc._msdcs.{domain}",
-                f"_ldap._tcp.pdc._msdcs.{domain}",
-            ]
-
-            for srv_name in srv_names:
-                # Use +short and consider non-empty output as success.
-                dig_result = self.run_command(
-                    f"dig {_DIG_COMPAT_FLAGS} @{local_resolver_ip} +short {srv_name} SRV",
-                    timeout=15,
-                    ignore_errors=True,
-                )
-                if dig_result is None:
-                    last_error = getattr(self, "_last_run_command_error", None)
-                    error_kind = None
-                    if isinstance(last_error, tuple):
-                        error_kind = next(iter(last_error), None)
-                    if error_kind == "timeout":
-                        print_warning(
-                            f"Local DNS resolver did not respond in time while verifying {marked_domain}."
-                        )
-                        print_info_verbose(
-                            "Check for a service listening on "
-                            f"{marked_local_resolver_ip}:53 (dnsmasq/unbound conflict)."
-                        )
-                        return False
-                if dig_result and (dig_result.stdout or "").strip():
-                    print_success(
-                        f"DNS resolution configured correctly for {marked_domain}"
-                    )
-                    return True
-
-            # As a last resort, try resolving the domain itself (may still be NXDOMAIN in AD labs).
-            dig_apex = self.run_command(
-                f"dig {_DIG_COMPAT_FLAGS} @{local_resolver_ip} +short {domain} A",
-                timeout=10,
-                ignore_errors=True,
+            dns_service = self._get_dns_discovery_service()
+            is_valid, error_kind = dns_service.verify_dns_resolution(
+                domain=domain,
+                resolver_ip=local_resolver_ip,
             )
-            if dig_apex is None:
-                last_error = getattr(self, "_last_run_command_error", None)
-                error_kind = None
-                if isinstance(last_error, tuple):
-                    error_kind = next(iter(last_error), None)
-                if error_kind == "timeout":
-                    print_warning(
-                        f"Local DNS resolver did not respond in time while verifying {marked_domain}."
-                    )
-                    print_info_verbose(
-                        "Check for a service listening on "
-                        f"{marked_local_resolver_ip}:53 (dnsmasq/unbound conflict)."
-                    )
-                    return False
-            if dig_apex and (dig_apex.stdout or "").strip():
+            if is_valid:
                 print_success(
                     f"DNS resolution configured correctly for {marked_domain}"
                 )
                 return True
 
-            # Provide safe debug details (status codes) without printing raw answers.
-            # Additionally, attempt a one-time self-heal for common validating-resolver
-            # failure modes (DNSSEC validation SERVFAIL) by rewriting/restarting Unbound.
-            for srv_name in srv_names:
-                dig_verbose = self.run_command(
-                    f"dig {_DIG_COMPAT_FLAGS} @{local_resolver_ip} {srv_name} SRV",
-                    timeout=15,
-                    ignore_errors=True,
+            if error_kind == "timeout":
+                print_info_verbose(
+                    "Check for a service listening on "
+                    f"{marked_local_resolver_ip}:53 (dnsmasq/unbound conflict)."
                 )
-                if dig_verbose and dig_verbose.stdout:
-                    header_line = ""
-                    for line in dig_verbose.stdout.splitlines():
-                        if "status:" in line and "HEADER" in line:
-                            header_line = line.strip()
-                            break
-                    if header_line:
-                        print_info_debug(
-                            f"[dns] dig SRV status for {marked_domain}: {header_line}"
-                        )
-                        if "status: SERVFAIL" in header_line:
-                            # If +cd returns an answer while normal queries SERVFAIL, it is a strong
-                            # indicator of DNSSEC validation failure for this zone. In that case,
-                            # rewrite the Unbound config (which includes domain-insecure/private-domain)
-                            # and restart Unbound once, then retry.
-                            dig_cd = self.run_command(
-                                f"dig {_DIG_COMPAT_FLAGS} @{local_resolver_ip} +cd +short {srv_name} SRV",
-                                timeout=15,
-                                ignore_errors=True,
-                            )
-                            if dig_cd and (dig_cd.stdout or "").strip():
-                                print_warning(
-                                    f"DNS resolution for {marked_domain} is failing due to resolver validation (SERVFAIL). "
-                                    "Refreshing Unbound configuration..."
-                                )
-                                try:
-                                    domain_forwarders, root_forwarders = (
-                                        self._read_unbound_adscan_forward_zones()
-                                    )
-                                    normalized_domain = domain.lower().rstrip(".")
-                                    if not root_forwarders:
-                                        root_forwarders = [
-                                            ns
-                                            for ns in self._get_existing_nameservers()
-                                            if ns and not _is_loopback_ip(ns)
-                                        ]
-                                    if normalized_domain in domain_forwarders:
-                                        self._write_unbound_adscan_config(
-                                            domain_forwarders=domain_forwarders,
-                                            root_forwarders=root_forwarders,
-                                        )
-                                        self._restart_unbound()
+                return False
 
-                                        retry = self.run_command(
-                                            f"dig {_DIG_COMPAT_FLAGS} @{local_resolver_ip} +short {srv_name} SRV",
-                                            timeout=15,
-                                            ignore_errors=True,
-                                        )
-                                        if retry and (retry.stdout or "").strip():
-                                            print_success(
-                                                f"DNS resolution configured correctly for {marked_domain}"
-                                            )
-                                            return True
-                                except Exception as exc:
-                                    telemetry.capture_exception(exc)
+            # Attempt a one-time self-heal for common validating-resolver
+            # failure modes (DNSSEC validation SERVFAIL) by rewriting/restarting Unbound.
+            if error_kind == "servfail":
+                print_warning(
+                    f"DNS resolution for {marked_domain} is failing due to resolver validation (SERVFAIL). "
+                    "Refreshing Unbound configuration..."
+                )
+                try:
+                    domain_forwarders, root_forwarders = (
+                        self._read_unbound_adscan_forward_zones()
+                    )
+                    normalized_domain = domain.lower().rstrip(".")
+                    if not root_forwarders:
+                        root_forwarders = [
+                            ns
+                            for ns in self._get_existing_nameservers()
+                            if ns and not _is_loopback_ip(ns)
+                        ]
+                    if normalized_domain in domain_forwarders:
+                        self._write_unbound_adscan_config(
+                            domain_forwarders=domain_forwarders,
+                            root_forwarders=root_forwarders,
+                        )
+                        self._restart_unbound()
+
+                        retry_ok, _retry_error = dns_service.verify_dns_resolution(
+                            domain=domain,
+                            resolver_ip=local_resolver_ip,
+                        )
+                        if retry_ok:
+                            print_success(
+                                f"DNS resolution configured correctly for {marked_domain}"
+                            )
+                            return True
+                except Exception as exc:
+                    telemetry.capture_exception(exc)
 
             print_error(f"DNS resolution failed for {marked_domain}")
             return False
@@ -26304,8 +26588,8 @@ class PentestShell:
     def dns_find_pdc_resolv(self, domain, ip):
         """Resolve the PDC IP for a domain using a specific resolver.
 
-        This uses ``dig`` instead of ``nslookup`` and supports a TCP fallback
-        (useful when UDP/53 is blocked).
+        This uses direct DNS queries and supports a TCP fallback when UDP/53 is
+        blocked.
         """
         from adscan_internal.rich_output import mark_sensitive
 
@@ -27220,6 +27504,7 @@ class PentestShell:
                 "kerberoast",
                 "kerberoast_preauth",
                 "asreproast",
+                "timeroast",
                 "sync_clock_with_pdc",
             ],
             "Trusts": ["enum_trusts", "raise_child", "enum_cross_domain_acl"],
@@ -27276,7 +27561,7 @@ class PentestShell:
                 "update_resolv_conf",
             ],
             "System": ["system", "ls", "rm", "cp", "mv", "cd", "mkdir", "cat", "exit"],
-            "Sessions": ["session"],
+            "Sessions": ["session", "ligolo"],
             "Help": ["help"],
             "ACL": ["enumerate_user_aces", "enum_cross_domain_acl"],
             "Reporting": ["initialize_report"],
@@ -27317,7 +27602,7 @@ class PentestShell:
             "BloodHound": "Using BloodHound for advanced analysis.",
             "Configs": "Management and enumeration of configurations.",
             "System": "System commands (ls, rm, etc.).",
-            "Sessions": "Management of remote sessions and reverse-shell listener.",
+            "Sessions": "Management of remote sessions, reverse-shell listener, and pivots.",
             "Help": "Tool help and documentation.",
             "ACL": "ACL enumeration",
             "Reporting": "Report generation",
@@ -27742,13 +28027,16 @@ def _print_check_summary(all_ok: bool):
     from rich.text import Text
 
     from adscan_internal import create_status_table, reset_spacing
+    from adscan_internal.cli.check import get_check_failure_recovery_guidance
     from adscan_internal.theme import ADSCAN_PRIMARY
+
+    full_container_runtime = _is_full_adscan_container_runtime()
 
     # Build status items for create_status_table
     status_items = []
 
     # Core Components
-    if _is_full_adscan_container_runtime():
+    if full_container_runtime:
         status_items.append(
             {
                 "name": "Python Virtual Env",
@@ -27838,7 +28126,9 @@ def _print_check_summary(all_ok: bool):
         status_message = "ADscan is ready to use. Run 'adscan start' to begin."
     else:
         status_text = Text("⚠ Some checks failed", style="bold yellow")
-        status_message = "Some components are missing. Run 'adscan check --fix' to attempt automatic repairs."
+        status_message = get_check_failure_recovery_guidance(
+            full_container_runtime=full_container_runtime
+        ).status_message
 
     status_panel = Panel(
         Text.assemble(

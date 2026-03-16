@@ -185,6 +185,8 @@ def _refresh_domain_dc_metadata(
     pdc_hostname: str | None,
 ) -> None:
     """Refresh `dcs`/`dcs_hostnames` for a domain after resolver updates."""
+    from adscan_internal.cli.dns import is_domain_best_effort_mode
+
     domain_data = shell.domains_data.setdefault(domain, {})
     old_dcs = list(domain_data.get("dcs", [])) if isinstance(domain_data.get("dcs"), list) else []
     old_hosts = (
@@ -196,29 +198,35 @@ def _refresh_domain_dc_metadata(
     discovered_ips: list[str] = []
     discovered_hosts: list[str] = []
     dc_ip_to_hostname: dict[str, str] = {}
-    try:
-        service_getter = getattr(shell, "_get_dns_discovery_service", None)
-        if callable(service_getter):
-            service = service_getter()
-            if service is not None and hasattr(service, "discover_domain_controllers"):
-                dc_ips, dc_hostnames, ip_to_host = service.discover_domain_controllers(
-                    domain=(domain or "").strip().rstrip("."),
-                    pdc_ip=pdc_ip,
-                    preferred_ips=[pdc_ip],
-                )
-                if isinstance(dc_ips, list):
-                    discovered_ips = [str(ip).strip() for ip in dc_ips if str(ip).strip()]
-                if isinstance(dc_hostnames, list):
-                    discovered_hosts = [
-                        str(host).strip() for host in dc_hostnames if str(host).strip()
-                    ]
-                if isinstance(ip_to_host, dict):
-                    dc_ip_to_hostname = {
-                        str(k): str(v) for k, v in ip_to_host.items() if str(k).strip()
-                    }
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_info_debug(f"[workspace_load] Failed to refresh DC metadata for {mark_sensitive(domain, 'domain')}: {exc}")
+    if not is_domain_best_effort_mode(shell, domain):
+        try:
+            service_getter = getattr(shell, "_get_dns_discovery_service", None)
+            if callable(service_getter):
+                service = service_getter()
+                if service is not None and hasattr(service, "discover_domain_controllers"):
+                    dc_ips, dc_hostnames, ip_to_host = service.discover_domain_controllers(
+                        domain=(domain or "").strip().rstrip("."),
+                        pdc_ip=pdc_ip,
+                        preferred_ips=[pdc_ip],
+                    )
+                    if isinstance(dc_ips, list):
+                        discovered_ips = [str(ip).strip() for ip in dc_ips if str(ip).strip()]
+                    if isinstance(dc_hostnames, list):
+                        discovered_hosts = [
+                            str(host).strip() for host in dc_hostnames if str(host).strip()
+                        ]
+                    if isinstance(ip_to_host, dict):
+                        dc_ip_to_hostname = {
+                            str(k): str(v) for k, v in ip_to_host.items() if str(k).strip()
+                        }
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[workspace_load] Failed to refresh DC metadata for {mark_sensitive(domain, 'domain')}: {exc}")
+    else:
+        print_info_debug(
+            f"[workspace_load] Best-effort DNS mode active for {mark_sensitive(domain, 'domain')}; "
+            "skipping SRV-based DC metadata refresh"
+        )
 
     dcs: list[str] = []
     for ip_value in discovered_ips:
@@ -277,6 +285,85 @@ def _refresh_domain_dc_metadata(
         f"dcs_old={len(old_dcs)} dcs_new={len(dcs)} "
         f"dcs_hostnames_old={len(old_hosts)} dcs_hostnames_new={len(dcs_hostnames)}"
     )
+
+
+def _restore_saved_domain_dns_context(
+    shell: WorkspaceLoaderShell,
+    *,
+    domain: str,
+    pdc_ip: str,
+    pdc_hostname: str | None,
+) -> bool:
+    """Restore persisted DNS runtime state for a loaded workspace domain."""
+    from adscan_internal.cli.dns import is_domain_best_effort_mode
+
+    marked_domain = mark_sensitive(domain, "domain")
+    domain_data = shell.domains_data.setdefault(domain, {})
+
+    if is_domain_best_effort_mode(shell, domain):
+        print_info_debug(
+            "[workspace_load] Best-effort DNS mode active for "
+            f"{marked_domain}; skipping resolver reconfiguration"
+        )
+        domain_data["pdc"] = pdc_ip
+        if pdc_hostname:
+            domain_data["pdc_hostname"] = pdc_hostname
+        _refresh_domain_dc_metadata(
+            shell,
+            domain=domain,
+            pdc_ip=pdc_ip,
+            pdc_hostname=pdc_hostname,
+        )
+        _restore_hosts_entry_for_domain(
+            shell,
+            domain=domain,
+            pdc_ip=pdc_ip,
+            pdc_hostname=pdc_hostname,
+        )
+        _capture_workspace_dns_repair_event(
+            shell=shell,
+            event="workspace_dns_restore_best_effort",
+            result="restored",
+            reason="best_effort_mode",
+        )
+        return True
+
+    if shell.do_update_resolv_conf(f"{domain} {pdc_ip}"):
+        resolved_pdc_ip = str(getattr(shell, "pdc", "") or pdc_ip)
+        resolved_pdc_hostname = (
+            str(getattr(shell, "pdc_hostname", "") or "").strip() or pdc_hostname
+        )
+        domain_data["pdc"] = resolved_pdc_ip
+        if resolved_pdc_hostname:
+            domain_data["pdc_hostname"] = resolved_pdc_hostname
+        _refresh_domain_dc_metadata(
+            shell,
+            domain=domain,
+            pdc_ip=resolved_pdc_ip,
+            pdc_hostname=resolved_pdc_hostname,
+        )
+        _restore_hosts_entry_for_domain(
+            shell,
+            domain=domain,
+            pdc_ip=resolved_pdc_ip,
+            pdc_hostname=resolved_pdc_hostname,
+        )
+        return True
+
+    print_warning(f"Could not configure DNS for domain {marked_domain}")
+    _capture_workspace_dns_repair_event(
+        shell=shell,
+        event="workspace_dns_restore_failed",
+        result="failed",
+        reason="saved_mapping_unreachable",
+    )
+    _attempt_workspace_dns_repair_interactive(
+        shell,
+        domain=domain,
+        saved_pdc_ip=pdc_ip,
+        saved_pdc_hostname=pdc_hostname,
+    )
+    return False
 
 
 def _prompt_updated_dc_ip_for_workspace_domain(domain: str) -> str | None:
@@ -702,48 +789,23 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
                     domain = domain_info["domain"]
                     pdc = domain_info["pdc"]
                     pdc_hostname = domain_info.get("pdc_hostname")
+                    _restore_saved_domain_dns_context(
+                        shell,
+                        domain=domain,
+                        pdc_ip=pdc,
+                        pdc_hostname=pdc_hostname,
+                    )
 
-                    # Configure the local resolver (Unbound)
-                    if shell.do_update_resolv_conf(f"{domain} {pdc}"):
-                        resolved_pdc_ip = str(getattr(shell, "pdc", "") or pdc)
-                        resolved_pdc_hostname = (
-                            str(getattr(shell, "pdc_hostname", "") or "").strip()
-                            or pdc_hostname
-                        )
-                        shell.domains_data.setdefault(domain, {})["pdc"] = resolved_pdc_ip
-                        if resolved_pdc_hostname:
-                            shell.domains_data.setdefault(domain, {})[
-                                "pdc_hostname"
-                            ] = resolved_pdc_hostname
-                        _refresh_domain_dc_metadata(
-                            shell,
-                            domain=domain,
-                            pdc_ip=resolved_pdc_ip,
-                            pdc_hostname=resolved_pdc_hostname,
-                        )
-                        _restore_hosts_entry_for_domain(
-                            shell,
-                            domain=domain,
-                            pdc_ip=resolved_pdc_ip,
-                            pdc_hostname=resolved_pdc_hostname,
-                        )
-                    else:
-                        marked_domain = mark_sensitive(domain, "domain")
-                        print_warning(
-                            f"Could not configure DNS for domain {marked_domain}"
-                        )
-                        _capture_workspace_dns_repair_event(
-                            shell=shell,
-                            event="workspace_dns_restore_failed",
-                            result="failed",
-                            reason="saved_mapping_unreachable",
-                        )
-                        _attempt_workspace_dns_repair_interactive(
-                            shell,
-                            domain=domain,
-                            saved_pdc_ip=pdc,
-                            saved_pdc_hostname=pdc_hostname,
-                        )
+            # Check whether the stored myip is still valid on the configured
+            # interface.  DHCP may have assigned a new IP after a reboot or
+            # VPN reconnect, causing reverse-connection operations to silently
+            # fail.  This surfaces the change immediately and auto-corrects it.
+            try:
+                from adscan_internal.services.myip_staleness import check_and_refresh_myip
+                check_and_refresh_myip(shell, context="workspace load")
+            except Exception as _myip_exc:
+                print_info_debug(f"[workspace_load] myip staleness check failed: {_myip_exc}")
+
         else:
             print_warning(
                 f"Variables file not found: {variables_file}. Using defaults."

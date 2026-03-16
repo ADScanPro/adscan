@@ -383,6 +383,7 @@ def handle_auth_and_optional_privs(
     prompt_for_user_privs_after: bool = True,
     force_authenticated_enumeration: bool = False,
     prompt_when_already_authenticated: bool = False,
+    allow_empty_credentials: bool = False,
 ) -> None:
     """Ensure authenticated enumeration and optionally ask for user privileges.
 
@@ -396,6 +397,9 @@ def handle_auth_and_optional_privs(
         prompt_when_already_authenticated: When True, and the domain is already
             ``auth``, ask whether to rerun the full authenticated scan or only
             continue with privilege enumeration for the current user.
+        allow_empty_credentials: When True, treat an empty string as an explicit
+            credential value (for example: valid blank-password logons) instead
+            of discarding it as missing input.
     """
     marked_domain = mark_sensitive(domain, "domain")
     current_auth_status = shell.domains_data.get(domain, {}).get("auth", "")
@@ -405,6 +409,9 @@ def handle_auth_and_optional_privs(
         f"prompt_privs={prompt_for_user_privs_after} "
         f"force_enum={force_authenticated_enumeration!r} "
         f"prompt_existing_auth={prompt_when_already_authenticated!r}"
+    )
+    has_non_empty_credential = any(
+        user and (cred is not None) and cred != "" for user, cred in users_with_creds
     )
 
     def _choose_authenticated_enumeration_action() -> str:
@@ -501,6 +508,13 @@ def handle_auth_and_optional_privs(
             enumeration_action = _choose_authenticated_enumeration_action()
         elif current_auth_status not in {"auth", "pwned"}:
             enumeration_action = "full_scan"
+
+    if enumeration_action == "full_scan" and not has_non_empty_credential:
+        print_info_debug(
+            "[creds] skipping do_enum_authenticated because only blank credentials "
+            "were provided; continuing with privilege checks only."
+        )
+        enumeration_action = "skip"
 
     if enumeration_action == "full_scan":
         try:
@@ -721,7 +735,7 @@ def handle_auth_and_optional_privs(
             )
 
     for user, cred in users_with_creds:
-        if not user or not cred:
+        if not user or (cred is None) or (cred == "" and not allow_empty_credentials):
             continue
         try:
             if _run_terminal_pivot_user_followups(user, cred):
@@ -809,6 +823,7 @@ def add_credential(
     ensure_fresh_kerberos_ticket: bool = True,
     force_authenticated_enumeration: bool = False,
     prompt_when_already_authenticated: bool = False,
+    allow_empty_credential: bool = False,
 ) -> None:
     """Add a credential to the workspace.
 
@@ -850,6 +865,10 @@ def add_credential(
             scan pipeline after a verified domain credential is processed.
         prompt_when_already_authenticated: When True, and the domain is already
             authenticated, prompt before rerunning the full authenticated scan.
+        allow_empty_credential: When True, treat ``""`` as an explicit password
+            value instead of rejecting it as empty input. This is reserved for
+            flows such as blank-password spraying where an empty secret is the
+            candidate being verified.
     """
     from adscan_internal import print_operation_header
     from adscan_internal.services.credential_store_service import (
@@ -1041,6 +1060,7 @@ def add_credential(
     else:
         # Handle domain credentials
         is_hash = shell.is_hash(cred)
+        is_explicit_blank_password = allow_empty_credential and cred == ""
         domain_data = shell.domains_data.get(domain, {})
         credentials_dict = domain_data.get("credentials", {})
         current_cred = (
@@ -1101,7 +1121,7 @@ def add_credential(
                             )
                 return
 
-        if cred and not skip_store_update:
+        if (cred is not None) and (allow_empty_credential or cred != "") and not skip_store_update:
             # Update domain credential using the service
             update_result = store_service.update_domain_credential(
                 domains_data=shell.domains_data,
@@ -1285,7 +1305,14 @@ def add_credential(
                     domain=domain,
                     username=user,
                 )
-                if existing_ticket and not ensure_fresh_kerberos_ticket:
+                if is_explicit_blank_password:
+                    marked_user = mark_sensitive(user, "user")
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_info_debug(
+                        "[add_credential] Skipping Kerberos ticket generation for "
+                        f"{marked_user}@{marked_domain} because the credential is a blank password."
+                    )
+                elif existing_ticket and not ensure_fresh_kerberos_ticket:
                     marked_user = mark_sensitive(user, "user")
                     marked_domain = mark_sensitive(domain, "domain")
                     marked_ticket = mark_sensitive(existing_ticket, "path")
@@ -1358,7 +1385,10 @@ def add_credential(
             if hasattr(shell, "domain"):
                 shell.domain = domain
 
-            if shell.domains_data[domain].get("username") is None:
+            if (
+                not is_explicit_blank_password
+                and shell.domains_data[domain].get("username") is None
+            ):
                 shell.domains_data[domain]["username"] = user
                 shell.domains_data[domain]["password"] = cred
 
@@ -1369,6 +1399,7 @@ def add_credential(
                 prompt_for_user_privs_after=prompt_for_user_privs_after,
                 force_authenticated_enumeration=force_authenticated_enumeration,
                 prompt_when_already_authenticated=prompt_when_already_authenticated,
+                allow_empty_credentials=allow_empty_credential,
             )
 
         elif not credential_persisted and not store_update_skipped and not ui_silent:

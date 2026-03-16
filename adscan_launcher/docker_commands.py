@@ -92,7 +92,7 @@ DEFAULT_BLOODHOUND_ADMIN_PASSWORD = "Adscan4thewin!"
 DEFAULT_BLOODHOUND_STACK_MODE = "managed"
 SUPPORTED_BLOODHOUND_STACK_MODES = ("managed",)
 DEFAULT_HOST_HELPER_SOCKET_NAME = "host-helper.sock"
-_DOCKER_RUN_HELP_HAS_GPUS_RE = re.compile(r"\\s--gpus\\b", re.IGNORECASE)
+_DOCKER_RUN_HELP_HAS_GPUS_RE = re.compile(r"\s--gpus\b", re.IGNORECASE)
 _DOCKER_INSTALL_DOCS_URL = "https://www.adscanpro.com/docs/getting-started/installation"
 _BLOODHOUND_TROUBLESHOOTING_DOCS_URL = (
     "https://www.adscanpro.com/docs/guides/troubleshooting"
@@ -3922,10 +3922,10 @@ def _detect_gpu_docker_run_args() -> tuple[str, ...]:
     """Best-effort GPU passthrough flags for docker run.
 
     IMPORTANT:
-        GPU passthrough is intentionally **opt-in** because `/dev/dri` mapping can
-        break OpenCL/Hashcat on some hosts (especially when running the container
-        as a non-root UID/GID). Default behaviour should be the most reliable:
-        CPU-only execution.
+        Intel/AMD `/dev/dri` passthrough remains **opt-in** because it can break
+        OpenCL/Hashcat on some hosts (especially when running the container as a
+        non-root UID/GID). NVIDIA is safer to enable automatically *only when*
+        Docker already advertises the NVIDIA runtime on the host.
 
         Enable with:
             `export ADSCAN_DOCKER_GPU=auto`   (best-effort)
@@ -3935,12 +3935,22 @@ def _detect_gpu_docker_run_args() -> tuple[str, ...]:
     """
     args: list[str] = []
 
-    mode = os.getenv("ADSCAN_DOCKER_GPU", "").strip().lower()
-    if not mode or mode in {"0", "false", "no", "off"}:
+    raw_mode = os.getenv("ADSCAN_DOCKER_GPU", "").strip().lower()
+    if raw_mode in {"0", "false", "no", "off"}:
         return ()
+    mode = raw_mode or "nvidia-auto"
 
     enable_dri = mode in {"1", "true", "yes", "on", "auto", "dri", "all"}
-    enable_nvidia = mode in {"1", "true", "yes", "on", "auto", "nvidia", "all"}
+    enable_nvidia = mode in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "auto",
+        "nvidia",
+        "all",
+        "nvidia-auto",
+    }
 
     # Intel/AMD iGPU/dri devices (best-effort, opt-in).
     if enable_dri and Path("/dev/dri").exists():

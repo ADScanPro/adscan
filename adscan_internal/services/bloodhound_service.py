@@ -719,6 +719,65 @@ class BloodHoundService(BaseService):
                 details={"domain": domain, "error": str(e)},
             ) from e
 
+    def get_timeroast_candidates(
+        self,
+        domain: str,
+        *,
+        max_results: int = 250,
+        scan_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get enabled computer accounts that match Timeroast heuristics."""
+        self._emit_progress(
+            scan_id=scan_id,
+            phase="bloodhound_computer_enumeration",
+            progress=0.0,
+            message="Querying BloodHound for Timeroast candidates",
+        )
+
+        try:
+            if not hasattr(self.client, "get_timeroast_candidates"):
+                raise BloodHoundServiceError(
+                    "Timeroast candidate queries are not supported by this BloodHound client",
+                    details={"edition": self.edition},
+                )
+
+            candidates = self.client.get_timeroast_candidates(
+                domain,
+                max_results=max_results,
+            )
+
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_computer_enumeration",
+                progress=1.0,
+                message=f"Retrieved {len(candidates)} Timeroast candidate(s)",
+            )
+
+            self.logger.info(
+                "Retrieved Timeroast candidates",
+                extra={
+                    "domain": domain,
+                    "count": len(candidates),
+                    "max_results": max_results,
+                },
+            )
+            return candidates
+        except Exception as e:
+            self.logger.exception(
+                "Failed to get Timeroast candidates from BloodHound",
+                extra={"domain": domain, "error": str(e), "max_results": max_results},
+            )
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_computer_enumeration",
+                progress=1.0,
+                message="Timeroast candidate query failed",
+            )
+            raise BloodHoundServiceError(
+                "Failed to retrieve Timeroast candidates from BloodHound",
+                details={"domain": domain, "error": str(e)},
+            ) from e
+
     def get_users_in_ou(
         self,
         domain: str,

@@ -228,7 +228,7 @@ class CredentialService(BaseService):
         credential_type = "hash" if self._is_ntlm_hash(credential) else "password"
 
         # Build command
-        command = f'{netexec_path} smb {pdc_fqdn} {auth_string} --log "{log_file_path}"'
+        command = f'{netexec_path} ldap {pdc_fqdn} {auth_string} --log "{log_file_path}"'
 
         self.logger.info(
             f"Verifying credentials for {username}@{domain} (type: {credential_type})"
@@ -481,13 +481,7 @@ class CredentialService(BaseService):
 
         # Check for success
         if "[+]" in output:
-            # NetExec marks admin context with patterns like "(Pwn3d!)" or
-            # "admin!" in the output. We consider any of these as admin.
-            is_admin = (
-                "(Pwn3d!)" in output
-                or "Pwn3d!" in output
-                or "admin!" in output
-            )
+            is_admin = "(Pwn3d!)" in output
             return CredentialVerificationResult(
                 status=CredentialStatus.VALID,
                 username=username,

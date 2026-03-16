@@ -75,6 +75,7 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "is_user_dc": "requires_initialized_domain",
     "kerberoast_preauth": "requires_initialized_domain",
     "ls": "exempt",
+    "massdns_report": "exempt",
     "mkdir": "exempt",
     "mssql_check_impersonate": "requires_initialized_domain",
     "mssql_impersonate": "requires_initialized_domain",

@@ -59,6 +59,7 @@ from adscan_internal.spraying import (
     build_kerbrute_bruteforce_command,
     build_netexec_computers_query_command,
     build_netexec_pass_pol_command,
+    build_netexec_password_spray_command,
     build_netexec_users_command,
     compute_spray_eligibility,
     parse_netexec_lockout_threshold_result,
@@ -474,6 +475,7 @@ class SprayShell(Protocol):
         skip_hash_cracking: bool = False,
         source_steps: list[object] | None = None,
         prompt_for_user_privs_after: bool = True,
+        allow_empty_credential: bool = False,
     ) -> None: ...
 
     def ask_for_pass_policy(self, domain: str) -> None: ...
@@ -488,6 +490,14 @@ _RECOMMENDED_SPRAY_CATEGORIES = {
     "useraspass_upper",
     "computer_pre2k",
 }
+_SPRAYING_OPTION_USER_AS_PASS = "Username as password"
+_SPRAYING_OPTION_USER_AS_PASS_LOWER = "Username as password in lowercase"
+_SPRAYING_OPTION_USER_AS_PASS_UPPER = "Username as password in uppercase"
+_SPRAYING_OPTION_BLANK_PASSWORD = "Users with a blank password"
+_SPRAYING_OPTION_CUSTOM_PASSWORD = "Username with a specific password"
+_SPRAYING_OPTION_COMPUTER_PRE2K = "Computer accounts (pre2k: hostname as password)"
+_SPRAYING_OPTION_RETRY_PASSWORDS = "Retry saved password candidates"
+_SPRAYING_OPTION_RETRY_DOMAIN_REUSE = "Retry saved SAM -> domain reuse candidates"
 _DOMAIN_HASH_SPRAY_LINE_RE = re.compile(
     r"^\s*SMB\s+\S+\s+\d+\s+\S+\s+\[(?P<status>[^\]]+)\]\s+(?P<rest>.*)$"
 )
@@ -786,6 +796,10 @@ def _summarize_domain_spray_outcomes(log_text: str) -> tuple[list[str], dict[str
     if not log_text:
         return [], outcome_counts
 
+    def _extract_username(rest: str) -> str:
+        account_token = str(rest or "").split(":", 1)[0].strip()
+        return account_token.split("\\")[-1].split("@", 1)[0].strip()
+
     for raw_line in log_text.splitlines():
         line = strip_ansi_codes(raw_line)
         parsed = _DOMAIN_HASH_SPRAY_LINE_RE.match(line)
@@ -802,8 +816,7 @@ def _summarize_domain_spray_outcomes(log_text: str) -> tuple[list[str], dict[str
             continue
 
         if status == "+":
-            account_token = rest.split(":", 1)[0].strip()
-            username = account_token.split("\\")[-1].split("@", 1)[0].strip()
+            username = _extract_username(rest)
             if not username:
                 continue
             hits_by_user.setdefault(username.lower(), username)
@@ -814,6 +827,10 @@ def _summarize_domain_spray_outcomes(log_text: str) -> tuple[list[str], dict[str
         if failure_match:
             code = str(failure_match.group("code") or "").upper()
             if code:
+                if code in {"STATUS_PASSWORD_MUST_CHANGE", "KDC_ERR_KEY_EXPIRED"}:
+                    username = _extract_username(rest)
+                    if username:
+                        hits_by_user.setdefault(username.lower(), username)
                 outcome_counts[code] = int(outcome_counts.get(code, 0)) + 1
                 continue
         if "connection error" in rest.lower():
@@ -851,6 +868,240 @@ def _summarize_outcomes_for_table(
     if len(ordered) > limit:
         summary += f", +{len(ordered) - limit} more"
     return summary
+
+
+def _render_valid_spray_hits_panel(
+    hits: list[dict[str, str]],
+    *,
+    spray_type: str | None,
+) -> None:
+    """Render a concise panel listing the discovered spray hits."""
+    from adscan_internal.rich_output import BRAND_COLORS, print_panel
+    from rich.table import Table
+    from rich.text import Text
+
+    table = Table(
+        title=Text(
+            "Valid Credentials Found", style=f"bold {BRAND_COLORS['info']}"
+        ),
+        show_header=True,
+        header_style=f"bold {BRAND_COLORS['info']}",
+        show_lines=True,
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("Username", style="bold")
+    table.add_column("Method", style="dim")
+    table.add_column("Accepted Secret", style="yellow")
+
+    hits_sorted = sorted(
+        hits, key=lambda item: str(item.get("username", "")).lower()
+    )
+    for idx, hit in enumerate(hits_sorted[:10], start=1):
+        user = str(hit.get("username") or "")
+        password = str(hit.get("password") or "")
+        accepted_secret = (
+            "Blank password"
+            if spray_type == "Blank Password" or password == ""
+            else "Password accepted"
+        )
+        table.add_row(
+            str(idx),
+            mark_sensitive(user, "user"),
+            spray_type or "Password spray",
+            accepted_secret,
+        )
+
+    if len(hits_sorted) > 10:
+        print_warning(
+            f"Showing 10/{len(hits_sorted)} valid credentials. Use `creds show` to see stored credentials."
+        )
+
+    print_panel(
+        [table],
+        title=Text(
+            f"Spraying Results ({len(hits_sorted)} success{'es' if len(hits_sorted) != 1 else ''})",
+            style=f"bold {BRAND_COLORS['info']}",
+        ),
+        border_style=BRAND_COLORS["info"],
+        expand=False,
+    )
+    if spray_type == "Blank Password":
+        print_info(
+            "These hits authenticated with a blank password. ADscan will treat them as explicit blank-password credentials."
+        )
+
+
+def _persist_and_record_spray_hits(
+    shell: SprayShell,
+    *,
+    domain: str,
+    hits: list[dict[str, str]],
+    spray_type: str | None,
+    entry_label: str | None,
+    source_context: dict[str, object] | None,
+    source_steps: list[object] | None,
+    persist_via_add_credential: bool = False,
+    allow_empty_credential: bool = False,
+) -> None:
+    """Persist spray hits and record related attack-graph provenance."""
+    from adscan_internal.services.attack_graph_service import (
+        record_credential_source_steps,
+        upsert_domain_password_reuse_edges,
+        upsert_password_spray_entry_edge,
+        upsert_share_password_entry_edge,
+    )
+    from adscan_internal.services.share_credential_provenance_service import (
+        ShareCredentialProvenanceService,
+    )
+
+    typed_source_steps = _extract_typed_source_steps(source_steps)
+    share_provenance_service = ShareCredentialProvenanceService()
+    share_edge_payload = share_provenance_service.build_share_password_edge_payload(
+        source_context=source_context,
+        spray_type=spray_type,
+        verified_via="spraying",
+    )
+    hits_sorted = sorted(
+        hits, key=lambda item: str(item.get("username", "")).lower()
+    )
+
+    grouped_hits: dict[str, set[str]] = {}
+    for hit in hits_sorted:
+        username = str(hit.get("username") or "").strip()
+        credential = str(hit.get("password") or "")
+        if not username:
+            continue
+        grouped_hits.setdefault(credential.lower(), set()).add(username)
+
+    evidence_source = "password_spraying"
+    if isinstance(source_context, dict):
+        origin = str(source_context.get("origin") or "").strip().lower()
+        if origin:
+            evidence_source = f"password_spraying:{origin}"
+
+    domain_reuse_created = 0
+    for hit in hits_sorted:
+        username = str(hit.get("username") or "").strip()
+        credential = str(hit.get("password") or "")
+        if not username:
+            continue
+        grouped = grouped_hits.get(credential.lower())
+        if not grouped:
+            continue
+        targets = sorted(grouped, key=str.lower)
+        if len(targets) < 2:
+            grouped_hits.pop(credential.lower(), None)
+            continue
+        domain_reuse_created += int(
+            upsert_domain_password_reuse_edges(
+                shell,
+                domain,
+                source_usernames=targets,
+                target_usernames=targets,
+                credential=credential,
+                status="discovered",
+                evidence_source=evidence_source,
+            )
+            or 0
+        )
+        grouped_hits.pop(credential.lower(), None)
+    if domain_reuse_created > 0:
+        print_info_debug(
+            f"[spray] Recorded {domain_reuse_created} DomainPassReuse edge(s)."
+        )
+
+    spray_type_label = spray_type or "Custom Password"
+    should_record_spray_edge = (
+        spray_type_label.startswith("Username as Password")
+        or spray_type_label == "Blank Password"
+        or spray_type_label == "Computer Pre2k"
+    )
+
+    for hit in hits_sorted:
+        username = str(hit.get("username") or "")
+        password = str(hit.get("password") or "")
+        if typed_source_steps:
+            try:
+                record_credential_source_steps(
+                    shell,
+                    domain,
+                    username=username,
+                    steps=typed_source_steps,
+                    status="success",
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    "[spray] Failed to record inherited credential provenance "
+                    "steps in attack graph (continuing)."
+                )
+        if should_record_spray_edge and not typed_source_steps:
+            try:
+                upsert_password_spray_entry_edge(
+                    shell,
+                    domain,
+                    username=username,
+                    password=password,
+                    spray_type=spray_type,
+                    spray_category=_normalize_spray_type_key(spray_type),
+                    status="success",
+                    entry_label=entry_label or "Domain Users",
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    "[spray] Failed to record PasswordSpray edge in attack graph (continuing)."
+                )
+        if share_edge_payload:
+            try:
+                share_entry_label, share_notes = share_edge_payload
+                share_notes = dict(share_notes)
+                if password or allow_empty_credential:
+                    share_notes["password"] = password
+                upsert_share_password_entry_edge(
+                    shell,
+                    domain,
+                    username=username,
+                    entry_label=share_entry_label,
+                    status="success",
+                    notes=share_notes,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    "[spray] Failed to record PasswordInShare edge (continuing)."
+                )
+
+    if persist_via_add_credential:
+        for hit in hits_sorted:
+            username = str(hit.get("username") or "").strip()
+            password = str(hit.get("password") or "")
+            if not username:
+                continue
+            shell.add_credential(
+                domain,
+                username,
+                password,
+                source_steps=source_steps,
+                prompt_for_user_privs_after=True,
+                allow_empty_credential=allow_empty_credential,
+            )
+        return
+
+    handle_validated_domain_hits_followup(
+        shell,
+        domain=domain,
+        hits=[
+            {
+                "username": str(hit.get("username") or ""),
+                "credential": str(hit.get("password") or ""),
+                "is_hash": False,
+            }
+            for hit in hits_sorted
+        ],
+        source_steps=source_steps,
+        discovery_label="sprayed",
+    )
 
 
 def validate_domain_reuse_with_ntlm_hash(
@@ -1372,6 +1623,7 @@ def should_proceed_with_repeated_spraying(
             "useraspass": "Username as password",
             "useraspass_lower": "Username as password in lowercase",
             "useraspass_upper": "Username as password in uppercase",
+            "blank_password": "Blank password",
             "password": "Specific password",
             "computer_pre2k": "Computer accounts (pre2k)",
         }
@@ -1858,10 +2110,7 @@ def _resolve_multi_credential_spray_budget(
     if requested_count <= 0:
         return 0, "No sprayable credentials were provided."
 
-    if (
-        eligibility.lockout_threshold is None
-        and any("no lockout enforced" in note.lower() for note in eligibility.notes)
-    ):
+    if any("no lockout enforced" in note.lower() for note in eligibility.notes):
         return requested_count, "Domain reports no account lockout threshold."
 
     if eligibility.used_policy_data and eligibility.minimum_remaining_attempts is not None:
@@ -2673,9 +2922,11 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         shell: The shell instance with spraying capabilities.
         domain: The domain in which to perform spraying.
     """
-    if not getattr(shell, "kerbrute_path", None):
+    has_kerbrute = bool(getattr(shell, "kerbrute_path", None))
+    has_netexec = bool(getattr(shell, "netexec_path", None))
+    if not has_kerbrute and not has_netexec:
         print_error(
-            "kerbrute is not installed. Please run 'adscan install' to install it."
+            "Password spraying requires kerbrute and/or NetExec. Please run 'adscan install'."
         )
         return
 
@@ -2691,7 +2942,13 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
             "Domain": domain,
             "PDC": pdc,
             "Authentication Type": auth_type.upper(),
-            "Protocol": "Kerberos Pre-Authentication",
+            "Protocol": (
+                "Kerberos Pre-Authentication / SMB"
+                if has_kerbrute and has_netexec
+                else "Kerberos Pre-Authentication"
+                if has_kerbrute
+                else "SMB (NetExec)"
+            ),
         },
         icon="💦",
     )
@@ -2709,29 +2966,36 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     if not user_list_file:
         return
 
-    options = [
-        "Username as password",
-        "Username as password in lowercase",
-        "Username as password in uppercase",
-        "Username with a specific password",
-    ]
+    options: list[str] = []
+    if has_kerbrute:
+        options.extend(
+            [
+                _SPRAYING_OPTION_USER_AS_PASS,
+                _SPRAYING_OPTION_USER_AS_PASS_LOWER,
+                _SPRAYING_OPTION_USER_AS_PASS_UPPER,
+                _SPRAYING_OPTION_CUSTOM_PASSWORD,
+            ]
+        )
+    if has_netexec:
+        options.append(_SPRAYING_OPTION_BLANK_PASSWORD)
     pending_candidates = _load_pending_spraying_password_candidates(shell, domain=domain)
     pending_domain_reuse_candidates = _load_pending_domain_reuse_candidates(
         shell, domain=domain
     )
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
     if has_enabled_computer_list(workspace_cwd, shell.domains_dir, domain):
-        options.append("Computer accounts (pre2k: hostname as password)")
+        options.append(_SPRAYING_OPTION_COMPUTER_PRE2K)
     if pending_candidates:
-        options.append("Retry saved password candidates")
+        options.append(_SPRAYING_OPTION_RETRY_PASSWORDS)
     if pending_domain_reuse_candidates:
-        options.append("Retry saved SAM -> domain reuse candidates")
+        options.append(_SPRAYING_OPTION_RETRY_DOMAIN_REUSE)
 
     ctf_mode = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
     default_idx = 0
     if ctf_mode:
         pre2k_idx = next(
-            (idx for idx, opt in enumerate(options) if "pre2k" in opt), None
+            (idx for idx, opt in enumerate(options) if opt == _SPRAYING_OPTION_COMPUTER_PRE2K),
+            None,
         )
         if pre2k_idx is not None:
             default_idx = pre2k_idx
@@ -2761,6 +3025,7 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
             )
         return
 
+    selected_option = options[current_row]
     auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
     is_auth = auth_state in {"auth", "pwned"}
     pdc_ip = shell.domains_data[domain]["pdc"]
@@ -2772,32 +3037,33 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     user_transform: str | None = None
     user_as_pass = True
 
-    if current_row == len(options) - 1 and pending_domain_reuse_candidates:
+    if selected_option == _SPRAYING_OPTION_RETRY_DOMAIN_REUSE:
         retry_pending_domain_reuse_validation(shell, domain)
         return
-    if current_row == len(options) - 1 - (1 if pending_domain_reuse_candidates else 0) and pending_candidates:
+    if selected_option == _SPRAYING_OPTION_RETRY_PASSWORDS:
         retry_pending_password_spraying(shell, domain)
         return
-    if current_row == 0:
+    if selected_option == _SPRAYING_OPTION_USER_AS_PASS:
         spray_category = "useraspass"
-    elif current_row == 1:
+    elif selected_option == _SPRAYING_OPTION_USER_AS_PASS_LOWER:
         spray_category = "useraspass_lower"
         user_transform = "lower"
-    elif current_row == 2:
+    elif selected_option == _SPRAYING_OPTION_USER_AS_PASS_UPPER:
         spray_category = "useraspass_upper"
         user_transform = "capitalize"
-    elif current_row == 3:
+    elif selected_option == _SPRAYING_OPTION_BLANK_PASSWORD:
+        spray_password = ""
+        spray_category = "blank_password"
+        user_as_pass = False
+    elif selected_option == _SPRAYING_OPTION_CUSTOM_PASSWORD:
         spray_password = Prompt.ask("Enter the password for spraying")
         spray_category = "password"
         user_as_pass = False
-    elif (
-        current_row == 4
-        and "Computer accounts (pre2k: hostname as password)" in options
-    ):
+    elif selected_option == _SPRAYING_OPTION_COMPUTER_PRE2K:
         spray_category = "computer_pre2k"
         user_as_pass = False
     else:
-        print_error(f"Invalid option selected: {current_row}")
+        print_error(f"Invalid option selected: {selected_option}")
         return
 
     if spray_category == "computer_pre2k":
@@ -2856,52 +3122,6 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     )
 
     try:
-        if is_auth:
-            password_fragment = (
-                safe_log_filename_fragment(spray_password) if spray_password else None
-            )
-            output_file = os.path.join(
-                "domains",
-                domain,
-                "kerberos",
-                (
-                    "auth_spray.log"
-                    if spray_category == "useraspass"
-                    else "auth_spray_low.log"
-                    if spray_category == "useraspass_lower"
-                    else "auth_spray_up.log"
-                    if spray_category == "useraspass_upper"
-                    else f"auth_spray_{password_fragment}.log"
-                ),
-            )
-        else:
-            password_fragment = (
-                safe_log_filename_fragment(spray_password) if spray_password else None
-            )
-            output_file = os.path.join(
-                "domains",
-                domain,
-                "kerberos",
-                (
-                    "unauth_spray.log"
-                    if spray_category == "useraspass"
-                    else "unauth_spray_low.log"
-                    if spray_category == "useraspass_lower"
-                    else "unauth_spray_up.log"
-                    if spray_category == "useraspass_upper"
-                    else f"unauth_spray_{password_fragment}.log"
-                ),
-            )
-
-        kerbrute_cmd = build_kerbrute_command(
-            kerbrute_path=shell.kerbrute_path,
-            domain=domain,
-            dc_ip=pdc_ip,
-            users_file=temp_users_path,
-            output_file=output_file,
-            password=spray_password,
-            user_as_pass=user_as_pass,
-        )
         spray_type = (
             "Username as Password"
             if spray_category == "useraspass"
@@ -2909,6 +3129,8 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
             if spray_category == "useraspass_lower"
             else "Username as Password (uppercase)"
             if spray_category == "useraspass_upper"
+            else "Blank Password"
+            if spray_category == "blank_password"
             else "Custom Password"
         )
         if spray_category in _RECOMMENDED_SPRAY_CATEGORIES:
@@ -2921,7 +3143,76 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
                 domain,
                 extra={"category": spray_category, "spray_type": spray_type},
             )
-        spraying_command(shell, kerbrute_cmd, domain, spray_type=spray_type)
+
+        if spray_category == "blank_password":
+            output_file = os.path.join(
+                "domains",
+                domain,
+                "smb",
+                "auth_spray_blank.log" if is_auth else "unauth_spray_blank.log",
+            )
+            netexec_cmd = build_netexec_password_spray_command(
+                nxc_path=shell.netexec_path,
+                dc_ip=pdc_ip,
+                users_file=temp_users_path,
+                password=spray_password,
+                domain=domain,
+                log_file=output_file,
+            )
+            netexec_spraying_command(
+                shell,
+                netexec_cmd,
+                domain,
+                spray_type=spray_type,
+            )
+        else:
+            if is_auth:
+                password_fragment = (
+                    safe_log_filename_fragment(spray_password) if spray_password else None
+                )
+                output_file = os.path.join(
+                    "domains",
+                    domain,
+                    "kerberos",
+                    (
+                        "auth_spray.log"
+                        if spray_category == "useraspass"
+                        else "auth_spray_low.log"
+                        if spray_category == "useraspass_lower"
+                        else "auth_spray_up.log"
+                        if spray_category == "useraspass_upper"
+                        else f"auth_spray_{password_fragment}.log"
+                    ),
+                )
+            else:
+                password_fragment = (
+                    safe_log_filename_fragment(spray_password) if spray_password else None
+                )
+                output_file = os.path.join(
+                    "domains",
+                    domain,
+                    "kerberos",
+                    (
+                        "unauth_spray.log"
+                        if spray_category == "useraspass"
+                        else "unauth_spray_low.log"
+                        if spray_category == "useraspass_lower"
+                        else "unauth_spray_up.log"
+                        if spray_category == "useraspass_upper"
+                        else f"unauth_spray_{password_fragment}.log"
+                    ),
+                )
+
+            kerbrute_cmd = build_kerbrute_command(
+                kerbrute_path=shell.kerbrute_path,
+                domain=domain,
+                dc_ip=pdc_ip,
+                users_file=temp_users_path,
+                output_file=output_file,
+                password=spray_password,
+                user_as_pass=user_as_pass,
+            )
+            spraying_command(shell, kerbrute_cmd, domain, spray_type=spray_type)
     finally:
         try:
             os.remove(temp_users_path)
@@ -2934,6 +3225,7 @@ def spraying_with_password(
     domain: str,
     password: str,
     *,
+    entry_label: str | None = None,
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
 ) -> None:
@@ -2948,70 +3240,37 @@ def spraying_with_password(
         domain: The domain in which to perform spraying.
         password: The password to use for spraying.
     """
-    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
-
     if not getattr(shell, "kerbrute_path", None):
         print_error(
             "kerbrute is not installed. Please run 'adscan install' to install it."
         )
         return
 
-    ensure_kerberos_output_dir(shell, domain)
     marked_domain = mark_sensitive(domain, "domain")
     auth_mode = shell.domains_data.get(domain, {}).get("auth")
     print_info_debug(
         f"[spray] Starting spraying_with_password for {marked_domain} "
         f"(auth={auth_mode!r}, kerbrute_path={shell.kerbrute_path})"
     )
-    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
-    requires_auth_users = auth_state in {"auth", "pwned"}
-    user_list_file = get_spraying_user_list_path(
-        shell,
-        domain,
-        requires_auth_users=requires_auth_users,
-    )
-    if not user_list_file:
-        print_info_debug(
-            f"[spray] Aborting spraying_with_password for {marked_domain}: no user list available"
-        )
-        return
-    if not _ensure_spraying_clock_sync(shell, domain, source="spraying_with_password"):
-        return
-    if not should_proceed_with_repeated_spraying(shell, domain, "password", password):
-        print_info("Password spraying cancelled by user.")
-        print_info_debug(
-            f"[spray] Aborting spraying_with_password for {marked_domain}: repeated spraying not approved"
-        )
-        return
-
-    eligibility = compute_spraying_eligibility(
+    eligibility = _prepare_password_spraying_eligibility(
         shell,
         domain=domain,
-        user_list_file=user_list_file,
-        safe_threshold=(
-            2
-            if str(shell.domains_data[domain].get("auth", "")).strip().lower()
-            in {"auth", "pwned"}
-            else 0
-        ),
+        spray_category="password",
+        spray_password=password,
+        guardrail_prompt="Continue with custom-password spraying using the full user list?",
+        clock_sync_source="spraying_with_password",
     )
     if eligibility is None:
+        print_info_debug(
+            f"[spray] Aborting spraying_with_password for {marked_domain}: no eligible execution context"
+        )
         return
-    default_mode = shell.type == "ctf"
-    if not _enforce_lockout_guardrail(
-        domain=domain,
-        eligibility=eligibility,
-        prompt_text="Continue with custom-password spraying using the full user list?",
-        default_confirm=default_mode,
-    ):
-        print_info("Password spraying cancelled by user.")
-        return
-    print_spraying_eligibility(shell, domain, eligibility)
     _execute_single_password_spraying(
         shell,
         domain=domain,
         password=password,
         eligibility=eligibility,
+        entry_label=entry_label,
         source_context=source_context,
         source_steps=source_steps,
         show_intro=True,
@@ -3024,6 +3283,7 @@ def _execute_single_password_spraying(
     domain: str,
     password: str,
     eligibility: SprayEligibilityResult,
+    entry_label: str | None = None,
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
     show_intro: bool = False,
@@ -3070,6 +3330,7 @@ def _execute_single_password_spraying(
             kerbrute_cmd,
             domain,
             spray_type="Custom Password",
+            entry_label=entry_label,
             source_context=source_context,
             source_steps=source_steps,
         )
@@ -3079,6 +3340,321 @@ def _execute_single_password_spraying(
             os.remove(temp_users_path)
         except OSError:
             pass
+
+
+def _prepare_password_spraying_eligibility(
+    shell: SprayShell,
+    *,
+    domain: str,
+    spray_category: str,
+    spray_password: str | None,
+    guardrail_prompt: str,
+    clock_sync_source: str,
+) -> SprayEligibilityResult | None:
+    """Return a validated eligibility set for one spraying attempt."""
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    requires_auth_users = auth_state in {"auth", "pwned"}
+    user_list_file = get_spraying_user_list_path(
+        shell,
+        domain,
+        requires_auth_users=requires_auth_users,
+    )
+    if not user_list_file:
+        return None
+
+    if not _ensure_spraying_clock_sync(shell, domain, source=clock_sync_source):
+        return None
+
+    if not should_proceed_with_repeated_spraying(
+        shell,
+        domain,
+        spray_category,
+        spray_password,
+    ):
+        print_info("Password spraying cancelled by user.")
+        return None
+
+    eligibility = compute_spraying_eligibility(
+        shell,
+        domain=domain,
+        user_list_file=user_list_file,
+        safe_threshold=2 if auth_state in {"auth", "pwned"} else 0,
+    )
+    if eligibility is None:
+        return None
+
+    default_mode = shell.type == "ctf"
+    if not _enforce_lockout_guardrail(
+        domain=domain,
+        eligibility=eligibility,
+        prompt_text=guardrail_prompt,
+        default_confirm=default_mode,
+    ):
+        print_info("Password spraying cancelled by user.")
+        return None
+
+    print_spraying_eligibility(shell, domain, eligibility)
+    return eligibility
+
+
+def spraying_with_username_as_password(
+    shell: SprayShell,
+    domain: str,
+    *,
+    transform: str | None = None,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+    entry_label: str | None = None,
+) -> None:
+    """Perform a username-as-password spray using the requested username transform."""
+    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
+
+    if not getattr(shell, "kerbrute_path", None):
+        print_error(
+            "kerbrute is not installed. Please run 'adscan install' to install it."
+        )
+        return
+
+    transform_key = str(transform or "").strip().lower()
+    spray_category = (
+        "useraspass_lower"
+        if transform_key == "lower"
+        else "useraspass_upper"
+        if transform_key in {"upper", "uppercase", "capitalize"}
+        else "useraspass"
+    )
+    spray_type = (
+        "Username as Password (lowercase)"
+        if spray_category == "useraspass_lower"
+        else "Username as Password (uppercase)"
+        if spray_category == "useraspass_upper"
+        else "Username as Password"
+    )
+    guardrail_prompt = (
+        "Continue with username-as-password spraying using the full user list?"
+        if spray_category == "useraspass"
+        else "Continue with transformed username-as-password spraying using the full user list?"
+    )
+    eligibility = _prepare_password_spraying_eligibility(
+        shell,
+        domain=domain,
+        spray_category=spray_category,
+        spray_password=None,
+        guardrail_prompt=guardrail_prompt,
+        clock_sync_source=f"spraying_with_{spray_category}",
+    )
+    if eligibility is None:
+        return
+    if not eligibility.eligible_users:
+        print_warning(
+            "No eligible users available for spraying with the current safety rules."
+        )
+        return
+
+    kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
+    eligible_for_kerbrute = list(eligibility.eligible_users)
+    if spray_category == "useraspass_lower":
+        eligible_for_kerbrute = [user.lower() for user in eligible_for_kerbrute]
+    elif spray_category == "useraspass_upper":
+        eligible_for_kerbrute = [user.capitalize() for user in eligible_for_kerbrute]
+
+    temp_users_path = write_temp_users_file(
+        eligible_for_kerbrute, directory=kerberos_output_dir
+    )
+    try:
+        auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+        is_auth = auth_state in {"auth", "pwned"}
+        output_file = os.path.join(
+            "domains",
+            domain,
+            "kerberos",
+            (
+                "auth_spray.log"
+                if spray_category == "useraspass" and is_auth
+                else "auth_spray_low.log"
+                if spray_category == "useraspass_lower" and is_auth
+                else "auth_spray_up.log"
+                if spray_category == "useraspass_upper" and is_auth
+                else "unauth_spray.log"
+                if spray_category == "useraspass"
+                else "unauth_spray_low.log"
+                if spray_category == "useraspass_lower"
+                else "unauth_spray_up.log"
+            ),
+        )
+        kerbrute_cmd = build_kerbrute_command(
+            kerbrute_path=shell.kerbrute_path,
+            domain=domain,
+            dc_ip=shell.domains_data[domain]["pdc"],
+            users_file=temp_users_path,
+            output_file=output_file,
+            password=None,
+            user_as_pass=True,
+        )
+        spraying_command(
+            shell,
+            kerbrute_cmd,
+            domain,
+            spray_type=spray_type,
+            entry_label=entry_label,
+            source_context=source_context,
+            source_steps=source_steps,
+        )
+    finally:
+        try:
+            os.remove(temp_users_path)
+        except OSError:
+            pass
+
+
+def spraying_with_blank_password(
+    shell: SprayShell,
+    domain: str,
+    *,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+    entry_label: str | None = None,
+) -> None:
+    """Perform a blank-password spray against the selected domain."""
+    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
+
+    if not getattr(shell, "netexec_path", None):
+        print_error(
+            "NetExec is not installed or configured. Please run 'adscan install'."
+        )
+        return
+
+    eligibility = _prepare_password_spraying_eligibility(
+        shell,
+        domain=domain,
+        spray_category="blank_password",
+        spray_password="",
+        guardrail_prompt="Continue with blank-password spraying using the full user list?",
+        clock_sync_source="spraying_with_blank_password",
+    )
+    if eligibility is None:
+        return
+    if not eligibility.eligible_users:
+        print_warning(
+            "No eligible users available for spraying with the current safety rules."
+        )
+        return
+
+    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+    is_auth = auth_state in {"auth", "pwned"}
+    kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
+    temp_users_path = write_temp_users_file(
+        list(eligibility.eligible_users), directory=kerberos_output_dir
+    )
+    try:
+        output_file = os.path.join(
+            "domains",
+            domain,
+            "smb",
+            "auth_spray_blank.log" if is_auth else "unauth_spray_blank.log",
+        )
+        netexec_cmd = build_netexec_password_spray_command(
+            nxc_path=shell.netexec_path,
+            dc_ip=shell.domains_data[domain]["pdc"],
+            users_file=temp_users_path,
+            password="",
+            domain=domain,
+            log_file=output_file,
+        )
+        netexec_spraying_command(
+            shell,
+            netexec_cmd,
+            domain,
+            spray_type="Blank Password",
+            entry_label=entry_label,
+            source_context=source_context,
+            source_steps=source_steps,
+        )
+    finally:
+        try:
+            os.remove(temp_users_path)
+        except OSError:
+            pass
+
+
+def _normalize_spray_type_key(spray_type: str | None) -> str:
+    """Normalize spray-type labels to one internal dispatch key."""
+    normalized = str(spray_type or "").strip().lower()
+    aliases = {
+        "username as password": "useraspass",
+        "username as password (lowercase)": "useraspass_lower",
+        "username as password (uppercase)": "useraspass_upper",
+        "users with a blank password": "blank_password",
+        "blank password": "blank_password",
+        "username with a specific password": "custom_password",
+        "custom password": "custom_password",
+        "computer accounts (pre2k: hostname as password)": "computer_pre2k",
+        "computer pre2k": "computer_pre2k",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def execute_password_spray_attack_step(
+    shell: SprayShell,
+    domain: str,
+    *,
+    spray_type: str | None,
+    password: str | None = None,
+    entry_label: str | None = None,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+) -> bool:
+    """Execute one PasswordSpray attack-path step from recorded graph metadata."""
+    mode_key = _normalize_spray_type_key(spray_type)
+    if mode_key == "computer_pre2k":
+        do_computer_pre2k_spraying(shell, domain)
+        return True
+    if mode_key == "blank_password":
+        spraying_with_blank_password(
+            shell,
+            domain,
+            source_context=source_context,
+            source_steps=source_steps,
+            entry_label=entry_label,
+        )
+        return True
+    if mode_key == "custom_password":
+        if password is None:
+            print_warning(
+                "Cannot execute PasswordSpray step: custom-password spray metadata is missing the password."
+            )
+            return False
+        spraying_with_password(
+            shell,
+            domain,
+            password,
+            entry_label=entry_label,
+            source_context=source_context,
+            source_steps=source_steps,
+        )
+        return True
+    if mode_key in {"useraspass", "useraspass_lower", "useraspass_upper"}:
+        transform = (
+            "lower"
+            if mode_key == "useraspass_lower"
+            else "capitalize"
+            if mode_key == "useraspass_upper"
+            else None
+        )
+        spraying_with_username_as_password(
+            shell,
+            domain,
+            transform=transform,
+            source_context=source_context,
+            source_steps=source_steps,
+            entry_label=entry_label,
+        )
+        return True
+
+    print_warning(
+        f"Cannot execute PasswordSpray step: unsupported spray type {mark_sensitive(str(spray_type or 'N/A'), 'detail')}."
+    )
+    return False
 
 
 def spraying_with_passwords(
@@ -3486,6 +4062,44 @@ def spraying_command(
     )
 
 
+def netexec_spraying_command(
+    shell: SprayShell,
+    command: str,
+    domain: str,
+    *,
+    spray_type: str | None = None,
+    entry_label: str | None = None,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+) -> None:
+    """Wrapper for NetExec-based spraying commands with the standard header."""
+    from adscan_internal import print_operation_header
+
+    resolved_spray_type = spray_type or "Custom Password"
+    print_operation_header(
+        "Password Spraying Attack",
+        details={
+            "Domain": domain,
+            "Spray Type": resolved_spray_type,
+            "User List": "Domain Users",
+            "PDC": shell.domains_data[domain].get("pdc", "N/A"),
+            "Protocol": "SMB (NetExec)",
+        },
+        icon="💧",
+    )
+
+    print_info_debug(f"Command: {command}")
+    execute_netexec_spraying_command(
+        shell,
+        command,
+        domain,
+        spray_type=resolved_spray_type,
+        entry_label=entry_label,
+        source_context=source_context,
+        source_steps=source_steps,
+    )
+
+
 def execute_spraying_command(
     shell: SprayShell,
     command: str,
@@ -3498,22 +4112,11 @@ def execute_spraying_command(
 ) -> None:
     """Execute the spraying command and process results."""
     from adscan_internal.cli.common import SECRET_MODE
-    from adscan_internal.rich_output import BRAND_COLORS, print_panel
-
-    from adscan_internal.services.attack_graph_service import (
-        record_credential_source_steps,
-        upsert_domain_password_reuse_edges,
-        upsert_password_spray_entry_edge,
-        upsert_share_password_entry_edge,
-    )
-    from rich.table import Table
-    from rich.text import Text
 
     marked_domain = mark_sensitive(domain, "domain")
     print_warning(
         f"Performing the spraying on {marked_domain}. Please be patient (this can take a while)"
     )
-    typed_source_steps = _extract_typed_source_steps(source_steps)
 
     try:
         # Use run_command instead of spawn_command to avoid output interleaving
@@ -3571,179 +4174,21 @@ def execute_spraying_command(
                 continue
 
         found_credentials = bool(hits_by_user)
-        from adscan_internal.services.share_credential_provenance_service import (
-            ShareCredentialProvenanceService,
-        )
-
-        share_provenance_service = ShareCredentialProvenanceService()
-        share_edge_payload = share_provenance_service.build_share_password_edge_payload(
-            source_context=source_context,
-            spray_type=spray_type,
-            verified_via="spraying",
-        )
 
         if found_credentials:
-            # Always show the raw hits in a succinct way (no passwords).
-            table = Table(
-                title=Text(
-                    "Valid Credentials Found", style=f"bold {BRAND_COLORS['info']}"
-                ),
-                show_header=True,
-                header_style=f"bold {BRAND_COLORS['info']}",
-                show_lines=True,
-            )
-            table.add_column("#", style="dim", width=4, justify="right")
-            table.add_column("Username", style="bold")
-            table.add_column("Method", style="dim")
-
             hits = list(hits_by_user.values())
-            hits_sorted = sorted(
-                hits, key=lambda item: str(item.get("username", "")).lower()
+            _render_valid_spray_hits_panel(
+                hits,
+                spray_type=spray_type,
             )
-            for idx, hit in enumerate(hits_sorted[:10], start=1):
-                user = str(hit.get("username") or "")
-                table.add_row(
-                    str(idx),
-                    mark_sensitive(user, "user"),
-                    spray_type or "Password spray",
-                )
-
-            if len(hits_sorted) > 10:
-                print_warning(
-                    f"Showing 10/{len(hits_sorted)} valid credentials. Use `creds show` to see stored credentials."
-                )
-
-            print_panel(
-                [table],
-                title=Text(
-                    f"Spraying Results ({len(hits_sorted)} success{'es' if len(hits_sorted) != 1 else ''})",
-                    style=f"bold {BRAND_COLORS['info']}",
-                ),
-                border_style=BRAND_COLORS["info"],
-                expand=False,
-            )
-
-            # Record domain password/hash reuse context from spray hits:
-            # users that authenticate with the same secret are reachable pivots.
-            grouped_hits: dict[str, set[str]] = {}
-            for hit in hits_sorted:
-                username = str(hit.get("username") or "").strip()
-                credential = str(hit.get("password") or "").strip()
-                if not username or not credential:
-                    continue
-                grouped_hits.setdefault(credential.lower(), set()).add(username)
-
-            evidence_source = "password_spraying"
-            if isinstance(source_context, dict):
-                origin = str(source_context.get("origin") or "").strip().lower()
-                if origin:
-                    evidence_source = f"password_spraying:{origin}"
-
-            domain_reuse_created = 0
-            for hit in hits_sorted:
-                username = str(hit.get("username") or "").strip()
-                credential = str(hit.get("password") or "").strip()
-                if not username or not credential:
-                    continue
-                grouped = grouped_hits.get(credential.lower())
-                if not grouped:
-                    continue
-                targets = sorted(grouped, key=str.lower)
-                if len(targets) < 2:
-                    grouped_hits.pop(credential.lower(), None)
-                    continue
-                domain_reuse_created += int(
-                    upsert_domain_password_reuse_edges(
-                        shell,
-                        domain,
-                        source_usernames=targets,
-                        target_usernames=targets,
-                        credential=credential,
-                        status="discovered",
-                        evidence_source=evidence_source,
-                    )
-                    or 0
-                )
-                grouped_hits.pop(credential.lower(), None)
-            if domain_reuse_created > 0:
-                print_info_debug(
-                    f"[spray] Recorded {domain_reuse_created} DomainPassReuse edge(s)."
-                )
-
-            # Record provenance edges in the attack graph for each hit.
-            spray_type_label = spray_type or "Custom Password"
-            should_record_spray_edge = (
-                spray_type_label.startswith("Username as Password")
-                or spray_type_label == "Computer Pre2k"
-            )
-            for hit in hits_sorted:
-                username = str(hit.get("username") or "")
-                password = str(hit.get("password") or "")
-                if typed_source_steps:
-                    try:
-                        record_credential_source_steps(
-                            shell,
-                            domain,
-                            username=username,
-                            steps=typed_source_steps,
-                            status="success",
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        telemetry.capture_exception(exc)
-                        print_info_debug(
-                            "[spray] Failed to record inherited credential provenance "
-                            "steps in attack graph (continuing)."
-                        )
-                if should_record_spray_edge:
-                    if not typed_source_steps:
-                        try:
-                            upsert_password_spray_entry_edge(
-                                shell,
-                                domain,
-                                username=username,
-                                password=password,
-                                spray_type=spray_type,
-                                status="success",
-                                entry_label=entry_label or "Domain Users",
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            telemetry.capture_exception(exc)
-                            print_info_debug(
-                                "[spray] Failed to record PasswordSpray edge in attack graph (continuing)."
-                            )
-                if share_edge_payload:
-                    try:
-                        share_entry_label, share_notes = share_edge_payload
-                        share_notes = dict(share_notes)
-                        if password:
-                            share_notes["password"] = password
-                        upsert_share_password_entry_edge(
-                            shell,
-                            domain,
-                            username=username,
-                            entry_label=share_entry_label,
-                            status="success",
-                            notes=share_notes,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        telemetry.capture_exception(exc)
-                        print_info_debug(
-                            "[spray] Failed to record PasswordInShare edge (continuing)."
-                        )
-
-            handle_validated_domain_hits_followup(
+            _persist_and_record_spray_hits(
                 shell,
                 domain=domain,
-                hits=[
-                    {
-                        "username": str(hit.get("username") or ""),
-                        "credential": str(hit.get("password") or ""),
-                        "is_hash": False,
-                    }
-                    for hit in hits_sorted
-                ],
+                hits=hits,
+                spray_type=spray_type,
+                entry_label=entry_label,
+                source_context=source_context,
                 source_steps=source_steps,
-                discovery_label="sprayed",
             )
 
         # Handle command result
@@ -3789,6 +4234,96 @@ def execute_spraying_command(
         telemetry.capture_exception(e)
         print_error("Error executing password spraying command.")
         print_exception(show_locals=False, exception=e)
+
+
+def execute_netexec_spraying_command(
+    shell: SprayShell,
+    command: str,
+    domain: str,
+    *,
+    spray_type: str | None = None,
+    entry_label: str | None = None,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+) -> None:
+    """Execute a NetExec-based spray and process its hits."""
+    from adscan_internal.cli.common import SECRET_MODE
+
+    marked_domain = mark_sensitive(domain, "domain")
+    print_warning(
+        f"Performing the spraying on {marked_domain}. Please be patient (this can take a while)"
+    )
+
+    try:
+        print_info_debug(
+            f"[spray] Executing NetExec spraying command on domain {marked_domain}"
+        )
+        completed_process = shell._run_netexec(
+            command,
+            domain=domain,
+            timeout=None,
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+
+        if completed_process is None:
+            print_error("Failed to execute password spraying command")
+            return
+
+        raw_output = str(getattr(completed_process, "stdout", "") or "")
+        raw_stderr_output = str(getattr(completed_process, "stderr", "") or "")
+        combined_output = "\n".join(
+            text for text in (raw_output, raw_stderr_output) if text
+        )
+        hit_usernames, outcome_counts = _summarize_domain_spray_outcomes(combined_output)
+        hits = [{"username": username, "password": ""} for username in hit_usernames]
+
+        if hits:
+            _render_valid_spray_hits_panel(hits, spray_type=spray_type)
+            _persist_and_record_spray_hits(
+                shell,
+                domain=domain,
+                hits=hits,
+                spray_type=spray_type,
+                entry_label=entry_label,
+                source_context=source_context,
+                source_steps=source_steps,
+                persist_via_add_credential=True,
+                allow_empty_credential=True,
+            )
+
+        if completed_process.returncode != 0 and not hits:
+            print_error(
+                f"Password spraying command failed with return code: {completed_process.returncode}"
+            )
+            outcome_summary = _summarize_outcomes_for_table(outcome_counts, limit=4)
+            if outcome_summary != "-":
+                print_warning(
+                    f"NetExec spray outcomes for {marked_domain}: {outcome_summary}"
+                )
+            if raw_stderr_output:
+                print_warning_debug(f"stderr: {raw_stderr_output}")
+        elif not hits:
+            outcome_summary = _summarize_outcomes_for_table(outcome_counts, limit=4)
+            if outcome_summary != "-":
+                print_warning(
+                    f"No credentials found during spraying. NetExec outcomes: {outcome_summary}"
+                )
+            else:
+                print_warning("No valid credentials found.")
+        else:
+            print_info_verbose("Password spraying completed successfully")
+    except Exception as e:  # noqa: BLE001
+        telemetry.capture_exception(e)
+        if not SECRET_MODE:
+            print_error("Error executing password spraying command.")
+            print_warning(
+                "No credentials were captured during spraying. Check the log above for signs of must-change accounts, "
+                "logon failures, or connectivity issues."
+            )
+        else:
+            print_exception(show_locals=False, exception=e)
 
 
 def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
