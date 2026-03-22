@@ -13,13 +13,17 @@ import json
 import os
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+import re
 from typing import Any
 
 from adscan_core.path_utils import get_adscan_home, get_effective_user_home
 
-VERSION = "6.2.0"
+VERSION = "6.2.1"
 _LAUNCHER_VERSION_ENV = "ADSCAN_LAUNCHER_VERSION"
 _RUNTIME_IMAGE_ENV = "ADSCAN_RUNTIME_IMAGE"
+_SOURCE_TREE_VERSION_RE = re.compile(
+    r'(?ms)^\[project\].*?^\s*version\s*=\s*"([^"]+)"\s*$'
+)
 
 
 def _print_info_debug(message: str) -> None:
@@ -43,7 +47,53 @@ def detect_installer() -> str:
         return "pipx"
     if "pipx" in str(exe_path).lower():
         return "pipx"
+    if _resolve_source_tree_version() is not None:
+        if (
+            os.environ.get("UV_ACTIVE")
+            or os.environ.get("UV_PROJECT_ENVIRONMENT")
+            or os.environ.get("UV_NO_SYNC")
+        ):
+            return "uv"
+        if ".venv" in str(exe_path):
+            return "uv"
+        return "source_tree"
     return "pip"
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_source_tree_version() -> str | None:
+    """Return the source-tree version from ``pyproject.toml`` when available."""
+    candidate_roots = (
+        Path.cwd(),
+        Path(os.path.realpath(os.sys.executable)).parent,
+        Path(__file__).resolve().parent,
+    )
+    for root in candidate_roots:
+        try:
+            search_roots = (root, *root.parents)
+        except Exception:
+            continue
+        for candidate in search_roots:
+            pyproject = candidate / "pyproject.toml"
+            if not pyproject.is_file():
+                continue
+            if not (candidate / "adscan_core").exists():
+                continue
+            if not (candidate / "adscan_launcher").exists():
+                continue
+            try:
+                contents = pyproject.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            match = _SOURCE_TREE_VERSION_RE.search(contents)
+            if match:
+                return str(match.group(1)).strip() or None
+    return None
+
+
+def get_source_tree_version() -> str | None:
+    """Return the source-tree version from ``pyproject.toml`` when available."""
+    return _resolve_source_tree_version()
 
 
 @functools.lru_cache(maxsize=1)
@@ -89,6 +139,16 @@ def resolve_installed_version_info() -> dict[str, str]:
         return info
     except PackageNotFoundError:
         pass
+
+    source_tree_version = _resolve_source_tree_version()
+    if source_tree_version:
+        info["version"] = source_tree_version
+        info["source"] = "source_tree_pyproject"
+        _print_info_debug(
+            "[version] resolved from source tree pyproject.toml: "
+            f"{info['version']}"
+        )
+        return info
 
     if ver_file.is_file():
         persisted = ver_file.read_text(encoding="utf-8").strip()
@@ -161,6 +221,7 @@ def clear_version_context_caches() -> None:
     """Clear internal LRU caches (test helper)."""
     resolve_installed_version_info.cache_clear()
     get_telemetry_version_fields.cache_clear()
+    _resolve_source_tree_version.cache_clear()
 
 
 __all__ = [
@@ -168,7 +229,7 @@ __all__ = [
     "detect_installer",
     "resolve_installed_version_info",
     "get_installed_version",
+    "get_source_tree_version",
     "get_telemetry_version_fields",
     "clear_version_context_caches",
 ]
-

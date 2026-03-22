@@ -70,6 +70,29 @@ def load_enabled_computer_samaccounts(
     return results
 
 
+def count_enabled_computer_accounts(
+    workspace_dir: str,
+    domains_dir: str,
+    domain: str,
+) -> int:
+    """Return the number of unique enabled computer accounts in the workspace list.
+
+    Args:
+        workspace_dir: Workspace root directory (absolute or relative).
+        domains_dir: Domains directory (relative to workspace).
+        domain: Target domain.
+
+    Returns:
+        Number of unique enabled computer accounts derived from
+        ``enabled_computers.txt``.
+
+    Raises:
+        OSError: If the file cannot be read.
+    """
+
+    return len(load_enabled_computer_samaccounts(workspace_dir, domains_dir, domain))
+
+
 def ensure_enabled_computer_ip_file(
     workspace_dir: str,
     domains_dir: str,

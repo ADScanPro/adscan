@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 import re
 from typing import Any, Callable, Iterable
+import json
 
+from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services import attack_graph_core
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
@@ -499,17 +501,41 @@ def build_group_member_index(
     domain: str,
     *,
     exclude_tier0: bool = False,
-) -> tuple[dict[str, set[str]], bool]:
+    include_computers: bool = True,
+) -> tuple[dict[str, set[str]], dict[str, set[str]], bool]:
+    """Build inverted group-membership indices from the snapshot.
+
+    Args:
+        snapshot: Prepared membership snapshot (from ``prepare_membership_snapshot``).
+        domain: Canonical domain name used for label normalisation.
+        exclude_tier0: When True, tier-0 users are excluded from the user index.
+        include_computers: When True (default), also build a computer membership
+            index from ``computer_to_groups``.  Computers are kept separate from
+            users so that execution helpers (which resolve user credentials) are
+            not polluted with computer accounts.
+
+    Returns:
+        ``(user_group_members, computer_group_members, has_principals)`` where:
+        - ``user_group_members``     — ``{group_canonical: {user_labels}}``
+        - ``computer_group_members`` — ``{group_canonical: {computer_labels}}``
+        - ``has_principals``         — True when at least one user *or* computer
+          was found in the snapshot (guards against completely empty snapshots).
+    """
     if not snapshot:
-        return {}, False
+        return {}, {}, False
 
     user_to_groups = snapshot.get("user_to_groups")
+    computer_to_groups = snapshot.get("computer_to_groups")
     group_to_parents = snapshot.get("group_to_parents")
-    if not isinstance(user_to_groups, dict):
-        return {}, False
 
-    has_users = bool(user_to_groups)
-    group_members: dict[str, set[str]] = {}
+    has_users = isinstance(user_to_groups, dict) and bool(user_to_groups)
+    has_computers = include_computers and isinstance(computer_to_groups, dict) and bool(computer_to_groups)
+
+    if not has_users and not has_computers:
+        return {}, {}, False
+
+    user_group_members: dict[str, set[str]] = {}
+    computer_group_members: dict[str, set[str]] = {}
     ancestor_cache: dict[str, set[str]] = {}
     parents_map = group_to_parents if isinstance(group_to_parents, dict) else {}
 
@@ -523,29 +549,43 @@ def build_group_member_index(
                 if str(user or "").strip()
             )
 
-    for user_label, direct_groups in user_to_groups.items():
-        if not isinstance(direct_groups, list):
-            continue
-        canonical_user = _canonical_membership_label(domain, user_label)
-        if not canonical_user:
-            continue
-        if exclude_tier0 and canonical_user in tier0_users:
-            continue
-
+    def _add_to_index(
+        index: dict[str, set[str]],
+        principal_label: str,
+        direct_groups: list[str],
+    ) -> None:
         for group in direct_groups:
             group_label = _canonical_membership_label(domain, group)
             if not group_label:
                 continue
             groups_to_add = {group_label}
             groups_to_add.update(
-                _expand_group_ancestors(
-                    domain, group_label, parents_map, ancestor_cache
-                )
+                _expand_group_ancestors(domain, group_label, parents_map, ancestor_cache)
             )
             for ancestor in groups_to_add:
-                group_members.setdefault(ancestor, set()).add(canonical_user)
+                index.setdefault(ancestor, set()).add(principal_label)
 
-    return group_members, has_users
+    if has_users:
+        for user_label, direct_groups in user_to_groups.items():  # type: ignore[union-attr]
+            if not isinstance(direct_groups, list):
+                continue
+            canonical_user = _canonical_membership_label(domain, user_label)
+            if not canonical_user:
+                continue
+            if exclude_tier0 and canonical_user in tier0_users:
+                continue
+            _add_to_index(user_group_members, canonical_user, direct_groups)
+
+    if has_computers:
+        for computer_label, direct_groups in computer_to_groups.items():  # type: ignore[union-attr]
+            if not isinstance(direct_groups, list):
+                continue
+            canonical_computer = _canonical_membership_label(domain, computer_label)
+            if not canonical_computer:
+                continue
+            _add_to_index(computer_group_members, canonical_computer, direct_groups)
+
+    return user_group_members, computer_group_members, has_users or has_computers
 
 
 def _strip_leading_relations(
@@ -765,10 +805,10 @@ def apply_affected_user_metadata(
             if sid:
                 label_sid_map[canonical_label] = sid
 
-    group_members, has_users = build_group_member_index(
-        snapshot, domain, exclude_tier0=True
+    user_group_members, computer_group_members, has_principals = build_group_member_index(
+        snapshot, domain, exclude_tier0=True, include_computers=True
     )
-    if not has_users:
+    if not has_principals:
         return records
 
     annotated: list[dict[str, Any]] = []
@@ -787,19 +827,27 @@ def apply_affected_user_metadata(
             canonical_source = _canonical_membership_label(domain, source_label)
             kind = label_kind_map.get(canonical_source, "")
 
+            # Users and computers are tracked separately:
+            #   affected_users     — for execution helpers that resolve credentials
+            #   affected_computers — for display only (computer accounts have no stored creds)
             affected_users: list[str] = []
-            affected_count = 0
+            affected_computers: list[str] = []
             if kind == "Group":
-                members = sorted(
-                    group_members.get(canonical_source, set()), key=str.lower
+                affected_users = sorted(
+                    user_group_members.get(canonical_source, set()), key=str.lower
                 )
-                affected_users = members
-                affected_count = len(members)
+                affected_computers = sorted(
+                    computer_group_members.get(canonical_source, set()), key=str.lower
+                )
             elif source_label:
+                # Individual principal (User or Computer) — single affected entry.
                 affected_users = [source_label]
-                affected_count = 1
 
-            if filter_empty and kind == "Group" and affected_count == 0:
+            affected_user_count = len(affected_users)
+            affected_computer_count = len(affected_computers)
+            affected_principal_count = affected_user_count + affected_computer_count
+
+            if filter_empty and kind == "Group" and affected_principal_count == 0:
                 source_sid = label_sid_map.get(canonical_source)
                 if not _is_empty_group_whitelisted(domain, source_label, source_sid):
                     stripped = _strip_leading_steps(current, count=1)
@@ -808,14 +856,25 @@ def apply_affected_user_metadata(
                     current = stripped
                     continue
 
+            # Only aggregate User/Computer → MemberOf → Group into the group
+            # source when the source itself IS a group.  For User or Computer
+            # sources the MemberOf represents the attacker's own membership
+            # chain (e.g. ms01$ → MemberOf → GroupA → ...) which must be
+            # preserved so that the selected principal is not stripped from the
+            # display.
             if (
-                rels
+                kind == "Group"
+                and rels
                 and str(rels[0] or "").strip().lower() == "memberof"
                 and len(nodes) > 1
             ):
                 group_label = _canonical_membership_label(domain, str(nodes[1]))
-                member_count = len(group_members.get(group_label, set()))
-                if member_count > 1:
+                # Check combined user + computer count for the leading-MemberOf
+                # collapse heuristic: collapse only when the next group has multiple
+                # principals (avoid collapsing single-member groups).
+                next_user_count = len(user_group_members.get(group_label, set()))
+                next_computer_count = len(computer_group_members.get(group_label, set()))
+                if next_user_count + next_computer_count > 1:
                     stripped_record, stripped_count = _strip_leading_relations(
                         current, relations_to_strip={"MemberOf"}
                     )
@@ -832,7 +891,12 @@ def apply_affected_user_metadata(
             meta = current["meta"]
             if isinstance(meta, dict):
                 meta.setdefault("affected_users", affected_users)
-                meta.setdefault("affected_user_count", affected_count)
+                meta.setdefault("affected_user_count", affected_user_count)
+                if affected_computers:
+                    meta.setdefault("affected_computers", affected_computers)
+                    meta.setdefault("affected_computer_count", affected_computer_count)
+                # Combined count used by display layer (Affected column).
+                meta.setdefault("affected_principal_count", affected_principal_count)
             annotated.append(current)
             break
 
@@ -866,6 +930,8 @@ def minimize_display_paths(
     *,
     domain: str,
     snapshot: dict[str, Any] | None,
+    scope: str | None = None,
+    principal_count: int = 1,
 ) -> list[dict[str, Any]]:
     """Minimize confusing/redundant prefixes in display records.
 
@@ -891,13 +957,6 @@ def minimize_display_paths(
             record = dict(record)
             record["status"] = _derive_display_status_from_steps(steps)
         return record
-
-    if not snapshot:
-        # Still allow label-based minimization (2) when no snapshot is available.
-        return [
-            _recompute_status(_minimize_display_record_by_repeated_labels(record))
-            for record in records
-        ]
 
     user_to_groups = (
         snapshot.get("user_to_groups") if isinstance(snapshot, dict) else {}
@@ -942,8 +1001,28 @@ def minimize_display_paths(
         principal_groups_cache[canonical_principal] = groups
         return groups
 
+    # When scope is not explicitly supplied (legacy callers), default to an empty
+    # string so that scope-gated minimizations (leading_memberof, domain-only) are
+    # NOT applied.  Callers that want domain-scope behaviour must pass scope="domain".
+    scope_norm = str(scope or "").strip().lower()
+    # leading_memberof collapses USER → MemberOf → GROUP prefixes:
+    #   - domain: always (all low-priv users as source → group view is the signal)
+    #   - owned / principals: only when multiple users are in scope — with a single
+    #     owned user the starting principal IS the point of interest, same as "user"
+    #   - user: never (the specific user is the point of interest)
+    _apply_leading_memberof = scope_norm == "domain" or (
+        scope_norm in {"owned", "principals"} and principal_count > 1
+    )
+    _active_rules = ["redundant_memberof", "repeated_labels"]
+    if _apply_leading_memberof:
+        _active_rules.append("leading_memberof")
+    print_info_debug(
+        f"[bh-minimize] scope={scope_norm!r} principal_count={principal_count}"
+        f" → active rules: {', '.join(_active_rules)} | {len(records)} path(s)"
+    )
     minimized: list[dict[str, Any]] = []
     for record in records:
+        orig_nodes = record.get("nodes") or []
         updated = _minimize_display_record_by_redundant_memberof(
             record,
             domain=domain,
@@ -951,8 +1030,20 @@ def minimize_display_paths(
             user_to_groups=user_to_groups,
             computer_to_groups=computer_to_groups,
         )
+        if updated is None:
+            orig_path = " → ".join(str(n) for n in orig_nodes)
+            print_info_debug(f"[bh-minimize] eliminated (redundant_memberof): {orig_path!r}")
+            continue
         updated = _minimize_display_record_by_repeated_labels(updated)
-        minimized.append(_recompute_status(updated))
+        if _apply_leading_memberof:
+            updated = _minimize_display_record_by_leading_memberof(updated)
+        final = _recompute_status(updated)
+        if final.get("meta", {}).get("minimized"):
+            orig_path = " → ".join(str(n) for n in orig_nodes)
+            new_path = " → ".join(str(n) for n in (final.get("nodes") or []))
+            reason = final.get("meta", {}).get("minimized_reason", "")
+            print_info_debug(f"[bh-minimize] {orig_path!r} → {new_path!r} (reason={reason})")
+        minimized.append(final)
     return minimized
 
 
@@ -1024,13 +1115,27 @@ def _minimize_display_record_by_redundant_memberof(
     principal_group_closure: Callable[[str], set[str]],
     user_to_groups: object,
     computer_to_groups: object,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
+    """Eliminate display records that contain redundant MemberOf prefix pivots.
+
+    A ``X → MemberOf → G`` edge is considered *redundant* when G was already
+    reachable through a prior principal's transitive group membership.  For
+    example, in ``USER1 → GenericAll → USER2 → MemberOf → GROUP1 → DCSync``
+    where USER1 is already a member of GROUP1, showing USER2's membership hop
+    is redundant.  The entire record is dropped (returns ``None``) because
+    truncating it to start from GROUP1 would create a duplicate of the shorter
+    path that already starts at GROUP1 directly.
+
+    Critical ordering rule: the outgoing edge is checked BEFORE adding the
+    current node's groups to ``satisfied_groups``.  This prevents a principal
+    from making its *own* outgoing ``MemberOf`` look redundant (which would
+    incorrectly strip the selected principal from the display).
+    """
     nodes = record.get("nodes")
     rels = record.get("relations")
     if not isinstance(nodes, list) or not isinstance(rels, list) or not nodes:
         return record
 
-    # Track groups that are already satisfied by earlier principals.
     satisfied_groups: set[str] = set()
     seen_principals: set[str] = set()
     redundant_memberof_indices: list[int] = []
@@ -1039,10 +1144,10 @@ def _minimize_display_record_by_redundant_memberof(
         if rel_idx >= len(nodes):
             break
         current = str(nodes[rel_idx] or "").strip()
+        canonical = ""
+        is_principal = False
         if current:
             canonical = _canonical_membership_label(domain, current)
-            # Only treat labels that exist in membership maps as principals.
-            is_principal = False
             if isinstance(user_to_groups, dict) and canonical in user_to_groups:
                 is_principal = True
             if (
@@ -1051,28 +1156,34 @@ def _minimize_display_record_by_redundant_memberof(
                 and canonical in computer_to_groups
             ):
                 is_principal = True
-            if is_principal and canonical not in seen_principals:
-                seen_principals.add(canonical)
-                satisfied_groups.update(principal_group_closure(current))
 
-        if str(rel or "").strip().lower() != "memberof":
-            continue
-        if rel_idx + 1 >= len(nodes):
-            continue
-        group_label = _canonical_membership_label(domain, str(nodes[rel_idx + 1]))
-        if group_label and group_label in satisfied_groups:
-            redundant_memberof_indices.append(rel_idx)
+        # CHECK the outgoing edge FIRST, before adding this node's groups.
+        # The check-before-add order is critical: it ensures that at rel_idx=0
+        # satisfied_groups is still empty when we evaluate the start node's own
+        # outgoing MemberOf, so the start node never falsely marks its own direct
+        # membership hop as redundant.  All other MemberOf edges at rel_idx > 0
+        # are evaluated against groups already accumulated by prior nodes.
+        if str(rel or "").strip().lower() == "memberof" and rel_idx + 1 < len(nodes):
+            group_label = _canonical_membership_label(domain, str(nodes[rel_idx + 1]))
+            if group_label and group_label in satisfied_groups:
+                redundant_memberof_indices.append(rel_idx)
+
+        # THEN add this principal's transitive groups so that *subsequent*
+        # MemberOf edges later in the path can be checked against them.
+        # The start node is included: if an intermediate principal later joins a
+        # group the start node already belongs to, that hop is redundant.
+        if is_principal and canonical and canonical not in seen_principals:
+            seen_principals.add(canonical)
+            satisfied_groups.update(principal_group_closure(current))
 
     if not redundant_memberof_indices:
         return record
 
-    # Strip to the last redundant MemberOf pivot (closest to the terminal action).
-    last_idx = redundant_memberof_indices[-1]
-    return _strip_display_record_prefix(
-        record,
-        start_node_index=last_idx + 1,
-        reason="redundant_memberof",
-    )
+    # The path contains a redundant MemberOf pivot — the source principal already
+    # belongs to the target group via a shorter direct membership, so this longer
+    # route adds no new information and would produce a duplicate display entry.
+    # Return None so the caller drops the record entirely.
+    return None
 
 
 def _minimize_display_record_by_repeated_labels(
@@ -1107,6 +1218,36 @@ def _minimize_display_record_by_repeated_labels(
         start_node_index=start_idx,
         reason="repeated_node_label",
     )
+
+
+def _minimize_display_record_by_leading_memberof(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Strip a leading ``X → MemberOf → GROUP`` prefix (domain scope only).
+
+    When the very first relationship in a path is MemberOf, the path starts
+    with a principal's own group membership pivot.  In domain-wide scope all
+    members of that group share this path, so stripping the leading principal
+    produces a cleaner group-level display::
+
+        ADSCAN → MemberOf → DOMAIN USERS → ADCSESC3 → TARGET
+        → DOMAIN USERS → ADCSESC3 → TARGET
+
+    This is intentionally restricted to cases where ``rels[0] == "MemberOf"``
+    so that mid-path pivots like ``ATTACKER → GenericAll → USER2 → MemberOf →
+    GROUP → ATTACK`` (where GenericAll is rels[0]) are unaffected.
+    """
+    nodes = record.get("nodes")
+    rels = record.get("relations")
+    if (
+        isinstance(nodes, list)
+        and isinstance(rels, list)
+        and rels
+        and len(nodes) >= 3
+        and str(rels[0] or "").strip().lower() == "memberof"
+    ):
+        return _strip_display_record_prefix(record, start_node_index=1, reason="leading_memberof")
+    return record
 
 
 def filter_shortest_paths_for_principals(
@@ -1251,7 +1392,7 @@ def compute_display_paths_for_domain(
     snapshot: dict[str, Any] | None,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     target_mode: str = "tier0",
     expand_terminal_memberships: bool = True,
 ) -> list[dict[str, Any]]:
@@ -1295,7 +1436,7 @@ def compute_display_paths_for_domain(
         runtime_graph,
         max_depth=max_depth,
         max_paths=max_paths,
-        require_high_value_target=require_high_value_target,
+        target=target,
         target_mode=mode,
     )
     collapsed = collapse_memberof_prefixes(
@@ -1326,7 +1467,7 @@ def compute_display_paths_for_start_node(
     start_node_id: str,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     target_mode: str = "tier0",
     expand_start_memberships: bool = True,
     expand_terminal_memberships: bool = True,
@@ -1406,19 +1547,41 @@ def compute_display_paths_for_start_node(
         start_node_id=start_node_id,
         max_depth=max_depth,
         max_paths=max_paths,
-        require_high_value_target=require_high_value_target,
+        target=target,
         target_mode=mode,
     )
-    records = minimize_display_paths(records, domain=domain, snapshot=snapshot)
+
+    minimized_records = minimize_display_paths(
+        records, domain=domain, snapshot=snapshot
+    )
+    print_info_debug(
+        f"[attack_paths_core] Raw paths for start_node_id={start_node_id}: "
+        f"{json.dumps([r.get('source') for r in records])}"
+    )
+    minimized_records = minimize_display_paths(
+        records, domain=domain, snapshot=snapshot
+    )
+    print_info_debug(
+        f"[attack_paths_core] After minimize_display_paths: "
+        f"{json.dumps([r.get('source') for r in minimized_records])}"
+    )
     annotated = apply_affected_user_metadata(
-        records,
+        minimized_records,
         graph=runtime_graph,
         domain=domain,
         snapshot=snapshot,
         filter_empty=True,
     )
+    print_info_debug(
+        f"[attack_paths_core] After apply_affected_user_metadata: "
+        f"{json.dumps([r.get('source') for r in annotated])}"
+    )
     if filter_shortest_paths:
-        return filter_shortest_paths_for_principals(annotated)
+        filtered = filter_shortest_paths_for_principals(annotated)
+        print_info_debug(
+            f"[attack_paths_core] After filter_shortest_paths_for_principals: {len(filtered)}"
+        )
+        return filtered
     return annotated
 
 
@@ -1430,7 +1593,7 @@ def compute_display_paths_for_user(
     username: str,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     target_mode: str = "tier0",
     filter_shortest_paths: bool = True,
 ) -> list[dict[str, Any]]:
@@ -1444,7 +1607,7 @@ def compute_display_paths_for_user(
         start_node_id=start_node_id,
         max_depth=max_depth,
         max_paths=max_paths,
-        require_high_value_target=require_high_value_target,
+        target=target,
         target_mode=target_mode,
         filter_shortest_paths=filter_shortest_paths,
     )
@@ -1458,7 +1621,7 @@ def compute_display_paths_for_principals(
     principals: list[str],
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     membership_sample_max: int = 3,
     target_mode: str = "tier0",
     filter_shortest_paths: bool = True,
@@ -1482,7 +1645,7 @@ def compute_display_paths_for_principals(
             username=username,
             max_depth=max_depth,
             max_paths=remaining,
-            require_high_value_target=require_high_value_target,
+            target=target,
             target_mode=target_mode,
             filter_shortest_paths=filter_shortest_paths,
         )

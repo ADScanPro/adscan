@@ -944,6 +944,9 @@ def check_dpapi(
             dpapi_command,
             domain=domain,
             timeout=600,
+            operation_kind="winrm_dpapi_fallback",
+            service="winrm",
+            target_count=1,
         )
         output = completed_process.stdout or ""
         errors_output = completed_process.stderr or ""
@@ -1083,6 +1086,9 @@ def _check_autologon_legacy_netexec(
         autologon_command,
         domain=domain,
         timeout=300,
+        operation_kind="winrm_autologon_fallback",
+        service="winrm",
+        target_count=1,
     )
     output = completed_process.stdout or ""
     errors_output = completed_process.stderr or ""

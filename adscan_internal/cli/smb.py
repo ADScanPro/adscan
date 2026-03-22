@@ -1619,7 +1619,14 @@ def execute_netexec_pass_policy(shell: Any, *, command: str, domain: str) -> Non
         domain: Target domain.
     """
     try:
-        completed_process = shell._run_netexec(command, domain=domain, timeout=300)
+        completed_process = shell._run_netexec(
+            command,
+            domain=domain,
+            timeout=900,
+            operation_kind="password_policy",
+            service="ldap",
+            target_count=1,
+        )
 
         if completed_process.returncode == 0:
             if completed_process.stdout:
@@ -1734,7 +1741,13 @@ def run_smb_null_enum_users(shell: Any, *, domain: str) -> None:
     print_info("Creating a SMB user list")
     print_info_debug(f"Command: {command}")
 
-    completed_process = shell._run_netexec(command, domain=domain, timeout=300)
+    completed_process = shell._run_netexec(
+        command,
+        domain=domain,
+        timeout=900,
+        operation_kind="smb_user_enum",
+        service="smb",
+    )
     if completed_process is None:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(
@@ -2837,6 +2850,7 @@ def ask_for_smb_shares_read(
             aggregate_map_rel=output_rel,
             shares=shares,
             hosts=hosts,
+            share_map=share_map,
             triage_username=username,
             triage_password=password,
             selected_method=selected_method,
@@ -5458,10 +5472,40 @@ def _generate_rclone_mapping(
         return {"success": False}
 
     os.makedirs(run_output_abs, exist_ok=True)
+    share_map_hosts = 0
+    share_map_pairs = 0
+    if isinstance(share_map, dict):
+        for host_name, host_shares in share_map.items():
+            if not str(host_name or "").strip() or not isinstance(host_shares, dict):
+                continue
+            readable_pairs = 0
+            for share_name, perms in host_shares.items():
+                normalized_share = str(share_name or "").strip()
+                perms_text = str(perms or "").strip().lower()
+                if (
+                    not normalized_share
+                    or _is_globally_excluded_mapping_share(normalized_share)
+                    or "read" not in perms_text
+                ):
+                    continue
+                readable_pairs += 1
+            if readable_pairs <= 0:
+                continue
+            share_map_hosts += 1
+            share_map_pairs += readable_pairs
+
     target_pairs = _resolve_cifs_host_share_targets(
         hosts=hosts,
         shares=shares,
         share_map=share_map,
+    )
+    fallback_used = not (isinstance(share_map, dict) and bool(share_map_pairs))
+    print_info_debug(
+        "rclone mapping target resolution: "
+        f"source={'share_map' if not fallback_used else 'hosts_x_shares_fallback'} "
+        f"resolved_targets={len(target_pairs)} share_map_hosts={share_map_hosts} "
+        f"share_map_pairs={share_map_pairs} fallback_used={fallback_used} "
+        f"hosts={len(hosts)} shares={len(shares)}"
     )
     transport_username, transport_password, transport_domain = (
         _resolve_rclone_transport_auth(
@@ -8395,6 +8439,7 @@ def run_smb_share_tree_mapping_with_cifs(
                 aggregate_map_rel=aggregate_map_rel,
                 shares=shares,
                 hosts=hosts,
+                share_map=share_map,
                 triage_username=username,
                 triage_password=password,
                 selected_method=selected_method,
@@ -8581,6 +8626,7 @@ def run_smb_share_tree_mapping_with_spider_plus(
                     aggregate_map_rel=aggregate_map_rel,
                     shares=shares,
                     hosts=hosts,
+                    share_map=share_map,
                     triage_username=username,
                     triage_password=password,
                     selected_method=selected_method,
@@ -8793,6 +8839,7 @@ def run_smb_share_tree_mapping_with_rclone(
                 aggregate_map_rel=aggregate_map_rel,
                 shares=shares,
                 hosts=hosts,
+                share_map=share_map,
                 triage_username=username,
                 triage_password=password,
                 selected_method=selected_method,
@@ -8814,6 +8861,7 @@ def _run_post_mapping_sensitive_data_workflow(
     aggregate_map_rel: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     triage_username: str | None = None,
     triage_password: str | None = None,
     selected_method: str | None = None,
@@ -8896,6 +8944,7 @@ def _run_post_mapping_sensitive_data_workflow(
             domain=domain,
             shares=shares,
             hosts=hosts,
+            share_map=share_map,
             username=triage_username or "",
             password=triage_password or "",
             selected_method=selected_method,
@@ -8938,6 +8987,7 @@ def _run_post_mapping_sensitive_data_workflow(
                 domain=domain,
                 shares=shares,
                 hosts=hosts,
+                share_map=share_map,
                 username=triage_username or "",
                 password=triage_password or "",
                 selected_method=(
@@ -9046,6 +9096,7 @@ def _run_selected_deterministic_share_scan(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
     selected_method: str,
@@ -9068,6 +9119,7 @@ def _run_selected_deterministic_share_scan(
             domain=domain,
             shares=shares,
             hosts=hosts,
+            share_map=share_map,
             username=username,
             password=password,
             backend=backend,
@@ -9087,9 +9139,9 @@ def _run_selected_deterministic_share_scan(
         fallback_used = True
         print_warning(
             "rclone deterministic analysis did not complete successfully. "
-            "Falling back to CIFS deterministic analysis."
+            "Falling back to legacy manspider analysis."
         )
-        completed = _run_backend("cifs")
+        completed = _run_backend("manspider")
         if completed:
             return {
                 "completed": True,
@@ -9097,10 +9149,10 @@ def _run_selected_deterministic_share_scan(
                 "executed_backends": executed_backends,
             }
         print_warning(
-            "CIFS deterministic fallback did not complete successfully. "
-            "Falling back to legacy manspider analysis."
+            "Legacy manspider fallback did not complete successfully. "
+            "Falling back to CIFS deterministic analysis."
         )
-        completed = _run_backend("manspider")
+        completed = _run_backend("cifs")
     elif primary_backend == "cifs":
         fallback_used = True
         print_warning(
@@ -9160,6 +9212,7 @@ def _run_post_mapping_deterministic_share_scan(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
 ) -> bool:
@@ -9169,6 +9222,7 @@ def _run_post_mapping_deterministic_share_scan(
         domain=domain,
         shares=shares,
         hosts=hosts,
+        share_map=share_map,
         username=username,
         password=password,
         backend=_resolve_deterministic_backend_from_method(
@@ -9188,6 +9242,7 @@ def _run_post_mapping_deterministic_share_scan_with_backend(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
     backend: str,
@@ -9199,6 +9254,7 @@ def _run_post_mapping_deterministic_share_scan_with_backend(
         domain=domain,
         shares=shares,
         hosts=hosts,
+        share_map=share_map,
         username=username,
         password=password,
         backend=backend,
@@ -9213,6 +9269,7 @@ def _run_post_mapping_deterministic_share_scan_sequence(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
     backend: str,
@@ -9230,6 +9287,7 @@ def _run_post_mapping_deterministic_share_scan_sequence(
             domain=domain,
             shares=shares,
             hosts=hosts,
+            share_map=share_map,
             username=username,
             password=password,
             backend=backend,
@@ -9250,6 +9308,7 @@ def _run_post_mapping_deterministic_share_scan_sequence(
         domain=domain,
         shares=shares,
         hosts=hosts,
+        share_map=share_map,
         username=username,
         password=password,
         backend=backend,
@@ -9285,13 +9344,14 @@ def _run_post_mapping_deterministic_share_scan_sequence(
             domain=domain,
             shares=shares,
             hosts=hosts,
+            share_map=share_map,
             username=username,
-                password=password,
-                backend=backend,
-                phase=phase,
-                cifs_mount_root=cifs_mount_root,
-                backend_context=backend_context,
-            )
+            password=password,
+            backend=backend,
+            phase=phase,
+            cifs_mount_root=cifs_mount_root,
+            backend_context=backend_context,
+        )
         results.append(phase_result)
         if not bool(phase_result.get("completed")):
             break
@@ -9302,6 +9362,7 @@ def _run_post_mapping_deterministic_share_scan_sequence(
             domain=domain,
             shares=shares,
             hosts=hosts,
+            share_map=share_map,
             username=username,
             password=password,
             backend=backend,
@@ -9346,6 +9407,7 @@ def _prepare_post_mapping_deterministic_rclone_context(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
     backend: str,
@@ -9404,7 +9466,7 @@ def _prepare_post_mapping_deterministic_rclone_context(
         password=password,
         hosts=hosts,
         shares=shares,
-        share_map=None,
+        share_map=share_map,
         run_output_abs=run_output_abs,
         aggregate_map_abs=aggregate_map_abs,
     )
@@ -9514,6 +9576,7 @@ def _run_sensitive_scan_phase_with_backend(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
     backend: str,
@@ -9532,6 +9595,7 @@ def _run_sensitive_scan_phase_with_backend(
                 domain=domain,
                 shares=shares,
                 hosts=hosts,
+                share_map=share_map,
                 username=username,
                 password=password,
                 phase=phase,
@@ -9542,6 +9606,7 @@ def _run_sensitive_scan_phase_with_backend(
             domain=domain,
             shares=shares,
             hosts=hosts,
+            share_map=share_map,
             username=username,
             password=password,
             phase=phase,
@@ -9558,6 +9623,7 @@ def _run_sensitive_scan_phase_with_backend(
                 domain=domain,
                 shares=shares,
                 hosts=hosts,
+                share_map=share_map,
                 username=username,
                 password=password,
                 cifs_mount_root=cifs_mount_root,
@@ -9569,6 +9635,7 @@ def _run_sensitive_scan_phase_with_backend(
             domain=domain,
             shares=shares,
             hosts=hosts,
+            share_map=share_map,
             username=username,
             password=password,
             cifs_mount_root=cifs_mount_root,
@@ -9620,6 +9687,7 @@ def _run_post_mapping_deterministic_rclone_credsweeper_scan(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
     phase: str,
@@ -9675,7 +9743,7 @@ def _run_post_mapping_deterministic_rclone_credsweeper_scan(
         target_pairs = _resolve_cifs_host_share_targets(
             hosts=hosts,
             shares=shares,
-            share_map=None,
+            share_map=share_map,
         )
         download_result = _run_rclone_copy_loot_download(
             shell=shell,
@@ -9804,6 +9872,7 @@ def _run_post_mapping_deterministic_rclone_artifact_scan(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
     phase: str,
@@ -9845,7 +9914,7 @@ def _run_post_mapping_deterministic_rclone_artifact_scan(
         target_pairs = _resolve_cifs_host_share_targets(
             hosts=hosts,
             shares=shares,
-            share_map=None,
+            share_map=share_map,
         )
         download_result = _run_rclone_copy_loot_download(
             shell=shell,
@@ -9918,6 +9987,7 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
     cifs_mount_root: str | None = None,
@@ -9948,7 +10018,7 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
     mount_targets = _resolve_cifs_host_share_targets(
         hosts=hosts,
         shares=shares,
-        share_map=None,
+        share_map=share_map,
     )
     mounted_points: list[str] = []
     try:
@@ -10101,6 +10171,7 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
     domain: str,
     shares: list[str],
     hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None = None,
     username: str,
     password: str,
     cifs_mount_root: str | None = None,
@@ -10126,7 +10197,7 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
     mount_targets = _resolve_cifs_host_share_targets(
         hosts=hosts,
         shares=shares,
-        share_map=None,
+        share_map=share_map,
     )
     mounted_points: list[str] = []
     try:

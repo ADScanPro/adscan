@@ -45,6 +45,16 @@ if command -v sudo >/dev/null 2>&1; then
     echo "adscan ALL=(root) NOPASSWD: /usr/bin/ntpdig"
     echo "adscan ALL=(root) NOPASSWD: /usr/sbin/ntpdig"
     echo "adscan ALL=(root) NOPASSWD: /usr/bin/install"
+    # Needed so sudo_validate() non-interactive probe succeeds in this container.
+    echo "adscan ALL=(root) NOPASSWD: /usr/bin/true"
+    echo "adscan ALL=(root) NOPASSWD: /bin/true"
+    # kill is used by stop_background() to terminate root-owned process groups.
+    echo "adscan ALL=(root) NOPASSWD: /bin/kill"
+    echo "adscan ALL=(root) NOPASSWD: /usr/bin/kill"
+    # Background tools launched via launch_background() (needs_root=True).
+    # Responder — scoped to the dedicated venv python running Responder.py only.
+    echo "adscan ALL=(root) NOPASSWD: /opt/adscan/tool_venvs/responder/venv/bin/python"
+    # ntlmrelayx — will be added here when the relay attack module is implemented.
   } > /etc/sudoers.d/adscan
   chmod 0440 /etc/sudoers.d/adscan
 fi

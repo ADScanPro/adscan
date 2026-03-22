@@ -8,19 +8,18 @@ behaviour stable for the current CLI.
 from __future__ import annotations
 
 import os
-import signal
 import sqlite3
 import threading
 import time
 from typing import Any, Protocol
 
 from adscan_internal import telemetry
+from adscan_internal.background_process import launch_background, stop_background
 from adscan_internal.constants import TOOLS_INSTALL_DIR
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_error,
     print_info,
-    print_info_debug,
     print_instruction,
     print_success,
     print_warning,
@@ -97,53 +96,6 @@ def find_domain_by_netbios(shell: ResponderShell, netbios: str | None) -> str | 
         if "netbios" in data and data["netbios"] == netbios:
             return domain
     return None
-
-
-def execute_responder(
-    shell: ResponderShell, command: list[str], env: dict[str, str]
-) -> None:
-    """Execute Responder in the background.
-
-    Args:
-        shell: The shell instance with spawn_command method
-        command: Command to execute as list
-        env: Environment variables dictionary
-    """
-    print_info_debug(
-        f"[DEBUG] execute_responder: Received command: {' '.join(command)}"
-    )
-    print_info_debug(
-        f"[DEBUG] execute_responder: Received environment with keys (sample): {list(env.keys())[:10]}..."
-    )
-    try:
-        # Launch responder in background with inherited stdio
-        shell.responder_process = shell.spawn_command(
-            command,
-            env=env,
-            shell=False,
-            stdout=None,
-            stderr=None,
-            preexec_fn=os.setsid,
-        )
-        print_info_debug(
-            f"[DEBUG] execute_responder: self.responder_process object: {shell.responder_process}"
-        )
-        if shell.responder_process and hasattr(shell.responder_process, "pid"):
-            print_info_debug(
-                f"[DEBUG] execute_responder: Responder process PID: {shell.responder_process.pid}"
-            )
-        else:
-            print_info_debug(
-                "[DEBUG] execute_responder: Responder process object is None or does not have a PID."
-            )
-
-    except Exception as e:
-        telemetry.capture_exception(e)
-        print_info_debug(
-            f"[DEBUG] execute_responder: Exception during responder launch: {str(e)}"
-        )
-        print_error("Error executing Responder.")
-        print_exception(show_locals=False, exception=e)
 
 
 def monitor_responder_db(shell: ResponderShell, _args: str) -> None:
@@ -225,19 +177,15 @@ def monitor_responder_db(shell: ResponderShell, _args: str) -> None:
 def start_responder(shell: ResponderShell) -> None:
     """Start Responder to capture network hashes and begin monitoring the database.
 
-    This function checks if the network interface is configured before starting Responder.
-    If the interface is configured, it creates two threads: one to execute Responder and another
-    to monitor its database for new hashes.
-
-    Requires that the shell instance variable `interface` is configured with the appropriate
-    network interface before execution. Use 'stop_responder' to stop the processes started.
+    Requires that the shell instance variable ``interface`` is configured with
+    the appropriate network interface before execution.
+    Use ``stop_responder`` to stop the processes started.
     """
     if not shell.interface:
         print_error("The network interface must be configured before running Responder")
         return
 
     env = os.environ.copy()
-    # Use Python from isolated venv if available, fallback to system python
     responder_python = shell.responder_python or "python"
     command = [
         responder_python,
@@ -246,20 +194,22 @@ def start_responder(shell: ResponderShell) -> None:
         shell.interface,
     ]
 
-    # Debug logs
-    print_info_debug(f"[DEBUG] start_responder: Prepared command: {' '.join(command)}")
-    print_info_debug(
-        f"[DEBUG] start_responder: Passing environment with keys (sample): {list(env.keys())[:10]}..."
-    )
-
-    # Original user-facing message
     print_info("Starting Responder to capture hashes")
 
-    # Start Responder (execute_responder is now non-blocking as Popen is used without wait)
-    execute_responder(shell, command, env)
+    shell.responder_process = launch_background(
+        command,
+        shell.spawn_command,
+        env=env,
+        needs_root=True,
+        label="Responder",
+    )
 
-    # Create thread to monitor the database
+    if shell.responder_process is None:
+        # launch_background already printed the error.
+        return
+
     monitor_thread = threading.Thread(target=monitor_responder_db, args=(shell, ""))
+    monitor_thread.daemon = True
     monitor_thread.start()
 
     print_instruction(
@@ -308,11 +258,6 @@ def stop_responder(shell: ResponderShell) -> None:
     Args:
         shell: The shell instance with responder_process attribute
     """
-    try:
-        if hasattr(shell, "responder_process") and shell.responder_process:
-            os.killpg(os.getpgid(shell.responder_process.pid), signal.SIGTERM)
-            print_success("Responder stopped.")
-    except Exception as e:
-        telemetry.capture_exception(e)
-        print_error("Error stopping Responder.")
-        print_exception(show_locals=False, exception=e)
+    process = getattr(shell, "responder_process", None)
+    if stop_background(process, label="Responder"):
+        print_success("Responder stopped.")

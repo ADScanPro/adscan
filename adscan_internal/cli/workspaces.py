@@ -304,21 +304,6 @@ def workspace_select(shell: WorkspaceShell) -> None:
     if shell.current_domain:
         shell.domain_save()
 
-    if len(workspaces) == 1:
-        from adscan_internal.workspaces import activate_workspace
-
-        activate_workspace(
-            shell, workspaces_dir=shell.workspaces_dir, workspace_name=workspaces[0]
-        )
-        shell.load_workspace_data(shell.current_workspace_dir or "")
-        marked_workspace_name = mark_sensitive(
-            shell.current_workspace or "", "workspace"
-        )
-        print_success(
-            f"Workspace '{marked_workspace_name}' selected automatically as it's the only one."
-        )
-        return
-
     create_option = "[ + Create new workspace ]"
     workspace_options = workspaces + [create_option]
     selected_idx = shell._questionary_select("Select a workspace:", workspace_options)

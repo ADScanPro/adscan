@@ -1752,6 +1752,72 @@ def print_info_debug(message: Union[str, Text], panel: bool = False, icon: str =
             _print_logger_format_fallback("DEBUG", message, level_color="cyan")
 
 
+def print_cypher_query(query: str) -> None:
+    """Print a Cypher query in a clean, copy-paste-friendly format.
+
+    - Always writes to log file for post-analysis.
+    - In debug mode: prints directly to console (no DEBUG prefix, no source file,
+      no syntax highlighting) so the query can be copy-pasted into BloodHound UI as-is.
+
+    Args:
+        query: Cypher query string, already normalized to a single line.
+    """
+    import logging
+
+    global _debug_mode
+    plain_log = f"[bh-cypher] {query}"
+
+    # Always persist to file handlers regardless of debug mode
+    try:
+        from adscan_internal import logging_config as _logging_config  # type: ignore
+
+        _logger = _get_logger()
+        record = _logger.makeRecord(
+            _logger.name,
+            logging.DEBUG,
+            "",
+            0,
+            plain_log,
+            args=(),
+            exc_info=None,
+        )
+        for _handler in (
+            getattr(_logging_config, "_file_handler", None),
+            getattr(_logging_config, "_workspace_file_handler", None),
+        ):
+            if _handler is None:
+                continue
+            try:
+                _handler.emit(record)
+            except Exception:
+                continue
+
+        # In debug mode also capture to telemetry handler — mirrors print_info_debug
+        # behaviour where logger.debug() triggers _telemetry_console_handler.
+        if _debug_mode:
+            _telemetry_handler = getattr(
+                _logging_config, "_telemetry_console_handler", None
+            )
+            if _telemetry_handler is not None:
+                try:
+                    _telemetry_handler.emit(record)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Show in console only in debug mode — bypass RichHandler for clean display
+    if not _debug_mode:
+        return
+
+    from rich.text import Text as _Text
+
+    console = _get_console()
+    line = _Text("[bh-cypher] ", style="dim cyan")
+    line.append(query, style="dim")
+    console.print(line, highlight=False, soft_wrap=True)
+
+
 def print_success(
     message: Union[str, Text],
     panel: bool = False,
@@ -4806,8 +4872,14 @@ def print_attack_paths_summary(
     max_path_steps: int | None = None,
     search_mode_label: str | None = None,
     actionable_count: int | None = None,
+    show_sections: bool = False,
 ) -> None:
-    """Render attack paths in a clear, compact summary."""
+    """Render attack paths in a clear, compact summary.
+
+    When ``show_sections=True`` the table is split into a high-value section
+    (normal styling) and a pivot/non-HV section (dim styling) separated by a
+    horizontal rule.  Paths must already be sorted HV-first by the caller.
+    """
     from rich.table import Table
     from rich.text import Text
 
@@ -4817,12 +4889,46 @@ def print_attack_paths_summary(
     total = len(paths)
     show_count = min(max_display, total)
 
+    visible = paths[:show_count]
+
+    # Compute total HV/non-HV from the FULL list (not just visible) so that the
+    # header always reflects the true scope even when max_display clips pivot paths.
+    total_hv = sum(1 for p in paths if p.get("target_is_high_value")) if show_sections else 0
+    total_nonhv = total - total_hv if show_sections else 0
+    visible_hv = sum(1 for p in visible if p.get("target_is_high_value")) if show_sections else 0
+    visible_nonhv = show_count - visible_hv if show_sections else 0
+    # Both sections exist in the DATA (regardless of visibility).
+    _has_both_sections = show_sections and total_hv > 0 and total_nonhv > 0
+    # Whether the separator is visible in the rendered table.
+    _separator_visible = _has_both_sections and visible_hv > 0 and visible_nonhv > 0
+
     summary_text = Text()
-    summary_text.append("Attack Paths Found: ", style="bold white")
-    summary_text.append(str(total), style=f"bold {BRAND_COLORS['warning']}")
-    summary_text.append("  ")
-    summary_text.append("Showing: ", style="bold white")
-    summary_text.append(str(show_count), style=f"bold {BRAND_COLORS['info']}")
+    if show_sections and _has_both_sections:
+        summary_text.append("🎯 High-Value: ", style="bold white")
+        # Show "X/total" when the limit clips some HV paths, otherwise just X.
+        hv_label = f"{visible_hv}/{total_hv}" if visible_hv < total_hv else str(total_hv)
+        summary_text.append(hv_label, style=f"bold {BRAND_COLORS['warning']}")
+        summary_text.append("   ⚠ Pivot: ", style="bold white")
+        pivot_label = (
+            f"{visible_nonhv}/{total_nonhv}" if visible_nonhv < total_nonhv else str(total_nonhv)
+        )
+        pivot_style = BRAND_COLORS["info"] if visible_nonhv > 0 else "dim"
+        summary_text.append(pivot_label, style=f"bold {pivot_style}")
+        summary_text.append("   Showing: ", style="bold white")
+        summary_text.append(str(show_count), style=f"bold {BRAND_COLORS['success']}")
+        if show_count < total:
+            summary_text.append(f"/{total}", style="dim")
+    elif show_sections and total_hv == 0 and total_nonhv > 0:
+        summary_text.append("⚠ Pivot Paths Found: ", style="bold white")
+        summary_text.append(str(total_nonhv), style=f"bold {BRAND_COLORS['info']}")
+        summary_text.append("  Showing: ", style="bold white")
+        summary_text.append(str(show_count), style=f"bold {BRAND_COLORS['success']}")
+    else:
+        summary_text.append("Attack Paths Found: ", style="bold white")
+        summary_text.append(str(total), style=f"bold {BRAND_COLORS['warning']}")
+        summary_text.append("  ")
+        summary_text.append("Showing: ", style="bold white")
+        summary_text.append(str(show_count), style=f"bold {BRAND_COLORS['info']}")
     if str(search_mode_label or "").strip():
         summary_text.append("  ")
         summary_text.append("Mode: ", style="bold white")
@@ -4973,6 +5079,14 @@ def print_attack_paths_summary(
             return Text("Disabled", style=BRAND_COLORS["error"])
         return Text("", style="dim")
 
+    # Pre-compute the last HV row index for section separator placement.
+    # Only meaningful when both sections are actually visible in the table.
+    last_hv_row = -1
+    if _separator_visible:
+        for _i, _p in enumerate(visible):
+            if _p.get("target_is_high_value"):
+                last_hv_row = _i
+
     for idx, path in enumerate(paths[:show_count], start=1):
         nodes = path.get("nodes", [])
         rels = path.get("relations", [])
@@ -4993,7 +5107,11 @@ def print_attack_paths_summary(
         state_cell = Text("", style="dim")
         meta = path.get("meta") if isinstance(path, dict) else None
         if isinstance(meta, dict):
-            affected_count = meta.get("affected_user_count")
+            # Prefer combined principal count (users + computers); fall back to
+            # legacy user-only count for older cached records.
+            affected_count = meta.get("affected_principal_count")
+            if not isinstance(affected_count, int):
+                affected_count = meta.get("affected_user_count")
             if isinstance(affected_count, int):
                 affected_cell = str(affected_count)
             target_kind = str(meta.get("execution_support_target_kind") or "").strip()
@@ -5002,8 +5120,16 @@ def print_attack_paths_summary(
             state_cell = _format_target_state_cell(meta)
         exec_cell = _format_exec_cell(meta if isinstance(meta, dict) else None)
 
+        is_nonhv_row = _has_both_sections and not path.get("target_is_high_value")
+        is_last_hv = _separator_visible and (idx - 1) == last_hv_row
+        row_style = "dim" if is_nonhv_row else ""
+        idx_cell: str | Text = (
+            Text(str(idx), style=f"bold {BRAND_COLORS['warning']}")
+            if _has_both_sections and not is_nonhv_row
+            else str(idx)
+        )
         row = [
-            str(idx),
+            idx_cell,
             path_str,
             affected_cell,
             target_cell,
@@ -5012,7 +5138,7 @@ def print_attack_paths_summary(
             status,
             str(length),
         ]
-        table.add_row(*row)
+        table.add_row(*row, style=row_style, end_section=is_last_hv)
 
     print_table(table, spacing="both")
 
@@ -5359,7 +5485,9 @@ def print_attack_path_detail(
             _get_console().print(execution_summary)
 
         affected_source = str(meta.get("affected_users_source") or "").strip()
-        affected_count = meta.get("affected_user_count")
+        affected_count = meta.get("affected_principal_count")
+        if not isinstance(affected_count, int):
+            affected_count = meta.get("affected_user_count")
         if affected_source:
             affected_summary = Text()
             affected_summary.append("Affected Scope: ", style="bold white")
@@ -5805,6 +5933,40 @@ def print_attack_path_detail_debug(
         return
     print_info_debug("DEBUG attack path detail (debug-only output).")
     print_attack_path_detail(domain, path, index=index)
+    _get_console().print()
+
+
+def print_attack_paths_summary_debug(
+    domain: str,
+    paths: List[Dict[str, object]],
+    *,
+    stage_label: str = "",
+    max_display: int = 30,
+) -> None:
+    """Print an attack-path summary table only when debug mode is enabled.
+
+    Used to instrument the post-processing pipeline — shows the current set of
+    display records after each filter/rule is applied so the pipeline can be
+    inspected step-by-step without affecting normal (non-debug) output.
+
+    Follows the same pattern as print_attack_path_detail_debug: the stage label
+    is emitted via print_info_debug (logger → RichHandler with DEBUG indicator)
+    for consistency with the rest of the debug UX.
+
+    Args:
+        domain: Domain name shown in the table header.
+        paths: Display records at this pipeline stage.
+        stage_label: Human-readable name for the stage (e.g. "after cyclic filter").
+        max_display: Maximum rows to show in the table (default 30).
+    """
+    global _debug_mode
+    if not _debug_mode:
+        return
+    label = str(stage_label or "pipeline stage").strip()
+    print_info_debug(f"[attack-paths] {label} — {len(paths)} path(s)")
+    if not paths:
+        return
+    print_attack_paths_summary(domain, paths, max_display=max_display)
     _get_console().print()
 
 

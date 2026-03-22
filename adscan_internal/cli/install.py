@@ -1472,14 +1472,14 @@ def install_rusthound_ce_helper(
                 )
                 deps.print_info(
                     "You can install it manually later with: "
-                    "cargo install rusthound-ce@2.4.1 --force"
+                    "cargo install rusthound-ce@2.4.7 --force"
                 )
     except Exception as exc:  # noqa: BLE001
         deps.telemetry_capture_exception(exc)
         deps.print_warning(f"Error installing RustHound-CE: {exc}")
         deps.print_info(
             "You can install it manually later with: "
-            "cargo install rusthound-ce@2.4.1 --force"
+            "cargo install rusthound-ce@2.4.7 --force"
         )
 
 

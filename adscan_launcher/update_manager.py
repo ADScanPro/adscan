@@ -13,6 +13,7 @@ the PyPI launcher uses the same logic with a smaller set of injected helpers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,10 @@ from rich.console import Group
 from rich.text import Text
 
 from adscan_launcher.docker_commands import pull_runtime_image_with_diagnostics
+
+
+_UPDATE_HEALTH_FILENAME = "update_health.json"
+_STALE_UPDATE_WARNING_DAYS = 14
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,126 @@ class UpdateContext:
     print_success: Callable[[str], None]
     print_panel: Callable[..., None]
     confirm_ask: Callable[[str, bool], bool]
+
+
+def is_dev_update_context(
+    *,
+    os_getenv: Callable[[str, str | None], str | None] = os.getenv,
+    image_name: str | None = None,
+) -> bool:
+    """Return whether update/version UX should be suppressed for dev workflows."""
+    docker_channel = str(os_getenv("ADSCAN_DOCKER_CHANNEL", "") or "").strip().lower()
+    session_env = str(os_getenv("ADSCAN_SESSION_ENV", "") or "").strip().lower()
+    runtime_image = str(os_getenv("ADSCAN_RUNTIME_IMAGE", "") or "").strip().lower()
+    candidate_image = str(image_name or runtime_image or "").strip().lower()
+    image_no_digest = candidate_image.split("@", 1)[0]
+    image_repo = image_no_digest.split(":", 1)[0]
+    image_tag = image_no_digest.split(":", 1)[1] if ":" in image_no_digest else ""
+    return (
+        docker_channel == "dev"
+        or session_env == "dev"
+        or image_repo.endswith("-dev")
+        or image_tag == "edge"
+    )
+
+
+def _get_update_health_path(adscan_base_dir: str) -> Path:
+    """Return the JSON file used for local update health metadata."""
+    return Path(adscan_base_dir) / _UPDATE_HEALTH_FILENAME
+
+
+def read_local_update_health(adscan_base_dir: str) -> dict[str, object]:
+    """Return persisted local update health metadata when available."""
+    path = _get_update_health_path(adscan_base_dir)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def get_local_update_recency_summary(
+    adscan_base_dir: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Return local update recency metadata derived from persisted state."""
+    payload = read_local_update_health(adscan_base_dir)
+    last_success_raw = str(payload.get("last_success_at") or "").strip()
+    if not last_success_raw:
+        return {
+            "has_successful_update": False,
+            "is_stale": True,
+            "age_days": None,
+            "message": "No successful local update recorded yet.",
+        }
+    try:
+        last_success_at = datetime.fromisoformat(last_success_raw)
+    except ValueError:
+        return {
+            "has_successful_update": False,
+            "is_stale": True,
+            "age_days": None,
+            "message": "Last successful local update timestamp is unreadable.",
+        }
+    if last_success_at.tzinfo is None:
+        last_success_at = last_success_at.replace(tzinfo=timezone.utc)
+    current_time = now or datetime.now(timezone.utc)
+    age_days = max(0, int((current_time - last_success_at).total_seconds() // 86400))
+    is_stale = age_days >= _STALE_UPDATE_WARNING_DAYS
+    return {
+        "has_successful_update": True,
+        "is_stale": is_stale,
+        "age_days": age_days,
+        "message": (
+            f"Last successful local update: {last_success_raw}"
+            if not is_stale
+            else f"Last successful local update: {last_success_raw} ({age_days}d old)"
+        ),
+    }
+
+
+def _write_local_update_health(adscan_base_dir: str, payload: dict[str, object]) -> None:
+    """Persist local update health metadata best-effort."""
+    path = _get_update_health_path(adscan_base_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _record_update_health(
+    ctx: UpdateContext,
+    *,
+    ok: bool,
+    updated_launcher: bool,
+    updated_runtime: bool,
+) -> None:
+    """Persist local metadata about the last update attempt and success."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    payload = read_local_update_health(ctx.adscan_base_dir)
+    payload["last_attempt_at"] = now.isoformat()
+    payload["last_attempt_ok"] = ok
+    payload["last_attempt_launcher_updated"] = updated_launcher
+    payload["last_attempt_runtime_updated"] = updated_runtime
+    payload["installer"] = ctx.detect_installer()
+    payload["docker_image"] = ctx.get_docker_image_name()
+    try:
+        payload["launcher_version"] = str(ctx.get_installed_version() or "").strip()
+    except Exception as exc:  # pragma: no cover - defensive guard
+        ctx.telemetry_capture_exception(exc)
+    if ok:
+        payload["last_success_at"] = now.isoformat()
+        payload["last_success_launcher_updated"] = updated_launcher
+        payload["last_success_runtime_updated"] = updated_runtime
+    try:
+        _write_local_update_health(ctx.adscan_base_dir, payload)
+    except Exception as exc:  # pragma: no cover - best effort persistence
+        ctx.telemetry_capture_exception(exc)
+        ctx.print_info_debug(f"[update] Failed to persist local update health: {exc}")
 
 
 def get_launcher_update_info(ctx: UpdateContext) -> dict:
@@ -263,13 +388,6 @@ def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> b
         ctx.print_instruction("Try: python3 -m pip install --upgrade adscan")
         ctx.print_info_debug(f"[update] pip upgrade error: {exc}")
         return False
-    if latest_version:
-        try:
-            ver_dir = Path(ctx.adscan_base_dir)
-            ver_dir.mkdir(parents=True, exist_ok=True)
-            (ver_dir / "version").write_text(latest_version, encoding="utf-8")
-        except Exception:
-            pass
     return True
 
 
@@ -323,10 +441,13 @@ def _update_docker_image(
 def _render_update_panel(
     ctx: UpdateContext, launcher_info: dict, docker_info: dict
 ) -> None:
-    """Render a concise update summary panel."""
+    """Render an update summary panel with clear operational guidance."""
     lines: list[Text] = []
     current = launcher_info.get("current") or "unknown"
     latest = launcher_info.get("latest") or "unknown"
+    update_needed = bool(
+        launcher_info.get("is_newer") or docker_info.get("needs_update")
+    )
     if launcher_info.get("is_newer"):
         lines.append(
             Text(
@@ -346,11 +467,68 @@ def _render_update_panel(
     elif docker_info.get("image_present"):
         lines.append(Text(f"Docker image: {image} (up-to-date)", style="green"))
 
+    if update_needed:
+        if launcher_info.get("is_newer") and docker_info.get("needs_update"):
+            action_text = (
+                "Action: refresh both the launcher and runtime image together."
+            )
+        elif launcher_info.get("is_newer"):
+            action_text = "Action: refresh the launcher from the host."
+        else:
+            action_text = "Action: refresh the runtime image from the host."
+        lines.append(
+            Text(
+                "Recommended: keep both launcher and runtime updated for bug fixes, "
+                "new attack coverage, and escalation improvements.",
+                style="cyan",
+            )
+        )
+        lines.append(
+            Text(
+                action_text,
+                style="white",
+            )
+        )
+        lines.append(
+            Text(
+                "Run on the host: adscan update",
+                style="bold white",
+            )
+        )
+    recency = get_local_update_recency_summary(ctx.adscan_base_dir)
+    recency_message = str(recency.get("message") or "").strip()
+    if recency_message:
+        lines.append(
+            Text(
+                recency_message,
+                style="yellow" if bool(recency.get("is_stale")) else "dim",
+            )
+        )
+    if bool(recency.get("is_stale")):
+        lines.append(
+            Text(
+                f"Recommendation: update at least every {_STALE_UPDATE_WARNING_DAYS} days.",
+                style="bold yellow",
+            )
+        )
+
     ctx.print_panel(
         Group(*lines),
-        title="Updates",
-        border_style=None,
+        title="Updates Required" if update_needed else "Updates",
+        border_style="yellow" if update_needed else None,
         padding=(1, 2),
+    )
+
+
+def _confirm_skip_update(ctx: UpdateContext, *, component_label: str) -> bool:
+    """Ask the operator to confirm skipping a recommended update."""
+    ctx.print_warning(
+        f"Skipping the {component_label} update is not recommended. "
+        "The latest release is typically the most stable and includes the newest fixes and features."
+    )
+    return ctx.confirm_ask(
+        f"Are you sure you want to continue without updating the {component_label}?",
+        False,
     )
 
 
@@ -364,13 +542,8 @@ def offer_updates_for_command(ctx: UpdateContext, command: str) -> None:
         return
 
     # Maintainer dev channel should not show update checks/prompts.
-    docker_channel = str(ctx.os_getenv("ADSCAN_DOCKER_CHANNEL", "") or "").strip().lower()
     docker_image = str(ctx.get_docker_image_name() or "").strip().lower()
-    image_no_digest = docker_image.split("@", 1)[0]
-    image_repo = image_no_digest.split(":", 1)[0]
-    image_tag = image_no_digest.split(":", 1)[1] if ":" in image_no_digest else ""
-    is_dev_image = image_repo.endswith("-dev") or image_tag == "edge"
-    if docker_channel == "dev" or is_dev_image:
+    if is_dev_update_context(os_getenv=ctx.os_getenv, image_name=docker_image):
         ctx.print_info_debug(
             "[update] Dev channel detected; skipping launcher/docker update checks."
         )
@@ -397,11 +570,22 @@ def offer_updates_for_command(ctx: UpdateContext, command: str) -> None:
         or not ctx.sys_stdin_isatty()
     ):
         ctx.print_info("Non-interactive environment detected; skipping update prompts.")
+        recency = get_local_update_recency_summary(ctx.adscan_base_dir)
+        if bool(recency.get("is_stale")):
+            ctx.print_warning(str(recency.get("message") or "Local update cadence looks stale."))
+        ctx.print_info(
+            "Running with a stale launcher or runtime image can produce incorrect checks, "
+            "missed fixes, and older attack coverage."
+        )
         ctx.print_instruction("Run: adscan update")
         return
 
     if launcher_info.get("is_newer"):
         if ctx.confirm_ask("Update the launcher now?", True):
+            if _update_launcher(ctx, str(launcher_info.get("latest") or "")):
+                ctx.print_success("Launcher update completed, restarting...")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+        elif not _confirm_skip_update(ctx, component_label="launcher"):
             if _update_launcher(ctx, str(launcher_info.get("latest") or "")):
                 ctx.print_success("Launcher update completed, restarting...")
                 os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -427,6 +611,12 @@ def offer_updates_for_command(ctx: UpdateContext, command: str) -> None:
                     "Resolve Docker/image pull issues first, then retry the same command."
                 )
                 raise SystemExit(1)
+        elif not _confirm_skip_update(ctx, component_label="runtime image"):
+            _update_docker_image(
+                ctx,
+                str(docker_info.get("image") or ctx.get_docker_image_name()),
+                command_name=command,
+            )
 
 
 def run_update_command(ctx: UpdateContext) -> bool:
@@ -445,6 +635,7 @@ def run_update_command(ctx: UpdateContext) -> bool:
     ok = True
     updated_launcher = False
     launcher_restart_ready = False
+    docker_updated = False
     if launcher_info.get("is_newer"):
         updated_launcher = _update_launcher(ctx, str(launcher_info.get("latest") or ""))
         ok = ok and bool(updated_launcher)
@@ -458,9 +649,17 @@ def run_update_command(ctx: UpdateContext) -> bool:
 
     image_name = str(docker_info.get("image") or ctx.get_docker_image_name())
     if docker_info.get("needs_update") or not docker_info.get("image_present"):
-        ok = _update_docker_image(ctx, image_name, command_name="update") and ok
+        docker_updated = _update_docker_image(ctx, image_name, command_name="update")
+        ok = docker_updated and ok
     else:
         ctx.print_info("Docker image already up-to-date.")
+
+    _record_update_health(
+        ctx,
+        ok=ok,
+        updated_launcher=updated_launcher,
+        updated_runtime=docker_updated,
+    )
 
     if updated_launcher and launcher_restart_ready:
         ctx.print_success("Updates completed, restarting...")

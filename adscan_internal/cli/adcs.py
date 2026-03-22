@@ -152,7 +152,13 @@ def detect_adcs(
             )
             print_info_debug(f"Command: {command}")
 
-        completed_process = shell._run_netexec(command, domain=domain, timeout=300)
+        completed_process = shell._run_netexec(
+            command,
+            domain=domain,
+            timeout=900,
+            operation_kind="adcs_detection",
+            service="ldap",
+        )
         if completed_process is None:
             if emit_telemetry:
                 _capture_adcs_not_discovered(shell, domain_data, error=True)

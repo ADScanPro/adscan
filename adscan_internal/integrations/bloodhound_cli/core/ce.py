@@ -6,12 +6,11 @@ BloodHound CE implementation using HTTP API
 import configparser
 import os
 from json import JSONDecodeError
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 import time
 import requests
 from .base import BloodHoundClient
-from .logging_utils import get_logger
 from .settings import (
     CONFIG_FILE,
     BLOODHOUND_CE_DEFAULT_WEB_PORT,
@@ -21,11 +20,14 @@ from .settings import (
 )
 from adscan_internal.rich_output import (
     mark_sensitive,
+    print_cypher_query,
     print_error,
     print_info,
     print_info_debug,
+    print_panel,
     print_success,
     print_warning,
+    print_exception
 )
 
 
@@ -38,6 +40,28 @@ def _get_default_admin_password() -> str:
     )
 
 
+_bh_complexity_warning_shown = False
+
+
+def _warn_bh_complexity_limit() -> None:
+    """Show a one-time actionable warning when BH CE rejects a query as too complex."""
+    global _bh_complexity_warning_shown
+    if _bh_complexity_warning_shown:
+        return
+    _bh_complexity_warning_shown = True
+    print_panel(
+        "[bold yellow]BloodHound CE — Cypher complexity limit triggered[/bold yellow]\n\n"
+        "BloodHound CE rejected this query because the Cypher complexity limit is enabled.\n"
+        "The managed configuration ships with this limit [bold]disabled[/bold] by default,\n"
+        "but the running container was started with an older configuration.\n\n"
+        "[bold]To fix:[/bold] run [bold cyan]adscan start[/bold cyan] — it will automatically\n"
+        "detect the configuration change and recreate the containers with the updated settings.\n"
+        "Your data (Neo4j graph, Postgres) is stored in Docker volumes and will not be affected.",
+        title="Action required",
+        border_style="yellow",
+    )
+
+
 class BloodHoundCEClient(BloodHoundClient):
     """BloodHound CE client using HTTP API."""
 
@@ -45,8 +69,8 @@ class BloodHoundCEClient(BloodHoundClient):
         self,
         base_url: str = None,
         api_token: Optional[str] = None,
-        debug: bool = False,
-        verbose: bool = False,
+        debug: bool = True,
+        verbose: bool = True,
         verify: bool = True,
     ):
         super().__init__(debug, verbose)
@@ -73,7 +97,6 @@ class BloodHoundCEClient(BloodHoundClient):
         self.session = requests.Session()
         if self.api_token:
             self.session.headers.update({"Authorization": f"Bearer {self.api_token}"})
-        self.logger = get_logger("BloodHoundCE", base_url=self.base_url)
         # Store credentials for token renewal
         self._stored_username = None
         self._stored_password = None
@@ -103,8 +126,8 @@ class BloodHoundCEClient(BloodHoundClient):
         return stripped
 
     def _debug(self, message: str, **context) -> None:
-        if self.debug:
-            self.logger.debug(message, **context)
+        ctx_str = f" {context}" if context else ""
+        print_info_debug(f"[bloodhound-ce] {message}{ctx_str}")
 
     def _load_config(self) -> Optional[Dict[str, str]]:
         """Load configuration from the resolved config path."""
@@ -165,16 +188,9 @@ class BloodHoundCEClient(BloodHoundClient):
             # Clean up query: normalize whitespace but preserve structure
             # Using split() + join() preserves all non-whitespace characters
             cleaned_query = " ".join(query.split())
+            print_cypher_query(cleaned_query)
 
             payload = {"query": cleaned_query, "include_properties": True}
-
-            self._debug(
-                "executing cypher query",
-                raw_query=query,
-                cleaned_query=cleaned_query,
-                url=url,
-                params=params,
-            )
 
             response = self.session.post(
                 url, json=payload, verify=self.verify, timeout=60
@@ -231,85 +247,154 @@ class BloodHoundCEClient(BloodHoundClient):
             self._debug("cypher query error", error=str(exc))
             return []
 
-    def execute_query_rows(self, query: str) -> List[Dict]:
-        """Execute a Cypher query and return row data (non-node results)."""
-        try:
-            url = f"{self.base_url}/api/v2/graphs/cypher"
-
-            cleaned_query = " ".join(query.split())
-            payload = {"query": cleaned_query, "include_properties": True}
-
-            self._debug(
-                "executing cypher rows query",
-                raw_query=query,
-                cleaned_query=cleaned_query,
-                url=url,
-            )
-
-            response = self.session.post(
-                url, json=payload, verify=self.verify, timeout=60
-            )
-
-            if response.status_code == 401:
-                self._debug("authentication failed, attempting token renewal")
-                if self.ensure_authenticated_robust():
-                    response = self.session.post(
-                        url, json=payload, verify=self.verify, timeout=60
-                    )
-                else:
-                    self._debug(
-                        "token renewal failed",
-                        status=response.status_code,
-                        response_text=response.text,
-                    )
-                    return []
-
-            if response.status_code != 200:
-                self._last_error = (
-                    f"HTTP {response.status_code}: {response.text.strip()}"
-                )
-                self._debug(
-                    "cypher rows query failed",
-                    status=response.status_code,
-                    response_text=response.text,
-                )
-                return []
-
-            data = response.json()
-            self._last_error = None
-            payload_data = data.get("data", data)
-            if isinstance(payload_data, dict):
-                if "rows" in payload_data and isinstance(payload_data["rows"], list):
-                    rows = payload_data["rows"]
-                    columns = payload_data.get("columns")
-                    if (
-                        isinstance(columns, list)
-                        and rows
-                        and all(isinstance(row, list) for row in rows)
-                    ):
-                        return [dict(zip(columns, row, strict=False)) for row in rows]
-                    return rows
-                if "results" in payload_data and isinstance(
-                    payload_data["results"], list
-                ):
-                    return payload_data["results"]
-                if "data" in payload_data and isinstance(payload_data["data"], list):
-                    return payload_data["data"]
-            if isinstance(payload_data, list):
-                return payload_data
-            return []
-        except JSONDecodeError as json_error:
-            self._last_error = f"JSON decode error: {json_error}"
-            self._debug("failed to parse rows response", error=str(json_error))
-            return []
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            self._last_error = f"Query error: {exc}"
-            self._debug("cypher rows query error", error=str(exc))
-            return []
-
     def get_last_error(self) -> str | None:
         """Return the last query error message, if any."""
         return self._last_error
+
+    # ── Path query (fast path) ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_path_literals(literals: List[Dict]) -> List[Dict]:
+        """Convert BH CE ``literals`` response into path dicts.
+
+        When a Cypher query uses
+        ``RETURN nodes(p) AS path_nodes, relationships(p) AS rels``
+        instead of ``RETURN p``, BH CE returns a ``literals`` list where pairs
+        of entries represent one path each:
+          - ``{"key": "path_nodes", "value": [{Id, Labels, Props}, ...]}``
+          - ``{"key": "rels",       "value": [{Type, StartId, EndId, Props}, ...]}``
+
+        This converts each pair into ``{"nodes": [node_dict, ...], "rels": [str, ...]}``
+        matching the format expected by ``_bh_paths_to_display_records``.
+
+        No DFS needed — BH already reconstructed the ordered paths before
+        sending the response.
+        """
+
+        def _node_from_literal(raw: Dict) -> Dict:
+            props = raw.get("Props") or {}
+            labels: List[str] = raw.get("Labels") or []
+            # Prefer the most specific label (skip the generic "Base" label).
+            kind = next((lbl for lbl in labels if lbl != "Base"), labels[0] if labels else "")
+            label = str(
+                props.get("name")
+                or props.get("samaccountname")
+                or raw.get("ElementId")
+                or ""
+            )
+            object_id = str(props.get("objectid") or props.get("objectId") or "")
+            is_tier_zero = bool(
+                props.get("isTierZero")
+                or props.get("highvalue")
+                or "admin_tier_0" in str(props.get("system_tags") or "")
+            )
+            return {
+                "label": label,
+                "kind": kind,
+                "objectId": object_id,
+                "isTierZero": is_tier_zero,
+                "properties": props,
+            }
+
+        results: List[Dict] = []
+        i = 0
+        while i + 1 < len(literals):
+            pn_entry = literals[i]
+            rl_entry = literals[i + 1]
+            # Defensive: ensure we're reading the right keys.
+            if pn_entry.get("key") != "path_nodes" or rl_entry.get("key") != "rels":
+                i += 1
+                continue
+            raw_nodes: List[Dict] = pn_entry.get("value") or []
+            raw_rels: List[Dict] = rl_entry.get("value") or []
+            if not raw_nodes or not raw_rels or len(raw_nodes) != len(raw_rels) + 1:
+                i += 2
+                continue
+            results.append(
+                {
+                    "nodes": [_node_from_literal(n) for n in raw_nodes],
+                    "rels": [str(r.get("Type") or r.get("kind") or "") for r in raw_rels],
+                }
+            )
+            i += 2
+        return results
+
+    def execute_path_query(self, query: str) -> List[Dict]:
+        """Execute a path Cypher query and return parsed path dicts.
+
+        Expects the query to use
+        ``RETURN nodes(p) AS path_nodes, relationships(p) AS rels``
+        so BH CE returns structured per-path data in ``literals`` instead of
+        a deduplicated subgraph that requires a Python-side DFS.
+
+        Args:
+            query: Cypher query string ending with the ``RETURN nodes(p) … rels``
+                   clause (and optionally a ``LIMIT`` clause).
+
+        Returns:
+            List of ``{"nodes": [node_dict, ...], "rels": [str, ...]}`` — one
+            entry per path — ready for ``_bh_paths_to_display_records``.
+        """
+        try:
+            cleaned_query = " ".join(query.split())
+            print_cypher_query(cleaned_query)
+
+            url = f"{self.base_url}/api/v2/graphs/cypher"
+            payload = {"query": cleaned_query, "include_properties": True}
+            response = self.session.post(url, json=payload, verify=self.verify, timeout=60)
+
+            if response.status_code == 401:
+                if self.ensure_authenticated_robust():
+                    response = self.session.post(url, json=payload, verify=self.verify, timeout=60)
+                else:
+                    return []
+
+            self._debug(
+                "path query response",
+                status=response.status_code,
+                headers=dict(response.headers),
+            )
+
+            if response.status_code != 200:
+                self._debug(
+                    "path query failed",
+                    status=response.status_code,
+                    response_text=(response.text or "")[:300],
+                )
+                if response.status_code == 400:
+                    _body = (response.text or "").lower()
+                    if "too complex" in _body or "complexity" in _body:
+                        _warn_bh_complexity_limit()
+                return []
+
+            data = response.json()
+            self._debug(
+                "path query data",
+                has_data=isinstance(data, dict),
+                keys=list(data.keys()) if isinstance(data, dict) else None,
+            )
+            literals: List[Dict] = (data.get("data") or {}).get("literals") or []
+            paths = self._parse_path_literals(literals)
+            self._debug("path query parsed", raw_literals=len(literals), parsed_paths=len(paths))
+            if paths:
+                for i, sample in enumerate(paths[:2]):
+                    node_names = " → ".join(
+                        str(nd.get("label") or nd.get("objectId") or "?")
+                        for nd in (sample.get("nodes") or [])
+                    )
+                    self._debug(f"path sample [{i}]", nodes=node_names, rels=sample.get("rels"))
+                if len(paths) > 4:
+                    for i, sample in enumerate(paths[-2:], start=len(paths) - 2):
+                        node_names = " → ".join(
+                            str(nd.get("label") or nd.get("objectId") or "?")
+                            for nd in (sample.get("nodes") or [])
+                        )
+                        self._debug(f"path sample [{i}]", nodes=node_names, rels=sample.get("rels"))
+            return paths
+
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self._debug("path query error", error=str(exc))
+            return []
 
     def execute_query_with_relationships(self, query: str) -> Dict:
         """Execute a Cypher query and include relationships in the response"""
@@ -317,17 +402,12 @@ class BloodHoundCEClient(BloodHoundClient):
             url = f"{self.base_url}/api/v2/graphs/cypher"
 
             cleaned_query = " ".join(query.split())
+            print_cypher_query(cleaned_query)
             payload = {
                 "query": cleaned_query,
                 "include_properties": True,
                 "include_relationships": True,
             }
-
-            self._debug(
-                "executing relationship query",
-                raw_query=query,
-                cleaned_query=cleaned_query,
-            )
 
             response = self.session.post(
                 url, json=payload, verify=self.verify, timeout=60
@@ -1300,12 +1380,47 @@ class BloodHoundCEClient(BloodHoundClient):
         except Exception:
             return []
 
-    def get_low_priv_paths_to_high_value(
-        self, domain: str, *, max_depth: int = 4
-    ) -> List[Dict]:
-        """Return raw path rows from low-priv users to high-value targets."""
+    def _build_bh_edge_type_filter(self) -> str:
+        """Return the Cypher relationship-type filter string derived from the catalog.
+
+        Example output: ``[:MemberOf|GenericAll|GenericWrite|...*]``
+        When the catalog provides no BH-native types (should not happen), returns
+        an empty string so queries fall back to unrestricted traversal.
+        """
         try:
-            depth = max(1, min(max_depth, 8))
+            from adscan_internal.services.attack_step_catalog import (
+                get_bh_cypher_relation_types,
+            )
+
+            types = get_bh_cypher_relation_types()
+            if not types:
+                return ""
+            return ":" + "|".join(types)
+        except Exception:
+            return ""
+
+    def get_low_priv_paths_to_high_value(
+        self,
+        domain: str,
+        *,
+        max_depth: int = 5,
+        max_paths: Optional[int] = None,
+        target: str = "highvalue",
+    ) -> List[Dict]:
+        """Return raw path rows from low-priv users to high-value targets.
+
+        When ``target="all"`` the target filter is omitted so paths to any
+        non-source node are returned.  When ``target="lowpriv"`` only paths
+        to non-high-value nodes are returned.
+
+        Args:
+            max_paths: When provided, adds a Cypher ``LIMIT`` clause so Neo4j
+                caps the subgraph size before returning it.  This dramatically
+                reduces both network transfer and Python-side DFS time when
+                there are many paths (large domains).
+        """
+        try:
+            depth = max(1, max_depth)
             domain_value = domain.replace("'", "\\'")
             source_domain_filter = self._build_domain_filter(
                 alias="u",
@@ -1315,24 +1430,36 @@ class BloodHoundCEClient(BloodHoundClient):
                 alias="u", default_true=True
             )
             source_high_value_filter = self._build_high_value_filter(alias="u")
-            target_high_value_filter = self._build_high_value_filter(alias="h")
-            intermediate_high_value_filter = self._build_high_value_filter(alias="n")
+            edge_filter = self._build_bh_edge_type_filter()
+            acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
 
+            named_target_filter = f"\n  AND {self._build_named_node_filter(alias='h')}"
+
+            if target == "highvalue":
+                target_clause = f"  AND {self._build_high_value_filter(alias='h')}"
+                no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
+                no_terminal_memberof = ""
+            elif target == "lowpriv":
+                target_clause = f"  AND NOT {self._build_high_value_filter(alias='h')}"
+                no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
+                no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=False)}"
+            else:  # "all"
+                target_clause = ""
+                no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
+                no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=True)}"
+
+            limit_clause = f"\nLIMIT {max(1, max_paths)}" if max_paths is not None else ""
             cypher_query = f"""
-            MATCH p=(u:User)-[*1..{depth}]->(h)
+            MATCH p=(u:User)-[{edge_filter}*1..{depth}]->(h)
             WHERE {source_domain_filter}
               AND {source_enabled_filter}
-              AND NOT {source_high_value_filter}
-              AND {target_high_value_filter}
-            WITH p, nodes(p) AS ns, last(nodes(p)) AS lastNode
-            WHERE NONE(n IN ns WHERE n <> lastNode AND {intermediate_high_value_filter})
-            RETURN p
+              AND NOT {source_high_value_filter}{target_clause}{named_target_filter}
+            WITH p, nodes(p) AS ns
+            WHERE {acyclic_filter}{no_intermediate_hv}{no_terminal_memberof}
+            RETURN ns AS path_nodes, relationships(p) AS rels{limit_clause}
             """
 
-            graph_data = self.execute_query_with_relationships(cypher_query)
-            if not graph_data:
-                return []
-            return self._extract_paths_from_graph(graph_data, max_depth=depth)
+            return self.execute_path_query(cypher_query)
         except Exception:
             return []
 
@@ -1357,14 +1484,116 @@ class BloodHoundCEClient(BloodHoundClient):
         return f"coalesce({alias}.enabled, {default_flag}) = true"
 
     def _build_high_value_filter(self, *, alias: str) -> str:
-        """Return a Cypher predicate that identifies Tier Zero/high-value nodes."""
+        """Return a Cypher predicate that identifies Tier Zero/high-value nodes.
+
+        Uses ``split(system_tags, ' ')`` instead of treating ``system_tags`` as a
+        list — in BH CE the property is a space-separated string, so ``IN []``
+        never matches and nodes with ``admin_tier_0`` would incorrectly pass the
+        filter.
+        """
         return (
             "("
             f"coalesce({alias}.highvalue, false) = true "
-            f'OR "admin_tier_0" IN coalesce({alias}.system_tags, []) '
+            f"OR 'admin_tier_0' IN split(coalesce({alias}.system_tags, ''), ' ') "
             f"OR coalesce({alias}.isTierZero, false) = true"
             ")"
         )
+
+    def _build_named_node_filter(self, *, alias: str) -> str:
+        """Return a Cypher predicate that excludes stub/incomplete nodes without a name.
+
+        BH CE creates minimal stub nodes (e.g. delegation SPN targets) that only
+        carry ``lastseen`` and ``objectid`` but no ``name`` property.  These nodes
+        are never meaningful attack targets and must be excluded from all path
+        queries regardless of target mode.
+        """
+        return f"{alias}.name IS NOT NULL"
+
+    def _build_non_membership_path_filter(self, *, path_alias: str = "p") -> str:
+        """Return a Cypher predicate requiring at least one non-MemberOf edge in a path."""
+        return f"ANY(r IN relationships({path_alias}) WHERE type(r) <> 'MemberOf')"
+
+    def _build_non_terminal_memberof_filter(
+        self,
+        *,
+        path_alias: str = "p",
+        nodes_alias: str = "nodes(p)",
+        except_highvalue_terminal: bool = False,
+    ) -> str:
+        """Return a predicate that limits MemberOf as the terminal edge.
+
+        Paths ending with a MemberOf edge after an interesting step (e.g.
+        KERBEROAST → JON.SNOW → MemberOf → NIGHT WATCH) add no attack value —
+        MemberOf is a property of the compromised principal, not an actionable
+        next step.
+
+        When ``except_highvalue_terminal=True`` (``--all`` mode) the filter is
+        relaxed: a MemberOf terminal is still allowed when the terminal node IS
+        high-value/tier-zero (e.g. USER1 → MemberOf → DOMAIN ADMINS).  That case
+        represents a real privilege-escalation finding and must be preserved.
+
+        When ``except_highvalue_terminal=False`` (normal high-value mode) the
+        filter is not used at all — callers already require the terminal to be
+        high-value, so a MemberOf edge to DOMAIN ADMINS is always valid.
+        """
+        base = f"type(last(relationships({path_alias}))) <> 'MemberOf'"
+        if not except_highvalue_terminal:
+            return base
+        ns = nodes_alias
+        terminal_hv = (
+            f"coalesce(last({ns}).highvalue, false) = true"
+            f" OR 'admin_tier_0' IN split(coalesce(last({ns}).system_tags, ''), ' ')"
+            f" OR coalesce(last({ns}).isTierZero, false) = true"
+        )
+        return f"({base} OR ({terminal_hv}))"
+
+    def _build_no_intermediate_high_value_filter(self, *, nodes_alias: str = "nodes(p)") -> str:
+        """Return a predicate ensuring only the terminal node can be high-value.
+
+        Prevents BH from returning paths that pass *through* a high-value node on
+        the way to another high-value node.  Example: WINTERFELL (a DC, tier-zero)
+        → MemberOf → DOMAIN CONTROLLERS (also tier-zero) would generate two paths:
+        one ending at WINTERFELL and one ending at DOMAIN CONTROLLERS.  The longer
+        one is redundant because owning WINTERFELL already gives full domain access.
+
+        Uses ``ALL(n IN ns WHERE n = last(ns) OR NOT <is_highvalue>)`` rather than
+        list slicing.  List slicing on path functions (``nodes(p)[..-1]``,
+        ``nodes(p)[0..size(nodes(p))-1]``) causes ``Type mismatch: expected List<T>
+        but was Integer`` on Neo4j 4.4 / BloodHound CE.  ``last()`` and ``ALL()``
+        are first-class Cypher 4.x constructs that work reliably.
+
+        Callers should pass ``nodes_alias="ns"`` and include ``nodes(p) AS ns`` in
+        the preceding ``WITH`` clause so the list is computed once per row.
+
+        Only meaningful when ``target="highvalue"`` or ``target="lowpriv"``; callers
+        should skip this filter in ``--all`` mode.
+        """
+        hv = self._build_high_value_filter(alias="n")
+        ns = nodes_alias
+        return f"ALL(n IN {ns} WHERE n = last({ns}) OR NOT ({hv}))"
+
+    def _build_acyclic_path_filter(self, *, nodes_alias: str = "nodes(p)") -> str:
+        """Return a Cypher predicate that rejects paths containing repeated nodes.
+
+        Variable-length BH traversals can return paths where the same node
+        appears more than once (e.g. DOMAIN USERS → ... → DOMAIN USERS → ...).
+        Filtering these out in Cypher avoids shipping useless rows over the
+        network and removes the need for Python-side cyclic detection.
+
+        Uses ``single()`` instead of a nested list comprehension.  The nested
+        form ``ALL(n IN nodes(p) WHERE 1 = size([x IN nodes(p) WHERE x = n]))``
+        triggers "Variable `x` not defined" on Neo4j 4.4 because the parser
+        does not resolve variables introduced inside list comprehensions that
+        are nested inside ``ALL()`` predicates.  ``single()`` is a first-class
+        predicate function in Neo4j 4.4 and avoids the scoping issue entirely:
+        ``single(m IN nodes(p) WHERE id(m) = id(n))`` returns true iff exactly
+        one node in the path has the same internal Neo4j id as ``n``.
+
+        Callers should pass ``nodes_alias="ns"`` and include ``nodes(p) AS ns`` in
+        the preceding ``WITH`` clause so the list is computed once per row.
+        """
+        ns = nodes_alias
+        return f"ALL(n IN {ns} WHERE single(m IN {ns} WHERE id(m) = id(n)))"
 
     def _build_low_priv_source_filter(
         self,
@@ -1424,6 +1653,7 @@ class BloodHoundCEClient(BloodHoundClient):
                 "WriteDacl",
                 "WriteOwner",
                 "DCSync",
+                "WriteSPN",
             }
             domain_value = domain.replace("'", "\\'")
             limit_value = max(1, min(int(max_results), 5000))
@@ -1464,20 +1694,11 @@ class BloodHoundCEClient(BloodHoundClient):
             {"nodes": [<source_node>, <target_node>], "rels": [<relation>]}
         """
         try:
-            allowed_relations = {
-                "ADCSESC1",
-                "ADCSESC3",
-                "ADCSESC4",
-                "ADCSESC6a",
-                "ADCSESC6b",
-                "ADCSESC9a",
-                "ADCSESC9b",
-                "ADCSESC10a",
-                "ADCSESC10b",
-                "ADCSESC13",
-                "CoerceAndRelayNTLMToADCS",
-                "GoldenCert",
-            }
+            from adscan_internal.services.attack_step_catalog import (
+                get_bh_native_adcs_cypher_names,
+            )
+
+            allowed_relations = get_bh_native_adcs_cypher_names()
             domain_value = domain.replace("'", "\\'")
             limit_value = max(1, min(int(max_results), 5000))
             source_filter = self._build_low_priv_source_filter(
@@ -1783,37 +2004,23 @@ class BloodHoundCEClient(BloodHoundClient):
     def _extract_paths_from_graph(
         self, graph_data: Dict, *, max_depth: int
     ) -> List[Dict]:
-        """Extract ordered paths from CE graph response."""
+        """Extract all paths from a BH CE subgraph response without Python-side filtering.
+
+        BH CE Cypher queries already apply all filters (high-value targets, MemberOf-only
+        paths, domain, etc.) before returning the subgraph.  This method simply
+        reconstructs the ordered paths from the nodes/edges the query returned.
+
+        Source nodes are identified structurally as nodes with no incoming edges
+        (in-degree 0 in the subgraph); terminal nodes are those with no outgoing edges
+        (out-degree 0).  No high-value, kind, or membership checks are performed here.
+        """
         nodes_map = graph_data.get("nodes", {})
         edges = graph_data.get("edges", [])
         if not nodes_map or not edges:
             return []
 
-        def _node_props(node_data: Dict) -> Dict:
-            return node_data.get("properties") if isinstance(node_data, dict) else {}
-
-        def _node_is_high_value(node_data: Dict) -> bool:
-            props = _node_props(node_data)
-            return bool(
-                node_data.get("isTierZero")
-                or props.get("highvalue")
-                or "admin_tier_0" in (props.get("system_tags") or [])
-            )
-
-        def _node_is_user(node_data: Dict) -> bool:
-            return str(node_data.get("kind", "")).lower() == "user"
-
-        def _node_name(node_data: Dict) -> str:
-            props = _node_props(node_data)
-            return (
-                props.get("samaccountname")
-                or props.get("name")
-                or node_data.get("label")
-                or node_data.get("objectId")
-                or ""
-            )
-
         adjacency: Dict[str, List[Dict]] = {}
+        all_targets: set[str] = set()
         for edge in edges:
             source = edge.get("source")
             target = edge.get("target")
@@ -1822,17 +2029,11 @@ class BloodHoundCEClient(BloodHoundClient):
             adjacency.setdefault(source, []).append(
                 {"target": target, "label": edge.get("label") or edge.get("kind")}
             )
+            all_targets.add(target)
 
-        start_nodes = [
-            node_id
-            for node_id, node_data in nodes_map.items()
-            if _node_is_user(node_data) and not _node_is_high_value(node_data)
-        ]
-        target_nodes = {
-            node_id
-            for node_id, node_data in nodes_map.items()
-            if _node_is_high_value(node_data)
-        }
+        # Nodes with in-degree 0 are path origins; nodes with out-degree 0 are terminals.
+        start_nodes = [nid for nid in nodes_map if nid not in all_targets]
+        terminal_nodes = {nid for nid in nodes_map if nid not in adjacency}
 
         results: List[Dict] = []
         seen_paths: set[tuple[str, ...]] = set()
@@ -1841,17 +2042,16 @@ class BloodHoundCEClient(BloodHoundClient):
             stack = [(start, [start], [])]
             while stack:
                 current, path_nodes, path_rels = stack.pop()
-                if current in target_nodes and current != start:
+                if current in terminal_nodes and current != start:
                     path_key = tuple(path_nodes)
-                    if path_key in seen_paths:
-                        continue
-                    seen_paths.add(path_key)
-                    results.append(
-                        {
-                            "nodes": [nodes_map[n] for n in path_nodes],
-                            "rels": path_rels,
-                        }
-                    )
+                    if path_key not in seen_paths:
+                        seen_paths.add(path_key)
+                        results.append(
+                            {
+                                "nodes": [nodes_map[n] for n in path_nodes],
+                                "rels": path_rels,
+                            }
+                        )
                     continue
                 if len(path_rels) >= max_depth:
                     continue
@@ -1902,6 +2102,425 @@ class BloodHoundCEClient(BloodHoundClient):
             results.append({"nodes": [src_node, tgt_node], "rels": [label]})
 
         return results
+
+
+    def _bh_paths_to_display_records(
+        self,
+        bh_paths: List[Dict],
+        *,
+        domain: str,
+        max_paths: Optional[int] = None,
+    ) -> Tuple[List[Dict], Dict]:
+        """Convert extracted BH paths to display records and a minimal graph dict.
+
+        Args:
+            bh_paths: List of ``{"nodes": [node_dict, ...], "rels": [label, ...]}``
+                      as returned by ``_extract_paths_from_graph``.
+            domain: Domain name (e.g. ``"corp.local"``).
+            max_paths: Optional cap on the number of display records returned.
+
+        Returns:
+            A tuple ``(display_records, graph)`` where *graph* has the
+            ``{"nodes": {key: node_dict}, "edges": []}`` shape expected by
+            ``attack_paths_core.apply_affected_user_metadata``.
+        """
+        display_records: List[Dict] = []
+        graph_nodes: Dict = {}
+
+        for path in bh_paths:
+            if max_paths is not None and len(display_records) >= max_paths:
+                break
+
+            node_dicts: List[Dict] = path.get("nodes") or []
+            rels: List[str] = path.get("rels") or []
+            if not node_dicts or not rels or len(node_dicts) != len(rels) + 1:
+                continue
+
+            # Build canonical string labels from BH ``label`` field.
+            node_labels: List[str] = []
+            for node in node_dicts:
+                label = str(node.get("label") or "").strip()
+                if not label:
+                    props = (
+                        node.get("properties")
+                        if isinstance(node.get("properties"), dict)
+                        else {}
+                    )
+                    label = str(props.get("name") or node.get("objectId") or "")
+                node_labels.append(label)
+
+            if len(node_labels) < 2:
+                continue
+
+            # Populate graph_nodes keyed by objectId (or label fallback).
+            for node, label in zip(node_dicts, node_labels):
+                node_key = str(node.get("objectId") or label)
+                if node_key and node_key not in graph_nodes:
+                    graph_nodes[node_key] = {
+                        "label": label,
+                        "kind": node.get("kind") or "",
+                        "objectId": str(node.get("objectId") or ""),
+                        "isTierZero": bool(node.get("isTierZero")),
+                        "properties": (
+                            node.get("properties")
+                            if isinstance(node.get("properties"), dict)
+                            else {}
+                        ),
+                    }
+
+            # Build steps list.
+            steps: List[Dict] = []
+            for i, rel in enumerate(rels):
+                src_label = node_labels[i]
+                tgt_label = node_labels[i + 1]
+                src_short = src_label.split("@")[0] if "@" in src_label else src_label
+                tgt_short = tgt_label.split("@")[0] if "@" in tgt_label else tgt_label
+                steps.append(
+                    {
+                        "step": i + 1,
+                        "action": str(rel or ""),
+                        "details": {"from": src_short, "to": tgt_short},
+                    }
+                )
+
+            display_records.append(
+                {
+                    "nodes": node_labels,
+                    "relations": [str(r or "") for r in rels],
+                    "steps": steps,
+                    "length": len(rels),
+                    "status": "theoretical",
+                    "source": node_labels[0],
+                    "target": node_labels[-1],
+                    "meta": {},
+                }
+            )
+
+        graph: Dict = {"nodes": graph_nodes, "edges": []}
+        return display_records, graph
+
+    @staticmethod
+    def _to_sam_and_domain(name: str, domain: str) -> tuple[str, str]:
+        """Extract (samaccountname, domain) from a principal name.
+
+        Matching by ``samaccountname + domain`` instead of ``name`` is
+        necessary because BloodHound CE stores user nodes as
+        ``SAM@DOMAIN`` but computer nodes as FQDN (e.g.
+        ``EXCH01.PIRATE.HTB``), so a ``name``-based filter would never
+        match computer accounts supplied as ``exch01$`` or
+        ``exch01$@pirate.htb``.
+        """
+        n = str(name or "").strip()
+        if "@" in n:
+            sam, _, dom = n.partition("@")
+            return sam.lower(), (dom or domain).lower()
+        return n.lower(), (domain or "").lower()
+
+    def get_attack_paths_for_user(
+        self,
+        domain: str,
+        username: str,
+        *,
+        max_depth: int = 6,
+        max_paths: Optional[int] = None,
+        target: str = "highvalue",
+    ) -> List[Dict]:
+        """Return extracted BH paths from a specific principal to high-value nodes.
+
+        Args:
+            domain: Domain name (e.g. ``"corp.local"``).
+            username: Principal UPN (e.g. ``"user@corp.local"``).
+            max_depth: Maximum path length (capped at 8).
+            max_paths: Optional LIMIT applied to the Cypher query.
+            target: ``"highvalue"`` (default) restricts terminal nodes to
+                Tier-0/high-value; ``"all"`` removes the filter; ``"lowpriv"``
+                restricts to non-high-value terminals.
+
+        Returns:
+            List of ``{"nodes": [node_dict, ...], "rels": [label, ...]}`` paths
+            suitable for ``_bh_paths_to_display_records``.
+        """
+        try:
+            depth = max(1, max_depth)
+            sam, dom = self._to_sam_and_domain(username, domain)
+            sam_safe = sam.replace("'", "\\'")
+            dom_safe = dom.replace("'", "\\'")
+            edge_filter = self._build_bh_edge_type_filter()
+            non_membership_filter = self._build_non_membership_path_filter(path_alias="p")
+            acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
+
+            named_target_filter = f"\n  AND {self._build_named_node_filter(alias='h')}"
+
+            if target == "highvalue":
+                target_filter = self._build_high_value_filter(alias="h")
+                where_target = f"  AND {target_filter}"
+                no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
+                no_terminal_memberof = ""
+            elif target == "lowpriv":
+                where_target = f"  AND NOT {self._build_high_value_filter(alias='h')}"
+                no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
+                no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=False)}"
+            else:  # "all"
+                where_target = ""
+                no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
+                no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=True)}"
+
+            limit_clause = f"\nLIMIT {max(1, max_paths)}" if max_paths is not None else ""
+            cypher_query = f"""
+            MATCH p=(s)-[{edge_filter}*1..{depth}]->(h)
+            WHERE toLower(coalesce(s.samaccountname, "")) = toLower('{sam_safe}')
+              AND toLower(coalesce(s.domain, "")) = toLower('{dom_safe}'){where_target}{named_target_filter}
+            WITH p, nodes(p) AS ns
+            WHERE {non_membership_filter}
+              AND {acyclic_filter}{no_intermediate_hv}{no_terminal_memberof}
+            RETURN ns AS path_nodes, relationships(p) AS rels{limit_clause}
+            """
+
+            return self.execute_path_query(cypher_query)
+        except Exception:
+            return []
+
+    def get_attack_paths_from_owned(
+        self,
+        domain: str,
+        principals: List[str],
+        *,
+        max_depth: int = 6,
+        max_paths: Optional[int] = None,
+        target: str = "highvalue",
+    ) -> List[Dict]:
+        """Return extracted BH paths from a set of owned principals to high-value nodes.
+
+        Args:
+            domain: Domain name (e.g. ``"corp.local"``).
+            principals: List of principal UPNs (e.g. ``["user@corp.local"]``).
+            max_depth: Maximum path length (capped at 8).
+            max_paths: Optional LIMIT applied to the Cypher query.
+            target: ``"highvalue"`` (default) restricts terminal nodes to
+                Tier-0/high-value; ``"all"`` removes the filter; ``"lowpriv"``
+                restricts to non-high-value terminals.
+
+        Returns:
+            List of ``{"nodes": [node_dict, ...], "rels": [label, ...]}`` paths
+            suitable for ``_bh_paths_to_display_records``.
+        """
+        try:
+            if not principals:
+                return []
+            depth = max(1, max_depth)
+            domain_value = str(domain or "").replace("'", "\\'")
+            domain_filter = self._build_domain_filter(
+                alias="s", domain_value=domain_value
+            )
+            source_high_value_filter = self._build_high_value_filter(alias="s")
+            edge_filter = self._build_bh_edge_type_filter()
+            non_membership_filter = self._build_non_membership_path_filter(path_alias="p")
+            acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
+
+            named_target_filter = f"\n              AND {self._build_named_node_filter(alias='h')}"
+
+            if target == "highvalue":
+                target_filter = self._build_high_value_filter(alias="h")
+                where_target = f"\n              AND {target_filter}"
+                no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
+                no_terminal_memberof = ""
+            elif target == "lowpriv":
+                where_target = f"\n              AND NOT {self._build_high_value_filter(alias='h')}"
+                no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
+                no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=False)}"
+            else:  # "all"
+                where_target = ""
+                no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
+                no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=True)}"
+
+            limit_clause = f"\nLIMIT {max(1, max_paths)}" if max_paths is not None else ""
+            cypher_query = f"""
+            MATCH p=(s)-[{edge_filter}*1..{depth}]->(h)
+            WHERE {domain_filter}
+              AND COALESCE(s.system_tags, '') CONTAINS 'owned'
+              AND NOT {source_high_value_filter}{where_target}{named_target_filter}
+            WITH p, nodes(p) AS ns
+            WHERE {non_membership_filter}
+              AND {acyclic_filter}{no_intermediate_hv}{no_terminal_memberof}
+            RETURN ns AS path_nodes, relationships(p) AS rels{limit_clause}
+            """
+
+            return self.execute_path_query(cypher_query)
+        except Exception:
+            return []
+
+    def mark_principal_owned(self, username: str, *, owned: bool = True) -> bool:
+        """Mark or unmark a principal as owned in BloodHound via Cypher.
+
+        Args:
+            username: Principal UPN (e.g. ``"user@corp.local"``).
+            owned: ``True`` to mark as owned, ``False`` to unmark.
+
+        Returns:
+            ``True`` if the Cypher executed without exceptions, ``False`` otherwise.
+        """
+        try:
+            sam, dom = self._to_sam_and_domain(str(username or ""), "")
+            sam_safe = sam.replace("'", "\\'")
+            dom_safe = dom.replace("'", "\\'")
+            node_filter = (
+                f"toLower(coalesce(n.samaccountname, \"\")) = toLower('{sam_safe}')"
+                f" AND toLower(coalesce(n.domain, \"\")) = toLower('{dom_safe}')"
+            )
+
+            # Read current tags first to avoid CASE expressions, which BH CE may reject.
+            read_query = f"""
+            MATCH (n)
+            WHERE {node_filter}
+            RETURN n
+            LIMIT 1
+            """
+            rows = self.execute_query(read_query) or []
+            print_info_debug(f"rows: {rows}")
+            if not rows:
+                return False
+
+            current_tags = str(rows[0].get("system_tags") or "").strip()
+            self._debug(
+                "mark_principal_owned current state",
+                username=sam_safe,
+                current_tags=current_tags,
+                owned=owned,
+            )
+            if owned:
+                if current_tags == "owned" or "owned" in [t.strip() for t in current_tags.split(",") if t.strip()]:
+                    return True
+
+                if not current_tags:
+                    cypher_query = f"""
+                    MATCH (n)
+                    WHERE {node_filter}
+                    SET n.system_tags = 'owned'
+                    RETURN n
+                    """
+                else:
+                    cypher_query = f"""
+                    MATCH (n)
+                    WHERE {node_filter}
+                    AND NOT coalesce(n.system_tags, '') CONTAINS 'owned'
+                    SET n.system_tags = n.system_tags + ',owned'
+                    RETURN n
+                    """
+            else:
+                tag_list = [t.strip() for t in current_tags.split(",") if t.strip()]
+                if "owned" not in tag_list:
+                    return True
+
+                remaining_tags = [t for t in tag_list if t != "owned"]
+
+                if remaining_tags:
+                    new_tags = ",".join(remaining_tags).replace("'", "\\'")
+                    cypher_query = f"""
+                    MATCH (n)
+                    WHERE {node_filter}
+                    SET n.system_tags = '{new_tags}'
+                    RETURN n
+                    """
+                else:
+                    cypher_query = f"""
+                    MATCH (n)
+                    WHERE {node_filter}
+                    REMOVE n.system_tags
+                    RETURN n
+                    """
+
+            result = self.execute_query(cypher_query) or []
+            return bool(result)
+        except Exception as exc:
+            print_exception(show_locals=False, exception=exc)
+            return False
+
+    def get_bh_owned_principals(self, domain: str) -> set:
+        """Return the set of principal names marked as owned in BloodHound for a domain.
+
+        Args:
+            domain: Domain name (e.g. ``"corp.local"``).
+
+        Returns:
+            Set of lowercase UPN strings for principals with ``owned`` in BH system_tags.
+        """
+        try:
+            domain_value = str(domain or "").replace("'", "\\'")
+            cypher_query = f"""
+            MATCH (n)
+            WHERE toLower(coalesce(n.domain, "")) = toLower('{domain_value}')
+            AND COALESCE(n.system_tags, '') CONTAINS 'owned'
+            RETURN n
+            """
+            rows = self.execute_query(cypher_query)
+            owned_set: set = set()
+
+            for row in rows:
+                sam = str(row.get("samaccountname") or "").strip()
+                dom = str(row.get("domain") or "").strip()
+                system_tags = str(row.get("system_tags") or "").strip()
+                system_tags_raw = row.get("system_tags")
+                self._debug(
+                    "owned principal row",
+                    samaccountname=sam,
+                    domain=dom,
+                    system_tags_raw=repr(system_tags_raw),
+                    system_tags_type=type(system_tags_raw).__name__,
+                )
+                if not sam:
+                    continue
+
+                tags = {t.strip().lower() for t in system_tags.split(",") if t.strip()}
+                if "owned" in tags:
+                    owned_set.add(f"{sam}@{dom}".lower())
+
+            print_info_debug(f"owned_set: {sorted(owned_set)!r}")
+            return owned_set
+        except Exception:
+            return set()
+
+    def sync_owned_principals(
+        self, domain: str, owned_usernames: List[str]
+    ) -> Tuple[int, int]:
+        """Sync BH ``owned`` state to exactly match the provided authoritative list.
+
+        Marks principals in the list that BH does not know about, and unmarks any
+        BH-owned principal that is no longer in the source-of-truth list.
+
+        Args:
+            domain: Domain name (e.g. ``"corp.local"``).
+            owned_usernames: Authoritative list of owned principal names (UPNs or
+                bare samAccountNames).
+
+        Returns:
+            Tuple ``(marked_count, unmarked_count)`` for logging.
+        """
+        source_truth = {
+            f"{sam}@{dom}".lower()
+            for u in owned_usernames
+            if str(u or "").strip()
+            for sam, dom in [self._to_sam_and_domain(u, domain)]
+            if sam
+        }
+        bh_owned = {u.strip().lower() for u in self.get_bh_owned_principals(domain)}
+
+        to_mark = source_truth - bh_owned
+        to_unmark = bh_owned - source_truth
+
+        marked = sum(
+            1 for username in to_mark if self.mark_principal_owned(username, owned=True)
+        )
+        unmarked = sum(
+            1 for username in to_unmark if self.mark_principal_owned(username, owned=False)
+        )
+        self._debug(
+            "owned sync sets",
+            source_truth=sorted(source_truth),
+            bh_owned=sorted(bh_owned),
+            to_mark=sorted(to_mark),
+            to_unmark=sorted(to_unmark),
+        )
+        return marked, unmarked
 
     def get_critical_aces_by_domain(
         self, domain: str, blacklist: List[str], high_value: bool = False
@@ -2096,21 +2715,45 @@ class BloodHoundCEClient(BloodHoundClient):
                 )
                 return None
 
+            t0 = time.perf_counter()
             job_id = self._create_file_upload_job_id()
+            t1 = time.perf_counter()
             if job_id is None:
                 return None
 
             if not self._upload_file_to_job(job_id, file_path=file_path):
                 return None
+            t2 = time.perf_counter()
 
             if not self._end_file_upload_job(job_id):
                 return None
+            t3 = time.perf_counter()
 
+            try:
+                file_size = os.path.getsize(file_path)
+            except OSError:
+                file_size = -1
+            timing = {
+                "job_id": job_id,
+                "file_size_bytes": file_size,
+                "create_job_ms": round((t1 - t0) * 1000),
+                "upload_ms": round((t2 - t1) * 1000),
+                "end_job_ms": round((t3 - t2) * 1000),
+                "total_ms": round((t3 - t0) * 1000),
+            }
+            print_info_debug(
+                f"[bloodhound-ce] upload timing: "
+                f"job_id={job_id} "
+                f"size={file_size}B "
+                f"create={timing['create_job_ms']}ms "
+                f"upload={timing['upload_ms']}ms "
+                f"end={timing['end_job_ms']}ms "
+                f"total={timing['total_ms']}ms"
+            )
             return job_id
 
         except Exception as e:
             self._last_error = f"Upload failed with exception: {e}"
-            self.logger.error("upload error", error=str(e))
             print_error(f"Error uploading file: {e}")
             return None
 
@@ -2125,15 +2768,12 @@ class BloodHoundCEClient(BloodHoundClient):
             last_status = None
 
             print_info("Waiting for ingestion to complete...")
-            self.logger.info("waiting for ingestion", file_upload_job_id=job_id)
+            print_info_debug(f"[bloodhound-ce] waiting for ingestion: job_id={job_id}")
 
             while True:
                 job = self.get_file_upload_job(job_id)
                 if job is None:
                     if time.time() - start_time > 15:
-                        self.logger.warning(
-                            "could not fetch job details", file_upload_job_id=job_id
-                        )
                         self._last_error = f"Upload wait failed: timeout fetching job details (job_id={job_id})."
                         print_error("Timeout: Could not get job details")
                         return False
@@ -2142,12 +2782,6 @@ class BloodHoundCEClient(BloodHoundClient):
                     status_message = job.get("status_message", "")
 
                     if status != last_status:
-                        self.logger.info(
-                            "upload status",
-                            file_upload_job_id=job_id,
-                            status=status,
-                            message=status_message,
-                        )
                         print_info(f"Job status: {status} - {status_message}")
                         last_status = status
 
@@ -2159,19 +2793,8 @@ class BloodHoundCEClient(BloodHoundClient):
                             print_success(
                                 "Upload and processing completed successfully"
                             )
-                            self.logger.info(
-                                "upload complete",
-                                file_upload_job_id=job_id,
-                                status=status,
-                            )
                             return True
                         if status == 8:
-                            self.logger.warning(
-                                "upload partial",
-                                file_upload_job_id=job_id,
-                                status=status,
-                                message=status_message,
-                            )
                             self._last_error = (
                                 "Upload completed with warnings (partially complete). "
                                 f"status_message={status_message}"
@@ -2181,12 +2804,6 @@ class BloodHoundCEClient(BloodHoundClient):
                             )
                             return True
 
-                        self.logger.error(
-                            "upload failed",
-                            file_upload_job_id=job_id,
-                            status=status,
-                            message=status_message,
-                        )
                         self._last_error = (
                             f"Upload failed with status {status}: {status_message}"
                         )
@@ -2194,11 +2811,6 @@ class BloodHoundCEClient(BloodHoundClient):
                         return False
 
                 if time.time() - start_time > timeout_seconds:
-                    self.logger.error(
-                        "upload timeout",
-                        file_upload_job_id=job_id,
-                        timeout_seconds=timeout_seconds,
-                    )
                     self._last_error = f"Upload wait timed out after {timeout_seconds}s for job_id={job_id}."
                     print_error(f"Timeout after {timeout_seconds} seconds")
                     return False
@@ -2206,11 +2818,87 @@ class BloodHoundCEClient(BloodHoundClient):
                 time.sleep(max(1, poll_interval))
 
         except Exception as e:
-            self.logger.exception(
-                "upload wait error", file_upload_job_id=job_id, error=str(e)
-            )
             self._last_error = f"Upload wait failed with exception: {e}"
             print_error(f"Error in upload wait: {e}")
+            return False
+
+    def upsert_opengraph_edge(self, edge: Dict) -> bool:
+        """Upsert a single custom edge into BH CE via a Cypher MERGE mutation.
+
+        This is the fast path for custom edge creation (~10-50ms) vs the file
+        upload job pipeline (~30-60s ingestion wait).  Requires
+        ``bhe_enable_cypher_mutations=true`` on the BH CE container (default).
+
+        Args:
+            edge: OpenGraph edge dict with ``kind``, ``start``, ``end``,
+                  ``properties`` as produced by ``_build_opengraph_ref``.
+
+        Returns:
+            True if the mutation was accepted (HTTP 200), False otherwise.
+        """
+        try:
+            kind = str(edge.get("kind") or "").strip()
+            start_ref = edge.get("start") or {}
+            end_ref = edge.get("end") or {}
+            props = edge.get("properties") or {}
+
+            if not kind or not start_ref or not end_ref:
+                return False
+
+            # Build MATCH predicates from the match_by / value refs.
+            def _match_clause(var: str, ref: Dict) -> str:
+                match_by = str(ref.get("match_by") or "").strip().lower()
+                value = str(ref.get("value") or "").replace("'", "\\'")
+                if match_by == "id":
+                    return f"MATCH ({var}) WHERE toUpper(coalesce({var}.objectid, '')) = toUpper('{value}')"
+                # match_by == "name" — stored as NAME@DOMAIN uppercase in BH CE.
+                return f"MATCH ({var}) WHERE {var}.name = '{value}'"
+
+            # Sanitize the relationship type for use as a Cypher identifier.
+            # Non-alphanumeric chars are rare but backtick-quote just in case.
+            safe_kind = kind.replace("`", "")
+
+            # Edge properties to set.
+            state = str(props.get("state") or "discovered").replace("'", "\\'")
+            source = str(props.get("source") or "adscan").replace("'", "\\'")
+            edge_type = str(props.get("edge_type") or "").replace("'", "\\'")
+            first_seen = str(props.get("first_seen") or "").replace("'", "\\'")
+
+            query = (
+                f"{_match_clause('s', start_ref)} "
+                f"{_match_clause('e', end_ref)} "
+                f"MERGE (s)-[r:`{safe_kind}` {{source: '{source}'}}]->(e) "
+                f"SET r.state = '{state}', r.edge_type = '{edge_type}', r.first_seen = '{first_seen}' "
+                f"RETURN type(r) AS kind"
+            )
+
+            cleaned_query = " ".join(query.split())
+            print_cypher_query(cleaned_query)
+
+            url = f"{self.base_url}/api/v2/graphs/cypher"
+            payload = {"query": cleaned_query, "include_properties": False}
+            response = self.session.post(url, json=payload, verify=self.verify, timeout=30)
+
+            if response.status_code == 401:
+                if self.ensure_authenticated_robust():
+                    response = self.session.post(url, json=payload, verify=self.verify, timeout=30)
+                else:
+                    return False
+
+            if response.status_code == 200:
+                self._debug("opengraph cypher upsert accepted", kind=kind)
+                return True
+
+            self._debug(
+                "opengraph cypher upsert failed",
+                kind=kind,
+                status=response.status_code,
+                response_text=(response.text or "")[:200],
+            )
+            return False
+
+        except Exception as exc:  # noqa: BLE001
+            self._debug("opengraph cypher upsert error", error=str(exc))
             return False
 
     def list_upload_jobs(self) -> List[Dict]:
@@ -2229,8 +2917,7 @@ class BloodHoundCEClient(BloodHoundClient):
             else:
                 return []
         except Exception as e:
-            self.logger.error("list upload jobs failed", error=str(e))
-            print(f"Error listing upload jobs: {e}")
+            print_info_debug(f"[bloodhound-ce] list upload jobs failed: {e}")
             return []
 
     def get_accepted_upload_types(self) -> List[str]:
@@ -2243,8 +2930,7 @@ class BloodHoundCEClient(BloodHoundClient):
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            self.logger.error("accepted types request failed", error=str(e))
-            print(f"Error getting accepted types: {e}")
+            print_info_debug(f"[bloodhound-ce] get accepted types failed: {e}")
             return []
 
     def get_file_upload_job(self, job_id: int) -> Optional[Dict]:
@@ -2271,8 +2957,7 @@ class BloodHoundCEClient(BloodHoundClient):
 
             return None
         except Exception as e:
-            self.logger.error("get upload job failed", job_id=job_id, error=str(e))
-            print(f"Error getting upload job {job_id}: {e}")
+            print_info_debug(f"[bloodhound-ce] get upload job failed: job_id={job_id} error={e}")
             return None
 
     def infer_latest_file_upload_job_id(self) -> Optional[int]:
@@ -2286,8 +2971,7 @@ class BloodHoundCEClient(BloodHoundClient):
             latest_job = max(jobs, key=lambda x: x.get("id", 0))
             return latest_job.get("id")
         except Exception as e:
-            self.logger.error("infer latest upload job failed", error=str(e))
-            print(f"Error inferring latest job ID: {e}")
+            print_info_debug(f"[bloodhound-ce] infer latest upload job failed: {e}")
             return None
 
     def upload_data_and_wait(
@@ -2310,7 +2994,6 @@ class BloodHoundCEClient(BloodHoundClient):
             )
             return response.status_code == 200
         except Exception:
-            self.logger.exception("token verification error")
             return False
 
     def auto_renew_token(self) -> bool:
@@ -2384,11 +3067,9 @@ class BloodHoundCEClient(BloodHoundClient):
                 data = response.json()
             except JSONDecodeError as exc:
                 # Non‑JSON response (e.g., HTML or empty body) – treat as failure.
-                self.logger.exception(
-                    "token auto-renew json decode error",
-                    error=str(exc),
-                    status_code=response.status_code,
-                    text=(response.text or "")[:500],
+                print_info_debug(
+                    f"[bloodhound-ce] token auto-renew json decode error: {exc} "
+                    f"(status={response.status_code})"
                 )
                 return False
             token = None
@@ -2418,8 +3099,7 @@ class BloodHoundCEClient(BloodHoundClient):
             return True
 
         except Exception as e:
-            self.logger.exception("token auto-renew error", error=str(e))
-            print(f"Error auto-renewing token: {e}")
+            print_info_debug(f"[bloodhound-ce] token auto-renew error: {e}")
             return False
 
     def ensure_valid_token(self) -> bool:
@@ -2432,8 +3112,7 @@ class BloodHoundCEClient(BloodHoundClient):
             return True
 
         # Token is invalid, try to renew
-        self.logger.info("token expired, attempting renewal")
-        print("Token expired, attempting to renew...")
+        print_info_debug("[bloodhound-ce] token expired, attempting renewal")
         return self.auto_renew_token()
 
     def ensure_authenticated_interactive(self) -> bool:
@@ -2464,7 +3143,7 @@ class BloodHoundCEClient(BloodHoundClient):
             f"has_api_token={summary.get('has_api_token')}, "
             f"base_url={summary.get('base_url')})"
         )
-        print(
+        print_warning(
             "Authentication to BloodHound CE is required but the stored token/credentials "
             "are invalid or missing."
         )
@@ -2487,7 +3166,7 @@ class BloodHoundCEClient(BloodHoundClient):
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print_info_debug("[bloodhound-ce] prompt aborted: no username provided")
-            print("Aborting: no credentials provided.")
+            print_warning("Aborting: no credentials provided.")
             return False
 
         username = user_input or suggested_username
@@ -2498,12 +3177,12 @@ class BloodHoundCEClient(BloodHoundClient):
             password = getpass.getpass("BloodHound CE password: ")
         except (EOFError, KeyboardInterrupt):
             print_info_debug("[bloodhound-ce] prompt aborted: no password provided")
-            print("Aborting: no credentials provided.")
+            print_warning("Aborting: no credentials provided.")
             return False
 
         if not password:
             print_info_debug("[bloodhound-ce] prompt aborted: empty password")
-            print("Aborting: empty password is not allowed.")
+            print_warning("Aborting: empty password is not allowed.")
             return False
 
         # Try to authenticate with the provided credentials
@@ -2518,7 +3197,7 @@ class BloodHoundCEClient(BloodHoundClient):
                 f"has_api_token={summary.get('has_api_token')}, "
                 f"base_url={summary.get('base_url')})"
             )
-            print(
+            print_error(
                 "Error: Invalid BloodHound CE credentials. "
                 "Please verify the username/password and try again."
             )
@@ -2537,12 +3216,11 @@ class BloodHoundCEClient(BloodHoundClient):
         except Exception as e:
             # Failure to persist credentials should not stop the current use,
             # but we warn so the user knows auto‑renewal may not work next time.
-            self.logger.exception(
-                "failed to persist updated BloodHound CE credentials",
-                error=str(e),
+            print_info_debug(
+                f"[bloodhound-ce] failed to persist updated credentials: {e}"
             )
-            print(
-                "Warning: Could not persist updated BloodHound CE credentials to the config file. "
+            print_warning(
+                "Could not persist updated BloodHound CE credentials to the config file. "
                 "Authentication will work for this session but automatic renewal may fail next time."
             )
 

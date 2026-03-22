@@ -1831,6 +1831,24 @@ class BloodHoundService(BaseService):
                 details={"file_path": file_path, "error": str(e)},
             ) from e
 
+    def upsert_custom_edge(self, edge: dict) -> bool:
+        """Upsert a single custom edge into BH CE via Cypher MERGE (fast path).
+
+        Bypasses the file upload job pipeline (~30-60s ingestion) and writes
+        directly via ``/api/v2/graphs/cypher`` (~10-50ms).
+
+        Args:
+            edge: OpenGraph edge dict with ``kind``, ``start``, ``end``, ``properties``.
+
+        Returns:
+            True if accepted, False if the cypher endpoint rejected the mutation
+            (e.g. ``bhe_enable_cypher_mutations=false``) or an error occurred.
+        """
+        upsert_fn = getattr(self.client, "upsert_opengraph_edge", None)
+        if not callable(upsert_fn):
+            return False
+        return bool(upsert_fn(edge))  # pylint: disable=not-callable
+
     def start_upload_job(
         self, file_path: str, scan_id: Optional[str] = None
     ) -> int | None:

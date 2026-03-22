@@ -295,14 +295,10 @@ def compute_spray_eligibility(
     eligible: list[str] = []
     excluded: list[ExcludedUser] = []
 
-    if no_lockout_enforced or lockout_threshold == 0:
-        note = (
-            "Account lockout threshold is 0 (no lockout enforced)"
-            if lockout_threshold == 0
-            else "Account lockout threshold is None (no lockout enforced)"
-        )
+    if no_lockout_enforced:
         notes.append(
-            f"{note}. All users are eligible; spraying cannot lock accounts, but use caution."
+            "Account lockout threshold is None (no lockout enforced). All users are "
+            "eligible; spraying cannot lock accounts, but use caution."
         )
         return SprayEligibilityResult(
             input_users=list(file_users),
@@ -312,6 +308,22 @@ def compute_spray_eligibility(
             safe_remaining_threshold=safe_remaining_threshold,
             minimum_remaining_attempts=None,
             used_policy_data=False,
+            notes=notes,
+        )
+
+    if lockout_threshold == 0:
+        notes.append(
+            "Account lockout threshold is 0 (no lockout enforced). All users are "
+            "eligible; spraying cannot lock accounts."
+        )
+        return SprayEligibilityResult(
+            input_users=list(file_users),
+            eligible_users=list(file_users),
+            excluded_users=[],
+            lockout_threshold=lockout_threshold,
+            safe_remaining_threshold=safe_remaining_threshold,
+            minimum_remaining_attempts=None,
+            used_policy_data=True,
             notes=notes,
         )
 

@@ -31,6 +31,10 @@ from adscan_internal.execution_outcomes import build_timeout_completed_process
 from adscan_internal.execution_outcomes import (
     build_ldap_exact_connection_timeout_completed_process,
     output_has_exact_ldap_connection_timeout,
+    result_is_timeout,
+)
+from adscan_internal.integrations.netexec.timeouts import (
+    resolve_extended_timeout_seconds,
 )
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
 from adscan_internal.subprocess_env import (
@@ -40,6 +44,19 @@ from adscan_internal.subprocess_env import (
 from adscan_internal.text_utils import normalize_cli_output
 
 ExecutionResult = subprocess.CompletedProcess[str]
+
+_NETEXEC_SERVICE_TOKENS = {
+    "smb",
+    "ldap",
+    "mssql",
+    "rdp",
+    "winrm",
+    "ssh",
+    "vnc",
+    "ftp",
+    "http",
+    "https",
+}
 
 
 def _is_netexec_autoquote_enabled() -> bool:
@@ -76,6 +93,46 @@ def _quote_path_like_netexec_args(command: str) -> str:
     for flag in ("--asreproast", "--log"):
         normalized = _quote_flag_value(normalized, flag)
     return normalized
+
+
+def _extract_service_from_command(command: str) -> str | None:
+    """Return the NetExec service token from one command."""
+
+    try:
+        argv = shlex.split(str(command or ""))
+    except ValueError:
+        return None
+    return next((token for token in argv if token in _NETEXEC_SERVICE_TOKENS), None)
+
+
+def _infer_target_count_from_command(command: str) -> int:
+    """Best-effort target count inference for one NetExec command."""
+
+    try:
+        argv = shlex.split(str(command or ""))
+    except ValueError:
+        return 1
+
+    service_index = next(
+        (idx for idx, token in enumerate(argv) if token in _NETEXEC_SERVICE_TOKENS),
+        None,
+    )
+    if service_index is None or service_index + 1 >= len(argv):
+        return 1
+
+    target_value = str(argv[service_index + 1]).strip()
+    if not target_value:
+        return 1
+    target_path = Path(os.path.expanduser(target_value))
+    if not target_path.is_file():
+        return 1
+
+    try:
+        with target_path.open("r", encoding="utf-8", errors="replace") as handle:
+            count = sum(1 for line in handle if line.strip())
+    except OSError:
+        return 1
+    return max(count, 1)
 
 
 @dataclass(frozen=True)
@@ -116,6 +173,10 @@ class NetExecRunner:
         domain: str | None = None,
         timeout: int | None = None,
         pre_sync: bool = True,
+        operation_kind: str | None = None,
+        service: str | None = None,
+        target_count: int | None = None,
+        allow_timeout_recovery: bool = True,
         **kwargs: object,
     ) -> ExecutionResult | None:
         """Run a NetExec command, applying automatic recovery steps.
@@ -150,6 +211,23 @@ class NetExecRunner:
             pass
 
         effective_domain = domain or ctx.extract_domain(command) or ctx.default_domain
+        current_timeout = timeout
+        effective_service = str(service or _extract_service_from_command(command) or "").strip().lower() or None
+        effective_target_count = max(
+            int(target_count or _infer_target_count_from_command(command) or 1),
+            1,
+        )
+        timeout_recovery_attempts = 0
+        max_timeout_recovery_attempts = 2
+
+        print_info_debug(
+            "[netexec] timeout context: "
+            f"operation_kind={operation_kind or 'default'} "
+            f"service={effective_service or 'unknown'} "
+            f"target_count={effective_target_count} "
+            f"global_timeout={current_timeout if current_timeout is not None else 'disabled'} "
+            f"allow_timeout_recovery={allow_timeout_recovery!r}"
+        )
 
         if pre_sync and effective_domain:
             should_sync = True
@@ -190,7 +268,9 @@ class NetExecRunner:
             try:
                 spec = CommandSpec(
                     command=cmd,
-                    timeout=timeout or local_kwargs.pop("timeout", None),
+                    timeout=current_timeout
+                    if current_timeout is not None
+                    else local_kwargs.pop("timeout", None),
                     shell=bool(local_kwargs.pop("shell", True)),
                     capture_output=bool(local_kwargs.pop("capture_output", True)),
                     text=bool(local_kwargs.pop("text", True)),
@@ -396,6 +476,7 @@ class NetExecRunner:
                 has_exact_ldap_connection_timeout = _is_ldap_command(
                     current_command
                 ) and output_has_exact_ldap_connection_timeout(combined_output)
+                has_timeout_result = result_is_timeout(proc, tool_name="netexec")
 
                 output_lines = (
                     combined_output.strip().splitlines() if combined_output else []
@@ -515,6 +596,77 @@ class NetExecRunner:
                         f"No output received after {max_retries} attempts. "
                         "Proceeding with empty result."
                     )
+
+                if has_timeout_result:
+                    timeout_label = (
+                        f"{current_timeout}s"
+                        if current_timeout is not None
+                        else "disabled"
+                    )
+                    print_warning(
+                        "NetExec command exceeded the current ADscan execution timeout "
+                        f"({timeout_label})."
+                    )
+                    print_info(
+                        f"Scope size estimate: {effective_target_count} target(s)."
+                    )
+
+                    if (
+                        not allow_timeout_recovery
+                        or bool(os.getenv("CI"))
+                        or bool(getattr(ctx.state_owner, "non_interactive", False))
+                    ):
+                        if not allow_timeout_recovery:
+                            print_warning(
+                                "Timeout recovery is disabled for this NetExec command."
+                            )
+                        else:
+                            print_warning(
+                                "Non-interactive mode detected; timeout recovery will not prompt."
+                            )
+                        return proc
+
+                    if timeout_recovery_attempts >= max_timeout_recovery_attempts:
+                        print_warning(
+                            "NetExec timeout recovery has already been attempted multiple times. "
+                            "Stopping retries to avoid an infinite loop."
+                        )
+                        return proc
+
+                    extended_timeout = resolve_extended_timeout_seconds(
+                        service=effective_service,
+                        current_timeout_seconds=current_timeout,
+                        target_count=effective_target_count,
+                    )
+                    if current_timeout is not None and ctx.confirm_ask(
+                        (
+                            "Do you want to retry this NetExec command "
+                            f"with a longer ADscan timeout ({extended_timeout}s)?"
+                        ),
+                        True,
+                    ):
+                        timeout_recovery_attempts += 1
+                        current_timeout = extended_timeout
+                        needs_retry = True
+                        print_info_debug(
+                            "[netexec] Retrying after timeout with extended "
+                            f"global_timeout={current_timeout}s"
+                        )
+                        break
+
+                    if current_timeout is not None and ctx.confirm_ask(
+                        "Do you want to retry this NetExec command without a global ADscan timeout?",
+                        False,
+                    ):
+                        timeout_recovery_attempts += 1
+                        current_timeout = None
+                        needs_retry = True
+                        print_info_debug(
+                            "[netexec] Retrying after timeout with global_timeout=disabled"
+                        )
+                        break
+
+                    return proc
 
                 if has_exact_ldap_connection_timeout:
                     print_warning(

@@ -28,7 +28,7 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin RustHound-CE version (must match ADscan expectations)
-RUN cargo install --locked --version 2.4.1 rusthound-ce
+RUN cargo install --locked --version 2.4.7 rusthound-ce
 
 ###############################################################################
 # Shared runtime base for both PRO and LITE images

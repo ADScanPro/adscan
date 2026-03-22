@@ -451,6 +451,43 @@ class BestEffortPromptPolicy:
     show_risk_panel: bool = False
 
 
+def _fingerprint_is_strong_dc_signal(
+    evidence: CandidateIpFingerprintEvidence | None,
+) -> bool:
+    """Return True when fingerprint evidence strongly suggests a DC/AD host."""
+    if evidence is None:
+        return False
+    return evidence.method in {"hosts", "ldap", "smb"}
+
+
+def _host_looks_like_dc_candidate(
+    *,
+    fingerprint_evidence: CandidateIpFingerprintEvidence | None,
+    port_evidence: CandidateDcPortEvidence | None,
+) -> bool:
+    """Return True when the overall evidence supports a DC-like classification."""
+    return bool(
+        (port_evidence and port_evidence.dc_likely)
+        or _fingerprint_is_strong_dc_signal(fingerprint_evidence)
+    )
+
+
+def _host_looks_like_dns_candidate(
+    *,
+    fingerprint_evidence: CandidateIpFingerprintEvidence | None,
+    port_evidence: CandidateDcPortEvidence | None,
+) -> bool:
+    """Return True when the host looks DNS-like but not confidently DC-like."""
+    if _host_looks_like_dc_candidate(
+        fingerprint_evidence=fingerprint_evidence,
+        port_evidence=port_evidence,
+    ):
+        return False
+    if fingerprint_evidence and fingerprint_evidence.method == "ptr":
+        return True
+    return bool(port_evidence and 53 in port_evidence.open_tcp_ports)
+
+
 def _candidate_dc_port_evidence_from_open_ports(
     *,
     candidate_ip: str,
@@ -767,7 +804,11 @@ def _format_candidate_ip_evidence_lines(
         "[bold]Additional host evidence:[/bold]",
         f"• {method_label}: {detail_value}",
     ]
-    if evidence.domain == selected_domain:
+    if evidence.method == "ptr":
+        lines.append(
+            "• PTR alone is weak evidence. It can identify a DNS namespace, but it does not confirm a Domain Controller."
+        )
+    elif evidence.domain == selected_domain:
         lines.append(
             "• The resolved IP still looks AD-related for the validated domain, but DNS SRV did not answer."
         )
@@ -794,15 +835,53 @@ def _format_candidate_port_probe_lines(
     else:
         open_ports = "none"
 
-    lines = [
-        "[bold]Additional port evidence:[/bold]",
-        f"• {port_evidence.source.upper()} AD ports open: {open_ports}",
-    ]
+    lines = ["[bold]Additional port evidence:[/bold]"]
+    if port_evidence.dc_likely:
+        lines.append(f"• {port_evidence.source.upper()} AD ports open: {open_ports}")
+    else:
+        lines.append(f"• {port_evidence.source.upper()} observed open ports: {open_ports}")
     if port_evidence.dc_likely:
         lines.append(
             "• The host still looks like a Domain Controller candidate based on AD-related ports."
         )
+    elif port_evidence.open_tcp_ports == (53,):
+        lines.append(
+            "• Port 53 alone suggests a DNS service, but it is not enough to identify a Domain Controller."
+        )
+    elif port_evidence.open_tcp_ports:
+        lines.append(
+            "• The observed ports are not sufficient to classify this host as a Domain Controller."
+        )
     return lines
+
+
+def _build_domain_validation_failure_summary(
+    *,
+    validation: DomainValidationOutcome,
+    fingerprint_evidence: CandidateIpFingerprintEvidence | None,
+    port_evidence: CandidateDcPortEvidence | None,
+) -> str:
+    """Return the top-level failure summary copy for DNS validation panels."""
+    if _host_looks_like_dc_candidate(
+        fingerprint_evidence=fingerprint_evidence,
+        port_evidence=port_evidence,
+    ):
+        return (
+            "[yellow]The host resolved, but it did not answer DNS SRV queries for the tested "
+            "domain namespace.[/yellow]"
+        )
+    if _host_looks_like_dns_candidate(
+        fingerprint_evidence=fingerprint_evidence,
+        port_evidence=port_evidence,
+    ):
+        return (
+            "[yellow]We found DNS-like evidence for this namespace, but not enough proof that "
+            "this IP is an Active Directory Domain Controller.[/yellow]"
+        )
+    return (
+        "[yellow]We could not validate this IP as a Domain Controller or usable AD DNS "
+        "resolver for the tested domain.[/yellow]"
+    )
 
 
 def _build_domain_validation_next_step(
@@ -817,8 +896,21 @@ def _build_domain_validation_next_step(
             "This host still looks like a Domain Controller candidate. "
             "You can continue in best-effort mode with this DC/IP, or re-enter a different DC/DNS IP."
         )
+    if _host_looks_like_dns_candidate(
+        fingerprint_evidence=fingerprint_evidence,
+        port_evidence=port_evidence,
+    ):
+        return (
+            "This host looks DNS-like, but not DC-like. Provide a known DC/DNS IP, or scan a range "
+            "that actually contains Domain Controllers."
+        )
     if fingerprint_evidence:
         marked_evidence_domain = mark_sensitive(fingerprint_evidence.domain, "domain")
+        if fingerprint_evidence.method == "ptr":
+            return (
+                f"PTR suggests the namespace {marked_evidence_domain}, but PTR alone is not enough. "
+                "Retry with a verified DC/DNS IP or use host-range discovery."
+            )
         if fingerprint_evidence.domain == validation.selected_domain:
             return (
                 "This host still looks like a DC for the validated domain. "
@@ -1377,11 +1469,17 @@ def preflight_domain_pdc_interactive(
         )
         if best_effort_policy is not None:
             next_step = best_effort_policy.recommendation_copy
+        summary_copy = _build_domain_validation_failure_summary(
+            validation=validation,
+            fingerprint_evidence=fingerprint_evidence,
+            port_evidence=port_evidence,
+        )
         print_panel(
             "[bold]We couldn't validate the DC/PDC IP.[/bold]\n\n"
             f"Domain: {marked_domain}\n"
             f"IP: {marked_candidate}\n\n"
-            "[yellow]The host resolved, but it did not answer DNS SRV queries for the tested domain namespace.[/yellow]\n\n"
+            + summary_copy
+            + "\n\n"
             + "\n".join(attempt_lines)
             + ("\n\n" + "\n".join(evidence_lines) if evidence_lines else "")
             + ("\n\n" + "\n".join(port_lines) if port_lines else "")
@@ -1399,7 +1497,7 @@ def preflight_domain_pdc_interactive(
                 print_info_debug(f"[pdc_preflight] {attempt_line}")
             if fingerprint_evidence:
                 print_info_debug(
-                    "[pdc_preflight] candidate IP still looks AD-related via "
+                    "[pdc_preflight] candidate IP evidence via "
                     f"{fingerprint_evidence.method}: "
                     f"{mark_sensitive(fingerprint_evidence.domain, 'domain')}"
                 )

@@ -43,6 +43,7 @@ from adscan_internal.subprocess_env import command_string_needs_clean_env
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.workspaces import domain_relpath, domain_subpath
 from adscan_internal.workspaces.computers import (
+    count_enabled_computer_accounts,
     has_enabled_computer_list,
     load_enabled_computer_samaccounts,
 )
@@ -272,13 +273,16 @@ def handle_validated_domain_hits_followup(
             return True
 
     principals = [str(hit.get("username") or "") for hit in normalized_hits]
+    # Use --all for small spraying results (bounded, affordable); fall back to
+    # highvalue-only when there are many principals to avoid expensive traversal.
+    _spray_target = "all" if len(principals) <= 15 else "highvalue"
     executed = offer_attack_paths_for_execution_for_principals(
         shell,
         domain,
         max_display=20,
         principals=principals,
         max_depth=10,
-        include_all=False,
+        target=_spray_target,
     )
     if executed:
         return True
@@ -667,6 +671,130 @@ def _has_recommended_spraying_attempt(shell: SprayShell, domain: str) -> bool:
     return any(str(item) in _RECOMMENDED_SPRAY_CATEGORIES for item in attempted)
 
 
+def _get_enabled_computer_account_count(shell: SprayShell, domain: str) -> int | None:
+    """Return the enabled computer count for the domain, or None when unavailable."""
+
+    workspace_cwd = shell.current_workspace_dir or os.getcwd()
+    try:
+        count = count_enabled_computer_accounts(workspace_cwd, shell.domains_dir, domain)
+    except OSError as exc:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            "[spray] Unable to count enabled computers for "
+            f"{marked_domain}: {mark_sensitive(str(exc), 'detail')}"
+        )
+        return None
+
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info_debug(
+        f"[spray] enabled computer count for {marked_domain}: {count}"
+    )
+    return count
+
+
+def _should_recommend_pre2k_for_ctf(shell: SprayShell, domain: str) -> bool:
+    """Return True when pre2k is a meaningful recommendation in a CTF workspace."""
+
+    count = _get_enabled_computer_account_count(shell, domain)
+    if count is None:
+        print_info_debug(
+            "[spray] pre2k recommendation gate: enabled computer count unavailable; "
+            "keeping recommendation enabled."
+        )
+        return True
+    if count <= 1:
+        print_info_debug(
+            "[spray] pre2k recommendation gate: disabled because there is "
+            f"only {count} enabled computer account."
+        )
+        return False
+    print_info_debug(
+        "[spray] pre2k recommendation gate: enabled because there are "
+        f"{count} enabled computer accounts."
+    )
+    return True
+
+
+def maybe_offer_ctf_pre2k_followup(shell: SprayShell, domain: str, *, reason: str) -> None:
+    """Offer a premium CTF follow-up to run only pre2k when it was skipped so far."""
+
+    if str(getattr(shell, "type", "") or "").strip().lower() != "ctf":
+        return
+    if shell.domains_data.get(domain, {}).get("auth") == "pwned":
+        return
+    if not _should_recommend_pre2k_for_ctf(shell, domain):
+        return
+
+    history = get_password_spraying_history(shell)
+    domain_history = history.get(domain, {})
+    if isinstance(domain_history.get("computer_pre2k"), dict):
+        print_info_debug(
+            "[spray] premium pre2k follow-up skipped because computer_pre2k "
+            "was already attempted."
+        )
+        return
+
+    ux_state = _get_spraying_ux_state(shell, domain)
+    repeat_on_explicit_user_skip = reason in {
+        "ask_for_spraying_declined",
+        "spraying_menu_cancelled",
+    }
+    if bool(ux_state.get("pre2k_followup_prompted", False)) and not repeat_on_explicit_user_skip:
+        print_info_debug(
+            "[spray] premium pre2k follow-up already shown in this session."
+        )
+        return
+
+    marked_domain = mark_sensitive(domain, "domain")
+    print_panel(
+        "\n".join(
+            [
+                f"Domain: {marked_domain}",
+                "Computer pre2k spraying has not been attempted yet.",
+                "In many CTFs this is the intended foothold path when multiple computer accounts exist.",
+                "",
+                "Recommended focused action:",
+                "Run only the pre2k computer check now.",
+            ]
+        ),
+        title="[bold yellow]Recommended CTF Follow-up: Pre2k[/bold yellow]",
+        border_style="yellow",
+        expand=False,
+    )
+    ux_state["pre2k_followup_prompted"] = True
+    _capture_spraying_ux_event(
+        shell,
+        "ctf_pre2k_followup_prompted",
+        domain,
+        extra={"reason": reason},
+    )
+
+    if getattr(shell, "auto", False):
+        print_info_debug(
+            "[spray] auto mode active; not prompting for premium pre2k follow-up."
+        )
+        return
+
+    if Confirm.ask(
+        "Do you want to run only the computer pre2k check now?",
+        default=True,
+    ):
+        _capture_spraying_ux_event(
+            shell,
+            "ctf_pre2k_followup_accepted",
+            domain,
+            extra={"reason": reason},
+        )
+        do_computer_pre2k_spraying(shell, domain)
+    else:
+        _capture_spraying_ux_event(
+            shell,
+            "ctf_pre2k_followup_declined",
+            domain,
+            extra={"reason": reason},
+        )
+
+
 def maybe_show_ctf_spraying_recommendation(
     shell: SprayShell,
     domain: str,
@@ -679,6 +807,12 @@ def maybe_show_ctf_spraying_recommendation(
     if shell.domains_data.get(domain, {}).get("auth") == "pwned":
         return
     if _has_recommended_spraying_attempt(shell, domain):
+        return
+    if not _should_recommend_pre2k_for_ctf(shell, domain):
+        print_info_debug(
+            "[spray] skipping CTF spraying recommendation because pre2k does not "
+            "add value with <= 1 enabled computer account."
+        )
         return
 
     ux_state = _get_spraying_ux_state(shell, domain)
@@ -1050,7 +1184,7 @@ def _persist_and_record_spray_hits(
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
                 print_info_debug(
-                    "[spray] Failed to record PasswordSpray edge in attack graph (continuing)."
+                    "[spray] Failed to record spray entry edge in attack graph (continuing)."
                 )
         if share_edge_payload:
             try:
@@ -1798,10 +1932,10 @@ def compute_spraying_eligibility(
                     "lockout threshold unavailable."
                 )
 
-            if no_lockout_enforced:
+            if no_lockout_enforced or lockout_threshold == 0:
                 print_info_debug(
                     "[eligibility] Skipping user BadPwdCount lookup because "
-                    "the domain reports no lockout threshold."
+                    f"no lockout is enforced (threshold={lockout_threshold})."
                 )
             else:
                 users_proc = _run_netexec_query_with_parse_retry(
@@ -2873,28 +3007,8 @@ def ask_for_spraying(shell: SprayShell, domain: str) -> None:
 
     if str(getattr(shell, "type", "") or "").strip().lower() == "ctf":
         ux_state["initial_declined"] = True
-        marked_domain = mark_sensitive(domain, "domain")
-        print_warning(
-            f"You skipped spraying for {marked_domain}. In many CTF labs this is a key foothold step."
-        )
-        skip_confirmed = Confirm.ask(
-            "Skip CTF spraying checks for now?",
-            default=False,
-        )
-        if not skip_confirmed:
-            ux_state["decline_override"] = True
-            _capture_spraying_ux_event(
-                shell,
-                "ctf_spraying_decline_override",
-                domain,
-            )
-            if shell.domains_data[domain]["auth"] == "auth":
-                shell.ask_for_pass_policy(domain)
-            do_spraying(shell, domain)
-            return
-
         _capture_spraying_ux_event(shell, "ctf_spraying_skipped", domain)
-        maybe_show_ctf_spraying_recommendation(
+        maybe_offer_ctf_pre2k_followup(
             shell,
             domain,
             reason="ask_for_spraying_declined",
@@ -2983,21 +3097,24 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         shell, domain=domain
     )
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
-    if has_enabled_computer_list(workspace_cwd, shell.domains_dir, domain):
+    ctf_mode = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    pre2k_recommended = _should_recommend_pre2k_for_ctf(shell, domain) if ctf_mode else True
+    if has_enabled_computer_list(workspace_cwd, shell.domains_dir, domain) and (
+        not ctf_mode or pre2k_recommended
+    ):
         options.append(_SPRAYING_OPTION_COMPUTER_PRE2K)
     if pending_candidates:
         options.append(_SPRAYING_OPTION_RETRY_PASSWORDS)
     if pending_domain_reuse_candidates:
         options.append(_SPRAYING_OPTION_RETRY_DOMAIN_REUSE)
 
-    ctf_mode = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
     default_idx = 0
     if ctf_mode:
         pre2k_idx = next(
             (idx for idx, opt in enumerate(options) if opt == _SPRAYING_OPTION_COMPUTER_PRE2K),
             None,
         )
-        if pre2k_idx is not None:
+        if pre2k_idx is not None and pre2k_recommended:
             default_idx = pre2k_idx
             print_info(
                 "CTF recommendation: try Computer accounts (pre2k) first when available."
@@ -3018,7 +3135,7 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     if current_row is None:
         print_warning("Spraying cancelled by user")
         if ctf_mode:
-            maybe_show_ctf_spraying_recommendation(
+            maybe_offer_ctf_pre2k_followup(
                 shell,
                 domain,
                 reason="spraying_menu_cancelled",
@@ -3604,7 +3721,7 @@ def execute_password_spray_attack_step(
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
 ) -> bool:
-    """Execute one PasswordSpray attack-path step from recorded graph metadata."""
+    """Execute one spray-derived attack-path step from recorded graph metadata."""
     mode_key = _normalize_spray_type_key(spray_type)
     if mode_key == "computer_pre2k":
         do_computer_pre2k_spraying(shell, domain)
@@ -3621,7 +3738,7 @@ def execute_password_spray_attack_step(
     if mode_key == "custom_password":
         if password is None:
             print_warning(
-                "Cannot execute PasswordSpray step: custom-password spray metadata is missing the password."
+                "Cannot execute spray step: custom-password metadata is missing the password."
             )
             return False
         spraying_with_password(
@@ -3652,7 +3769,7 @@ def execute_password_spray_attack_step(
         return True
 
     print_warning(
-        f"Cannot execute PasswordSpray step: unsupported spray type {mark_sensitive(str(spray_type or 'N/A'), 'detail')}."
+        f"Cannot execute spray step: unsupported spray type {mark_sensitive(str(spray_type or 'N/A'), 'detail')}."
     )
     return False
 
@@ -4365,6 +4482,11 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
         print_warning("No enabled computers available for pre2k checks.")
         return
 
+    print_info_debug(
+        "[spray] launching computer pre2k check with "
+        f"{len(computer_sams)} enabled computer account(s)."
+    )
+
     if not should_proceed_with_repeated_spraying(shell, domain, "computer_pre2k", None):
         print_info("Computer pre2k check cancelled by user.")
         return
@@ -4442,7 +4564,7 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
             kerbrute_cmd,
             domain,
             spray_type="Computer Pre2k",
-            entry_label="Domain Computers",
+            entry_label="Domain Users",
         )
     finally:
         try:

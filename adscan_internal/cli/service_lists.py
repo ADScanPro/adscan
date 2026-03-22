@@ -77,7 +77,13 @@ def extract_service_for_domain(shell: Any, *, domain: str, service: str) -> None
 def extract_services(shell: Any, *, command: str, domain: str, service: str) -> None:
     """Execute extraction command and update workspace host lists."""
     try:
-        proc = shell._run_netexec(command, domain=domain, timeout=300)
+        proc = shell._run_netexec(
+            command,
+            domain=domain,
+            timeout=900,
+            operation_kind=f"service_list_extract:{service}",
+            service=service,
+        )
 
         workspace_cwd = shell.current_workspace_dir or os.getcwd()
         service_path = domain_subpath(workspace_cwd, shell.domains_dir, domain, service)

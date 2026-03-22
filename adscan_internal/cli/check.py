@@ -19,6 +19,14 @@ import sys
 import signal
 from typing import Any, Dict, List
 
+from adscan_core.path_utils import get_adscan_state_dir
+from adscan_core.version_context import get_telemetry_version_fields
+from adscan_launcher.update_manager import (
+    get_local_update_recency_summary,
+    is_dev_update_context,
+)
+from rich.console import Group
+from rich.text import Text
 from adscan_core.linux_capabilities import (
     CAP_NET_ADMIN_BIT as _CAP_NET_ADMIN_BIT,
     CAP_NET_BIND_SERVICE_BIT as _CAP_NET_BIND_SERVICE_BIT,
@@ -43,6 +51,100 @@ class CheckFailureRecoveryGuidance:
     instruction: str
     follow_up_message: str | None = None
     interactive_prompt: str | None = None
+
+
+def _check_container_runtime_version_alignment(deps: Any) -> bool:
+    """Return whether launcher/runtime version metadata looks aligned."""
+    version_fields = get_telemetry_version_fields()
+    launcher_version = str(version_fields.get("launcher_version") or "").strip()
+    runtime_version = str(version_fields.get("runtime_version") or "").strip()
+    launcher_source = str(version_fields.get("launcher_version_source") or "unknown")
+    runtime_source = str(version_fields.get("runtime_version_source") or "unknown")
+
+    deps.print_info_debug(
+        "[check] container runtime version context: "
+        f"launcher_version={launcher_version!r} ({launcher_source}), "
+        f"runtime_version={runtime_version!r} ({runtime_source})"
+    )
+
+    if not launcher_version or not runtime_version or launcher_version == runtime_version:
+        return True
+
+    deps.print_warning("Launcher/runtime version mismatch detected.")
+    print_panel = getattr(deps, "print_panel", None)
+    if callable(print_panel):
+        print_panel(
+            Group(
+                Text(
+                    f"Launcher: {launcher_version} ({launcher_source})",
+                    style="bold yellow",
+                ),
+                Text(
+                    f"Runtime: {runtime_version} ({runtime_source})",
+                    style="bold yellow",
+                ),
+                Text(
+                    "State mismatch can cause incorrect checks, stale bug behavior, "
+                    "and older attack/escalation coverage.",
+                    style="cyan",
+                ),
+                Text("Action: Run on the host: adscan update", style="bold white"),
+            ),
+            title="Version Alignment",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+    deps.print_info(
+        "Launcher version "
+        f"{launcher_version} ({launcher_source}) does not match runtime version "
+        f"{runtime_version} ({runtime_source})."
+    )
+    deps.print_instruction("Run on the host: adscan update")
+    deps.print_info(
+        "Keeping both the launcher and runtime image updated is recommended because "
+        "updates regularly ship bug fixes, new attack coverage, and new escalation paths."
+    )
+    return False
+
+
+def _emit_local_update_recency_guidance(deps: Any) -> None:
+    """Render local update recency guidance when the launcher/runtime looks stale."""
+    if is_dev_update_context():
+        deps.print_info_debug(
+            "[check] Dev channel detected; skipping local update recency guidance."
+        )
+        return
+    recency = get_local_update_recency_summary(str(get_adscan_state_dir()))
+    recency_message = str(recency.get("message") or "").strip()
+    if not recency_message:
+        return
+    deps.print_info_debug(
+        "[check] local update recency: "
+        f"has_successful_update={recency.get('has_successful_update')!r}, "
+        f"is_stale={recency.get('is_stale')!r}, "
+        f"age_days={recency.get('age_days')!r}, "
+        f"message={recency_message!r}"
+    )
+    if not bool(recency.get("is_stale")):
+        return
+    deps.print_warning("Local update cadence looks stale.")
+    print_panel = getattr(deps, "print_panel", None)
+    if callable(print_panel):
+        print_panel(
+            Group(
+                Text(recency_message, style="bold yellow"),
+                Text(
+                    "Older launcher/runtime state can leave bug fixes, new attack coverage, "
+                    "and escalation improvements unapplied.",
+                    style="cyan",
+                ),
+                Text("Action: Run on the host: adscan update", style="bold white"),
+            ),
+            title="Maintenance",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+    deps.print_instruction("Run on the host: adscan update")
 
 
 def get_check_failure_recovery_guidance(
@@ -880,6 +982,7 @@ class SystemPackagesCheckConfig:
 
     system_packages_to_verify: Mapping[str, Dict[str, Any]]
     fix_mode: bool
+    full_container_runtime: bool = False
 
 
 @dataclass(frozen=True)
@@ -892,6 +995,7 @@ class SystemPackagesCheckDeps:
     apply_effective_user_home_to_env: Callable[[Dict[str, str]], None]
     sudo_validate: Callable[[], bool]
     print_info: Callable[[str], None]
+    print_info_debug: Callable[[str], None]
     print_success: Callable[[str], None]
     print_warning: Callable[[str], None]
     print_error: Callable[[str], None]
@@ -917,12 +1021,30 @@ def check_system_packages(
         deps=deps,
     )
     if missing_pkgs:
-        deps.print_error(f"Missing system packages: {', '.join(missing_pkgs)}")
-        deps.print_instruction(
-            f"Try installing them with: sudo apt install {' '.join(missing_pkgs)}"
+        deps.print_info_debug(
+            "[check] Missing system packages after runtime normalization: "
+            + ", ".join(missing_pkgs)
         )
+        deps.print_error(f"Missing system packages: {', '.join(missing_pkgs)}")
+        if config.full_container_runtime:
+            deps.print_instruction(
+                "Run on the host: adscan update"
+            )
+            deps.print_info(
+                "This check is running inside the ADscan runtime, so missing runtime-managed "
+                "packages should be repaired by refreshing the host launcher/runtime image."
+            )
+        else:
+            deps.print_instruction(
+                f"Try installing them with: sudo apt install {' '.join(missing_pkgs)}"
+            )
 
         if config.fix_mode:
+            if config.full_container_runtime:
+                deps.print_warning(
+                    "Automatic system-package repair is not available inside the ADscan runtime."
+                )
+                return False, missing_pkgs
             if not shutil.which("apt-get"):
                 deps.print_warning(
                     "Automatic package installation requires apt-get (Debian-based systems)."
@@ -1181,10 +1303,20 @@ def _normalize_missing_system_packages_for_runtime(
         preferred_runtime_john = "/opt/adscan/tools/john/run/john"
         if os.path.exists(preferred_runtime_john):
             john_executable = preferred_runtime_john
+            deps.print_info_debug(
+                f"[check] Found preferred runtime john candidate: {preferred_runtime_john}"
+            )
         else:
             which_john = shutil.which("john")
             if which_john:
                 john_executable = os.path.realpath(which_john)
+                deps.print_info_debug(
+                    f"[check] Found john via PATH candidate: {john_executable}"
+                )
+            else:
+                deps.print_info_debug(
+                    "[check] John the Ripper not found in preferred runtime path or PATH."
+                )
 
         if john_executable:
             try:
@@ -1197,12 +1329,22 @@ def _normalize_missing_system_packages_for_runtime(
                 )
             except Exception as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
+                deps.print_info_debug(
+                    f"[check] Failed to probe john candidate {john_executable}: {exc}"
+                )
             else:
                 if result and getattr(result, "returncode", 1) == 0:
                     deps.print_success(
                         f"John the Ripper is available via PATH ({john_executable})"
                     )
                     normalized_missing.remove("john")
+                else:
+                    deps.print_info_debug(
+                        "[check] John candidate did not pass build-info probe: "
+                        f"path={john_executable}, returncode={getattr(result, 'returncode', None)}, "
+                        f"stdout={(getattr(result, 'stdout', '') or '').strip()[:200]!r}, "
+                        f"stderr={(getattr(result, 'stderr', '') or '').strip()[:200]!r}"
+                    )
 
     if "hashcat" in normalized_missing:
         hashcat_executable = shutil.which("hashcat")
@@ -1677,6 +1819,7 @@ class DockerComposeCheckDeps:
     print_warning: Callable[[str], None]
     print_error: Callable[[str], None]
     print_instruction: Callable[[str], None]
+    print_panel: Callable[..., None]
     print_exception: Callable[..., None]
     telemetry_capture_exception: Callable[[BaseException], None]
 
@@ -2146,6 +2289,7 @@ class PyenvCheckDeps:
     print_warning: Callable[[str], None]
     print_error: Callable[[str], None]
     print_instruction: Callable[[str], None]
+    print_panel: Callable[..., None]
     print_exception: Callable[..., None]
     telemetry_capture_exception: Callable[[BaseException], None]
 
@@ -2359,6 +2503,7 @@ class CheckDeps:
     print_warning: Callable[[str], None]
     print_error: Callable[[str], None]
     print_instruction: Callable[[str], None]
+    print_panel: Callable[..., None]
     print_exception: Callable[..., None]
 
     # Interactive prompts
@@ -2429,6 +2574,10 @@ def run_check(
 
     if full_container_runtime:
         deps.set_last_check_session_extra({"mode": "container"})
+        if not _check_container_runtime_version_alignment(deps):
+            all_ok = False
+
+    _emit_local_update_recency_guidance(deps)
 
     if fix_mode:
         deps.telemetry_capture(
@@ -2585,6 +2734,7 @@ def run_check(
         config=SystemPackagesCheckConfig(
             system_packages_to_verify=system_packages_to_verify,
             fix_mode=fix_mode,
+            full_container_runtime=full_container_runtime,
         ),
         deps=SystemPackagesCheckDeps(
             verify_system_packages=deps.verify_system_packages,
@@ -2593,6 +2743,7 @@ def run_check(
             apply_effective_user_home_to_env=deps.apply_effective_user_home_to_env,
             sudo_validate=deps.sudo_validate,
             print_info=deps.print_info,
+            print_info_debug=deps.print_info_debug,
             print_success=deps.print_success,
             print_warning=deps.print_warning,
             print_error=deps.print_error,
@@ -2730,6 +2881,7 @@ def run_check(
             print_warning=deps.print_warning,
             print_error=deps.print_error,
             print_instruction=deps.print_instruction,
+            print_panel=deps.print_panel,
             print_exception=deps.print_exception,
             telemetry_capture_exception=deps.telemetry_capture_exception,
         ),
@@ -2821,6 +2973,7 @@ def run_check(
             print_warning=deps.print_warning,
             print_error=deps.print_error,
             print_instruction=deps.print_instruction,
+            print_panel=deps.print_panel,
             print_exception=deps.print_exception,
             telemetry_capture_exception=deps.telemetry_capture_exception,
         ),
@@ -3069,6 +3222,7 @@ def build_check_config_deps(
     print_warning: Callable[[str], None],
     print_error: Callable[[str], None],
     print_instruction: Callable[[str], None],
+    print_panel: Callable[..., None],
     print_exception: Callable[..., None],
     confirm_ask: Callable[..., bool],
     track_docs_link_shown: Callable[[str, str], None],
@@ -3183,6 +3337,7 @@ def build_check_config_deps(
         print_warning=print_warning,
         print_error=print_error,
         print_instruction=print_instruction,
+        print_panel=print_panel,
         print_exception=print_exception,
         confirm_ask=confirm_ask,
         track_docs_link_shown=track_docs_link_shown,
@@ -3299,6 +3454,7 @@ class AdscanCheckContext:
     print_warning: Callable[[str], None]
     print_error: Callable[[str], None]
     print_instruction: Callable[[str], None]
+    print_panel: Callable[..., None]
     print_exception: Callable[..., None]
     confirm_ask: Callable[..., bool]
     track_docs_link_shown: Callable[[str, str], None]
@@ -3403,6 +3559,7 @@ def build_adscan_check_context(
     print_warning: Callable[[str], None],
     print_error: Callable[[str], None],
     print_instruction: Callable[[str], None],
+    print_panel: Callable[..., None],
     print_exception: Callable[..., None],
     confirm_ask: Callable[..., bool],
     track_docs_link_shown: Callable[[str, str], None],
@@ -3513,6 +3670,7 @@ def build_adscan_check_context(
         print_warning=print_warning,
         print_error=print_error,
         print_instruction=print_instruction,
+        print_panel=print_panel,
         print_exception=print_exception,
         confirm_ask=confirm_ask,
         track_docs_link_shown=track_docs_link_shown,
@@ -3636,6 +3794,7 @@ def build_check_from_adscan_context(
         print_warning=context.print_warning,
         print_error=context.print_error,
         print_instruction=context.print_instruction,
+        print_panel=context.print_panel,
         print_exception=context.print_exception,
         confirm_ask=context.confirm_ask,
         track_docs_link_shown=context.track_docs_link_shown,

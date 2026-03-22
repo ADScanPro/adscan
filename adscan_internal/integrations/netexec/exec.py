@@ -67,7 +67,14 @@ def run_netexec_remote_command(
             command = f"{command} --smb-timeout 30"
         if current_method:
             command = f"{command} --exec-method {current_method}"
-        proc = shell._run_netexec(command, domain=domain, timeout=timeout)
+        proc = shell._run_netexec(
+            command,
+            domain=domain,
+            timeout=timeout,
+            operation_kind=f"netexec_remote_exec:{service_clean}",
+            service=service_clean,
+            target_count=1,
+        )
         output = ""
         if proc:
             output = (proc.stdout or "") + "\n" + (proc.stderr or "")

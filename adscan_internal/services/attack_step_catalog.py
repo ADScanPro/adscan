@@ -10,6 +10,7 @@ Scope:
 - Remediation complexity, effort, and full-mitigation flag per step
 - MITRE ATT&CK technique mapping per step
 - Windows Event IDs for SOC detection per step
+- BloodHound CE native edge flag and Cypher type names
 
 remediation_complexity values:
   low        – Single GPO/registry/ACL change, minimal testing required.
@@ -21,6 +22,14 @@ can_fully_mitigate:
   True   – The step can be fully eliminated from attack paths.
   False  – The step is architecturally inherent to Windows AD (e.g., unconstrained delegation
            on DCs); the risk can only be reduced, not eliminated.
+
+bh_native / bh_cypher_names:
+  bh_native=True means the edge exists natively in BloodHound CE's graph (added by its
+  collectors). Such edges are NOT uploaded via OpenGraph — they are already present.
+  bh_cypher_names lists the exact PascalCase Cypher relationship type(s) used in BH CE
+  queries. Some catalog entries map to multiple BH CE variants (e.g. ADCSESC6a/6b).
+  ADscan-custom relations (LocalAdminPassReuse, Timeroasting, DumpLSA, etc.) have
+  bh_native=False and are NOT included in BH CE Cypher queries.
 """
 
 from __future__ import annotations
@@ -53,6 +62,8 @@ class AttackStepCatalogEntry:
         None  # e.g. "Steal or Forge Kerberos Tickets: Kerberoasting"
     )
     detection_event_ids: tuple[str, ...] = ()  # Windows Event IDs for SOC detection
+    bh_native: bool = False  # True = edge exists natively in BloodHound CE's graph
+    bh_cypher_names: tuple[str, ...] = ()  # Cypher relationship type(s) for BH CE queries
 
 
 def _entry(
@@ -69,6 +80,8 @@ def _entry(
     mitre_technique_id: str | None = None,
     mitre_technique_name: str | None = None,
     detection_event_ids: tuple[str, ...] = (),
+    bh_native: bool = False,
+    bh_cypher_names: tuple[str, ...] = (),
 ) -> AttackStepCatalogEntry:
     """Build a normalized catalog entry."""
     return AttackStepCatalogEntry(
@@ -84,6 +97,8 @@ def _entry(
         mitre_technique_id=mitre_technique_id,
         mitre_technique_name=mitre_technique_name,
         detection_event_ids=detection_event_ids,
+        bh_native=bh_native,
+        bh_cypher_names=bh_cypher_names,
     )
 
 
@@ -99,6 +114,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_effort="Remove the user/group from the over-privileged group.",
         can_fully_mitigate=True,
         # No MITRE — pure graph context node, not an attack technique
+        bh_native=True,
+        bh_cypher_names=("MemberOf",),
     ),
     _entry(
         "localadminpassreuse",
@@ -115,6 +132,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1078.003",
         mitre_technique_name="Valid Accounts: Local Accounts",
         detection_event_ids=("4624", "4648"),
+        bh_cypher_names=("LocalAdminPassReuse",),
     ),
     _entry(
         "localcredreusesource",
@@ -131,6 +149,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1003.002",
         mitre_technique_name="OS Credential Dumping: Security Account Manager",
         detection_event_ids=("4688", "4656"),
+        bh_cypher_names=("LocalCredReuseSource",),
     ),
     _entry(
         "localcredtodomainreuse",
@@ -147,6 +166,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1078.002",
         mitre_technique_name="Valid Accounts: Domain Accounts",
         detection_event_ids=("4624", "4648", "4768", "4769"),
+        bh_cypher_names=("LocalCredToDomainReuse",),
     ),
     _entry(
         "domainpassreusesource",
@@ -162,6 +182,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1078.002",
         mitre_technique_name="Valid Accounts: Domain Accounts",
         detection_event_ids=("4624", "4768", "4769"),
+        bh_cypher_names=("DomainPassReuseSource",),
     ),
     _entry(
         "domainpassreuse",
@@ -177,6 +198,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1078.002",
         mitre_technique_name="Valid Accounts: Domain Accounts",
         detection_event_ids=("4624", "4648", "4768", "4769"),
+        bh_cypher_names=("DomainPassReuse",),
     ),
     _entry(
         "hassession",
@@ -198,6 +220,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1053.005",
         mitre_technique_name="Scheduled Task/Job: Scheduled Task",
         detection_event_ids=("4624", "4672"),
+        bh_native=True,
+        bh_cypher_names=("HasSession",),
     ),
     # ── Network exploitation / CVEs ─────────────────────────────────────────
     _entry(
@@ -216,6 +240,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1210",
         mitre_technique_name="Exploitation of Remote Services",
         detection_event_ids=("4742",),
+        bh_cypher_names=("Zerologon",),
     ),
     _entry(
         "nopac",
@@ -233,6 +258,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1068",
         mitre_technique_name="Exploitation for Privilege Escalation",
         detection_event_ids=("4741", "4742", "4768", "4769"),
+        bh_cypher_names=("NoPAC",),
     ),
     _entry(
         "printnightmare",
@@ -250,6 +276,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1068",
         mitre_technique_name="Exploitation for Privilege Escalation",
         detection_event_ids=("316",),
+        bh_cypher_names=("PrintNightmare",),
     ),
     _entry(
         "ms17-010",
@@ -268,6 +295,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1210",
         mitre_technique_name="Exploitation of Remote Services",
         detection_event_ids=(),
+        bh_cypher_names=("MS17010",),
     ),
     _entry(
         "mseven",
@@ -286,6 +314,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1187",
         mitre_technique_name="Forced Authentication",
         detection_event_ids=("4768",),
+        bh_cypher_names=("MSEven",),
     ),
     # ── Kerberos ────────────────────────────────────────────────────────────
     _entry(
@@ -306,6 +335,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1558",
         mitre_technique_name="Steal or Forge Kerberos Tickets",
         detection_event_ids=("4769",),
+        bh_native=True,
+        bh_cypher_names=("AllowedToDelegate",),
     ),
     _entry(
         "allowedtoact",
@@ -323,6 +354,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1134.001",
         mitre_technique_name="Access Token Manipulation: Token Impersonation/Theft",
         detection_event_ids=("4769", "5136"),
+        bh_native=True,
+        bh_cypher_names=("AllowedToAct",),
     ),
     _entry(
         "addallowedtoact",
@@ -340,6 +373,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1134.001",
         mitre_technique_name="Access Token Manipulation: Token Impersonation/Theft",
         detection_event_ids=("5136",),
+        bh_native=True,
+        bh_cypher_names=("AddAllowedToAct",),
     ),
     _entry(
         "coercetotgt",
@@ -356,6 +391,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1187",
         mitre_technique_name="Forced Authentication",
         detection_event_ids=("4768", "4769"),
+        bh_native=True,
+        bh_cypher_names=("CoerceToTGT",),
     ),
     _entry(
         "kerberoasting",
@@ -374,6 +411,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1558.003",
         mitre_technique_name="Steal or Forge Kerberos Tickets: Kerberoasting",
         detection_event_ids=("4769",),
+        bh_cypher_names=("Kerberoasting",),
     ),
     _entry(
         "asreproasting",
@@ -391,6 +429,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1558.004",
         mitre_technique_name="Steal or Forge Kerberos Tickets: AS-REP Roasting",
         detection_event_ids=("4768",),
+        bh_cypher_names=("ASREPRoasting",),
     ),
     _entry(
         "timeroasting",
@@ -407,6 +446,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         can_fully_mitigate=True,
         mitre_technique_id="T1110.002",
         mitre_technique_name="Brute Force: Password Cracking",
+        bh_cypher_names=("Timeroasting",),
     ),
     # ── Lateral movement / execution ────────────────────────────────────────
     _entry(
@@ -425,6 +465,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1021.002",
         mitre_technique_name="Remote Services: SMB/Windows Admin Shares",
         detection_event_ids=("4624", "4648", "4672"),
+        bh_native=True,
+        bh_cypher_names=("AdminTo",),
     ),
     _entry(
         "sqladmin",
@@ -441,6 +483,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1078",
         mitre_technique_name="Valid Accounts",
         detection_event_ids=("4624",),
+        bh_native=True,
+        bh_cypher_names=("SQLAdmin",),
     ),
     _entry(
         "canrdp",
@@ -457,6 +501,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1021.001",
         mitre_technique_name="Remote Services: Remote Desktop Protocol",
         detection_event_ids=("4624", "4778"),
+        bh_native=True,
+        bh_cypher_names=("CanRDP",),
     ),
     _entry(
         "canpsremote",
@@ -473,6 +519,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1021.006",
         mitre_technique_name="Remote Services: Windows Remote Management",
         detection_event_ids=("4624",),
+        bh_native=True,
+        bh_cypher_names=("CanPSRemote",),
     ),
     _entry(
         "guestsession",
@@ -490,6 +538,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1135",
         mitre_technique_name="Network Share Discovery",
         detection_event_ids=("4624", "5140"),
+        bh_cypher_names=("GuestSession",),
     ),
     _entry(
         "executedcom",
@@ -506,6 +555,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1021.003",
         mitre_technique_name="Remote Services: Distributed Component Object Model",
         detection_event_ids=("4624", "4688"),
+        bh_native=True,
+        bh_cypher_names=("ExecuteDCOM",),
     ),
     # ── ADCS / PKI ──────────────────────────────────────────────────────────
     _entry(
@@ -524,6 +575,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=True,
+        bh_cypher_names=("ADCSESC1",),
     ),
     _entry(
         "adcsesc2",
@@ -541,6 +594,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=False,
+        bh_cypher_names=("ADCSESC2",),
     ),
     _entry(
         "adcsesc3",
@@ -558,6 +613,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=True,
+        bh_cypher_names=("ADCSESC3",),
     ),
     _entry(
         "adcsesc4",
@@ -575,6 +632,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("5136", "4886", "4887"),
+        bh_native=True,
+        bh_cypher_names=("ADCSESC4",),
     ),
     _entry(
         "adcsesc5",
@@ -592,6 +651,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("5136", "4886", "4887"),
+        bh_native=False,
+        bh_cypher_names=("ADCSESC5",),
     ),
     _entry(
         "adcsesc6",
@@ -609,6 +670,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=True,
+        bh_cypher_names=("ADCSESC6a", "ADCSESC6b"),
     ),
     _entry(
         "adcsesc7",
@@ -626,6 +689,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=False,
+        bh_cypher_names=("ADCSESC7",),
     ),
     _entry(
         "adcsesc8",
@@ -644,6 +709,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=False,
+        bh_cypher_names=("ADCSESC8",),
     ),
     _entry(
         "adcsesc9",
@@ -662,6 +729,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("5136", "4886", "4887"),
+        bh_native=True,
+        bh_cypher_names=("ADCSESC9a", "ADCSESC9b"),
     ),
     _entry(
         "adcsesc10",
@@ -679,6 +748,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=True,
+        bh_cypher_names=("ADCSESC10a", "ADCSESC10b"),
     ),
     _entry(
         "adcsesc11",
@@ -696,6 +767,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=False,
+        bh_cypher_names=("ADCSESC11",),
     ),
     _entry(
         "adcsesc13",
@@ -713,6 +786,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=True,
+        bh_cypher_names=("ADCSESC13",),
     ),
     _entry(
         "adcsesc15",
@@ -730,6 +805,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("4886", "4887"),
+        bh_native=False,
+        bh_cypher_names=("ADCSESC15",),
     ),
     _entry(
         "coerceandrelayntlmtoadcs",
@@ -746,6 +823,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1187",
         mitre_technique_name="Forced Authentication",
         detection_event_ids=("4768",),
+        bh_native=True,
+        bh_cypher_names=("CoerceAndRelayNTLMToADCS",),
     ),
     _entry(
         "goldencert",
@@ -768,6 +847,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("5058", "5061"),
+        bh_native=True,
+        bh_cypher_names=("GoldenCert",),
     ),
     # ── ACL / Object control ─────────────────────────────────────────────────
     _entry(
@@ -786,6 +867,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1098",
         mitre_technique_name="Account Manipulation",
         detection_event_ids=("5136", "4662"),
+        bh_native=True,
+        bh_cypher_names=("GenericAll",),
     ),
     _entry(
         "genericwrite",
@@ -802,6 +885,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1098",
         mitre_technique_name="Account Manipulation",
         detection_event_ids=("5136",),
+        bh_native=True,
+        bh_cypher_names=("GenericWrite",),
     ),
     _entry(
         "owns",
@@ -818,6 +903,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1222.001",
         mitre_technique_name="Windows File and Directory Permissions Modification",
         detection_event_ids=("4662",),
+        bh_native=True,
+        bh_cypher_names=("Owns",),
     ),
     _entry(
         "forcechangepassword",
@@ -835,6 +922,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1098",
         mitre_technique_name="Account Manipulation",
         detection_event_ids=("4723", "4724"),
+        bh_native=True,
+        bh_cypher_names=("ForceChangePassword",),
     ),
     _entry(
         "addself",
@@ -850,6 +939,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1098",
         mitre_technique_name="Account Manipulation",
         detection_event_ids=("4728", "4732", "4756"),
+        bh_native=True,
+        bh_cypher_names=("AddSelf",),
     ),
     _entry(
         "addmember",
@@ -866,6 +957,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1098",
         mitre_technique_name="Account Manipulation",
         detection_event_ids=("4728", "4732", "4756"),
+        bh_native=True,
+        bh_cypher_names=("AddMember",),
     ),
     _entry(
         "readgmsapassword",
@@ -883,6 +976,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1555",
         mitre_technique_name="Credentials from Password Stores",
         detection_event_ids=("4662",),
+        bh_native=True,
+        bh_cypher_names=("ReadGMSAPassword",),
     ),
     _entry(
         "readlapspassword",
@@ -900,6 +995,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1555",
         mitre_technique_name="Credentials from Password Stores",
         detection_event_ids=("4662",),
+        bh_native=True,
+        bh_cypher_names=("ReadLAPSPassword",),
     ),
     _entry(
         "synclapspassword",
@@ -916,6 +1013,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1555",
         mitre_technique_name="Credentials from Password Stores",
         detection_event_ids=("4662",),
+        bh_native=True,
+        bh_cypher_names=("SyncLAPSPassword",),
     ),
     _entry(
         "writedacl",
@@ -932,6 +1031,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1222.001",
         mitre_technique_name="Windows File and Directory Permissions Modification",
         detection_event_ids=("5136",),
+        bh_native=True,
+        bh_cypher_names=("WriteDACL",),
     ),
     _entry(
         "writeowner",
@@ -948,6 +1049,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1222.001",
         mitre_technique_name="Windows File and Directory Permissions Modification",
         detection_event_ids=("5136",),
+        bh_native=True,
+        bh_cypher_names=("WriteOwner",),
     ),
     _entry(
         "writespn",
@@ -964,6 +1067,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1558.003",
         mitre_technique_name="Steal or Forge Kerberos Tickets: Kerberoasting",
         detection_event_ids=("5136",),
+        bh_native=True,
+        bh_cypher_names=("WriteSPN",),
     ),
     _entry(
         "addkeycredentiallink",
@@ -980,6 +1085,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1649",
         mitre_technique_name="Steal or Forge Authentication Certificates",
         detection_event_ids=("5136",),
+        bh_native=True,
+        bh_cypher_names=("AddKeyCredentialLink",),
     ),
     _entry(
         "allextendedrights",
@@ -997,6 +1104,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1098",
         mitre_technique_name="Account Manipulation",
         detection_event_ids=("4662",),
+        bh_native=True,
+        bh_cypher_names=("AllExtendedRights",),
     ),
     # ── Credential access ───────────────────────────────────────────────────
     _entry(
@@ -1016,6 +1125,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1003.006",
         mitre_technique_name="OS Credential Dumping: DCSync",
         detection_event_ids=("4662",),
+        bh_native=True,
+        bh_cypher_names=("DCSync",),
     ),
     _entry(
         "getchanges",
@@ -1031,6 +1142,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1003.006",
         mitre_technique_name="OS Credential Dumping: DCSync",
         detection_event_ids=("4662",),
+        bh_native=True,
+        bh_cypher_names=("GetChanges",),
     ),
     _entry(
         "getchangesall",
@@ -1046,6 +1159,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1003.006",
         mitre_technique_name="OS Credential Dumping: DCSync",
         detection_event_ids=("4662",),
+        bh_native=True,
+        bh_cypher_names=("GetChangesAll",),
     ),
     _entry(
         "dumplsa",
@@ -1062,6 +1177,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1003.004",
         mitre_technique_name="OS Credential Dumping: LSA Secrets",
         detection_event_ids=("4656", "4663"),
+        bh_cypher_names=("DumpLSA",),
     ),
     _entry(
         "dumpdpapi",
@@ -1079,6 +1195,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1555.004",
         mitre_technique_name="Credentials from Password Stores: Windows Credential Manager",
         detection_event_ids=("4663",),
+        bh_cypher_names=("DumpDPAPI",),
     ),
     _entry(
         "dumplsass",
@@ -1095,6 +1212,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1003.001",
         mitre_technique_name="OS Credential Dumping: LSASS Memory",
         detection_event_ids=("4656",),
+        bh_cypher_names=("DumpLSASS",),
     ),
     # ── Coercion ─────────────────────────────────────────────────────────────
     _entry(
@@ -1114,6 +1232,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1187",
         mitre_technique_name="Forced Authentication",
         detection_event_ids=("4768",),
+        bh_cypher_names=("DFSCoerce",),
     ),
     _entry(
         "petitpotam",
@@ -1132,6 +1251,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1187",
         mitre_technique_name="Forced Authentication",
         detection_event_ids=("4768",),
+        bh_cypher_names=("PetitPotam",),
     ),
     _entry(
         "printerbug",
@@ -1149,6 +1269,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1187",
         mitre_technique_name="Forced Authentication",
         detection_event_ids=("4768",),
+        bh_cypher_names=("PrinterBug",),
     ),
     # ── Entry vectors ────────────────────────────────────────────────────────
     _entry(
@@ -1166,6 +1287,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1087.002",
         mitre_technique_name="Account Discovery: Domain Account",
         detection_event_ids=(),
+        bh_cypher_names=("LDAPAnonymousBind",),
     ),
     _entry(
         "passwordspray",
@@ -1182,6 +1304,58 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1110.003",
         mitre_technique_name="Brute Force: Password Spraying",
         detection_event_ids=("4625", "4771"),
+        bh_cypher_names=("PasswordSpray",),
+    ),
+    _entry(
+        "useraspass",
+        support_kind="supported",
+        support_reason="Executable via built-in username-as-password spraying workflows",
+        category="entry_vector",
+        description="Username-as-password entry vector",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Prevent predictable password choices that mirror usernames or account names. "
+            "Enforce strong password policies, MFA, and monitor for spray patterns."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1110.003",
+        mitre_technique_name="Brute Force: Password Spraying",
+        detection_event_ids=("4625", "4771"),
+        bh_cypher_names=("UserAsPass",),
+    ),
+    _entry(
+        "blankpassword",
+        support_kind="supported",
+        support_reason="Executable via built-in blank-password validation workflow",
+        category="entry_vector",
+        description="Blank-password entry vector",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Disable blank passwords for all domain accounts and enforce password policy "
+            "validation during provisioning and account review."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1110.001",
+        mitre_technique_name="Brute Force: Password Guessing",
+        detection_event_ids=("4625", "4771"),
+        bh_cypher_names=("BlankPassword",),
+    ),
+    _entry(
+        "computerpre2k",
+        support_kind="supported",
+        support_reason="Executable via built-in pre2k computer-account validation workflow",
+        category="entry_vector",
+        description="Pre2k computer-account password entry vector",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Rotate computer account passwords, remove legacy pre-Windows 2000 style secrets, "
+            "and review machine-account provisioning for predictable host-based passwords."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1110.003",
+        mitre_technique_name="Brute Force: Password Spraying",
+        detection_event_ids=("4625", "4771"),
+        bh_cypher_names=("ComputerPre2k",),
     ),
     _entry(
         "passwordinshare",
@@ -1198,6 +1372,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1552.001",
         mitre_technique_name="Unsecured Credentials: Credentials In Files",
         detection_event_ids=(),
+        bh_cypher_names=("PasswordInShare",),
     ),
     _entry(
         "gpppassword",
@@ -1214,6 +1389,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1552.006",
         mitre_technique_name="Unsecured Credentials: Group Policy Preferences",
         detection_event_ids=(),
+        bh_cypher_names=("GPPPassword",),
     ),
     _entry(
         "userdescription",
@@ -1230,11 +1406,14 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1087.002",
         mitre_technique_name="Account Discovery: Domain Account",
         detection_event_ids=("4662",),
+        bh_cypher_names=("UserDescription",),
     ),
 )
 
 ATTACK_STEP_CATALOG: dict[str, AttackStepCatalogEntry] = {
-    entry.relation: entry for entry in _CATALOG_ENTRIES if entry.relation
+    entry.relation: entry
+    for entry in _CATALOG_ENTRIES
+    if entry.relation
 }
 
 _RELATION_ALIASES_BY_KEY: dict[str, str] = {
@@ -1298,6 +1477,85 @@ def get_exploitation_relation_vuln_keys() -> dict[str, str]:
         for relation, entry in ATTACK_STEP_CATALOG.items()
         if isinstance(entry.vuln_key, str) and entry.vuln_key.strip()
     }
+
+
+# ── BloodHound CE edge helpers ─────────────────────────────────────────────────
+
+
+def get_bh_native_relations() -> frozenset[str]:
+    """Return the set of catalog relation keys that exist natively in BH CE's graph.
+
+    ADscan-custom relations (LocalAdminPassReuse, Timeroasting, DumpLSA, etc.)
+    are excluded because they are not stored as edges in BloodHound.
+    """
+    return frozenset(
+        rel for rel, entry in ATTACK_STEP_CATALOG.items() if entry.bh_native
+    )
+
+
+def get_bh_cypher_relation_types() -> tuple[str, ...]:
+    """Return BH CE Cypher relationship type names for all catalog entries that have them.
+
+    Includes both BH-native edges and ADscan opengraph edges (e.g. Kerberoasting,
+    ASREPRoasting, PasswordSpray, UserAsPass, BlankPassword, ComputerPre2k)
+    that ADscan writes into BH CE via opengraph sync.
+
+    Use this to build the ``[:TypeA|TypeB|...*1..N]`` filter in attack-path
+    Cypher queries so the query is automatically kept in sync with the catalog.
+
+    Returns a sorted, deduplicated tuple of PascalCase type strings.
+    """
+    result: list[str] = []
+    for entry in ATTACK_STEP_CATALOG.values():
+        if entry.bh_cypher_names:
+            result.extend(entry.bh_cypher_names)
+    return tuple(sorted(set(result)))
+
+
+def get_bh_canonical_cypher_name(relation: str) -> str:
+    """Return the canonical BH CE Cypher type name for a relation string.
+
+    Handles variants like ``ADCSESC9`` → ``ADCSESC9a`` where BH CE splits a
+    single ESC into multiple sub-types (a/b).  The first ``bh_cypher_name`` in
+    the catalog entry is used as the canonical form.  If the relation is unknown
+    or already canonical, the input is returned unchanged.
+
+    Args:
+        relation: Raw relation string (e.g. ``"ADCSESC9"``, ``"adcsesc9"``).
+
+    Returns:
+        Canonical BH CE Cypher type string (e.g. ``"ADCSESC9a"``).
+    """
+    key = str(relation or "").strip().lower().replace("-", "")
+    # Direct catalog key match (e.g. "adcsesc9" → entry with bh_cypher_names=("ADCSESC9a","ADCSESC9b"))
+    entry = ATTACK_STEP_CATALOG.get(key)
+    if entry and entry.bh_cypher_names:
+        return entry.bh_cypher_names[0]
+    # Try matching against existing bh_cypher_names (e.g. "adcsesc9a" already canonical)
+    for catalog_entry in ATTACK_STEP_CATALOG.values():
+        if key in {n.lower() for n in catalog_entry.bh_cypher_names}:
+            return catalog_entry.bh_cypher_names[0]
+    # Unknown — return as-is (uppercase for Cypher conventions)
+    return str(relation or "").strip()
+
+
+def get_bh_native_adcs_cypher_names() -> frozenset[str]:
+    """Return Cypher type names for ADCS escalation edges that BH CE creates natively.
+
+    These are the ESC techniques that BloodHound CE's own ingestor adds to the
+    graph.  Non-native ADCS variants (ESC2, ESC5, ESC7, ESC8, ESC11, ESC15) are
+    excluded because BH CE does not create those edges natively.
+    """
+    _adcs_prefixes = ("ADCS",)
+    _adcs_exact = {"CoerceAndRelayNTLMToADCS", "GoldenCert"}
+    result: set[str] = set()
+    for entry in ATTACK_STEP_CATALOG.values():
+        if not entry.bh_native:
+            continue
+        for name in entry.bh_cypher_names:
+            if any(name.startswith(p) for p in _adcs_prefixes) or name in _adcs_exact:
+                result.add(name)
+    return frozenset(result)
 
 
 # ── Remediation metadata helpers ──────────────────────────────────────────────

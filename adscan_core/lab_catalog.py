@@ -106,6 +106,8 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
         "XEN",
         "Orion",
         "FullHouse",
+        # Pro Labs / Endgames
+        "Genesis",
         "Zephyr",
         "Breakpoint",
         "Dante",
@@ -173,7 +175,13 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
     # generic/non-AD boxes and were not backed by stable AD fingerprints.
     # Leave the provider empty rather than risking incorrect inference.
     "vulnhub": (),
-    "goad": (),
+    # GOAD (Game of Active Directory) is a self-hosted lab framework by Orange
+    # Cyberdefense.  Each variant is a distinct deployment with its own domain
+    # topology.  Domain fingerprints below cover all forests in every variant.
+    "goad": (
+        "GOAD",
+        "GOAD_Light",
+    ),
     "proving_grounds": (),
     "other": (),
     "local_test": (),
@@ -189,7 +197,7 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
 # Design rules (see domain_inference.py for full rationale):
 #   1. Only domains UNIQUE to a single machine in this catalog.
 #      Ambiguous domains (multiple machines share the same domain) are omitted:
-#        htb.local      → Forest / Mantis / Reel / Sizzle
+#        htb.local      → Forest / Mantis / Reel / Sizzle / XEN (Endgame)
 #        megabank.local → Resolute / Monteverde
 #      For ambiguous domains, PDC hostname inference distinguishes machines.
 #   2. Only domains where the second-level label does NOT already match the
@@ -258,6 +266,36 @@ _MACHINE_DOMAIN_FINGERPRINTS: dict[str, tuple[str, str]] = {
     # CPTS (HTB Academy) — lab and exam both use inlanefreight.local
     # SLD "inlanefreight" doesn't match catalog entry "cpts".
     "inlanefreight.local": ("certifications", "cpts"),
+    # ---------------------------------------------------------------------------
+    # HTB Pro Labs & Endgames
+    # ---------------------------------------------------------------------------
+    # P.O.O (HTB Endgame) — domain: intranet.poo, DC: COMPATIBILITY.intranet.poo
+    # SLD "intranet" doesn't match catalog entry "p.o.o"; non-standard .poo TLD.
+    "intranet.poo": ("hackthebox", "p.o.o"),
+    # RPG (HTB Endgame) — domain: roundsoft.local, machines: Gelus/Lux/Shinra/Ignis
+    # SLD "roundsoft" doesn't match catalog entry "rpg".
+    "roundsoft.local": ("hackthebox", "rpg"),
+    # Ascension (HTB Endgame) — two forests: daedalus.local + megaairline.local
+    # Cross-forest transitive trust between the two; neither SLD matches "ascension".
+    "daedalus.local": ("hackthebox", "ascension"),
+    "megaairline.local": ("hackthebox", "ascension"),
+    # Offshore (HTB Pro Lab) — root: offshore.com; child domains dev/admin/client.offshore.com
+    # Child domains strip to offshore.com via subdomain stripping, so one fingerprint covers all.
+    # Non-standard .com TLD bypasses SLD heuristic; explicit fingerprint required.
+    "offshore.com": ("hackthebox", "offshore"),
+    # Zephyr (HTB Pro Lab) — two organizations: zephyr.local + painters.local
+    # zephyr.local SLD matches lab name (covered by SLD rule); painters.local doesn't.
+    "painters.local": ("hackthebox", "zephyr"),
+    # ---------------------------------------------------------------------------
+    # GOAD (Game of Active Directory) — Orange Cyberdefense self-hosted lab
+    # ---------------------------------------------------------------------------
+    # GOAD full (5 VMs) — two forests:
+    #   sevenkingdoms.local  (forest 1: kingslanding + winterfell via north.sevenkingdoms.local child)
+    #   essos.local          (forest 2: meereen + braavos)
+    # north.sevenkingdoms.local strips to sevenkingdoms.local → single fingerprint covers both.
+    # GOAD-Light shares the same forest structure with fewer machines.
+    "sevenkingdoms.local": ("goad", "goad"),
+    "essos.local": ("goad", "goad"),
 }
 
 

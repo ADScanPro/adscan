@@ -59,6 +59,7 @@ from adscan_internal.path_utils import get_effective_user_home
 from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
+    print_panel,
     print_panel_with_table,
 )
 from adscan_internal.services import EnumerationService
@@ -2387,44 +2388,8 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         if not wordlist:
             return
     else:
-        in_container_runtime = is_full_container_runtime(shell)
-        marked_domain = mark_sensitive(domain, "domain")
-        wordlist = ""
-        if in_container_runtime:
-            wordlist = (
-                select_host_file_via_gui(
-                    shell,
-                    title=f"Select the Kerberos username wordlist for domain {domain}",
-                    initial_dir=str(get_effective_user_home()),
-                    log_prefix="ldap",
-                )
-                or ""
-            ).strip()
-            if not wordlist:
-                print_info_debug(
-                    "[ldap] Host GUI picker not used/failed; falling back to manual path prompt"
-                )
+        wordlist = _prompt_kerberos_username_wordlist(shell, domain)
         if not wordlist:
-            wordlist = (
-                Prompt.ask(
-                    f"Specify the path of the username wordlist for domain {marked_domain}:"
-                )
-                or ""
-            ).strip()
-        if not wordlist:
-            print_error("Please provide the path to the wordlist file.")
-            return
-
-        wordlist = maybe_import_host_file_to_workspace(
-            shell,
-            domain=domain,
-            source_path=wordlist,
-            dest_dir="wordlists_custom",
-            log_prefix="ldap",
-        )
-        if not os.path.exists(wordlist):
-            marked_wordlist = mark_sensitive(wordlist, "path")
-            print_error(f"The wordlist file {marked_wordlist} does not exist.")
             return
 
     workspace_cwd = shell._get_workspace_cwd()
@@ -2485,6 +2450,105 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         shell,
         domain,
         source="kerberos_user_enum",
+    )
+    _show_kerberos_enum_shortcut_hint(shell, domain)
+
+
+def _prompt_kerberos_username_wordlist(
+    shell: LdapShell,
+    domain: str,
+) -> str | None:
+    """Prompt until a valid Kerberos username wordlist is selected or skipped."""
+
+    in_container_runtime = is_full_container_runtime(shell)
+    marked_domain = mark_sensitive(domain, "domain")
+
+    while True:
+        wordlist = ""
+        if in_container_runtime:
+            wordlist = (
+                select_host_file_via_gui(
+                    shell,
+                    title=f"Select the Kerberos username wordlist for domain {domain}",
+                    initial_dir=str(get_effective_user_home()),
+                    log_prefix="ldap",
+                )
+                or ""
+            ).strip()
+            if not wordlist:
+                print_info_debug(
+                    "[ldap] Host GUI picker not used/failed; falling back to manual path prompt"
+                )
+
+        if not wordlist:
+            wordlist = (
+                Prompt.ask(
+                    f"Specify the path of the username wordlist for domain {marked_domain}:"
+                )
+                or ""
+            ).strip()
+        if not wordlist:
+            print_warning("Kerberos user enumeration skipped: no wordlist path was provided.")
+            return None
+
+        imported_wordlist = maybe_import_host_file_to_workspace(
+            shell,
+            domain=domain,
+            source_path=wordlist,
+            dest_dir="wordlists_custom",
+            log_prefix="ldap",
+        )
+        if os.path.exists(imported_wordlist):
+            return imported_wordlist
+
+        marked_wordlist = mark_sensitive(imported_wordlist, "path")
+        print_warning(f"The wordlist file {marked_wordlist} does not exist.")
+
+        options = [
+            "Re-enter the wordlist path (Recommended)",
+            "Skip Kerberos user enumeration",
+        ]
+        choice_idx = shell._questionary_select(
+            "Kerberos username wordlist not found. How do you want to proceed?",
+            options,
+            default_idx=0,
+        )
+        if choice_idx == 1:
+            print_info(
+                "Skipping Kerberos user enumeration. You can rerun it later with "
+                f"`kerberos_enum_users {domain}`."
+            )
+            _show_kerberos_enum_shortcut_hint(shell, domain)
+            return None
+
+
+def _show_kerberos_enum_shortcut_hint(shell: LdapShell, domain: str) -> None:
+    """Render a reusable reminder for rerunning Kerberos user enumeration only."""
+
+    marked_domain = mark_sensitive(domain, "domain")
+    workspace_cwd = shell.current_workspace_dir or shell._get_workspace_cwd()
+    users_file = domain_subpath(workspace_cwd, shell.domains_dir, domain, "users.txt")
+    users_rel = os.path.join("domains", domain, "users.txt")
+    has_users_file = os.path.exists(users_file) and os.path.getsize(users_file) > 0
+
+    lines = [
+        "If you want to keep enumerating users via Kerberos later, you do not need to rerun the full scan.",
+        "",
+        f"Use this shortcut instead: kerberos_enum_users {marked_domain}",
+    ]
+    if has_users_file:
+        lines.append(f"Current users file: {mark_sensitive(users_rel, 'path')}")
+    else:
+        lines.append(
+            "If you skipped the wordlist or want to retry with a better list, "
+            "you can come back to this step directly."
+        )
+
+    print_panel(
+        "\n".join(lines),
+        title="[bold cyan]Kerberos User Enumeration Shortcut[/bold cyan]",
+        border_style="cyan",
+        expand=False,
     )
 
 

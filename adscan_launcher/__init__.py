@@ -10,10 +10,11 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
+from adscan_core.version_context import VERSION, get_source_tree_version
+
 __all__ = ["__version__"]
 
 try:
     __version__ = version("adscan")
 except PackageNotFoundError:
-    # Source checkout fallback.
-    __version__ = "6.2.0"
+    __version__ = get_source_tree_version() or VERSION

@@ -123,6 +123,11 @@ from adscan_internal.workspaces import (
     DEFAULT_DOMAIN_LAYOUT,
     domain_subpath,
 )
+from adscan_internal.integrations.netexec.timeouts import (
+    get_recommended_internal_timeout,
+    resolve_netexec_cve_timeout_seconds,
+    resolve_service_command_timeout_seconds,
+)
 from adscan_internal.docker_commands import (
     handle_check_docker as _handle_check_docker_mode,
     handle_ci_docker as _handle_ci_docker_mode,
@@ -152,7 +157,9 @@ from adscan_internal.docker_status import (
 from adscan_internal.bloodhound_ce_compose import (
     BLOODHOUND_CE_VERSION,
     BLOODHOUND_CE_DEFAULT_WEB_PORT,
+    compose_config_changed,
     compose_pull,
+    compose_recreate,
     compose_up,
     ensure_bloodhound_compose_file,
 )
@@ -1033,6 +1040,7 @@ from adscan_internal.cli.tools_env import (  # noqa: E402
 # Import from responder to avoid circular dependencies
 from adscan_internal.cli.responder import (  # noqa: E402
     clear_responder_db,
+    start_responder,
     stop_responder,
 )
 
@@ -3887,8 +3895,9 @@ def _maybe_ask_attribution(shell) -> None:
 
     options = [
         "LinkedIn",
-        "GitHub (search / trending / Awesome lists)",
+        "GitHub",
         "A colleague or friend recommended it",
+        "Discord community",
         "Web (adscanpro.com)",
         "Conference or talk (RootedCON, Hackén...)",
         "Other / Prefer not to say",
@@ -3898,6 +3907,7 @@ def _maybe_ask_attribution(shell) -> None:
         "linkedin",
         "github_organic",
         "word_of_mouth",
+        "discord_community",
         "landing_web",
         "conference",
         "other",
@@ -3911,7 +3921,7 @@ def _maybe_ask_attribution(shell) -> None:
         idx = questionary_select_index(
             title="How did you first hear about ADscan?",
             options=options,
-            default_idx=5,  # default → "Other / Prefer not to say"
+            default_idx=6,  # default → "Other / Prefer not to say"
             shell=shell,
         )
     except Exception:
@@ -7987,9 +7997,9 @@ def _install_rusthound_ce(env=None):
 
         cargo_exe = os.path.join(cargo_bin_path, "cargo")
         cargo_cmd = (
-            [cargo_exe, "install", "rusthound-ce@2.4.1"]
+            [cargo_exe, "install", "rusthound-ce@2.4.7"]
             if os.path.exists(cargo_exe)
-            else ["cargo", "install", "rusthound-ce@2.4.1"]
+            else ["cargo", "install", "rusthound-ce@2.4.7"]
         )
         result = run_command(
             cargo_cmd, check=False, capture_output=True, text=True, env=env, timeout=900
@@ -8150,14 +8160,14 @@ def _get_rusthound_verification_status(env=None):
         )
         if verification_results["cargo_available"]:
             status["messages"]["recommendations"].append(
-                "Install it with: cargo install rusthound-ce@2.4.1 --force"
+                "Install it with: cargo install rusthound-ce@2.4.7 --force"
             )
         else:
             status["messages"]["recommendations"].append(
                 "First install cargo with: apt install cargo"
             )
             status["messages"]["recommendations"].append(
-                "Then install RustHound-CE with: cargo install rusthound-ce@2.4.1 --force"
+                "Then install RustHound-CE with: cargo install rusthound-ce@2.4.7 --force"
             )
 
     # Cargo bin in PATH messages
@@ -8785,10 +8795,6 @@ def _start_bloodhound_ce():
 
         # Host runtime: rely on the shared BloodHound CE compose helpers so that
         # both Docker-mode and host-mode use the same stack management logic.
-        if _check_bloodhound_ce_running():
-            print_info_verbose("BloodHound CE containers already appear to be running")
-            return True
-
         if not docker_available() or not _ensure_docker_daemon_running():
             print_error(
                 "Cannot start BloodHound CE containers because the Docker daemon is not running "
@@ -8799,6 +8805,28 @@ def _start_bloodhound_ce():
         compose_path = ensure_bloodhound_compose_file(version=BLOODHOUND_CE_VERSION)
         if not compose_path:
             return False
+
+        # Detect configuration changes since the last recorded startup.
+        # This covers both users upgrading from a previous ADscan version (no hash
+        # file yet → treated as changed) and updates to the managed compose template
+        # (e.g. new env vars).  Data volumes are always preserved during recreation.
+        if compose_config_changed(compose_path):
+            print_info(
+                "BloodHound CE configuration has been updated — "
+                "recreating containers to apply the new settings..."
+            )
+            print_info_verbose(
+                "Your data (Neo4j graph, Postgres) is stored in Docker volumes "
+                "and will not be affected."
+            )
+            if not compose_recreate(compose_path):
+                return False
+            return True
+
+        # No configuration change — start normally (no-op if already running).
+        if _check_bloodhound_ce_running():
+            print_info_verbose("BloodHound CE containers already appear to be running")
+            return True
 
         print_info("Starting BloodHound CE containers...")
         if not compose_up(compose_path):
@@ -10276,6 +10304,23 @@ class PentestShell:
             )
 
         self._bloodhound_service = service
+
+        # Activate OpenGraph sync as soon as the BH service is available so
+        # any custom edge created afterwards (via upsert_edge) is automatically
+        # uploaded — regardless of which command triggered it (bh sync, spraying,
+        # LDAP enum, kerberoasting, etc.).
+        try:
+            from adscan_internal.services import bh_opengraph_sync
+
+            bh_opengraph_sync.setup(lambda: self._get_bloodhound_service())
+            # Sync mode is on by default (uploads block the calling thread so
+            # logs appear inline). Set ADSCAN_BH_OPENGRAPH_ASYNC=true to switch
+            # to background worker mode.
+            if os.getenv("ADSCAN_BH_OPENGRAPH_ASYNC", "").lower() in ("1", "true"):
+                bh_opengraph_sync.set_sync_mode(False)
+        except Exception:  # noqa: BLE001
+            pass
+
         return service
 
     def _get_dns_resolver_service(self) -> "DNSResolverService":
@@ -15466,10 +15511,10 @@ class PentestShell:
             return
         try:
             from adscan_internal.cli.spraying import (
-                maybe_show_ctf_spraying_recommendation,
+                maybe_offer_ctf_pre2k_followup,
             )
 
-            maybe_show_ctf_spraying_recommendation(
+            maybe_offer_ctf_pre2k_followup(
                 self,
                 domain,
                 reason="phase_5_completed",
@@ -15568,6 +15613,7 @@ class PentestShell:
                 from adscan_internal.rich_output import print_panel
                 from adscan_internal.services.attack_graph_service import (
                     get_attack_path_summaries,
+                    ATTACK_PATHS_MAX_DEPTH_DOMAIN,
                 )
 
                 default_execute_all = bool(
@@ -15589,9 +15635,9 @@ class PentestShell:
                         self,
                         domain,
                         scope="domain",
-                        max_depth=10,
+                        max_depth=ATTACK_PATHS_MAX_DEPTH_DOMAIN,
                         max_paths=None,
-                        require_high_value_target=True,
+                        target="highvalue",
                     )
 
                 summaries = _compute_summaries()
@@ -16480,55 +16526,11 @@ class PentestShell:
         )
 
     def do_responder(self, _args):
+        """Start Responder to capture network hashes and monitor the Responder database.
+
+        Use 'stop_responder' to stop the processes started.
         """
-        Starts Responder to capture network hashes and begins monitoring the Responder database.
-
-        This method checks if the network interface is configured before starting Responder.
-        If the interface is configured, it creates two threads: one to execute Responder and another
-        to monitor its database for new hashes.
-
-        Parameters:
-            args -- Additional arguments (currently not used).
-
-        Requires that the instance variable `self.interface` is configured with the appropriate network interface
-        before execution. Use 'stop_responder' to stop the processes started.
-        """
-
-        if not self.interface:
-            print_error(
-                "The network interface must be configured before running Responder"
-            )
-            return
-
-        env = os.environ.copy()
-        # Use Python from isolated venv if available, fallback to system python
-        responder_python = self.responder_python or "python"
-        command = [
-            responder_python,
-            os.path.join(TOOLS_INSTALL_DIR, "responder", "Responder.py"),
-            "-I",
-            self.interface,
-        ]
-
-        # Debug logs
-        print_info_debug(f"[DEBUG] do_responder: Prepared command: {' '.join(command)}")
-        print_info_debug(
-            f"[DEBUG] do_responder: Passing environment with keys (sample): {list(env.keys())[:10]}..."
-        )
-
-        # Original user-facing message
-        print_info("Starting Responder to capture hashes")
-
-        # Start Responder (execute_responder is now non-blocking as Popen is used without wait)
-        self.execute_responder(command, env)
-
-        # Create thread to monitor the database
-        monitor_thread = threading.Thread(target=self.monitor_responder_db, args=("",))
-        monitor_thread.start()
-
-        print_instruction(
-            "Responder and monitoring started in the background. Use 'stop_responder' to stop them."
-        )
+        start_responder(self)
 
     def execute_responder(self, command, env):
         """Executes Responder in the background."""
@@ -18003,7 +18005,7 @@ class PentestShell:
         source_context: dict[str, object] | None = None,
         source_steps: list[object] | None = None,
     ) -> bool:
-        """Execute a PasswordSpray attack-path step from recorded graph metadata."""
+        """Execute one spray-derived attack-path step from recorded graph metadata."""
         from adscan_internal.cli.spraying import execute_password_spray_attack_step
 
         return execute_password_spray_attack_step(
@@ -19406,19 +19408,6 @@ class PentestShell:
             return
         self._cve_findings.pop((target_domain, scope), None)
 
-    def _resolve_netexec_cve_timeout_seconds(
-        self,
-        *,
-        cve: str,
-        target_scope: str,
-    ) -> int:
-        """Return the default NetExec timeout for CVE modules."""
-        cve_key = str(cve or "").strip().lower()
-        scope_key = str(target_scope or "").strip().lower()
-        if cve_key == "zerologon":
-            return 900 if scope_key == "dcs" else 600
-        return 300
-
     def _run_netexec_cve_with_timeout_recovery(
         self,
         *,
@@ -19427,61 +19416,28 @@ class PentestShell:
         cve: str,
         target_scope: str,
     ):
-        """Run a NetExec CVE command and optionally retry on timeout."""
-        from adscan_internal.execution_outcomes import result_is_timeout
+        """Run one NetExec CVE command using the shared NetExec timeout UX."""
         from adscan_internal.rich_output import mark_sensitive
 
-        timeout_seconds = self._resolve_netexec_cve_timeout_seconds(
+        target_count = self._infer_service_command_target_count(command)
+        timeout_seconds = resolve_netexec_cve_timeout_seconds(
             cve=cve,
             target_scope=target_scope,
+            target_count=target_count,
         )
-        completed_process = self._run_netexec(
-            command,
-            domain=target_domain,
-            timeout=timeout_seconds,
-        )
-        if not result_is_timeout(completed_process, tool_name="netexec"):
-            return completed_process
-
         marked_cve = mark_sensitive(str(cve or "").strip(), "text")
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        print_warning(
-            f"NetExec {marked_cve} check for {marked_target_domain} timed out after {timeout_seconds} seconds."
-        )
-        print_info(
-            "Some NetExec CVE modules, especially Zerologon, can legitimately take longer on slow targets."
-        )
-
-        is_non_interactive = bool(os.getenv("CI")) or bool(
-            getattr(self, "non_interactive", False)
-        )
-        if is_non_interactive:
-            print_warning(
-                "Non-interactive mode detected; skipping retry with extended timeout."
-            )
-            return completed_process
-
-        extended_timeout = max(
-            timeout_seconds * 2,
-            1800 if str(cve or "").strip().lower() == "zerologon" else 900,
-        )
-        if not Confirm.ask(
-            (
-                f"Do you want to retry the {marked_cve} check "
-                f"with a longer timeout ({extended_timeout}s)?"
-            ),
-            default=True,
-        ):
-            return completed_process
-
-        print_info(
-            f"Retrying NetExec {marked_cve} check for {marked_target_domain} "
-            f"with timeout={extended_timeout}s."
+        print_info_debug(
+            "[cves] timeout policy: "
+            f"cve={marked_cve} target_scope={target_scope} "
+            f"target_count={target_count} global_timeout={timeout_seconds}"
         )
         return self._run_netexec(
             command,
             domain=target_domain,
-            timeout=extended_timeout,
+            timeout=timeout_seconds,
+            operation_kind=f"cve_module:{str(cve or '').strip().lower() or 'unknown'}",
+            service="smb",
+            target_count=target_count,
         )
 
     def execute_netexec_cve_all(self, command, target_domain, cve):
@@ -19902,7 +19858,12 @@ class PentestShell:
         step_status = "blocked" if cve_key == "printnightmare" else "discovered"
 
         try:
-            completed_process = self.run_command(command, timeout=300)
+            completed_process = self._run_netexec_cve_with_timeout_recovery(
+                command=command,
+                target_domain=target_domain,
+                cve=cve,
+                target_scope="dcs",
+            )
 
             if completed_process.returncode == 0:
                 output_str = completed_process.stdout
@@ -22088,6 +22049,7 @@ class PentestShell:
         from adscan_internal.cli.attack_path_execution import (
             offer_attack_paths_with_non_high_value_fallback,
         )
+        from adscan_internal.services.attack_graph_service import ATTACK_PATHS_MAX_DEPTH_USER
 
         if self.domains_data[domain]["auth"] == "pwned" and self.type == "ctf":
             return
@@ -22100,8 +22062,9 @@ class PentestShell:
                 self,
                 domain,
                 start=username,
-                max_depth=10,
+                max_depth=ATTACK_PATHS_MAX_DEPTH_USER,
                 max_display=20,
+                target="all",
                 context_username=username,
                 context_password=password,
             )
@@ -23662,6 +23625,87 @@ class PentestShell:
             prompt_for_user_privs_after=prompt_for_user_privs_after,
         )
 
+    def _infer_service_command_target_count(self, command: str) -> int:
+        """Infer how many targets one NetExec service command will process."""
+
+        try:
+            argv = shlex.split(str(command or ""))
+        except ValueError:
+            return 1
+
+        services = {
+            "smb",
+            "ldap",
+            "mssql",
+            "rdp",
+            "winrm",
+            "ssh",
+            "vnc",
+            "ftp",
+            "http",
+            "https",
+        }
+        service_index = next(
+            (idx for idx, token in enumerate(argv) if token in services),
+            None,
+        )
+        if service_index is None or service_index + 1 >= len(argv):
+            return 1
+
+        target_value = str(argv[service_index + 1]).strip()
+        if not target_value:
+            return 1
+        target_path = Path(_expand_effective_user_path(target_value))
+        if not target_path.is_file():
+            return 1
+
+        try:
+            with target_path.open("r", encoding="utf-8", errors="replace") as handle:
+                count = sum(1 for line in handle if line.strip())
+        except OSError:
+            return 1
+        return max(count, 1)
+
+    def _ensure_service_command_netexec_timeout(
+        self,
+        *,
+        command: str,
+        service: str,
+    ) -> str:
+        """Raise internal NetExec per-target timeout for slower service protocols."""
+
+        normalized_service = str(service or "").strip().lower()
+        desired_timeout = get_recommended_internal_timeout(
+            normalized_service,
+            default=30,
+        )
+        if desired_timeout <= 30:
+            return command
+
+        timeout_pattern = re.compile(r"(?:(^|\s)--timeout\s+)(\d+)\b")
+        match = timeout_pattern.search(command)
+        if match:
+            current_timeout = int(match.group(2))
+            if current_timeout >= desired_timeout:
+                return command
+            updated = timeout_pattern.sub(
+                lambda m: f"{m.group(1)}--timeout {desired_timeout}",
+                command,
+                count=1,
+            )
+            print_info_debug(
+                "[service-access] Raised internal NetExec timeout for "
+                f"service={normalized_service}: {current_timeout}s -> {desired_timeout}s"
+            )
+            return updated
+
+        updated = f"{command} --timeout {desired_timeout}"
+        print_info_debug(
+            "[service-access] Added internal NetExec timeout for "
+            f"service={normalized_service}: {desired_timeout}s"
+        )
+        return updated
+
     def run_service_command(
         self,
         command,
@@ -23675,7 +23719,19 @@ class PentestShell:
         from adscan_internal.rich_output import mark_sensitive
 
         max_retries = 3
-        timeout_seconds = 600  # 10 minutes
+        command = self._ensure_service_command_netexec_timeout(
+            command=command,
+            service=service,
+        )
+        target_count = self._infer_service_command_target_count(command)
+        timeout_seconds: int | None = resolve_service_command_timeout_seconds(
+            service=service, target_count=target_count, return_boolean=return_boolean
+        )
+        print_info_debug(
+            "[service-access] timeout policy: "
+            f"service={service} target_count={target_count} "
+            f"global_timeout={timeout_seconds if timeout_seconds is not None else 'disabled'}"
+        )
 
         # Modify the command for RDP outside of execute_command
         # if service == "rdp":
@@ -23818,11 +23874,20 @@ class PentestShell:
                     time.sleep(5)
                 else:
                     print_error(f"Attempts exhausted for service {service}")
-                    break  # Break after exhausting attempts
+                    if return_boolean:
+                        return False
+                    break
 
             except subprocess.CalledProcessError as e:
                 telemetry.capture_exception(e)
-
+                if "[ADSCAN] NETEXEC_COMMAND_TIMEOUT" in str(e.stderr or ""):
+                    marked_service = mark_sensitive(service, "text")
+                    print_warning(
+                        f"NetExec {marked_service} enumeration ended due to timeout recovery being declined or exhausted."
+                    )
+                    if return_boolean:
+                        return False
+                    break
                 print_error(f"Error executing {service} enumeration: {e.stderr}")
                 break
 
@@ -23902,16 +23967,18 @@ class PentestShell:
         shows paths whose terminal node is a high-value target, based on
         BloodHound `highvalue` plus Tier-0 / privileged-group heuristics. Use
         `--tier0-only` to restrict results to Tier-0 targets only. Use `--all`
-        to include every path regardless of the target.
+        to include every path regardless of the target. Use `--lowpriv` to show
+        only paths to non-high-value targets (pivot opportunities, lateral movement).
 
         Usage:
-            attack_paths <domain> [user|owned] [index] [--max N] [--depth N] [--path-steps N] [--all]
+            attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv]
 
         Args:
             domain: Target domain (e.g. `north.sevenkingdoms.local`)
-            user: Optional start node label to compute paths from (e.g. `jon.snow`)
+            user: Optional start node label to compute paths from (e.g. `jon.snow`).
+                Pass multiple usernames to compute paths for all of them (principals scope).
                 Special value `owned` computes paths for all domain users with
-                stored domain credentials in `domains_data[domain]["credentials"]`.
+                stored domain credentials in `domains_data["credentials"]`.
             index: Optional path index to display details directly (1-based)
 
         Flags:
@@ -23920,36 +23987,42 @@ class PentestShell:
             --path-steps N: Max number of steps shown inline per path in the summary table (default: unlimited)
             --tier0-only: Restrict paths to Tier-0 targets only
             --all: Include paths whose target is not high value
+            --lowpriv: Show only paths to non-high-value targets (pivot/lateral-movement opportunities)
 
         Examples:
             attack_paths north.sevenkingdoms.local
             attack_paths north.sevenkingdoms.local --tier0-only
             attack_paths north.sevenkingdoms.local --all
+            attack_paths north.sevenkingdoms.local --lowpriv
             attack_paths north.sevenkingdoms.local --max 20 --depth 6
             attack_paths north.sevenkingdoms.local --path-steps 2
             attack_paths north.sevenkingdoms.local jon.snow
             attack_paths north.sevenkingdoms.local jon.snow 1
+            attack_paths north.sevenkingdoms.local jon.snow arya.stark
             attack_paths north.sevenkingdoms.local owned
             attack_paths north.sevenkingdoms.local 2
         """
         from adscan_internal.cli.bloodhound import run_show_attack_paths
+        from adscan_internal.services.attack_graph_service import ATTACK_PATHS_MAX_DEPTH_USER
 
         parts = args.split()
         domain = parts[0] if parts else (self.domain or "")
         if not domain:
             print_instruction(
-                "Usage: attack_paths <domain> [user|owned] [index] [--max N] [--depth N] "
-                "[--path-steps N] [--tier0-only] [--all]"
+                "Usage: attack_paths <domain> [user|owned|user1 user2 ...] [index] [--max N] [--depth N] "
+                "[--path-steps N] [--tier0-only] [--all] [--lowpriv] [--no-cache]"
             )
             return
 
         index: int | None = None
         start_user: str | None = None
         max_display = 20
-        max_depth = 10
+        max_depth = ATTACK_PATHS_MAX_DEPTH_USER
         max_path_steps: int | None = None
         include_all = False
+        lowpriv = False
         target_mode = "impact"
+        no_cache = False
 
         # Parse flags first: --max N, --depth N (and remove them from positional parsing).
         positionals: list[str] = []
@@ -23958,6 +24031,11 @@ class PentestShell:
             token = parts[i]
             if token == "--all":
                 include_all = True
+                i += 1
+                continue
+            if token in {"--lowpriv", "--low-priv", "--non-highvalue"}:
+                include_all = False
+                lowpriv = True
                 i += 1
                 continue
             if token in {"--tier0-only", "--tierzero-only", "--tier0"}:
@@ -24010,38 +24088,53 @@ class PentestShell:
                     max_path_steps = None
                 i += 1
                 continue
+            if token == "--no-cache":
+                no_cache = True
+                i += 1
+                continue
             positionals.append(token)
             i += 1
 
-        # Positional args: domain [user|index] [index]
-        # Backwards compatible: if the second positional is numeric, treat it as index.
+        # Positional args after domain: [user|owned|user1 user2 ...] [index]
+        # Rules:
+        #   - Single non-digit, non-"owned" token  → user scope
+        #   - Multiple non-digit tokens            → principals scope (multi-user)
+        #   - "owned" token                        → owned scope
+        #   - Trailing digit token                 → path index
+        start_users: list[str] = []
         if len(positionals) >= 2:
-            second = positionals[1]
-            if second.isdigit():
-                index = int(second)
-            else:
-                start_user = second
-                if len(positionals) >= 3:
-                    third = positionals[2]
-                    if not third.isdigit():
-                        print_instruction(
-                            "Usage: attack_paths <domain> [user|owned] [index] [--max N] [--depth N] "
-                            "[--path-steps N] [--tier0-only] [--all]"
-                        )
-                        return
-                    index = int(third)
+            # Collect all non-digit positionals after domain as user tokens,
+            # then look for an optional trailing numeric index.
+            remaining = positionals[1:]
+            if remaining and remaining[-1].isdigit():
+                index = int(remaining[-1])
+                remaining = remaining[:-1]
+            for token in remaining:
+                if token.isdigit():
+                    # Unexpected second digit — treat as index (legacy compat)
+                    index = int(token)
+                else:
+                    start_users.append(token)
 
+        if len(start_users) == 1:
+            start_user = start_users[0]
+        elif len(start_users) > 1:
+            start_user = None  # principals scope handled via start_users
+
+        attack_target = "lowpriv" if lowpriv else "all" if include_all else "highvalue"
         run_show_attack_paths(
             self,
             domain,
             start_user=start_user,
+            start_users=start_users if len(start_users) > 1 else None,
             index=index,
             max_display=max_display,
             max_depth=max_depth,
             max_path_steps=max_path_steps,
-            include_all=include_all,
+            target=attack_target,
             target_mode=target_mode,
             allow_execution=True,
+            no_cache=no_cache,
         )
 
     def do_attack_steps(self, args):
@@ -24790,6 +24883,17 @@ class PentestShell:
             print_error("Error launching applications.")
             print_exception(show_locals=False, exception=e)
             self.run_command("neo4j stop", timeout=300)
+
+    def _ensure_bloodhound_ce_running(self) -> bool:
+        """Ensure BloodHound CE is running, launching it if needed.
+
+        Reuses the same check-and-launch logic as the collector upload flow
+        so all BH CE callers (upload, attack paths, etc.) behave consistently.
+
+        Returns:
+            True if BloodHound CE is ready, False otherwise.
+        """
+        return launch_bloodhound_ce_suite(None)
 
     def ask_for_ldap_computers(self, target_domain):
         """Delegates LDAP computers prompt to CLI ldap module (backwards-compatible)."""
@@ -28292,6 +28396,7 @@ def _build_check_context(handle_check_fn):
         print_warning=print_warning,
         print_error=print_error,
         print_instruction=print_instruction,
+        print_panel=print_panel,
         print_exception=print_exception,
         confirm_ask=lambda prompt, default: Confirm.ask(prompt, default=default),
         track_docs_link_shown=track_docs_link_shown,

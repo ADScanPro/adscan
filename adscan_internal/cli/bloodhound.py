@@ -35,6 +35,10 @@ from adscan_internal import (
 from adscan_internal.bloodhound_ce_compose import BLOODHOUND_CE_DEFAULT_WEB_PORT
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.rich_output import mark_passthrough, mark_sensitive, print_panel
+from adscan_internal.services.attack_graph_service import (
+    ATTACK_PATHS_MAX_DEPTH_DOMAIN,
+    ATTACK_PATHS_MAX_DEPTH_USER,
+)
 from adscan_internal.workspaces import domain_subpath
 
 
@@ -1668,6 +1672,24 @@ def run_bloodhound_attack_paths(
             )
             return str(name or "").strip()
 
+        # Certipy returns one path per (principal, template) pair so the same
+        # source→relation→target edge can appear in many paths.  Deduplicate here
+        # so each unique edge is processed (and uploaded to BH CE) exactly once.
+        # Notes are built from certipy_templates (independent of path count), so
+        # deduplication by path signature is safe.
+        if str(method_name) == "get_certipy_adcs_paths":
+            _seen_sigs: set[tuple] = set()
+            _deduped: list[dict] = []
+            for _p in raw_paths:
+                _sig = tuple(
+                    _node_display_label(n) if isinstance(n, dict) else str(n)
+                    for n in (_p.get("nodes") or [])
+                ) + tuple(str(r) for r in (_p.get("rels") or []))
+                if _sig not in _seen_sigs:
+                    _seen_sigs.add(_sig)
+                    _deduped.append(_p)
+            raw_paths = _deduped
+
         for entry in raw_paths:
             nodes = entry.get("nodes") or []
             rels = entry.get("rels") or []
@@ -1731,6 +1753,10 @@ def run_bloodhound_attack_paths(
                 notes_by_relation_index=notes_by_relation_index or None,
                 log_creation=False,
                 shell=shell,
+                # Certipy-discovered ADCS paths must always be uploaded to BH CE
+                # even when the relation is a native BH type, because BH CE's own
+                # collector may not have detected the edge in this environment.
+                force_opengraph=str(method_name) == "get_certipy_adcs_paths",
             )
             recorded_steps += int(added_edges or 0)
             if added_edges:
@@ -1946,8 +1972,9 @@ def run_bloodhound_attack_paths(
             shell,
             target_domain,
             start="owned",
-            max_depth=max(10, max_depth),
+            max_depth=max(ATTACK_PATHS_MAX_DEPTH_USER, max_depth),
             max_display=20,
+            target="all",
             target_mode="impact",
         )
     else:
@@ -1967,9 +1994,9 @@ def run_bloodhound_attack_paths(
             shell,
             target_domain,
             scope="domain",
-            max_depth=max(max_depth, 10),
+            max_depth=max(max_depth, ATTACK_PATHS_MAX_DEPTH_DOMAIN),
             max_paths=20,
-            require_high_value_target=True,
+            target="highvalue",
             target_mode="impact",
         )
         if display_paths:
@@ -2045,13 +2072,15 @@ def run_show_attack_paths(
     target_domain: str,
     *,
     start_user: str | None = None,
+    start_users: list[str] | None = None,
     index: int | None = None,
     max_display: int = 10,
-    max_depth: int = 10,
-    include_all: bool = False,
+    max_depth: int = ATTACK_PATHS_MAX_DEPTH_USER,
+    target: str = "highvalue",
     target_mode: str = "impact",
     allow_execution: bool = True,
     max_path_steps: int | None = None,
+    no_cache: bool = False,
 ) -> None:
     """Show attack paths and optionally a detailed path."""
     from adscan_internal.services.attack_graph_service import (
@@ -2157,6 +2186,7 @@ def run_show_attack_paths(
                     max_display=max_display,
                     max_path_steps=max_path_steps,
                     search_mode_label=summary_search_mode_label,
+                    show_sections=show_sections,
                 )
 
     if target_domain not in shell.domains:
@@ -2170,9 +2200,15 @@ def run_show_attack_paths(
     membership_cache_before = get_membership_snapshot_cache_stats()
 
     start_user_norm = (start_user or "").strip().lower()
+    # Two-section display (HV first + pivot section) is active when target="all".
+    show_sections = target == "all"
+    # When show_sections is active the panel header already shows 🎯/⚠ counts,
+    # so the "Mode:" label is redundant — suppress it.
     summary_search_mode_label = (
-        "Pivot Search"
-        if include_all
+        None
+        if show_sections
+        else "Low-Priv Search"
+        if target == "lowpriv"
         else "Tier-0 Search"
         if str(target_mode or "impact").strip().lower() == "tier0"
         else "High-Value Search"
@@ -2197,7 +2233,7 @@ def run_show_attack_paths(
     }
 
     def _sort_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return sorted(
+        sorted_paths = sorted(
             paths,
             key=lambda item: (
                 status_order.get(str(item.get("status") or "").strip().lower(), 3),
@@ -2208,6 +2244,11 @@ def run_show_attack_paths(
                 str(item.get("target", "")).lower(),
             ),
         )
+        if show_sections:
+            return [p for p in sorted_paths if p.get("target_is_high_value")] + [
+                p for p in sorted_paths if not p.get("target_is_high_value")
+            ]
+        return sorted_paths
 
     def _compute_paths() -> list[dict[str, Any]]:
         if start_user_norm == "owned":
@@ -2224,8 +2265,9 @@ def run_show_attack_paths(
                 scope="owned",
                 max_depth=max_depth,
                 max_paths=max_paths_compute,
-                require_high_value_target=not include_all,
+                target=target,
                 target_mode=target_mode,
+                no_cache=no_cache,
             )
             if not owned_paths:
                 marked_domain = mark_sensitive(target_domain, "domain")
@@ -2242,6 +2284,22 @@ def run_show_attack_paths(
                 )
                 return []
             return _sort_paths(owned_paths)
+        if start_users and len(start_users) > 1:
+            principal_paths = get_attack_path_summaries(
+                shell,
+                target_domain,
+                scope="principals",
+                principals=start_users,
+                max_depth=max_depth,
+                max_paths=max_paths_compute,
+                target=target,
+                target_mode=target_mode,
+                no_cache=no_cache,
+            )
+            if not principal_paths:
+                marked_users = ", ".join(mark_sensitive(u, "user") for u in start_users)
+                print_warning(f"No attack paths found for users: {marked_users}.")
+            return _sort_paths(principal_paths)
         if start_user:
             user_paths = get_attack_path_summaries(
                 shell,
@@ -2250,8 +2308,9 @@ def run_show_attack_paths(
                 username=start_user,
                 max_depth=max_depth,
                 max_paths=max_paths_compute,
-                require_high_value_target=not include_all,
+                target=target,
                 target_mode=target_mode,
+                no_cache=no_cache,
             )
             return _sort_paths(user_paths)
         domain_paths = get_attack_path_summaries(
@@ -2260,8 +2319,9 @@ def run_show_attack_paths(
             scope="domain",
             max_depth=max_depth,
             max_paths=max_paths_compute,
-            require_high_value_target=not include_all,
+            target=target,
             target_mode=target_mode,
+            no_cache=no_cache,
         )
         return _sort_paths(domain_paths)
 
@@ -2299,6 +2359,7 @@ def run_show_attack_paths(
         max_display=max_display,
         max_path_steps=max_path_steps,
         search_mode_label=summary_search_mode_label,
+        show_sections=show_sections,
     )
 
     if index is None:

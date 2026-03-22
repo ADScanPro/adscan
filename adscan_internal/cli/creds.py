@@ -503,6 +503,7 @@ def handle_auth_and_optional_privs(
         return "full_scan"
 
     enumeration_action = "skip"
+    full_scan_started = False
     if current_auth_status != "pwned":
         if force_authenticated_enumeration:
             enumeration_action = _choose_authenticated_enumeration_action()
@@ -528,6 +529,7 @@ def handle_auth_and_optional_privs(
                 f"(force={force_authenticated_enumeration!r})"
             )
             shell.do_enum_authenticated(domain)
+            full_scan_started = True
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
             print_warning(f"Failed to start authenticated enumeration: {e}")
@@ -720,8 +722,13 @@ def handle_auth_and_optional_privs(
         )
         return True
 
+    standard_user_privs_covered_by_full_scan = full_scan_started and (
+        enumeration_action == "full_scan"
+    )
     should_offer_standard_user_privs = (
-        prompt_for_user_privs_after and updated_auth_status != "pwned"
+        prompt_for_user_privs_after
+        and updated_auth_status != "pwned"
+        and not standard_user_privs_covered_by_full_scan
     )
     if not should_offer_standard_user_privs:
         if not prompt_for_user_privs_after:
@@ -733,12 +740,22 @@ def handle_auth_and_optional_privs(
             print_info_debug(
                 "[creds] standard ask_for_user_privs disabled because domain is pwned"
             )
+        elif standard_user_privs_covered_by_full_scan:
+            print_info_debug(
+                "[creds] standard ask_for_user_privs disabled because the "
+                "full authenticated scan already includes User Privilege Assessment"
+            )
 
     for user, cred in users_with_creds:
         if not user or (cred is None) or (cred == "" and not allow_empty_credentials):
             continue
         try:
             if _run_terminal_pivot_user_followups(user, cred):
+                continue
+            if is_attack_path_execution_active(shell):
+                print_info_debug(
+                    "[creds] standard ask_for_user_privs disabled during active attack path"
+                )
                 continue
             if not should_offer_standard_user_privs:
                 continue
@@ -803,6 +820,45 @@ def handle_auth_and_optional_privs(
         except Exception as e:  # noqa: BLE001
             telemetry.capture_exception(e)
             print_info_verbose(f"Failed to prompt for user privileges: {e}")
+
+
+def _mark_user_owned_in_bloodhound(shell: Any, domain: str, user: str) -> None:
+    """Mark a verified domain credential holder as owned in BloodHound (best-effort).
+
+    Args:
+        shell: PentestShell instance with ``_get_bloodhound_service`` access.
+        domain: Domain name (e.g. ``"corp.local"``).
+        user: Username (samAccountName or UPN).
+    """
+    service_getter = getattr(shell, "_get_bloodhound_service", None)
+    if not service_getter:
+        return
+    try:
+        bh_service = service_getter()
+    except Exception:
+        return
+    client = getattr(bh_service, "client", None)
+    if client is None or not hasattr(client, "mark_principal_owned"):
+        return
+
+    username_upn = user if "@" in user else f"{user}@{domain}"
+    marked_user = mark_sensitive(user, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+    try:
+        success = client.mark_principal_owned(username_upn, owned=True)
+        if success:
+            print_info_debug(
+                f"[bloodhound] Marked {marked_user}@{marked_domain} as owned in BloodHound."
+            )
+        else:
+            print_info_debug(
+                f"[bloodhound] Could not mark {marked_user}@{marked_domain} as owned "
+                "in BloodHound (principal may not be in the graph yet)."
+            )
+    except Exception as exc:
+        print_info_debug(
+            f"[bloodhound] mark_principal_owned raised for {marked_user}@{marked_domain}: {exc}"
+        )
 
 
 def add_credential(
@@ -1298,6 +1354,16 @@ def add_credential(
             # Track credential count for case study metrics
             if hasattr(shell, "_session_credentials_count"):
                 shell._session_credentials_count += 1
+
+            # Mark the verified user as owned in BloodHound (best-effort, non-blocking).
+            try:
+                _mark_user_owned_in_bloodhound(shell, domain, user)
+            except Exception as _bh_exc:
+                telemetry.capture_exception(_bh_exc)
+                print_info_debug(
+                    f"[add_credential] BH mark-owned failed for "
+                    f"{mark_sensitive(user, 'user')}@{mark_sensitive(domain, 'domain')}: {_bh_exc}"
+                )
 
             try:
                 existing_ticket = store_service.get_kerberos_ticket(

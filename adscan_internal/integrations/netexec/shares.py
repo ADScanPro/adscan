@@ -46,7 +46,14 @@ def list_share_directory(
     print_info_debug(
         f"[netexec] Share list command: {cmd}"
     )
-    proc = shell._run_netexec(cmd, domain=domain, timeout=timeout)
+    proc = shell._run_netexec(
+        cmd,
+        domain=domain,
+        timeout=timeout,
+        operation_kind="share_list",
+        service="smb",
+        target_count=1,
+    )
     output = ""
     if proc:
         output = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -84,7 +91,14 @@ def download_share_files(
             f"--get-file \"{remote_clean}\" \"{local_path}\""
         )
         print_info_debug(f"[netexec] Share download command: {cmd}")
-        proc = shell._run_netexec(cmd, domain=domain, timeout=timeout)
+        proc = shell._run_netexec(
+            cmd,
+            domain=domain,
+            timeout=timeout,
+            operation_kind="share_download",
+            service="smb",
+            target_count=1,
+        )
         if not proc or proc.returncode != 0:
             marked_file = mark_sensitive(remote_clean, "path")
             print_warning(f"Failed to download {marked_file} from share {share}.")

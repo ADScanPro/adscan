@@ -17,6 +17,9 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.integrations.netexec.timeouts import (
+    get_recommended_internal_timeout,
+)
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.workspaces.computers import ensure_enabled_computer_ip_file
 from rich.prompt import Confirm
@@ -199,9 +202,11 @@ def run_service_access_sweep(
             auth_str = shell.build_auth_nxc(username, password, domain, kerberos=False)
             marked_domain = mark_sensitive(domain, "domain")
             marked_username = mark_sensitive(username, "user")
+            netexec_timeout_seconds = get_recommended_internal_timeout(service)
             command = (
                 f"{shlex.quote(shell.netexec_path)} {service} {shlex.quote(targets)} {auth_str} "
-                f"-t 20 --timeout 30 --log domains/{marked_domain}/{service}/{marked_username}_privs.log"
+                f"-t 20 --timeout {netexec_timeout_seconds} "
+                f"--log domains/{marked_domain}/{service}/{marked_username}_privs.log"
             )
 
             print_info(

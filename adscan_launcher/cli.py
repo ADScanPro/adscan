@@ -77,6 +77,8 @@ from adscan_launcher.telemetry import (
 )
 from adscan_launcher.update_manager import (
     UpdateContext,
+    get_local_update_recency_summary,
+    is_dev_update_context,
     offer_updates_for_command,
     run_update_command,
 )
@@ -1176,6 +1178,15 @@ def main(argv: list[str] | None = None) -> None:
         print_info(f"ADscan launcher: v{__version__}")
         img = get_docker_image_name()
         print_info(f"Docker image: {img}")
+        if not is_dev_update_context(image_name=img):
+            recency = get_local_update_recency_summary(str(get_state_dir()))
+            recency_message = str(recency.get("message") or "").strip()
+            if recency_message:
+                if bool(recency.get("is_stale")):
+                    print_warning(recency_message)
+                else:
+                    print_info(recency_message)
+        print_info("Recommended: keep both launcher and runtime current with `adscan update`.")
         raise SystemExit(0)
 
     _guard_supported_host_platform(

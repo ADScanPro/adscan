@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import logging
 import os
 import re
 import time
@@ -18,11 +17,12 @@ from adscan_internal.rich_output import (
     print_info_debug,
     print_info_verbose,
     print_exception,
+    print_attack_paths_summary_debug,
 )
 from adscan_internal.workspaces import domain_subpath, read_json_file, write_json_file
 from adscan_internal.workspaces.computers import load_enabled_computer_samaccounts
 
-from adscan_internal.services import attack_paths_core
+from adscan_internal.services import attack_graph_core, attack_paths_core
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
     classify_relation_support,
@@ -43,15 +43,13 @@ from adscan_internal.services.cache_metrics import (
 
 
 ATTACK_GRAPH_SCHEMA_VERSION = "1.1"
-_ATTACK_GRAPH_MAINTENANCE_VERSION = 1
+_ATTACK_GRAPH_MAINTENANCE_VERSION = 2
 _CONTEXT_RELATIONS_LOWER = {
     str(relation).strip().lower() for relation in CONTEXT_ONLY_RELATIONS.keys()
 }
 
 # Edge classification for CTEM correlation (centralized in attack_step_catalog).
 EXPLOITATION_EDGE_VULN_KEYS: dict[str, str] = get_exploitation_relation_vuln_keys()
-logger = logging.getLogger(__name__)
-
 # Attack-path UX may need different trade-offs than privilege verification flows.
 # We keep it configurable so operators can prefer speed (BloodHound-first) or
 # accuracy (LDAP-first) while exploring paths.
@@ -99,6 +97,60 @@ def _env_float(
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
+
+
+# ---------------------------------------------------------------------------
+# Attack path depth constants — shared by both BH CE and local DFS engines.
+# These values ensure fair comparisons and prevent path explosion in wide scopes.
+#
+#   user / owned / principals  →  ATTACK_PATHS_MAX_DEPTH_USER   (7)
+#   domain                     →  ATTACK_PATHS_MAX_DEPTH_DOMAIN  (6)
+#   --all / --lowpriv target   →  additional -1 reduction (more terminal nodes)
+#
+# Effective depth matrix:
+#   scope=user,      target=highvalue → 7
+#   scope=user,      target=all       → 6
+#   scope=domain,    target=highvalue → 6
+#   scope=domain,    target=all       → 5
+# ---------------------------------------------------------------------------
+ATTACK_PATHS_MAX_DEPTH_USER: int = int(
+    os.getenv("ADSCAN_ATTACK_PATHS_MAX_DEPTH_USER", "7")
+)
+ATTACK_PATHS_MAX_DEPTH_DOMAIN: int = int(
+    os.getenv("ADSCAN_ATTACK_PATHS_MAX_DEPTH_DOMAIN", "6")
+)
+_ATTACK_PATHS_ALL_TARGET_DEPTH_REDUCTION: int = 1
+
+
+def _effective_max_depth(requested: int, *, scope: str, target: str) -> int:
+    """Compute the effective max path depth for a scope + target combination.
+
+    Applies a scope-specific safety cap (domain < user) and an additional
+    −1 reduction for non-highvalue targets (--all / --lowpriv), which produce
+    many more terminal nodes and therefore much larger path sets.
+
+    If the caller explicitly requests a depth below the cap, that is respected.
+    If they request more, the cap is enforced for safety.
+
+    Args:
+        requested: Caller-supplied max_depth (from CLI --depth flag or default).
+        scope: One of "user", "owned", "principals", "domain".
+        target: One of "highvalue", "all", "lowpriv".
+
+    Returns:
+        Effective depth to use (always ≥ 1).
+    """
+    scope_cap = (
+        ATTACK_PATHS_MAX_DEPTH_DOMAIN
+        if str(scope or "").strip().lower() == "domain"
+        else ATTACK_PATHS_MAX_DEPTH_USER
+    )
+    target_reduction = (
+        _ATTACK_PATHS_ALL_TARGET_DEPTH_REDUCTION
+        if str(target or "").strip().lower() in {"all", "lowpriv"}
+        else 0
+    )
+    return max(1, min(requested, scope_cap - target_reduction))
 
 
 _ATTACK_PATHS_CACHE_ENABLED = os.getenv(
@@ -157,6 +209,61 @@ def _get_attack_graph_maintenance_state(graph: dict[str, Any]) -> dict[str, Any]
 def _maintenance_key(version: int) -> str:
     """Return the maintenance marker key for the current code version."""
     return f"v{version}"
+
+
+# In-process set to avoid redundant BH CE legacy sync checks within a session.
+_bh_ce_sync_done_domains: set[str] = set()
+
+
+
+def _ensure_bh_ce_legacy_sync(shell: object, domain: str) -> None:
+    """One-time migration: re-enqueue legacy custom edges to BH CE.
+
+    Runs the first time BH CE is used for a domain per process. Checks
+    ``maintenance.bh_ce_synced`` in ``attack_graph.json`` — if absent,
+    re-enqueues all non-native custom edges so BH CE has a complete picture
+    even for workspaces created before the BH CE opengraph integration.
+
+    New graphs created after this change include ``bh_ce_synced: true`` from
+    the start, so the migration is a no-op for them.
+    """
+    domain_norm = str(domain or "").strip().lower()
+    if domain_norm in _bh_ce_sync_done_domains:
+        return
+    _bh_ce_sync_done_domains.add(domain_norm)
+
+    path = _graph_path(shell, domain)
+    if not os.path.exists(path):
+        return  # No local graph → nothing to migrate
+
+    try:
+        graph = load_attack_graph(shell, domain)
+        maintenance = _get_attack_graph_maintenance_state(graph)
+        if maintenance.get("bh_ce_synced"):
+            return  # Already migrated
+
+        edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+        synced_count = 0
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            from_id = str(edge.get("from") or "")
+            to_id = str(edge.get("to") or "")
+            relation = str(edge.get("relation") or "")
+            if not from_id or not to_id or not relation:
+                continue
+            _record_edge_in_bloodhound_ce(from_id, to_id, relation, edge, graph=graph)
+            synced_count += 1
+
+        maintenance["bh_ce_synced"] = True
+        save_attack_graph(shell, domain, graph)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            f"[bh-ce-sync] legacy sync complete for {marked_domain}: "
+            f"{synced_count} edge(s) enqueued"
+        )
+    except Exception:  # noqa: BLE001
+        pass  # best-effort: never block attack path computation
 
 
 def _load_enabled_users(shell: object, domain: str) -> set[str] | None:
@@ -1496,10 +1603,11 @@ def resolve_group_user_members(
 
     snapshot = _load_membership_snapshot(shell, domain)
     if isinstance(snapshot, dict):
-        group_members, has_users = attack_paths_core.build_group_member_index(
+        group_members, _computers, has_users = attack_paths_core.build_group_member_index(
             snapshot,
             domain,
             exclude_tier0=False,
+            include_computers=False,
         )
         if has_users:
             members_labels = group_members.get(canonical_group, set()) or set()
@@ -1704,7 +1812,7 @@ def _log_attack_path_compute_timing(
     elapsed_seconds: float,
     path_count: int,
     max_depth: int,
-    require_high_value_target: bool,
+    target: str,
     target_mode: str,
 ) -> None:
     """Emit centralized timing metrics for attack-path computations."""
@@ -1712,7 +1820,7 @@ def _log_attack_path_compute_timing(
     print_info_verbose(
         f"[attack_paths] compute scope={scope} domain={marked_domain} "
         f"paths={path_count} max_depth={max_depth} "
-        f"high_value_only={require_high_value_target!r} target_mode={target_mode} "
+        f"target={target!r} target_mode={target_mode} "
         f"elapsed={elapsed_seconds:.2f}s"
     )
     if elapsed_seconds >= 30.0:
@@ -1752,10 +1860,10 @@ def _attack_paths_cache_base_key(
 
 
 def _attack_paths_cache_get(
-    key: tuple[Any, ...], *, domain: str, scope: str
+    key: tuple[Any, ...], *, domain: str, scope: str, no_cache: bool = False
 ) -> list[dict[str, Any]] | None:
     """Return cached attack-path records when available."""
-    if not _ATTACK_PATHS_CACHE_ENABLED:
+    if no_cache or not _ATTACK_PATHS_CACHE_ENABLED:
         return None
     cached = _ATTACK_PATHS_COMPUTE_CACHE.get(key)
     if cached is None:
@@ -1884,11 +1992,12 @@ def _build_group_member_index(
     domain: str,
     *,
     exclude_tier0: bool = False,
-) -> tuple[dict[str, set[str]], bool]:
-    """Build group -> members index (recursive) for users in scope."""
+    include_computers: bool = True,
+) -> tuple[dict[str, set[str]], dict[str, set[str]], bool]:
+    """Build group -> members index (recursive) for users and optionally computers."""
     snapshot = _load_membership_snapshot(shell, domain)
     return attack_paths_core.build_group_member_index(
-        snapshot, domain, exclude_tier0=exclude_tier0
+        snapshot, domain, exclude_tier0=exclude_tier0, include_computers=include_computers
     )
 
 
@@ -1946,8 +2055,8 @@ def _apply_affected_user_metadata(
             if canonical:
                 label_kind_map[canonical] = _node_kind(node)
 
-    group_members, has_users = attack_paths_core.build_group_member_index(
-        snapshot, domain, exclude_tier0=True
+    group_members, _computer_group_members, has_users = attack_paths_core.build_group_member_index(
+        snapshot, domain, exclude_tier0=True, include_computers=False
     )
     broad_group_names = {
         "DOMAIN USERS",
@@ -2009,6 +2118,9 @@ def _apply_affected_user_metadata(
         source_name = scope_name
 
         should_override = (
+            not isinstance(meta.get("affected_principal_count"), int)
+            or int(meta.get("affected_principal_count", 0)) <= 0
+        ) and (
             not isinstance(meta.get("affected_user_count"), int)
             or int(meta.get("affected_user_count", 0)) <= 0
         )
@@ -2298,13 +2410,6 @@ def get_certipy_adcs_paths(
     if not isinstance(templates, dict):
         return []
 
-    domain_node = {
-        "name": domain_key,
-        "kind": ["Domain"],
-        "properties": {"name": domain_key, "domain": domain_key},
-        "isTierZero": True,
-    }
-
     loaded_graph = graph
     if loaded_graph is None:
         try:
@@ -2312,6 +2417,11 @@ def get_certipy_adcs_paths(
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             loaded_graph = None
+    domain_node = resolve_domain_node_record_for_domain(
+        shell,
+        domain_key,
+        graph=loaded_graph,
+    )
 
     def _canonical_principal_label(*, principal_domain: str, name: str) -> str:
         name_clean = str(name or "").strip()
@@ -2361,7 +2471,13 @@ def get_certipy_adcs_paths(
             principals = _extract_certipy_principals(entry)
             if principals:
                 for vuln in vulnerabilities.keys():
-                    relation = f"ADCS{str(vuln).strip().upper()}"
+                    from adscan_internal.services.attack_step_catalog import (
+                        get_bh_canonical_cypher_name,
+                    )
+
+                    relation = get_bh_canonical_cypher_name(
+                        f"ADCS{str(vuln).strip().upper()}"
+                    )
                     for principal in principals:
                         principal_domain, group_name = _normalize_certipy_principal(
                             domain=domain_key, principal=principal
@@ -2642,6 +2758,17 @@ def _canonical_node_label(node: dict[str, Any]) -> str:
             return f"{sam.upper()}@{domain.upper()}"
         if sam:
             return sam
+
+    if kind == "Domain":
+        canonical = _pick(
+            props.get("name"),
+            node.get("name"),
+            node.get("label"),
+            props.get("domain"),
+            node.get("domain"),
+        )
+        if canonical:
+            return canonical.upper()
 
     # Prefer canonical "name" for groups/GPOs/etc, then existing label.
     return (
@@ -3550,6 +3677,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
 
             repaired = False
             normalized = False
+            domain_normalized = False
             kind_normalized = False
             metadata_updated = 0
             reuse_notes_compacted = 0
@@ -3562,6 +3690,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                 # avoidance works as intended.
                 repaired = _repair_duplicate_nodes_by_label(data)
                 normalized = _normalize_user_computer_labels(data)
+                domain_normalized = _normalize_domain_labels(data)
                 snapshot = _load_membership_snapshot(shell, domain)
                 kind_normalized = _normalize_principal_kinds_from_snapshot(
                     data, snapshot
@@ -3574,6 +3703,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                 maintenance_version != maintenance_target
                 or repaired
                 or normalized
+                or domain_normalized
                 or kind_normalized
                 or metadata_updated
                 or reuse_notes_compacted
@@ -3587,6 +3717,8 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                         parts.append("repaired duplicate nodes")
                     if normalized:
                         parts.append("normalized principal labels")
+                    if domain_normalized:
+                        parts.append("normalized domain labels")
                     if kind_normalized:
                         parts.append("normalized principal kinds")
                     if metadata_updated:
@@ -3606,6 +3738,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
             if migrated:
                 _repair_duplicate_nodes_by_label(migrated)
                 _normalize_user_computer_labels(migrated)
+                _normalize_domain_labels(migrated)
                 snapshot = _load_membership_snapshot(shell, domain)
                 _normalize_principal_kinds_from_snapshot(migrated, snapshot)
                 _refresh_attack_graph_edge_metadata(migrated)
@@ -3622,6 +3755,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
         "generated_at": _utc_now_iso(),
         "maintenance": {
             "normalization": _maintenance_key(_ATTACK_GRAPH_MAINTENANCE_VERSION),
+            "bh_ce_synced": True,  # New graphs sync edges in real-time; no migration needed.
         },
         "nodes": {},
         "edges": [],
@@ -4017,6 +4151,7 @@ def upsert_edge(
     status: str = "discovered",
     notes: dict[str, Any] | None = None,
     log_creation: bool = True,
+    force_opengraph: bool = False,
 ) -> dict[str, Any]:
     """Upsert an edge by (from, relation, to)."""
     relation_norm = _normalize_relation(relation)
@@ -4072,7 +4207,8 @@ def upsert_edge(
             edge["category"] = edge_category
             edge["vuln_key"] = edge_vuln_key
             current = str(edge.get("status") or "discovered")
-            if _status_rank(desired_status) > _status_rank(current):
+            status_changed = _status_rank(desired_status) > _status_rank(current)
+            if status_changed:
                 edge["status"] = desired_status
             edge.setdefault("edge_type", edge_type)
             merged_notes: dict[str, Any] = {}
@@ -4090,6 +4226,15 @@ def upsert_edge(
                 merged_notes.update(desired_notes)
             if merged_notes:
                 edge["notes"] = merged_notes
+            # Sync to BH CE when force_opengraph is set (always re-upload) or when
+            # status improved — keeps BH CE state in sync with attack_graph.json.
+            # _record_edge_in_bloodhound_ce skips native BH relations unless
+            # force_opengraph=True, so native edges are not re-created as custom ones.
+            if force_opengraph or status_changed:
+                _record_edge_in_bloodhound_ce(
+                    from_id, to_id, relation_norm, edge,
+                    graph=graph, force_opengraph=force_opengraph,
+                )
             return edge
 
     edge_id_input = f"{from_id}|{relation_norm}|{to_id}|{edge_type}"
@@ -4109,6 +4254,7 @@ def upsert_edge(
         "last_seen": now,
     }
     edges.append(entry)
+    _record_edge_in_bloodhound_ce(from_id, to_id, relation_norm, entry, graph=graph, force_opengraph=force_opengraph)
     if log_creation:
         try:
 
@@ -4157,6 +4303,118 @@ def upsert_edge(
     return entry
 
 
+def _build_opengraph_ref(
+    node_id: str,
+    *,
+    graph: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Build an OpenGraph node match reference from an internal ``name:`` node ID.
+
+    Uses the graph to look up the actual node properties so we can send the
+    most reliable match reference to BH CE:
+
+    1. ``match_by: "id"`` with the SID — most reliable, used when objectId is available.
+    2. ``match_by: "name"`` with full ``NAME@DOMAIN`` uppercase — required by BH CE for
+       name-based matching (e.g. ``"MISSANDEI@ESSOS.LOCAL"``).
+
+    Args:
+        node_id: Internal node ID, e.g. ``"name:administrator"`` or ``"name:S-1-5-21-..."``.
+        graph: Optional attack graph dict; when provided, node properties are used to
+            build a more precise reference.
+
+    Returns:
+        OpenGraph match dict: ``{"match_by": "id"|"name", "value": "..."}``.
+    """
+    value = node_id.removeprefix("name:").strip()
+    if value.upper().startswith("S-1-"):
+        return {"match_by": "id", "value": value.upper()}
+
+    # Resolve via graph when available — critical for user/computer nodes whose
+    # internal id is just samaccountname but BH CE needs NAME@DOMAIN or SID.
+    if graph is not None:
+        nodes_map = graph.get("nodes")
+        if isinstance(nodes_map, dict):
+            node = nodes_map.get(node_id)
+            if isinstance(node, dict):
+                props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+                # Prefer SID (most reliable match in BH CE)
+                object_id = (
+                    node.get("objectId")
+                    or node.get("objectid")
+                    or props.get("objectid")
+                    or props.get("objectId")
+                )
+                if object_id and str(object_id).upper().startswith("S-1-"):
+                    return {"match_by": "id", "value": str(object_id).upper()}
+                # Fall back to full NAME@DOMAIN format
+                full_name = node.get("name") or props.get("name")
+                if full_name and "@" in str(full_name):
+                    return {"match_by": "name", "value": str(full_name).upper()}
+
+    return {"match_by": "name", "value": value.upper()}
+
+
+def _record_edge_in_bloodhound_ce(
+    from_id: str,
+    to_id: str,
+    relation: str,
+    entry: dict[str, Any],
+    *,
+    graph: dict[str, Any] | None = None,
+    force_opengraph: bool = False,
+) -> None:
+    """Record an edge in BloodHound CE so it appears in Cypher path queries.
+
+    Primary mechanism: Cypher MERGE (via ``bh_opengraph_sync``), which is fast and
+    idempotent.  Falls back to the file-upload pipeline if Cypher is unavailable.
+    The internal queue acts as a pre-activation buffer so edges created before BH CE
+    is ready are not lost.
+
+    Silently no-ops when:
+    - The relation is a native BloodHound edge (BH CE's collector already added it)
+      and ``force_opengraph`` is False.
+    - Any error occurs (best-effort, must never raise).
+
+    Args:
+        from_id: Source node ID (``"name:<value>"`` format).
+        to_id: Target node ID (``"name:<value>"`` format).
+        relation: Relation/edge type (e.g. ``"Kerberoasting"``, ``"ADCSESC1"``).
+        entry: The full edge dict just appended/updated in the local graph.
+        graph: Optional attack graph dict used to resolve precise BH CE node refs
+            (objectId / full NAME@DOMAIN).
+        force_opengraph: When True, record in BH CE even if the relation is native.
+            Use for certipy-discovered ADCS paths where BH CE's ingestor may have
+            missed the edge, and for re-syncing existing local edges to BH CE.
+    """
+    try:
+        from adscan_internal.services import bh_opengraph_sync  # local import avoids circular dep
+        from adscan_internal.services.attack_step_catalog import get_bh_native_relations
+
+        # Skip native BH edges — they already exist in the BH graph from collector runs.
+        # Exception: force_opengraph=True bypasses this for certipy-sourced ADCS paths
+        # where BH CE's ingestor may have missed the edge.
+        relation_key = _normalize_relation_key(relation)
+        if not force_opengraph and relation_key in get_bh_native_relations():
+            return
+
+        # Always enqueue — even if the worker isn't running yet. The queue acts as
+        # a pre-activation buffer; edges are drained once setup() is called.
+        og_edge: dict[str, Any] = {
+            "kind": relation,
+            "start": _build_opengraph_ref(from_id, graph=graph),
+            "end": _build_opengraph_ref(to_id, graph=graph),
+            "properties": {
+                "state": entry.get("status", "discovered"),
+                "source": "adscan",
+                "edge_type": entry.get("edge_type", ""),
+                "first_seen": entry.get("first_seen", ""),
+            },
+        }
+        bh_opengraph_sync.enqueue_custom_edge(og_edge)
+    except Exception:  # noqa: BLE001
+        pass  # best-effort: never block graph creation
+
+
 def add_bloodhound_path_edges(
     graph: dict[str, Any],
     *,
@@ -4167,6 +4425,7 @@ def add_bloodhound_path_edges(
     notes_by_relation_index: dict[int, dict[str, Any]] | None = None,
     log_creation: bool = True,
     shell: object | None = None,
+    force_opengraph: bool = False,
 ) -> int:
     """Add edges for a BloodHound-derived path (nodes + relations).
 
@@ -4200,6 +4459,7 @@ def add_bloodhound_path_edges(
             status=status,
             notes=notes_by_relation_index.get(idx) if notes_by_relation_index else None,
             log_creation=log_creation,
+            force_opengraph=force_opengraph,
         )
         if edge:
             created += 1
@@ -4312,7 +4572,7 @@ def compute_maximal_attack_paths(
     graph: dict[str, Any],
     *,
     max_depth: int,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     terminal_mode: str = "tier0",
 ) -> list[AttackPath]:
     """Compute maximal paths up to depth.
@@ -4374,7 +4634,7 @@ def compute_maximal_attack_paths(
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
-        if require_high_value_target and not is_terminal(acc_steps[-1].to_id):
+        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
             return
         signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
         if signature in seen_signatures:
@@ -4849,10 +5109,6 @@ def ensure_entry_node_for_domain(
             print_info_debug(
                 f"[domain_users] resolver failed for {marked_domain}; falling back to synthetic: {exc}"
             )
-            logger.exception(
-                "Failed to resolve Domain Users group from BloodHound; falling back to synthetic",
-                extra={"domain": domain},
-            )
 
     special_entry = _resolve_special_principal_entry(shell, domain, graph, label_clean)
     if special_entry:
@@ -4987,16 +5243,137 @@ def ensure_domain_node_for_domain(
     domain: str,
     graph: dict[str, Any],
 ) -> str:
-    """Ensure a domain node exists, preferring BloodHound-backed nodes when possible.
+    """Ensure a canonical Domain node exists for one domain."""
+    node_record = resolve_domain_node_record_for_domain(
+        shell, domain, graph=graph
+    )
+    upsert_nodes(graph, [node_record])
+    return _node_id(node_record)
 
-    We use a dedicated Domain node so takeover steps can end at a canonical
-    destination (the domain object) rather than an arbitrary Tier0 host.
+
+def _normalize_domain_fqdn(value: str | None) -> str:
+    """Return a stable uppercase FQDN representation for one domain-like value."""
+    return str(value or "").strip().rstrip(".").upper()
+
+
+def _canonicalize_domain_node_record(
+    node_record: dict[str, Any],
+    *,
+    domain: str,
+) -> dict[str, Any]:
+    """Return a normalized Domain node record with canonical casing."""
+    canonical_domain = _normalize_domain_fqdn(domain)
+    record = copy.deepcopy(node_record) if isinstance(node_record, dict) else {}
+    props = (
+        record.get("properties") if isinstance(record.get("properties"), dict) else {}
+    )
+    props = dict(props)
+
+    label = _canonical_node_label(
+        {
+            **record,
+            "kind": ["Domain"],
+            "properties": props,
+        }
+    )
+    canonical_label = _normalize_domain_fqdn(label or canonical_domain)
+
+    record["name"] = canonical_label
+    record["kind"] = ["Domain"]
+    record["isTierZero"] = True
+    record["label"] = canonical_label
+    props["name"] = canonical_label
+    props["domain"] = canonical_domain or canonical_label
+    record["properties"] = props
+    return record
+
+
+def _select_existing_domain_node_record(
+    graph: dict[str, Any] | None,
+    *,
+    domain: str,
+) -> dict[str, Any] | None:
+    """Return the best matching persisted Domain node for one domain, if present."""
+    if not isinstance(graph, dict):
+        return None
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    if not isinstance(nodes_map, dict):
+        return None
+
+    normalized_domain = str(domain or "").strip().rstrip(".").lower()
+    if not normalized_domain:
+        return None
+
+    def _matches(node: dict[str, Any]) -> bool:
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        )
+        for raw in (
+            node.get("label"),
+            node.get("name"),
+            props.get("name"),
+            props.get("domain"),
+        ):
+            candidate = str(raw or "").strip().rstrip(".").lower()
+            if candidate == normalized_domain:
+                return True
+        return False
+
+    def _score(node: dict[str, Any]) -> tuple[int, int, int]:
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        )
+        return (
+            1 if str(node.get("objectId") or node.get("objectid") or "").strip() else 0,
+            1 if bool(props) else 0,
+            1 if bool(node.get("isTierZero") or props.get("isTierZero")) else 0,
+        )
+
+    matches: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+    for node in nodes_map.values():
+        if not isinstance(node, dict):
+            continue
+        if _node_kind(node) != "Domain":
+            continue
+        if not _matches(node):
+            continue
+        matches.append((_score(node), node))
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return _canonicalize_domain_node_record(matches[0][1], domain=domain)
+
+
+def resolve_domain_node_record_for_domain(
+    shell: object,
+    domain: str,
+    *,
+    graph: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve the canonical Domain node record, preferring graph/BH over synthetic.
+
+    Resolution order:
+    1. Existing persisted Domain node in the provided graph.
+    2. BloodHound domain-node resolver.
+    3. Synthetic fallback.
     """
     domain_clean = (domain or "").strip()
     if not domain_clean:
-        # Fall back to a stable placeholder.
-        return ensure_entry_node(graph, label="Domain")
+        return {
+            "name": "DOMAIN",
+            "kind": ["Domain"],
+            "label": "DOMAIN",
+            "properties": {"name": "DOMAIN", "domain": "DOMAIN"},
+            "isTierZero": True,
+        }
 
+    existing = _select_existing_domain_node_record(graph, domain=domain_clean)
+    if existing:
+        return existing
+
+    marked_domain = mark_sensitive(domain_clean, "domain")
     try:
         if hasattr(shell, "_get_bloodhound_service"):
             service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
@@ -5005,58 +5382,52 @@ def ensure_domain_node_for_domain(
                 if isinstance(node_props, dict) and (
                     node_props.get("name") or node_props.get("objectid")
                 ):
-                    # Mark as high value to ensure default path filtering includes it.
-                    node_record = {
-                        "name": str(node_props.get("name") or domain_clean),
-                        "kind": ["Domain"],
-                        "objectId": node_props.get("objectid")
-                        or node_props.get("objectId"),
-                        "properties": node_props,
-                        "isTierZero": True,
-                    }
-                    upsert_nodes(graph, [node_record])
-                    marked_domain = mark_sensitive(domain_clean, "domain")
+                    node_record = _canonicalize_domain_node_record(
+                        {
+                            "name": str(node_props.get("name") or domain_clean),
+                            "kind": ["Domain"],
+                            "objectId": node_props.get("objectid")
+                            or node_props.get("objectId"),
+                            "properties": node_props,
+                            "isTierZero": True,
+                        },
+                        domain=domain_clean,
+                    )
                     marked_label = mark_sensitive(
-                        str(node_record.get("name") or ""), "domain"
+                        str(node_record.get("label") or ""), "domain"
                     )
                     print_info_debug(
                         f"[domain_node] resolved from BloodHound for {marked_domain}: label={marked_label}"
                     )
-                    return _node_id(node_record)
-            marked_domain = mark_sensitive(domain_clean, "domain")
+                    return node_record
             print_info_debug(
                 f"[domain_node] BloodHound service missing resolver for {marked_domain}; "
                 "falling back to synthetic"
             )
         else:
-            marked_domain = mark_sensitive(domain_clean, "domain")
             print_info_debug(
                 f"[domain_node] shell has no BloodHound service accessor for {marked_domain}; "
                 "falling back to synthetic"
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        marked_domain = mark_sensitive(domain_clean, "domain")
         print_info_debug(
             f"[domain_node] resolver failed for {marked_domain}; falling back to synthetic: {exc}"
         )
-        logger.exception(
-            "Failed to resolve domain node from BloodHound; falling back to synthetic",
-            extra={"domain": domain_clean},
-        )
 
-    # Fallback: create a synthetic Domain node (still marked high value).
-    node_record = {
-        "name": domain_clean,
-        "kind": ["Domain"],
-        "properties": {"name": domain_clean, "domain": domain_clean},
-        "isTierZero": True,
-    }
+    node_record = _canonicalize_domain_node_record(
+        {
+            "name": domain_clean,
+            "kind": ["Domain"],
+            "properties": {"name": domain_clean, "domain": domain_clean},
+            "isTierZero": True,
+        },
+        domain=domain_clean,
+    )
     _mark_synthetic_node_record(
         node_record, domain=domain_clean, source="fallback_domain_node"
     )
-    upsert_nodes(graph, [node_record])
-    return _node_id(node_record)
+    return node_record
 
 
 def resolve_netexec_target_for_node_label(
@@ -6521,7 +6892,7 @@ def upsert_password_spray_entry_edge(
     status: str = "success",
     entry_label: str = "Domain Users",
 ) -> bool:
-    """Upsert a password spraying entry-vector edge: Entry -> PasswordSpray -> username.
+    """Upsert a spraying entry-vector edge: Entry -> spray relation -> principal.
 
     This records provenance in `attack_graph.json` so attack paths can be
     constructed dynamically from compromised users.
@@ -6543,8 +6914,25 @@ def upsert_password_spray_entry_edge(
     if not user_clean:
         return False
 
+    spray_category_clean = str(spray_category or "").strip().lower()
+    spray_type_clean = str(spray_type or "").strip().lower()
+
+    relation = "PasswordSpray"
+    if spray_category_clean == "computer_pre2k" or spray_type_clean == "computer pre2k":
+        relation = "ComputerPre2k"
+    elif spray_category_clean in {"useraspass", "useraspass_lower", "useraspass_upper"}:
+        relation = "UserAsPass"
+    elif spray_category_clean == "blank_password" or spray_type_clean == "blank password":
+        relation = "BlankPassword"
+
     graph = load_attack_graph(shell, domain)
-    entry_id = ensure_entry_node_for_domain(shell, domain, graph, label=entry_label)
+    effective_entry_label = "Domain Users" if relation == "ComputerPre2k" else entry_label
+    entry_id = ensure_entry_node_for_domain(
+        shell,
+        domain,
+        graph,
+        label=effective_entry_label or "Domain Users",
+    )
     spray_kind_hint = None
     if str(spray_type or "").strip().lower() == "computer pre2k":
         spray_kind_hint = "computer"
@@ -6569,7 +6957,7 @@ def upsert_password_spray_entry_edge(
         graph,
         from_id=entry_id,
         to_id=user_id,
-        relation="PasswordSpray",
+        relation=relation,
         edge_type="entry_vector",
         status=status,
         notes=notes,
@@ -6663,7 +7051,8 @@ def update_roast_entry_edge_status(
             continue
 
         current = str(edge.get("status") or "discovered")
-        if _status_rank(status) > _status_rank(current):
+        status_changed = _status_rank(status) > _status_rank(current)
+        if status_changed:
             edge["status"] = status
         edge["last_seen"] = now
 
@@ -6680,6 +7069,8 @@ def update_roast_entry_edge_status(
         notes["attempts"] = attempts
         edge["notes"] = notes
         save_attack_graph(shell, domain, graph)
+        if status_changed:
+            _record_edge_in_bloodhound_ce(entry_id, principal_id, relation, edge, graph=graph)
         return True
 
     notes: dict[str, Any] = {}
@@ -6711,8 +7102,8 @@ def has_attack_paths_for_user(shell: object, domain: str, username: str) -> bool
             shell,
             domain,
             username=username,
-            max_depth=10,
-            require_high_value_target=True,
+            max_depth=ATTACK_PATHS_MAX_DEPTH_USER,
+            target="highvalue",
         )
     )
 
@@ -7009,6 +7400,47 @@ def _normalize_user_computer_labels(graph: dict[str, Any]) -> bool:
     return changed
 
 
+def _normalize_domain_labels(graph: dict[str, Any]) -> bool:
+    """Ensure Domain nodes use a canonical uppercase FQDN label."""
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    if not isinstance(nodes_map, dict):
+        return False
+
+    graph_domain = str(graph.get("domain") or "").strip().upper()
+    changed = False
+    for node in nodes_map.values():
+        if not isinstance(node, dict):
+            continue
+        if _node_kind(node) != "Domain":
+            continue
+
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        )
+        canonical = _canonical_node_label(node)
+        if not canonical and graph_domain:
+            canonical = graph_domain
+        if not canonical:
+            continue
+
+        if str(node.get("label") or "").strip() != canonical:
+            node["label"] = canonical
+            changed = True
+
+        if str(props.get("name") or "").strip() != canonical:
+            props["name"] = canonical
+            changed = True
+
+        if graph_domain and str(props.get("domain") or "").strip() != graph_domain:
+            props["domain"] = graph_domain
+            changed = True
+
+        if node.get("properties") is not props:
+            node["properties"] = props
+
+    return changed
+
+
 def _normalize_principal_kinds_from_snapshot(
     graph: dict[str, Any], snapshot: dict[str, Any] | None
 ) -> bool:
@@ -7072,7 +7504,7 @@ def compute_maximal_attack_paths_from_start(
     *,
     start_node_id: str,
     max_depth: int,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     terminal_mode: str = "tier0",
 ) -> list[AttackPath]:
     """Compute maximal paths starting from a specific node."""
@@ -7110,7 +7542,7 @@ def compute_maximal_attack_paths_from_start(
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
-        if require_high_value_target and not is_terminal(acc_steps[-1].to_id):
+        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
             return
         signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
         if signature in seen_signatures:
@@ -7307,6 +7739,384 @@ def _stitch_principal_memberships_for_runtime_paths(
     return snapshot_injected, runtime_injected
 
 
+def _build_snapshot_label_to_node(
+    snapshot: dict[str, Any] | None,
+    base_graph: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build a {label: node_dict} index for HV lookups.
+
+    Sources (merged, base_graph wins on conflict):
+      1. Membership snapshot nodes  — users and groups with HV properties.
+      2. Attack graph nodes         — domain nodes and other targets that the DFS
+         uses as terminals; these carry the ``highvalue``/``isTierZero``/
+         ``system_tags`` properties that ``_node_is_effectively_high_value`` checks.
+
+    The snapshot alone is insufficient because it only contains user/group
+    membership data and never includes domain-level nodes (e.g. ``ESSOS.LOCAL``).
+    Without the attack graph, domain terminals are always tagged as pivot.
+    """
+    result: dict[str, dict[str, Any]] = {}
+
+    # Layer 1: snapshot nodes (users/groups).
+    if snapshot:
+        snap_nodes = snapshot.get("nodes")
+        if isinstance(snap_nodes, dict):
+            for node in snap_nodes.values():
+                if isinstance(node, dict):
+                    label = str(node.get("label") or "").strip()
+                    if label:
+                        result[label] = node
+
+    # Layer 2: attack graph nodes (domains, computers, CAs, etc.) — override snapshot.
+    if base_graph:
+        ag_nodes = base_graph.get("nodes")
+        if isinstance(ag_nodes, dict):
+            for node in ag_nodes.values():
+                if isinstance(node, dict):
+                    label = str(node.get("label") or "").strip()
+                    if label:
+                        result[label] = node
+
+    return result
+
+
+def _trim_trailing_memberof_edges(
+    rec: dict[str, Any],
+    *,
+    label_to_node: dict[str, Any],
+    except_hv: bool,
+) -> dict[str, Any] | None:
+    """Strip trailing MemberOf-to-non-HV edges from a path record.
+
+    Recursively removes trailing (MemberOf, Group) pairs until the last relation
+    is not MemberOf, the terminal node is HV (when except_hv=True, matching BH CE
+    behaviour where HV terminals are kept), or the path becomes degenerate (< 2 nodes).
+
+    Args:
+        rec: Path record dict with ``nodes`` and ``relations``/``rels`` keys.
+        label_to_node: Label-to-node index built from snapshot + attack graph.
+        except_hv: When True, stop trimming as soon as the terminal node is HV
+            (mirrors BH CE ``target="all"`` semantics).
+
+    Returns:
+        Trimmed copy of *rec* with updated ``nodes``, ``relations``/``rels``, and
+        ``target`` fields, or ``None`` if the path has fewer than 2 nodes after
+        trimming (degenerate — discard).
+    """
+    nodes = list(rec.get("nodes") or [])
+    rel_key = "relations" if "relations" in rec else "rels"
+    rels = list(rec.get(rel_key) or [])
+
+    while rels:
+        last_rel = str(rels[-1]).strip().lower()
+        if last_rel != "memberof":
+            break
+        if except_hv:
+            tgt_label = str(nodes[-1]) if nodes else ""
+            tgt_node = label_to_node.get(tgt_label) or {}
+            if attack_graph_core._node_is_effectively_high_value(tgt_node):  # noqa: SLF001
+                break  # HV terminal — stop trimming, keep as-is
+        # Remove the last node and last relation.
+        nodes = nodes[:-1]
+        rels = rels[:-1]
+
+    if len(nodes) < 2:
+        return None
+
+    trimmed = dict(rec)
+    trimmed["nodes"] = nodes
+    trimmed[rel_key] = rels
+    trimmed["target"] = nodes[-1]
+    return trimmed
+
+
+def _record_terminal_is_hv(
+    rec: dict[str, Any],
+    label_to_node: dict[str, Any],
+) -> bool:
+    """Return True when *rec*'s terminal node is high-value / tier-0.
+
+    Consults the same ``_node_is_effectively_high_value`` predicate used by the
+    HV-tag stage (stage 7 in the local pipeline, stage 6 in the BH pipeline) so
+    that the containment filter and any UX ordering logic use identical criteria.
+
+    Args:
+        rec: Display path record with a ``target`` field.
+        label_to_node: Label-to-node index (snapshot + attack graph nodes).
+
+    Returns:
+        True if the target node is effectively high-value; False otherwise or
+        when the target cannot be resolved.
+    """
+    tgt_node = label_to_node.get(str(rec.get("target") or "")) or {}
+    return attack_graph_core._node_is_effectively_high_value(tgt_node)  # noqa: SLF001
+
+
+def _apply_local_postprocessing_pipeline(
+    records: list[dict[str, Any]],
+    *,
+    shell: object,
+    domain: str,
+    scope: str,
+    target: str,
+    snapshot: dict[str, Any] | None,
+    principal_count: int = 1,
+    owned_labels: frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Apply the shared post-processing pipeline to local DFS results.
+
+    Mirrors the BH CE pipeline so both engines produce equivalent output and
+    emit identical step-by-step debug logging for fair performance comparison.
+
+    Pipeline stages (mirror of _compute_bh_attack_paths):
+        1.  Debug log raw output
+        2.  terminal-MemberOf filter + trim (target=all/lowpriv; mirrors BH CE Cypher filter)
+        2b. owned-terminal filter — after trim (terminals may change), before minimize
+        3.  minimize_display_paths (redundant_memberof, repeated_labels)
+        4.  Safety-net dedup (exact key)
+        5.  apply_affected_user_metadata
+        6.  filter_contained_paths (HV-aware keep_shortest or keep_longest by scope)
+        7.  target_is_high_value tagging via snapshot nodes
+
+    Stage ordering rationale: BH CE applies the non-terminal MemberOf filter at the Cypher
+    level (before any Python post-processing). In local we mirror this by running it as the
+    first Python stage — before minimize — so redundant_memberof cannot strip a trailing
+    MemberOf edge and hide paths that should have been filtered.
+    """
+    _is_multi = principal_count > 1
+
+    # Build label-to-node index once — reused by stage 2 (terminal MemberOf) and stage 7 (HV tag).
+    # Must include attack graph nodes (domains, computers, CAs) because the membership snapshot
+    # only carries user/group data; domain terminals like ESSOS.LOCAL are only in the attack graph.
+    _base_graph = load_attack_graph(shell, domain)
+    _label_to_node = _build_snapshot_label_to_node(snapshot, base_graph=_base_graph)
+
+    # Log scope / rule matrix (mirrors BH CE pipeline header).
+    _apply_leading = scope == "domain" or (scope in {"owned", "principals"} and _is_multi)
+    _minimize_rules = "redundant_memberof + repeated_labels" + (
+        " + leading_memberof" if _apply_leading else ""
+    )
+    if scope == "domain":
+        _scope_filter = "filter_contained_paths[keep_longest]"
+    elif scope in {"owned", "principals"} and _is_multi:
+        _scope_filter = "filter_contained_paths[keep_shortest]"
+    else:
+        _scope_filter = "none (single principal)"
+    print_info_debug(
+        f"[local-pipeline] scope={scope!r} principal_count={principal_count} → "
+        f"minimize: [{_minimize_rules}] | scope-filter: [{_scope_filter}] | "
+        f"dedup: [exact key safety-net, all scopes]"
+    )
+    print_attack_paths_summary_debug(domain, records, stage_label="1/6 · raw local-dfs")
+
+    # Stage 2: Non-terminal MemberOf filter — mirrors BH CE _build_non_terminal_memberof_filter.
+    #   Runs BEFORE minimize so redundant_memberof cannot strip a trailing MemberOf and hide
+    #   paths that should be filtered.
+    #   target="highvalue": skip — terminal is already constrained to HV by DFS, filter N/A.
+    #   target="all":       filter paths ending in MemberOf UNLESS terminal node is HV/tier-0.
+    #   target="lowpriv":   filter all paths ending in MemberOf (no exceptions).
+    # Rationale: a path ending KERBEROAST → USER → MemberOf → NIGHT WATCH adds no attack value;
+    # MemberOf is a property of the compromised principal, not an actionable next step.
+    if target in {"all", "lowpriv"}:
+        _except_hv_terminal = target == "all"
+        _terminal_mo_trimmed = 0
+        _terminal_mo_discarded = 0
+        _terminal_mo_kept: list[dict[str, Any]] = []
+        for rec in records:
+            rels = rec.get("relations") or rec.get("rels") or []
+            last_rel = str(rels[-1] if rels else "").strip().lower()
+            if last_rel != "memberof":
+                _terminal_mo_kept.append(rec)
+                continue
+            # Path ends in MemberOf. If HV terminal and except_hv=True, keep as-is.
+            if _except_hv_terminal:
+                tgt_label = str(rec.get("target") or "")
+                tgt_node = _label_to_node.get(tgt_label) or {}
+                if attack_graph_core._node_is_effectively_high_value(tgt_node):  # noqa: SLF001
+                    _terminal_mo_kept.append(rec)
+                    continue
+            # Trim trailing MemberOf→non-HV edges instead of discarding the path.
+            # BH CE naturally produces paths ending at the pre-MemberOf node (e.g. a
+            # Computer) because its Cypher WHERE clause filters paths whose last edge
+            # is MemberOf to a non-HV group.  Local DFS generates the extended path;
+            # we mirror BH CE by stripping those trailing edges.
+            trimmed = _trim_trailing_memberof_edges(
+                rec,
+                label_to_node=_label_to_node,
+                except_hv=_except_hv_terminal,
+            )
+            if trimmed is None:
+                _terminal_mo_discarded += 1
+                print_info_debug(
+                    f"[local-pipeline]   terminal-memberof discarded (degenerate after trim): "
+                    f"{' → '.join(rec.get('nodes') or [])}"
+                )
+            else:
+                _terminal_mo_trimmed += 1
+                _terminal_mo_kept.append(trimmed)
+                print_info_debug(
+                    f"[local-pipeline]   terminal-memberof trimmed: "
+                    f"{' → '.join(rec.get('nodes') or [])} "
+                    f"→→ {' → '.join(trimmed.get('nodes') or [])}"
+                )
+        if _terminal_mo_trimmed or _terminal_mo_discarded:
+            print_info_debug(
+                f"[local-pipeline] terminal-memberof [{target!r}, except_hv={_except_hv_terminal}]: "
+                f"trimmed {_terminal_mo_trimmed}, discarded {_terminal_mo_discarded} "
+                f"→ {len(_terminal_mo_kept)} remain"
+            )
+        records = _terminal_mo_kept
+    print_attack_paths_summary_debug(
+        domain, records, stage_label=f"2/6 · after terminal-memberof filter [{target!r}]"
+    )
+
+    # Stage 2b: Owned-terminal filter.
+    # Placed here — after the terminal-MemberOf trim (which can change the final
+    # node of a path) but BEFORE minimize (expensive O(n²) operation).  Removing
+    # useless paths early reduces the work for all subsequent stages.
+    #
+    # Discards paths whose terminal node is already an owned/compromised principal.
+    # A path ending at an owned node has zero exploitation value — the operator
+    # already controls that node.  Paths that pass *through* an owned intermediate
+    # are handled by the containment filter (stage 6): the shorter path from that
+    # owned node is kept and the longer super-path dropped.
+    # Only active for owned/principals multi-principal scopes.
+    if owned_labels and _is_multi:
+        _owned_removed = 0
+        _owned_kept: list[dict[str, Any]] = []
+        for rec in records:
+            term = _normalize_account(str(rec.get("target") or ""))
+            if term in owned_labels:
+                _owned_removed += 1
+                print_info_debug(
+                    f"[local-pipeline]   owned-terminal removed: "
+                    f"{' → '.join(rec.get('nodes') or [])}"
+                )
+            else:
+                _owned_kept.append(rec)
+        if _owned_removed:
+            print_info_debug(
+                f"[local-pipeline] owned-terminal filter: removed {_owned_removed} path(s) "
+                f"ending at owned principal(s) → {len(_owned_kept)} remain"
+            )
+        records = _owned_kept
+
+    # Stage 3: minimize_display_paths.
+    n_before_min = len(records)
+    records = attack_paths_core.minimize_display_paths(
+        records,
+        domain=domain,
+        snapshot=snapshot,
+        scope=scope,
+        principal_count=principal_count,
+    )
+    n_minimized = sum(1 for r in records if r.get("meta", {}).get("minimized"))
+    if n_minimized or n_before_min != len(records):
+        print_info_debug(
+            f"[local-pipeline] minimize: {n_before_min} → {len(records)}, "
+            f"{n_minimized} record(s) modified"
+        )
+    print_attack_paths_summary_debug(
+        domain, records,
+        stage_label=f"3/6 · after minimize (scope={scope}, {n_minimized} record(s) modified)",
+    )
+
+    # Stage 4: Safety-net dedup.
+    seen: set[tuple[Any, ...]] = set()
+    deduped: list[dict[str, Any]] = []
+    n_dedup_removed = 0
+    for rec in records:
+        key = attack_graph_core.display_record_signature(rec)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(rec)
+        else:
+            n_dedup_removed += 1
+            print_info_debug(
+                f"[local-pipeline]   dedup removed: {' → '.join(rec.get('nodes') or [])}"
+            )
+    if n_dedup_removed:
+        print_info_debug(
+            f"[local-pipeline] dedup: removed {n_dedup_removed} duplicate(s) → {len(deduped)} remain"
+        )
+    records = deduped
+    print_attack_paths_summary_debug(
+        domain, records,
+        stage_label=f"4/6 · after dedup [{scope}] ({n_dedup_removed} removed)",
+    )
+
+    # Stage 5: affected-user metadata (shell-aware, no BH CE graph required).
+    records = _apply_affected_user_metadata(shell, domain, records)
+    print_attack_paths_summary_debug(
+        domain, records, stage_label=f"5/6 · after annotate_affected_users [{scope}]"
+    )
+
+    # Stage 6: Containment filter.
+    #
+    # domain scope: always keep_longest (holistic view — full chain is more
+    #   informative than sub-paths).
+    # owned/principals multi-principal: HV-aware keep_shortest regardless of
+    #   target mode.  Rationale: owned principals are already compromised; the
+    # domain scope  : keep_longest — holistic view, reduce noise.
+    # non-domain     : unified HV-aware keep_shortest + Pass-2 prefix removal.
+    #   • Pass 1 (keep_shortest + HV priority): keep shorter path to same terminal;
+    #     HV-terminal paths beat non-HV regardless of length (Case 2 + HV priority).
+    #   • Pass 2: drop strict prefixes — if a shorter path is a prefix of a longer
+    #     kept path (same source, different terminal) it is removed.  HV-terminal
+    #     paths are never dropped even if they happen to be a prefix of a longer
+    #     non-HV path (Case 1).
+    #   Applies uniformly to all non-domain scopes (user, owned, principals) and
+    #   all target modes (--all, --highvalue, --lowpriv).
+    if scope not in {"domain"}:
+        _is_hv = lambda rec: _record_terminal_is_hv(rec, _label_to_node)  # noqa: E731
+        result, n_contained = attack_graph_core.filter_contained_paths_for_domain_listing(
+            records, keep_shortest=True, is_hv_terminal=_is_hv, preserve_prefix_paths=True
+        )
+        if n_contained:
+            print_info_debug(
+                f"[local-pipeline] contained filter [hv-aware, {scope}]: "
+                f"removed {n_contained} path(s) → {len(result)} remain"
+            )
+        records = result
+        print_attack_paths_summary_debug(
+            domain, records,
+            stage_label=(
+                f"6/6 · after contained filter [hv-aware, {scope}] ({n_contained} removed)"
+            ),
+        )
+    else:
+        result, n_contained = attack_graph_core.filter_contained_paths_for_domain_listing(
+            records, keep_shortest=False
+        )
+        if n_contained:
+            print_info_debug(
+                f"[local-pipeline] contained filter [keep_longest, domain]: "
+                f"removed {n_contained} sub-path(s) → {len(result)} remain"
+            )
+        records = result
+        print_attack_paths_summary_debug(
+            domain, records,
+            stage_label=(
+                f"6/6 · after contained filter [keep_longest, domain] ({n_contained} removed)"
+            ),
+        )
+
+    # Stage 7: HV tagging using snapshot node data (mirrors BH CE graph-based tagging).
+    _hv_count = 0
+    for rec in records:
+        tgt_node = _label_to_node.get(str(rec.get("target") or "")) or {}
+        is_hv = attack_graph_core._node_is_effectively_high_value(tgt_node)  # noqa: SLF001
+        rec["target_is_high_value"] = is_hv
+        if is_hv:
+            _hv_count += 1
+    print_info_debug(
+        f"[local-pipeline] hv-tag: {_hv_count} high-value, {len(records) - _hv_count} pivot"
+    )
+    print_info_debug(f"[local-pipeline] final: {len(records)} attack path(s) after all post-processing")
+
+    return records
+
+
 def compute_display_paths_for_user(
     shell: object,
     domain: str,
@@ -7314,8 +8124,9 @@ def compute_display_paths_for_user(
     username: str,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     target_mode: str = "tier0",
+    no_cache: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal dynamic paths from a specific user node.
 
@@ -7334,6 +8145,10 @@ def compute_display_paths_for_user(
              because our DFS only returns simple paths (no repeated nodes).
     """
     started_at = time.monotonic()
+    effective_depth = _effective_max_depth(max_depth, scope="user", target=target)
+    print_info_debug(
+        f"[local-pipeline] effective_depth={effective_depth} (requested={max_depth} scope='user' target={target!r})"
+    )
     user_norm = str(username or "").strip().lower()
     cache_key = _attack_paths_cache_base_key(
         shell,
@@ -7341,14 +8156,14 @@ def compute_display_paths_for_user(
         scope="user",
         params=(
             user_norm,
-            int(max_depth),
+            int(effective_depth),
             max_paths,
-            bool(require_high_value_target),
+            target,
             str(target_mode or "tier0").strip().lower(),
             bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
         ),
     )
-    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="user")
+    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="user", no_cache=no_cache)
     if cached is not None:
         cached = _filter_zero_length_display_paths(cached, domain=domain, scope="user")
         cached = _apply_affected_user_metadata(shell, domain, cached)
@@ -7357,8 +8172,8 @@ def compute_display_paths_for_user(
             scope="user",
             elapsed_seconds=max(0.0, time.monotonic() - started_at),
             path_count=len(cached),
-            max_depth=max_depth,
-            require_high_value_target=require_high_value_target,
+            max_depth=effective_depth,
+            target=target,
             target_mode=target_mode,
         )
         return cached
@@ -7413,29 +8228,47 @@ def compute_display_paths_for_user(
             principal_node_ids=candidate_to_ids,
             skip_tier0_principals=True,
         )
+    _dfs_t0 = time.monotonic()
     records = _sort_display_paths(
         attack_paths_core.compute_display_paths_for_start_node(
             runtime_graph,
             domain=domain,
             snapshot=snapshot,
             start_node_id=start_node_id,
-            max_depth=max_depth,
+            max_depth=effective_depth,
             max_paths=max_paths,
-            require_high_value_target=require_high_value_target,
+            target=target,
             target_mode=target_mode,
             expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
             filter_shortest_paths=False,
         )
     )
+    _dfs_elapsed = time.monotonic() - _dfs_t0
+    print_info_debug(
+        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=user)"
+    )
     records = _filter_zero_length_display_paths(records, domain=domain, scope="user")
-    records = _apply_affected_user_metadata(shell, domain, records)
+    records = _apply_local_postprocessing_pipeline(
+        records,
+        shell=shell,
+        domain=domain,
+        scope="user",
+        target=target,
+        snapshot=snapshot,
+        principal_count=1,
+    )
+    _total_elapsed = max(0.0, time.monotonic() - started_at)
+    print_info_debug(
+        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
+        f" | total={_total_elapsed:.3f}s ({len(records)} paths, scope=user)"
+    )
     _log_attack_path_compute_timing(
         domain=domain,
         scope="user",
-        elapsed_seconds=max(0.0, time.monotonic() - started_at),
+        elapsed_seconds=_total_elapsed,
         path_count=len(records),
-        max_depth=max_depth,
-        require_high_value_target=require_high_value_target,
+        max_depth=effective_depth,
+        target=target,
         target_mode=target_mode,
     )
     _attack_paths_cache_put(cache_key, records, domain=domain, scope="user")
@@ -7448,34 +8281,39 @@ def compute_display_paths_for_domain(
     *,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     target_mode: str = "tier0",
+    no_cache: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain with optional high-value promotion.
 
     This is the backend used by `attack_paths <domain>` when no explicit start
     user (or "owned") is provided.
 
-    When `require_high_value_target=True`, we still compute all maximal paths,
+    When `target="highvalue"`, we still compute all maximal paths,
     then *promote* paths whose terminal node is not high value but is a member
     (recursively) of an effectively high-value group. The promotion appends a
     context-only `MemberOf` step so the operator can understand why the path is
     surfaced.
     """
     started_at = time.monotonic()
+    effective_depth = _effective_max_depth(max_depth, scope="domain", target=target)
+    print_info_debug(
+        f"[local-pipeline] effective_depth={effective_depth} (requested={max_depth} scope='domain' target={target!r})"
+    )
     cache_key = _attack_paths_cache_base_key(
         shell,
         domain,
         scope="domain",
         params=(
-            int(max_depth),
+            int(effective_depth),
             max_paths,
-            bool(require_high_value_target),
+            target,
             str(target_mode or "tier0").strip().lower(),
             bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
         ),
     )
-    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="domain")
+    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="domain", no_cache=no_cache)
     if cached is not None:
         cached = _filter_zero_length_display_paths(
             cached, domain=domain, scope="domain"
@@ -7486,8 +8324,8 @@ def compute_display_paths_for_domain(
             scope="domain",
             elapsed_seconds=max(0.0, time.monotonic() - started_at),
             path_count=len(cached),
-            max_depth=max_depth,
-            require_high_value_target=require_high_value_target,
+            max_depth=effective_depth,
+            target=target,
             target_mode=target_mode,
         )
         return cached
@@ -7522,27 +8360,45 @@ def compute_display_paths_for_domain(
                 principal_node_ids=candidate_to_ids,
                 skip_tier0_principals=True,
             )
+    _dfs_t0 = time.monotonic()
     records = _sort_display_paths(
         attack_paths_core.compute_display_paths_for_domain(
             runtime_graph,
             domain=domain,
             snapshot=snapshot,
-            max_depth=max_depth,
+            max_depth=effective_depth,
             max_paths=max_paths,
-            require_high_value_target=require_high_value_target,
+            target=target,
             target_mode=target_mode,
             expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
         )
     )
+    _dfs_elapsed = time.monotonic() - _dfs_t0
+    print_info_debug(
+        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=domain)"
+    )
     records = _filter_zero_length_display_paths(records, domain=domain, scope="domain")
-    records = _apply_affected_user_metadata(shell, domain, records)
+    records = _apply_local_postprocessing_pipeline(
+        records,
+        shell=shell,
+        domain=domain,
+        scope="domain",
+        target=target,
+        snapshot=snapshot,
+        principal_count=2,  # domain scope is always treated as multi-principal
+    )
+    _total_elapsed = max(0.0, time.monotonic() - started_at)
+    print_info_debug(
+        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
+        f" | total={_total_elapsed:.3f}s ({len(records)} paths, scope=domain)"
+    )
     _log_attack_path_compute_timing(
         domain=domain,
         scope="domain",
-        elapsed_seconds=max(0.0, time.monotonic() - started_at),
+        elapsed_seconds=_total_elapsed,
         path_count=len(records),
-        max_depth=max_depth,
-        require_high_value_target=require_high_value_target,
+        max_depth=effective_depth,
+        target=target,
         target_mode=target_mode,
     )
     _attack_paths_cache_put(cache_key, records, domain=domain, scope="domain")
@@ -7705,8 +8561,9 @@ def compute_display_paths_for_owned_users(
     *,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     target_mode: str = "tier0",
+    no_cache: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal dynamic paths for all owned users in a domain.
 
@@ -7716,7 +8573,7 @@ def compute_display_paths_for_owned_users(
         shell: Shell instance holding `domains_data` and BloodHound service access.
         domain: Domain name.
         max_depth: Max depth for path search.
-        require_high_value_target: When True, only include paths whose terminal node
+        target: When "highvalue", only include paths whose terminal node
             is high value (Tier Zero / highvalue / admin_tier_0).
 
     Returns:
@@ -7731,9 +8588,432 @@ def compute_display_paths_for_owned_users(
         principals=owned,
         max_depth=max_depth,
         max_paths=max_paths,
-        require_high_value_target=require_high_value_target,
+        target=target,
         target_mode=target_mode,
+        no_cache=no_cache,
     )
+
+
+def _sync_bh_owned_principals(
+    shell: object, domain: str, owned_usernames: list[str]
+) -> None:
+    """Sync BloodHound ``owned`` node state with the authoritative domains_data list.
+
+    Ensures every principal in *owned_usernames* is marked ``owned=true`` in BH,
+    and that any BH-owned principal absent from the list is unmarked.  The
+    ``domains_data`` credentials dict is always the source of truth.
+    """
+    service_getter = getattr(shell, "_get_bloodhound_service", None)
+    if not service_getter:
+        return
+    try:
+        bh_service = service_getter()
+    except Exception:
+        return
+    client = getattr(bh_service, "client", None)
+    if client is None or not hasattr(client, "sync_owned_principals"):
+        return
+    try:
+        print_info_debug(
+            f"[bh-engine] Owned sync input for {mark_sensitive(domain, 'domain')}: "
+            f"{owned_usernames!r}"
+)
+        marked, unmarked = client.sync_owned_principals(domain, owned_usernames)
+        if marked or unmarked:
+            print_info_debug(
+                f"[bh-engine] Owned sync for {mark_sensitive(domain, 'domain')}: "
+                f"+{marked} marked, -{unmarked} unmarked."
+            )
+        else:
+            print_info_debug(
+                f"[bh-engine] Owned sync for {mark_sensitive(domain, 'domain')}: already in sync."
+            )
+    except Exception as exc:
+        print_info_debug(
+            f"[bh-engine] Owned sync failed for {mark_sensitive(domain, 'domain')}: {exc}"
+        )
+
+
+def _is_bh_available(shell: object) -> bool:
+    """Return True when a connected BloodHound CE client is reachable.
+
+    If BH CE is configured but not running, attempts to launch it first by
+    reusing the same check-and-launch logic as the collector upload flow
+    (``shell._ensure_bloodhound_ce_running``).
+    """
+    service_getter = getattr(shell, "_get_bloodhound_service", None)
+    if not service_getter:
+        return False
+
+    # First pass: check if already connected.
+    try:
+        service = service_getter()
+        client = getattr(service, "client", None)
+        if client is not None and hasattr(client, "get_attack_paths_for_user"):
+            return True
+    except Exception:
+        pass
+
+    # Not connected — try to ensure BH CE is running (reuses launch logic).
+    ensure_fn = getattr(shell, "_ensure_bloodhound_ce_running", None)
+    if not ensure_fn:
+        return False
+    try:
+        if not ensure_fn():
+            return False
+        service = service_getter()
+        client = getattr(service, "client", None)
+        return client is not None and hasattr(client, "get_attack_paths_for_user")
+    except Exception:
+        return False
+
+
+def _ask_or_get_attack_path_engine(shell: object) -> str:
+    """Return the attack-path engine to use.
+
+    In production (non-dev) always returns ``"local"`` — local DFS is faster
+    and has no dependency on BH CE data being present for the domain.
+    In development mode (``ADSCAN_SESSION_ENV=dev``) shows an interactive
+    questionary selector so engineers can compare BH CE vs local DFS output,
+    defaulting to local.
+
+    Returns:
+        ``"bloodhound"`` or ``"local"``.
+    """
+    # In production (non-dev) always use local DFS — faster and no BH data dependency.
+    # BH CE engine is only available in dev mode via the interactive selector.
+    is_dev = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
+    if not is_dev:
+        return "local"
+
+    if not _is_bh_available(shell):
+        return "local"
+
+    if not hasattr(shell, "_questionary_select"):
+        return "local"
+
+    options = [
+        "BloodHound CE  (Cypher graph queries)",
+        "Local  (attack_graph.json)",
+    ]
+    try:
+        idx = shell._questionary_select(  # type: ignore[attr-defined]
+            "Select attack path engine:",
+            options,
+            default_idx=1,
+        )
+    except Exception:  # noqa: BLE001
+        return "local"
+
+    return "bloodhound" if idx == 0 else "local"
+
+
+def _compute_bh_attack_paths(
+    shell: object,
+    domain: str,
+    *,
+    scope: str,
+    username: str | None = None,
+    principals: list[str] | None = None,
+    max_depth: int,
+    max_paths: int | None = None,
+    target: str = "highvalue",
+) -> list[dict[str, Any]] | None:
+    """Compute attack paths using the BloodHound Cypher engine.
+
+    Returns a list of display records on success, or None when the BH client
+    is unavailable so callers can fall through to the local Python engine.
+    """
+    service_getter = getattr(shell, "_get_bloodhound_service", None)
+    if not service_getter:
+        return None
+    try:
+        bh_service = service_getter()
+    except Exception:
+        return None
+    client = getattr(bh_service, "client", None)
+    if client is None or not hasattr(client, "get_attack_paths_for_user"):
+        return None
+
+    # Ensure the OpenGraph sync worker is initialised with this service, then
+    # flush any pending custom edges before querying so paths are up-to-date.
+    # Uses the same BloodHoundService.start_upload_job pipeline as collector ZIPs.
+    try:
+        from adscan_internal.services import bh_opengraph_sync
+
+        bh_opengraph_sync.setup(lambda: bh_service)
+        pending = bh_opengraph_sync.pending_count()
+        if pending > 0:
+            print_info_debug(
+                f"[bh_opengraph_sync] flushing {pending} pending custom edge(s) before attack path query..."
+            )
+            flushed = bh_opengraph_sync.wait_until_flushed(timeout=30.0)
+            s = bh_opengraph_sync.stats()
+            print_info_debug(
+                f"[bh_opengraph_sync] flush complete: flushed={flushed} "
+                f"uploaded={s['total_uploaded']} failed={s['total_failed']}"
+            )
+    except Exception:  # noqa: BLE001
+        pass  # never block attack path computation
+
+    # One-time legacy migration: re-enqueue any custom edges from attack_graph.json
+    # that predate the BH CE opengraph integration. No-op for new workspaces or
+    # already-migrated ones (flag checked in attack_graph.json maintenance section).
+    _ensure_bh_ce_legacy_sync(shell, domain)
+
+    _bh_t0 = time.perf_counter()
+    try:
+        scope_norm = str(scope or "domain").strip().lower()
+        effective_depth = _effective_max_depth(max_depth, scope=scope_norm, target=target)
+        print_info_debug(
+            f"[bh-pipeline] effective_depth={effective_depth} "
+            f"(requested={max_depth} scope={scope_norm!r} target={target!r})"
+        )
+        _query_t0 = time.perf_counter()
+        if scope_norm == "user":
+            if not str(username or "").strip():
+                return []
+            bh_paths = client.get_attack_paths_for_user(
+                domain,
+                str(username).strip(),
+                max_depth=effective_depth,
+                max_paths=max_paths,
+                target=target,
+            )
+        elif scope_norm == "owned":
+            owned = get_owned_domain_usernames_for_attack_paths(shell, domain)
+            if not owned:
+                return []
+            principals = owned  # unify owned list into principals for downstream filters
+            # Sync BH owned state — domains_data is the source of truth.
+            _sync_bh_owned_principals(shell, domain, owned)
+            bh_paths = client.get_attack_paths_from_owned(
+                domain,
+                owned,
+                max_depth=effective_depth,
+                max_paths=max_paths,
+                target=target,
+            )
+        elif scope_norm == "principals":
+            if not principals:
+                return []
+            # Sync BH owned state — caller-supplied principals are the source of truth.
+            _sync_bh_owned_principals(shell, domain, principals)
+            bh_paths = client.get_attack_paths_from_owned(
+                domain,
+                principals,
+                max_depth=effective_depth,
+                max_paths=max_paths,
+                target=target,
+            )
+        else:
+            # "domain" scope — single query, target filter controlled by flag.
+            bh_paths = client.get_low_priv_paths_to_high_value(
+                domain,
+                max_depth=effective_depth,
+                max_paths=max_paths,
+                target=target,
+            )
+        _query_elapsed = time.perf_counter() - _query_t0
+
+        if not bh_paths:
+            print_info_debug(
+                f"[engine=bh-ce] query={_query_elapsed:.3f}s | post=0.000s | total={time.perf_counter() - _bh_t0:.3f}s"
+                f" (0 paths, scope={scope_norm})"
+            )
+            return []
+
+        # Compute the number of distinct source principals for this query — used
+        # to decide whether multi-user rules (leading_memberof, filter_contained
+        # shortest) should be activated for owned/principals scopes.
+        if scope_norm == "user":
+            _principal_count = 1
+        elif scope_norm == "owned":
+            _principal_count = len(owned)
+        elif scope_norm == "principals":
+            _principal_count = len(principals)
+        else:
+            _principal_count = 0  # domain: not applicable, rules always active
+
+        _is_multi = _principal_count > 1 or scope_norm == "domain"
+
+        print_info_debug(f"[bh-pipeline] BH returned {len(bh_paths)} raw path(s)")
+
+        display_records, graph = client._bh_paths_to_display_records(
+            bh_paths, domain=domain, max_paths=max_paths
+        )
+        print_info_debug(f"[bh-pipeline] after conversion: {len(display_records)} display record(s)")
+        # Build label-to-node index early — used by both stage 5 (containment
+        # filter HV-awareness) and stage 6 (HV tagging).
+        _label_to_node: dict[str, dict] = {
+            v.get("label", k): v for k, v in (graph.get("nodes") or {}).items()
+        }
+        # Log the full rule matrix for this scope so debug output is self-explanatory.
+        _apply_leading = scope_norm == "domain" or (
+            scope_norm in {"owned", "principals"} and _is_multi
+        )
+        _minimize_rules = "redundant_memberof + repeated_labels" + (
+            " + leading_memberof" if _apply_leading else ""
+        )
+        if scope_norm == "domain":
+            _scope_filter = "filter_contained_paths[keep_longest]"
+        elif scope_norm in {"owned", "principals"} and _is_multi:
+            _scope_filter = "filter_contained_paths[keep_shortest]"
+        else:
+            _scope_filter = "none (single user)"
+        print_info_debug(
+            f"[bh-pipeline] scope={scope_norm!r} principal_count={_principal_count} → "
+            f"minimize: [{_minimize_rules}] | scope-filter: [{_scope_filter}] | "
+            f"dedup: [exact key safety-net, all scopes]"
+        )
+        # Cyclic paths are filtered at the Cypher level via _build_acyclic_path_filter:
+        # ALL(n IN nodes(p) WHERE single(m IN nodes(p) WHERE id(m) = id(n)))
+        # single() avoids the nested list comprehension scoping issue that caused
+        # "Variable `x` not defined" with the original predicate on Neo4j 4.4.
+        print_attack_paths_summary_debug(domain, display_records, stage_label="1/5 · raw BH (acyclic filter in Cypher)")
+
+        # Stage 1b: Owned-terminal filter.
+        # BH CE has no terminal-MemberOf trim stage (handled in Cypher WHERE), so
+        # terminals are already final.  Filter here — before minimize — to reduce
+        # work for all subsequent stages.
+        if scope_norm in {"owned", "principals"} and _is_multi and principals:
+            _bh_owned_labels = frozenset(_normalize_account(p) for p in principals)
+            _bh_owned_removed = 0
+            _bh_owned_kept: list[dict[str, Any]] = []
+            for rec in display_records:
+                term = _normalize_account(str(rec.get("target") or ""))
+                if term in _bh_owned_labels:
+                    _bh_owned_removed += 1
+                    print_info_debug(
+                        f"[bh-pipeline]   owned-terminal removed: "
+                        f"{' → '.join(rec.get('nodes') or [])}"
+                    )
+                else:
+                    _bh_owned_kept.append(rec)
+            if _bh_owned_removed:
+                print_info_debug(
+                    f"[bh-pipeline] owned-terminal filter: removed {_bh_owned_removed} path(s) "
+                    f"ending at owned principal(s) → {len(_bh_owned_kept)} remain"
+                )
+            display_records = _bh_owned_kept
+
+        snapshot = _load_membership_snapshot(shell, domain)
+
+        # minimize_display_paths applies scope-aware rules to clean up display paths:
+        #   domain              → redundant_memberof + repeated_labels + leading_memberof
+        #   owned/principals >1 → redundant_memberof + repeated_labels + leading_memberof
+        #   owned/principals =1 → redundant_memberof + repeated_labels (starting principal matters)
+        #   user                → redundant_memberof + repeated_labels (starting user matters)
+        n_before_min = len(display_records)
+        display_records = attack_paths_core.minimize_display_paths(
+            display_records,
+            domain=domain,
+            snapshot=snapshot,
+            scope=scope_norm,
+            principal_count=_principal_count,
+        )
+        n_minimized = sum(1 for r in display_records if r.get("meta", {}).get("minimized"))
+        if n_minimized or n_before_min != len(display_records):
+            print_info_debug(
+                f"[bh-pipeline] minimize: {n_before_min} → {len(display_records)}, {n_minimized} record(s) modified"
+            )
+        print_attack_paths_summary_debug(
+            domain, display_records,
+            stage_label=f"2/5 · after minimize (scope={scope_norm}, {n_minimized} record(s) modified)"
+        )
+
+        # Safety-net dedup: minimize_display_paths may still collapse distinct
+        # paths to the same display key (e.g. different MemberOf prefixes that
+        # both resolve to the same group). O(n), keeps first occurrence.
+        seen: set[tuple] = set()
+        deduped: list[dict[str, Any]] = []
+        n_dedup_removed = 0
+        for rec in display_records:
+            key = attack_graph_core.display_record_signature(rec)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(rec)
+            else:
+                n_dedup_removed += 1
+                print_info_debug(
+                    f"[bh-pipeline]   dedup removed: {' → '.join(rec.get('nodes') or [])}"
+                )
+        if n_dedup_removed:
+            print_info_debug(f"[bh-pipeline] dedup: removed {n_dedup_removed} duplicate(s) → {len(deduped)} remain")
+        print_attack_paths_summary_debug(
+            domain, deduped,
+            stage_label=f"3/5 · after dedup [{scope_norm}] ({n_dedup_removed} removed)"
+        )
+
+        annotated = attack_paths_core.apply_affected_user_metadata(
+            deduped,
+            graph=graph,
+            domain=domain,
+            snapshot=snapshot,
+            filter_empty=True,
+        )
+        print_attack_paths_summary_debug(domain, annotated, stage_label=f"4/5 · after annotate_affected_users [{scope_norm}]")
+
+        # Apply scope-specific path-reduction rules.
+        #
+        # domain scope  : keep_longest — holistic view, reduce noise.
+        # non-domain     : unified HV-aware keep_shortest + Pass-2 prefix removal
+        #   (same logic as local pipeline — see comments there).
+        #   Applies to all non-domain scopes and all target modes.
+        if scope_norm not in {"domain"}:
+            _is_hv = lambda rec: _record_terminal_is_hv(rec, _label_to_node)  # noqa: E731
+            result, n_contained = attack_graph_core.filter_contained_paths_for_domain_listing(
+                annotated, keep_shortest=True, is_hv_terminal=_is_hv, preserve_prefix_paths=True
+            )
+            if n_contained:
+                print_info_debug(
+                    f"[bh-pipeline] contained filter [hv-aware, {scope_norm}]: removed {n_contained} path(s) → {len(result)} remain"
+                )
+            else:
+                result = annotated
+            print_attack_paths_summary_debug(
+                domain, result,
+                stage_label=f"5/5 · after contained filter [hv-aware, {scope_norm}] ({n_contained if n_contained else 0} removed)"
+            )
+        else:
+            result, n_contained = attack_graph_core.filter_contained_paths_for_domain_listing(
+                annotated, keep_shortest=False
+            )
+            if n_contained:
+                print_info_debug(
+                    f"[bh-pipeline] contained filter [keep_longest, domain]: removed {n_contained} sub-path(s) → {len(result)} remain"
+                )
+            else:
+                result = annotated
+            print_attack_paths_summary_debug(
+                domain, result,
+                stage_label=f"5/5 · after contained filter [keep_longest, domain] ({n_contained if n_contained else 0} removed)"
+            )
+
+        print_info_debug(f"[bh-pipeline] final: {len(result)} attack path(s) after all post-processing")
+
+        # HV tagging — _label_to_node already built above.
+        _hv_count = 0
+        for rec in result:
+            tgt_node = _label_to_node.get(str(rec.get("target") or "")) or {}
+            is_hv = attack_graph_core._node_is_effectively_high_value(tgt_node)  # noqa: SLF001
+            rec["target_is_high_value"] = is_hv
+            if is_hv:
+                _hv_count += 1
+        print_info_debug(
+            f"[bh-pipeline] hv-tag: {_hv_count} high-value, {len(result) - _hv_count} pivot"
+        )
+
+        _bh_elapsed = time.perf_counter() - _bh_t0
+        _post_elapsed = _bh_elapsed - _query_elapsed
+        print_info_debug(
+            f"[engine=bh-ce] query={_query_elapsed:.3f}s | post={_post_elapsed:.3f}s | total={_bh_elapsed:.3f}s"
+            f" ({len(result)} paths, scope={scope_norm})"
+        )
+        return result
+    except Exception as exc:
+        print_info_debug(f"[bh-engine] attack path query failed: {exc}")
+        return None
 
 
 def get_attack_path_summaries(
@@ -7745,9 +9025,10 @@ def get_attack_path_summaries(
     principals: list[str] | None = None,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     target_mode: str = "tier0",
     membership_sample_max: int = 3,
+    no_cache: bool = False,
 ) -> list[dict[str, Any]]:
     """Return user-facing attack-path summaries through the shell-aware layer.
 
@@ -7755,39 +9036,66 @@ def get_attack_path_summaries(
     It guarantees that all shell-aware post-processing is applied consistently:
     filtering, affected-user metadata, cache handling, and future UX-oriented
     enrichments.
+
+    When BloodHound CE is available, prompts the user interactively to choose
+    between the BloodHound Cypher engine and the local Python DFS engine.
+    The choice is cached on the shell for the duration of the session.
     """
     scope_norm = str(scope or "domain").strip().lower()
+
+    # BH CE is the primary engine. In dev mode an interactive selector is shown
+    # so engineers can compare both engines. Fall back silently to local DFS when
+    # BH CE is unavailable or the query fails.
+    if _ask_or_get_attack_path_engine(shell) == "bloodhound":
+        bh_result = _compute_bh_attack_paths(
+            shell,
+            domain,
+            scope=scope_norm,
+            username=username,
+            principals=list(principals or []),
+            max_depth=max_depth,
+            max_paths=max_paths,
+            target=target,
+        )
+        if bh_result is not None:
+            return bh_result
+
+    _local_t0 = time.perf_counter()
+    local_result: list[dict[str, Any]]
     if scope_norm == "domain":
-        return compute_display_paths_for_domain(
+        local_result = compute_display_paths_for_domain(
             shell,
             domain,
             max_depth=max_depth,
             max_paths=max_paths,
-            require_high_value_target=require_high_value_target,
+            target=target,
             target_mode=target_mode,
+            no_cache=no_cache,
         )
-    if scope_norm == "user":
+    elif scope_norm == "user":
         if not str(username or "").strip():
             return []
-        return compute_display_paths_for_user(
+        local_result = compute_display_paths_for_user(
             shell,
             domain,
             username=str(username or "").strip(),
             max_depth=max_depth,
             max_paths=max_paths,
-            require_high_value_target=require_high_value_target,
+            target=target,
             target_mode=target_mode,
+            no_cache=no_cache,
         )
-    if scope_norm == "owned":
-        return compute_display_paths_for_owned_users(
+    elif scope_norm == "owned":
+        local_result = compute_display_paths_for_owned_users(
             shell,
             domain,
             max_depth=max_depth,
             max_paths=max_paths,
-            require_high_value_target=require_high_value_target,
+            target=target,
             target_mode=target_mode,
+            no_cache=no_cache,
         )
-    if scope_norm == "principals":
+    elif scope_norm == "principals":
         normalized_principals = [
             str(principal or "").strip()
             for principal in (principals or [])
@@ -7795,17 +9103,21 @@ def get_attack_path_summaries(
         ]
         if not normalized_principals:
             return []
-        return compute_display_paths_for_principals(
+        local_result = compute_display_paths_for_principals(
             shell,
             domain,
             principals=normalized_principals,
             max_depth=max_depth,
             max_paths=max_paths,
-            require_high_value_target=require_high_value_target,
+            target=target,
             membership_sample_max=membership_sample_max,
             target_mode=target_mode,
+            no_cache=no_cache,
         )
-    raise ValueError(f"Unsupported attack path summary scope: {scope!r}")
+    else:
+        raise ValueError(f"Unsupported attack path summary scope: {scope!r}")
+    print_info_debug(f"[engine=local-dfs] {len(local_result)} path(s) in {time.perf_counter() - _local_t0:.2f}s")
+    return local_result
 
 
 def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
@@ -7902,9 +9214,10 @@ def compute_display_paths_for_principals(
     principals: list[str],
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     membership_sample_max: int = 3,
     target_mode: str = "tier0",
+    no_cache: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal dynamic paths for a list of user principals.
 
@@ -7912,6 +9225,10 @@ def compute_display_paths_for_principals(
     identical membership-originating path per owned user.
     """
     started_at = time.monotonic()
+    effective_depth = _effective_max_depth(max_depth, scope="principals", target=target)
+    print_info_debug(
+        f"[local-pipeline] effective_depth={effective_depth} (requested={max_depth} scope='principals' target={target!r})"
+    )
     normalized_principals = [str(p or "").strip().lower() for p in principals]
     normalized_principals = [p for p in normalized_principals if p]
     if not normalized_principals:
@@ -7920,8 +9237,8 @@ def compute_display_paths_for_principals(
             scope="principals",
             elapsed_seconds=max(0.0, time.monotonic() - started_at),
             path_count=0,
-            max_depth=max_depth,
-            require_high_value_target=require_high_value_target,
+            max_depth=effective_depth,
+            target=target,
             target_mode=target_mode,
         )
         return []
@@ -7934,14 +9251,14 @@ def compute_display_paths_for_principals(
         scope="principals",
         params=(
             principals_key,
-            int(max_depth),
+            int(effective_depth),
             max_paths,
-            bool(require_high_value_target),
+            target,
             int(membership_sample_max),
             str(target_mode or "tier0").strip().lower(),
         ),
     )
-    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="principals")
+    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="principals", no_cache=no_cache)
     if cached is not None:
         cached = _filter_zero_length_display_paths(
             cached, domain=domain, scope="principals"
@@ -7952,8 +9269,8 @@ def compute_display_paths_for_principals(
             scope="principals",
             elapsed_seconds=max(0.0, time.monotonic() - started_at),
             path_count=len(cached),
-            max_depth=max_depth,
-            require_high_value_target=require_high_value_target,
+            max_depth=effective_depth,
+            target=target,
             target_mode=target_mode,
         )
         return cached
@@ -8054,31 +9371,50 @@ def compute_display_paths_for_principals(
         snapshot=snapshot,
         scope="principals",
     )
+    _dfs_t0 = time.monotonic()
     records = _sort_display_paths(
         attack_paths_core.compute_display_paths_for_principals(
             runtime_graph,
             domain=domain,
             snapshot=snapshot,
             principals=unique_principals,
-            max_depth=max_depth,
+            max_depth=effective_depth,
             max_paths=max_paths,
-            require_high_value_target=require_high_value_target,
+            target=target,
             membership_sample_max=membership_sample_max,
             target_mode=target_mode,
             filter_shortest_paths=False,
         )
     )
+    _dfs_elapsed = time.monotonic() - _dfs_t0
+    print_info_debug(
+        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=principals)"
+    )
     records = _filter_zero_length_display_paths(
         records, domain=domain, scope="principals"
     )
-    records = _apply_affected_user_metadata(shell, domain, records)
+    records = _apply_local_postprocessing_pipeline(
+        records,
+        shell=shell,
+        domain=domain,
+        scope="principals",
+        target=target,
+        snapshot=snapshot,
+        principal_count=len(unique_principals),
+        owned_labels=frozenset(_normalize_account(p) for p in unique_principals),
+    )
+    _total_elapsed = max(0.0, time.monotonic() - started_at)
+    print_info_debug(
+        f"[engine=local-dfs] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
+        f" | total={_total_elapsed:.3f}s ({len(records)} paths, scope=principals)"
+    )
     _log_attack_path_compute_timing(
         domain=domain,
         scope="principals",
-        elapsed_seconds=max(0.0, time.monotonic() - started_at),
+        elapsed_seconds=_total_elapsed,
         path_count=len(records),
-        max_depth=max_depth,
-        require_high_value_target=require_high_value_target,
+        max_depth=effective_depth,
+        target=target,
         target_mode=target_mode,
     )
     _attack_paths_cache_put(cache_key, records, domain=domain, scope="principals")
@@ -8118,7 +9454,7 @@ def compute_attack_path_metrics(
         paths = compute_maximal_attack_paths(
             graph,
             max_depth=max_depth,
-            require_high_value_target=True,
+            target="highvalue",
             terminal_mode="tier0",
         )
 

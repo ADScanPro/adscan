@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from adscan_internal.services.attack_step_support_registry import (
@@ -45,6 +46,27 @@ class AttackPath:
     @property
     def length(self) -> int:
         return len(self.steps)
+
+
+def display_record_signature(record: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return a case-insensitive deduplication signature for one display record.
+
+    Attack-path records can occasionally differ only by label casing when
+    multiple data sources persist semantically identical nodes (for example a
+    BloodHound-backed `ESSOS.LOCAL` domain node and a synthetic `essos.local`
+    node). The UI should treat those paths as the same path.
+
+    Args:
+        record: Display record produced by ``path_to_display_record``.
+
+    Returns:
+        Tuple ``(nodes, relations)`` normalized for case-insensitive matching.
+    """
+    nodes = tuple(str(node or "").strip().lower() for node in (record.get("nodes") or []))
+    relations = tuple(
+        str(relation or "").strip().lower() for relation in (record.get("relations") or [])
+    )
+    return nodes, relations
 
 
 def load_attack_graph(path: Path) -> dict[str, Any] | None:
@@ -134,7 +156,7 @@ def compute_display_paths_for_domain_unfiltered(
     *,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     target_mode: str = "tier0",
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain (graph-only, unfiltered).
@@ -151,7 +173,7 @@ def compute_display_paths_for_domain_unfiltered(
         max_depth=max_depth,
         max_paths=max_paths,
         # Always compute all paths and apply filtering/promotion after.
-        require_high_value_target=False,
+        target="all",
         terminal_mode=mode,
     )
 
@@ -160,7 +182,7 @@ def compute_display_paths_for_domain_unfiltered(
 
     for path in computed:
         candidate = path
-        if require_high_value_target:
+        if target == "highvalue":
             target_is_hv = _path_target_is_high_value(graph, path.target_id, mode=mode)
             if not target_is_hv:
                 promoted = _try_promote_target_via_membership_edges(
@@ -171,13 +193,19 @@ def compute_display_paths_for_domain_unfiltered(
                     target_is_hv = True
             if not target_is_hv:
                 continue
+        elif target == "lowpriv":
+            if _path_target_is_high_value(graph, path.target_id, mode=mode):
+                continue
 
         record = path_to_display_record(graph, candidate)
+        record["target_is_high_value"] = _path_target_is_high_value(
+            graph, candidate.target_id, mode=mode
+        )
         nodes = record.get("nodes")
         rels = record.get("relations")
         if not isinstance(nodes, list) or not isinstance(rels, list):
             continue
-        key = (tuple(str(n) for n in nodes), tuple(str(r) for r in rels))
+        key = display_record_signature(record)
         if key in seen:
             continue
         seen.add(key)
@@ -188,8 +216,37 @@ def compute_display_paths_for_domain_unfiltered(
 
 def filter_contained_paths_for_domain_listing(
     records: list[dict[str, Any]],
+    *,
+    keep_shortest: bool = False,
+    is_hv_terminal: Callable[[dict[str, Any]], bool] | None = None,
+    preserve_prefix_paths: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Remove paths that are fully contained within another longer path."""
+    """Remove paths that are fully contained within another path.
+
+    Args:
+        records: Display path records to filter.
+        keep_shortest: When False (default / domain scope), keep the longest
+            path and remove shorter ones that are strict contiguous sub-paths of
+            it — giving the most holistic attack chain view.  When True
+            (owned / principals multi-user scope), keep the shortest path and
+            remove longer paths that contain it — giving the most direct route
+            to exploitation from already-compromised principals.
+        is_hv_terminal: Optional callable returning True when a record's
+            terminal node is high-value / tier-0.  Only used with
+            ``keep_shortest=True``.  When provided the sort key becomes
+            ``(not is_hv_terminal(rec), length)`` so that HV-terminal paths are
+            processed before non-HV paths of the same or greater length.  This
+            prevents a shorter non-HV path from shadowing a longer HV path:
+            e.g.  ``A→B`` (non-HV) would otherwise mark ``A→B→C→HV`` as a
+            super-path and drop it.
+        preserve_prefix_paths: When True (non-domain scopes), a longer path is
+            only considered redundant if the matching sub-sequence ends at the
+            **same terminal node** as the longer path.  This prevents dropping
+            ``A→B`` just because ``A→B→C`` exists — B and C are different
+            exploitable targets.  When False (domain scope), all sub-sequences
+            are marked as covered/shadowed regardless of their terminal, giving
+            the most compact holistic view.
+    """
     if len(records) <= 1:
         return records, 0
 
@@ -203,31 +260,100 @@ def filter_contained_paths_for_domain_listing(
         rels_t = tuple(str(r) for r in rels)
         normalized.append((nodes_t, rels_t, record))
 
-    normalized.sort(key=lambda item: len(item[1]), reverse=True)
+    if not keep_shortest:
+        # Domain mode: process longest-first; mark strict sub-paths as covered.
+        # When preserve_prefix_paths=True (non-domain) only sub-sequences that
+        # end at the same terminal as the kept path are marked covered — this
+        # prevents "A→B" from being shadowed by "A→B→C" (different target).
+        normalized.sort(key=lambda item: len(item[1]), reverse=True)
+        covered: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        kept: list[dict[str, Any]] = []
+        removed = 0
+        for nodes_t, rels_t, record in normalized:
+            sig = (nodes_t, rels_t)
+            if sig in covered:
+                removed += 1
+                continue
+            kept.append(record)
+            rel_len = len(rels_t)
+            if rel_len <= 0:
+                continue
+            terminal = nodes_t[-1]
+            for start in range(0, rel_len):
+                for end in range(start + 1, rel_len + 1):
+                    if end - start >= rel_len:
+                        continue
+                    if preserve_prefix_paths and nodes_t[end] != terminal:
+                        # Sub-sequence ends at a different target — keep it.
+                        continue
+                    covered.add((nodes_t[start : end + 1], rels_t[start:end]))
+        return kept, removed
+    else:
+        # Owned/principals multi-user mode: keep the most direct path within
+        # each contained group.  Sort key:
+        #   (not is_hv, length)
+        # HV-terminal paths get priority (False < True), then shorter within
+        # the same HV category.  This ensures:
+        #   • A shorter HV path beats a longer HV path              → keep shorter HV
+        #   • A longer HV path beats a shorter non-HV path          → keep HV even if longer
+        #   • Neither is HV → keep shorter                          → most direct route
+        #
+        # When preserve_prefix_paths=True a longer path is only treated as a
+        # super-path when the matching kept sub-sequence ends at the same
+        # terminal, i.e. both reach the same target.  A prefix that ends at a
+        # different (intermediate) node means the longer path reaches a new
+        # target and must be kept.
+        if is_hv_terminal is not None:
+            normalized.sort(key=lambda item: (not is_hv_terminal(item[2]), len(item[1])))
+        else:
+            normalized.sort(key=lambda item: len(item[1]))
+        kept_sigs: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        # Store tuples so Pass 2 can access node/rel sequences without re-parsing.
+        kept_entries: list[tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]] = []
+        removed_multi = 0
+        for nodes_t, rels_t, record in normalized:
+            rel_len = len(rels_t)
+            terminal = nodes_t[-1]
+            is_super_path = False
+            for start in range(0, rel_len):
+                for end in range(start + 1, rel_len + 1):
+                    if end - start >= rel_len:
+                        continue
+                    if (nodes_t[start : end + 1], rels_t[start:end]) in kept_sigs:
+                        if not preserve_prefix_paths or nodes_t[end] == terminal:
+                            is_super_path = True
+                            break
+                if is_super_path:
+                    break
+            if is_super_path:
+                removed_multi += 1
+            else:
+                kept_entries.append((nodes_t, rels_t, record))
+                kept_sigs.add((nodes_t, rels_t))
 
-    covered: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
-    kept: list[dict[str, Any]] = []
-    removed = 0
+        # Pass 2 — Case 1: remove strict prefixes (same source, different target).
+        # Builds a set of every prefix sub-sequence (starting at index 0) that exists
+        # inside a longer kept path.  A shorter path whose full signature appears in
+        # this set is a strict prefix of some longer path and adds no information —
+        # the intermediate node is already visible in the longer chain.
+        #
+        # HV-terminal paths are never dropped, even if they happen to be a prefix of
+        # a longer non-HV path (e.g. "A→HV" survives when "A→HV→X" also exists).
+        covered_prefixes: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        for nodes_t, rels_t, _rec in kept_entries:
+            for end in range(1, len(rels_t)):   # strict prefix: end < full length
+                covered_prefixes.add((nodes_t[: end + 1], rels_t[:end]))
 
-    for nodes_t, rels_t, record in normalized:
-        sig = (nodes_t, rels_t)
-        if sig in covered:
-            removed += 1
-            continue
-        kept.append(record)
+        pass2_kept: list[dict[str, Any]] = []
+        pass2_removed = 0
+        for nodes_t, rels_t, record in kept_entries:
+            rec_is_hv = is_hv_terminal(record) if is_hv_terminal is not None else False
+            if (nodes_t, rels_t) in covered_prefixes and not rec_is_hv:
+                pass2_removed += 1
+            else:
+                pass2_kept.append(record)
 
-        rel_len = len(rels_t)
-        if rel_len <= 0:
-            continue
-        for start in range(0, rel_len):
-            for end in range(start + 1, rel_len + 1):
-                if end - start >= rel_len:
-                    continue
-                sub_nodes = nodes_t[start : end + 1]
-                sub_rels = rels_t[start:end]
-                covered.add((sub_nodes, sub_rels))
-
-    return kept, removed
+        return pass2_kept, removed_multi + pass2_removed
 
 
 def compute_display_paths_for_start_node(
@@ -236,7 +362,7 @@ def compute_display_paths_for_start_node(
     start_node_id: str,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     target_mode: str = "tier0",
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths starting from a specific node id."""
@@ -249,7 +375,7 @@ def compute_display_paths_for_start_node(
         start_node_id=start_node_id,
         max_depth=max_depth,
         max_paths=max_paths,
-        require_high_value_target=False,
+        target="all",
         terminal_mode=mode,
     )
 
@@ -258,7 +384,7 @@ def compute_display_paths_for_start_node(
 
     for path in computed:
         candidate = path
-        if require_high_value_target:
+        if target == "highvalue":
             target_is_hv = _path_target_is_high_value(graph, path.target_id, mode=mode)
             if not target_is_hv:
                 promoted = _try_promote_target_via_membership_edges(
@@ -269,8 +395,14 @@ def compute_display_paths_for_start_node(
                     target_is_hv = True
             if not target_is_hv:
                 continue
+        elif target == "lowpriv":
+            if _path_target_is_high_value(graph, path.target_id, mode=mode):
+                continue
 
         record = path_to_display_record(graph, candidate)
+        record["target_is_high_value"] = _path_target_is_high_value(
+            graph, candidate.target_id, mode=mode
+        )
         nodes = record.get("nodes")
         rels = record.get("relations")
         if not isinstance(nodes, list) or not isinstance(rels, list):
@@ -508,7 +640,7 @@ def compute_maximal_attack_paths(
     *,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     terminal_mode: str = "tier0",
 ) -> list[AttackPath]:
     """Compute maximal paths up to depth for a full-domain graph."""
@@ -573,7 +705,7 @@ def compute_maximal_attack_paths(
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        if require_high_value_target and not is_terminal(acc_steps[-1].to_id):
+        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
             return
         signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
         if signature in seen_signatures:
@@ -646,7 +778,7 @@ def compute_maximal_attack_paths_from_start(
     start_node_id: str,
     max_depth: int,
     max_paths: int | None = None,
-    require_high_value_target: bool = True,
+    target: str = "highvalue",
     terminal_mode: str = "tier0",
 ) -> list[AttackPath]:
     """Compute maximal paths starting from a specific node."""
@@ -700,7 +832,7 @@ def compute_maximal_attack_paths_from_start(
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             return
-        if require_high_value_target and not is_terminal(acc_steps[-1].to_id):
+        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
             return
         signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
         if signature in seen_signatures:

@@ -39,6 +39,7 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.services.privileged_group_classifier import sid_rid
 from adscan_internal.workspaces import domain_relpath, domain_subpath
+from adscan_internal.workspaces.computers import count_enabled_computer_accounts
 
 
 _MONTH_SECONDS = 30 * 24 * 60 * 60
@@ -316,6 +317,32 @@ def _get_timeroast_candidates(
         )
     )
     return candidates
+
+
+def _should_skip_ctf_timeroast_due_to_single_computer(
+    shell: TimeroastShell,
+    domain: str,
+) -> bool:
+    """Return True when CTF Timeroast should be skipped due to a trivial computer set."""
+
+    if str(getattr(shell, "type", "") or "").strip().lower() != "ctf":
+        return False
+
+    workspace_cwd = shell.current_workspace_dir or os.getcwd()
+    marked_domain = mark_sensitive(domain, "domain")
+    try:
+        count = count_enabled_computer_accounts(workspace_cwd, shell.domains_dir, domain)
+    except OSError as exc:
+        print_info_debug(
+            "[timeroast] enabled computer count unavailable for "
+            f"{marked_domain}: {mark_sensitive(str(exc), 'detail')}"
+        )
+        return False
+
+    print_info_debug(
+        f"[timeroast] enabled computer count for {marked_domain}: {count}"
+    )
+    return count <= 1
 
 
 def _write_timeroast_candidate_artifact(
@@ -623,6 +650,17 @@ def run_timeroast_quick_win(shell: TimeroastShell, target_domain: str) -> bool:
         print_error(
             f"Domain '{marked_target_domain}' is not configured. "
             "Please add or select a valid domain."
+        )
+        return False
+
+    if _should_skip_ctf_timeroast_due_to_single_computer(shell, target_domain):
+        marked_domain = mark_sensitive(target_domain, "domain")
+        print_info(
+            f"Skipping Timeroast candidate checks in {marked_domain}: only one enabled computer account was found."
+        )
+        print_info_debug(
+            "[timeroast] CTF quick win skipped because pre2k/timeroast heuristics "
+            "do not add value with <= 1 enabled computer."
         )
         return False
 

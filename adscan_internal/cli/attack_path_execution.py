@@ -35,6 +35,9 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.interaction import is_non_interactive
+from adscan_internal.integrations.netexec.timeouts import (
+    get_recommended_internal_timeout,
+)
 from adscan_internal.passwords import generate_strong_password, is_password_complex
 from adscan_internal.rich_output import (
     BRAND_COLORS,
@@ -153,13 +156,26 @@ _EXECUTION_CONTEXT_ACTIONS = {
     "dumpdpapi",
     *ACL_ACE_RELATIONS,
 }
+_EXECUTION_READINESS_ACTIONS = _EXECUTION_CONTEXT_ACTIONS | {
+    "kerberoasting",
+    "asreproasting",
+}
 
 
 def _affected_user_count(summary: dict[str, Any]) -> int:
-    """Return affected-user count from summary metadata when available."""
+    """Return affected principal count (users + computers) from summary metadata.
+
+    Returns ``affected_principal_count`` when present (set by
+    ``apply_affected_user_metadata`` and covers both user and computer members).
+    Falls back to ``affected_user_count`` for older cached records that pre-date
+    computer-group support, and finally to the length of ``affected_users``.
+    """
     meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
     if not isinstance(meta, dict):
         return 0
+    principal_count = meta.get("affected_principal_count")
+    if isinstance(principal_count, int) and principal_count >= 0:
+        return principal_count
     count = meta.get("affected_user_count")
     if isinstance(count, int) and count >= 0:
         return count
@@ -189,8 +205,8 @@ def _get_stored_credential_map(shell: Any, domain: str) -> dict[str, str]:
     return normalized
 
 
-def _first_credential_context_step(summary: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
-    """Return the first path step that requires an execution credential context."""
+def _first_execution_readiness_step(summary: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Return the first path step that gates whether execution can start."""
     steps = summary.get("steps")
     if not isinstance(steps, list):
         return None
@@ -198,7 +214,7 @@ def _first_credential_context_step(summary: dict[str, Any]) -> tuple[str, dict[s
         if not isinstance(step, dict):
             continue
         action = str(step.get("action") or "").strip().lower()
-        if action in _EXECUTION_CONTEXT_ACTIONS:
+        if action in _EXECUTION_READINESS_ACTIONS:
             details = step.get("details")
             if isinstance(details, dict):
                 return action, details
@@ -214,7 +230,7 @@ def _execution_readiness_meta(
     context_password: str | None,
 ) -> dict[str, Any]:
     """Estimate whether a path has usable execution credential context."""
-    step_info = _first_credential_context_step(summary)
+    step_info = _first_execution_readiness_step(summary)
     if step_info is None:
         return {}
 
@@ -222,6 +238,70 @@ def _execution_readiness_meta(
     from_label = str(details.get("from") or "")
     to_label = str(details.get("to") or "")
     stored_creds = _get_stored_credential_map(shell, domain)
+
+    if action == "asreproasting":
+        return {
+            "execution_context_required": False,
+            "execution_support_status": "supported",
+            "execution_support_target_kind": "",
+            "execution_target_enabled": None,
+            "execution_target_enabled_source": "unknown",
+            "execution_ready_count": 1,
+            "execution_candidate_count": 1,
+            "execution_candidate_source": "asreproasting_no_auth_required",
+            "execution_readiness_reason": "asreproasting_no_auth_required",
+            "execution_context_action": action,
+        }
+
+    if action == "kerberoasting":
+        normalized_context_user = _normalize_account(context_username or "")
+        if normalized_context_user:
+            ready = bool(
+                context_password
+                or _resolve_domain_password(shell, domain, normalized_context_user)
+            )
+            return {
+                "execution_context_required": True,
+                "execution_support_status": "supported",
+                "execution_support_target_kind": "",
+                "execution_target_enabled": None,
+                "execution_target_enabled_source": "unknown",
+                "execution_ready_count": 1 if ready else 0,
+                "execution_candidate_count": 1,
+                "execution_candidate_source": "context_username",
+                "execution_readiness_reason": (
+                    "context_username"
+                    if ready
+                    else "context_username_missing_credential"
+                ),
+                "execution_context_action": action,
+            }
+        if stored_creds:
+            return {
+                "execution_context_required": True,
+                "execution_support_status": "supported",
+                "execution_support_target_kind": "",
+                "execution_target_enabled": None,
+                "execution_target_enabled_source": "unknown",
+                "execution_ready_count": len(stored_creds),
+                "execution_candidate_count": len(stored_creds),
+                "execution_candidate_source": "all_stored_credentials_fallback",
+                "execution_readiness_reason": "all_stored_credentials_fallback",
+                "execution_context_action": action,
+            }
+        return {
+            "execution_context_required": True,
+            "execution_support_status": "supported",
+            "execution_support_target_kind": "",
+            "execution_target_enabled": None,
+            "execution_target_enabled_source": "unknown",
+            "execution_ready_count": 0,
+            "execution_candidate_count": 0,
+            "execution_candidate_source": "unresolved",
+            "execution_readiness_reason": "no_stored_credentials_available",
+            "execution_context_action": action,
+        }
+
     target_kind = ""
     target_enabled: bool | None = None
     target_enabled_source = "unknown"
@@ -2202,9 +2282,10 @@ def execute_selected_attack_path(
                 log_file = (
                     f"domains/{domain}/{service}/verify_{exec_username}_{service}.log"
                 )
+                netexec_timeout_seconds = get_recommended_internal_timeout(service)
                 command = (
                     f"{shell.netexec_path} {service} {target_host} {auth} "
-                    f"--timeout 30 --log {log_file}"
+                    f"--timeout {netexec_timeout_seconds} --log {log_file}"
                 )
                 print_info_verbose(f"Command: {command}")
 
@@ -2486,14 +2567,14 @@ def execute_selected_attack_path(
 
                 continue
 
-            if key == "passwordspray":
+            if key in {"passwordspray", "useraspass", "blankpassword", "computerpre2k"}:
                 if not to_label:
-                    print_warning("Cannot execute PasswordSpray: missing target principal.")
+                    print_warning(f"Cannot execute {action}: missing target principal.")
                     return execution_started
 
                 target_user = _normalize_account(to_label)
                 if not target_user:
-                    print_warning("Cannot execute PasswordSpray: invalid target principal.")
+                    print_warning(f"Cannot execute {action}: invalid target principal.")
                     return execution_started
 
                 spray_type, spray_category, spray_password = (
@@ -2559,7 +2640,7 @@ def execute_selected_attack_path(
 
                     if not attempted:
                         print_warning(
-                            "Cannot execute PasswordSpray: spray mode "
+                            f"Cannot execute {action}: spray mode "
                             f"{marked_spray_type} could not be started."
                         )
                         _mark_blocked_step(
@@ -2590,7 +2671,7 @@ def execute_selected_attack_path(
                             except Exception as exc:  # noqa: BLE001
                                 telemetry.capture_exception(exc)
                         print_warning(
-                            "PasswordSpray did not recover credentials for "
+                            f"{action} did not recover credentials for "
                             f"{marked_target}. Stopping this path."
                         )
                         return True
@@ -2598,7 +2679,7 @@ def execute_selected_attack_path(
                     context_username = target_user
                     context_password = recovered_credential
                     print_info_debug(
-                        "[attack_paths] execution context handed off after PasswordSpray: "
+                        f"[attack_paths] execution context handed off after {action}: "
                         f"user={marked_target} "
                         f"spray_type={marked_spray_type}"
                     )
@@ -3921,7 +4002,7 @@ def offer_attack_paths_for_execution(
     start: str,
     max_depth: int = 10,
     max_display: int = 20,
-    include_all: bool = False,
+    target: str = "highvalue",
     target_mode: str = "impact",
     context_username: str | None = None,
     context_password: str | None = None,
@@ -3938,7 +4019,7 @@ def offer_attack_paths_for_execution(
         start: Either a username label or the special value `owned`.
         max_depth: Max path depth for pathfinding.
         max_display: Max number of paths to show in the summary and selection.
-        include_all: When True, include paths to non-high-value targets.
+        target: Target scope — ``"highvalue"`` (default), ``"all"``, or ``"lowpriv"``.
         context_username/context_password: When provided, use these credentials for
             execution attempts (useful for `ask_for_user_privs` flows).
 
@@ -3946,13 +4027,12 @@ def offer_attack_paths_for_execution(
         True if an execution attempt was started, False otherwise.
     """
     start_norm = (start or "").strip().lower()
-    require_high_value_target = not include_all
     _compute_summaries = _build_attack_path_summary_provider(
         shell,
         domain=domain,
         start=start,
         max_depth=max_depth,
-        include_all=include_all,
+        target=target,
         target_mode=target_mode,
     )
 
@@ -3972,7 +4052,7 @@ def offer_attack_paths_for_execution(
             domain=domain,
             start=start,
             start_norm=start_norm,
-            require_high_value_target=require_high_value_target,
+            target=target,
             target_mode=target_mode,
         )
         return False
@@ -3983,7 +4063,7 @@ def offer_attack_paths_for_execution(
         summaries=summaries,
         max_display=max_display,
         search_mode_label=_target_search_mode_label(
-            include_all=include_all, target_mode=target_mode
+            target=target, target_mode=target_mode
         ),
         context_username=context_username,
         context_password=context_password,
@@ -3995,22 +4075,48 @@ def offer_attack_paths_for_execution(
     )
 
 
-def _target_scope_label(*, require_high_value_target: bool, target_mode: str) -> str:
+def _target_scope_label(*, target: str, target_mode: str) -> str:
     """Return a user-facing label for the current target filtering mode."""
-    if not require_high_value_target:
+    if target == "all":
         return "all targets"
+    if target == "lowpriv":
+        return "low-privilege targets"
     if str(target_mode or "impact").strip().lower() == "tier0":
         return "Tier-0 targets"
     return "high-value targets"
 
 
-def _target_search_mode_label(*, include_all: bool, target_mode: str) -> str:
+def _target_search_mode_label(*, target: str, target_mode: str) -> str:
     """Return a compact label describing the current attack-path search mode."""
-    if include_all:
+    if target == "all":
         return "Pivot Search"
+    if target == "lowpriv":
+        return "Low-Priv Search"
     if str(target_mode or "impact").strip().lower() == "tier0":
         return "Tier-0 Search"
     return "High-Value Search"
+
+
+def _resolve_summary_search_mode_label(
+    summary: dict[str, Any],
+    *,
+    default_search_mode_label: str | None,
+    show_sections: bool,
+) -> str | None:
+    """Return the effective search-mode label for one rendered/executed path.
+
+    When the UX is rendering mixed high-value + pivot results in one table
+    (`target=all`), the runtime follow-up logic must key off the selected path,
+    not off a single global label for the whole screen. Otherwise pivot-only
+    follow-ups get skipped for non-HV paths shown in the merged view.
+    """
+    if show_sections:
+        return (
+            "High-Value Search"
+            if bool(summary.get("target_is_high_value"))
+            else "Pivot Search"
+        )
+    return default_search_mode_label
 
 
 def _print_no_attack_paths_warning(
@@ -4018,13 +4124,13 @@ def _print_no_attack_paths_warning(
     domain: str,
     start: str,
     start_norm: str,
-    require_high_value_target: bool,
+    target: str,
     target_mode: str,
 ) -> None:
     """Emit a consistent warning when no attack paths are available."""
     marked_domain = mark_sensitive(domain, "domain")
     scope = _target_scope_label(
-        require_high_value_target=require_high_value_target,
+        target=target,
         target_mode=target_mode,
     )
     if start_norm == "owned":
@@ -4044,12 +4150,11 @@ def _build_attack_path_summary_provider(
     domain: str,
     start: str,
     max_depth: int,
-    include_all: bool,
+    target: str,
     target_mode: str,
 ) -> Callable[[], list[dict[str, Any]]]:
     """Build a reusable summary provider for a specific attack-path scope."""
     start_norm = (start or "").strip().lower()
-    require_high_value_target = not include_all
 
     def _compute_summaries() -> list[dict[str, Any]]:
         if start_norm == "owned":
@@ -4062,7 +4167,7 @@ def _build_attack_path_summary_provider(
                 scope="owned",
                 max_depth=max_depth,
                 max_paths=None,
-                require_high_value_target=require_high_value_target,
+                target=target,
                 target_mode=target_mode,
             )
 
@@ -4076,7 +4181,7 @@ def _build_attack_path_summary_provider(
             username=start,
             max_depth=max_depth,
             max_paths=None,
-            require_high_value_target=require_high_value_target,
+            target=target,
             target_mode=target_mode,
         )
 
@@ -4090,6 +4195,7 @@ def offer_attack_paths_with_non_high_value_fallback(
     start: str,
     max_depth: int = 10,
     max_display: int = 20,
+    target: str = "highvalue",
     target_mode: str = "impact",
     context_username: str | None = None,
     context_password: str | None = None,
@@ -4098,20 +4204,85 @@ def offer_attack_paths_with_non_high_value_fallback(
     execute_only_statuses: set[str] | None = None,
     retry_attempted: bool = False,
 ) -> bool:
-    """Offer high-value paths first, then optionally broaden to all targets.
+    """Offer attack paths, with optional HV-first + fallback broadening.
 
-    Behavior:
-        - In `ctf` mode, when no Tier-0/high-value paths exist, automatically
-          broadens to all reachable targets.
-        - In `audit` mode, the operator is prompted before broadening.
+    When ``target`` is ``"highvalue"`` (default):
+        - Shows Tier-0/high-value paths first.
+        - In ``ctf`` mode automatically broadens to all targets when none found.
+        - In ``audit`` mode prompts the operator before broadening.
+
+    When ``target`` is ``"all"`` or ``"lowpriv"``:
+        - Goes directly to that target mode without the HV-first prompt flow.
+        - Intended for bounded scopes (single user, owned) where running the
+          broader query is affordable.
     """
     start_norm = (start or "").strip().lower()
+
+    if target != "highvalue":
+        # Direct mode — skip HV-first + fallback prompt, go straight to target.
+        direct_compute = _build_attack_path_summary_provider(
+            shell,
+            domain=domain,
+            start=start,
+            max_depth=max_depth,
+            target=target,
+            target_mode=target_mode,
+        )
+        try:
+            direct_summaries = direct_compute()
+        except RecursionError as exc:
+            telemetry.capture_exception(exc)
+            print_error(
+                "Attack-path computation failed while expanding nested group memberships "
+                f"for {mark_sensitive(domain, 'domain')}. The environment appears to have "
+                "deep or cyclic group nesting."
+            )
+            return False
+        if not direct_summaries:
+            _print_no_attack_paths_warning(
+                domain=domain,
+                start=start,
+                start_norm=start_norm,
+                target=target,
+                target_mode=target_mode,
+            )
+            return False
+        if target == "all":
+            return _offer_two_section_attack_paths(
+                shell,
+                domain,
+                summaries=direct_summaries,
+                max_display=max_display,
+                target_mode=target_mode,
+                context_username=context_username,
+                context_password=context_password,
+                allow_execute_all=allow_execute_all,
+                default_execute_all=default_execute_all,
+                execute_only_statuses=execute_only_statuses,
+                retry_attempted=retry_attempted,
+                recompute_summaries=direct_compute,
+            )
+        return offer_attack_paths_for_execution_summaries(
+            shell,
+            domain,
+            summaries=direct_summaries,
+            max_display=max_display,
+            search_mode_label=_target_search_mode_label(target=target, target_mode=target_mode),
+            context_username=context_username,
+            context_password=context_password,
+            allow_execute_all=allow_execute_all,
+            default_execute_all=default_execute_all,
+            execute_only_statuses=execute_only_statuses,
+            retry_attempted=retry_attempted,
+            recompute_summaries=direct_compute,
+        )
+
     primary_compute = _build_attack_path_summary_provider(
         shell,
         domain=domain,
         start=start,
         max_depth=max_depth,
-        include_all=False,
+        target="highvalue",
         target_mode=target_mode,
     )
     try:
@@ -4133,7 +4304,7 @@ def offer_attack_paths_with_non_high_value_fallback(
             summaries=primary_summaries,
             max_display=max_display,
             search_mode_label=_target_search_mode_label(
-                include_all=False, target_mode=target_mode
+                target="highvalue", target_mode=target_mode
             ),
             context_username=context_username,
             context_password=context_password,
@@ -4148,7 +4319,7 @@ def offer_attack_paths_with_non_high_value_fallback(
         domain=domain,
         start=start,
         start_norm=start_norm,
-        require_high_value_target=True,
+        target="highvalue",
         target_mode=target_mode,
     )
 
@@ -4207,7 +4378,7 @@ def offer_attack_paths_with_non_high_value_fallback(
         domain=domain,
         start=start,
         max_depth=max_depth,
-        include_all=True,
+        target="all",
         target_mode=target_mode,
     )
     try:
@@ -4227,7 +4398,7 @@ def offer_attack_paths_with_non_high_value_fallback(
             domain=domain,
             start=start,
             start_norm=start_norm,
-            require_high_value_target=False,
+            target="all",
             target_mode=target_mode,
         )
         return False
@@ -4238,7 +4409,7 @@ def offer_attack_paths_with_non_high_value_fallback(
         summaries=fallback_summaries,
         max_display=max_display,
         search_mode_label=_target_search_mode_label(
-            include_all=True, target_mode=target_mode
+            target="all", target_mode=target_mode
         ),
         context_username=context_username,
         context_password=context_password,
@@ -4250,6 +4421,57 @@ def offer_attack_paths_with_non_high_value_fallback(
     )
 
 
+def _offer_two_section_attack_paths(
+    shell: Any,
+    domain: str,
+    *,
+    summaries: list[dict[str, Any]],
+    max_display: int = 20,
+    target_mode: str = "impact",
+    context_username: str | None = None,
+    context_password: str | None = None,
+    allow_execute_all: bool = False,
+    default_execute_all: bool = False,
+    execute_only_statuses: set[str] | None = None,
+    retry_attempted: bool = False,
+    recompute_summaries: Any = None,
+) -> bool:
+    """Display attack paths in two sections: high-value targets first, then non-HV pivots.
+
+    HV section is shown as the primary interactive view. If the operator does not
+    execute from the HV section (or there are no HV paths), the non-HV pivot section
+    is shown as a secondary view. Returns ``True`` if any path was executed.
+    """
+    def _sort_hv_first(sums: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [s for s in sums if s.get("target_is_high_value")] + [
+            s for s in sums if not s.get("target_is_high_value")
+        ]
+
+    merged = _sort_hv_first(summaries)
+
+    # Wrap recompute so refreshed results are also sorted HV-first.
+    _orig_recompute = recompute_summaries
+
+    def _recompute_sorted() -> list[dict[str, Any]]:
+        fresh = _orig_recompute() if callable(_orig_recompute) else merged
+        return _sort_hv_first(fresh)
+
+    return offer_attack_paths_for_execution_summaries(
+        shell,
+        domain,
+        summaries=merged,
+        show_sections=True,
+        max_display=max_display,
+        context_username=context_username,
+        context_password=context_password,
+        allow_execute_all=allow_execute_all,
+        default_execute_all=default_execute_all,
+        execute_only_statuses=execute_only_statuses,
+        retry_attempted=retry_attempted,
+        recompute_summaries=_recompute_sorted,
+    )
+
+
 def offer_attack_paths_for_execution_for_principals(
     shell: Any,
     domain: str,
@@ -4257,7 +4479,7 @@ def offer_attack_paths_for_execution_for_principals(
     principals: list[str],
     max_depth: int = 10,
     max_display: int = 20,
-    include_all: bool = False,
+    target: str = "highvalue",
     target_mode: str = "impact",
     context_username: str | None = None,
     context_password: str | None = None,
@@ -4271,7 +4493,6 @@ def offer_attack_paths_for_execution_for_principals(
     This is used by batch credential discovery flows (e.g. password spraying)
     to avoid printing one identical group-originating path per user.
     """
-    require_high_value_target = not include_all
 
     def _compute_summaries() -> list[dict[str, Any]]:
         return get_attack_path_summaries(
@@ -4281,7 +4502,7 @@ def offer_attack_paths_for_execution_for_principals(
             principals=principals,
             max_depth=max_depth,
             max_paths=None,
-            require_high_value_target=require_high_value_target,
+            target=target,
             target_mode=target_mode,
         )
 
@@ -4297,11 +4518,28 @@ def offer_attack_paths_for_execution_for_principals(
         )
         return False
 
+    if target == "all":
+        return _offer_two_section_attack_paths(
+            shell,
+            domain,
+            summaries=summaries,
+            max_display=max_display,
+            target_mode=target_mode,
+            context_username=context_username,
+            context_password=context_password,
+            allow_execute_all=allow_execute_all,
+            default_execute_all=default_execute_all,
+            execute_only_statuses=execute_only_statuses,
+            retry_attempted=retry_attempted,
+            recompute_summaries=_compute_summaries,
+        )
+
     return offer_attack_paths_for_execution_summaries(
         shell,
         domain,
         summaries=summaries,
         max_display=max_display,
+        search_mode_label=_target_search_mode_label(target=target, target_mode=target_mode),
         context_username=context_username,
         context_password=context_password,
         allow_execute_all=allow_execute_all,
@@ -4319,6 +4557,7 @@ def offer_attack_paths_for_execution_summaries(
     summaries: list[dict[str, Any]] | None,
     max_display: int = 20,
     search_mode_label: str | None = None,
+    show_sections: bool = False,
     context_username: str | None = None,
     context_password: str | None = None,
     allow_execute_all: bool = False,
@@ -4327,7 +4566,12 @@ def offer_attack_paths_for_execution_summaries(
     retry_attempted: bool = False,
     recompute_summaries: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> bool:
-    """Shared UX loop for showing/executing already computed path summaries."""
+    """Shared UX loop for showing/executing already computed path summaries.
+
+    When ``show_sections=True`` the table renders high-value paths first
+    (normal styling) separated from non-HV pivot paths (dim styling).
+    Callers must pass summaries pre-sorted HV-first.
+    """
     if not summaries:
         return False
 
@@ -4395,7 +4639,25 @@ def offer_attack_paths_for_execution_summaries(
         desired_statuses if isinstance(desired_statuses, set) else None
     )
 
-    summaries = _refresh_summaries()
+    # Initial annotation: the summaries passed by the caller are already fresh
+    # (just computed). Annotate them in-place without calling recompute_summaries,
+    # which would trigger a redundant full recomputation (including any interactive
+    # engine selector). The recompute_summaries callback is reserved for subsequent
+    # refresh calls after a path has been executed.
+    summaries = _annotate_execution_readiness(
+        shell,
+        domain=domain,
+        summaries=_sorted_paths(list(summaries)),
+        context_username=context_username,
+        context_password=context_password,
+    )
+    # When rendering two sections (HV + pivot), re-group HV-first after sorting.
+    # _sorted_paths sorts globally by status/length — this restores the section
+    # grouping while preserving the relative order within each section.
+    if show_sections:
+        summaries = [s for s in summaries if s.get("target_is_high_value")] + [
+            s for s in summaries if not s.get("target_is_high_value")
+        ]
     print_info_debug(
         f"[attack_paths] summaries refreshed: domain={marked_domain} count={len(summaries)}"
     )
@@ -4412,6 +4674,7 @@ def offer_attack_paths_for_execution_summaries(
         max_display=min(max_display, len(summaries)),
         search_mode_label=search_mode_label,
         actionable_count=len(actionable_paths),
+        show_sections=show_sections,
     )
     if not actionable_paths:
         non_actionable_total, reasons = _summarize_non_actionable_paths(
@@ -4619,7 +4882,11 @@ def offer_attack_paths_for_execution_summaries(
                         summary=summary,
                         context_username=context_username,
                         context_password=context_password,
-                        search_mode_label=search_mode_label,
+                        search_mode_label=_resolve_summary_search_mode_label(
+                            summary,
+                            default_search_mode_label=search_mode_label,
+                            show_sections=show_sections,
+                        ),
                     )
                     executed = executed or attempted
                     if attempted and not was_pwned_at_start and _domain_now_pwned():
@@ -4635,11 +4902,16 @@ def offer_attack_paths_for_execution_summaries(
             return executed
 
         selected = summaries[selected_idx]
+        selected_search_mode_label = _resolve_summary_search_mode_label(
+            selected,
+            default_search_mode_label=search_mode_label,
+            show_sections=show_sections,
+        )
         print_attack_path_detail(
             domain,
             selected,
             index=selected_idx + 1,
-            search_mode_label=search_mode_label,
+            search_mode_label=selected_search_mode_label,
         )
 
         status = str(selected.get("status") or "theoretical").lower()
@@ -4750,7 +5022,7 @@ def offer_attack_paths_for_execution_summaries(
             summary=selected,
             context_username=context_username,
             context_password=context_password,
-            search_mode_label=search_mode_label,
+            search_mode_label=selected_search_mode_label,
         )
         if executed:
             if not was_pwned_at_start and _domain_now_pwned():
@@ -4784,6 +5056,10 @@ def offer_attack_paths_for_execution_summaries(
                 "(this can take longer on large domains)."
             )
             summaries = _refresh_summaries()
+            if show_sections:
+                summaries = [s for s in summaries if s.get("target_is_high_value")] + [
+                    s for s in summaries if not s.get("target_is_high_value")
+                ]
             actionable_paths = [
                 summary
                 for summary in summaries
@@ -4802,6 +5078,7 @@ def offer_attack_paths_for_execution_summaries(
                     max_display=min(max_display, len(summaries)),
                     search_mode_label=search_mode_label,
                     actionable_count=len(actionable_paths),
+                    show_sections=show_sections,
                 )
                 continue
             if summaries:

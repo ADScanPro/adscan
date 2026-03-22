@@ -41,6 +41,15 @@ class MssqlShell(Protocol):
     myip: str | None
     domains_data: dict
 
+    def _run_netexec(
+        self,
+        command: str,
+        *,
+        domain: str | None = None,
+        timeout: int | None = None,
+        **kwargs,
+    ) -> subprocess.CompletedProcess[str] | None: ...
+
     def _get_lab_slug(self) -> str | None: ...
 
     def _get_service_executor(
@@ -72,8 +81,33 @@ def _build_mssql_context(shell: MssqlShell) -> MSSQLContext:
     if not shell.netexec_path:
         raise ValueError("netexec_path not configured")
 
+    def _infer_domain_from_command(command: str) -> str | None:
+        import shlex
+
+        try:
+            argv = shlex.split(str(command or ""))
+        except ValueError:
+            return None
+        for idx, token in enumerate(argv):
+            if token in {"-d", "--domain"} and idx + 1 < len(argv):
+                value = str(argv[idx + 1]).strip()
+                if value:
+                    return value
+        return None
+
     def _runner(command: str, timeout: int):
-        result = shell.run_command(command, timeout=timeout)
+        domain = _infer_domain_from_command(command)
+        if hasattr(shell, "_run_netexec"):
+            result = shell._run_netexec(
+                command,
+                domain=domain,
+                timeout=timeout,
+                operation_kind="mssql_remote_exec",
+                service="mssql",
+                target_count=1,
+            )
+        else:
+            result = shell.run_command(command, timeout=timeout)
         if result is not None:
             return result
         last_error = getattr(shell, "_last_run_command_error", None)

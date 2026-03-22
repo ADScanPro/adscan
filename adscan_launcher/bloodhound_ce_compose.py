@@ -11,6 +11,7 @@ The goal is to avoid host-level installers and external helpers (e.g. downloadin
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -50,7 +51,7 @@ from adscan_launcher.output import (
 BLOODHOUND_CE_DEFAULT_WEB_PORT = 8442
 BLOODHOUND_CE_GRAPH_HTTP_PORT = 17474
 BLOODHOUND_CE_GRAPH_BOLT_PORT = 17687
-BLOODHOUND_CE_VERSION = "7.4.1"
+BLOODHOUND_CE_VERSION = "8.7.0"
 BLOODHOUND_COMPOSE_URL = "https://raw.githubusercontent.com/SpecterOps/bloodhound/main/examples/docker-compose/docker-compose.yml"
 _VENDORED_BLOODHOUND_COMPOSE_RESOURCE = "assets/bloodhound/docker-compose.yml"
 _ALLOW_REMOTE_COMPOSE_FALLBACK_ENV = "ADSCAN_BLOODHOUND_ALLOW_REMOTE_COMPOSE_FALLBACK"
@@ -58,6 +59,12 @@ _DOCKER_INSTALL_DOCS_URL = "https://www.adscanpro.com/docs/getting-started/insta
 _DEFAULT_BH_COMPOSE_PROJECT = "adscan-bhce"
 _DEFAULT_BH_COMPOSE_DIRNAME = "bloodhound-ce"
 _DEFAULT_BLOODHOUND_COMPOSE_PULL_TIMEOUT_SECONDS = 3600
+
+# Filename stored alongside docker-compose.yml to track the SHA-256 of the last
+# deployed template content.  A mismatch triggers container recreation so that
+# config changes (e.g. bhe_disable_cypher_complexity_limit) take effect without
+# requiring manual intervention from the user.
+_COMPOSE_HASH_FILENAME = ".compose.sha256"
 
 _PORT_BIND_ERROR_RE = re.compile(
     r"bind port 127\.0\.0\.1:(\d+)/tcp:.*address already in use", re.IGNORECASE
@@ -428,6 +435,12 @@ def _managed_compose_rebuild_reasons(content: str, *, version: str) -> list[str]
     if any(token.lower() in lowered for token in _GRAPH_DB_HOST_PORT_TOKENS):
         reasons.append("legacy_graph_host_port_bindings")
 
+    # Detect old default that kept the Cypher complexity limit enabled.  The managed
+    # template now ships with the limit disabled so existing containers pick up the
+    # change on the next ``adscan start`` without user intervention.
+    if "${bhe_disable_cypher_complexity_limit:-false}" in lowered:
+        reasons.append("cypher_complexity_limit_not_disabled")
+
     required_tokens = (
         "services:",
         "app-db:",
@@ -471,6 +484,103 @@ def _build_pinned_compose_from_template(*, version: str) -> str | None:
     pinned, _, _ = _apply_compose_port_migrations(pinned)
     print_info_debug(f"[bloodhound-ce] compose source: {compose_source}")
     return pinned
+
+
+def _hash_compose_content(content: str) -> str:
+    """Return SHA-256 hex digest of compose file content."""
+    return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _get_compose_hash_path(compose_path: Path) -> Path:
+    """Return path to the SHA-256 tracking file alongside the compose file."""
+    return compose_path.parent / _COMPOSE_HASH_FILENAME
+
+
+def _save_compose_hash(compose_path: Path) -> None:
+    """Persist the SHA-256 of the current compose file content for change detection."""
+    try:
+        content = compose_path.read_text(encoding="utf-8", errors="replace")
+        _get_compose_hash_path(compose_path).write_text(
+            _hash_compose_content(content), encoding="utf-8"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"[bloodhound-ce] failed to save compose hash: {exc}")
+
+
+def compose_config_changed(compose_path: Path) -> bool:
+    """Return True if the compose file has changed since the last recorded startup.
+
+    A missing hash file is treated as "changed" so that:
+    - Existing users upgrading ADscan (no hash file yet) trigger a one-time
+      container recreation to pick up any new configuration.
+    - New users on a fresh install skip recreation because
+      ``ensure_bloodhound_compose_file`` writes the hash immediately.
+
+    Returns False if the compose file itself does not exist (nothing to compare).
+    """
+    if not compose_path.exists():
+        return False
+    hash_path = _get_compose_hash_path(compose_path)
+    if not hash_path.exists():
+        # No hash recorded — treat as changed so containers are recreated once.
+        print_info_debug(
+            "[bloodhound-ce] no compose hash file found — treating as config change"
+        )
+        return True
+    try:
+        stored = hash_path.read_text(encoding="utf-8").strip()
+        current = _hash_compose_content(
+            compose_path.read_text(encoding="utf-8", errors="replace")
+        )
+        if stored != current:
+            print_info_debug(
+                f"[bloodhound-ce] compose hash mismatch: stored={stored[:12]}… current={current[:12]}…"
+            )
+            return True
+        print_info_debug("[bloodhound-ce] compose hash matches — no container recreation needed")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"[bloodhound-ce] compose hash check failed: {exc}")
+        return False
+
+
+def compose_recreate(compose_path: Path) -> bool:
+    """Stop and recreate BloodHound CE containers to apply updated configuration.
+
+    Data volumes (Neo4j, Postgres) are preserved — only containers are replaced.
+    Saves the new compose hash on success so subsequent starts are no-ops.
+    """
+    cmd_down = _compose_base_args(compose_path) + ["down", "--remove-orphans"]
+    print_info_debug(f"[bloodhound-ce] recreate down: {shell_quote_cmd(cmd_down)}")
+    try:
+        proc_down = run_docker(cmd_down, check=False, capture_output=True, timeout=120)
+        if proc_down.returncode != 0:
+            print_info_debug(
+                f"[bloodhound-ce] down non-fatal: rc={proc_down.returncode} "
+                f"stderr={proc_down.stderr!r}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[bloodhound-ce] down exception (non-fatal): {exc}")
+
+    cmd_up = _compose_base_args(compose_path) + ["up", "-d"]
+    print_info_debug(f"[bloodhound-ce] recreate up: {shell_quote_cmd(cmd_up)}")
+    try:
+        proc_up = run_docker(cmd_up, check=False, capture_output=True, timeout=600)
+        if proc_up.returncode == 0:
+            _save_compose_hash(compose_path)
+            print_success(
+                "BloodHound CE containers recreated with the updated configuration."
+            )
+            return True
+        combined = (proc_up.stderr or "") + "\n" + (proc_up.stdout or "")
+        print_error("Failed to recreate BloodHound CE containers.")
+        print_info_debug(f"[bloodhound-ce] recreate up output:\n{combined}")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error("Error recreating BloodHound CE containers.")
+        return False
 
 
 def _build_compose_backup_path(compose_path: Path) -> Path:
@@ -541,6 +651,7 @@ def ensure_bloodhound_compose_file(
                     )
                     return None
                 compose_path.write_text(rebuilt, encoding="utf-8")
+                _save_compose_hash(compose_path)
                 print_info_debug(
                     "[bloodhound-ce] compose managed rebuild reasons: "
                     f"{mark_sensitive(', '.join(rebuild_reasons), 'detail')}"
@@ -572,6 +683,7 @@ def ensure_bloodhound_compose_file(
 
             if updated != existing:
                 compose_path.write_text(updated, encoding="utf-8")
+                _save_compose_hash(compose_path)
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_info_debug(f"[bloodhound-ce] compose read/update failed: {exc}")
@@ -589,6 +701,7 @@ def ensure_bloodhound_compose_file(
         if pinned is None:
             return None
         compose_path.write_text(pinned, encoding="utf-8")
+        _save_compose_hash(compose_path)
         print_success(
             f"BloodHound CE docker-compose.yml configured for version {version}."
         )
