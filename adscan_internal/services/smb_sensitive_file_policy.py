@@ -60,6 +60,8 @@ HEAVY_ARTIFACT_EXTENSIONS: tuple[str, ...] = (
     ".vdi",
 )
 
+DOCUMENT_CREDENTIAL_MAX_FILESIZE_BYTES: Final[int] = 10 * 1024 * 1024
+
 SENSITIVE_FILE_WRAPPER_EXTENSIONS: tuple[str, ...] = (
     ".bak",
     ".backup",
@@ -188,6 +190,14 @@ def get_sensitive_phase_extensions(phase: str) -> tuple[str, ...]:
     return tuple(str(ext) for ext in extensions)
 
 
+def get_sensitive_phase_max_file_size_bytes(phase: str) -> int | None:
+    """Return an optional max file size budget for one sensitive-data phase."""
+    normalized = str(phase or "").strip().lower()
+    if normalized == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS:
+        return DOCUMENT_CREDENTIAL_MAX_FILESIZE_BYTES
+    return None
+
+
 def get_manspider_phase_extensions(phase: str) -> tuple[str, ...]:
     """Return extension list formatted for ``manspider -e`` for one phase."""
     return tuple(ext.lstrip(".") for ext in get_sensitive_phase_extensions(phase))
@@ -247,6 +257,7 @@ def get_sensitive_benchmark_profile(scope: str) -> str:
 __all__ = [
     "DEFAULT_SMB_SENSITIVE_FILE_PROFILE",
     "DIRECT_SECRET_ARTIFACT_EXTENSIONS",
+    "DOCUMENT_CREDENTIAL_MAX_FILESIZE_BYTES",
     "DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS",
     "HEAVY_ARTIFACT_EXTENSIONS",
     "SENSITIVE_FILE_WRAPPER_EXTENSIONS",
@@ -271,6 +282,7 @@ __all__ = [
     "resolve_effective_sensitive_extension",
     "get_sensitive_phase_definition",
     "get_sensitive_phase_extensions",
+    "get_sensitive_phase_max_file_size_bytes",
     "get_sensitive_file_extensions",
     "get_sensitive_file_profile",
 ]

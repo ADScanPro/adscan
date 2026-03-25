@@ -81,6 +81,42 @@ class NmapShell(Protocol):
     def _get_lab_slug(self) -> str | None: ...
 
 
+def _confirm_skip_important_port_scan(
+    *,
+    domain: str,
+    ip_count: int,
+    important_ports_csv: str,
+) -> bool:
+    """Return whether the operator wants to skip service discovery anyway."""
+    marked_domain = mark_sensitive(domain, "domain")
+    print_panel(
+        "\n".join(
+            [
+                "Skipping the important port scan reduces service-targeting precision.",
+                f"Domain: {marked_domain}",
+                f"Resolved IPs queued: {ip_count}",
+                f"Important TCP ports skipped: {important_ports_csv}",
+                "",
+                "What ADscan loses if you skip this step:",
+                "- service-specific host lists such as smb/ips.txt, winrm/ips.txt, rdp/ips.txt, and mssql/ips.txt",
+                "- current-vantage reachability evidence for those hosts",
+                "- cleaner post-auth targeting with less noise on broad host lists",
+                "",
+                "Later workflows will fall back to broader target sets such as reachable hosts or the full enabled computer list.",
+            ]
+        ),
+        title="Skip Important Port Scan?",
+        border_style="yellow",
+        expand=False,
+    )
+    return bool(
+        Confirm.ask(
+            f"Skip service discovery anyway for domain {marked_domain}?",
+            default=False,
+        )
+    )
+
+
 def _confirm_large_dc_discovery_scan(
     shell: NmapShell,
     *,
@@ -2008,6 +2044,12 @@ def convert_hostnames_to_ips_and_scan(
                     default=prompt_default,
                 )
             )
+            if not should_run_port_scan:
+                should_run_port_scan = not _confirm_skip_important_port_scan(
+                    domain=domain,
+                    ip_count=ip_count,
+                    important_ports_csv=important_ports_csv,
+                )
         if should_run_port_scan:
             # Now execute the port scan on the IP file sequentially
             scan_output_path = os.path.join(nmap_dir, "imp_ports_scan")

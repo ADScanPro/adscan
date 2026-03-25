@@ -48,7 +48,10 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.text_utils import strip_ansi_codes
-from adscan_internal.workspaces.computers import ensure_enabled_computer_ip_file
+from adscan_internal.workspaces.computers import (
+    consume_service_targeting_fallback_notice,
+    resolve_domain_service_target_file,
+)
 from adscan_internal.workspaces.subpaths import domain_relpath
 
 _NXC_SMB_LINE_RE = re.compile(r"^\s*SMB\s+\S+\s+\d+\s+(?P<host>[A-Za-z0-9_.-]+)\s+")
@@ -95,13 +98,24 @@ def _resolve_bulk_hosts_target(
     if _is_hosts_file_target(requested_host):
         return str(requested_host).strip()
     workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
-    hosts_file, source = ensure_enabled_computer_ip_file(
+    hosts_file, source = resolve_domain_service_target_file(
         workspace_dir,
         shell.domains_dir,
         domain,
-        shell.domains_data.get(domain, {}),
+        service="smb",
+        domain_data=shell.domains_data.get(domain, {}),
     )
     if hosts_file:
+        targeting_notice = consume_service_targeting_fallback_notice(
+            shell,
+            workspace_dir=workspace_dir,
+            domains_dir=shell.domains_dir,
+            domain=domain,
+            service="smb",
+            source=source,
+        )
+        if targeting_notice:
+            print_info(targeting_notice)
         print_info_debug(
             f"[dumps] using domain target file source={source} "
             f"for {mark_sensitive(domain, 'domain')}: "

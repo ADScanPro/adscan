@@ -4,6 +4,13 @@ set -euo pipefail
 uid="${ADSCAN_UID:-1000}"
 gid="${ADSCAN_GID:-1000}"
 
+# Always mark the process as running inside the ADscan FULL container runtime.
+# The official host launcher provides additional wiring (host-helper socket,
+# local resolver IP, launcher marker), but manual `docker run` / `docker exec`
+# should still be recognized as container runtime so the Python guard can block
+# unsupported launch paths clearly.
+export ADSCAN_CONTAINER_RUNTIME=1
+
 # Entry-point log file for ADscan runtime diagnostics.
 ENTRYPOINT_LOG="/opt/adscan/state/entrypoint.log"
 mkdir -p "$(dirname "${ENTRYPOINT_LOG}")" >/dev/null 2>&1 || true
@@ -25,6 +32,42 @@ if ! command -v gosu >/dev/null 2>&1; then
   _ep_log "gosu not found; image build is incomplete"
   exit 1
 fi
+
+_check_launcher_runtime_contract() {
+  local issues=()
+
+  if [[ "${ADSCAN_CONTAINER_RUNTIME:-}" != "1" ]]; then
+    return 0
+  fi
+
+  if [[ "${ADSCAN_OFFICIAL_LAUNCHER:-}" != "1" ]]; then
+    issues+=("missing_official_launcher_marker")
+  fi
+
+  if [[ -z "${ADSCAN_HOST_HELPER_SOCK:-}" ]]; then
+    issues+=("missing_host_helper_socket_env")
+  elif [[ ! -S "${ADSCAN_HOST_HELPER_SOCK}" ]]; then
+    issues+=("host_helper_socket_not_ready")
+  fi
+
+  if [[ -z "${ADSCAN_LOCAL_RESOLVER_IP:-}" ]]; then
+    issues+=("missing_local_resolver_ip")
+  fi
+
+  if [[ "${#issues[@]}" -eq 0 ]]; then
+    _ep_log "launcher runtime contract OK"
+    return 0
+  fi
+
+  _ep_log "launcher runtime contract incomplete: ${issues[*]}"
+  _ep_log "FULL runtime should be started via the official host launcher (pipx/pip install adscan)"
+  _ep_log "manual in-container launches will be blocked by the Python runtime guard"
+  if [[ -n "${ADSCAN_HOST_HELPER_SOCK:-}" ]]; then
+    _ep_log "host helper socket path: ${ADSCAN_HOST_HELPER_SOCK}"
+  fi
+}
+
+_check_launcher_runtime_contract
 
 if ! getent group "${gid}" >/dev/null 2>&1; then
   groupadd -g "${gid}" adscan >/dev/null 2>&1 || true

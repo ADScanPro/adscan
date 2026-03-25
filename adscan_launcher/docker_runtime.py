@@ -742,6 +742,8 @@ def build_adscan_run_command(
             "-e",
             "ADSCAN_CONTAINER_RUNTIME=1",
             "-e",
+            "ADSCAN_OFFICIAL_LAUNCHER=1",
+            "-e",
             f"ADSCAN_RUNTIME_IMAGE={cfg.image}",
             "-e",
             "ADSCAN_HOST_HELPER_SOCK=/run/adscan/host-helper.sock",

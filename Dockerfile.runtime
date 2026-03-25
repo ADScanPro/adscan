@@ -40,6 +40,9 @@ ARG JOHN_BLEEDING_JUMBO_COMMIT=d8f5b0138e6f9fe24ab453f886dcaa2abb2e5407
 ARG CREDSWEEPER_VERSION=1.15.1
 ARG HASHCAT_VERSION=7.1.2
 ARG LIGOLO_NG_VERSION=0.8.3
+ARG MEDUSA_COMMIT=fef1e1f0ee91f6108a5a48d3b3c11dc4df40b122
+ARG FREERDP_VERSION=3.24.1
+ARG FREERDP_COMMIT=b6e770ccba87c58ffd0a55366fef33361798e39c
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ENV ADSCAN_HOME=/opt/adscan \
@@ -75,8 +78,13 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       nodejs \
       npm \
       build-essential \
+      automake \
+      autoconf \
+      libtool \
       pkg-config \
       make \
+      cmake \
+      ninja-build \
       clang \
       llvm \
       libclang-dev \
@@ -117,8 +125,37 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       fonts-crosextra-carlito \
       fonts-crosextra-caladea \
       fonts-liberation \
+      libx11-dev \
+      libxext-dev \
+      libxinerama-dev \
+      libxcursor-dev \
+      libxkbcommon-dev \
+      libxkbfile-dev \
+      libxrandr-dev \
+      libxi-dev \
+      libxrender-dev \
+      libxv-dev \
+      libxfixes-dev \
+      libxdamage-dev \
+      libxtst-dev \
+      libfuse3-dev \
+      libpam0g-dev \
+      libasound2-dev \
+      libcups2-dev \
+      libpulse-dev \
+      libjpeg-dev \
+      libpng-dev \
+      libavutil-dev \
+      libavcodec-dev \
+      libswscale-dev \
+      libusb-1.0-0-dev \
+      libpcsclite-dev \
+      libsystemd-dev \
+      libwayland-dev \
+      wayland-protocols \
+      libepoxy-dev \
+      libicu-dev \
       libmagic1 \
-      freerdp3-x11 \
       ntpsec-ntpdate \
       unbound \
       unbound-anchor \
@@ -140,45 +177,59 @@ RUN mkdir -p /opt/adscan/{bin,tools,tool_venvs,wordlists,logs,fonts} /workspaces
 
 # Install Python tool environments (mirrors `PipToolsConfig` from adscan.py)
 RUN set -eux; \
+  pip_retry() { \
+    local python_bin="$1"; shift; \
+    local attempt=1; \
+    local max_attempts=4; \
+    until "$python_bin" -m pip install --no-cache-dir --retries 8 --timeout 120 "$@"; do \
+      if [ "$attempt" -ge "$max_attempts" ]; then \
+        echo "pip install failed after ${max_attempts} attempts: $*" >&2; \
+        return 1; \
+      fi; \
+      echo "pip install failed (attempt ${attempt}/${max_attempts}) for: $*" >&2; \
+      sleep $((attempt * 5)); \
+      attempt=$((attempt + 1)); \
+    done; \
+  }; \
   python3 -m venv /opt/adscan/tool_venvs/impacket/venv; \
-  /opt/adscan/tool_venvs/impacket/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/impacket/venv/bin/python -m pip install --no-cache-dir "impacket==0.13.0" "pycryptodome==3.23.0"; \
+  pip_retry /opt/adscan/tool_venvs/impacket/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/impacket/venv/bin/python "impacket==0.13.0" "pycryptodome==3.23.0"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/netexec/venv; \
-  /opt/adscan/tool_venvs/netexec/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/netexec/venv/bin/python -m pip install --no-cache-dir "git+https://github.com/Pennyw0rth/NetExec.git@f187717"; \
+  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python "git+https://github.com/Pennyw0rth/NetExec.git@f187717"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/certipy/venv; \
-  /opt/adscan/tool_venvs/certipy/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/certipy/venv/bin/python -m pip install --no-cache-dir "certipy-ad==5.0.4"; \
+  pip_retry /opt/adscan/tool_venvs/certipy/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/certipy/venv/bin/python "certipy-ad==5.0.4"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/bloodyad/venv; \
-  /opt/adscan/tool_venvs/bloodyad/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/bloodyad/venv/bin/python -m pip install --no-cache-dir "bloodyAD==2.5.1" "minikerberos==0.4.9"; \
+  pip_retry /opt/adscan/tool_venvs/bloodyad/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/bloodyad/venv/bin/python "bloodyAD==2.5.1" "minikerberos==0.4.9"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/bloodhound-ce-py/venv; \
-  /opt/adscan/tool_venvs/bloodhound-ce-py/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/bloodhound-ce-py/venv/bin/python -m pip install --no-cache-dir "bloodhound-ce==1.9.1"; \
+  pip_retry /opt/adscan/tool_venvs/bloodhound-ce-py/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/bloodhound-ce-py/venv/bin/python "bloodhound-ce==1.9.1"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/weakpass/venv; \
-  /opt/adscan/tool_venvs/weakpass/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/weakpass/venv/bin/python -m pip install --no-cache-dir "weakpass-lookup"; \
+  pip_retry /opt/adscan/tool_venvs/weakpass/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/weakpass/venv/bin/python "weakpass-lookup"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/enum-trusts/venv; \
-  /opt/adscan/tool_venvs/enum-trusts/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/enum-trusts/venv/bin/python -m pip install --no-cache-dir "git+https://github.com/ADScanPro/enum-trusts.git@f7eae14"; \
+  pip_retry /opt/adscan/tool_venvs/enum-trusts/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/enum-trusts/venv/bin/python "git+https://github.com/ADScanPro/enum-trusts.git@f7eae14"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/manspider/venv; \
-  /opt/adscan/tool_venvs/manspider/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/manspider/venv/bin/python -m pip install --no-cache-dir "git+https://github.com/ADScanPro/MANSPIDER@cedb138"; \
+  pip_retry /opt/adscan/tool_venvs/manspider/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/manspider/venv/bin/python "git+https://github.com/ADScanPro/MANSPIDER@cedb138"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/credsweeper/venv; \
-  /opt/adscan/tool_venvs/credsweeper/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/credsweeper/venv/bin/python -m pip install --no-cache-dir "credsweeper==${CREDSWEEPER_VERSION}"; \
+  pip_retry /opt/adscan/tool_venvs/credsweeper/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/credsweeper/venv/bin/python "credsweeper==${CREDSWEEPER_VERSION}"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/pypykatz/venv; \
-  /opt/adscan/tool_venvs/pypykatz/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/pypykatz/venv/bin/python -m pip install --no-cache-dir "pypykatz==0.6.13"; \
+  pip_retry /opt/adscan/tool_venvs/pypykatz/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/pypykatz/venv/bin/python "pypykatz==0.6.13"; \
   \
   chmod -R 0777 /opt/adscan/tool_venvs
 
@@ -238,6 +289,40 @@ RUN set -eux; \
   python3 -m venv /opt/adscan/tool_venvs/responder/venv; \
   /opt/adscan/tool_venvs/responder/venv/bin/python -m pip install --no-cache-dir -U pip; \
   /opt/adscan/tool_venvs/responder/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/responder/requirements.txt; \
+  \
+  git clone https://github.com/jmk-foofus/medusa.git /opt/adscan/tools/medusa; \
+  git -C /opt/adscan/tools/medusa checkout "${MEDUSA_COMMIT}"; \
+  git clone --branch "${FREERDP_VERSION}" --depth 1 https://github.com/FreeRDP/FreeRDP.git /opt/adscan/tools/freerdp; \
+  test "$(git -C /opt/adscan/tools/freerdp rev-parse HEAD)" = "${FREERDP_COMMIT}"; \
+  cmake -S /opt/adscan/tools/freerdp -B /opt/adscan/tools/freerdp/build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/opt/adscan/tools/freerdp/install \
+    -DBUILD_TESTING=OFF \
+    -DWITH_SERVER=OFF \
+    -DWITH_X11=ON \
+    -DWITH_WAYLAND=ON; \
+  cmake --build /opt/adscan/tools/freerdp/build --parallel "$(nproc)"; \
+  cmake --install /opt/adscan/tools/freerdp/build; \
+  ln -sf /opt/adscan/tools/freerdp/install/bin/xfreerdp /opt/adscan/bin/xfreerdp; \
+  ln -sf /opt/adscan/tools/freerdp/install/bin/xfreerdp /opt/adscan/bin/xfreerdp3; \
+  printf '%s\n' '/opt/adscan/tools/freerdp/install/lib' '/opt/adscan/tools/freerdp/install/lib64' \
+    > /etc/ld.so.conf.d/adscan-freerdp.conf; \
+  ldconfig; \
+  ( \
+    export PKG_CONFIG_PATH="/opt/adscan/tools/freerdp/install/lib/pkgconfig:/opt/adscan/tools/freerdp/install/lib64/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" && \
+    export CPPFLAGS="-I/opt/adscan/tools/freerdp/install/include/freerdp3 -I/opt/adscan/tools/freerdp/install/include/winpr3${CPPFLAGS:+ ${CPPFLAGS}}" && \
+    export CFLAGS="-I/opt/adscan/tools/freerdp/install/include${CFLAGS:+ ${CFLAGS}}" && \
+    export LDFLAGS="-L/opt/adscan/tools/freerdp/install/lib -L/opt/adscan/tools/freerdp/install/lib64 -Wl,-rpath,/opt/adscan/tools/freerdp/install/lib -Wl,-rpath,/opt/adscan/tools/freerdp/install/lib64${LDFLAGS:+ ${LDFLAGS}}" && \
+    cd /opt/adscan/tools/medusa; \
+    make distclean >/dev/null 2>&1 || true; \
+    autoreconf -fi && \
+    ./configure --prefix=/opt/adscan/tools/medusa/install --with-freerdp=/opt/adscan/tools/freerdp/install && \
+    make -sj"$(nproc)" && \
+    make install \
+  ); \
+  ln -sf /opt/adscan/tools/medusa/install/bin/medusa /opt/adscan/bin/medusa; \
+  /opt/adscan/bin/xfreerdp --version; \
+  /opt/adscan/bin/medusa -d | grep -i 'rdp'; \
   \
   git clone https://github.com/openwall/john.git /opt/adscan/tools/john; \
   git -C /opt/adscan/tools/john checkout "${JOHN_BLEEDING_JUMBO_COMMIT}"; \
@@ -335,7 +420,8 @@ RUN set -eux; \
     gpp-decrypt==2.0.0 \
     requests==2.32.5 \
     matplotlib==3.10.8 \
-    graphviz==0.21
+    graphviz==0.21 \
+    rustworkx==0.15.1
 
 COPY adscan.py /opt/adscan-src/adscan.py
 COPY adscan_core /opt/adscan-src/adscan_core

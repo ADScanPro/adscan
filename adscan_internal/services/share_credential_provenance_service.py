@@ -8,6 +8,7 @@ Centralizes creation of:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import PurePosixPath
 from typing import Any
 
 from adscan_internal.services.base_service import BaseService
@@ -24,6 +25,7 @@ class ShareCredentialProvenanceService(BaseService):
         artifact: str | None = None,
         auth_username: str | None = None,
         origin: str = "share_spidering",
+        access_vector: str | None = None,
         include_origin_without_fields: bool = True,
     ) -> dict[str, object] | None:
         """Build a normalized source_context dictionary for spraying flows."""
@@ -39,8 +41,14 @@ class ShareCredentialProvenanceService(BaseService):
             context["shares"] = share_values
         if artifact_text:
             context["artifact"] = artifact_text
+            artifact_kind = self._infer_artifact_kind(artifact_text)
+            if artifact_kind != "unknown":
+                context["artifact_kind"] = artifact_kind
         if auth_text:
             context["auth_username"] = auth_text
+        access_vector_text = str(access_vector or "").strip()
+        if access_vector_text:
+            context["access_vector"] = access_vector_text
         if origin and (include_origin_without_fields or context):
             context["origin"] = origin
         return context or None
@@ -85,6 +93,9 @@ class ShareCredentialProvenanceService(BaseService):
             notes["origin"] = origin
         if artifact_text:
             notes["artifact"] = artifact_text
+            artifact_kind = self._infer_artifact_kind(artifact_text)
+            if artifact_kind != "unknown":
+                notes["artifact_kind"] = artifact_kind
         if host_values:
             notes["hosts"] = ", ".join(host_values)
             notes["hosts_list"] = host_values
@@ -138,8 +149,13 @@ class ShareCredentialProvenanceService(BaseService):
         if spray_type_text:
             notes["spray_type"] = spray_type_text
         artifact_text = str(source_context.get("artifact") or "").strip()
+        artifact_kind = str(source_context.get("artifact_kind") or "").strip().lower()
+        if not artifact_kind and artifact_text:
+            artifact_kind = self._infer_artifact_kind(artifact_text)
         if artifact_text:
             notes["artifact"] = artifact_text
+        if artifact_kind and artifact_kind != "unknown":
+            notes["artifact_kind"] = artifact_kind
         secret_text = str(secret or "").strip()
         if secret_text:
             notes["password"] = secret_text
@@ -155,6 +171,82 @@ class ShareCredentialProvenanceService(BaseService):
         if auth_text:
             notes["auth_username"] = auth_text
         return entry_label, notes
+
+    def build_password_artifact_source_steps(
+        self,
+        *,
+        source_context: dict[str, object] | None,
+        spray_type: str | None = None,
+        secret: str | None = None,
+        verified_via: str = "spraying",
+    ) -> list[object]:
+        """Build generic artifact/share credential provenance steps from source context."""
+        if not isinstance(source_context, dict):
+            return []
+
+        origin = str(source_context.get("origin") or "").strip().lower()
+        if origin not in {"share_spidering", "artifact_filesystem"}:
+            return []
+
+        relation = "PasswordInShare" if origin == "share_spidering" else "PasswordInFile"
+        edge_type = "share_password" if origin == "share_spidering" else "file_password"
+        auth_text = str(source_context.get("auth_username") or "").strip()
+        host_values = self._normalize_context_values(source_context.get("hosts"))
+        share_values = self._normalize_context_values(source_context.get("shares"))
+        artifact_text = str(source_context.get("artifact") or "").strip()
+        artifact_kind = str(source_context.get("artifact_kind") or "").strip().lower()
+        if not artifact_kind and artifact_text:
+            artifact_kind = self._infer_artifact_kind(artifact_text)
+        secret_text = str(secret or "").strip()
+        spray_type_text = str(spray_type or "").strip()
+        access_vector_text = str(source_context.get("access_vector") or "").strip()
+
+        notes: dict[str, Any] = {
+            "origin": origin,
+            "verified_via": str(verified_via or "spraying"),
+        }
+        if access_vector_text:
+            notes["access_vector"] = access_vector_text
+        if spray_type_text:
+            notes["spray_type"] = spray_type_text
+        if artifact_text:
+            notes["artifact"] = artifact_text
+        if artifact_kind and artifact_kind != "unknown":
+            notes["artifact_kind"] = artifact_kind
+        if secret_text:
+            notes["password"] = secret_text
+        if auth_text:
+            notes["auth_username"] = auth_text
+        if host_values:
+            notes["hosts"] = ", ".join(host_values)
+            notes["hosts_list"] = host_values
+        if share_values:
+            notes["shares"] = ", ".join(share_values)
+            notes["shares_list"] = share_values
+
+        try:
+            from adscan_internal.services.attack_graph_service import (
+                CredentialSourceStep,
+                resolve_entry_label_for_auth,
+            )
+        except Exception:  # noqa: BLE001
+            return []
+
+        entry_label = resolve_entry_label_for_auth(auth_text)
+        entry_kind = ""
+        if origin == "artifact_filesystem" and host_values:
+            entry_label = host_values[0]
+            entry_kind = "computer"
+
+        return [
+            CredentialSourceStep(
+                relation=relation,
+                edge_type=edge_type,
+                entry_label=entry_label,
+                entry_kind=entry_kind,
+                notes=notes,
+            )
+        ]
 
     @staticmethod
     def _normalize_values(values: Sequence[str] | None) -> list[str]:
@@ -184,3 +276,96 @@ class ShareCredentialProvenanceService(BaseService):
         if isinstance(value, Sequence):
             return cls._normalize_values([str(item) for item in value])
         return cls._normalize_values([str(value)])
+
+    @staticmethod
+    def _infer_artifact_kind(artifact: str) -> str:
+        """Infer a coarse artifact kind from a path-like artifact string."""
+        artifact_text = str(artifact or "").strip().replace("\\", "/")
+        if not artifact_text:
+            return "unknown"
+
+        path = PurePosixPath(artifact_text)
+        filename = path.name.lower()
+        suffixes = [suffix.lower() for suffix in path.suffixes]
+        suffix_key = "".join(suffixes[-2:]) if len(suffixes) >= 2 else (suffixes[-1] if suffixes else "")
+
+        archive_suffixes = {
+            ".zip",
+            ".7z",
+            ".rar",
+            ".tar",
+            ".tgz",
+            ".gz",
+            ".bz2",
+            ".xz",
+            ".cab",
+            ".iso",
+            ".tar.gz",
+            ".tar.bz2",
+            ".tar.xz",
+        }
+        config_suffixes = {
+            ".cfg",
+            ".cnf",
+            ".conf",
+            ".config",
+            ".env",
+            ".ini",
+            ".json",
+            ".properties",
+            ".toml",
+            ".xml",
+            ".yaml",
+            ".yml",
+        }
+        document_suffixes = {
+            ".csv",
+            ".doc",
+            ".docx",
+            ".odt",
+            ".ods",
+            ".pdf",
+            ".ppt",
+            ".pptx",
+            ".rtf",
+            ".xls",
+            ".xlsx",
+        }
+        text_suffixes = {
+            ".log",
+            ".md",
+            ".ps1",
+            ".reg",
+            ".sh",
+            ".sql",
+            ".txt",
+        }
+        binary_suffixes = {
+            ".accdb",
+            ".bin",
+            ".dat",
+            ".db",
+            ".dll",
+            ".exe",
+            ".kdbx",
+            ".mdb",
+            ".p12",
+            ".pfx",
+            ".sqlite",
+        }
+
+        if suffix_key in archive_suffixes or (filename.endswith(".bak") and "config" not in filename):
+            return "archive"
+        if suffix_key in config_suffixes:
+            return "config"
+        if suffix_key in document_suffixes:
+            return "document"
+        if suffix_key in text_suffixes:
+            return "text"
+        if suffix_key in binary_suffixes:
+            return "binary"
+        if any(keyword in filename for keyword in {"config", "settings"}):
+            return "config"
+        if any(keyword in filename for keyword in {"backup", "archive"}):
+            return "archive"
+        return "unknown"

@@ -19,6 +19,8 @@ import socket
 import re
 import secrets
 import time
+import json
+import fcntl
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +120,7 @@ _DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3600
 _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB = 1.0
 _LOW_MEMORY_WARNING_THRESHOLD_GB = 1.5
 _EPHEMERAL_CONTAINER_SHARED_TOKEN: str | None = None
+_RUNTIME_SESSION_LOCK_NAME = "active-runtime.lock"
 _LEGACY_IMAGE_WARNING_SHOWN = False
 _DOCKER_RUNTIME_CONTEXT_EMITTED = False
 _DOCKER_HOST_RESOURCES_CONTEXT_EMITTED = False
@@ -130,6 +133,270 @@ _DOCKER_PULL_NETWORK_PREFLIGHT_TIMEOUT_SECONDS = 2.0
 # Keep BloodHound CE config in the effective user's home (sudo-safe), matching
 # the default behavior of bloodhound-cli tooling.
 BH_CONFIG_FILE = get_effective_user_home() / ".bloodhound_config"
+
+
+def _get_runtime_session_lock_path() -> Path:
+    """Return the launcher-wide runtime lock file path."""
+    return _get_run_dir() / _RUNTIME_SESSION_LOCK_NAME
+
+
+def _build_runtime_session_lock_metadata(
+    *,
+    command_name: str,
+    workspace_name: str | None = None,
+) -> dict[str, Any]:
+    """Build operator-facing metadata for the active runtime lock owner."""
+    metadata: dict[str, Any] = {
+        "pid": os.getpid(),
+        "command_name": str(command_name or "").strip() or "unknown",
+        "started_at_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        "adscan_home": str(get_adscan_home_dir()),
+    }
+    normalized_workspace = str(workspace_name or "").strip()
+    if normalized_workspace:
+        metadata["workspace_name"] = normalized_workspace
+    return metadata
+
+
+def _read_runtime_session_lock_metadata(lock_path: Path) -> dict[str, Any]:
+    """Read lock metadata from disk for UX/debug output."""
+    try:
+        raw = lock_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[runtime-lock] failed reading metadata: "
+            f"path={mark_sensitive(str(lock_path), 'path')} "
+            f"error={mark_sensitive(str(exc), 'error')}"
+        )
+    return {}
+
+
+def _write_runtime_session_lock_metadata(
+    handle: Any,
+    *,
+    metadata: dict[str, Any],
+) -> None:
+    """Persist the current lock owner metadata into the lock file."""
+    handle.seek(0)
+    handle.truncate()
+    json.dump(metadata, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _extract_workspace_from_passthrough_args(adscan_args: list[str]) -> str | None:
+    """Best-effort extraction of `--workspace/-w` from passthrough args."""
+    args = list(adscan_args or [])
+    for index, value in enumerate(args):
+        if value in {"--workspace", "-w"} and index + 1 < len(args):
+            workspace_name = str(args[index + 1] or "").strip()
+            return workspace_name or None
+        if value.startswith("--workspace="):
+            workspace_name = value.split("=", 1)[1].strip()
+            return workspace_name or None
+    return None
+
+
+def _print_runtime_session_lock_conflict(
+    *,
+    command_name: str,
+    lock_path: Path,
+    metadata: dict[str, Any],
+) -> None:
+    """Render a premium UX panel when another launcher runtime is active."""
+    active_command = str(metadata.get("command_name", "") or "").strip() or "unknown"
+    active_pid = str(metadata.get("pid", "") or "").strip() or "unknown"
+    started_at = (
+        str(metadata.get("started_at_utc", "") or "").strip() or "unknown"
+    )
+    active_workspace = str(metadata.get("workspace_name", "") or "").strip()
+    active_home = (
+        str(metadata.get("adscan_home", "") or "").strip()
+        or str(get_adscan_home_dir())
+    )
+
+    marked_lock_path = mark_sensitive(str(lock_path), "path")
+    marked_active_home = mark_sensitive(active_home, "path")
+
+    lines = [
+        "Another ADscan launcher/runtime session is already active.",
+        "",
+        f"Active command: {mark_sensitive(active_command, 'detail')}",
+        f"Active PID: {mark_sensitive(active_pid, 'detail')}",
+        f"Started at (UTC): {mark_sensitive(started_at, 'detail')}",
+        f"ADSCAN_HOME: {marked_active_home}",
+        f"Lock file: {marked_lock_path}",
+    ]
+    if active_workspace:
+        lines.append(
+            f"Active workspace: {mark_sensitive(active_workspace, 'workspace')}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "ADscan blocks a second launcher session because Docker mode shares:",
+            "- the host-helper socket",
+            "- runtime state/log mounts",
+            "- workspace persistence paths",
+            "",
+            "Starting another session now could break helper-backed features in the active runtime or overwrite shared state.",
+        ]
+    )
+
+    if active_command == "start":
+        lines.extend(
+            [
+                "",
+                "An ADscan interactive runtime is already open. Return to that terminal and exit the active ADscan session before starting another one.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "Wait for the active launcher command to finish, then retry.",
+            ]
+        )
+
+    print_panel(
+        "\n".join(lines),
+        title="Another ADscan Runtime Is Active",
+        border_style="yellow",
+    )
+    if active_command == "start":
+        print_instruction("Go back to the terminal that already has ADscan open.")
+        print_instruction("Exit that ADscan session cleanly, then retry this command.")
+    else:
+        print_instruction("Wait for the active launcher command to finish, then retry.")
+    print_instruction("Do not launch a second ADscan runtime from another terminal at the same time.")
+
+
+def _acquire_runtime_session_lock(
+    *,
+    command_name: str,
+    workspace_name: str | None = None,
+) -> Any | None:
+    """Acquire the single-runtime launcher lock or render a conflict panel."""
+    lock_path = _get_runtime_session_lock_path()
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_warning(
+            "Failed to prepare the ADscan runtime lock directory. Continuing without concurrency guard."
+        )
+        print_info_debug(
+            "[runtime-lock] failed creating parent dir: "
+            f"path={mark_sensitive(str(lock_path.parent), 'path')} "
+            f"error={mark_sensitive(str(exc), 'error')}"
+        )
+        return None
+
+    try:
+        handle = open(lock_path, "a+", encoding="utf-8")  # noqa: SIM115
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_warning(
+            "Failed to open the ADscan runtime lock file. Continuing without concurrency guard."
+        )
+        print_info_debug(
+            "[runtime-lock] failed opening lock file: "
+            f"path={mark_sensitive(str(lock_path), 'path')} "
+            f"error={mark_sensitive(str(exc), 'error')}"
+        )
+        return None
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        metadata = _read_runtime_session_lock_metadata(lock_path)
+        print_info_debug(
+            "[runtime-lock] active session conflict: "
+            f"command={mark_sensitive(command_name, 'detail')} "
+            f"path={mark_sensitive(str(lock_path), 'path')} "
+            f"owner_command={mark_sensitive(str(metadata.get('command_name', 'unknown')), 'detail')}"
+        )
+        telemetry.capture(
+            "docker_runtime_concurrency_blocked",
+            {
+                "command_name": str(command_name or "").strip() or "unknown",
+                "owner_command_name": str(metadata.get("command_name", "") or "").strip()
+                or "unknown",
+                "owner_pid": str(metadata.get("pid", "") or "").strip() or "unknown",
+                "has_owner_workspace": str(
+                    bool(str(metadata.get("workspace_name", "") or "").strip())
+                ).lower(),
+            },
+        )
+        _print_runtime_session_lock_conflict(
+            command_name=command_name,
+            lock_path=lock_path,
+            metadata=metadata,
+        )
+        try:
+            handle.close()
+        except OSError:
+            pass
+        return False
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_warning(
+            "Failed to acquire the ADscan runtime lock. Continuing without concurrency guard."
+        )
+        print_info_debug(
+            "[runtime-lock] unexpected flock error: "
+            f"path={mark_sensitive(str(lock_path), 'path')} "
+            f"error={mark_sensitive(str(exc), 'error')}"
+        )
+        try:
+            handle.close()
+        except OSError:
+            pass
+        return None
+
+    metadata = _build_runtime_session_lock_metadata(
+        command_name=command_name,
+        workspace_name=workspace_name,
+    )
+    try:
+        _write_runtime_session_lock_metadata(handle, metadata=metadata)
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[runtime-lock] failed writing metadata: "
+            f"path={mark_sensitive(str(lock_path), 'path')} "
+            f"error={mark_sensitive(str(exc), 'error')}"
+        )
+    return handle
+
+
+def _release_runtime_session_lock(handle: Any | None) -> None:
+    """Release a previously acquired runtime-session lock."""
+    if handle in (None, False):
+        return
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.flush()
+        os.fsync(handle.fileno())
+    except OSError:
+        pass
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
 
 
 def _emit_bloodhound_ce_config_diagnostics(
@@ -4713,95 +4980,101 @@ def handle_check_docker(
     """Check ADscan Docker-mode prerequisites."""
     _emit_docker_runtime_context(command_name="check")
     _emit_docker_host_resources_context(command_name="check")
+    runtime_lock = _acquire_runtime_session_lock(command_name="check")
+    if runtime_lock is False:
+        return False
     image = _select_existing_or_preferred_image()
     all_ok = True
     _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
-
-    print_info("Checking ADscan Docker mode...")
-    if not docker_available():
-        print_error("Docker is not installed or not in PATH.")
-        print_instruction(
-            f"Install Docker + Docker Compose, then retry. Guide: {_DOCKER_INSTALL_DOCS_URL}"
-        )
-        return False
-
-    if not image_exists(image):
-        print_warning(f"ADscan docker image not present: {image}")
-        print_instruction("Run: adscan install (pulls the latest image).")
-        all_ok = False
-
-    managed_ready, _compose_path = _ensure_managed_bloodhound_runtime_ready(
-        command_name="check",
-        desired_password=_get_bloodhound_admin_password(),
-        pull_missing_images=False,
-        pull_stream_output=False,
-        pull_timeout_seconds=None,
-        start_stack=True,
-        verify_auth=True,
-        allow_auth_bootstrap=False,
-        allow_low_memory=allow_low_memory,
-    )
-    if not managed_ready:
-        all_ok = False
-
-    # Best-effort: run `--version` inside the container to validate basic execution.
-    if all_ok:
-        workspaces_dir = _get_workspaces_dir()
-        config_dir = _get_config_dir()
-        codex_dir = _get_codex_container_dir()
-        logs_dir = _get_logs_dir()
-        run_dir = _get_run_dir()
-        state_dir = _get_state_dir()
-        if not _ensure_host_mount_dir_writable(
-            workspaces_dir, description="Workspaces"
-        ):
-            return False
-        if not _ensure_host_mount_dir_writable(config_dir, description="Config"):
-            return False
-        if not _ensure_host_mount_dir_writable(
-            codex_dir, description="Codex Container Auth"
-        ):
-            return False
-        if not _ensure_host_mount_dir_writable(logs_dir, description="Logs"):
-            return False
-        if not _ensure_host_mount_dir_writable(run_dir, description="Runtime"):
-            return False
-        if not _ensure_host_mount_dir_writable(state_dir, description="State"):
+    try:
+        print_info("Checking ADscan Docker mode...")
+        if not docker_available():
+            print_error("Docker is not installed or not in PATH.")
+            print_instruction(
+                f"Install Docker + Docker Compose, then retry. Guide: {_DOCKER_INSTALL_DOCS_URL}"
+            )
             return False
 
-        helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
-            command_name="check",
-            run_dir=run_dir,
-        )
-        if helper_proc is None:
+        if not image_exists(image):
+            print_warning(f"ADscan docker image not present: {image}")
+            print_instruction("Run: adscan install (pulls the latest image).")
             all_ok = False
-        else:
-            _stop_host_helper(helper_proc)
+
+        managed_ready, _compose_path = _ensure_managed_bloodhound_runtime_ready(
+            command_name="check",
+            desired_password=_get_bloodhound_admin_password(),
+            pull_missing_images=False,
+            pull_stream_output=False,
+            pull_timeout_seconds=None,
+            start_stack=True,
+            verify_auth=True,
+            allow_auth_bootstrap=False,
+            allow_low_memory=allow_low_memory,
+        )
+        if not managed_ready:
+            all_ok = False
 
         if all_ok:
-            cfg = DockerRunConfig(
-                image=image, workspaces_host_dir=workspaces_dir, interactive=False
-            )
-            cmd = build_adscan_run_command(cfg, adscan_args=["--version"])
-            print_info_debug(f"[docker] probe: {shell_quote_cmd(cmd)}")
-            try:
-                proc = run_docker(cmd, check=False, capture_output=True, timeout=60)
-                if proc.returncode == 0:
-                    print_success("Docker-mode execution probe succeeded.")
-                else:
-                    all_ok = False
-                    print_warning("Docker-mode execution probe failed.")
-                    if proc.stderr:
-                        print_info_debug(f"[docker] probe stderr:\n{proc.stderr}")
-                    if proc.stdout:
-                        print_info_debug(f"[docker] probe stdout:\n{proc.stdout}")
-            except Exception as exc:  # pragma: no cover
-                telemetry.capture_exception(exc)
-                print_warning("Docker-mode execution probe failed due to an exception.")
-                print_info_debug(f"[docker] probe exception: {exc}")
-                all_ok = False
+            workspaces_dir = _get_workspaces_dir()
+            config_dir = _get_config_dir()
+            codex_dir = _get_codex_container_dir()
+            logs_dir = _get_logs_dir()
+            run_dir = _get_run_dir()
+            state_dir = _get_state_dir()
+            if not _ensure_host_mount_dir_writable(
+                workspaces_dir, description="Workspaces"
+            ):
+                return False
+            if not _ensure_host_mount_dir_writable(config_dir, description="Config"):
+                return False
+            if not _ensure_host_mount_dir_writable(
+                codex_dir, description="Codex Container Auth"
+            ):
+                return False
+            if not _ensure_host_mount_dir_writable(logs_dir, description="Logs"):
+                return False
+            if not _ensure_host_mount_dir_writable(run_dir, description="Runtime"):
+                return False
+            if not _ensure_host_mount_dir_writable(state_dir, description="State"):
+                return False
 
-    return all_ok
+            helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
+                command_name="check",
+                run_dir=run_dir,
+            )
+            if helper_proc is None:
+                all_ok = False
+            else:
+                _stop_host_helper(helper_proc)
+
+            if all_ok:
+                cfg = DockerRunConfig(
+                    image=image, workspaces_host_dir=workspaces_dir, interactive=False
+                )
+                cmd = build_adscan_run_command(cfg, adscan_args=["--version"])
+                print_info_debug(f"[docker] probe: {shell_quote_cmd(cmd)}")
+                try:
+                    proc = run_docker(cmd, check=False, capture_output=True, timeout=60)
+                    if proc.returncode == 0:
+                        print_success("Docker-mode execution probe succeeded.")
+                    else:
+                        all_ok = False
+                        print_warning("Docker-mode execution probe failed.")
+                        if proc.stderr:
+                            print_info_debug(f"[docker] probe stderr:\n{proc.stderr}")
+                        if proc.stdout:
+                            print_info_debug(f"[docker] probe stdout:\n{proc.stdout}")
+                except Exception as exc:  # pragma: no cover
+                    telemetry.capture_exception(exc)
+                    print_warning(
+                        "Docker-mode execution probe failed due to an exception."
+                    )
+                    print_info_debug(f"[docker] probe exception: {exc}")
+                    all_ok = False
+
+        return all_ok
+    finally:
+        _release_runtime_session_lock(runtime_lock)
 
 
 def handle_start_docker(
@@ -4815,146 +5088,145 @@ def handle_start_docker(
     """Start ADscan inside Docker and return the docker exit code."""
     _emit_docker_runtime_context(command_name="start")
     _emit_docker_host_resources_context(command_name="start")
+    runtime_lock = _acquire_runtime_session_lock(command_name="start")
+    if runtime_lock is False:
+        return 1
     image = _select_existing_or_preferred_image()
     resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
     compose_path: Path | None = None
-    if not docker_available():
-        print_error("Docker is not installed or not in PATH.")
-        return 1
-    if not _ensure_docker_compose_prerequisites(command_name="start"):
-        return 1
-    resolved_image = _ensure_runtime_image_available(
-        image=image,
-        pull_timeout_seconds=pull_timeout_seconds,
-        command_name="start",
-    )
-    if not resolved_image:
-        return 1
-    image = resolved_image
-
-    managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
-        command_name="start",
-        desired_password=_get_bloodhound_admin_password(),
-        pull_missing_images=True,
-        pull_stream_output=False,
-        pull_timeout_seconds=pull_timeout_seconds,
-        start_stack=True,
-        verify_auth=True,
-        allow_auth_bootstrap=True,
-        allow_low_memory=allow_low_memory,
-    )
-    if not managed_ready or compose_path is None:
-        return 1
-    _ensure_bloodhound_config_mountable()
-    print_info_debug(
-        "[bloodhound-ce] host config availability before docker run: "
-        f"path={mark_sensitive(str(BH_CONFIG_FILE), 'path')} "
-        f"exists={BH_CONFIG_FILE.exists()}"
-    )
-
-    workspaces = _get_workspaces_dir()
-    config_dir = _get_config_dir()
-    codex_dir = _get_codex_container_dir()
-    logs_dir = _get_logs_dir()
-    run_dir = _get_run_dir()
-    state_dir = _get_state_dir()
-    if not _ensure_host_mount_dir_writable(workspaces, description="Workspaces"):
-        return 1
-    if not _ensure_host_mount_dir_writable(config_dir, description="Config"):
-        return 1
-    if not _ensure_host_mount_dir_writable(
-        codex_dir, description="Codex Container Auth"
-    ):
-        return 1
-    if not _ensure_host_mount_dir_writable(logs_dir, description="Logs"):
-        return 1
-    if not _ensure_host_mount_dir_writable(run_dir, description="Runtime"):
-        return 1
-    if not _ensure_host_mount_dir_writable(state_dir, description="State"):
-        return 1
-
-    helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
-        command_name="start",
-        run_dir=run_dir,
-    )
-    if helper_proc is None:
-        return 1
     try:
-        gpu_args = _detect_gpu_docker_run_args()
-        local_resolver_ip = _select_container_local_resolver_ip()
-        if local_resolver_ip is None:
+        if not docker_available():
+            print_error("Docker is not installed or not in PATH.")
             return 1
-
-        # Build extra docker run args, including GPU flags and a bind mount for the
-        # shared BloodHound CE configuration so host and container always see the
-        # same ~/.bloodhound_config.
-        extra_run_args: list[str] = list(gpu_args)
-        try:
-            if BH_CONFIG_FILE.exists():
-                print_info_debug(
-                    "[bloodhound-ce] mounting host config into container: "
-                    f"{mark_sensitive(str(BH_CONFIG_FILE), 'path')} -> "
-                    "/opt/adscan/.bloodhound_config"
-                )
-                extra_run_args.extend(
-                    [
-                        "-v",
-                        f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
-                    ]
-                )
-            else:
-                print_info_debug(
-                    "[bloodhound-ce] host config missing; no mount for ~/.bloodhound_config"
-                )
-        except Exception:
-            # Best-effort only; failure to mount the config should not break docker
-            # start, but may cause host/container configs to diverge.
-            pass
-
-        cfg = DockerRunConfig(
+        if not _ensure_docker_compose_prerequisites(command_name="start"):
+            return 1
+        resolved_image = _ensure_runtime_image_available(
             image=image,
-            workspaces_host_dir=workspaces,
-            interactive=True,
-            extra_run_args=tuple(extra_run_args),
-            extra_env=tuple(
-                [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
-                + (
-                    [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
-                    if compose_path is not None
-                    else []
-                )
-                + [
-                    ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
-                    ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
-                ]
-            ),
+            pull_timeout_seconds=pull_timeout_seconds,
+            command_name="start",
+        )
+        if not resolved_image:
+            return 1
+        image = resolved_image
+
+        managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
+            command_name="start",
+            desired_password=_get_bloodhound_admin_password(),
+            pull_missing_images=True,
+            pull_stream_output=False,
+            pull_timeout_seconds=pull_timeout_seconds,
+            start_stack=True,
+            verify_auth=True,
+            allow_auth_bootstrap=True,
+            allow_low_memory=allow_low_memory,
+        )
+        if not managed_ready or compose_path is None:
+            return 1
+        _ensure_bloodhound_config_mountable()
+        print_info_debug(
+            "[bloodhound-ce] host config availability before docker run: "
+            f"path={mark_sensitive(str(BH_CONFIG_FILE), 'path')} "
+            f"exists={BH_CONFIG_FILE.exists()}"
         )
 
-        adscan_args: list[str] = []
-        if verbose:
-            # Subcommand-scoped flag.
-            pass
-        if debug:
-            # Subcommand-scoped flag.
-            pass
-        adscan_args.append("start")
-        if verbose:
-            adscan_args.append("--verbose")
-        if debug:
-            adscan_args.append("--debug")
-
-        cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
-        print_info_debug(f"[docker] start: {shell_quote_cmd(cmd)}")
-        try:
-            proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
-            return int(proc.returncode)
-        except subprocess.SubprocessError as exc:
-            telemetry.capture_exception(exc)
-            print_error("Failed to start ADscan in Docker.")
-            print_info_debug(f"[docker] start exception: {exc}")
+        workspaces = _get_workspaces_dir()
+        config_dir = _get_config_dir()
+        codex_dir = _get_codex_container_dir()
+        logs_dir = _get_logs_dir()
+        run_dir = _get_run_dir()
+        state_dir = _get_state_dir()
+        if not _ensure_host_mount_dir_writable(workspaces, description="Workspaces"):
             return 1
+        if not _ensure_host_mount_dir_writable(config_dir, description="Config"):
+            return 1
+        if not _ensure_host_mount_dir_writable(
+            codex_dir, description="Codex Container Auth"
+        ):
+            return 1
+        if not _ensure_host_mount_dir_writable(logs_dir, description="Logs"):
+            return 1
+        if not _ensure_host_mount_dir_writable(run_dir, description="Runtime"):
+            return 1
+        if not _ensure_host_mount_dir_writable(state_dir, description="State"):
+            return 1
+
+        helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
+            command_name="start",
+            run_dir=run_dir,
+        )
+        if helper_proc is None:
+            return 1
+        try:
+            gpu_args = _detect_gpu_docker_run_args()
+            local_resolver_ip = _select_container_local_resolver_ip()
+            if local_resolver_ip is None:
+                return 1
+
+            extra_run_args: list[str] = list(gpu_args)
+            try:
+                if BH_CONFIG_FILE.exists():
+                    print_info_debug(
+                        "[bloodhound-ce] mounting host config into container: "
+                        f"{mark_sensitive(str(BH_CONFIG_FILE), 'path')} -> "
+                        "/opt/adscan/.bloodhound_config"
+                    )
+                    extra_run_args.extend(
+                        [
+                            "-v",
+                            f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
+                        ]
+                    )
+                else:
+                    print_info_debug(
+                        "[bloodhound-ce] host config missing; no mount for ~/.bloodhound_config"
+                    )
+            except Exception:
+                pass
+
+            cfg = DockerRunConfig(
+                image=image,
+                workspaces_host_dir=workspaces,
+                interactive=True,
+                extra_run_args=tuple(extra_run_args),
+                extra_env=tuple(
+                    [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+                    + (
+                        [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
+                        if compose_path is not None
+                        else []
+                    )
+                    + [
+                        ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
+                        ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+                    ]
+                ),
+            )
+
+            adscan_args: list[str] = []
+            if verbose:
+                pass
+            if debug:
+                pass
+            adscan_args.append("start")
+            if verbose:
+                adscan_args.append("--verbose")
+            if debug:
+                adscan_args.append("--debug")
+
+            cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
+            print_info_debug(f"[docker] start: {shell_quote_cmd(cmd)}")
+            try:
+                proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
+                return int(proc.returncode)
+            except subprocess.SubprocessError as exc:
+                telemetry.capture_exception(exc)
+                print_error("Failed to start ADscan in Docker.")
+                print_info_debug(f"[docker] start exception: {exc}")
+                return 1
+        finally:
+            _stop_host_helper(helper_proc)
     finally:
-        _stop_host_helper(helper_proc)
+        _release_runtime_session_lock(runtime_lock)
 
 
 def handle_ci_docker(
@@ -4980,151 +5252,158 @@ def handle_ci_docker(
     """Run `adscan ci` inside Docker and return the docker exit code."""
     _emit_docker_runtime_context(command_name="ci")
     _emit_docker_host_resources_context(command_name="ci")
+    runtime_lock = _acquire_runtime_session_lock(
+        command_name="ci",
+        workspace_name=workspace,
+    )
+    if runtime_lock is False:
+        return 1
     image = _select_existing_or_preferred_image()
     resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
     compose_path: Path | None = None
-    if not docker_available():
-        print_error("Docker is not installed or not in PATH.")
-        return 1
-    if not _ensure_docker_compose_prerequisites(command_name="ci"):
-        return 1
-    resolved_image = _ensure_runtime_image_available(
-        image=image,
-        pull_timeout_seconds=pull_timeout_seconds,
-        command_name="ci",
-    )
-    if not resolved_image:
-        return 1
-    image = resolved_image
-
-    managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
-        command_name="ci",
-        desired_password=_get_bloodhound_admin_password(),
-        pull_missing_images=True,
-        pull_stream_output=False,
-        pull_timeout_seconds=pull_timeout_seconds,
-        start_stack=True,
-        verify_auth=True,
-        allow_auth_bootstrap=True,
-        allow_low_memory=allow_low_memory,
-    )
-    if not managed_ready or compose_path is None:
-        return 1
-
-    workspaces_dir = _get_workspaces_dir()
-    config_dir = _get_config_dir()
-    codex_dir = _get_codex_container_dir()
-    logs_dir = _get_logs_dir()
-    run_dir = _get_run_dir()
-    state_dir = _get_state_dir()
-    if not _ensure_host_mount_dir_writable(workspaces_dir, description="Workspaces"):
-        return 1
-    if not _ensure_host_mount_dir_writable(config_dir, description="Config"):
-        return 1
-    if not _ensure_host_mount_dir_writable(
-        codex_dir, description="Codex Container Auth"
-    ):
-        return 1
-    if not _ensure_host_mount_dir_writable(logs_dir, description="Logs"):
-        return 1
-    if not _ensure_host_mount_dir_writable(run_dir, description="Runtime"):
-        return 1
-    if not _ensure_host_mount_dir_writable(state_dir, description="State"):
-        return 1
-
-    helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
-        command_name="ci",
-        run_dir=run_dir,
-    )
-    if helper_proc is None:
-        return 1
-
     try:
-        # Preserve Rich colors when running locally: allocate a TTY when the host has one.
-        # In CI (no TTY), we avoid `-t` to prevent "the input device is not a TTY" errors.
-        interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
-        local_resolver_ip = _select_container_local_resolver_ip()
-        if local_resolver_ip is None:
+        if not docker_available():
+            print_error("Docker is not installed or not in PATH.")
             return 1
-        _ensure_bloodhound_config_mountable()
-        extra_run_args: list[str] = []
-        try:
-            if BH_CONFIG_FILE.exists():
-                print_info_debug(
-                    "[bloodhound-ce] mounting host config into container: "
-                    f"{mark_sensitive(str(BH_CONFIG_FILE), 'path')} -> "
-                    "/opt/adscan/.bloodhound_config"
-                )
-                extra_run_args.extend(
-                    [
-                        "-v",
-                        f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
-                    ]
-                )
-            else:
-                print_info_debug(
-                    "[bloodhound-ce] host config missing; no mount for ~/.bloodhound_config"
-                )
-        except Exception:
-            pass
-        cfg = DockerRunConfig(
+        if not _ensure_docker_compose_prerequisites(command_name="ci"):
+            return 1
+        resolved_image = _ensure_runtime_image_available(
             image=image,
-            workspaces_host_dir=workspaces_dir,
-            interactive=interactive,
-            extra_run_args=tuple(extra_run_args),
-            extra_env=tuple(
-                [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
-                + (
-                    [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
-                    if compose_path is not None
-                    else []
-                )
-                + [
-                    ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
-                    ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
-                ]
-            ),
+            pull_timeout_seconds=pull_timeout_seconds,
+            command_name="ci",
         )
-
-        adscan_args: list[str] = []
-        adscan_args.append("ci")
-        adscan_args.append(mode)
-        if debug:
-            adscan_args.append("--debug")
-        if verbose:
-            adscan_args.append("--verbose")
-        adscan_args.extend(["--type", workspace_type, "--interface", interface])
-
-        if hosts:
-            adscan_args.extend(["--hosts", hosts])
-        if domain:
-            adscan_args.extend(["--domain", domain])
-        if dc_ip:
-            adscan_args.extend(["--dc-ip", dc_ip])
-        if username:
-            adscan_args.extend(["--username", username])
-        if password:
-            adscan_args.extend(["--password", password])
-        if workspace:
-            adscan_args.extend(["--workspace", workspace])
-        if keep_workspace:
-            adscan_args.append("--keep-workspace")
-        if generate_report:
-            adscan_args.append("--generate-report")
-            adscan_args.extend(["--report-format", report_format])
-
-        cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
-        print_info_debug(f"[docker] ci: {shell_quote_cmd(cmd)}")
-        try:
-            proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
-            return int(proc.returncode)
-        except subprocess.SubprocessError as exc:
-            telemetry.capture_exception(exc)
-            print_error("Failed to run ADscan CI in Docker.")
-            print_info_debug(f"[docker] ci exception: {exc}")
+        if not resolved_image:
             return 1
+        image = resolved_image
+
+        managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
+            command_name="ci",
+            desired_password=_get_bloodhound_admin_password(),
+            pull_missing_images=True,
+            pull_stream_output=False,
+            pull_timeout_seconds=pull_timeout_seconds,
+            start_stack=True,
+            verify_auth=True,
+            allow_auth_bootstrap=True,
+            allow_low_memory=allow_low_memory,
+        )
+        if not managed_ready or compose_path is None:
+            return 1
+
+        workspaces_dir = _get_workspaces_dir()
+        config_dir = _get_config_dir()
+        codex_dir = _get_codex_container_dir()
+        logs_dir = _get_logs_dir()
+        run_dir = _get_run_dir()
+        state_dir = _get_state_dir()
+        if not _ensure_host_mount_dir_writable(workspaces_dir, description="Workspaces"):
+            return 1
+        if not _ensure_host_mount_dir_writable(config_dir, description="Config"):
+            return 1
+        if not _ensure_host_mount_dir_writable(
+            codex_dir, description="Codex Container Auth"
+        ):
+            return 1
+        if not _ensure_host_mount_dir_writable(logs_dir, description="Logs"):
+            return 1
+        if not _ensure_host_mount_dir_writable(run_dir, description="Runtime"):
+            return 1
+        if not _ensure_host_mount_dir_writable(state_dir, description="State"):
+            return 1
+
+        helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
+            command_name="ci",
+            run_dir=run_dir,
+        )
+        if helper_proc is None:
+            return 1
+
+        try:
+            interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+            local_resolver_ip = _select_container_local_resolver_ip()
+            if local_resolver_ip is None:
+                return 1
+            _ensure_bloodhound_config_mountable()
+            extra_run_args: list[str] = []
+            try:
+                if BH_CONFIG_FILE.exists():
+                    print_info_debug(
+                        "[bloodhound-ce] mounting host config into container: "
+                        f"{mark_sensitive(str(BH_CONFIG_FILE), 'path')} -> "
+                        "/opt/adscan/.bloodhound_config"
+                    )
+                    extra_run_args.extend(
+                        [
+                            "-v",
+                            f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
+                        ]
+                    )
+                else:
+                    print_info_debug(
+                        "[bloodhound-ce] host config missing; no mount for ~/.bloodhound_config"
+                    )
+            except Exception:
+                pass
+            cfg = DockerRunConfig(
+                image=image,
+                workspaces_host_dir=workspaces_dir,
+                interactive=interactive,
+                extra_run_args=tuple(extra_run_args),
+                extra_env=tuple(
+                    [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+                    + (
+                        [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
+                        if compose_path is not None
+                        else []
+                    )
+                    + [
+                        ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
+                        ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+                    ]
+                ),
+            )
+
+            adscan_args: list[str] = []
+            adscan_args.append("ci")
+            adscan_args.append(mode)
+            if debug:
+                adscan_args.append("--debug")
+            if verbose:
+                adscan_args.append("--verbose")
+            adscan_args.extend(["--type", workspace_type, "--interface", interface])
+
+            if hosts:
+                adscan_args.extend(["--hosts", hosts])
+            if domain:
+                adscan_args.extend(["--domain", domain])
+            if dc_ip:
+                adscan_args.extend(["--dc-ip", dc_ip])
+            if username:
+                adscan_args.extend(["--username", username])
+            if password:
+                adscan_args.extend(["--password", password])
+            if workspace:
+                adscan_args.extend(["--workspace", workspace])
+            if keep_workspace:
+                adscan_args.append("--keep-workspace")
+            if generate_report:
+                adscan_args.append("--generate-report")
+                adscan_args.extend(["--report-format", report_format])
+
+            cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
+            print_info_debug(f"[docker] ci: {shell_quote_cmd(cmd)}")
+            try:
+                proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
+                return int(proc.returncode)
+            except subprocess.SubprocessError as exc:
+                telemetry.capture_exception(exc)
+                print_error("Failed to run ADscan CI in Docker.")
+                print_info_debug(f"[docker] ci exception: {exc}")
+                return 1
+        finally:
+            _stop_host_helper(helper_proc)
     finally:
-        _stop_host_helper(helper_proc)
+        _release_runtime_session_lock(runtime_lock)
 
 
 def update_docker_image(*, pull_timeout_seconds: int | None = None) -> int:
@@ -5173,116 +5452,124 @@ def run_adscan_passthrough_docker(
     """
     _emit_docker_runtime_context(command_name="passthrough")
     _emit_docker_host_resources_context(command_name="passthrough")
+    runtime_lock = _acquire_runtime_session_lock(
+        command_name="passthrough",
+        workspace_name=_extract_workspace_from_passthrough_args(adscan_args),
+    )
+    if runtime_lock is False:
+        return 1
     image = _select_existing_or_preferred_image()
     resolved_stack_mode = _normalize_bloodhound_stack_mode(bloodhound_stack_mode)
     compose_path: Path | None = None
-    if not docker_available():
-        print_error("Docker is not installed or not in PATH.")
-        return 1
-    if not _ensure_docker_compose_prerequisites(command_name="passthrough"):
-        return 1
-    resolved_image = _ensure_runtime_image_available(
-        image=image,
-        pull_timeout_seconds=pull_timeout_seconds,
-        command_name="passthrough",
-    )
-    if not resolved_image:
-        return 1
-    image = resolved_image
-
-    managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
-        command_name="passthrough",
-        desired_password=_get_bloodhound_admin_password(),
-        pull_missing_images=True,
-        pull_stream_output=True,
-        pull_timeout_seconds=pull_timeout_seconds,
-        start_stack=True,
-        verify_auth=True,
-        allow_auth_bootstrap=True,
-        allow_low_memory=allow_low_memory,
-    )
-    if not managed_ready or compose_path is None:
-        return 1
-
-    workspaces_dir = _get_workspaces_dir()
-    config_dir = _get_config_dir()
-    codex_dir = _get_codex_container_dir()
-    logs_dir = _get_logs_dir()
-    run_dir = _get_run_dir()
-    state_dir = _get_state_dir()
-    if not _ensure_host_mount_dir_writable(workspaces_dir, description="Workspaces"):
-        return 1
-    if not _ensure_host_mount_dir_writable(config_dir, description="Config"):
-        return 1
-    if not _ensure_host_mount_dir_writable(
-        codex_dir, description="Codex Container Auth"
-    ):
-        return 1
-    if not _ensure_host_mount_dir_writable(logs_dir, description="Logs"):
-        return 1
-    if not _ensure_host_mount_dir_writable(run_dir, description="Runtime"):
-        return 1
-    if not _ensure_host_mount_dir_writable(state_dir, description="State"):
-        return 1
-
-    helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
-        command_name="passthrough",
-        run_dir=run_dir,
-    )
-    if helper_proc is None:
-        return 1
     try:
-        # Preserve Rich colors when running locally: allocate a TTY when the host has one.
-        interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
-        local_resolver_ip = _select_container_local_resolver_ip()
-        if local_resolver_ip is None:
+        if not docker_available():
+            print_error("Docker is not installed or not in PATH.")
             return 1
-        _ensure_bloodhound_config_mountable()
-        extra_run_args: list[str] = []
-        try:
-            if BH_CONFIG_FILE.exists():
-                extra_run_args.extend(
-                    [
-                        "-v",
-                        f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
-                    ]
-                )
-        except Exception:
-            pass
-
-        cfg = DockerRunConfig(
+        if not _ensure_docker_compose_prerequisites(command_name="passthrough"):
+            return 1
+        resolved_image = _ensure_runtime_image_available(
             image=image,
-            workspaces_host_dir=workspaces_dir,
-            interactive=interactive,
-            extra_run_args=tuple(extra_run_args),
-            extra_env=tuple(
-                [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
-                + (
-                    [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
-                    if compose_path is not None
-                    else []
-                )
-                + [
-                    ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
-                    ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
-                ]
-            ),
+            pull_timeout_seconds=pull_timeout_seconds,
+            command_name="passthrough",
         )
+        if not resolved_image:
+            return 1
+        image = resolved_image
 
-        container_args: list[str] = list(adscan_args)
-        if verbose:
-            container_args.append("--verbose")
-        if debug:
-            container_args.append("--debug")
+        managed_ready, compose_path = _ensure_managed_bloodhound_runtime_ready(
+            command_name="passthrough",
+            desired_password=_get_bloodhound_admin_password(),
+            pull_missing_images=True,
+            pull_stream_output=True,
+            pull_timeout_seconds=pull_timeout_seconds,
+            start_stack=True,
+            verify_auth=True,
+            allow_auth_bootstrap=True,
+            allow_low_memory=allow_low_memory,
+        )
+        if not managed_ready or compose_path is None:
+            return 1
 
-        cmd = build_adscan_run_command(cfg, adscan_args=container_args)
-        print_info_debug(f"[docker] passthrough: {shell_quote_cmd(cmd)}")
-        proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
-        return int(proc.returncode)
-    except subprocess.SubprocessError as exc:
-        telemetry.capture_exception(exc)
-        print_error("Failed to run ADscan in Docker.")
-        print_info_debug(f"[docker] passthrough exception: {exc}")
-        return 1
+        workspaces_dir = _get_workspaces_dir()
+        config_dir = _get_config_dir()
+        codex_dir = _get_codex_container_dir()
+        logs_dir = _get_logs_dir()
+        run_dir = _get_run_dir()
+        state_dir = _get_state_dir()
+        if not _ensure_host_mount_dir_writable(workspaces_dir, description="Workspaces"):
+            return 1
+        if not _ensure_host_mount_dir_writable(config_dir, description="Config"):
+            return 1
+        if not _ensure_host_mount_dir_writable(
+            codex_dir, description="Codex Container Auth"
+        ):
+            return 1
+        if not _ensure_host_mount_dir_writable(logs_dir, description="Logs"):
+            return 1
+        if not _ensure_host_mount_dir_writable(run_dir, description="Runtime"):
+            return 1
+        if not _ensure_host_mount_dir_writable(state_dir, description="State"):
+            return 1
+
+        helper_proc, _helper_socket = _ensure_host_helper_runtime_ready(
+            command_name="passthrough",
+            run_dir=run_dir,
+        )
+        if helper_proc is None:
+            return 1
+        try:
+            interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+            local_resolver_ip = _select_container_local_resolver_ip()
+            if local_resolver_ip is None:
+                return 1
+            _ensure_bloodhound_config_mountable()
+            extra_run_args: list[str] = []
+            try:
+                if BH_CONFIG_FILE.exists():
+                    extra_run_args.extend(
+                        [
+                            "-v",
+                            f"{BH_CONFIG_FILE}:/opt/adscan/.bloodhound_config",
+                        ]
+                    )
+            except Exception:
+                pass
+
+            cfg = DockerRunConfig(
+                image=image,
+                workspaces_host_dir=workspaces_dir,
+                interactive=interactive,
+                extra_run_args=tuple(extra_run_args),
+                extra_env=tuple(
+                    [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+                    + (
+                        [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
+                        if compose_path is not None
+                        else []
+                    )
+                    + [
+                        ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
+                        ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
+                    ]
+                ),
+            )
+
+            container_args: list[str] = list(adscan_args)
+            if verbose:
+                container_args.append("--verbose")
+            if debug:
+                container_args.append("--debug")
+
+            cmd = build_adscan_run_command(cfg, adscan_args=container_args)
+            print_info_debug(f"[docker] passthrough: {shell_quote_cmd(cmd)}")
+            proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
+            return int(proc.returncode)
+        except subprocess.SubprocessError as exc:
+            telemetry.capture_exception(exc)
+            print_error("Failed to run ADscan in Docker.")
+            print_info_debug(f"[docker] passthrough exception: {exc}")
+            return 1
+        finally:
+            _stop_host_helper(helper_proc)
     finally:
-        _stop_host_helper(helper_proc)
+        _release_runtime_session_lock(runtime_lock)

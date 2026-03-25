@@ -58,6 +58,7 @@ from adscan_internal.services.attack_graph_service import (
 )
 from adscan_internal.services.attack_graph_runtime_service import (
     clear_attack_path_execution,
+    get_attack_path_followup_context,
     set_attack_path_step_context,
     set_attack_path_execution,
 )
@@ -1071,24 +1072,11 @@ def _resolve_golden_cert_target_host(
 
 
 def _sorted_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    status_order = {
-        "theoretical": 0,
-        "unavailable": 1,
-        "unsupported": 2,
-        "blocked": 3,
-        "attempted": 4,
-        "exploited": 5,
-    }
-
-    return sorted(
-        paths,
-        key=lambda item: (
-            status_order.get(str(item.get("status") or "").strip().lower(), 3),
-            int(item.get("length", 0)) if str(item.get("length", "")).isdigit() else 0,
-            str(item.get("source", "")).lower(),
-            str(item.get("target", "")).lower(),
-        ),
+    from adscan_internal.services.attack_step_support_registry import (
+        build_path_priority_key,
     )
+
+    return sorted(paths, key=build_path_priority_key)
 
 
 def _find_first_step(summary: dict[str, Any], *, action: str) -> dict[str, Any] | None:
@@ -2115,13 +2103,23 @@ def execute_selected_attack_path(
                 f"outcome_key={mark_sensitive(str(effective_outcome.get('key') or 'none'), 'detail')}"
             )
             if is_pivot_search:
-                if (
-                    str(effective_outcome.get("key") or "").strip().lower()
-                    != "user_credential_obtained"
-                ):
+                outcome_key = str(effective_outcome.get("key") or "").strip().lower()
+                if outcome_key != "user_credential_obtained":
                     outcome_followups = build_followups_for_execution_outcome(
                         shell,
                         outcome=effective_outcome,
+                    )
+                else:
+                    followup_context = get_attack_path_followup_context(shell)
+                    compromised_user = _normalize_account(
+                        str(effective_outcome.get("compromised_user") or "")
+                    )
+                    print_info_debug(
+                        "[attack_paths] user-credential outcome follow-ups "
+                        "deferred to credential-ingestion flow: "
+                        f"user={mark_sensitive(compromised_user or 'unknown', 'user')} "
+                        f"nested_followup_active={bool(followup_context)!r} "
+                        f"context={mark_sensitive(str(followup_context or {}), 'detail')}"
                     )
                 print_info_debug(
                     "[attack_paths] outcome follow-ups resolved: "
@@ -2173,10 +2171,13 @@ def execute_selected_attack_path(
             context_username = compromised_user
             context_password = credential
             marked_user = mark_sensitive(compromised_user, "user")
+            followup_context = get_attack_path_followup_context(shell)
             print_info_debug(
                 "[attack_paths] execution context handed off to newly compromised user: "
                 f"previous_user={mark_sensitive(previous_user or 'none', 'detail')} "
-                f"new_user={marked_user}"
+                f"new_user={marked_user} "
+                f"nested_followup_active={bool(followup_context)!r} "
+                f"context={mark_sensitive(str(followup_context or {}), 'detail')}"
             )
 
         for idx, step in enumerate(steps, start=1):
@@ -2192,11 +2193,14 @@ def execute_selected_attack_path(
             if key in dangerous_actions:
                 # High-risk step intentionally disabled.
                 return execution_started
+            relation_support = classify_relation_support(key)
             set_attack_path_step_context(
                 shell,
                 search_mode_label=search_mode_label,
                 step_index=idx,
                 last_executable_idx=last_executable_idx,
+                compromise_semantics=relation_support.compromise_semantics,
+                compromise_effort=relation_support.compromise_effort,
             )
             details = (
                 step.get("details") if isinstance(step.get("details"), dict) else {}

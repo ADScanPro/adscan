@@ -904,7 +904,9 @@ def _build_domain_reuse_eligibility(
     )
     if eligibility is None:
         return None
-    print_spraying_eligibility(shell, domain, eligibility)
+    if not print_spraying_eligibility(shell, domain, eligibility):
+        print_info("Password spraying cancelled by user.")
+        return None
     default_confirm = shell.type == "ctf"
     if not _enforce_lockout_guardrail(
         domain=domain,
@@ -1082,7 +1084,6 @@ def _persist_and_record_spray_hits(
         record_credential_source_steps,
         upsert_domain_password_reuse_edges,
         upsert_password_spray_entry_edge,
-        upsert_share_password_entry_edge,
     )
     from adscan_internal.services.share_credential_provenance_service import (
         ShareCredentialProvenanceService,
@@ -1090,9 +1091,10 @@ def _persist_and_record_spray_hits(
 
     typed_source_steps = _extract_typed_source_steps(source_steps)
     share_provenance_service = ShareCredentialProvenanceService()
-    share_edge_payload = share_provenance_service.build_share_password_edge_payload(
+    artifact_source_steps = share_provenance_service.build_password_artifact_source_steps(
         source_context=source_context,
         spray_type=spray_type,
+        secret=None,
         verified_via="spraying",
     )
     hits_sorted = sorted(
@@ -1186,24 +1188,35 @@ def _persist_and_record_spray_hits(
                 print_info_debug(
                     "[spray] Failed to record spray entry edge in attack graph (continuing)."
                 )
-        if share_edge_payload:
+        if artifact_source_steps:
             try:
-                share_entry_label, share_notes = share_edge_payload
-                share_notes = dict(share_notes)
-                if password or allow_empty_credential:
-                    share_notes["password"] = password
-                upsert_share_password_entry_edge(
+                typed_artifact_source_steps = []
+                for step in artifact_source_steps:
+                    notes = getattr(step, "notes", None)
+                    copied_notes = dict(notes) if isinstance(notes, dict) else {}
+                    if password or allow_empty_credential:
+                        copied_notes["password"] = password
+                    typed_artifact_source_steps.append(
+                        type(step)(
+                            relation=getattr(step, "relation", "PasswordInFile"),
+                            edge_type=getattr(step, "edge_type", "file_password"),
+                            entry_label=getattr(step, "entry_label", "Domain Users"),
+                            entry_kind=getattr(step, "entry_kind", ""),
+                            notes=copied_notes,
+                            record_on_failure=getattr(step, "record_on_failure", False),
+                        )
+                    )
+                record_credential_source_steps(
                     shell,
                     domain,
                     username=username,
-                    entry_label=share_entry_label,
                     status="success",
-                    notes=share_notes,
+                    steps=typed_artifact_source_steps,
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
                 print_info_debug(
-                    "[spray] Failed to record PasswordInShare edge (continuing)."
+                    "[spray] Failed to record artifact/share credential provenance edge (continuing)."
                 )
 
     if persist_via_add_credential:
@@ -2180,8 +2193,13 @@ def compute_computer_spraying_eligibility(
 
 def print_spraying_eligibility(
     shell: SprayShell, domain: str, eligibility: SprayEligibilityResult
-) -> None:
-    """Render eligibility info for spraying in a user-friendly way."""
+) -> bool:
+    """Render eligibility info for spraying and confirm continuation when needed.
+
+    Returns:
+        bool: True when the calling flow should continue, False when the user
+            cancels after reviewing excluded accounts.
+    """
     marked_domain = mark_sensitive(domain, "domain")
     summary_lines: list[str] = [
         f"Domain: {marked_domain}",
@@ -2232,6 +2250,20 @@ def print_spraying_eligibility(
                 f"Excluded users total: {len(eligibility.excluded_users)} "
                 f"(showing first {len(preview)})."
             )
+        if not eligibility.eligible_users:
+            return True
+        if getattr(shell, "auto", False):
+            print_info_debug(
+                "[eligibility] Auto mode detected; continuing without excluded-user confirmation."
+            )
+            return True
+        return bool(
+            Confirm.ask(
+                "Some accounts were excluded from this spray attempt. Continue with the eligible users only?",
+                default=True,
+            )
+        )
+    return True
 
 
 def _resolve_multi_credential_spray_budget(
@@ -3217,7 +3249,9 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         print_info("Password spraying cancelled by user.")
         return
 
-    print_spraying_eligibility(shell, domain, eligibility)
+    if not print_spraying_eligibility(shell, domain, eligibility):
+        print_info("Password spraying cancelled by user.")
+        return
 
     if not eligibility.eligible_users:
         print_warning(
@@ -3510,7 +3544,9 @@ def _prepare_password_spraying_eligibility(
         print_info("Password spraying cancelled by user.")
         return None
 
-    print_spraying_eligibility(shell, domain, eligibility)
+    if not print_spraying_eligibility(shell, domain, eligibility):
+        print_info("Password spraying cancelled by user.")
+        return None
     return eligibility
 
 
@@ -3845,7 +3881,9 @@ def spraying_with_passwords(
     ):
         print_info("Password spraying cancelled by user.")
         return []
-    print_spraying_eligibility(shell, domain, eligibility)
+    if not print_spraying_eligibility(shell, domain, eligibility):
+        print_info("Password spraying cancelled by user.")
+        return []
 
     budget, budget_reason = _resolve_multi_password_spray_budget(
         shell=shell,
@@ -4491,34 +4529,10 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
         print_info("Computer pre2k check cancelled by user.")
         return
 
-    safe_threshold = 2
-    eligibility = compute_computer_spraying_eligibility(
-        shell,
-        domain=domain,
-        computer_sams=computer_sams,
-        safe_threshold=safe_threshold,
-    )
-    if eligibility is None:
-        return
-
-    if not _enforce_lockout_guardrail(
-        domain=domain,
-        eligibility=eligibility,
-        prompt_text="Continue with computer pre2k checks using the full list?",
-        default_confirm=False,
-    ):
-        print_info("Computer pre2k check cancelled by user.")
-        return
-
-    print_spraying_eligibility(shell, domain, eligibility)
-    if not eligibility.eligible_users:
-        print_warning("No eligible computer accounts available for pre2k checks.")
-        return
-
     summary_lines = [
         f"Domain: {marked_domain}",
-        f"Computers in list: {len(eligibility.input_users)}",
-        f"Eligible computers: {len(eligibility.eligible_users)}",
+        f"Computers in list: {len(computer_sams)}",
+        f"Attempted computers: {len(computer_sams)}",
         "Password pattern: hostname (lowercase, without $)",
     ]
     print_panel(
@@ -4530,7 +4544,7 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
 
     pdc_ip = shell.domains_data.get(domain, {}).get("pdc")
     kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
-    combos = [f"{sam}:{sam.rstrip('$').lower()}" for sam in eligibility.eligible_users]
+    combos = [f"{sam}:{sam.rstrip('$').lower()}" for sam in computer_sams]
     combos_path = write_temp_combo_file(combos, directory=kerberos_output_dir)
 
     try:

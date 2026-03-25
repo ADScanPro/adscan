@@ -678,9 +678,28 @@ def _should_use_questionary_prompt() -> bool:
         return False
 
 
-def _classify_prompt_answer(answer_text: str, *, password_mode: bool) -> str:
+def _classify_prompt_answer(
+    answer_text: str,
+    *,
+    password_mode: bool,
+    prompt_message: str = "",
+) -> str:
     """Best-effort classification for prompt answer sanitization."""
-    if password_mode:
+    prompt_lower = str(prompt_message or "").strip().lower()
+    if password_mode or any(
+        keyword in prompt_lower
+        for keyword in (
+            "password",
+            "passphrase",
+            "hash",
+            "ntlm",
+            "secret",
+            "credential",
+            "token",
+            "apikey",
+            "api key",
+        )
+    ):
         return "password"
 
     cleaned = str(answer_text or "").strip()
@@ -716,7 +735,11 @@ def _logged_prompt_ask(*prompt_args: Any, **kwargs: Any) -> str:
         fallback = "" if default_value is None else str(default_value)
         shown = "[hidden]" if password_mode and fallback else fallback
         print_info(f"{prompt_message} [dim](auto: {shown})[/dim]")
-        answer_type = _classify_prompt_answer(fallback, password_mode=password_mode)
+        answer_type = _classify_prompt_answer(
+            fallback,
+            password_mode=password_mode,
+            prompt_message=prompt_message,
+        )
         marked_answer = mark_sensitive(fallback, answer_type)
         answer_tag = (
             "[prompt][password][answer]" if password_mode else "[prompt][answer]"
@@ -727,7 +750,11 @@ def _logged_prompt_ask(*prompt_args: Any, **kwargs: Any) -> str:
 
     if _should_disable_prompt_interaction():
         fallback = "" if default_value is None else str(default_value)
-        answer_type = _classify_prompt_answer(fallback, password_mode=password_mode)
+        answer_type = _classify_prompt_answer(
+            fallback,
+            password_mode=password_mode,
+            prompt_message=prompt_message,
+        )
         marked_answer = mark_sensitive(fallback, answer_type)
         answer_tag = (
             "[prompt][password][answer]" if password_mode else "[prompt][answer]"
@@ -758,7 +785,9 @@ def _logged_prompt_ask(*prompt_args: Any, **kwargs: Any) -> str:
                 )
                 fallback = "" if default_value is None else str(default_value)
                 answer_type = _classify_prompt_answer(
-                    fallback, password_mode=password_mode
+                    fallback,
+                    password_mode=password_mode,
+                    prompt_message=prompt_message,
                 )
                 marked_answer = mark_sensitive(fallback, answer_type)
                 answer_tag = (
@@ -783,7 +812,11 @@ def _logged_prompt_ask(*prompt_args: Any, **kwargs: Any) -> str:
             answer = Prompt.ask(*prompt_args, **kwargs)
 
     answer_text = "" if answer is None else str(answer)
-    answer_type = _classify_prompt_answer(answer_text, password_mode=password_mode)
+    answer_type = _classify_prompt_answer(
+        answer_text,
+        password_mode=password_mode,
+        prompt_message=prompt_message,
+    )
     marked_answer = mark_sensitive(answer_text, answer_type)
     answer_tag = "[prompt][password][answer]" if password_mode else "[prompt][answer]"
     print_telemetry_only(f"{answer_tag} {prompt_message}: {marked_answer}")
@@ -917,11 +950,15 @@ def prompt_ask(
         fallback = "" if default is None else str(default)
         print_info_debug(
             f"[prompt] Fallback to default for '{prompt}': "
-            f"{mark_sensitive(fallback, _classify_prompt_answer(fallback, password_mode=password))} "
+            f"{mark_sensitive(fallback, _classify_prompt_answer(fallback, password_mode=password, prompt_message=prompt))} "
             f"({type(exc).__name__})"
         )
         answer_tag = "[prompt][password][answer]" if password else "[prompt][answer]"
-        data_type = _classify_prompt_answer(fallback, password_mode=password)
+        data_type = _classify_prompt_answer(
+            fallback,
+            password_mode=password,
+            prompt_message=prompt,
+        )
         print_telemetry_only(
             f"{answer_tag} {prompt}: {mark_sensitive(fallback, data_type)}"
         )
@@ -2587,6 +2624,9 @@ def print_panel(
     """
     console = _get_console()
     telemetry_console = _get_telemetry_console()
+
+    if title is not None and title_align is None:
+        title_align = "center"
 
     # Use brand color as default border style
     if border_style is None:
@@ -4970,12 +5010,16 @@ def print_attack_paths_summary(
     table.add_column("Path", style="cyan", no_wrap=False)
     table.add_column("Affected", style="white", no_wrap=False, width=10)
     table.add_column("Target", style="white", no_wrap=False, width=10)
+    table.add_column("Type", style="white", no_wrap=False, width=18)
     table.add_column("State", style="white", no_wrap=False, width=10)
     table.add_column("Exec", style="white", no_wrap=False, width=10)
     table.add_column("Status", style="magenta", no_wrap=False, width=10)
     table.add_column("Len", justify="right", width=4)
     format_node_label, _, format_relation_display, _ = (
         _get_attack_path_narrative_formatters()
+    )
+    from adscan_internal.services.attack_step_support_registry import (
+        describe_path_compromise_semantics,
     )
 
     def _format_inline_chain(
@@ -5104,6 +5148,9 @@ def print_attack_paths_summary(
 
         affected_cell = ""
         target_cell = ""
+        path_type_cell = describe_path_compromise_semantics(
+            [str(rel) for rel in rels if str(rel or "").strip()]
+        )
         state_cell = Text("", style="dim")
         meta = path.get("meta") if isinstance(path, dict) else None
         if isinstance(meta, dict):
@@ -5133,6 +5180,7 @@ def print_attack_paths_summary(
             path_str,
             affected_cell,
             target_cell,
+            path_type_cell,
             state_cell,
             exec_cell,
             status,
@@ -5196,7 +5244,7 @@ def _fallback_format_attack_path_relation_display(
         if source_username:
             return f"{relation_label} (from {source_username})"
         return relation_label
-    if relation_key in {"passwordinshare", "gpppassword"}:
+    if relation_key in {"passwordinshare", "passwordinfile", "gpppassword"}:
         host_hint = ""
         share_hint = ""
         artifact_hint = ""
@@ -5264,10 +5312,11 @@ def _fallback_format_attack_path_source_context(
             context_parts.append(f"secret {mark_sensitive(secret, 'password')}")
         return " ".join(context_parts).strip()
 
-    if relation_key in {"passwordinshare", "gpppassword"}:
+    if relation_key in {"passwordinshare", "passwordinfile", "gpppassword"}:
         host_hint = ""
         share_hint = ""
         artifact_hint = str(details.get("artifact") or "").strip().replace("\\", "/")
+        artifact_kind = str(details.get("artifact_kind") or "").strip().lower()
         secret = str(details.get("secret") or details.get("password") or "").strip()
         for value in details.get("hosts_list"), details.get("hosts"):
             if isinstance(value, list) and value:
@@ -5291,7 +5340,10 @@ def _fallback_format_attack_path_source_context(
         if host_hint:
             context_parts.append(f"host {host_hint}")
         if artifact_hint:
-            context_parts.append(f"artifact {artifact_hint}")
+            if artifact_kind:
+                context_parts.append(f"{artifact_kind} artifact {artifact_hint}")
+            else:
+                context_parts.append(f"artifact {artifact_hint}")
         if secret:
             context_parts.append(f"secret {mark_sensitive(secret, 'password')}")
         return " | ".join(context_parts)
@@ -5426,6 +5478,11 @@ def print_attack_path_detail(
     """Render a detailed single attack path breakdown."""
     from rich.table import Table
     from rich.text import Text
+    from adscan_internal.services.attack_step_support_registry import (
+        classify_path_compromise_semantics,
+        describe_path_compromise_effort,
+        describe_path_compromise_semantics,
+    )
 
     nodes = path.get("nodes", [])
     rels = path.get("relations", [])
@@ -5474,6 +5531,30 @@ def print_attack_path_detail(
             str(search_mode_label).strip(), style=BRAND_COLORS["success"]
         )
         _get_console().print(mode_summary)
+
+    path_compromise_semantics = ""
+    if rels:
+        path_compromise_semantics = classify_path_compromise_semantics(
+            [str(rel) for rel in rels if str(rel or "").strip()]
+        )
+        path_type_summary = Text()
+        path_type_summary.append("Path Type: ", style="bold white")
+        path_type_summary.append(
+            describe_path_compromise_semantics(
+                [str(rel) for rel in rels if str(rel or "").strip()]
+            ),
+            style=BRAND_COLORS["warning"],
+        )
+        _get_console().print(path_type_summary)
+        effort_summary = Text()
+        effort_summary.append("Compromise Effort: ", style="bold white")
+        effort_summary.append(
+            describe_path_compromise_effort(
+                [str(rel) for rel in rels if str(rel or "").strip()]
+            ),
+            style=BRAND_COLORS["info"],
+        )
+        _get_console().print(effort_summary)
 
     meta = path.get("meta") if isinstance(path.get("meta"), dict) else {}
     if isinstance(meta, dict):
@@ -5577,6 +5658,41 @@ def print_attack_path_detail(
                         style=BRAND_COLORS["warning"],
                     )
                 _get_console().print(advisory_summary)
+        if path_compromise_semantics == "access_capability_only":
+            advisory_summary = Text()
+            advisory_summary.append("Execution Advisory: ", style="bold white")
+            action_key = execution_context_action.lower()
+            if action_key == "canpsremote":
+                advisory_summary.append(
+                    "This path grants privileged WinRM/PowerShell access to the target host. "
+                    "Treat it as high-value host access rather than an immediate credential compromise.",
+                    style=BRAND_COLORS["warning"],
+                )
+            elif action_key == "canrdp":
+                advisory_summary.append(
+                    "This path grants privileged RDP access to the target host. "
+                    "Interactive access may unlock further post-exploitation, but it is not a direct credential compromise by itself.",
+                    style=BRAND_COLORS["warning"],
+                )
+            elif action_key == "sqladmin":
+                advisory_summary.append(
+                    "This path grants privileged SQL administrative access. "
+                    "Use SQL post-exploitation and impersonation checks to turn it into code execution or credential access.",
+                    style=BRAND_COLORS["warning"],
+                )
+            elif action_key == "adminto":
+                advisory_summary.append(
+                    "This path grants local administrator-style host access. "
+                    "Host credential dumping and local secret extraction usually provide the next highest-value move.",
+                    style=BRAND_COLORS["warning"],
+                )
+            else:
+                advisory_summary.append(
+                    "This path grants privileged host access rather than direct identity compromise. "
+                    "Expect host-centric post-exploitation follow-ups after execution.",
+                    style=BRAND_COLORS["warning"],
+                )
+            _get_console().print(advisory_summary)
         if (
             isinstance(execution_ready_count, int)
             and execution_ready_count >= 0

@@ -118,6 +118,12 @@ from adscan_internal.telemetry import (
     _determine_session_environment,
     init_sentry,
 )
+from adscan_internal.services.service_access_results import (
+    ServiceAccessFinding,
+    render_no_confirmed_service_access,
+    render_service_access_results,
+    select_confirmed_service_access_followup_targets,
+)
 from adscan_internal.version import get_version, get_version_tag
 from adscan_internal.workspaces import (
     DEFAULT_DOMAIN_LAYOUT,
@@ -936,7 +942,8 @@ def _is_full_adscan_container_runtime() -> bool:
         return True
     if not is_docker_env():
         return False
-    if os.getenv("ADSCAN_HOME") != "/opt/adscan":
+    adscan_home = str(os.getenv("ADSCAN_HOME") or "").strip()
+    if adscan_home and adscan_home != "/opt/adscan":
         return False
     return (
         os.path.isdir("/opt/adscan/tool_venvs")
@@ -1810,6 +1817,95 @@ def _guard_root_shell_without_user_context(command: str) -> None:
         telemetry.capture_exception(exc)
 
 
+def _container_runtime_launcher_contract_issues() -> list[str]:
+    """Return missing launcher-managed runtime requirements for FULL container mode."""
+    issues: list[str] = []
+    if not _is_full_adscan_container_runtime():
+        return issues
+
+    if str(os.getenv("ADSCAN_OFFICIAL_LAUNCHER") or "").strip() != "1":
+        issues.append("official_launcher_marker")
+
+    helper_sock = str(os.getenv("ADSCAN_HOST_HELPER_SOCK") or "").strip()
+    if not helper_sock:
+        issues.append("host_helper_socket_env")
+    elif not os.path.exists(helper_sock):
+        issues.append("host_helper_socket_path")
+
+    if not str(os.getenv("ADSCAN_LOCAL_RESOLVER_IP") or "").strip():
+        issues.append("local_resolver_ip")
+
+    return issues
+
+
+def _guard_container_runtime_launcher_contract(command: str | None) -> None:
+    """Abort when the FULL runtime was not started through the official launcher."""
+    if not _is_full_adscan_container_runtime():
+        return
+    if command in (None, "version", "host-helper"):
+        return
+
+    issues = _container_runtime_launcher_contract_issues()
+    if not issues:
+        return
+
+    helper_sock = str(os.getenv("ADSCAN_HOST_HELPER_SOCK") or "").strip()
+    runtime_image = str(os.getenv("ADSCAN_RUNTIME_IMAGE") or "adscan runtime").strip()
+    marked_helper_sock = mark_sensitive(helper_sock or "<unset>", "path")
+    marked_runtime_image = mark_sensitive(runtime_image, "path")
+
+    print_info_debug(
+        "[container_guard] Refusing direct in-container launch without official launcher "
+        f"(command={command}, issues={issues}, helper_sock={marked_helper_sock})"
+    )
+    telemetry.capture(
+        "container_runtime_launcher_contract_missing",
+        {
+            "command": str(command or ""),
+            "issues": list(issues),
+            "has_official_launcher_marker": str(
+                str(os.getenv("ADSCAN_OFFICIAL_LAUNCHER") or "").strip() == "1"
+            ).lower(),
+            "has_host_helper_sock_env": str(bool(helper_sock)).lower(),
+            "host_helper_sock_exists": str(
+                bool(helper_sock and os.path.exists(helper_sock))
+            ).lower(),
+            "has_local_resolver_ip": str(
+                bool(str(os.getenv("ADSCAN_LOCAL_RESOLVER_IP") or "").strip())
+            ).lower(),
+        },
+    )
+
+    issue_map = {
+        "official_launcher_marker": "- Missing official launcher marker inside the runtime.",
+        "host_helper_socket_env": "- Missing host-helper socket environment (`ADSCAN_HOST_HELPER_SOCK`).",
+        "host_helper_socket_path": "- Host-helper socket path is not mounted or is unavailable.",
+        "local_resolver_ip": "- Missing launcher-provided local resolver IP (`ADSCAN_LOCAL_RESOLVER_IP`).",
+    }
+    detail_lines = [issue_map[issue] for issue in issues if issue in issue_map]
+
+    print_panel(
+        "[bold]This ADscan FULL runtime must be launched from the official host launcher.[/bold]\n\n"
+        "The current container session is missing launcher-managed runtime wiring, so "
+        "ADscan will not run from this shell.\n\n"
+        f"Runtime image: {marked_runtime_image}\n"
+        f"Host-helper socket: {marked_helper_sock}\n\n"
+        "Missing runtime requirements:\n"
+        + "\n".join(detail_lines)
+        + "\n\n"
+        "The official launcher sets up the host-helper, loopback DNS context, "
+        "workspace/state mounts, and container runtime environment before ADscan starts.",
+        title="[bold]🧭 Official Launcher Required[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+    print_instruction("Install the official launcher on the host with `pipx install adscan`.")
+    print_instruction("Alternative: `pip install adscan`.")
+    print_instruction("Exit the container shell and run `adscan start` from the host.")
+    print_instruction("Do not launch ADscan manually from inside the FULL runtime container.")
+    raise SystemExit(1)
+
+
 # --- Constants for installation ---
 ADSCAN_BASE_DIR = _get_adscan_base_dir()
 ADSCAN_STATE_DIR = os.getenv("ADSCAN_STATE_DIR") or os.path.join(
@@ -2027,7 +2123,7 @@ SYSTEM_PACKAGES_CONFIG = {
     "unzip": "unzip",
     "p7zip-full": "7z",
     "hydra": "hydra",
-    "freerdp3-x11": "xfreerdp3",
+    "freerdp3-x11": "xfreerdp",
     "tesseract-ocr": "tesseract",
     "antiword": "antiword",
     "moreutils": "moreutils",
@@ -10145,6 +10241,7 @@ class PentestShell:
         self.credsweeper_path = get_tool_executable_path("credsweeper")
         self.pypykatz_path = get_tool_executable_path("pypykatz")
         self.kerbrute_path = get_external_tool_executable("kerbrute")
+        self.medusa_path = shutil.which("medusa")
         self.bloodhound_gui_path = os.path.join(
             TOOLS_INSTALL_DIR,
             "bloodhound_gui",
@@ -12879,15 +12976,37 @@ class PentestShell:
         self.console.clear()
         # Prompt redrawing is handled by the prompt_toolkit loop automatically
 
+    @staticmethod
+    def _resolve_prompt_history_path_for_workspace(
+        workspace_dir: str | None,
+    ) -> str:
+        """Return the prompt history file path for the active workspace context."""
+        history_filename = ".adscan_history"
+        if workspace_dir:
+            return os.path.join(workspace_dir, history_filename)
+        return os.path.join(ADSCAN_BASE_DIR, history_filename)
+
+    @staticmethod
+    def _maybe_refresh_prompt_session_for_workspace(
+        *,
+        current_history_path: str,
+        current_workspace_dir: str | None,
+        session_factory: Callable[[str], PromptSession],
+    ) -> tuple[str, PromptSession | None]:
+        """Return a fresh prompt session when workspace history path changed."""
+        desired_history_path = PentestShell._resolve_prompt_history_path_for_workspace(
+            current_workspace_dir
+        )
+        if desired_history_path == current_history_path:
+            return current_history_path, None
+        os.makedirs(os.path.dirname(desired_history_path), exist_ok=True)
+        return desired_history_path, session_factory(desired_history_path)
+
     def run(self):
         """Main loop for the interactive shell using prompt-toolkit."""
-        history_filename = ".adscan_history"
-        if self.current_workspace_dir:
-            history_path = os.path.join(self.current_workspace_dir, history_filename)
-        else:
-            # Fallback if current_workspace_dir isn't set, though it should be
-            history_path = os.path.join(ADSCAN_BASE_DIR, history_filename)
-
+        history_path = self._resolve_prompt_history_path_for_workspace(
+            self.current_workspace_dir
+        )
         os.makedirs(os.path.dirname(history_path), exist_ok=True)
 
         set_variables = [
@@ -13113,18 +13232,21 @@ class PentestShell:
 
         command_lexer = SimpleCommandLexer(list(self.commands.keys()))
 
-        session = PromptSession(
-            history=FileHistory(history_path),
-            auto_suggest=AutoSuggestFromHistory(),  # Temporarily commented out
-            completer=command_completer,
-            key_bindings=kb,
-            lexer=command_lexer,
-            style=self.prompt_style,
-            bottom_toolbar=self._get_bottom_toolbar_content,  # Temporarily commented out
-            # reserve_space_for_menu=8, # Max 8 lines for completion menu
-            # enable_history_search=True, # Temporarily commented out
-            # refresh_interval=0.5 # Optional: for dynamic prompts, not strictly needed here
-        )
+        def _build_prompt_session(resolved_history_path: str) -> PromptSession:
+            return PromptSession(
+                history=FileHistory(resolved_history_path),
+                auto_suggest=AutoSuggestFromHistory(),  # Temporarily commented out
+                completer=command_completer,
+                key_bindings=kb,
+                lexer=command_lexer,
+                style=self.prompt_style,
+                bottom_toolbar=self._get_bottom_toolbar_content,  # Temporarily commented out
+                # reserve_space_for_menu=8, # Max 8 lines for completion menu
+                # enable_history_search=True, # Temporarily commented out
+                # refresh_interval=0.5 # Optional: for dynamic prompts, not strictly needed here
+            )
+
+        session = _build_prompt_session(history_path)
 
         # Initial display before the first prompt (if any)
         # self.console.print(self._get_rich_prompt_object(), end="") # The prompt is now part of session.prompt
@@ -13143,6 +13265,21 @@ class PentestShell:
                     continue  # Skip to next iteration, effectively polling
 
                 # >>> END OF MODIFICATION <<<
+                refreshed_history_path, refreshed_session = (
+                    self._maybe_refresh_prompt_session_for_workspace(
+                        current_history_path=history_path,
+                        current_workspace_dir=self.current_workspace_dir,
+                        session_factory=_build_prompt_session,
+                    )
+                )
+                if refreshed_session is not None:
+                    print_info_debug(
+                        "[prompt] Switching command history to workspace file: "
+                        f"{mark_sensitive(refreshed_history_path, 'path')}"
+                    )
+                    history_path = refreshed_history_path
+                    session = refreshed_session
+
                 def get_prompt_message_callable():
                     # Default fallback Rich Text prompt
                     default_prompt_text = Text("(ADscan) > ", style="white")
@@ -18412,6 +18549,7 @@ class PentestShell:
         *,
         profile=None,
         phase=None,
+        analysis_context=None,
     ):
         from adscan_internal.rich_output import mark_sensitive
         from adscan_internal.services.credsweeper_service import (
@@ -18424,6 +18562,7 @@ class PentestShell:
             DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
             SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
             get_manspider_sensitive_extensions,
+            get_sensitive_phase_max_file_size_bytes,
         )
 
         if self._should_skip_unauth_followups(target_domain, username):
@@ -18453,6 +18592,14 @@ class PentestShell:
                 str(profile or DEFAULT_SMB_SENSITIVE_FILE_PROFILE)
             )
         )
+        max_filesize_arg = ""
+        if phase == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS:
+            max_file_size_bytes = get_sensitive_phase_max_file_size_bytes(
+                SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS
+            )
+            if isinstance(max_file_size_bytes, int) and max_file_size_bytes > 0:
+                max_file_size_mb = max(1, int(max_file_size_bytes // (1024 * 1024)))
+                max_filesize_arg = f"--max-filesize {max_file_size_mb}M "
         if self.domains_data[target_domain]["auth"] == "auth":
             auth = self.build_auth_nxc(
                 username, password, target_domain, kerberos=False
@@ -18460,13 +18607,13 @@ class PentestShell:
             command = (
                 f"{manspider_bin} --threads 256 {hosts_str} {auth} "
                 f"-e {extensions_arg} -l {spider_output_arg} "
-                f"{exclusion_args}"
+                f"{max_filesize_arg}{exclusion_args}"
             )
         else:
             command = (
                 f"{manspider_bin} --threads 256 {hosts_str} "
                 f"-e {extensions_arg} -l {spider_output_arg} "
-                f"{exclusion_args}"
+                f"{max_filesize_arg}{exclusion_args}"
             )
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_info(
@@ -18482,6 +18629,8 @@ class PentestShell:
             auth_username=username,
             loot_dir=spider_output_dir,
             credsweeper_jobs=get_default_credsweeper_jobs(),
+            phase=phase,
+            analysis_context=analysis_context,
         )
 
     def do_netexec_smb_descriptions(self, domain):
@@ -18913,7 +19062,13 @@ class PentestShell:
         )
 
     def _write_user_list_file(
-        self, domain: str, filename: str, users: list[str]
+        self,
+        domain: str,
+        filename: str,
+        users: list[str],
+        *,
+        merge_existing: bool = False,
+        update_source: str | None = None,
     ) -> str:
         """Write a user list file under the domain directory.
 
@@ -18921,6 +19076,10 @@ class PentestShell:
             domain: Target domain.
             filename: Output filename (e.g. "admins.txt").
             users: Usernames to write (one per line).
+            merge_existing: When True, preserve any existing entries already
+                present in the file and append only newly discovered users.
+            update_source: Optional human-friendly source label used by the
+                incremental summary panel for `users.txt`.
 
         Returns:
             str: Full path to the written file.
@@ -18944,15 +19103,97 @@ class PentestShell:
             seen.add(key)
             normalized.append(cleaned)
 
+        existing_entries: list[str] = []
+        existing_seen: set[str] = set()
+        if merge_existing and os.path.exists(users_file):
+            try:
+                with open(users_file, "r", encoding="utf-8") as file:
+                    for line in file:
+                        cleaned = str(line or "").strip()
+                        if not cleaned:
+                            continue
+                        key = cleaned.lower()
+                        if key in existing_seen:
+                            continue
+                        existing_seen.add(key)
+                        existing_entries.append(cleaned)
+            except OSError as exc:
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[users] Failed to read existing entries from "
+                    f"{mark_sensitive(users_file, 'path')}: {exc}"
+                )
+
+        final_entries = list(normalized)
+        newly_added = len(normalized)
+        already_present = 0
+        if merge_existing:
+            final_entries = list(existing_entries)
+            for user in normalized:
+                key = user.lower()
+                if key in existing_seen:
+                    already_present += 1
+                    continue
+                existing_seen.add(key)
+                final_entries.append(user)
+            newly_added = len(final_entries) - len(existing_entries)
+
         with open(users_file, "w", encoding="utf-8") as file:
-            if normalized:
-                file.write("\n".join(normalized) + "\n")
+            if final_entries:
+                file.write("\n".join(final_entries) + "\n")
             else:
                 file.truncate(0)
 
         marked_path = mark_sensitive(users_file, "path")
-        print_info(f"[users] Wrote {len(normalized)} entries to {marked_path}")
+        if merge_existing:
+            print_info(
+                f"[users] Updated {marked_path} with {newly_added} new entr"
+                f"{'y' if newly_added == 1 else 'ies'} "
+                f"({already_present} already present, {len(final_entries)} total)"
+            )
+            if filename == "users.txt":
+                self._print_user_inventory_update_panel(
+                    domain=domain,
+                    path=users_file,
+                    discovered_count=len(normalized),
+                    newly_added=newly_added,
+                    already_present=already_present,
+                    total_count=len(final_entries),
+                    source=update_source,
+                )
+        else:
+            print_info(f"[users] Wrote {len(final_entries)} entries to {marked_path}")
         return users_file
+
+    def _print_user_inventory_update_panel(
+        self,
+        *,
+        domain: str,
+        path: str,
+        discovered_count: int,
+        newly_added: int,
+        already_present: int,
+        total_count: int,
+        source: str | None = None,
+    ) -> None:
+        """Render a concise summary panel after incremental `users.txt` updates."""
+        marked_domain = mark_sensitive(domain, "domain")
+        marked_path = mark_sensitive(path, "path")
+        source_line = ""
+        if source:
+            source_line = f"Source: {source}\n"
+        print_panel(
+            (
+                f"Domain: {marked_domain}\n"
+                f"{source_line}"
+                f"Discovered this run: {discovered_count}\n"
+                f"Newly added to users.txt: {newly_added}\n"
+                f"Already present: {already_present}\n"
+                f"Total inventory in users.txt: {total_count}\n"
+                f"File: {marked_path}"
+            ),
+            title="👥 User Inventory Updated",
+        )
 
     def execute_netexec_users(self, command, domain, filename):
         """Executes the command to generate user lists (e.g., all, admin, privileged) via BloodHound."""
@@ -20677,6 +20918,8 @@ class PentestShell:
         auth_username=None,
         loot_dir=None,
         credsweeper_jobs=None,
+        phase=None,
+        analysis_context=None,
     ):
         """Delegate to smb module for consistency."""
         from adscan_internal.cli.smb import execute_manspider
@@ -20691,6 +20934,8 @@ class PentestShell:
             auth_username=auth_username,
             loot_dir=loot_dir,
             credsweeper_jobs=credsweeper_jobs,
+            phase=phase,
+            analysis_context=analysis_context,
         )
 
     def analyze_log_with_credsweeper(self, log_file: str) -> dict:
@@ -20801,6 +21046,8 @@ class PentestShell:
         source_shares: list[str] | None = None,
         auth_username: str | None = None,
         source_artifact: str | None = None,
+        analysis_origin: str = "credsweeper",
+        ai_findings: list[object] | None = None,
     ):
         """Handle all credentials found by CredSweeper, display them with Rich, save them to files, and offer password spraying."""
         from adscan_internal.cli.creds import handle_found_credentials
@@ -20813,6 +21060,8 @@ class PentestShell:
             source_shares=source_shares,
             auth_username=auth_username,
             source_artifact=source_artifact,
+            analysis_origin=analysis_origin,
+            ai_findings=ai_findings,
         )
 
     def spraying_with_password(
@@ -23719,6 +23968,7 @@ class PentestShell:
         from adscan_internal.rich_output import mark_sensitive
 
         max_retries = 3
+        found_privileged_hosts = False
         command = self._ensure_service_command_netexec_timeout(
             command=command,
             service=service,
@@ -23792,6 +24042,7 @@ class PentestShell:
                 output = execute_command()
                 if output:  # Only process if there is output
                     privileged_hosts = []
+                    confirmed_findings: list[ServiceAccessFinding] = []
 
                     for line in output.splitlines():
                         if (
@@ -23805,6 +24056,18 @@ class PentestShell:
                             if match_ip and match_hostname:
                                 host = match_ip.group(0)
                                 privileged_hosts.append(host)
+                                confirmed_findings.append(
+                                    ServiceAccessFinding(
+                                        service=service,
+                                        host=host,
+                                        username=username,
+                                        category="confirmed",
+                                        reason="confirmed",
+                                        status=line.strip(),
+                                        backend="netexec",
+                                    )
+                                )
+                                found_privileged_hosts = True
                                 if return_boolean:
                                     return True
                                 marked_username = mark_sensitive(username, "user")
@@ -23841,27 +24104,104 @@ class PentestShell:
                                         )
                                 except Exception as exc:  # noqa: BLE001
                                     telemetry.capture_exception(exc)
-                                if prompt:
+
+                    if confirmed_findings:
+                        render_service_access_results(
+                            service=service,
+                            username=username,
+                            findings=confirmed_findings,
+                            total_targets=target_count,
+                        )
+                        if prompt:
+                            selected_followups, used_selector = (
+                                select_confirmed_service_access_followup_targets(
+                                    self,
+                                    service=service,
+                                    findings=confirmed_findings,
+                                )
+                            )
+                            if used_selector:
+                                func = getattr(self, f"ask_for_{service}_access")
+                                if service == "smb":
+                                    selected_hosts = [
+                                        finding.host for finding in selected_followups
+                                    ]
+                                    marked_username = mark_sensitive(
+                                        username, "user"
+                                    )
+                                    marked_hosts = [
+                                        mark_sensitive(host, "hostname")
+                                        for host in selected_hosts
+                                    ]
+                                    print_info_debug(
+                                        "[service-access] launching batch SMB follow-up: "
+                                        f"service={service} user={marked_username} hosts={marked_hosts}"
+                                    )
+                                    func(
+                                        domain,
+                                        selected_hosts,
+                                        username,
+                                        password,
+                                    )
+                                else:
+                                    for finding in selected_followups:
+                                        marked_username = mark_sensitive(
+                                            finding.username, "user"
+                                        )
+                                        marked_host = mark_sensitive(
+                                            finding.host, "hostname"
+                                        )
+                                        print_info_debug(
+                                            "[service-access] launching selected service follow-up: "
+                                            f"service={service} user={marked_username} host={marked_host}"
+                                        )
+                                        func(
+                                            domain,
+                                            finding.host,
+                                            finding.username,
+                                            password,
+                                        )
+                            else:
+                                func = getattr(self, f"ask_for_{service}_access")
+                                for finding in confirmed_findings:
+                                    marked_username = mark_sensitive(
+                                        finding.username, "user"
+                                    )
+                                    marked_host = mark_sensitive(
+                                        finding.host, "hostname"
+                                    )
                                     print_info_debug(
                                         "[service-access] launching service follow-up prompt: "
                                         f"service={service} user={marked_username} host={marked_host}"
                                     )
-                                    func = getattr(self, f"ask_for_{service}_access")
-                                    func(domain, host, username, password)
-                                else:
-                                    print_info_debug(
-                                        "[service-access] service follow-up prompt suppressed: "
-                                        f"service={service} user={marked_username} host={marked_host}"
+                                    func(
+                                        domain,
+                                        finding.host,
+                                        finding.username,
+                                        password,
                                     )
+                        else:
+                            for finding in confirmed_findings:
+                                marked_username = mark_sensitive(
+                                    finding.username, "user"
+                                )
+                                marked_host = mark_sensitive(
+                                    finding.host, "hostname"
+                                )
+                                print_info_debug(
+                                    "[service-access] service follow-up prompt suppressed: "
+                                    f"service={service} user={marked_username} host={marked_host}"
+                                )
 
                     if not privileged_hosts:
-                        marked_username = mark_sensitive(username, "user")
-                        print_error(
-                            f"{service} enumeration completed for user {marked_username}. No hosts with privileges found."
+                        render_no_confirmed_service_access(
+                            service=service,
+                            username=username,
+                            total_targets=target_count,
                         )
                         if return_boolean:
                             return False
-                    break  # If we reach here, execution was successful
+                    return found_privileged_hosts
 
             except subprocess.TimeoutExpired as e:
                 telemetry.capture_exception(e)
@@ -23876,7 +24216,7 @@ class PentestShell:
                     print_error(f"Attempts exhausted for service {service}")
                     if return_boolean:
                         return False
-                    break
+                    return found_privileged_hosts
 
             except subprocess.CalledProcessError as e:
                 telemetry.capture_exception(e)
@@ -23887,16 +24227,18 @@ class PentestShell:
                     )
                     if return_boolean:
                         return False
-                    break
+                    return found_privileged_hosts
                 print_error(f"Error executing {service} enumeration: {e.stderr}")
-                break
+                return found_privileged_hosts
 
             except Exception as e:
                 telemetry.capture_exception(e)
 
                 print_error("Unexpected error during {service} enumeration.")
                 print_exception(show_locals=False, exception=e)
-                break
+                return found_privileged_hosts
+
+        return found_privileged_hosts
 
     def ask_for_ldap_users(self, target_domain):
         """Delegates LDAP users prompt to CLI ldap module (backwards-compatible)."""
@@ -24300,8 +24642,11 @@ class PentestShell:
         password_fallback_display: str | None = None,
     ) -> None:
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.cli.bloodhound import (
+            get_bloodhound_collector_timeout_seconds,
+        )
 
-        collector_timeout = 1200
+        collector_timeout = get_bloodhound_collector_timeout_seconds(tool_name)
         try:
 
             def _detect_kerberos_time_error_reason(
@@ -24564,9 +24909,23 @@ class PentestShell:
                 )
                 if completed_process is None:
                     marked_domain = mark_sensitive(domain, "domain")
-                    print_error(
-                        f"BloodHound collector timed out or failed to start for {marked_domain}."
-                    )
+                    last_error = getattr(self, "_last_run_command_error", None)
+                    error_kind = ""
+                    if isinstance(last_error, tuple) and len(last_error) == 2:
+                        error_kind = str(next(iter(last_error), "")).strip().lower()
+                    if error_kind == "timeout":
+                        print_error(
+                            f"BloodHound collector timed out after {collector_timeout} seconds for {marked_domain}."
+                        )
+                        print_instruction(
+                            "Large domains can require a longer collector window. "
+                            "Retry with ADSCAN_BLOODHOUND_COLLECTOR_TIMEOUT set to a higher value, "
+                            "for example `ADSCAN_BLOODHOUND_COLLECTOR_TIMEOUT=3600 adscan ...`."
+                        )
+                    else:
+                        print_error(
+                            f"BloodHound collector failed to start for {marked_domain}."
+                        )
                     return
                 stdout = completed_process.stdout
                 stderr = completed_process.stderr
@@ -24768,9 +25127,23 @@ class PentestShell:
                     )
                     if completed_process is None:
                         marked_domain = mark_sensitive(domain, "domain")
-                        print_error(
-                            f"BloodHound collector timed out or failed to start for {marked_domain}."
-                        )
+                        last_error = getattr(self, "_last_run_command_error", None)
+                        error_kind = ""
+                        if isinstance(last_error, tuple) and len(last_error) == 2:
+                            error_kind = str(next(iter(last_error), "")).strip().lower()
+                        if error_kind == "timeout":
+                            print_error(
+                                f"BloodHound collector timed out after {collector_timeout} seconds for {marked_domain}."
+                            )
+                            print_instruction(
+                                "Large domains can require a longer collector window. "
+                                "Retry with ADSCAN_BLOODHOUND_COLLECTOR_TIMEOUT set to a higher value, "
+                                "for example `ADSCAN_BLOODHOUND_COLLECTOR_TIMEOUT=3600 adscan ...`."
+                            )
+                        else:
+                            print_error(
+                                f"BloodHound collector failed to start for {marked_domain}."
+                            )
                         return
                     stdout = completed_process.stdout
                     stderr = completed_process.stderr
@@ -28804,6 +29177,8 @@ if __name__ == "__main__":
     _guard_unsupported_distribution(args.command)
 
     _guard_root_shell_without_user_context(args.command)
+
+    _guard_container_runtime_launcher_contract(args.command)
 
     # Install requires privileged system operations (apt/systemctl). Allow users to run
     # `adscan install` without prefixing sudo; re-exec through sudo with a minimal set of

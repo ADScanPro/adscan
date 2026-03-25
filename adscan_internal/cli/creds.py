@@ -11,9 +11,11 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 from rich.panel import Panel
+from rich.prompt import Confirm
 from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
@@ -43,6 +45,14 @@ NON_SPRAYABLE_CREDSWEEPER_RULES = {"uuid"}
 UUID_VALUE_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+@dataclass(frozen=True)
+class CredentialPresentationOptions:
+    """Shared credential-review presentation options for SMB/WinRM findings."""
+
+    confidence_label: str | None = "ML Confidence"
+    source_column_label: str = "Path(s)"
 
 
 def normalize_creds_subcommand(subcommand: str) -> tuple[str, bool]:
@@ -578,11 +588,31 @@ def handle_auth_and_optional_privs(
         is_user_tier0_or_high_value,
         normalize_samaccountname,
     )
+    from adscan_internal.services.attack_step_support_registry import (
+        classify_relation_support,
+    )
 
-    def _is_terminal_pivot_attack_step() -> bool:
-        """Return True when the active step is the final actionable pivot step."""
+    def _resolve_active_step_compromise_metadata() -> tuple[str, str]:
+        """Return normalized compromise semantics and effort for the active step."""
+        context = get_attack_path_step_context(shell)
+        semantics = str(context.get("compromise_semantics") or "").strip().lower()
+        effort = str(context.get("compromise_effort") or "").strip().lower()
+        if semantics or effort:
+            return semantics or "other", effort or "other"
+        active = getattr(shell, "_active_attack_graph_step", None)
+        relation = str(getattr(active, "relation", "") or "").strip().lower()
+        if relation:
+            support = classify_relation_support(relation)
+            return support.compromise_semantics, support.compromise_effort
+        return "other", "other"
+
+    def _is_terminal_direct_compromise_attack_step() -> bool:
+        """Return True for a terminal direct-compromise step in a supported search."""
         context = get_attack_path_step_context(shell)
         search_mode = str(context.get("search_mode_label") or "").strip().lower()
+        compromise_semantics, compromise_effort = (
+            _resolve_active_step_compromise_metadata()
+        )
         try:
             step_index = int(context.get("step_index") or 0)
             last_executable_idx = int(context.get("last_executable_idx") or 0)
@@ -592,15 +622,33 @@ def handle_auth_and_optional_privs(
                 f"context={mark_sensitive(str(context), 'detail')}"
             )
             return False
-        is_terminal_pivot = (
-            search_mode == "pivot search"
+        is_terminal_direct_compromise = (
+            search_mode in {"pivot search", "high-value search"}
             and step_index > 0
             and step_index == last_executable_idx
+            and compromise_semantics == "direct_target_compromise"
+        )
+        print_info_debug(
+            "[creds] terminal direct-compromise check: "
+            f"search_mode={mark_sensitive(search_mode or 'none', 'detail')} "
+            f"compromise_semantics={mark_sensitive(compromise_semantics, 'detail')} "
+            f"compromise_effort={mark_sensitive(compromise_effort, 'detail')} "
+            f"step_index={step_index} last_executable_idx={last_executable_idx} "
+            f"result={is_terminal_direct_compromise!r}"
+        )
+        return is_terminal_direct_compromise
+
+    def _is_terminal_pivot_attack_step() -> bool:
+        """Return True when the active step is the final actionable pivot step."""
+        context = get_attack_path_step_context(shell)
+        search_mode = str(context.get("search_mode_label") or "").strip().lower()
+        is_terminal_pivot = (
+            search_mode == "pivot search"
+            and _is_terminal_direct_compromise_attack_step()
         )
         print_info_debug(
             "[creds] terminal pivot check: "
             f"search_mode={mark_sensitive(search_mode or 'none', 'detail')} "
-            f"step_index={step_index} last_executable_idx={last_executable_idx} "
             f"result={is_terminal_pivot!r}"
         )
         return is_terminal_pivot
@@ -642,7 +690,8 @@ def handle_auth_and_optional_privs(
         if followup_context:
             print_info_debug(
                 "[creds] terminal pivot follow-up gate: disabled "
-                "(nested attack-path follow-up active) "
+                "(nested attack-path follow-up active; defering to potential "
+                "new-principal privilege assessment flow) "
                 f"context={mark_sensitive(str(followup_context), 'detail')}"
             )
             return False
@@ -722,6 +771,59 @@ def handle_auth_and_optional_privs(
         )
         return True
 
+    def _should_force_full_user_privs_from_attack_context(user: str) -> bool:
+        """Return True when attack-path context should promote a full user pivot.
+
+        Credentials discovered from an active attack-path follow-up (for example,
+        passwords recovered while enumerating SMB shares or services) represent a
+        *new* pivot source that was not part of the original terminal step. In
+        that scenario we intentionally prefer the broader ``ask_for_user_privs``
+        flow over the lightweight terminal-pivot UX.
+        """
+        if not is_attack_path_execution_active(shell):
+            print_info_debug(
+                "[creds] attack-context credential flow: disabled "
+                "(attack path execution inactive)"
+            )
+            return False
+        followup_context = get_attack_path_followup_context(shell)
+        compromise_semantics, compromise_effort = (
+            _resolve_active_step_compromise_metadata()
+        )
+        if not followup_context and compromise_semantics != "access_capability_only":
+            print_info_debug(
+                "[creds] attack-context credential flow: disabled "
+                "(no nested follow-up context and active step semantics are not access_capability_only)"
+            )
+            return False
+
+        normalized_user = normalize_samaccountname(user)
+        if not normalized_user:
+            print_info_debug(
+                "[creds] attack-context credential flow: disabled "
+                "(credential user could not be normalized)"
+            )
+            return False
+
+        active_step_user = _resolve_active_step_execution_user()
+        if active_step_user and normalized_user == active_step_user:
+            print_info_debug(
+                "[creds] attack-context credential flow: disabled "
+                "(credential belongs to active step execution user)"
+            )
+            return False
+
+        print_info_debug(
+            "[creds] attack-context credential flow: enabling full "
+            "ask_for_user_privs for newly discovered principal "
+            f"user={mark_sensitive(normalized_user, 'user')} "
+            f"active_step_user={mark_sensitive(active_step_user or 'N/A', 'user')} "
+            f"compromise_semantics={mark_sensitive(compromise_semantics, 'detail')} "
+            f"compromise_effort={mark_sensitive(compromise_effort, 'detail')} "
+            f"context={mark_sensitive(str(followup_context), 'detail')}"
+        )
+        return True
+
     standard_user_privs_covered_by_full_scan = full_scan_started and (
         enumeration_action == "full_scan"
     )
@@ -752,17 +854,58 @@ def handle_auth_and_optional_privs(
         try:
             if _run_terminal_pivot_user_followups(user, cred):
                 continue
-            if is_attack_path_execution_active(shell):
+            force_full_user_privs_from_attack_context = (
+                _should_force_full_user_privs_from_attack_context(user)
+            )
+            normalized_user = normalize_samaccountname(user)
+            should_force_high_value_terminal_user_privs = False
+            if (
+                is_attack_path_execution_active(shell)
+                and not force_full_user_privs_from_attack_context
+                and _is_terminal_direct_compromise_attack_step()
+                and normalized_user
+            ):
+                should_force_high_value_terminal_user_privs = (
+                    is_user_tier0_or_high_value(
+                        shell, domain=domain, samaccountname=normalized_user
+                    )
+                )
                 print_info_debug(
-                    "[creds] standard ask_for_user_privs disabled during active attack path"
+                    "[creds] terminal direct-compromise high-value check: "
+                    f"user={mark_sensitive(normalized_user, 'user')} "
+                    f"result={should_force_high_value_terminal_user_privs!r}"
+                )
+                if should_force_high_value_terminal_user_privs:
+                    print_info_debug(
+                        "[creds] enabling ask_for_user_privs for terminal "
+                        "high-value direct compromise "
+                        f"user={mark_sensitive(normalized_user, 'user')}"
+                    )
+            if (
+                is_attack_path_execution_active(shell)
+                and not force_full_user_privs_from_attack_context
+                and not should_force_high_value_terminal_user_privs
+            ):
+                print_info_debug(
+                    "[creds] standard ask_for_user_privs disabled during active "
+                    "attack path (no attack-context new-principal override)"
                 )
                 continue
-            if not should_offer_standard_user_privs:
+            should_offer_user_privs = (
+                should_offer_standard_user_privs
+                or force_full_user_privs_from_attack_context
+                or should_force_high_value_terminal_user_privs
+            )
+            if not should_offer_user_privs:
+                print_info_debug(
+                    "[creds] ask_for_user_privs skipped "
+                    f"(standard={should_offer_standard_user_privs!r}, "
+                    f"attack_context_override={force_full_user_privs_from_attack_context!r})"
+                )
                 continue
 
             attack_path_active = is_attack_path_execution_active(shell)
             active_step_user = _resolve_active_step_execution_user()
-            normalized_user = normalize_samaccountname(user)
 
             if attack_path_active:
                 active = getattr(shell, "_active_attack_graph_step", None)
@@ -2557,7 +2700,12 @@ def filter_sprayable_credential_entries(
     return sprayable, skipped
 
 
-def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
+def display_credentials_with_rich(
+    shell: Any,
+    credentials: dict,
+    *,
+    presentation: CredentialPresentationOptions | None = None,
+) -> None:
     """Display all found credentials in a structured, aesthetic format using Rich.
 
     Organized by credential type with ML confidence scores.
@@ -2568,6 +2716,8 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
     """
     if not credentials:
         return
+
+    presentation = presentation or CredentialPresentationOptions()
 
     # Create panels for each credential type
     panels = []
@@ -2596,9 +2746,21 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
         )
         table.add_column("#", style="dim", width=4, justify="right")
         table.add_column("Value", style="cyan", no_wrap=False, max_width=72, overflow="ellipsis")
-        table.add_column("ML Confidence", style="green", justify="right", width=12)
+        if presentation.confidence_label:
+            table.add_column(
+                presentation.confidence_label,
+                style="green",
+                justify="right",
+                width=12,
+            )
         table.add_column("Seen", style="magenta", justify="right", width=6)
-        table.add_column("Sources", style="dim", no_wrap=False, max_width=96, overflow="fold")
+        table.add_column(
+            presentation.source_column_label,
+            style="dim",
+            no_wrap=False,
+            max_width=110,
+            overflow="fold",
+        )
 
         for idx, (
             value,
@@ -2627,17 +2789,86 @@ def display_credentials_with_rich(shell: Any, credentials: dict) -> None:
                 except (ValueError, TypeError):
                     ml_display = "N/A"
 
-            table.add_row(
+            row = [
                 str(idx),
                 display_value,
-                ml_display,
-                str(occurrence_count),
-                summarize_credential_sources(shell, sources) or "N/A",
+            ]
+            if presentation.confidence_label:
+                row.append(ml_display)
+            row.extend(
+                [
+                    str(occurrence_count),
+                    summarize_credential_sources(shell, sources) or "N/A",
+                ]
             )
+            table.add_row(*row)
 
         panels.append(Panel(table, border_style="blue"))
 
     # Display all panels
+    shell.console.print()
+    for panel in panels:
+        shell.console.print(panel)
+        shell.console.print()
+
+
+def display_credential_path_lookup_with_rich(
+    shell: Any,
+    aggregated_credentials: dict[
+        str,
+        list[tuple[Any, Any, Any, Any, Any, int, list[tuple[str, int | None]]]],
+    ],
+) -> None:
+    """Display one row-aligned remote/local source lookup table for each credential type."""
+    if not aggregated_credentials:
+        return
+
+    panels: list[Panel] = []
+    for cred_type in sorted(aggregated_credentials.keys()):
+        rows = aggregated_credentials.get(cred_type) or []
+        if not rows:
+            continue
+        table = Table(
+            title=f"{cred_type} Source Paths",
+            show_header=True,
+            header_style="bold cyan",
+            expand=True,
+        )
+        table.add_column("Row", style="dim", width=4, justify="right")
+        table.add_column(
+            "Remote",
+            style="white",
+            no_wrap=False,
+            overflow="fold",
+        )
+        table.add_column(
+            "Local copy",
+            style="cyan",
+            no_wrap=False,
+            overflow="fold",
+        )
+        for idx, row in enumerate(rows, 1):
+            sources = row[6]
+            remote_sources = [
+                _format_credential_source(shell, file_path=path, line_num=line_num)
+                for path, line_num in sources
+                if str(path or "").strip()
+            ]
+            local_sources = [
+                _format_local_credential_source(shell, file_path=path, line_num=line_num)
+                for path, line_num in sources
+                if str(path or "").strip()
+            ]
+            table.add_row(
+                str(idx),
+                mark_sensitive(remote_sources[0], "path") if remote_sources else "N/A",
+                mark_sensitive(local_sources[0], "path") if local_sources else "N/A",
+            )
+        panels.append(Panel(table, border_style="cyan"))
+
+    if not panels:
+        return
+    print_info("Full remote/local source paths for the credential rows above:")
     shell.console.print()
     for panel in panels:
         shell.console.print(panel)
@@ -2704,6 +2935,21 @@ def aggregate_credentials_for_display(
         ),
         reverse=True,
     )
+
+
+def aggregate_credentials_by_type(
+    credentials: dict[str, list[tuple[Any, Any, Any, Any, Any]]],
+) -> dict[str, list[tuple[Any, Any, Any, Any, Any, int, list[tuple[str, int | None]]]]]:
+    """Aggregate CredSweeper findings by credential type for downstream UX/reporting."""
+    aggregated: dict[
+        str,
+        list[tuple[Any, Any, Any, Any, Any, int, list[tuple[str, int | None]]]],
+    ] = {}
+    for cred_type, creds_list in credentials.items():
+        if not creds_list:
+            continue
+        aggregated[cred_type] = aggregate_credentials_for_display(creds_list)
+    return aggregated
 
 
 def build_credential_source_display(
@@ -2799,6 +3045,18 @@ def _derive_credential_origin_path(file_path: str) -> str:
     return ""
 
 
+def _format_local_credential_source(
+    shell: Any,
+    *,
+    file_path: str,
+    line_num: int | None,
+) -> str:
+    """Format one local loot source path for fast manual review."""
+    line_suffix = f":{line_num}" if isinstance(line_num, int) and line_num > 0 else ""
+    relative_path = _relativize_credential_loot_path(shell, file_path)
+    return f"{relative_path}{line_suffix}"
+
+
 def _format_credential_source(
     shell: Any,
     *,
@@ -2820,9 +3078,9 @@ def summarize_credential_sources(
     *,
     max_items: int = 3,
 ) -> str:
-    """Return a compact preview of where one credential value appeared."""
+    """Return a compact preview of canonical review paths for one credential value."""
     normalized_sources = [
-        _format_credential_source(shell, file_path=path, line_num=line_num)
+        _format_local_credential_source(shell, file_path=path, line_num=line_num)
         for path, line_num in sources
         if str(path or "").strip()
     ]
@@ -2834,6 +3092,207 @@ def summarize_credential_sources(
     if remaining > 0:
         preview = f"{preview}, +{remaining} more"
     return preview
+
+
+def summarize_local_credential_sources(
+    shell: Any,
+    sources: list[tuple[str, int | None]],
+    *,
+    max_items: int = 2,
+) -> str:
+    """Return a compact preview of local loot paths for manual review."""
+    normalized_sources = [
+        _format_local_credential_source(shell, file_path=path, line_num=line_num)
+        for path, line_num in sources
+        if str(path or "").strip()
+    ]
+    deduplicated_sources = list(dict.fromkeys(normalized_sources))
+    if not deduplicated_sources:
+        return ""
+    preview_items = deduplicated_sources[:max_items]
+    preview = ", ".join(mark_sensitive(item, "path") for item in preview_items)
+    remaining = len(deduplicated_sources) - len(preview_items)
+    if remaining > 0:
+        preview = f"{preview}, +{remaining} more"
+    return preview
+
+
+def save_aggregated_credential_review_reports(
+    shell: Any,
+    aggregated_credentials: dict[
+        str,
+        list[tuple[Any, Any, Any, Any, Any, int, list[tuple[str, int | None]]]],
+    ],
+    *,
+    base_dir: str = "smb/spidering",
+) -> dict[str, str]:
+    """Persist enriched per-type review reports with remote and local source paths."""
+    saved_files: dict[str, str] = {}
+    if not aggregated_credentials:
+        return saved_files
+
+    os.makedirs(base_dir, exist_ok=True)
+    for cred_type, rows in aggregated_credentials.items():
+        if not rows:
+            continue
+        safe_type_name = cred_type.lower().replace(" ", "_").replace("/", "_")
+        file_path = os.path.join(base_dir, f"{safe_type_name}.review.json")
+        entries: list[dict[str, Any]] = []
+        for idx, (
+            value,
+            ml_prob,
+            context_line,
+            line_num,
+            file_path_orig,
+            occurrence_count,
+            sources,
+        ) in enumerate(rows, 1):
+            entries.append(
+                {
+                    "index": idx,
+                    "value": value,
+                    "ml_confidence": ml_prob,
+                    "context_line": context_line,
+                    "line_number": line_num,
+                    "representative_source_file": file_path_orig,
+                    "seen": occurrence_count,
+                    "remote_sources": [
+                        _format_credential_source(shell, file_path=path, line_num=source_line_num)
+                        for path, source_line_num in sources
+                        if str(path or "").strip()
+                    ],
+                    "local_sources": [
+                        _format_local_credential_source(shell, file_path=path, line_num=source_line_num)
+                        for path, source_line_num in sources
+                        if str(path or "").strip()
+                    ],
+                }
+            )
+        try:
+            with open(file_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "credential_type": cred_type,
+                        "count": len(entries),
+                        "entries": entries,
+                    },
+                    handle,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            saved_files[cred_type] = file_path
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_warning(
+                f"Error saving local review report for {cred_type} credentials: {exc}"
+            )
+    return saved_files
+
+
+def save_aggregated_credential_review_indexes(
+    shell: Any,
+    aggregated_credentials: dict[
+        str,
+        list[tuple[Any, Any, Any, Any, Any, int, list[tuple[str, int | None]]]],
+    ],
+    *,
+    base_dir: str = "smb/spidering",
+) -> dict[str, str]:
+    """Persist one TSV index per credential type for quick terminal-based review."""
+    saved_files: dict[str, str] = {}
+    if not aggregated_credentials:
+        return saved_files
+
+    os.makedirs(base_dir, exist_ok=True)
+    for cred_type, rows in aggregated_credentials.items():
+        if not rows:
+            continue
+        safe_type_name = cred_type.lower().replace(" ", "_").replace("/", "_")
+        file_path = os.path.join(base_dir, f"{safe_type_name}.review.tsv")
+        try:
+            with open(file_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "\t".join(
+                        [
+                            "index",
+                            "value",
+                            "ml_confidence",
+                            "seen",
+                            "primary_remote_source",
+                            "primary_local_source",
+                        ]
+                    )
+                    + "\n"
+                )
+                for idx, row in enumerate(rows, 1):
+                    remote_sources = [
+                        _format_credential_source(shell, file_path=path, line_num=line_num)
+                        for path, line_num in row[6]
+                        if str(path or "").strip()
+                    ]
+                    local_sources = [
+                        _format_local_credential_source(shell, file_path=path, line_num=line_num)
+                        for path, line_num in row[6]
+                        if str(path or "").strip()
+                    ]
+                    handle.write(
+                        "\t".join(
+                            [
+                                str(idx),
+                                str(row[0] or ""),
+                                str(row[1] if row[1] is not None else ""),
+                                str(int(row[5] or 0)),
+                                remote_sources[0] if remote_sources else "",
+                                local_sources[0] if local_sources else "",
+                            ]
+                        )
+                        + "\n"
+                    )
+            saved_files[cred_type] = file_path
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_warning(
+                f"Error saving local review index for {cred_type} credentials: {exc}"
+            )
+    return saved_files
+
+
+def display_local_credential_review_paths(
+    shell: Any,
+    aggregated_credentials: dict[
+        str,
+        list[tuple[Any, Any, Any, Any, Any, int, list[tuple[str, int | None]]]],
+    ],
+    *,
+    preview_limit: int = 12,
+) -> None:
+    """Render compact local review tables keyed to the main credential row numbers."""
+    panels: list[Panel] = []
+    for cred_type in sorted(aggregated_credentials.keys()):
+        rows = aggregated_credentials.get(cred_type) or []
+        if not rows or len(rows) > preview_limit:
+            continue
+        table = Table(
+            title=f"{cred_type} Review Paths",
+            show_header=True,
+            header_style="bold cyan",
+            expand=True,
+        )
+        table.add_column("#", style="dim", width=4, justify="right")
+        table.add_column("Primary Path", style="white", no_wrap=False, max_width=110, overflow="fold")
+        table.add_column("Copies", style="magenta", justify="right", width=6)
+        for idx, row in enumerate(rows, 1):
+            local_preview = summarize_local_credential_sources(shell, row[6], max_items=1) or "N/A"
+            table.add_row(str(idx), local_preview, str(int(row[5] or 0)))
+        panels.append(Panel(table, border_style="cyan"))
+
+    if not panels:
+        return
+    print_info("Review paths for the credential rows above:")
+    shell.console.print()
+    for panel in panels:
+        shell.console.print(panel)
+        shell.console.print()
 
 
 def save_credentials_to_files(
@@ -2905,6 +3364,175 @@ def save_credentials_to_files(
     return saved_files
 
 
+def _select_action_index(
+    *,
+    shell: Any,
+    title: str,
+    options: list[str],
+    default_idx: int = 0,
+) -> int | None:
+    """Return one selected option index using the shell questionary helper when available."""
+    selector = getattr(shell, "_questionary_select", None)
+    if callable(selector):
+        return selector(title, options, default_idx=default_idx)
+    return None
+
+
+def _safe_secret_preview(secret: str, *, max_chars: int = 48) -> str:
+    """Return one masked secret preview for interactive prompts."""
+    value = str(secret or "").strip()
+    if len(value) <= max_chars:
+        return value
+    return f"{value[:max_chars - 3]}..."
+
+
+def _infer_ai_host_hint(finding: Any) -> str:
+    """Return one best-effort host hint from an AI finding."""
+    host_hint = str(getattr(finding, "host_hint", "") or "").strip()
+    if host_hint:
+        return host_hint
+    local_source = str(getattr(finding, "local_source", "") or "").strip().replace("\\", "/")
+    if not local_source:
+        return ""
+    parts = [part for part in local_source.split("/") if part]
+    return parts[0] if parts else ""
+
+
+def _run_ai_follow_up_actions(
+    shell: Any,
+    *,
+    domain: str,
+    ai_findings: list[Any],
+) -> None:
+    """Offer premium follow-up actions for AI findings based on actionable context."""
+    domain_candidates: list[tuple[str, str]] = []
+    local_smb_candidates: list[tuple[str, str, str]] = []
+    local_mssql_candidates: list[tuple[str, str, str]] = []
+    spray_candidates: list[str] = []
+    manual_only_notes: list[str] = []
+
+    seen_domain: set[tuple[str, str]] = set()
+    seen_local_smb: set[tuple[str, str, str]] = set()
+    seen_local_mssql: set[tuple[str, str, str]] = set()
+    seen_spray: set[str] = set()
+    seen_manual: set[str] = set()
+
+    for finding in ai_findings:
+        username = str(getattr(finding, "username", "") or "").strip()
+        secret = str(getattr(finding, "secret", "") or "").strip()
+        if not secret:
+            continue
+        recommended_action = str(
+            getattr(finding, "recommended_action", "") or "manual_only"
+        ).strip() or "manual_only"
+        service_hint = str(getattr(finding, "service_hint", "") or "unknown").strip().lower() or "unknown"
+        host_hint = _infer_ai_host_hint(finding)
+        credential_type = str(getattr(finding, "credential_type", "") or "secret").strip() or "secret"
+
+        if recommended_action == "add_domain_credential" and username:
+            key = (username, secret)
+            if key not in seen_domain:
+                domain_candidates.append(key)
+                seen_domain.add(key)
+            continue
+        if recommended_action == "add_local_smb_credential" and username and host_hint:
+            key = (host_hint, username, secret)
+            if key not in seen_local_smb:
+                local_smb_candidates.append(key)
+                seen_local_smb.add(key)
+            continue
+        if recommended_action == "add_local_mssql_credential" and username and host_hint:
+            key = (host_hint, username, secret)
+            if key not in seen_local_mssql:
+                local_mssql_candidates.append(key)
+                seen_local_mssql.add(key)
+            continue
+        if recommended_action == "spray" and not shell.is_hash(secret):
+            if secret not in seen_spray:
+                spray_candidates.append(secret)
+                seen_spray.add(secret)
+            continue
+
+        note = (
+            f"{credential_type}: user={username or '-'} service={service_hint or '-'} "
+            f"host={host_hint or '-'}"
+        )
+        if note not in seen_manual:
+            manual_only_notes.append(note)
+            seen_manual.add(note)
+
+    if domain_candidates:
+        if Confirm.ask(
+            f"Validate and store {len(domain_candidates)} AI-discovered domain credential(s)?",
+            default=True,
+        ):
+            for username, secret in domain_candidates:
+                shell.add_credential(
+                    domain,
+                    username,
+                    secret,
+                    prompt_for_user_privs_after=False,
+                )
+
+    if local_smb_candidates:
+        if Confirm.ask(
+            f"Validate and store {len(local_smb_candidates)} AI-discovered local SMB credential(s)?",
+            default=True,
+        ):
+            for host, username, secret in local_smb_candidates:
+                shell.add_credential(
+                    domain,
+                    username,
+                    secret,
+                    host=host,
+                    service="smb",
+                    prompt_for_user_privs_after=False,
+                )
+
+    if local_mssql_candidates:
+        if Confirm.ask(
+            f"Validate and store {len(local_mssql_candidates)} AI-discovered local MSSQL credential(s)?",
+            default=True,
+        ):
+            for host, username, secret in local_mssql_candidates:
+                shell.add_credential(
+                    domain,
+                    username,
+                    secret,
+                    host=host,
+                    service="mssql",
+                    prompt_for_user_privs_after=False,
+                )
+
+    if spray_candidates and domain in getattr(shell, "domains", []):
+        selected_secrets = spray_candidates
+        if len(spray_candidates) > 1:
+            choice = _select_action_index(
+                shell=shell,
+                title="Select one AI-discovered secret to use for password spraying:",
+                options=[_safe_secret_preview(value) for value in spray_candidates] + ["Skip automated spraying"],
+                default_idx=0,
+            )
+            if choice is None or choice >= len(spray_candidates):
+                selected_secrets = []
+            else:
+                selected_secrets = [spray_candidates[choice]]
+        if selected_secrets and Confirm.ask(
+            "Run password spraying using the selected AI-discovered secret?",
+            default=False,
+        ):
+            shell.spraying_with_passwords(domain, selected_secrets, source_label="AI share findings")
+
+    if manual_only_notes:
+        preview = ", ".join(mark_sensitive(item, "text") for item in manual_only_notes[:5])
+        if len(manual_only_notes) > 5:
+            preview = f"{preview}, +{len(manual_only_notes) - 5} more"
+        print_info(
+            "AI discovered additional secrets that were kept for manual review only: "
+            f"{preview}"
+        )
+
+
 def handle_found_credentials(
     shell: Any,
     credentials: dict,
@@ -2914,6 +3542,8 @@ def handle_found_credentials(
     source_shares: list[str] | None = None,
     auth_username: str | None = None,
     source_artifact: str | None = None,
+    analysis_origin: str = "credsweeper",
+    ai_findings: list[Any] | None = None,
 ) -> None:
     """Handle all credentials found by CredSweeper, display them with Rich,
     save them to files, and offer password spraying for all credential types.
@@ -2934,12 +3564,46 @@ def handle_found_credentials(
     if not credentials:
         return
 
+    share_values = [
+        str(value or "").strip().lower() for value in (source_shares or []) if str(value or "").strip()
+    ]
+    access_vector = ""
+    provenance_origin = "share_spidering"
+    if any(value in {"winrm", "rdp", "psremote", "mssql"} for value in share_values):
+        provenance_origin = "artifact_filesystem"
+        access_vector = share_values[0]
+    elif share_values:
+        access_vector = "smb"
+    spray_source_label = (
+        "CredSweeper artifact findings"
+        if provenance_origin == "artifact_filesystem"
+        else "CredSweeper share findings"
+    )
+
     # Display all credentials with Rich
-    print_success("Credentials found in shares:")
-    display_credentials_with_rich(shell, credentials)
+    origin = str(analysis_origin or "credsweeper").strip().lower()
+    presentation = CredentialPresentationOptions(
+        confidence_label="ML Confidence" if origin == "credsweeper" else None,
+        source_column_label="Path(s)",
+    )
+
+    print_success("Credentials discovered:")
+    display_credentials_with_rich(shell, credentials, presentation=presentation)
+    aggregated_credentials = aggregate_credentials_by_type(credentials)
 
     # Save credentials to files
     saved_files = save_credentials_to_files(credentials, base_dir="smb/spidering")
+    review_files = save_aggregated_credential_review_reports(
+        shell,
+        aggregated_credentials,
+        base_dir="smb/spidering",
+    )
+    review_index_files = save_aggregated_credential_review_indexes(
+        shell,
+        aggregated_credentials,
+        base_dir="smb/spidering",
+    )
+    display_local_credential_review_paths(shell, aggregated_credentials)
 
     try:
         from adscan_internal.services.report_service import record_technical_finding
@@ -2972,6 +3636,20 @@ def handle_found_credentials(
         for cred_type, file_path in saved_files.items():
             marked_file_path = mark_sensitive(file_path, "path")
             print_info(f"  - {cred_type}: {marked_file_path}")
+    if review_files:
+        print_info("Local review reports saved to smb/spidering/:")
+        for cred_type, file_path in review_files.items():
+            marked_file_path = mark_sensitive(file_path, "path")
+            print_info(f"  - {cred_type}: {marked_file_path}")
+    if review_index_files:
+        print_info("Quick local review indexes saved to smb/spidering/:")
+        for cred_type, file_path in review_index_files.items():
+            marked_file_path = mark_sensitive(file_path, "path")
+            print_info(f"  - {cred_type}: {marked_file_path}")
+
+    if origin in {"ai", "mixed"} and ai_findings:
+        _run_ai_follow_up_actions(shell, domain=domain, ai_findings=list(ai_findings))
+        return
 
     # Collect all credentials from all types for password spraying
     credential_entries: list[tuple[str, tuple]] = []
@@ -3034,14 +3712,15 @@ def handle_found_credentials(
             shares=source_shares,
             artifact=source_artifact,
             auth_username=auth_username,
-            origin="share_spidering",
+            origin=provenance_origin,
+            access_vector=access_vector or None,
             include_origin_without_fields=False,
         )
         shell.spraying_with_passwords(
             domain,
             [str(credential or "").strip() for credential, *_ in sprayable_credentials],
             source_context=source_context,
-            source_label="CredSweeper share findings",
+            source_label=spray_source_label,
         )
     else:
         print_info(

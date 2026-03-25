@@ -109,6 +109,74 @@ FILESYSTEM_TEXT_NARRATIVE_RULE_NAMES = {
     "ID_PASSWD_PAIR",
 }
 
+CREDSWEEPER_TIMEOUT_TEXT_SECONDS = 300
+CREDSWEEPER_TIMEOUT_DOC_SECONDS = 900
+CREDSWEEPER_TIMEOUT_DOC_DEPTH_SECONDS = 1200
+CREDSWEEPER_TIMEOUT_TEXT_MAX_SECONDS = 900
+CREDSWEEPER_TIMEOUT_DOC_MAX_SECONDS = 3600
+CREDSWEEPER_TIMEOUT_DOC_DEPTH_MAX_SECONDS = 5400
+
+
+def _apply_credsweeper_timeout_growth(
+    *,
+    base_timeout: int,
+    max_timeout: int,
+    candidate_files: int | None,
+    files_per_step: int,
+    seconds_per_step: int,
+) -> int:
+    """Grow one timeout budget progressively as file volume increases."""
+    try:
+        normalized_count = max(0, int(candidate_files or 0))
+    except (TypeError, ValueError):
+        normalized_count = 0
+    if normalized_count <= 0:
+        return base_timeout
+    step_size = max(1, int(files_per_step))
+    step_seconds = max(1, int(seconds_per_step))
+    extra_steps = (normalized_count - 1) // step_size
+    grown_timeout = base_timeout + (extra_steps * step_seconds)
+    return min(max_timeout, grown_timeout)
+
+
+def get_default_credsweeper_timeout(
+    *,
+    doc: bool = False,
+    depth: bool = False,
+    candidate_files: int | None = None,
+) -> int:
+    """Return the default CredSweeper command timeout for one scan mode.
+
+    Broad document scans are materially slower than plain-text scans because
+    CredSweeper has to parse container/document formats before evaluating rules.
+    Keep the default text timeout strict, but give ``--doc`` and ``--depth``
+    workflows a larger execution budget. In large loot sets, grow the timeout
+    progressively instead of relying on one fixed global ceiling.
+    """
+    if depth:
+        return _apply_credsweeper_timeout_growth(
+            base_timeout=CREDSWEEPER_TIMEOUT_DOC_DEPTH_SECONDS,
+            max_timeout=CREDSWEEPER_TIMEOUT_DOC_DEPTH_MAX_SECONDS,
+            candidate_files=candidate_files,
+            files_per_step=1500,
+            seconds_per_step=60,
+        )
+    if doc:
+        return _apply_credsweeper_timeout_growth(
+            base_timeout=CREDSWEEPER_TIMEOUT_DOC_SECONDS,
+            max_timeout=CREDSWEEPER_TIMEOUT_DOC_MAX_SECONDS,
+            candidate_files=candidate_files,
+            files_per_step=2000,
+            seconds_per_step=60,
+        )
+    return _apply_credsweeper_timeout_growth(
+        base_timeout=CREDSWEEPER_TIMEOUT_TEXT_SECONDS,
+        max_timeout=CREDSWEEPER_TIMEOUT_TEXT_MAX_SECONDS,
+        candidate_files=candidate_files,
+        files_per_step=10000,
+        seconds_per_step=60,
+    )
+
 
 def resolve_credsweeper_drop_ml_none_for_ruleset(
     *,
@@ -1358,6 +1426,10 @@ class CredSweeperService(BaseService):
                 f"({label} rules): {path_to_scan}"
             )
             print_info_debug(f"[credsweeper] Command ({label}): {command}")
+            print_info_debug(
+                "[credsweeper] Execution budget: "
+                f"label={label} doc={doc} depth={depth} timeout_seconds={int(timeout)}"
+            )
 
             ruleset_started_at = time.perf_counter()
             completed_process = self._command_executor(
@@ -1506,5 +1578,6 @@ __all__ = [
     "CredSweeperService",
     "CredSweeperFinding",
     "get_default_credsweeper_jobs",
+    "get_default_credsweeper_timeout",
     "get_credsweeper_rules_paths",
 ]

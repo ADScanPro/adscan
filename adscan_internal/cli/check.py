@@ -167,9 +167,6 @@ def get_check_failure_recovery_guidance(
                 "runtime image, then rerun this command."
             ),
             instruction="Run on the host: adscan update",
-            follow_up_message=(
-                "Do not run `adscan check --fix` inside the container for this case."
-            ),
         )
 
     return CheckFailureRecoveryGuidance(
@@ -193,6 +190,21 @@ def should_offer_interactive_check_repair(
     return (
         guidance.interactive_prompt is not None
         and args is not None
+        and getattr(args, "command", None) == "check"
+        and not ci_env
+        and stdin_isatty
+    )
+
+
+def should_offer_failed_check_override(
+    *,
+    args: Any | None,
+    ci_env: str | None,
+    stdin_isatty: bool,
+) -> bool:
+    """Return whether the user should be offered a continue-anyway override."""
+    return (
+        args is not None
         and getattr(args, "command", None) == "check"
         and not ci_env
         and stdin_isatty
@@ -289,7 +301,6 @@ def check_virtual_environment(
 
     deps.print_error(f"Virtual environment not found at {config.venv_path}.")
     if not config.fix_mode:
-        deps.print_instruction("Run: adscan check --fix")
         return False, False
 
     deps.print_info("Attempting to create the ADscan virtual environment (--fix)...")
@@ -317,7 +328,6 @@ def check_virtual_environment(
             return True, all_ok
 
         deps.print_error("Failed to create the virtual environment automatically.")
-        deps.print_instruction("Run: adscan check --fix")
         return False, False
     except Exception as exc:  # noqa: BLE001 - legacy catch-all for installation attempts
         deps.telemetry_capture_exception(exc)
@@ -1393,6 +1403,44 @@ def _normalize_missing_system_packages_for_runtime(
                     )
                     normalized_missing.remove("hashcat")
 
+    if "freerdp3-x11" in normalized_missing:
+        freerdp_executable = shutil.which("xfreerdp") or shutil.which("xfreerdp3")
+        if freerdp_executable:
+            freerdp_executable = os.path.realpath(freerdp_executable)
+            try:
+                result = deps.run_command(
+                    [freerdp_executable, "--version"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except Exception as exc:  # noqa: BLE001
+                deps.telemetry_capture_exception(exc)
+                deps.print_info_debug(
+                    f"[check] Failed to probe FreeRDP candidate {freerdp_executable}: {exc}"
+                )
+            else:
+                if result and getattr(result, "returncode", 1) == 0:
+                    combined_output = "\n".join(
+                        [
+                            getattr(result, "stdout", "") or "",
+                            getattr(result, "stderr", "") or "",
+                        ]
+                    ).strip()
+                    deps.print_success(
+                        "FreeRDP is available via PATH "
+                        f"({freerdp_executable}, {combined_output or 'version detected'})"
+                    )
+                    normalized_missing.remove("freerdp3-x11")
+                else:
+                    deps.print_info_debug(
+                        "[check] FreeRDP candidate did not pass version probe: "
+                        f"path={freerdp_executable}, returncode={getattr(result, 'returncode', None)}, "
+                        f"stdout={(getattr(result, 'stdout', '') or '').strip()[:200]!r}, "
+                        f"stderr={(getattr(result, 'stderr', '') or '').strip()[:200]!r}"
+                    )
+
     return normalized_missing, issues
 
 
@@ -1767,9 +1815,6 @@ def check_dns_resolver(
             else:
                 deps.print_warning(
                     "Unbound service is not active (local DNS may not work)."
-                )
-                deps.print_instruction(
-                    "Run: adscan check --fix (attempts to start Unbound and resolve conflicts)"
                 )
                 all_ok = False
     except Exception as e:
@@ -2340,9 +2385,6 @@ def check_pyenv_status(*, config: PyenvCheckConfig, deps: PyenvCheckDeps) -> boo
                         )
                         return False
                 else:
-                    deps.print_instruction(
-                        f"Run: adscan check --fix (will install Python {config.python_version})"
-                    )
                     return False
         else:
             deps.print_warning("pyenv is not installed or not accessible")
@@ -2365,7 +2407,6 @@ def check_pyenv_status(*, config: PyenvCheckConfig, deps: PyenvCheckDeps) -> boo
                     deps.print_warning("Failed to regenerate pyenv shims")
             else:
                 deps.print_warning("pyenv shims need regeneration")
-                deps.print_instruction("Run: adscan check --fix")
 
         return True
 
@@ -3127,6 +3168,36 @@ def run_check(
             deps.telemetry_capture(
                 "check_recovery",
                 properties={"method": "prompt_declined", "recovered": False},
+            )
+
+        offer_continue = should_offer_failed_check_override(
+            args=config.args,
+            ci_env=deps.os_getenv("CI"),
+            stdin_isatty=deps.sys_stdin_isatty(),
+        )
+        if offer_continue:
+            deps.print_warning(
+                "You can continue anyway, but some features may fail or behave incorrectly until the issues above are repaired."
+            )
+            proceed_anyway = deps.confirm_ask(
+                "Continue using ADscan anyway despite failed checks?",
+                default=False,
+            )
+            if proceed_anyway:
+                deps.telemetry_capture("check_override_accepted")
+                deps.telemetry_capture(
+                    "check_recovery",
+                    properties={"method": "override", "recovered": True},
+                )
+                deps.print_warning(
+                    "Proceeding despite failed checks at user request."
+                )
+                return True
+
+            deps.telemetry_capture("check_override_declined")
+            deps.telemetry_capture(
+                "check_recovery",
+                properties={"method": "override_declined", "recovered": False},
             )
 
         return False

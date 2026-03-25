@@ -874,7 +874,13 @@ def _run_ldap_anonymous_followups(shell: LdapShell, domain: str) -> None:
                 resolved_user_by_dn[record_dn] = candidate
 
     if confirmed_users:
-        shell._write_user_list_file(domain, "users.txt", sorted(confirmed_users))
+        shell._write_user_list_file(
+            domain,
+            "users.txt",
+            sorted(confirmed_users),
+            merge_existing=True,
+            update_source="Anonymous LDAP",
+        )
         try:
             shell._postprocess_user_list_file(
                 domain,
@@ -2437,7 +2443,13 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         return
 
     unique_users = sorted(set(users))
-    shell._write_user_list_file(domain, "users.txt", unique_users)
+    shell._write_user_list_file(
+        domain,
+        "users.txt",
+        unique_users,
+        merge_existing=True,
+        update_source="Kerberos user enumeration",
+    )
     shell._postprocess_user_list_file(
         domain,
         "users.txt",

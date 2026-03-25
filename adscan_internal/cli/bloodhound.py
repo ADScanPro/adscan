@@ -6,6 +6,7 @@ This module handles ACE enumeration and other BloodHound operations.
 from __future__ import annotations
 
 from typing import Any, Protocol
+from collections import defaultdict
 import os
 import sys
 import re
@@ -42,10 +43,39 @@ from adscan_internal.services.attack_graph_service import (
 from adscan_internal.workspaces import domain_subpath
 
 
-_BLOODHOUND_COLLECTOR_TIMEOUT_SECONDS = 1200
+_RUSTHOUND_COLLECTOR_TIMEOUT_SECONDS = 1800
+_BLOODHOUND_CE_PY_COLLECTOR_TIMEOUT_SECONDS = 3600
 # Compute-time path cap for `attack_paths` UX.
 # Set to `None` (default) for unlimited path computation, or to a positive int.
 ATTACK_PATHS_COMPUTE_DEFAULT_MAX: int | None = None
+
+
+def get_bloodhound_collector_timeout_seconds(tool_name: str) -> int:
+    """Return collector timeout in seconds for one collector, allowing env overrides."""
+    specific_env_names = {
+        "rusthound-ce": "ADSCAN_BLOODHOUND_RUSTHOUND_TIMEOUT",
+        "bloodhound-ce-python": "ADSCAN_BLOODHOUND_CE_PY_TIMEOUT",
+    }
+    specific_env = specific_env_names.get(tool_name)
+    candidates = []
+    if specific_env:
+        candidates.append(os.getenv(specific_env, "").strip())
+    candidates.append(os.getenv("ADSCAN_BLOODHOUND_COLLECTOR_TIMEOUT", "").strip())
+    for raw in candidates:
+        if not raw:
+            continue
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                return parsed
+        except (TypeError, ValueError):
+            continue
+
+    defaults = {
+        "rusthound-ce": _RUSTHOUND_COLLECTOR_TIMEOUT_SECONDS,
+        "bloodhound-ce-python": _BLOODHOUND_CE_PY_COLLECTOR_TIMEOUT_SECONDS,
+    }
+    return defaults.get(tool_name, _BLOODHOUND_CE_PY_COLLECTOR_TIMEOUT_SECONDS)
 
 
 def _get_attack_paths_step_sample_limit() -> int:
@@ -62,6 +92,316 @@ def _get_attack_paths_step_show_samples() -> bool:
     """Return whether to show sampled steps (capped) to the user."""
     raw = os.getenv("ADSCAN_ATTACK_PATHS_STEP_SHOW_SAMPLES", "1").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _get_acl_sanitization_threshold() -> int:
+    """Return the ACL per-source threshold above which sanitization is applied."""
+    raw = os.getenv("ADSCAN_ATTACK_PATHS_ACL_SANITIZE_THRESHOLD", "100")
+    try:
+        threshold = int(raw)
+    except (TypeError, ValueError):
+        threshold = 100
+    return max(0, threshold)
+
+
+def _get_acl_sanitization_depth() -> int:
+    """Return the bounded DFS depth used for noisy ACL source sanitization."""
+    raw = os.getenv("ADSCAN_ATTACK_PATHS_ACL_SANITIZE_DEPTH", "5")
+    try:
+        depth = int(raw)
+    except (TypeError, ValueError):
+        depth = 5
+    return max(1, min(depth, 12))
+
+
+def _bloodhound_node_display_label(node: object) -> str:
+    """Return a stable human-readable label for a BloodHound node payload."""
+    if not isinstance(node, dict):
+        return str(node or "").strip()
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    name = (
+        props.get("name")
+        or props.get("samaccountname")
+        or props.get("samAccountName")
+        or node.get("name")
+        or node.get("samaccountname")
+        or node.get("samAccountName")
+        or node.get("label")
+        or node.get("objectId")
+        or ""
+    )
+    return str(name or "").strip()
+
+
+def _sanitize_acl_paths_for_attack_graph(
+    shell: BloodHoundShell,
+    *,
+    domain: str,
+    graph: dict[str, Any],
+    raw_paths: list[dict[str, Any]],
+    max_depth: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return ACL edges to persist after per-source noise sanitization.
+
+    Strategy:
+    - Sources with fewer than ``X`` ACL edges are persisted directly.
+    - Sources with ``>= X`` ACL edges are only persisted when one of their ACL
+      edges participates in a bounded high-value path on an in-memory runtime
+      graph that includes all ACL candidates plus the already-built graph.
+    """
+    from adscan_internal.services import attack_graph_core
+    from adscan_internal.services.attack_graph_service import (  # local import avoids cycle
+        _node_id,
+        add_bloodhound_path_edges,
+    )
+    from adscan_internal.workspaces import write_json_file
+
+    threshold = _get_acl_sanitization_threshold()
+    sanitize_depth = max(max_depth, _get_acl_sanitization_depth())
+
+    valid_entries: list[dict[str, Any]] = []
+    source_to_entries: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    source_to_label: dict[str, str] = {}
+
+    for entry in raw_paths:
+        if not isinstance(entry, dict):
+            continue
+        nodes = entry.get("nodes") or []
+        rels = entry.get("rels") or []
+        if not isinstance(nodes, list) or not isinstance(rels, list):
+            continue
+        if len(nodes) < 2 or not rels:
+            continue
+        if not isinstance(nodes[0], dict):
+            continue
+        source_id = _node_id(nodes[0])
+        if not source_id:
+            continue
+        source_to_entries[source_id].append(entry)
+        source_to_label.setdefault(source_id, _bloodhound_node_display_label(nodes[0]))
+        valid_entries.append(entry)
+
+    report: dict[str, Any] = {
+        "domain": domain,
+        "threshold": threshold,
+        "sanitization_depth": sanitize_depth,
+        "total_acl_rows": len(valid_entries),
+        "direct_sources": 0,
+        "noisy_sources": 0,
+        "direct_acl_rows": 0,
+        "promoted_acl_rows": 0,
+        "dropped_acl_rows": 0,
+        "top_noisy_sources": [],
+        "direct_samples": [],
+        "promoted_samples": [],
+        "retained_sources": [],
+        "dropped_sources": [],
+        "final_retained_sources_count": 0,
+        "fully_dropped_sources_count": 0,
+    }
+
+    if threshold <= 0 or not valid_entries:
+        report["direct_sources"] = len(source_to_entries)
+        report["direct_acl_rows"] = len(valid_entries)
+        return valid_entries, report
+
+    direct_entries: list[dict[str, Any]] = []
+    noisy_entries: dict[str, list[dict[str, Any]]] = {}
+    for source_id, entries in source_to_entries.items():
+        if len(entries) <= threshold:
+            direct_entries.extend(entries)
+        else:
+            noisy_entries[source_id] = entries
+
+    report["direct_sources"] = len(source_to_entries) - len(noisy_entries)
+    report["noisy_sources"] = len(noisy_entries)
+    report["direct_acl_rows"] = len(direct_entries)
+    report["direct_samples"] = [
+        {
+            "source": _bloodhound_node_display_label((entry.get("nodes") or [None])[0]),
+            "relation": str((entry.get("rels") or [""])[0] or ""),
+            "target": _bloodhound_node_display_label((entry.get("nodes") or [None, None])[1]),
+        }
+        for entry in direct_entries[:20]
+        if isinstance(entry, dict) and len(entry.get("nodes") or []) >= 2 and (entry.get("rels") or [])
+    ]
+    direct_source_counts = {
+        source_id: len(entries)
+        for source_id, entries in source_to_entries.items()
+        if source_id not in noisy_entries
+    }
+
+    if not noisy_entries:
+        return valid_entries, report
+
+    runtime_graph: dict[str, Any] = dict(graph)
+    runtime_graph["nodes"] = dict(
+        graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    )
+    runtime_graph["edges"] = list(
+        graph.get("edges") if isinstance(graph.get("edges"), list) else []
+    )
+
+    for entry in valid_entries:
+        nodes = [node for node in (entry.get("nodes") or []) if isinstance(node, dict)]
+        rels = entry.get("rels") or []
+        if len(nodes) < 2 or not isinstance(rels, list):
+            continue
+        added = add_bloodhound_path_edges(
+            runtime_graph,
+            nodes=nodes,
+            relations=[str(rel) for rel in rels],
+            status="discovered",
+            edge_type="bloodhound_ce",
+            log_creation=False,
+            shell=shell,
+        )
+        _ = added
+
+    noisy_rows: list[dict[str, Any]] = []
+    for source_id, entries in noisy_entries.items():
+        matched = attack_graph_core.collect_source_step_signatures_on_high_value_paths(
+            runtime_graph,
+            start_node_id=source_id,
+            max_depth=sanitize_depth,
+            target_mode="impact",
+        )
+
+        source_report = {
+            "source": source_to_label.get(source_id, source_id),
+            "source_id": source_id,
+            "acl_count": len(entries),
+            "promoted_acl_count": 0,
+        }
+
+        for entry in entries:
+            nodes = entry.get("nodes") or []
+            rels = entry.get("rels") or []
+            if len(nodes) < 2 or not rels:
+                continue
+            if not isinstance(nodes[0], dict) or not isinstance(nodes[1], dict):
+                continue
+            signature = (
+                _node_id(nodes[0]),
+                str(rels[0]),
+                _node_id(nodes[1]),
+            )
+            if signature not in matched:
+                continue
+            noisy_rows.append(entry)
+            source_report["promoted_acl_count"] += 1
+            if len(report["promoted_samples"]) < 20:
+                report["promoted_samples"].append(
+                    {
+                        "source": _bloodhound_node_display_label(nodes[0]),
+                        "relation": str(rels[0] or ""),
+                        "target": _bloodhound_node_display_label(nodes[1]),
+                    }
+                )
+
+        report["top_noisy_sources"].append(source_report)
+
+    kept_paths = direct_entries + noisy_rows
+    report["promoted_acl_rows"] = len(noisy_rows)
+    report["dropped_acl_rows"] = len(valid_entries) - len(kept_paths)
+    report["top_noisy_sources"] = sorted(
+        report["top_noisy_sources"],
+        key=lambda item: (-int(item.get("acl_count", 0)), str(item.get("source") or "").lower()),
+    )[:20]
+    retained_sources: list[dict[str, Any]] = []
+    dropped_sources: list[dict[str, Any]] = []
+    for source_id, count in sorted(
+        direct_source_counts.items(),
+        key=lambda item: (-int(item[1]), source_to_label.get(item[0], item[0]).lower()),
+    ):
+        retained_sources.append(
+            {
+                "source": source_to_label.get(source_id, source_id),
+                "source_id": source_id,
+                "retained_acl_count": count,
+                "retention_mode": "direct",
+            }
+        )
+    for item in report["top_noisy_sources"]:
+        promoted_count = int(item.get("promoted_acl_count", 0) or 0)
+        source_id = str(item.get("source_id") or "")
+        source_name = str(item.get("source") or source_id)
+        if promoted_count > 0:
+            retained_sources.append(
+                {
+                    "source": source_name,
+                    "source_id": source_id,
+                    "retained_acl_count": promoted_count,
+                    "retention_mode": "sanitized",
+                }
+            )
+        else:
+            dropped_sources.append(
+                {
+                    "source": source_name,
+                    "source_id": source_id,
+                    "original_acl_count": int(item.get("acl_count", 0) or 0),
+                }
+            )
+    retained_sources = sorted(
+        retained_sources,
+        key=lambda item: (-int(item.get("retained_acl_count", 0)), str(item.get("source") or "").lower()),
+    )
+    dropped_sources = sorted(
+        dropped_sources,
+        key=lambda item: (-int(item.get("original_acl_count", 0)), str(item.get("source") or "").lower()),
+    )
+    report["retained_sources"] = retained_sources
+    report["dropped_sources"] = dropped_sources
+    report["final_retained_sources_count"] = len(retained_sources)
+    report["fully_dropped_sources_count"] = len(dropped_sources)
+
+    try:
+        output_path = domain_subpath(
+            shell._get_workspace_cwd(),
+            shell.domains_dir,
+            domain,
+            "BH",
+            "acl_sanitization_report.json",
+        )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        write_json_file(output_path, report)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[bloodhound] failed to write ACL sanitization report: {exc}")
+
+    print_info_debug(
+        "[bloodhound] ACL sanitization: "
+        f"total={report['total_acl_rows']} direct={report['direct_acl_rows']} "
+        f"promoted={report['promoted_acl_rows']} dropped={report['dropped_acl_rows']} "
+        f"threshold={threshold} depth={sanitize_depth}"
+    )
+    print_info_debug(
+        "[bloodhound] ACL sanitization final sources: "
+        f"retained={report['final_retained_sources_count']} "
+        f"dropped={report['fully_dropped_sources_count']}"
+    )
+    for item in report["retained_sources"][:20]:
+        print_info_debug(
+            "[bloodhound] ACL retained source: "
+            f"{mark_sensitive(str(item.get('source') or ''), 'user')} "
+            f"mode={item.get('retention_mode')} "
+            f"retained={item.get('retained_acl_count')}"
+        )
+    for item in report["top_noisy_sources"]:
+        print_info_debug(
+            "[bloodhound] ACL noisy source: "
+            f"{mark_sensitive(str(item.get('source') or ''), 'user')} "
+            f"count={item.get('acl_count')} promoted={item.get('promoted_acl_count')}"
+        )
+    for item in report["dropped_sources"][:20]:
+        print_info_debug(
+            "[bloodhound] ACL dropped source: "
+            f"{mark_sensitive(str(item.get('source') or ''), 'user')} "
+            f"original={item.get('original_acl_count')}"
+        )
+
+    return kept_paths, report
 
 
 def _resolve_attack_paths_compute_cap(max_display: int) -> int | None:
@@ -210,15 +550,22 @@ def _print_high_value_session_summary(
         )
 
 
-def _print_collector_long_running_notice(tool_name: str, domain: str) -> None:
+def _print_collector_long_running_notice(
+    tool_name: str, domain: str, *, timeout_seconds: int | None = None
+) -> None:
     """Show a UX notice that collection can take a long time on large domains."""
     marked_domain = mark_sensitive(domain, "domain")
+    effective_timeout = timeout_seconds or get_bloodhound_collector_timeout_seconds(
+        tool_name
+    )
+    timeout_minutes = max(1, effective_timeout // 60)
     print_panel(
         "\n".join(
             [
                 f"Collector: {tool_name}",
                 f"Domain: {marked_domain}",
-                "This collection can take 10–20 minutes on large domains.",
+                "This collection can take a long time on large domains.",
+                f"Current collector timeout: {timeout_minutes} minutes.",
                 "Please be patient while the collector runs.",
             ]
         ),
@@ -852,7 +1199,11 @@ def run_bloodhound_collector(
     )
 
     print_info_debug(f"Command: {display_command or command}")
-    _print_collector_long_running_notice("rusthound-ce", target_domain)
+    _print_collector_long_running_notice(
+        "rusthound-ce",
+        target_domain,
+        timeout_seconds=get_bloodhound_collector_timeout_seconds("rusthound-ce"),
+    )
 
     # When using Kerberos, clock skew must be corrected against the KDC/PDC of the
     # realm that issues the tickets (auth_domain), not necessarily the target domain.
@@ -958,7 +1309,13 @@ def run_bloodhound_collector(
     )
 
     print_info_debug(f"Command: {ce_py_display_command or ce_py_command}")
-    _print_collector_long_running_notice("bloodhound-ce-python", target_domain)
+    _print_collector_long_running_notice(
+        "bloodhound-ce-python",
+        target_domain,
+        timeout_seconds=get_bloodhound_collector_timeout_seconds(
+            "bloodhound-ce-python"
+        ),
+    )
 
     fallback_password_command = None
     fallback_password_display = None
@@ -1246,7 +1603,10 @@ def run_bloodhound_attack_paths(
         (
             "ACL/ACE Relationships",
             "get_low_priv_acl_paths",
-            lambda: service.get_low_priv_acl_paths(target_domain, max_results=1000),
+            lambda: service.get_low_priv_acl_paths(
+                target_domain,
+                max_results=None,
+            ),
         ),  # type: ignore[attr-defined]
         (
             "Access & Sessions",
@@ -1603,6 +1963,9 @@ def run_bloodhound_attack_paths(
             raw_paths = runner()
         except Exception as exc:
             telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[bloodhound] {method_name} runner exception: {exc}"
+            )
             print_step_status(
                 title, status="failed", step_number=step_number, total_steps=total_steps
             )
@@ -1651,27 +2014,6 @@ def run_bloodhound_attack_paths(
         sampled_steps: list[str] = []
         sampled_seen: set[str] = set()
 
-        def _node_display_label(node: object) -> str:
-            if not isinstance(node, dict):
-                return str(node or "").strip()
-            props = (
-                node.get("properties")
-                if isinstance(node.get("properties"), dict)
-                else {}
-            )
-            name = (
-                props.get("name")
-                or props.get("samaccountname")
-                or props.get("samAccountName")
-                or node.get("name")
-                or node.get("samaccountname")
-                or node.get("samAccountName")
-                or node.get("label")
-                or node.get("objectId")
-                or ""
-            )
-            return str(name or "").strip()
-
         # Certipy returns one path per (principal, template) pair so the same
         # source→relation→target edge can appear in many paths.  Deduplicate here
         # so each unique edge is processed (and uploaded to BH CE) exactly once.
@@ -1682,13 +2024,31 @@ def run_bloodhound_attack_paths(
             _deduped: list[dict] = []
             for _p in raw_paths:
                 _sig = tuple(
-                    _node_display_label(n) if isinstance(n, dict) else str(n)
+                    _bloodhound_node_display_label(n) if isinstance(n, dict) else str(n)
                     for n in (_p.get("nodes") or [])
                 ) + tuple(str(r) for r in (_p.get("rels") or []))
                 if _sig not in _seen_sigs:
                     _seen_sigs.add(_sig)
                     _deduped.append(_p)
             raw_paths = _deduped
+
+        acl_report: dict[str, Any] | None = None
+        if method_name == "get_low_priv_acl_paths":
+            raw_paths, acl_report = _sanitize_acl_paths_for_attack_graph(
+                shell,
+                domain=target_domain,
+                graph=graph,
+                raw_paths=[entry for entry in raw_paths if isinstance(entry, dict)],
+                max_depth=max_depth,
+            )
+            print_info_debug(
+                "[bloodhound] ACL sanitization report: "
+                f"direct_sources={acl_report.get('direct_sources', 0)} "
+                f"noisy_sources={acl_report.get('noisy_sources', 0)} "
+                f"direct_acl_rows={acl_report.get('direct_acl_rows', 0)} "
+                f"promoted_acl_rows={acl_report.get('promoted_acl_rows', 0)} "
+                f"dropped_acl_rows={acl_report.get('dropped_acl_rows', 0)}"
+            )
 
         for entry in raw_paths:
             nodes = entry.get("nodes") or []
@@ -1766,8 +2126,8 @@ def run_bloodhound_attack_paths(
                 for rel_idx, rel in enumerate(relation_names):
                     if rel_idx + 1 >= len(nodes):
                         break
-                    left = _node_display_label(nodes[rel_idx])
-                    right = _node_display_label(nodes[rel_idx + 1])
+                    left = _bloodhound_node_display_label(nodes[rel_idx])
+                    right = _bloodhound_node_display_label(nodes[rel_idx + 1])
                     if not left or not right or not rel:
                         continue
                     step_str = f"{mark_sensitive(left, 'user')} -> {str(rel)} -> {mark_sensitive(right, 'user')}"
@@ -1784,12 +2144,52 @@ def run_bloodhound_attack_paths(
         print_info(
             f"{title}: results={len(raw_paths)}; attack steps recorded={recorded_steps}."
         )
+        if method_name == "get_low_priv_acl_paths" and isinstance(acl_report, dict):
+            raw_total = int(acl_report.get("total_acl_rows", 0) or 0)
+            direct_total = int(acl_report.get("direct_acl_rows", 0) or 0)
+            promoted_total = int(acl_report.get("promoted_acl_rows", 0) or 0)
+            dropped_total = int(acl_report.get("dropped_acl_rows", 0) or 0)
+            print_info(
+                "ACL sanitization summary: "
+                f"raw={raw_total}; direct={direct_total}; "
+                f"sanitized={promoted_total}; dropped={dropped_total}."
+            )
+            direct_samples = [
+                f"{mark_sensitive(str(item.get('source') or ''), 'user')} -> "
+                f"{str(item.get('relation') or '')} -> "
+                f"{mark_sensitive(str(item.get('target') or ''), 'user')}"
+                for item in (acl_report.get("direct_samples") or [])
+                if isinstance(item, dict)
+            ]
+            promoted_samples = [
+                f"{mark_sensitive(str(item.get('source') or ''), 'user')} -> "
+                f"{str(item.get('relation') or '')} -> "
+                f"{mark_sensitive(str(item.get('target') or ''), 'user')}"
+                for item in (acl_report.get("promoted_samples") or [])
+                if isinstance(item, dict)
+            ]
+            if show_samples and direct_samples:
+                direct_title = "ACL/ACE Relationships - direct steps"
+                if direct_total > len(direct_samples):
+                    direct_title = (
+                        "ACL/ACE Relationships - direct steps "
+                        f"(showing {len(direct_samples)}/{direct_total})"
+                    )
+                print_info_list(direct_samples, title=direct_title, icon="→")
+            if show_samples and promoted_samples:
+                promoted_title = "ACL/ACE Relationships - sanitized promoted steps"
+                if promoted_total > len(promoted_samples):
+                    promoted_title = (
+                        "ACL/ACE Relationships - sanitized promoted steps "
+                        f"(showing {len(promoted_samples)}/{promoted_total})"
+                    )
+                print_info_list(promoted_samples, title=promoted_title, icon="→")
         if method_name == "get_high_value_session_paths":
             _print_high_value_session_summary(
                 domain=target_domain,
                 paths=[entry for entry in raw_paths if isinstance(entry, dict)],
             )
-        if show_samples and sampled_steps:
+        if show_samples and sampled_steps and method_name != "get_low_priv_acl_paths":
             title_text = f"{title} - discovered steps"
             if sample_limit > 0 and len(sampled_steps) >= sample_limit:
                 title_text = f"{title} - discovered steps (showing {len(sampled_steps)}/{recorded_steps})"
@@ -2223,27 +2623,12 @@ def run_show_attack_paths(
     )
     max_paths_compute = _resolve_attack_paths_compute_cap(max_display)
 
-    status_order = {
-        "theoretical": 0,
-        "unavailable": 1,
-        "unsupported": 2,
-        "blocked": 3,
-        "attempted": 4,
-        "exploited": 5,
-    }
-
     def _sort_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        sorted_paths = sorted(
-            paths,
-            key=lambda item: (
-                status_order.get(str(item.get("status") or "").strip().lower(), 3),
-                int(item.get("length", 0))
-                if str(item.get("length", "")).isdigit()
-                else 0,
-                str(item.get("source", "")).lower(),
-                str(item.get("target", "")).lower(),
-            ),
+        from adscan_internal.services.attack_step_support_registry import (
+            build_path_priority_key,
         )
+
+        sorted_paths = sorted(paths, key=build_path_priority_key)
         if show_sections:
             return [p for p in sorted_paths if p.get("target_is_high_value")] + [
                 p for p in sorted_paths if not p.get("target_is_high_value")

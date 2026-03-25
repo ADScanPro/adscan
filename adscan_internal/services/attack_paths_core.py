@@ -1395,6 +1395,7 @@ def compute_display_paths_for_domain(
     target: str = "highvalue",
     target_mode: str = "tier0",
     expand_terminal_memberships: bool = True,
+    start_node_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     runtime_graph: dict[str, Any] = dict(graph)
     runtime_graph["nodes"] = dict(
@@ -1438,6 +1439,7 @@ def compute_display_paths_for_domain(
         max_paths=max_paths,
         target=target,
         target_mode=mode,
+        start_node_ids=start_node_ids,
     )
     collapsed = collapse_memberof_prefixes(
         unfiltered,

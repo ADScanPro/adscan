@@ -27,6 +27,7 @@ from adscan_internal.services.smb_exclusion_policy import (
 from adscan_internal.services.smb_sensitive_file_policy import (
     DEFAULT_SMB_SENSITIVE_FILE_PROFILE,
     get_sensitive_file_profile,
+    get_sensitive_phase_max_file_size_bytes,
     resolve_effective_sensitive_extension,
 )
 
@@ -103,6 +104,7 @@ class CIFSCredSweeperScanService(BaseService):
             hosts=unique_hosts,
             shares=unique_shares,
             extensions=self._profile_extensions(profile=profile),
+            max_file_size_bytes=self._document_file_size_limit_for_profile(profile=profile),
         )
         result.prepare_seconds += max(0.0, time.perf_counter() - prepare_started)
         if mapped_candidates:
@@ -166,6 +168,12 @@ class CIFSCredSweeperScanService(BaseService):
             mode = self._classify_candidate_mode(file_path, profile=profile)
             if mode is None:
                 continue
+            if self._should_skip_document_candidate(
+                file_path=file_path,
+                mode=mode,
+                profile=profile,
+            ):
+                continue
             result.candidate_files += 1
             print_info_debug(
                 "[cifs-credsweeper] Scanning mapped candidate file: "
@@ -223,6 +231,15 @@ class CIFSCredSweeperScanService(BaseService):
                 visited_files += 1
                 mode = self._classify_candidate_mode(file_path, profile=profile)
                 if mode is None:
+                    result.prepare_seconds += max(
+                        0.0, time.perf_counter() - loop_prepare_started
+                    )
+                    continue
+                if self._should_skip_document_candidate(
+                    file_path=file_path,
+                    mode=mode,
+                    profile=profile,
+                ):
                     result.prepare_seconds += max(
                         0.0, time.perf_counter() - loop_prepare_started
                     )
@@ -324,6 +341,35 @@ class CIFSCredSweeperScanService(BaseService):
             profile or CIFSCredSweeperScanService.DEFAULT_PROFILE
         )
         return tuple(profile_groups["text_like"] + profile_groups["document_like"])
+
+    @staticmethod
+    def _document_file_size_limit_for_profile(*, profile: str) -> int | None:
+        """Return the document max-size policy applied to this CIFS profile."""
+        profile_groups = get_sensitive_file_profile(
+            profile or CIFSCredSweeperScanService.DEFAULT_PROFILE
+        )
+        if profile_groups["document_like"]:
+            return get_sensitive_phase_max_file_size_bytes("document_credentials")
+        return None
+
+    def _should_skip_document_candidate(
+        self,
+        *,
+        file_path: Path,
+        mode: str,
+        profile: str,
+    ) -> bool:
+        """Return whether one document candidate should be skipped by size policy."""
+        if mode != "doc":
+            return False
+        max_file_size_bytes = self._document_file_size_limit_for_profile(profile=profile)
+        if not isinstance(max_file_size_bytes, int) or max_file_size_bytes <= 0:
+            return False
+        try:
+            size_bytes = int(file_path.stat().st_size)
+        except OSError:
+            return False
+        return size_bytes > max_file_size_bytes
 
     @staticmethod
     def _merge_findings(

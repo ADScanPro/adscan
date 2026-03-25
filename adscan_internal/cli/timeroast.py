@@ -611,27 +611,6 @@ def _collect_timeroast_hashes(
         )
         return None
 
-    try:
-        from adscan_internal.services.attack_graph_service import (
-            upsert_roast_entry_edge,
-        )
-
-        for candidate in matched_candidates:
-            upsert_roast_entry_edge(
-                shell,
-                domain,
-                roast_type="timeroast",
-                username=candidate.samaccountname,
-                status="discovered",
-                notes={
-                    "rid": candidate.rid,
-                    "fqdn": candidate.fqdn,
-                    "reasons": list(candidate.reasons),
-                },
-            )
-    except Exception as exc:  # pragma: no cover - graph persistence best effort
-        telemetry.capture_exception(exc)
-
     print_success(
         "Collected Timeroast hashes for "
         f"{len(matched_candidates)} candidate machine account(s)."

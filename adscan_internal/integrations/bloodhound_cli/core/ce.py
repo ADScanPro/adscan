@@ -1626,7 +1626,7 @@ class BloodHoundCEClient(BloodHoundClient):
         """
 
     def get_low_priv_acl_paths(
-        self, domain: str, *, max_results: int = 1000
+        self, domain: str, *, max_results: int | None = None
     ) -> List[Dict]:
         """Return ACL/ACE-derived single-step paths from low-priv users.
 
@@ -1642,19 +1642,32 @@ class BloodHoundCEClient(BloodHoundClient):
         which is compatible with the existing attack-graph ingestion helpers.
         """
         try:
-            allowed_relations = {
-                "GenericAll",
-                "GenericWrite",
-                "ForceChangePassword",
-                "AddSelf",
-                "AddMember",
-                "ReadGMSAPassword",
-                "ReadLAPSPassword",
-                "WriteDacl",
-                "WriteOwner",
-                "DCSync",
-                "WriteSPN",
-            }
+            return self._get_low_priv_acl_paths_with_filters(
+                domain,
+                max_results=max_results,
+                target_filter="",
+                excluded_source_objectids=None,
+            )
+        except Exception:
+            return []
+
+    def get_low_priv_acl_paths_to_high_value(
+        self, domain: str, *, max_results: int = 1000
+    ) -> List[Dict]:
+        """Return low-priv ACL path steps that participate in short paths to HV targets.
+
+        Unlike the direct ACL helper, this query walks up to four ACL edges deep
+        so we can keep intermediate low-priv pivots such as:
+
+            LOWPRIV_GROUP -> AddMember -> INTERMEDIATE_GROUP -> GenericAll -> DOMAIN ADMINS
+
+        The returned value is still normalized into direct single-step edges so
+        the existing attack-graph ingestion logic can store each step without
+        duplication.
+        """
+        try:
+            allowed_relations = self._get_low_priv_acl_allowed_relations()
+            depth = 3
             domain_value = domain.replace("'", "\\'")
             limit_value = max(1, min(int(max_results), 5000))
             source_filter = self._build_low_priv_source_filter(
@@ -1662,24 +1675,134 @@ class BloodHoundCEClient(BloodHoundClient):
                 domain_value=domain_value,
                 match_domain_by_name_suffix=True,
             )
+            acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
+            no_intermediate_hv = self._build_no_intermediate_high_value_filter(
+                nodes_alias="ns"
+            )
+            target_filter = self._build_high_value_filter(alias="t")
+            named_target_filter = self._build_named_node_filter(alias="t")
 
             cypher_query = f"""
-            MATCH p=(s)-[r]->(t)
+            MATCH p=(s)-[*1..{depth}]->(t)
             WHERE 1=1
               {source_filter}
-              AND type(r) IN {sorted(allowed_relations)!r}
-            RETURN p
+              AND {target_filter}
+              AND {named_target_filter}
+            WITH p, nodes(p) AS ns
+            WHERE {acyclic_filter}
+              AND {no_intermediate_hv}
+              AND ALL(r IN relationships(p) WHERE type(r) IN {sorted(allowed_relations)!r})
+            RETURN ns AS path_nodes, relationships(p) AS rels
             LIMIT {limit_value}
             """
 
-            graph_data = self.execute_query_with_relationships(cypher_query)
-            if not graph_data:
+            paths = self.execute_path_query(cypher_query)
+            if not paths:
                 return []
-            return self._extract_direct_allowed_edges_from_graph(
-                graph_data, allowed_relations=allowed_relations
+            return self._extract_direct_allowed_edges_from_paths(
+                paths,
+                allowed_relations=allowed_relations,
             )
         except Exception:
             return []
+
+    def get_low_priv_acl_paths_to_non_high_value(
+        self,
+        domain: str,
+        *,
+        max_results: int = 1000,
+        excluded_source_objectids: List[str] | None = None,
+    ) -> List[Dict]:
+        """Return low-priv ACL paths whose targets are not high-value / tier-zero.
+
+        Optionally excludes source principals already seen reaching high-value
+        targets so the second ACL phase is reserved for additional low-priv pivots.
+        """
+        try:
+            target_filter = f"\n              AND NOT {self._build_high_value_filter(alias='t')}"
+            return self._get_low_priv_acl_paths_with_filters(
+                domain,
+                max_results=max_results,
+                target_filter=target_filter,
+                excluded_source_objectids=excluded_source_objectids,
+            )
+        except Exception:
+            return []
+
+    def _get_low_priv_acl_paths_with_filters(
+        self,
+        domain: str,
+        *,
+        max_results: int | None,
+        target_filter: str,
+        excluded_source_objectids: List[str] | None,
+    ) -> List[Dict]:
+        """Execute the shared low-priv ACL query with optional target/source filters."""
+        allowed_relations = self._get_low_priv_acl_allowed_relations()
+        domain_value = domain.replace("'", "\\'")
+        source_filter = self._build_low_priv_source_filter(
+            source_alias="s",
+            domain_value=domain_value,
+            match_domain_by_name_suffix=True,
+        )
+        excluded_sources_filter = self._build_objectid_exclusion_filter(
+            alias="s",
+            objectids=excluded_source_objectids,
+        )
+
+        limit_clause = ""
+        if max_results is not None:
+            limit_value = max(1, min(int(max_results), 5000))
+            limit_clause = f"\n        LIMIT {limit_value}"
+
+        cypher_query = f"""
+        MATCH p=(s)-[r]->(t)
+        WHERE 1=1
+          {source_filter}
+          AND type(r) IN {sorted(allowed_relations)!r}{target_filter}{excluded_sources_filter}
+        RETURN p
+        """.rstrip() + limit_clause
+
+        graph_data = self.execute_query_with_relationships(cypher_query)
+        if not graph_data:
+            return []
+        return self._extract_direct_allowed_edges_from_graph(
+            graph_data, allowed_relations=allowed_relations
+        )
+
+    def _get_low_priv_acl_allowed_relations(self) -> set[str]:
+        """Return the ACL relationship types used in Phase 2 low-priv collection."""
+        return {
+            "GenericAll",
+            "GenericWrite",
+            "ForceChangePassword",
+            "AddSelf",
+            "AddMember",
+            "ReadGMSAPassword",
+            "ReadLAPSPassword",
+            "WriteDacl",
+            "WriteOwner",
+            "DCSync",
+            "WriteSPN",
+        }
+
+    def _build_objectid_exclusion_filter(
+        self, *, alias: str, objectids: List[str] | None
+    ) -> str:
+        """Return a Cypher predicate excluding nodes whose objectId matches any value."""
+        cleaned = sorted(
+            {
+                str(value or "").strip()
+                for value in (objectids or [])
+                if str(value or "").strip()
+            }
+        )
+        if not cleaned:
+            return ""
+        escaped = "[" + ", ".join(repr(value) for value in cleaned) + "]"
+        return (
+            f"\n              AND NOT coalesce({alias}.objectid, {alias}.objectId, '') IN {escaped}"
+        )
 
     def get_low_priv_adcs_paths(
         self, domain: str, *, max_results: int = 1000
@@ -2100,6 +2223,55 @@ class BloodHoundCEClient(BloodHoundClient):
             if not isinstance(src_node, dict) or not isinstance(tgt_node, dict):
                 continue
             results.append({"nodes": [src_node, tgt_node], "rels": [label]})
+
+        return results
+
+    def _extract_direct_allowed_edges_from_paths(
+        self, paths: List[Dict], *, allowed_relations: set[str]
+    ) -> List[Dict]:
+        """Flatten path rows into unique direct edges.
+
+        This is used when a recursive path query is intentionally expanded into
+        single-step attack-graph edges for storage.
+        """
+        results: List[Dict] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+
+        for path in paths:
+            nodes = path.get("nodes") or []
+            rels = path.get("rels") or []
+            if not isinstance(nodes, list) or not isinstance(rels, list):
+                continue
+            if len(nodes) < 2 or len(rels) != len(nodes) - 1:
+                continue
+
+            for idx, rel in enumerate(rels):
+                label = str(rel or "").strip()
+                if not label or label not in allowed_relations:
+                    continue
+                src_node = nodes[idx]
+                tgt_node = nodes[idx + 1]
+                if not isinstance(src_node, dict) or not isinstance(tgt_node, dict):
+                    continue
+                src_key = str(
+                    src_node.get("objectId")
+                    or src_node.get("objectid")
+                    or src_node.get("label")
+                    or src_node.get("name")
+                    or idx
+                )
+                tgt_key = str(
+                    tgt_node.get("objectId")
+                    or tgt_node.get("objectid")
+                    or tgt_node.get("label")
+                    or tgt_node.get("name")
+                    or idx
+                )
+                key = (src_key, label, tgt_key)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                results.append({"nodes": [src_node, tgt_node], "rels": [label]})
 
         return results
 

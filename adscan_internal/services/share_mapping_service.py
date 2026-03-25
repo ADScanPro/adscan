@@ -214,6 +214,7 @@ class ShareMappingService(BaseService):
         hosts: list[str],
         shares: list[str],
         extensions: tuple[str, ...],
+        max_file_size_bytes: int | None = None,
     ) -> dict[tuple[str, str], list[str]]:
         """Resolve remote candidate paths grouped by host/share from aggregate JSON."""
         if not aggregate_map_path or not os.path.exists(aggregate_map_path):
@@ -261,7 +262,7 @@ class ShareMappingService(BaseService):
                 bucket_key = (host_name, share_name)
                 bucket = resolved.get(bucket_key)
                 bucket_seen = seen.get(bucket_key)
-                for remote_path in files_bucket.keys():
+                for remote_path, metadata in files_bucket.items():
                     if not isinstance(remote_path, str):
                         continue
                     normalized_path = remote_path.strip()
@@ -274,6 +275,17 @@ class ShareMappingService(BaseService):
                         allowed_extensions=tuple(normalized_extensions),
                     ) not in normalized_extensions:
                         continue
+                    if (
+                        isinstance(max_file_size_bytes, int)
+                        and max_file_size_bytes > 0
+                        and self._parse_size_to_bytes(
+                            str((metadata or {}).get("size", "")).strip()
+                            if isinstance(metadata, dict)
+                            else ""
+                        )
+                        > max_file_size_bytes
+                    ):
+                        continue
                     if bucket is None:
                         bucket = resolved.setdefault(bucket_key, [])
                     if bucket_seen is None:
@@ -284,6 +296,32 @@ class ShareMappingService(BaseService):
                     bucket_seen.add(dedup_key)
                     bucket.append(normalized_path)
         return resolved
+
+    @staticmethod
+    def _parse_size_to_bytes(size_text: str) -> int:
+        """Parse one human-readable size field into bytes when possible."""
+        text = str(size_text or "").strip()
+        if not text:
+            return 0
+        parts = text.split()
+        if not parts:
+            return 0
+        try:
+            value = float(parts[0])
+        except ValueError:
+            return 0
+        unit = parts[1].upper() if len(parts) > 1 else "B"
+        factors = {
+            "B": 1,
+            "KB": 1024,
+            "MB": 1024 * 1024,
+            "GB": 1024 * 1024 * 1024,
+            "TB": 1024 * 1024 * 1024 * 1024,
+        }
+        factor = factors.get(unit)
+        if factor is None:
+            return 0
+        return int(value * factor)
 
     def _load_or_init_aggregate(
         self,

@@ -57,6 +57,21 @@ _SAFE_WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$")
 _CONTAINER_WORKSPACES_DIR = "/opt/adscan/workspaces"
 
 
+def _looks_like_ntlm_hash(value: str) -> bool:
+    """Return True when value resembles an NTLM hash or LM:NT pair."""
+    candidate = value.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{32}", candidate):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F]{32}:[0-9a-fA-F]{32}", candidate):
+        return True
+    return False
+
+
+def _resolve_host_rdp_binary() -> str | None:
+    """Resolve xfreerdp for host launches via PATH."""
+    return shutil_which("xfreerdp") or shutil_which("xfreerdp3")
+
+
 class HostHelperError(RuntimeError):
     """Raised when the host helper cannot process a request."""
 
@@ -717,24 +732,27 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
             )
 
         # Resolve the RDP client on the host.
-        rdp_bin = shutil_which("xfreerdp3") or shutil_which("xfreerdp")
+        rdp_bin = _resolve_host_rdp_binary()
         if not rdp_bin:
             return HostHelperResponse(
                 False,
                 127,
                 None,
                 None,
-                "xfreerdp3/xfreerdp not found on host",
+                "xfreerdp not found on host",
             )
 
         argv = [
             rdp_bin,
             f"/d:{domain}",
             f"/u:{username}",
-            f"/p:{password}",
             f"/v:{validated_host}",
             "/cert:ignore",
         ]
+        if _looks_like_ntlm_hash(password):
+            argv.append(f"/pth:{password}")
+        else:
+            argv.append(f"/p:{password}")
         return _run_detached_as_invoker(argv, env=_build_invoker_env())
 
     if op == "cifs_mount_share":

@@ -1196,7 +1196,7 @@ class BloodHoundService(BaseService):
         self,
         domain: str,
         *,
-        max_results: int = 1000,
+        max_results: Optional[int] = None,
         scan_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Get low-privilege ACL/ACE effective paths (CE only)."""
@@ -1246,6 +1246,136 @@ class BloodHoundService(BaseService):
             raise BloodHoundServiceError(
                 "Failed to retrieve low-privilege ACL paths from BloodHound",
                 details={"domain": domain, "error": str(e)},
+            ) from e
+
+    def get_low_priv_acl_paths_to_high_value(
+        self,
+        domain: str,
+        *,
+        max_results: int = 1000,
+        scan_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get low-privilege ACL/ACE paths to high-value / tier-zero targets."""
+        self._emit_progress(
+            scan_id=scan_id,
+            phase="bloodhound_path_analysis",
+            progress=0.0,
+            message="Querying low-privilege ACL/ACE relationships to high-value targets",
+        )
+
+        try:
+            if not hasattr(self.client, "get_low_priv_acl_paths_to_high_value"):
+                raise BloodHoundServiceError(
+                    "High-value ACL queries are not supported by this BloodHound client",
+                    details={"edition": self.edition},
+                )
+
+            paths = self.client.get_low_priv_acl_paths_to_high_value(
+                domain,
+                max_results=max_results,
+            )
+
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_path_analysis",
+                progress=1.0,
+                message=f"Retrieved {len(paths)} high-value ACL path(s)",
+            )
+
+            self.logger.info(
+                f"Retrieved {len(paths)} high-value low-priv ACL path(s)",
+                extra={
+                    "domain": domain,
+                    "count": len(paths),
+                    "max_results": max_results,
+                },
+            )
+            return paths
+        except Exception as e:
+            self.logger.exception(
+                "Failed to retrieve high-value low-privilege ACL paths",
+                extra={"domain": domain, "error": str(e), "max_results": max_results},
+            )
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_path_analysis",
+                progress=1.0,
+                message="High-value ACL path query failed",
+            )
+            raise BloodHoundServiceError(
+                "Failed to retrieve high-value ACL paths from BloodHound",
+                details={"domain": domain, "error": str(e)},
+            ) from e
+
+    def get_low_priv_acl_paths_to_non_high_value(
+        self,
+        domain: str,
+        *,
+        max_results: int = 1000,
+        excluded_source_objectids: Optional[List[str]] = None,
+        scan_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get low-privilege ACL/ACE paths to non-high-value targets."""
+        self._emit_progress(
+            scan_id=scan_id,
+            phase="bloodhound_path_analysis",
+            progress=0.0,
+            message="Querying low-privilege ACL/ACE relationships to non-high-value targets",
+        )
+
+        try:
+            if not hasattr(self.client, "get_low_priv_acl_paths_to_non_high_value"):
+                raise BloodHoundServiceError(
+                    "Non-high-value ACL queries are not supported by this BloodHound client",
+                    details={"edition": self.edition},
+                )
+
+            paths = self.client.get_low_priv_acl_paths_to_non_high_value(
+                domain,
+                max_results=max_results,
+                excluded_source_objectids=excluded_source_objectids,
+            )
+
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_path_analysis",
+                progress=1.0,
+                message=f"Retrieved {len(paths)} non-high-value ACL path(s)",
+            )
+
+            self.logger.info(
+                f"Retrieved {len(paths)} non-high-value low-priv ACL path(s)",
+                extra={
+                    "domain": domain,
+                    "count": len(paths),
+                    "max_results": max_results,
+                    "excluded_sources": len(excluded_source_objectids or []),
+                },
+            )
+            return paths
+        except Exception as e:
+            self.logger.exception(
+                "Failed to retrieve non-high-value low-privilege ACL paths",
+                extra={
+                    "domain": domain,
+                    "error": str(e),
+                    "max_results": max_results,
+                    "excluded_sources": len(excluded_source_objectids or []),
+                },
+            )
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_path_analysis",
+                progress=1.0,
+                message="Non-high-value ACL path query failed",
+            )
+            raise BloodHoundServiceError(
+                "Failed to retrieve non-high-value ACL paths from BloodHound",
+                details={
+                    "domain": domain,
+                    "error": str(e),
+                    "excluded_sources": len(excluded_source_objectids or []),
+                },
             ) from e
 
     def get_low_priv_adcs_paths(

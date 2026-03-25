@@ -351,11 +351,46 @@ class DNSResolverService(BaseService):
                 if reload and reload.returncode == 0:
                     return True
 
+                listener_ready = bool(
+                    self._rt.is_unbound_listening_local(resolver_ip=local_resolver_ip)
+                )
+                reload_stderr = str(getattr(reload, "stderr", "") or "").strip()
+                reload_stdout = str(getattr(reload, "stdout", "") or "").strip()
+                reload_rc = getattr(reload, "returncode", None)
+                marked_local_resolver_ip = mark_sensitive(local_resolver_ip, "ip")
+                if listener_ready:
+                    print_info_debug(
+                        "[dns] unbound-control reload failed while Unbound is already "
+                        f"listening on {marked_local_resolver_ip}:53 "
+                        f"(rc={reload_rc}, stderr={reload_stderr or '<empty>'}, "
+                        f"stdout={reload_stdout or '<empty>'})"
+                    )
+                    print_warning(
+                        "Unbound is already listening on the local DNS port, but its "
+                        "control interface is unavailable. ADscan could not reload the "
+                        "updated resolver configuration."
+                    )
+                else:
+                    print_info_debug(
+                        "[dns] unbound-control reload failed and Unbound does not appear "
+                        f"to be listening on {marked_local_resolver_ip}:53 "
+                        f"(rc={reload_rc}, stderr={reload_stderr or '<empty>'}, "
+                        f"stdout={reload_stdout or '<empty>'})"
+                    )
+
                 started = self._rt.start_unbound_without_systemd_via_sudo() or self._rt.start_unbound_without_systemd()
                 if not started:
                     return False
 
                 reload = self._host.run_command(reload_cmd, timeout=15, ignore_errors=True)
+                if reload and reload.returncode != 0:
+                    reload_stderr = str(getattr(reload, "stderr", "") or "").strip()
+                    reload_stdout = str(getattr(reload, "stdout", "") or "").strip()
+                    print_info_debug(
+                        "[dns] unbound-control reload still failing after start attempt "
+                        f"(rc={reload.returncode}, stderr={reload_stderr or '<empty>'}, "
+                        f"stdout={reload_stdout or '<empty>'})"
+                    )
                 return bool(reload and reload.returncode == 0)
 
             # Host installs: validate config strictly before restarting.

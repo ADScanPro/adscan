@@ -14,6 +14,13 @@ import json
 import re
 
 from adscan_internal.services.base_service import BaseService
+from adscan_internal.services.smb_sensitive_file_policy import (
+    DIRECT_SECRET_ARTIFACT_EXTENSIONS,
+    DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS,
+    HEAVY_ARTIFACT_EXTENSIONS,
+    TEXT_LIKE_CREDENTIAL_EXTENSIONS,
+    resolve_effective_sensitive_extension,
+)
 
 
 @dataclass(frozen=True)
@@ -69,8 +76,23 @@ class ShareMapTriageParseDiagnostics:
     notes: list[str]
 
 
+@dataclass(frozen=True)
+class ShareMapTriagePromptChunk:
+    """One bounded AI triage chunk derived from a consolidated share mapping."""
+
+    chunk_label: str
+    mapping_json: str
+    file_entries: int
+    host_shares: int
+    prompt_chars: int
+
+
 class ShareMapAITriageService(BaseService):
     """Build analysis prompts from a consolidated SMB share map."""
+
+    _TRIAGE_BUCKET_TEXT = "text_like"
+    _TRIAGE_BUCKET_DOCUMENT = "document_like"
+    _TRIAGE_BUCKET_ARTIFACT = "artifact_like"
 
     def load_full_mapping_json(self, *, aggregate_map_path: str) -> str:
         """Load full aggregate share mapping JSON as text.
@@ -149,6 +171,151 @@ class ShareMapAITriageService(BaseService):
             f"{mapping_json}"
         )
 
+    def compact_mapping_json_for_ai(
+        self,
+        *,
+        mapping_json: str,
+    ) -> str:
+        """Return a compact mapping payload containing only AI-relevant fields."""
+        payload = self._load_mapping_payload(mapping_json=mapping_json)
+        if payload is None:
+            return mapping_json
+
+        compact_payload: dict[str, Any] = {
+            "schema_version": payload.get("schema_version", 1),
+            "domain": str(payload.get("domain", "")).strip(),
+            "hosts": {},
+        }
+        hosts = payload.get("hosts", {})
+        if not isinstance(hosts, dict):
+            return json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))
+
+        compact_hosts: dict[str, Any] = {}
+        for host, host_entry in hosts.items():
+            if not isinstance(host, str) or not isinstance(host_entry, dict):
+                continue
+            shares = host_entry.get("shares", {})
+            if not isinstance(shares, dict):
+                continue
+            compact_shares: dict[str, Any] = {}
+            for share, share_entry in shares.items():
+                if not isinstance(share, str) or not isinstance(share_entry, dict):
+                    continue
+                files = share_entry.get("files", {})
+                if not isinstance(files, dict):
+                    continue
+                compact_files: dict[str, dict[str, str]] = {}
+                for path, metadata in files.items():
+                    if not isinstance(path, str):
+                        continue
+                    size_text = ""
+                    if isinstance(metadata, dict):
+                        size_text = str(metadata.get("size", "")).strip()
+                    compact_files[path] = {"size": size_text}
+                if compact_files:
+                    compact_shares[share] = {"files": compact_files}
+            if compact_shares:
+                compact_hosts[host] = {"shares": compact_shares}
+        compact_payload["hosts"] = compact_hosts
+        return json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))
+
+    def filter_mapping_json_by_extensions(
+        self,
+        *,
+        mapping_json: str,
+        allowed_extensions: tuple[str, ...],
+    ) -> str:
+        """Return mapping JSON containing only files matching one extension set."""
+        normalized_extensions = {
+            str(extension).strip().casefold()
+            for extension in allowed_extensions
+            if str(extension).strip()
+        }
+        if not normalized_extensions:
+            return self.compact_mapping_json_for_ai(mapping_json=mapping_json)
+
+        payload = self._load_mapping_payload(mapping_json=mapping_json)
+        if payload is None:
+            return mapping_json
+
+        compact_payload = self._build_compact_payload(payload=payload)
+        hosts = compact_payload.get("hosts", {})
+        if not isinstance(hosts, dict):
+            return json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))
+
+        filtered_hosts: dict[str, Any] = {}
+        for host, host_entry in hosts.items():
+            if not isinstance(host, str) or not isinstance(host_entry, dict):
+                continue
+            shares = host_entry.get("shares", {})
+            if not isinstance(shares, dict):
+                continue
+            filtered_shares: dict[str, Any] = {}
+            for share, share_entry in shares.items():
+                if not isinstance(share, str) or not isinstance(share_entry, dict):
+                    continue
+                files = share_entry.get("files", {})
+                if not isinstance(files, dict):
+                    continue
+                filtered_files = {
+                    path: metadata
+                    for path, metadata in files.items()
+                    if isinstance(path, str)
+                    and resolve_effective_sensitive_extension(
+                        path,
+                        allowed_extensions=tuple(normalized_extensions),
+                    )
+                    in normalized_extensions
+                }
+                if filtered_files:
+                    filtered_shares[share] = {"files": filtered_files}
+            if filtered_shares:
+                filtered_hosts[host] = {"shares": filtered_shares}
+        compact_payload["hosts"] = filtered_hosts
+        return json.dumps(compact_payload, ensure_ascii=False, separators=(",", ":"))
+
+    def build_triage_prompt_chunks(
+        self,
+        *,
+        domain: str,
+        search_scope: str,
+        mapping_json: str,
+        max_prompt_chars: int,
+    ) -> list[ShareMapTriagePromptChunk]:
+        """Return one or more bounded AI triage chunks for the current scope."""
+        compact_mapping_json = self.compact_mapping_json_for_ai(mapping_json=mapping_json)
+        chunks: list[ShareMapTriagePromptChunk] = []
+
+        for bucket_label, extensions in self._iter_scope_extension_buckets(
+            search_scope=search_scope
+        ):
+            bucket_json = self.filter_mapping_json_by_extensions(
+                mapping_json=compact_mapping_json,
+                allowed_extensions=extensions,
+            )
+            if self.count_total_file_entries(mapping_json=bucket_json) == 0:
+                continue
+            chunks.extend(
+                self._split_mapping_json_to_fit_prompt(
+                    domain=domain,
+                    search_scope=search_scope,
+                    mapping_json=bucket_json,
+                    max_prompt_chars=max_prompt_chars,
+                    chunk_label=bucket_label,
+                )
+            )
+
+        if chunks:
+            return chunks
+
+        return self._split_mapping_json_to_fit_prompt(
+            domain=domain,
+            search_scope=search_scope,
+            mapping_json=compact_mapping_json,
+            max_prompt_chars=max_prompt_chars,
+            chunk_label="all_mapped_files",
+        )
+
     def count_total_file_entries(self, *, mapping_json: str) -> int:
         """Count total file entries in the consolidated share map payload."""
         try:
@@ -176,6 +343,23 @@ class ShareMapAITriageService(BaseService):
                 files = share_entry.get("files", {})
                 if isinstance(files, dict):
                     total += len(files)
+        return total
+
+    def count_total_host_share_pairs(self, *, mapping_json: str) -> int:
+        """Count host/share pairs present in the mapping payload."""
+        payload = self._load_mapping_payload(mapping_json=mapping_json)
+        if payload is None:
+            return 0
+        hosts = payload.get("hosts", {})
+        if not isinstance(hosts, dict):
+            return 0
+        total = 0
+        for host_entry in hosts.values():
+            if not isinstance(host_entry, dict):
+                continue
+            shares = host_entry.get("shares", {})
+            if isinstance(shares, dict):
+                total += len(shares)
         return total
 
     def resolve_principal_allowed_shares(
@@ -591,6 +775,328 @@ class ShareMapAITriageService(BaseService):
 
         encoded = base64.b64encode(file_bytes).decode("ascii")
         return "Binary content (base64):\n" + encoded[:16000]
+
+    def _split_mapping_json_to_fit_prompt(
+        self,
+        *,
+        domain: str,
+        search_scope: str,
+        mapping_json: str,
+        max_prompt_chars: int,
+        chunk_label: str,
+    ) -> list[ShareMapTriagePromptChunk]:
+        """Split a mapping payload into prompt-sized chunks when needed."""
+        payload = self._load_mapping_payload(mapping_json=mapping_json)
+        if payload is None:
+            return []
+
+        compact_payload = self._build_compact_payload(payload=payload)
+        full_prompt = self.build_triage_prompt(
+            domain=domain,
+            search_scope=search_scope,
+            mapping_json=json.dumps(
+                compact_payload, ensure_ascii=False, separators=(",", ":")
+            ),
+        )
+        if len(full_prompt) <= max_prompt_chars:
+            return [
+                ShareMapTriagePromptChunk(
+                    chunk_label=chunk_label,
+                    mapping_json=json.dumps(
+                        compact_payload, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    file_entries=self.count_total_file_entries(
+                        mapping_json=json.dumps(
+                            compact_payload, ensure_ascii=False, separators=(",", ":")
+                        )
+                    ),
+                    host_shares=self.count_total_host_share_pairs(
+                        mapping_json=json.dumps(
+                            compact_payload, ensure_ascii=False, separators=(",", ":")
+                        )
+                    ),
+                    prompt_chars=len(full_prompt),
+                )
+            ]
+
+        chunks: list[ShareMapTriagePromptChunk] = []
+        current_payload: dict[str, Any] = {
+            "schema_version": compact_payload.get("schema_version", 1),
+            "domain": compact_payload.get("domain", ""),
+            "hosts": {},
+        }
+
+        current_entries = 0
+        chunk_index = 1
+        flattened_entries = self._iter_file_entries(payload=compact_payload)
+        for host, share, path, metadata in flattened_entries:
+            self._add_file_entry(
+                payload=current_payload,
+                host=host,
+                share=share,
+                path=path,
+                metadata=metadata,
+            )
+            prompt_chars = self._estimate_prompt_chars(
+                domain=domain,
+                search_scope=search_scope,
+                payload=current_payload,
+            )
+            if prompt_chars > max_prompt_chars and current_entries > 0:
+                self._remove_file_entry(
+                    payload=current_payload,
+                    host=host,
+                    share=share,
+                    path=path,
+                )
+                chunks.append(
+                    self._build_chunk_from_payload(
+                        domain=domain,
+                        search_scope=search_scope,
+                        payload=current_payload,
+                        chunk_label=chunk_label,
+                        chunk_index=chunk_index,
+                    )
+                )
+                chunk_index += 1
+                current_payload = {
+                    "schema_version": compact_payload.get("schema_version", 1),
+                    "domain": compact_payload.get("domain", ""),
+                    "hosts": {},
+                }
+                current_entries = 0
+                self._add_file_entry(
+                    payload=current_payload,
+                    host=host,
+                    share=share,
+                    path=path,
+                    metadata=metadata,
+                )
+                prompt_chars = self._estimate_prompt_chars(
+                    domain=domain,
+                    search_scope=search_scope,
+                    payload=current_payload,
+                )
+                if prompt_chars > max_prompt_chars:
+                    raise ValueError(
+                        "One AI triage file entry exceeds the maximum prompt budget."
+                    )
+
+            current_entries += 1
+
+        if current_entries > 0:
+            chunks.append(
+                self._build_chunk_from_payload(
+                    domain=domain,
+                    search_scope=search_scope,
+                    payload=current_payload,
+                    chunk_label=chunk_label,
+                    chunk_index=chunk_index,
+                )
+            )
+        return chunks
+
+    def _build_chunk_from_payload(
+        self,
+        *,
+        domain: str,
+        search_scope: str,
+        payload: dict[str, Any],
+        chunk_label: str,
+        chunk_index: int,
+    ) -> ShareMapTriagePromptChunk:
+        """Serialize one bounded payload chunk with prompt metadata."""
+        mapping_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        prompt_chars = len(
+            self.build_triage_prompt(
+                domain=domain,
+                search_scope=search_scope,
+                mapping_json=mapping_json,
+            )
+        )
+        suffix = f"_{chunk_index}" if chunk_index > 1 else ""
+        return ShareMapTriagePromptChunk(
+            chunk_label=f"{chunk_label}{suffix}",
+            mapping_json=mapping_json,
+            file_entries=self.count_total_file_entries(mapping_json=mapping_json),
+            host_shares=self.count_total_host_share_pairs(mapping_json=mapping_json),
+            prompt_chars=prompt_chars,
+        )
+
+    def _estimate_prompt_chars(
+        self,
+        *,
+        domain: str,
+        search_scope: str,
+        payload: dict[str, Any],
+    ) -> int:
+        """Return prompt size for one candidate mapping payload."""
+        return len(
+            self.build_triage_prompt(
+                domain=domain,
+                search_scope=search_scope,
+                mapping_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            )
+        )
+
+    @staticmethod
+    def _add_file_entry(
+        *,
+        payload: dict[str, Any],
+        host: str,
+        share: str,
+        path: str,
+        metadata: dict[str, str],
+    ) -> None:
+        """Insert one file entry into one compact mapping payload."""
+        hosts = payload.setdefault("hosts", {})
+        host_bucket = hosts.setdefault(host, {"shares": {}})
+        shares = host_bucket.setdefault("shares", {})
+        share_bucket = shares.setdefault(share, {"files": {}})
+        files = share_bucket.setdefault("files", {})
+        files[path] = dict(metadata)
+
+    @staticmethod
+    def _remove_file_entry(
+        *,
+        payload: dict[str, Any],
+        host: str,
+        share: str,
+        path: str,
+    ) -> None:
+        """Remove one file entry and prune empty host/share buckets."""
+        hosts = payload.get("hosts", {})
+        if not isinstance(hosts, dict):
+            return
+        host_bucket = hosts.get(host)
+        if not isinstance(host_bucket, dict):
+            return
+        shares = host_bucket.get("shares", {})
+        if not isinstance(shares, dict):
+            return
+        share_bucket = shares.get(share)
+        if not isinstance(share_bucket, dict):
+            return
+        files = share_bucket.get("files", {})
+        if not isinstance(files, dict):
+            return
+        files.pop(path, None)
+        if not files:
+            shares.pop(share, None)
+        if not shares:
+            hosts.pop(host, None)
+
+    @staticmethod
+    def _build_compact_payload(*, payload: dict[str, Any]) -> dict[str, Any]:
+        """Build one compact triage payload from one aggregate mapping payload."""
+        compact_payload: dict[str, Any] = {
+            "schema_version": payload.get("schema_version", 1),
+            "domain": str(payload.get("domain", "")).strip(),
+            "hosts": {},
+        }
+        hosts = payload.get("hosts", {})
+        if not isinstance(hosts, dict):
+            return compact_payload
+        compact_hosts: dict[str, Any] = {}
+        for host, host_entry in hosts.items():
+            if not isinstance(host, str) or not isinstance(host_entry, dict):
+                continue
+            shares = host_entry.get("shares", {})
+            if not isinstance(shares, dict):
+                continue
+            compact_shares: dict[str, Any] = {}
+            for share, share_entry in shares.items():
+                if not isinstance(share, str) or not isinstance(share_entry, dict):
+                    continue
+                files = share_entry.get("files", {})
+                if not isinstance(files, dict):
+                    continue
+                compact_files: dict[str, dict[str, str]] = {}
+                for path, metadata in files.items():
+                    if not isinstance(path, str):
+                        continue
+                    size_text = ""
+                    if isinstance(metadata, dict):
+                        size_text = str(metadata.get("size", "")).strip()
+                    compact_files[path] = {"size": size_text}
+                if compact_files:
+                    compact_shares[share] = {"files": compact_files}
+            if compact_shares:
+                compact_hosts[host] = {"shares": compact_shares}
+        compact_payload["hosts"] = compact_hosts
+        return compact_payload
+
+    @staticmethod
+    def _load_mapping_payload(*, mapping_json: str) -> dict[str, Any] | None:
+        """Parse one mapping JSON string and return the payload dictionary."""
+        try:
+            payload = json.loads(mapping_json)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    @staticmethod
+    def _iter_scope_extension_buckets(
+        *,
+        search_scope: str,
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Return ordered extension buckets used to reduce AI triage context."""
+        normalized_scope = str(search_scope or "").strip().lower()
+        if normalized_scope == "sensitive_data":
+            return (
+                (
+                    ShareMapAITriageService._TRIAGE_BUCKET_DOCUMENT,
+                    DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS,
+                ),
+                (
+                    ShareMapAITriageService._TRIAGE_BUCKET_TEXT,
+                    TEXT_LIKE_CREDENTIAL_EXTENSIONS,
+                ),
+            )
+        return (
+            (
+                ShareMapAITriageService._TRIAGE_BUCKET_TEXT,
+                TEXT_LIKE_CREDENTIAL_EXTENSIONS,
+            ),
+            (
+                ShareMapAITriageService._TRIAGE_BUCKET_DOCUMENT,
+                DOCUMENT_LIKE_CREDENTIAL_EXTENSIONS,
+            ),
+            (
+                ShareMapAITriageService._TRIAGE_BUCKET_ARTIFACT,
+                DIRECT_SECRET_ARTIFACT_EXTENSIONS + HEAVY_ARTIFACT_EXTENSIONS,
+            ),
+        )
+
+    @staticmethod
+    def _iter_file_entries(
+        *,
+        payload: dict[str, Any],
+    ) -> list[tuple[str, str, str, dict[str, str]]]:
+        """Flatten one compact mapping payload into file-entry tuples."""
+        flattened: list[tuple[str, str, str, dict[str, str]]] = []
+        hosts = payload.get("hosts", {})
+        if not isinstance(hosts, dict):
+            return flattened
+        for host, host_entry in hosts.items():
+            if not isinstance(host, str) or not isinstance(host_entry, dict):
+                continue
+            shares = host_entry.get("shares", {})
+            if not isinstance(shares, dict):
+                continue
+            for share, share_entry in shares.items():
+                if not isinstance(share, str) or not isinstance(share_entry, dict):
+                    continue
+                files = share_entry.get("files", {})
+                if not isinstance(files, dict):
+                    continue
+                for path, metadata in files.items():
+                    if not isinstance(path, str) or not isinstance(metadata, dict):
+                        continue
+                    flattened.append((host, share, path, dict(metadata)))
+        return flattened
 
     @staticmethod
     def _extract_json_object(response_text: str) -> dict[str, Any] | None:

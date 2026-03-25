@@ -8,6 +8,7 @@ behaviour stable for the current CLI.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -19,12 +20,39 @@ from adscan_internal import (
     print_error,
     print_exception,
     print_info,
+    print_info_debug,
     print_info_verbose,
+    print_warning,
     telemetry,
 )
+from adscan_internal.execution_outcomes import result_is_timeout
+from adscan_internal.integrations.medusa import (
+    MedusaContext,
+    MedusaRunner,
+    get_recommended_medusa_settings,
+    parse_medusa_account_matches,
+)
+from adscan_internal.integrations.netexec.timeouts import (
+    resolve_service_command_timeout_seconds,
+)
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
+from adscan_internal.services.service_access_results import (
+    ServiceAccessFinding,
+    render_service_access_results,
+    summarize_service_access_categories,
+    select_confirmed_service_access_followup_targets,
+)
 from adscan_internal.text_utils import strip_ansi_codes
 
+
+def _looks_like_ntlm_hash(value: str) -> bool:
+    """Return True when value resembles an NTLM hash or LM:NT pair."""
+    candidate = value.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{32}", candidate):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F]{32}:[0-9a-fA-F]{32}", candidate):
+        return True
+    return False
 
 def ask_for_rdp_access(
     shell: Any, *, domain: str, host: str, username: str, password: str
@@ -70,10 +98,10 @@ def rdp_access(
     """
     from adscan_internal.docker_runtime import is_docker_env
 
-    rdp_binary = shutil.which("xfreerdp3") or shutil.which("xfreerdp")
+    rdp_binary = shutil.which("xfreerdp") or shutil.which("xfreerdp3")
     if not rdp_binary:
         print_error(
-            "RDP client not found. Please install xfreerdp3 or xfreerdp via 'adscan install'."
+            "RDP client not found. Please install xfreerdp via 'adscan install'."
         )
         return
 
@@ -156,11 +184,18 @@ def rdp_access(
     marked_username = mark_sensitive(username, "user")
     marked_password = mark_sensitive(password, "password")
     marked_host = mark_sensitive(host, "hostname")
+    use_ntlm_hash = _looks_like_ntlm_hash(password)
 
-    command = (
-        f"{rdp_binary} /d:'{marked_domain}' /u:'{marked_username}' "
-        f"/p:'{marked_password}' /v:{marked_host} /cert:ignore"
-    )
+    if use_ntlm_hash:
+        command = (
+            f"{rdp_binary} /d:'{marked_domain}' /u:'{marked_username}' "
+            f"/pth:'{marked_password}' /v:{marked_host} /cert:ignore"
+        )
+    else:
+        command = (
+            f"{rdp_binary} /d:'{marked_domain}' /u:'{marked_username}' "
+            f"/p:'{marked_password}' /v:{marked_host} /cert:ignore"
+        )
 
     print_info(f"Accessing host {marked_host} via RDP as user {marked_username}")
     execute_rdp_access(shell, command)
@@ -332,3 +367,204 @@ def execute_rdp_access(shell: Any, command: str) -> bool:
         print_exception(show_locals=False, exception=e)
         return False
 
+
+def run_rdp_service_access_sweep_with_medusa(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    targets: str,
+    prompt: bool = True,
+    target_count: int = 1,
+) -> bool:
+    """Enumerate RDP access with Medusa.
+
+    Args:
+        shell: Active shell instance.
+        domain: Target AD domain.
+        username: Username to test.
+        password: Plaintext password or NTLM hash.
+        targets: Single host or file with one host per line.
+        prompt: Whether to ask for interactive RDP access after a hit.
+        target_count: Best-effort target count used for timeout/concurrency policy.
+
+    Returns:
+        True when one or more hosts grant RDP access, False otherwise.
+    """
+    medusa_path = getattr(shell, "medusa_path", None) or shutil.which("medusa")
+    if not medusa_path:
+        print_error(
+            "Medusa is not available. Rebuild the ADscan runtime image so the new RDP backend is installed."
+        )
+        return False
+
+    workspace_cwd = (
+        shell._get_workspace_cwd()  # type: ignore[attr-defined]
+        if hasattr(shell, "_get_workspace_cwd")
+        else getattr(shell, "current_workspace_dir", os.getcwd())
+    )
+    log_abs_path = os.path.join(
+        workspace_cwd,
+        "domains",
+        domain,
+        "rdp",
+        f"{username}_privs_medusa.log",
+    )
+    os.makedirs(os.path.dirname(log_abs_path), exist_ok=True)
+
+    settings = get_recommended_medusa_settings("rdp", target_count=target_count)
+    use_ntlm_hash = bool(
+        callable(getattr(shell, "is_hash", None)) and shell.is_hash(password)
+    )
+    module_arguments = [f"DOMAIN:{domain}"]
+    if use_ntlm_hash:
+        module_arguments.append("PASS:HASH")
+
+    global_timeout = resolve_service_command_timeout_seconds(
+        service="rdp",
+        target_count=target_count,
+        return_boolean=False,
+    )
+    context = MedusaContext(
+        medusa_path=medusa_path,
+        command_runner=lambda command, timeout: shell.run_command(
+            command, timeout=timeout
+        ),
+    )
+    runner = MedusaRunner()
+    completed_process = runner.execute_login_sweep(
+        ctx=context,
+        protocol="rdp",
+        targets=targets,
+        username=username,
+        password=password,
+        settings=settings,
+        log_file=log_abs_path,
+        module_arguments=module_arguments,
+        timeout=global_timeout,
+    )
+
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_username = mark_sensitive(username, "user")
+    print_info_debug(
+        "[rdp-medusa] dispatch: "
+        f"domain={marked_domain} user={marked_username} targets={mark_sensitive(str(targets), 'path')} "
+        f"auth_mode={'pass_the_hash' if use_ntlm_hash else 'password'} "
+        f"threads={settings.total_logins} host_threads={settings.concurrent_hosts} "
+        f"connect_timeout={settings.connect_timeout_seconds}s global_timeout={global_timeout}s"
+    )
+    if use_ntlm_hash:
+        print_info(
+            f"Using Medusa RDP pass-the-hash mode for user {marked_username}"
+        )
+
+    if completed_process is None:
+        print_error("RDP enumeration failed before Medusa returned a result.")
+        return False
+
+    if result_is_timeout(completed_process, tool_name="medusa"):
+        print_warning(
+            "Medusa RDP enumeration ended due to timeout recovery being exhausted or declined."
+        )
+        return False
+
+    combined_output = "\n".join(
+        part for part in [completed_process.stdout or "", completed_process.stderr or ""] if part
+    )
+    findings = parse_medusa_account_matches(combined_output, protocol="rdp")
+    if not findings and os.path.exists(log_abs_path):
+        try:
+            with open(log_abs_path, "r", encoding="utf-8", errors="ignore") as handle:
+                findings = parse_medusa_account_matches(
+                    handle.read(),
+                    protocol="rdp",
+                )
+        except OSError:
+            findings = []
+
+    service_findings = [
+        ServiceAccessFinding(
+            service="rdp",
+            host=str(finding.host).strip(),
+            username=str(finding.username).strip(),
+            category=finding.result_category,
+            reason=finding.result_reason,
+            status=str(finding.status).strip(),
+            backend="medusa",
+        )
+        for finding in findings
+    ]
+    success_findings = [finding for finding in service_findings if finding.category == "confirmed"]
+    render_service_access_results(
+        service="rdp",
+        username=username,
+        findings=service_findings,
+        total_targets=target_count,
+    )
+    category_counts = summarize_service_access_categories(service_findings)
+    if category_counts["denied"] or category_counts["transport"] or category_counts["ambiguous"]:
+        print_info_debug(
+            "[rdp-medusa] unconfirmed result breakdown: "
+            f"denied={category_counts['denied']} "
+            f"transport={category_counts['transport']} "
+            f"ambiguous={category_counts['ambiguous']}"
+        )
+
+    found_privileged_hosts = False
+    for finding in success_findings:
+        found_privileged_hosts = True
+        host = finding.host
+        try:
+            from adscan_internal.services.attack_graph_service import (
+                upsert_netexec_privilege_edge,
+            )
+
+            upsert_netexec_privilege_edge(
+                shell,
+                domain,
+                username=finding.username,
+                relation="CanRDP",
+                target_ip=host,
+                target_hostname=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+    if prompt and success_findings:
+        selected_followups, used_selector = select_confirmed_service_access_followup_targets(
+            shell,
+            service="rdp",
+            findings=success_findings,
+        )
+        if used_selector:
+            for finding in selected_followups:
+                marked_host = mark_sensitive(finding.host, "hostname")
+                print_info_debug(
+                    "[rdp-medusa] launching selected follow-up: "
+                    f"user={marked_username} host={marked_host}"
+                )
+                rdp_access(
+                    shell,
+                    domain=domain,
+                    host=finding.host,
+                    username=finding.username,
+                    password=password,
+                )
+        else:
+            for finding in success_findings:
+                marked_host = mark_sensitive(finding.host, "hostname")
+                print_info_debug(
+                    "[rdp-medusa] launching follow-up prompt: "
+                    f"user={marked_username} host={marked_host}"
+                )
+                shell.ask_for_rdp_access(domain, finding.host, finding.username, password)
+    elif not prompt:
+        for finding in success_findings:
+            marked_host = mark_sensitive(finding.host, "hostname")
+            print_info_debug(
+                "[rdp-medusa] follow-up prompt suppressed: "
+                f"user={marked_username} host={marked_host}"
+            )
+
+    return found_privileged_hosts

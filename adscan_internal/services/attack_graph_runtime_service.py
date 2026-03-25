@@ -222,6 +222,8 @@ def set_attack_path_step_context(
     search_mode_label: str | None,
     step_index: int,
     last_executable_idx: int,
+    compromise_semantics: str | None = None,
+    compromise_effort: str | None = None,
 ) -> None:
     """Persist lightweight runtime metadata for the current attack-path step."""
     setattr(
@@ -231,6 +233,8 @@ def set_attack_path_step_context(
             "search_mode_label": str(search_mode_label or "").strip(),
             "step_index": int(step_index),
             "last_executable_idx": int(last_executable_idx),
+            "compromise_semantics": str(compromise_semantics or "").strip(),
+            "compromise_effort": str(compromise_effort or "").strip(),
         },
     )
 

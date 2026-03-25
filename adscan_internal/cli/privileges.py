@@ -16,13 +16,78 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
+from adscan_core.interaction import is_non_interactive
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.integrations.netexec.timeouts import (
     get_recommended_internal_timeout,
 )
+from adscan_internal.cli.rdp import run_rdp_service_access_sweep_with_medusa
 from adscan_internal.workspaces import domain_subpath
-from adscan_internal.workspaces.computers import ensure_enabled_computer_ip_file
+from adscan_internal.workspaces.computers import (
+    count_target_file_entries,
+    consume_service_targeting_fallback_notice,
+    load_target_entries,
+    resolve_domain_service_scope_preference,
+    resolve_domain_service_target_file,
+)
 from rich.prompt import Confirm
+
+
+def _resolve_next_broader_scope(
+    *,
+    service: str,
+    source: str,
+    current_scope_preference: str,
+) -> str | None:
+    """Return the next broader target scope after one empty sweep."""
+    normalized_source = str(source or "").strip().lower()
+    normalized_scope = str(current_scope_preference or "optimized").strip().lower()
+
+    if normalized_scope == "full":
+        return None
+    if normalized_scope == "reachable":
+        return "full"
+    if normalized_source.startswith(f"{service}_ips"):
+        return "reachable"
+    if normalized_source.startswith("reachable_ips"):
+        return "full"
+    return None
+
+
+def _prompt_broader_postauth_scope_retry(
+    shell: Any,
+    *,
+    service: str,
+    domain: str,
+    current_source: str,
+    next_scope_preference: str,
+    next_target_count: int,
+) -> bool:
+    """Ask whether to retry one empty service sweep with a broader scope."""
+    _ = domain
+    if is_non_interactive(shell):
+        return False
+    if not hasattr(shell, "_questionary_select"):
+        return False
+
+    scope_label_map = {
+        "reachable": "Current-vantage reachable hosts only",
+        "full": "Full resolved host scope",
+    }
+    next_scope_label = scope_label_map.get(next_scope_preference, next_scope_preference)
+    options = [
+        f"Retry {service.upper()} sweep with {next_scope_label} ({next_target_count} targets)",
+        "Skip broader retry",
+    ]
+    selected_idx = shell._questionary_select(  # type: ignore[attr-defined]
+        (
+            f"No {service.upper()} privileges were found using "
+            f"{current_source}. Broaden the sweep?"
+        ),
+        options,
+        default_idx=0,
+    )
+    return selected_idx == 0
 
 
 def run_enum_all_user_postauth_access(shell: Any, args: str | None) -> None:
@@ -114,6 +179,7 @@ def run_netexec_user_postauth_access(
         services=["smb", "winrm", "rdp", "mssql"],
         hosts=hosts,
         prompt=True,
+        scope_preference="optimized",
     )
 
 
@@ -144,6 +210,7 @@ def run_service_access_sweep(
     services: list[str],
     hosts: list[str] | None = None,
     prompt: bool = False,
+    scope_preference: str = "optimized",
 ) -> None:
     """Enumerate access across a set of services for one user."""
     if domain not in shell.domains_data:
@@ -152,12 +219,6 @@ def run_service_access_sweep(
         return
 
     for service in services:
-        # Only scan this service if its directory exists in current path.
-        if not os.path.exists(os.path.join(service, "ips.txt")):
-            print_info_verbose(
-                f"Skipping service {service} because the service is not available"
-            )
-            continue
         try:
             workspace_cwd = (
                 shell._get_workspace_cwd()  # type: ignore[attr-defined]
@@ -166,66 +227,172 @@ def run_service_access_sweep(
             )
             domains_dir = getattr(shell, "domains_dir", "domains")
 
-            targets: str | None = None
             cleaned_hosts = [
                 h.strip() for h in (hosts or []) if isinstance(h, str) and h.strip()
             ]
-            if cleaned_hosts:
-                if len(cleaned_hosts) == 1:
-                    targets = cleaned_hosts[0]
+            current_scope_preference = scope_preference
+            if not cleaned_hosts and current_scope_preference == "optimized":
+                current_scope_preference = resolve_domain_service_scope_preference(
+                    shell,
+                    workspace_dir=workspace_cwd,
+                    domains_dir=domains_dir,
+                    domain=domain,
+                    service=service,
+                    domain_data=shell.domains_data.get(domain, {}),
+                    prompt_title=(
+                        f"Choose the target scope for {service.upper()} post-auth service sweeps:"
+                    ),
+                )
+            while True:
+                targets: str | None = None
+                current_target_entries: set[str] = set()
+                source = "explicit_hosts"
+                if cleaned_hosts:
+                    if len(cleaned_hosts) == 1:
+                        targets = cleaned_hosts[0]
+                    else:
+                        tmp_dir = domain_subpath(workspace_cwd, domains_dir, domain, "tmp")
+                        os.makedirs(tmp_dir, exist_ok=True)
+                        targets_path = os.path.join(
+                            tmp_dir, f"hosts.{service}.{username}.txt"
+                        )
+                        with open(targets_path, "w", encoding="utf-8") as handle:
+                            for entry in sorted(set(cleaned_hosts), key=str.lower):
+                                handle.write(entry + "\n")
+                        targets = targets_path
+                    current_target_entries = {entry.lower() for entry in cleaned_hosts}
                 else:
-                    tmp_dir = domain_subpath(workspace_cwd, domains_dir, domain, "tmp")
-                    os.makedirs(tmp_dir, exist_ok=True)
-                    targets_path = os.path.join(
-                        tmp_dir, f"hosts.{service}.{username}.txt"
+                    default_hosts_file, source = resolve_domain_service_target_file(
+                        workspace_cwd,
+                        domains_dir,
+                        domain,
+                        service=service,
+                        domain_data=shell.domains_data.get(domain, {}),
+                        scope_preference=current_scope_preference,
                     )
-                    with open(targets_path, "w", encoding="utf-8") as handle:
-                        for entry in sorted(set(cleaned_hosts), key=str.lower):
-                            handle.write(entry + "\n")
-                    targets = targets_path
-            else:
-                default_hosts_file, source = ensure_enabled_computer_ip_file(
+                    if not default_hosts_file:
+                        break
+                    targets = default_hosts_file
+                    target_count = count_target_file_entries(default_hosts_file)
+                    print_info_debug(
+                        f"[privileges] using domain target file source={source} "
+                        f"for {mark_sensitive(domain, 'domain')}: "
+                        f"{mark_sensitive(str(targets), 'path')}"
+                    )
+                    print_info(
+                        f"{service.upper()} sweep scope: "
+                        f"{mark_sensitive(source, 'detail')} "
+                        f"({target_count} target(s))"
+                    )
+                    targeting_notice = consume_service_targeting_fallback_notice(
+                        shell,
+                        workspace_dir=workspace_cwd,
+                        domains_dir=domains_dir,
+                        domain=domain,
+                        service=service,
+                        source=source,
+                    )
+                    if targeting_notice:
+                        print_info(targeting_notice)
+                    current_target_entries = load_target_entries(default_hosts_file)
+
+                marked_domain = mark_sensitive(domain, "domain")
+                marked_username = mark_sensitive(username, "user")
+                print_info(
+                    f"Starting {service} privilege enumeration for user {marked_username}"
+                )
+                if service == "rdp":
+                    print_info_debug(
+                        "[privileges] service access sweep dispatch: "
+                        f"domain={marked_domain} user={marked_username} service={service} "
+                        f"backend=medusa prompt_on_success={prompt!r} "
+                        f"targets={mark_sensitive(str(targets), 'path')}"
+                    )
+                    found_hosts = bool(
+                        run_rdp_service_access_sweep_with_medusa(
+                            shell,
+                            domain=domain,
+                            username=username,
+                            password=password,
+                            targets=str(targets),
+                            prompt=prompt,
+                            target_count=(
+                                len(cleaned_hosts)
+                                if cleaned_hosts
+                                else target_count
+                            ),
+                        )
+                    )
+                else:
+                    auth_str = shell.build_auth_nxc(
+                        username,
+                        password,
+                        domain,
+                        kerberos=False,
+                    )
+                    netexec_timeout_seconds = get_recommended_internal_timeout(service)
+                    command = (
+                        f"{shlex.quote(shell.netexec_path)} {service} {shlex.quote(targets)} {auth_str} "
+                        f"-t 20 --timeout {netexec_timeout_seconds} "
+                        f"--log domains/{marked_domain}/{service}/{marked_username}_privs.log"
+                    )
+                    print_info_debug(
+                        "[privileges] service access sweep dispatch: "
+                        f"domain={marked_domain} user={marked_username} service={service} "
+                        f"backend=netexec prompt_on_success={prompt!r} "
+                        f"targets={mark_sensitive(str(targets), 'path')}"
+                    )
+                    print_info_verbose(f"Command: {command}")
+                    found_hosts = bool(
+                        shell.run_service_command(
+                            command,
+                            domain,
+                            service,
+                            username,
+                            password,
+                            prompt=prompt,
+                        )
+                    )
+                if found_hosts or cleaned_hosts:
+                    break
+
+                next_scope_preference = _resolve_next_broader_scope(
+                    service=service,
+                    source=source,
+                    current_scope_preference=current_scope_preference,
+                )
+                if not next_scope_preference:
+                    break
+                next_targets_file, _next_source = resolve_domain_service_target_file(
                     workspace_cwd,
                     domains_dir,
                     domain,
-                    shell.domains_data.get(domain, {}),
+                    service=service,
+                    domain_data=shell.domains_data.get(domain, {}),
+                    scope_preference=next_scope_preference,
                 )
-                if not default_hosts_file:
-                    continue
-                targets = default_hosts_file
-                print_info_debug(
-                    f"[privileges] using domain target file source={source} "
-                    f"for {mark_sensitive(domain, 'domain')}: "
-                    f"{mark_sensitive(str(targets), 'path')}"
-                )
-
-            auth_str = shell.build_auth_nxc(username, password, domain, kerberos=False)
-            marked_domain = mark_sensitive(domain, "domain")
-            marked_username = mark_sensitive(username, "user")
-            netexec_timeout_seconds = get_recommended_internal_timeout(service)
-            command = (
-                f"{shlex.quote(shell.netexec_path)} {service} {shlex.quote(targets)} {auth_str} "
-                f"-t 20 --timeout {netexec_timeout_seconds} "
-                f"--log domains/{marked_domain}/{service}/{marked_username}_privs.log"
-            )
-
-            print_info(
-                f"Starting {service} privilege enumeration for user {marked_username}"
-            )
-            print_info_debug(
-                "[privileges] service access sweep dispatch: "
-                f"domain={marked_domain} user={marked_username} service={service} "
-                f"prompt_on_success={prompt!r} targets={mark_sensitive(str(targets), 'path')}"
-            )
-            print_info_verbose(f"Command: {command}")
-            shell.run_service_command(
-                command,
-                domain,
-                service,
-                username,
-                password,
-                prompt=prompt,
-            )
+                next_target_count = count_target_file_entries(next_targets_file)
+                if not next_targets_file or next_target_count <= 0:
+                    break
+                next_target_entries = load_target_entries(next_targets_file)
+                if next_target_entries and next_target_entries.issubset(current_target_entries):
+                    print_info_debug(
+                        "[privileges] skipping broader sweep prompt because "
+                        f"{mark_sensitive(next_scope_preference, 'detail')} does not add "
+                        f"new {service.upper()} targets beyond "
+                        f"{mark_sensitive(source, 'detail')}"
+                    )
+                    break
+                if not _prompt_broader_postauth_scope_retry(
+                    shell,
+                    service=service,
+                    domain=domain,
+                    current_source=source,
+                    next_scope_preference=next_scope_preference,
+                    next_target_count=next_target_count,
+                ):
+                    break
+                current_scope_preference = next_scope_preference
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_error(f"Error processing service {service}.")

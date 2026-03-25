@@ -158,6 +158,7 @@ def compute_display_paths_for_domain_unfiltered(
     max_paths: int | None = None,
     target: str = "highvalue",
     target_mode: str = "tier0",
+    start_node_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain (graph-only, unfiltered).
 
@@ -175,6 +176,7 @@ def compute_display_paths_for_domain_unfiltered(
         # Always compute all paths and apply filtering/promotion after.
         target="all",
         terminal_mode=mode,
+        start_node_ids=start_node_ids,
     )
 
     results: list[dict[str, Any]] = []
@@ -642,6 +644,7 @@ def compute_maximal_attack_paths(
     max_paths: int | None = None,
     target: str = "highvalue",
     terminal_mode: str = "tier0",
+    start_node_ids: set[str] | None = None,
 ) -> list[AttackPath]:
     """Compute maximal paths up to depth for a full-domain graph."""
     if max_depth <= 0:
@@ -695,7 +698,24 @@ def compute_maximal_attack_paths(
             return _node_is_impact_high_value(node)
         return _node_is_tier0(node)
 
-    sources = [node_id for node_id in nodes_map.keys() if incoming.get(node_id, 0) == 0]
+    allowed_start_ids: set[str] = (
+        {str(node_id) for node_id in start_node_ids if str(node_id).strip()}
+        if start_node_ids
+        else set()
+    )
+    sources: list[str] = []
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        if allowed_start_ids and node_id not in allowed_start_ids:
+            continue
+        if outgoing.get(node_id, 0) <= 0:
+            continue
+        if not _node_is_enabled_user(node):
+            continue
+        if _node_is_effectively_high_value(node):
+            continue
+        sources.append(node_id)
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
@@ -895,6 +915,67 @@ def compute_maximal_attack_paths_from_start(
     return paths
 
 
+def collect_source_step_signatures_on_high_value_paths(
+    graph: dict[str, Any],
+    *,
+    start_node_id: str,
+    max_depth: int,
+    target_mode: str = "impact",
+) -> set[tuple[str, str, str]]:
+    """Return source-edge signatures that participate in HV/tier-zero paths.
+
+    This helper is intentionally lower-level than the CLI display pipeline. It
+    reuses the core DFS and high-value promotion semantics, but skips all
+    display-only minimization, deduplication, and UX shaping.
+
+    Args:
+        graph: In-memory attack graph.
+        start_node_id: Source node id to expand from.
+        max_depth: Maximum path depth.
+        target_mode: ``"tier0"`` or ``"impact"``. ``"impact"`` includes
+            effectively high-value targets and promotion via high-value groups.
+
+    Returns:
+        Set of ``(from_id, relation, to_id)`` signatures for steps that start
+        at ``start_node_id`` and are part of at least one path that reaches a
+        high-value / tier-zero target under the same promotion semantics used by
+        display-path generation.
+    """
+    mode = (target_mode or "impact").strip().lower()
+    if mode not in {"tier0", "impact"}:
+        mode = "impact"
+
+    required_rank = 1 if mode == "impact" else 3
+    results: set[tuple[str, str, str]] = set()
+
+    for path in compute_maximal_attack_paths_from_start(
+        graph,
+        start_node_id=start_node_id,
+        max_depth=max_depth,
+        max_paths=None,
+        target="all",
+        terminal_mode=mode,
+    ):
+        candidate = path
+        if not _path_target_is_high_value(graph, path.target_id, mode=mode):
+            promoted = _try_promote_target_via_membership_edges(
+                graph,
+                path,
+                required_rank=required_rank,
+                mode=mode,
+            )
+            if not promoted:
+                continue
+            candidate = promoted
+
+        for step in candidate.steps:
+            if step.from_id != start_node_id:
+                continue
+            results.add((step.from_id, step.relation, step.to_id))
+
+    return results
+
+
 def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str, Any]:
     """Convert an AttackPath to the CLI/UI-friendly dict shape."""
     from adscan_internal.services.attack_step_support_registry import (
@@ -1072,6 +1153,18 @@ def _node_is_effectively_high_value(node: dict[str, Any]) -> bool:
     if bool(node.get("highvalue")) or bool(props.get("highvalue")):
         return True
     return _node_is_privileged_group(node)
+
+
+def _node_is_enabled_user(node: dict[str, Any]) -> bool:
+    """Return True when the node represents an enabled user principal."""
+    if str(node.get("kind") or "") != "User":
+        return False
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    enabled = props.get("enabled")
+    if isinstance(enabled, bool):
+        return enabled
+    enabled = node.get("enabled")
+    return enabled is True
 
 
 def _node_is_impact_high_value(node: dict[str, Any]) -> bool:

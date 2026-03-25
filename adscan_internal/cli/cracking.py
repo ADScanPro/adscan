@@ -67,7 +67,7 @@ from rich.prompt import Confirm, Prompt
 from adscan_internal.interaction import is_non_interactive
 
 _MINIMUM_TIMEROAST_HASHCAT_VERSION = (7, 1, 2)
-_GRAPH_TRACKED_ROAST_HASH_TYPES = {"asreproast", "kerberoast", "timeroast"}
+_GRAPH_TRACKED_ROAST_HASH_TYPES = {"asreproast", "kerberoast"}
 _HASHCAT_NO_DEVICE_TEXT = "No devices found/left"
 _HASHCAT_EXHAUSTED_EXIT_CODE = 1
 _HASHCAT_FATAL_ERROR_PATTERNS = (
@@ -1504,7 +1504,7 @@ def execute_cracking(
                 attempted_users = set(_extract_hash_users(hash))
                 cracked_users = set(creds.keys())
                 for username, password in creds.items():
-                    if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES:
+                    if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES or hash_type == "timeroast":
                         try:
                             from adscan_internal.services.attack_graph_service import (
                                 update_roast_entry_edge_status,

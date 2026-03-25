@@ -621,6 +621,15 @@ class DNSDiscoveryService:
                         f"[dns_reverse] PTR ignored invalid hostname for {marked_ip}: {candidate}"
                     )
                     continue
+                try:
+                    ipaddress.ip_address(candidate.rstrip("."))
+                except ValueError:
+                    pass
+                else:
+                    print_info_debug(
+                        f"[dns_reverse] PTR ignored IP-literal hostname for {marked_ip}: {candidate}"
+                    )
+                    continue
                 marked_candidate = mark_sensitive(candidate, "host")
                 print_info_debug(
                     f"[dns_reverse] PTR resolved {marked_ip} -> {marked_candidate}"

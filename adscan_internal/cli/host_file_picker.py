@@ -78,6 +78,11 @@ def select_host_file_via_gui(
         print_info_debug(
             f"[{log_prefix}] Host GUI picker unavailable: ADSCAN_HOST_HELPER_SOCK={marked_sock}"
         )
+        print_info_debug(
+            f"[{log_prefix}] Host GUI picker prerequisites missing. "
+            "This usually means the FULL container was not started via the "
+            "official launcher, or the host-helper bootstrap failed."
+        )
         return None
 
     try:
@@ -171,6 +176,12 @@ def maybe_import_host_file_to_workspace(
         marked_sock = mark_sensitive(helper_sock or "<unset>", "path")
         print_warning(
             f"Host helper socket not available ({marked_sock}). Cannot import host file."
+        )
+        print_info_debug(
+            f"[{log_prefix}] Host file import unavailable because the host-helper "
+            "socket is missing. This usually means the FULL container runtime "
+            "was not launched through the official Docker wrapper, or the "
+            "host-helper failed to start."
         )
         return source_path
 

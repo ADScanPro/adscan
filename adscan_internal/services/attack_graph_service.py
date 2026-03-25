@@ -2972,6 +2972,18 @@ def _node_is_effectively_high_value(node: dict[str, Any]) -> bool:
     return _node_is_privileged_group(node)
 
 
+def _node_is_enabled_user(node: dict[str, Any]) -> bool:
+    """Return True when the node represents an enabled user principal."""
+    if _node_kind(node) != "User":
+        return False
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    enabled = props.get("enabled")
+    if isinstance(enabled, bool):
+        return enabled
+    enabled = node.get("enabled")
+    return enabled is True
+
+
 def _node_is_impact_high_value(node: dict[str, Any]) -> bool:
     """Return True for "high impact" (not necessarily domain-compromise) nodes."""
     return _node_is_effectively_high_value(node)
@@ -4497,6 +4509,7 @@ class CredentialSourceStep:
     relation: str
     edge_type: str
     entry_label: str = "Domain Users"
+    entry_kind: str = ""
     notes: dict[str, Any] = field(default_factory=dict)
     record_on_failure: bool = False
 
@@ -4533,7 +4546,7 @@ def record_credential_source_steps(
             continue
         entry_label = str(step.entry_label or "").strip()
         notes = step.notes if isinstance(step.notes, dict) else {}
-        entry_kind = str(notes.get("entry_kind") or "").strip().lower()
+        entry_kind = str(step.entry_kind or notes.get("entry_kind") or "").strip().lower()
 
         use_computer_entry = False
         if entry_kind == "computer":
@@ -4548,9 +4561,17 @@ def record_credential_source_steps(
             entry_id = ensure_computer_node_for_domain(
                 shell, domain, graph, principal=entry_label
             )
+        elif entry_kind == "user":
+            entry_id = ensure_user_node_for_domain(
+                shell, domain, graph, username=entry_label
+            )
+        elif entry_kind == "group":
+            entry_id = ensure_entry_node_for_domain(
+                shell, domain, graph, label=entry_label, entry_kind="group"
+            )
         else:
             entry_id = ensure_entry_node_for_domain(
-                shell, domain, graph, label=entry_label
+                shell, domain, graph, label=entry_label, entry_kind=entry_kind or None
             )
         edge = upsert_edge(
             graph,
@@ -4574,6 +4595,7 @@ def compute_maximal_attack_paths(
     max_depth: int,
     target: str = "highvalue",
     terminal_mode: str = "tier0",
+    start_node_ids: set[str] | None = None,
 ) -> list[AttackPath]:
     """Compute maximal paths up to depth.
 
@@ -4626,7 +4648,24 @@ def compute_maximal_attack_paths(
             return _node_is_impact_high_value(node)
         return _node_is_tier0(node)
 
-    sources = [node_id for node_id in nodes_map.keys() if incoming.get(node_id, 0) == 0]
+    allowed_start_ids: set[str] = (
+        {str(node_id) for node_id in start_node_ids if str(node_id).strip()}
+        if start_node_ids
+        else set()
+    )
+    sources: list[str] = []
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        if allowed_start_ids and node_id not in allowed_start_ids:
+            continue
+        if outgoing.get(node_id, 0) <= 0:
+            continue
+        if not _node_is_enabled_user(node):
+            continue
+        if _node_is_effectively_high_value(node):
+            continue
+        sources.append(node_id)
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
@@ -5012,12 +5051,13 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
 
 
 def ensure_entry_node(graph: dict[str, Any], *, label: str) -> str:
-    """Ensure the shared entry node exists (e.g. 'Domain Users')."""
+    """Ensure a synthetic non-principal entry node exists."""
     node = {
         "name": label,
-        "kind": ["Group"],
+        "kind": ["Entry"],
         "properties": {"name": label},
     }
+    _mark_synthetic_node_record(node, domain="", source="fallback_entry")
     upsert_nodes(graph, [node])
     return _node_id(node)
 
@@ -5045,6 +5085,7 @@ def ensure_entry_node_for_domain(
     graph: dict[str, Any],
     *,
     label: str,
+    entry_kind: str | None = None,
 ) -> str:
     """Ensure an entry node exists, preferring BloodHound-backed nodes when possible.
 
@@ -5114,6 +5155,16 @@ def ensure_entry_node_for_domain(
     if special_entry:
         return special_entry
 
+    resolved_principal = _resolve_bloodhound_principal_entry(
+        shell,
+        domain,
+        graph,
+        label_clean,
+        entry_kind=entry_kind,
+    )
+    if resolved_principal:
+        return resolved_principal
+
     if label_lower == "domain users":
         scoped_label = attack_paths_core._canonical_membership_label(  # noqa: SLF001
             domain, label_clean
@@ -5133,6 +5184,94 @@ def ensure_entry_node_for_domain(
         return _node_id(node_record)
 
     return ensure_entry_node(graph, label=label_clean)
+
+
+def _resolve_bloodhound_principal_entry(
+    shell: object,
+    domain: str,
+    graph: dict[str, Any],
+    label: str,
+    *,
+    entry_kind: str | None = None,
+) -> str | None:
+    """Best-effort resolve an arbitrary entry label to a real BH-backed principal node."""
+    label_clean = str(label or "").strip()
+    if not label_clean or not hasattr(shell, "_get_bloodhound_service"):
+        return None
+    try:
+        service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return None
+    if not service:
+        return None
+
+    normalized = _normalize_account(label_clean)
+    domain_upper = str(domain or "").strip().upper()
+    kind_hint = str(entry_kind or "").strip().lower()
+    candidates: list[tuple[int, dict[str, Any]]] = []
+
+    def _append_candidate(kind: str, node_props: dict[str, Any] | None) -> None:
+        if not isinstance(node_props, dict):
+            return
+        object_id = node_props.get("objectid") or node_props.get("objectId")
+        name = str(node_props.get("name") or "").strip()
+        if kind == "User":
+            canonical_name = name or f"{normalized.upper()}@{domain_upper}"
+            node_props.setdefault("name", canonical_name)
+            node_props.setdefault("samaccountname", normalized)
+        elif kind == "Computer":
+            canonical_name = name or label_clean
+            node_props.setdefault("name", canonical_name)
+        else:
+            canonical_name = name or label_clean
+            node_props.setdefault("name", canonical_name)
+        node_record = {
+            "name": canonical_name,
+            "kind": [kind],
+            "objectId": object_id or None,
+            "properties": node_props,
+        }
+        kind_priority = {"user": 0, "computer": 1, "group": 2}
+        if kind_hint in kind_priority:
+            score = 0 if kind.lower() == kind_hint else 10 + kind_priority[kind.lower()]
+        else:
+            score = kind_priority.get(kind.lower(), 20)
+        if object_id:
+            score -= 5
+        candidates.append((score, node_record))
+
+    if normalized and hasattr(service, "get_user_node_by_samaccountname"):
+        try:
+            _append_candidate(
+                "User",
+                service.get_user_node_by_samaccountname(domain, normalized),  # type: ignore[attr-defined]
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+    if hasattr(service, "get_group_node_by_samaccountname"):
+        try:
+            _append_candidate(
+                "Group",
+                service.get_group_node_by_samaccountname(domain, label_clean),  # type: ignore[attr-defined]
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+    if hasattr(service, "get_computer_node_by_name"):
+        try:
+            _append_candidate(
+                "Computer",
+                service.get_computer_node_by_name(domain, label_clean),  # type: ignore[attr-defined]
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    node_record = candidates[0][1]
+    upsert_nodes(graph, [node_record])
+    return _node_id(node_record)
 
 
 def resolve_entry_label_for_auth(auth_username: str | None) -> str:
@@ -7594,24 +7733,11 @@ def compute_maximal_attack_paths_from_start(
 
 
 def _sort_display_paths(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    status_order = {
-        "theoretical": 0,
-        "unavailable": 1,
-        "unsupported": 2,
-        "blocked": 3,
-        "attempted": 4,
-        "exploited": 5,
-    }
-
-    return sorted(
-        records,
-        key=lambda item: (
-            status_order.get(str(item.get("status") or "").strip().lower(), 3),
-            int(item.get("length", 0)) if str(item.get("length", "")).isdigit() else 0,
-            str(item.get("source", "")).lower(),
-            str(item.get("target", "")).lower(),
-        ),
+    from adscan_internal.services.attack_step_support_registry import (
+        build_path_priority_key,
     )
+
+    return sorted(records, key=build_path_priority_key)
 
 
 def _record_has_executable_steps(record: dict[str, Any]) -> bool:
@@ -8338,6 +8464,9 @@ def compute_display_paths_for_domain(
     runtime_graph["edges"] = list(
         base_graph.get("edges") if isinstance(base_graph.get("edges"), list) else []
     )
+    start_node_ids = _resolve_domain_enabled_low_priv_user_start_ids(
+        shell, domain, runtime_graph
+    )
 
     snapshot = _load_membership_snapshot(shell, domain)
     if (
@@ -8371,6 +8500,7 @@ def compute_display_paths_for_domain(
             target=target,
             target_mode=target_mode,
             expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
+            start_node_ids=start_node_ids,
         )
     )
     _dfs_elapsed = time.monotonic() - _dfs_t0
@@ -8403,6 +8533,56 @@ def compute_display_paths_for_domain(
     )
     _attack_paths_cache_put(cache_key, records, domain=domain, scope="domain")
     return records
+
+
+def _resolve_domain_enabled_low_priv_user_start_ids(
+    shell: object,
+    domain: str,
+    graph: dict[str, Any],
+) -> set[str]:
+    """Return enabled low-priv user node ids for the requested domain."""
+    nodes_map = graph.get("nodes")
+    if not isinstance(nodes_map, dict):
+        return set()
+
+    enabled_users = get_enabled_users_for_domain(shell, domain)
+    normalized_enabled_users = {
+        _normalize_account(username)
+        for username in (enabled_users or set())
+        if _normalize_account(username)
+    }
+    normalized_domain = str(domain or "").strip().upper()
+
+    start_node_ids: set[str] = set()
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        node = _enrich_node_enabled_metadata(shell, graph, node)
+        nodes_map[str(node_id)] = node
+        if not _node_is_enabled_user(node):
+            continue
+        if _node_is_effectively_high_value(node):
+            continue
+
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        node_domain = str(props.get("domain") or "").strip().upper()
+        if not node_domain:
+            label = _canonical_node_label(node)
+            if "@" in label:
+                node_domain = label.rsplit("@", 1)[-1].strip().upper()
+        if node_domain != normalized_domain:
+            continue
+
+        normalized_username = _normalize_account(_canonical_node_label(node))
+        if normalized_enabled_users and normalized_username not in normalized_enabled_users:
+            continue
+        start_node_ids.add(str(node_id))
+
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info_debug(
+        f"[attack_paths] domain start nodes resolved for {marked_domain}: {len(start_node_ids)} enabled low-priv users"
+    )
+    return start_node_ids
 
 
 def _filter_contained_paths_for_domain_listing(
@@ -8674,38 +8854,162 @@ def _ask_or_get_attack_path_engine(shell: object) -> str:
     In production (non-dev) always returns ``"local"`` — local DFS is faster
     and has no dependency on BH CE data being present for the domain.
     In development mode (``ADSCAN_SESSION_ENV=dev``) shows an interactive
-    questionary selector so engineers can compare BH CE vs local DFS output,
-    defaulting to local.
+    questionary selector so engineers can compare engines:
+      - BloodHound CE (only when connected)
+      - Local Python DFS (default)
+      - rustworkx Rust-backed DFS (dev benchmark)
 
     Returns:
-        ``"bloodhound"`` or ``"local"``.
+        ``"bloodhound"``, ``"local"``, or ``"rustworkx"``.
     """
     # In production (non-dev) always use local DFS — faster and no BH data dependency.
-    # BH CE engine is only available in dev mode via the interactive selector.
     is_dev = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
     if not is_dev:
-        return "local"
-
-    if not _is_bh_available(shell):
         return "local"
 
     if not hasattr(shell, "_questionary_select"):
         return "local"
 
-    options = [
-        "BloodHound CE  (Cypher graph queries)",
-        "Local  (attack_graph.json)",
-    ]
+    bh_available = _is_bh_available(shell)
+    if bh_available:
+        options = [
+            "BloodHound CE  (Cypher graph queries)",
+            "Local  (Python DFS)",
+            "rustworkx  (Rust-backed DFS)  [dev benchmark]",
+        ]
+        default_idx = 1
+    else:
+        options = [
+            "Local  (Python DFS)",
+            "rustworkx  (Rust-backed DFS)  [dev benchmark]",
+        ]
+        default_idx = 0
+
     try:
         idx = shell._questionary_select(  # type: ignore[attr-defined]
             "Select attack path engine:",
             options,
-            default_idx=1,
+            default_idx=default_idx,
         )
     except Exception:  # noqa: BLE001
         return "local"
 
-    return "bloodhound" if idx == 0 else "local"
+    if bh_available:
+        if idx == 0:
+            return "bloodhound"
+        if idx == 2:
+            return "rustworkx"
+        return "local"
+    return "rustworkx" if idx == 1 else "local"
+
+
+def _compute_rustworkx_display_paths(
+    shell: object,
+    domain: str,
+    *,
+    scope: str,
+    username: str | None = None,
+    principals: list[str] | None = None,
+    max_depth: int,
+    max_paths: int | None = None,
+    target: str = "highvalue",
+    target_mode: str = "tier0",
+    membership_sample_max: int = 3,
+) -> list[dict[str, Any]]:
+    """Run the full local-DFS pipeline with rustworkx as the graph engine.
+
+    Temporarily replaces ``attack_graph_core.compute_maximal_attack_paths`` and
+    ``compute_maximal_attack_paths_from_start`` with their rustworkx-backed
+    equivalents, then delegates to the standard scope-specific service functions
+    (with ``no_cache=True`` to get fresh DFS timings).  Original functions are
+    restored in a ``finally`` block.
+
+    Dev-mode only — not called in production.
+    """
+    from adscan_internal.services import attack_graph_core as _ag_core
+    from adscan_internal.services import attack_graph_core_rustworkx as _rw_engine
+
+    if not _rw_engine.is_available():
+        print_info_debug(
+            "[engine=rustworkx] rustworkx not installed — falling back to local Python DFS"
+        )
+        # Fall through to local DFS by returning sentinel; caller handles this.
+        return []
+
+    _orig_domain_dfs = _ag_core.compute_maximal_attack_paths  # type: ignore[attr-defined]
+    _orig_start_dfs = _ag_core.compute_maximal_attack_paths_from_start  # type: ignore[attr-defined]
+    try:
+        # Swap Python DFS with rustworkx variants (single-threaded CLI — safe).
+        _ag_core.compute_maximal_attack_paths = (  # type: ignore[attr-defined]
+            _rw_engine.compute_maximal_attack_paths_rustworkx
+        )
+        _ag_core.compute_maximal_attack_paths_from_start = (  # type: ignore[attr-defined]
+            _rw_engine.compute_maximal_attack_paths_from_start_rustworkx
+        )
+
+        scope_norm = str(scope or "domain").strip().lower()
+        _rw_t0 = time.perf_counter()
+
+        if scope_norm == "domain":
+            result = compute_display_paths_for_domain(
+                shell,
+                domain,
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                no_cache=True,
+            )
+        elif scope_norm == "user":
+            if not str(username or "").strip():
+                return []
+            result = compute_display_paths_for_user(
+                shell,
+                domain,
+                username=str(username or "").strip(),
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                no_cache=True,
+            )
+        elif scope_norm == "owned":
+            result = compute_display_paths_for_owned_users(
+                shell,
+                domain,
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                no_cache=True,
+            )
+        elif scope_norm == "principals":
+            normalized = [
+                str(p or "").strip() for p in (principals or []) if str(p or "").strip()
+            ]
+            if not normalized:
+                return []
+            result = compute_display_paths_for_principals(
+                shell,
+                domain,
+                principals=normalized,
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                membership_sample_max=membership_sample_max,
+                no_cache=True,
+            )
+        else:
+            raise ValueError(f"Unsupported scope for rustworkx engine: {scope!r}")
+
+        print_info_debug(
+            f"[engine=rustworkx] {len(result)} path(s) in {time.perf_counter() - _rw_t0:.2f}s"
+        )
+        return result
+    finally:
+        _ag_core.compute_maximal_attack_paths = _orig_domain_dfs  # type: ignore[attr-defined]
+        _ag_core.compute_maximal_attack_paths_from_start = _orig_start_dfs  # type: ignore[attr-defined]
 
 
 def _compute_bh_attack_paths(
@@ -9043,10 +9347,11 @@ def get_attack_path_summaries(
     """
     scope_norm = str(scope or "domain").strip().lower()
 
-    # BH CE is the primary engine. In dev mode an interactive selector is shown
-    # so engineers can compare both engines. Fall back silently to local DFS when
-    # BH CE is unavailable or the query fails.
-    if _ask_or_get_attack_path_engine(shell) == "bloodhound":
+    # In dev mode an interactive selector lets engineers compare all three engines.
+    # In production this always returns "local" without prompting.
+    _engine = _ask_or_get_attack_path_engine(shell)
+
+    if _engine == "bloodhound":
         bh_result = _compute_bh_attack_paths(
             shell,
             domain,
@@ -9059,6 +9364,20 @@ def get_attack_path_summaries(
         )
         if bh_result is not None:
             return bh_result
+
+    if _engine == "rustworkx":
+        return _compute_rustworkx_display_paths(
+            shell,
+            domain,
+            scope=scope_norm,
+            username=username,
+            principals=list(principals or []),
+            max_depth=max_depth,
+            max_paths=max_paths,
+            target=target,
+            target_mode=target_mode,
+            membership_sample_max=membership_sample_max,
+        )
 
     _local_t0 = time.perf_counter()
     local_result: list[dict[str, Any]]

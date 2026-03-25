@@ -13,7 +13,12 @@ import shlex
 
 from adscan_internal import print_error, print_info, print_info_debug
 from adscan_internal.rich_output import mark_sensitive
-from adscan_internal.workspaces.computers import ensure_enabled_computer_ip_file
+from adscan_internal.workspaces.computers import (
+    count_target_file_entries,
+    consume_service_targeting_fallback_notice,
+    resolve_domain_service_scope_preference,
+    resolve_domain_service_target_file,
+)
 
 
 def run_netexec_cve_dcs(shell: Any, *, cve: str, target_domain: str) -> None:
@@ -65,11 +70,22 @@ def run_netexec_cve_all(shell: Any, *, cve: str, target_domain: str) -> None:
 
     workspace_dir = getattr(shell, "current_workspace_dir", None) or os.getcwd()
     domains_dir = getattr(shell, "domains_dir", "domains")
-    targets_file, source = ensure_enabled_computer_ip_file(
+    scope_preference = resolve_domain_service_scope_preference(
+        shell,
+        workspace_dir=workspace_dir,
+        domains_dir=domains_dir,
+        domain=target_domain,
+        service="smb",
+        domain_data=domain_credentials,
+        prompt_title="Choose the target scope for SMB CVE enumeration:",
+    )
+    targets_file, source = resolve_domain_service_target_file(
         workspace_dir,
         domains_dir,
         target_domain,
-        domain_credentials,
+        service="smb",
+        domain_data=domain_credentials,
+        scope_preference=scope_preference,
     )
     if not targets_file:
         marked_target_domain = mark_sensitive(target_domain, "domain")
@@ -83,10 +99,24 @@ def run_netexec_cve_all(shell: Any, *, cve: str, target_domain: str) -> None:
         f"{auth} -t 20 --timeout 30 --smb-timeout 10 --log domains/{target_domain}/smb/{cve}.log -M {cve}"
     )
     marked_target_domain = mark_sensitive(target_domain, "domain")
+    targeting_notice = consume_service_targeting_fallback_notice(
+        shell,
+        workspace_dir=workspace_dir,
+        domains_dir=domains_dir,
+        domain=target_domain,
+        service="smb",
+        source=source,
+    )
+    if targeting_notice:
+        print_info(targeting_notice)
     print_info(f"Checking for {cve} on all hosts in domain {marked_target_domain}")
     print_info_debug(
         f"[cves] using domain target file source={source} "
         f"for {marked_target_domain}: {mark_sensitive(targets_file, 'path')}"
+    )
+    print_info(
+        f"SMB CVE scope: {mark_sensitive(source, 'detail')} "
+        f"({count_target_file_entries(targets_file)} target(s))"
     )
     print_info_debug(f"Command: {command}")
 

@@ -76,9 +76,11 @@ from adscan_internal.services.winrm_psrp_service import (
     WinRMPSRPService,
 )
 from adscan_internal.services.credsweeper_service import (
-    CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC,
-    CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT,
     get_default_credsweeper_jobs,
+)
+from adscan_internal.services.loot_credential_analysis_service import (
+    ENGINE_CREDSWEEPER,
+    run_loot_credential_analysis,
 )
 from adscan_internal.text_utils import strip_ansi_codes
 
@@ -2313,22 +2315,25 @@ def _run_winrm_sensitive_scan_phase(
         if not credsweeper_path:
             print_warning("CredSweeper is not configured; skipping WinRM credential scan.")
             return {"completed": False, "credential_findings": 0, "phase": phase}
-        credsweeper_service = shell._get_credsweeper_service()
         analysis_started_at = time.perf_counter()
-        findings = credsweeper_service.analyze_path_with_options(
-            loot_dir,
+        analysis_result = run_loot_credential_analysis(
+            shell,
+            domain=domain,
+            loot_dir=loot_dir,
+            phase=phase,
+            phase_label=phase_label,
+            candidate_files=len(downloaded_files),
+            analysis_context={
+                "ai_configured": False,
+                "credential_analysis_engine_by_phase": {phase: ENGINE_CREDSWEEPER},
+            },
+            ai_history_path="",
             credsweeper_path=credsweeper_path,
-            json_output_dir=os.path.join(phase_root_abs, "credsweeper"),
-            include_custom_rules=True,
-            rules_profile=(
-                CREDSWEEPER_RULES_PROFILE_FILESYSTEM_DOC
-                if phase == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS
-                else CREDSWEEPER_RULES_PROFILE_FILESYSTEM_TEXT
-            ),
-            custom_ml_threshold="0.0",
-            doc=phase == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
+            credsweeper_output_dir=os.path.join(phase_root_abs, "credsweeper"),
             jobs=get_default_credsweeper_jobs(),
+            credsweeper_findings=None,
         )
+        findings = dict(analysis_result.findings)
         structured_stats = shell._get_spidering_service().process_local_structured_files(
             root_path=loot_dir,
             phase=phase,

@@ -488,6 +488,18 @@ def _host_looks_like_dns_candidate(
     return bool(port_evidence and 53 in port_evidence.open_tcp_ports)
 
 
+def _should_offer_fingerprint_retry(
+    evidence: CandidateIpFingerprintEvidence | None,
+) -> bool:
+    """Return True when fingerprint-derived domain retry is strong enough to suggest."""
+    if evidence is None:
+        return False
+    if evidence.method not in {"hosts", "ldap", "smb"}:
+        return False
+    domain_text = str(evidence.domain or "").strip()
+    return bool(domain_text and re.search(r"[a-z]", domain_text, flags=re.IGNORECASE))
+
+
 def _candidate_dc_port_evidence_from_open_ports(
     *,
     candidate_ip: str,
@@ -810,7 +822,8 @@ def _format_candidate_ip_evidence_lines(
         )
     elif evidence.domain == selected_domain:
         lines.append(
-            "• The resolved IP still looks AD-related for the validated domain, but DNS SRV did not answer."
+            "• The host fingerprint still matches the validated domain. This usually points to "
+            "DNS/53 filtering, tunnel instability, or a resolver service outage rather than a wrong domain."
         )
     elif evidence.domain == requested_domain:
         lines.append(
@@ -855,6 +868,28 @@ def _format_candidate_port_probe_lines(
     return lines
 
 
+def _is_dns_path_failure(
+    *,
+    validation: DomainValidationOutcome,
+    fingerprint_evidence: CandidateIpFingerprintEvidence | None,
+    port_evidence: CandidateDcPortEvidence | None,
+) -> bool:
+    """Return True when DC identity looks credible but DNS reachability is failing."""
+    if validation.error != "no_servers":
+        return False
+    if not _host_looks_like_dc_candidate(
+        fingerprint_evidence=fingerprint_evidence,
+        port_evidence=port_evidence,
+    ):
+        return False
+    if fingerprint_evidence and fingerprint_evidence.domain not in {
+        validation.requested_domain,
+        validation.selected_domain,
+    }:
+        return False
+    return True
+
+
 def _build_domain_validation_failure_summary(
     *,
     validation: DomainValidationOutcome,
@@ -862,6 +897,15 @@ def _build_domain_validation_failure_summary(
     port_evidence: CandidateDcPortEvidence | None,
 ) -> str:
     """Return the top-level failure summary copy for DNS validation panels."""
+    if _is_dns_path_failure(
+        validation=validation,
+        fingerprint_evidence=fingerprint_evidence,
+        port_evidence=port_evidence,
+    ):
+        return (
+            "[yellow]The host still looks like a Domain Controller for this domain, but DNS "
+            "queries to port 53 did not answer from the current network path.[/yellow]"
+        )
     if _host_looks_like_dc_candidate(
         fingerprint_evidence=fingerprint_evidence,
         port_evidence=port_evidence,
@@ -891,6 +935,15 @@ def _build_domain_validation_next_step(
     port_evidence: CandidateDcPortEvidence | None = None,
 ) -> str:
     """Return the most actionable next-step guidance for DNS validation failures."""
+    if _is_dns_path_failure(
+        validation=validation,
+        fingerprint_evidence=fingerprint_evidence,
+        port_evidence=port_evidence,
+    ):
+        return (
+            "This usually means the domain is correct but DNS/53 is not reachable end-to-end. "
+            "Verify UDP+TCP/53 through the VPN/tunnel path, or provide another DC that answers DNS for the same domain."
+        )
     if port_evidence and port_evidence.dc_likely:
         return (
             "This host still looks like a Domain Controller candidate. "
@@ -1508,7 +1561,8 @@ def preflight_domain_pdc_interactive(
                     f"dc_likely={port_evidence.dc_likely}"
                 )
         if (
-            fingerprint_evidence
+            _should_offer_fingerprint_retry(fingerprint_evidence)
+            and fingerprint_evidence
             and fingerprint_evidence.domain != validation.selected_domain
             and Confirm.ask(
                 Text(

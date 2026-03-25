@@ -1,0 +1,21 @@
+{
+  "credential_type": "UUID",
+  "count": 1,
+  "entries": [
+    {
+      "index": 1,
+      "value": "A5C84275-3B97-4AB7-A40D-3802B2AF5FC2",
+      "ml_confidence": null,
+      "context_line": "uuid context",
+      "line_number": 1,
+      "representative_source_file": "loot/file.txt",
+      "seen": 1,
+      "remote_sources": [
+        "/home/macroblond44/Documents/adscan/adscan-private-tool/loot/file.txt:1"
+      ],
+      "local_sources": [
+        "/home/macroblond44/Documents/adscan/adscan-private-tool/loot/file.txt:1"
+      ]
+    }
+  ]
+}

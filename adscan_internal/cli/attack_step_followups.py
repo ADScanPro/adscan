@@ -172,20 +172,32 @@ def _run_user_host_access_followup(
     print_info(
         f"Checking new host/service access for {marked_user} in domain {marked_domain}."
     )
+    print_info_debug(
+        "[followup] starting runtime follow-up: "
+        "title='Check New Host Access' "
+        f"user={marked_user} domain={marked_domain}"
+    )
     with active_step_followup(
         shell,
         source="attack_path_runtime_followup",
         title="Check New Host Access",
     ):
-        run_service_access_sweep(
-            shell,
-            domain=domain,
-            username=username,
-            password=credential,
-            services=["smb", "winrm", "rdp", "mssql"],
-            hosts=None,
-            prompt=True,
-        )
+        try:
+            run_service_access_sweep(
+                shell,
+                domain=domain,
+                username=username,
+                password=credential,
+                services=["smb", "winrm", "rdp", "mssql"],
+                hosts=None,
+                prompt=True,
+            )
+        finally:
+            print_info_debug(
+                "[followup] finished runtime follow-up: "
+                "title='Check New Host Access' "
+                f"user={marked_user} domain={marked_domain}"
+            )
 
 
 def _run_user_share_followup(
@@ -201,17 +213,29 @@ def _run_user_share_followup(
     print_info(
         f"Enumerating newly accessible SMB shares for {marked_user} in domain {marked_domain}."
     )
+    print_info_debug(
+        "[followup] starting runtime follow-up: "
+        "title='Enumerate SMB Shares' "
+        f"user={marked_user} domain={marked_domain}"
+    )
     with active_step_followup(
         shell,
         source="attack_path_runtime_followup",
         title="Enumerate SMB Shares",
     ):
-        run_auth_shares(
-            shell,
-            domain=domain,
-            username=username,
-            password=credential,
-        )
+        try:
+            run_auth_shares(
+                shell,
+                domain=domain,
+                username=username,
+                password=credential,
+            )
+        finally:
+            print_info_debug(
+                "[followup] finished runtime follow-up: "
+                "title='Enumerate SMB Shares' "
+                f"user={marked_user} domain={marked_domain}"
+            )
 
 
 def _build_user_credential_followups(
@@ -273,6 +297,130 @@ def build_followups_for_step(
     kind = (target_kind or "").strip().lower()
 
     followups: list[FollowupAction] = []
+
+    if action == "adminto":
+        marked_target = mark_sensitive(target_label or target_sam_or_label, "hostname")
+
+        def _handle_dump_lsa() -> None:
+            dump_lsa = getattr(shell, "dump_lsa", None)
+            if callable(dump_lsa):
+                dump_lsa(domain, exec_username, exec_password, target_sam_or_label, "false")
+
+        def _handle_dump_dpapi() -> None:
+            dump_dpapi = getattr(shell, "dump_dpapi", None)
+            if callable(dump_dpapi):
+                dump_dpapi(
+                    domain,
+                    exec_username,
+                    exec_password,
+                    target_sam_or_label,
+                    "false",
+                )
+
+        followups.extend(
+            [
+                FollowupAction(
+                    key="dump_lsa",
+                    title="Dump LSA Secrets",
+                    description=f"Attempt an SMB/registry LSA secrets dump on {marked_target}.",
+                    handler=_handle_dump_lsa,
+                ),
+                FollowupAction(
+                    key="dump_dpapi",
+                    title="Dump DPAPI Secrets",
+                    description=f"Attempt a DPAPI credential dump on {marked_target}.",
+                    handler=_handle_dump_dpapi,
+                ),
+            ]
+        )
+        return followups
+
+    if action == "canpsremote":
+        marked_target = mark_sensitive(target_label or target_sam_or_label, "hostname")
+
+        def _handle_winrm() -> None:
+            ask_for_winrm_access = getattr(shell, "ask_for_winrm_access", None)
+            if callable(ask_for_winrm_access):
+                ask_for_winrm_access(
+                    domain,
+                    target_sam_or_label,
+                    exec_username,
+                    exec_password,
+                )
+
+        followups.append(
+            FollowupAction(
+                key="winrm_post_exploitation",
+                title="Open WinRM Access Workflow",
+                description=f"Use WinRM access on {marked_target} for host-centric post-exploitation.",
+                handler=_handle_winrm,
+            )
+        )
+        return followups
+
+    if action == "canrdp":
+        marked_target = mark_sensitive(target_label or target_sam_or_label, "hostname")
+
+        def _handle_rdp() -> None:
+            ask_for_rdp_access = getattr(shell, "ask_for_rdp_access", None)
+            if callable(ask_for_rdp_access):
+                ask_for_rdp_access(
+                    domain,
+                    target_sam_or_label,
+                    exec_username,
+                    exec_password,
+                )
+
+        followups.append(
+            FollowupAction(
+                key="rdp_access_workflow",
+                title="Open RDP Access Workflow",
+                description=f"Use RDP access on {marked_target} for interactive post-exploitation.",
+                handler=_handle_rdp,
+            )
+        )
+        return followups
+
+    if action == "sqladmin":
+        marked_target = mark_sensitive(target_label or target_sam_or_label, "hostname")
+
+        def _handle_mssql() -> None:
+            ask_for_mssql_access = getattr(shell, "ask_for_mssql_access", None)
+            if callable(ask_for_mssql_access):
+                ask_for_mssql_access(
+                    domain,
+                    target_sam_or_label,
+                    exec_username,
+                    exec_password,
+                )
+
+        def _handle_mssql_impersonate() -> None:
+            ask_for_mssql_impersonate = getattr(shell, "ask_for_mssql_impersonate", None)
+            if callable(ask_for_mssql_impersonate):
+                ask_for_mssql_impersonate(
+                    domain,
+                    target_sam_or_label,
+                    exec_username,
+                    exec_password,
+                )
+
+        followups.extend(
+            [
+                FollowupAction(
+                    key="mssql_access_workflow",
+                    title="Open MSSQL Access Workflow",
+                    description=f"Validate SQL administrative access and post-exploitation options on {marked_target}.",
+                    handler=_handle_mssql,
+                ),
+                FollowupAction(
+                    key="mssql_impersonation_workflow",
+                    title="Check MSSQL Impersonation",
+                    description=f"Check SQL impersonation and OS-level pivot options on {marked_target}.",
+                    handler=_handle_mssql_impersonate,
+                ),
+            ]
+        )
+        return followups
 
     if action == "writedacl":
         if kind == "domain":

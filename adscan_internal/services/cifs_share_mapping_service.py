@@ -164,6 +164,7 @@ class CIFSShareMappingService(BaseService):
         hosts: list[str],
         shares: list[str],
         extensions: tuple[str, ...],
+        max_file_size_bytes: int | None = None,
     ) -> list[str]:
         """Resolve local CIFS candidate paths from a consolidated mapping JSON."""
         if not aggregate_map_path or not os.path.exists(aggregate_map_path):
@@ -208,12 +209,23 @@ class CIFSShareMappingService(BaseService):
                 files_bucket = share_entry.get("files")
                 if not isinstance(files_bucket, dict):
                     continue
-                for remote_path in files_bucket.keys():
+                for remote_path, metadata in files_bucket.items():
                     if not isinstance(remote_path, str):
                         continue
                     if is_globally_excluded_smb_relative_path(remote_path):
                         continue
                     if Path(remote_path).suffix.casefold() not in normalized_extensions:
+                        continue
+                    if (
+                        isinstance(max_file_size_bytes, int)
+                        and max_file_size_bytes > 0
+                        and self._parse_size_to_bytes(
+                            str((metadata or {}).get("size", "")).strip()
+                            if isinstance(metadata, dict)
+                            else ""
+                        )
+                        > max_file_size_bytes
+                    ):
                         continue
                     local_path = self.resolve_candidate_local_path(
                         mount_root=mount_root,
@@ -227,6 +239,32 @@ class CIFSShareMappingService(BaseService):
                     seen_paths.add(local_path)
                     resolved_paths.append(local_path)
         return resolved_paths
+
+    @staticmethod
+    def _parse_size_to_bytes(size_text: str) -> int:
+        """Parse one human-readable aggregate size string into bytes."""
+        text = str(size_text or "").strip()
+        if not text:
+            return 0
+        parts = text.split()
+        if not parts:
+            return 0
+        try:
+            value = float(parts[0])
+        except ValueError:
+            return 0
+        unit = parts[1].upper() if len(parts) > 1 else "B"
+        factors = {
+            "B": 1,
+            "KB": 1024,
+            "MB": 1024 * 1024,
+            "GB": 1024 * 1024 * 1024,
+            "TB": 1024 * 1024 * 1024 * 1024,
+        }
+        factor = factors.get(unit)
+        if factor is None:
+            return 0
+        return int(value * factor)
 
     def _collect_share_files(
         self,
