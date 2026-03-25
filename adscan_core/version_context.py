@@ -18,7 +18,7 @@ from typing import Any
 
 from adscan_core.path_utils import get_adscan_home, get_effective_user_home
 
-VERSION = "6.2.2"
+VERSION = "6.2.3"
 _LAUNCHER_VERSION_ENV = "ADSCAN_LAUNCHER_VERSION"
 _RUNTIME_IMAGE_ENV = "ADSCAN_RUNTIME_IMAGE"
 _SOURCE_TREE_VERSION_RE = re.compile(

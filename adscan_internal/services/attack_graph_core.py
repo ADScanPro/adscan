@@ -264,9 +264,14 @@ def filter_contained_paths_for_domain_listing(
 
     if not keep_shortest:
         # Domain mode: process longest-first; mark strict sub-paths as covered.
-        # When preserve_prefix_paths=True (non-domain) only sub-sequences that
-        # end at the same terminal as the kept path are marked covered — this
-        # prevents "A→B" from being shadowed by "A→B→C" (different target).
+        #
+        # preserve_prefix_paths=True  (non-domain callers): only sub-sequences
+        #   ending at the same terminal as the kept path are shadowed.  These are
+        #   exactly the strict suffixes of the kept path — O(L) per path.
+        #
+        # preserve_prefix_paths=False (domain scope): all strict contiguous
+        #   sub-sequences are shadowed — O(L²) per path but unavoidable for the
+        #   holistic domain view.
         normalized.sort(key=lambda item: len(item[1]), reverse=True)
         covered: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
         kept: list[dict[str, Any]] = []
@@ -280,15 +285,18 @@ def filter_contained_paths_for_domain_listing(
             rel_len = len(rels_t)
             if rel_len <= 0:
                 continue
-            terminal = nodes_t[-1]
-            for start in range(0, rel_len):
-                for end in range(start + 1, rel_len + 1):
-                    if end - start >= rel_len:
-                        continue
-                    if preserve_prefix_paths and nodes_t[end] != terminal:
-                        # Sub-sequence ends at a different target — keep it.
-                        continue
-                    covered.add((nodes_t[start : end + 1], rels_t[start:end]))
+            if preserve_prefix_paths:
+                # O(L): only strict suffixes share the same terminal by definition.
+                # s=0 would be the full path itself — start from 1.
+                for s in range(1, rel_len):
+                    covered.add((nodes_t[s:], rels_t[s:]))
+            else:
+                # O(L²): mark every strict contiguous sub-sequence as covered.
+                for start in range(0, rel_len):
+                    for end in range(start + 1, rel_len + 1):
+                        if end - start >= rel_len:
+                            continue
+                        covered.add((nodes_t[start : end + 1], rels_t[start:end]))
         return kept, removed
     else:
         # Owned/principals multi-user mode: keep the most direct path within
@@ -300,11 +308,11 @@ def filter_contained_paths_for_domain_listing(
         #   • A longer HV path beats a shorter non-HV path          → keep HV even if longer
         #   • Neither is HV → keep shorter                          → most direct route
         #
-        # When preserve_prefix_paths=True a longer path is only treated as a
-        # super-path when the matching kept sub-sequence ends at the same
-        # terminal, i.e. both reach the same target.  A prefix that ends at a
-        # different (intermediate) node means the longer path reaches a new
-        # target and must be kept.
+        # preserve_prefix_paths=True  (production path): a candidate is a
+        #   super-path only when the shadowing sub-sequence ends at the same
+        #   terminal.  These are the strict suffixes of the candidate — O(L).
+        #
+        # preserve_prefix_paths=False: any sub-sequence match suffices — O(L²).
         if is_hv_terminal is not None:
             normalized.sort(key=lambda item: (not is_hv_terminal(item[2]), len(item[1])))
         else:
@@ -315,18 +323,26 @@ def filter_contained_paths_for_domain_listing(
         removed_multi = 0
         for nodes_t, rels_t, record in normalized:
             rel_len = len(rels_t)
-            terminal = nodes_t[-1]
             is_super_path = False
-            for start in range(0, rel_len):
-                for end in range(start + 1, rel_len + 1):
-                    if end - start >= rel_len:
-                        continue
-                    if (nodes_t[start : end + 1], rels_t[start:end]) in kept_sigs:
-                        if not preserve_prefix_paths or nodes_t[end] == terminal:
+            if preserve_prefix_paths:
+                # O(L): check only strict suffixes of the candidate — these end at
+                # the same terminal by construction, so no per-iteration node check.
+                # s=0 would be the full path (not a strict sub-path) — start from 1.
+                for s in range(1, rel_len):
+                    if (nodes_t[s:], rels_t[s:]) in kept_sigs:
+                        is_super_path = True
+                        break
+            else:
+                # O(L²): check all strict sub-sequences regardless of terminal.
+                for start in range(0, rel_len):
+                    for end in range(start + 1, rel_len + 1):
+                        if end - start >= rel_len:
+                            continue
+                        if (nodes_t[start : end + 1], rels_t[start:end]) in kept_sigs:
                             is_super_path = True
                             break
-                if is_super_path:
-                    break
+                    if is_super_path:
+                        break
             if is_super_path:
                 removed_multi += 1
             else:
@@ -920,7 +936,7 @@ def collect_source_step_signatures_on_high_value_paths(
     *,
     start_node_id: str,
     max_depth: int,
-    target_mode: str = "impact",
+    target_mode: str = "tier0",
 ) -> set[tuple[str, str, str]]:
     """Return source-edge signatures that participate in HV/tier-zero paths.
 
@@ -932,8 +948,8 @@ def collect_source_step_signatures_on_high_value_paths(
         graph: In-memory attack graph.
         start_node_id: Source node id to expand from.
         max_depth: Maximum path depth.
-        target_mode: ``"tier0"`` or ``"impact"``. ``"impact"`` includes
-            effectively high-value targets and promotion via high-value groups.
+        target_mode: ``"tier0"`` or ``"impact"``. ``"tier0"`` is the default
+            so intermediate high-value pivots do not stop expansion early.
 
     Returns:
         Set of ``(from_id, relation, to_id)`` signatures for steps that start
@@ -941,9 +957,9 @@ def collect_source_step_signatures_on_high_value_paths(
         high-value / tier-zero target under the same promotion semantics used by
         display-path generation.
     """
-    mode = (target_mode or "impact").strip().lower()
+    mode = (target_mode or "tier0").strip().lower()
     if mode not in {"tier0", "impact"}:
-        mode = "impact"
+        mode = "tier0"
 
     required_rank = 1 if mode == "impact" else 3
     results: set[tuple[str, str, str]] = set()

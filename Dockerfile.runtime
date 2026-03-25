@@ -31,6 +31,43 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 RUN cargo install --locked --version 2.4.7 rusthound-ce
 
 ###############################################################################
+# John the Ripper build stage (generic x86_64 for VM/host compatibility)
+###############################################################################
+FROM debian:trixie-slim AS john_builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG JOHN_BLEEDING_JUMBO_COMMIT=d8f5b0138e6f9fe24ab453f886dcaa2abb2e5407
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      git \
+      build-essential \
+      automake \
+      autoconf \
+      libtool \
+      pkg-config \
+      zlib1g-dev \
+      libbz2-dev \
+      libpcap-dev \
+      libssl-dev \
+      libgmp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+  mkdir -p /opt/adscan/tools/john; \
+  git clone https://github.com/openwall/john.git /opt/adscan/tools/john; \
+  git -C /opt/adscan/tools/john checkout "${JOHN_BLEEDING_JUMBO_COMMIT}"; \
+  ( \
+    cd /opt/adscan/tools/john/src && \
+    make -s -f Makefile.legacy clean && \
+    make -sj"$(nproc)" -f Makefile.legacy linux-x86-64 && \
+    cp /opt/adscan/tools/john/run/john /opt/adscan/tools/john/run/john-generic && \
+    ln -sf /opt/adscan/tools/john/run/john-generic /opt/adscan/tools/john/run/john \
+  ); \
+  chmod +x /opt/adscan/tools/john/run/john /opt/adscan/tools/john/run/john-generic
+
+###############################################################################
 # Shared runtime base for both PRO and LITE images
 ###############################################################################
 FROM debian:trixie-slim AS runtime-common
@@ -174,6 +211,8 @@ RUN set -eux; \
 RUN mkdir -p /opt/adscan/{bin,tools,tool_venvs,wordlists,logs,fonts} /workspaces \
   && fc-cache -f \
   && chmod -R 0777 /opt/adscan /workspaces
+
+COPY --from=john_builder /opt/adscan/tools/john/run /opt/adscan/tools/john/run
 
 # Install Python tool environments (mirrors `PipToolsConfig` from adscan.py)
 RUN set -eux; \
@@ -324,14 +363,7 @@ RUN set -eux; \
   /opt/adscan/bin/xfreerdp --version; \
   /opt/adscan/bin/medusa -d | grep -i 'rdp'; \
   \
-  git clone https://github.com/openwall/john.git /opt/adscan/tools/john; \
-  git -C /opt/adscan/tools/john checkout "${JOHN_BLEEDING_JUMBO_COMMIT}"; \
-  ( \
-    cd /opt/adscan/tools/john/src && \
-    ./configure && \
-    make -s clean && \
-    make -sj"$(nproc)" \
-  ); \
+  chmod +x /opt/adscan/tools/john/run/john /opt/adscan/tools/john/run/john-generic; \
   for tool in john keepass2john keepass2john.py zip2john zip2john.py pfx2john pfx2john.py ansible2john ansible2john.py; do \
     if [ -e "/opt/adscan/tools/john/run/${tool}" ]; then \
       chmod +x "/opt/adscan/tools/john/run/${tool}" || true; \

@@ -24,6 +24,11 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.cli.session_preflight import (
+    SessionPreflightConfig,
+    SessionPreflightDeps,
+    run_session_preflight,
+)
 
 try:
     from adscan_internal.services.report_service import (
@@ -48,9 +53,14 @@ class CiDeps:
     """Dependency bundle for running CI."""
 
     enable_auto_mode: Callable[[], None]
+    build_preflight_args: Callable[[], object]
+    handle_check: Callable[[object], bool]
+    get_last_check_extra: Callable[[], dict[str, object]]
+    track_docs_link_shown: Callable[[str, str], None]
     resolve_license_mode: Callable[[bool], object]
     create_shell: Callable[[object, object], object]
     console: object
+    exit: Callable[[int], None]
 
 
 def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
@@ -61,10 +71,28 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     args = config.args
 
     deps.enable_auto_mode()
+    preflight_result = run_session_preflight(
+        config=SessionPreflightConfig(
+            command_name="ci",
+            docs_utm_medium="ci_preflight_failed",
+            allow_unsafe_override=False,
+        ),
+        deps=SessionPreflightDeps(
+            build_preflight_args=deps.build_preflight_args,
+            handle_check=deps.handle_check,
+            get_last_check_extra=deps.get_last_check_extra,
+            track_docs_link_shown=deps.track_docs_link_shown,
+            confirm_ask=lambda _prompt, _default: False,
+            exit=deps.exit,
+        ),
+    )
 
     license_mode = deps.resolve_license_mode(config.requested_pro)
     shell = deps.create_shell(deps.console, license_mode)
     shell.session_command_type = "ci"
+    shell.preflight_check_passed = bool(preflight_result.passed)
+    shell.preflight_check_fix_attempted = bool(preflight_result.fix_attempted)
+    shell.preflight_check_overridden = bool(preflight_result.overridden)
     shell.ensure_workspaces_dir()
 
     created_workspace = False
@@ -96,6 +124,9 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         "mode": "ci",
         "scan_type": getattr(args, "type", None),
         "scan_mode": getattr(args, "mode", None),
+        "preflight_check_passed": bool(preflight_result.passed),
+        "preflight_check_fix_attempted": bool(preflight_result.fix_attempted),
+        "preflight_check_overridden": bool(preflight_result.overridden),
         **telemetry_context,
     }
     telemetry.capture("session_start", properties=session_properties)

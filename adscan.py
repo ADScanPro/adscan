@@ -1517,9 +1517,6 @@ def _ensure_dir_writable(
 
     print_warning(f"{description} directory is not writable: {path}")
     if not fix:
-        print_info_verbose(
-            "Run `adscan check --fix` to attempt automatic permission repairs."
-        )
         return False
 
     user, group = _get_effective_user_name_and_group()
@@ -2123,6 +2120,7 @@ SYSTEM_PACKAGES_CONFIG = {
     "unzip": "unzip",
     "p7zip-full": "7z",
     "hydra": "hydra",
+    "medusa": "medusa",
     "freerdp3-x11": "xfreerdp",
     "tesseract-ocr": "tesseract",
     "antiword": "antiword",
@@ -21923,25 +21921,6 @@ class PentestShell:
                 telemetry.capture_exception(exc)
                 print_info_debug(f"[backup-ops] escalation helper failed: {exc}")
 
-        if privileged_groups["account_operators"]:
-            print_warning(
-                f"The user {marked_username} is a member of the Account Operators group"
-            )
-            try:
-                from adscan_internal.cli.account_operators_escalation import (
-                    offer_account_operators_escalation,
-                )
-
-                offer_account_operators_escalation(
-                    self,
-                    domain=domain,
-                    username=username,
-                    password=password,
-                )
-            except Exception as exc:  # pragma: no cover - best effort
-                telemetry.capture_exception(exc)
-                print_info_debug(f"[acct-ops] escalation helper failed: {exc}")
-
         return privileged_groups
 
     def _check_privileged_groups_with_bloodhound(self, domain, username):
@@ -22340,7 +22319,7 @@ class PentestShell:
                 )
 
                 # If the user is already privileged (e.g. Domain Admins, Backup Operators,
-                # Administrators, Account Operators), don't show "attack paths" from them:
+                # Administrators), don't show "attack paths" from them:
                 # the fastest path is to use the privilege directly (DCSync, etc.).
                 #
                 # This avoids noisy/irrelevant paths such as `MemberOf -> Kerberoasting -> ...`.
@@ -22350,7 +22329,6 @@ class PentestShell:
                         "domain_admin",
                         "backup_operators",
                         "Administrators",
-                        "account_operators",
                     )
                 )
                 if not is_privileged_member:
@@ -22399,7 +22377,6 @@ class PentestShell:
                         "domain_admin",
                         "backup_operators",
                         "Administrators",
-                        "account_operators",
                     )
                 )
                 if is_live_privileged_member:
@@ -24363,7 +24340,7 @@ class PentestShell:
         max_path_steps: int | None = None
         include_all = False
         lowpriv = False
-        target_mode = "impact"
+        target_mode = "tier0"
         no_cache = False
 
         # Parse flags first: --max N, --depth N (and remove them from positional parsing).
@@ -28826,6 +28803,10 @@ def handle_ci(args):
         ),
         deps=CiDeps(
             enable_auto_mode=enable_auto_mode,
+            build_preflight_args=lambda: argparse.Namespace(command="check", fix=False),
+            handle_check=handle_check,
+            get_last_check_extra=lambda: _LAST_CHECK_SESSION_EXTRA or {},
+            track_docs_link_shown=track_docs_link_shown,
             resolve_license_mode=lambda requested: _resolve_license_mode(
                 requested_pro=requested
             ),
@@ -28834,6 +28815,7 @@ def handle_ci(args):
                 license_mode=license_mode,
             ),
             console=console,
+            exit=sys.exit,
         ),
     )
 

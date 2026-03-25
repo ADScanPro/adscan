@@ -28,6 +28,11 @@ from adscan_internal import (
     print_success,
 )
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.cli.session_preflight import (
+    SessionPreflightConfig,
+    SessionPreflightDeps,
+    run_session_preflight,
+)
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
 from adscan_internal.workspaces.subpaths import domain_relpath
@@ -1530,122 +1535,26 @@ def run_start_session(*, config: StartSessionConfig, deps: StartSessionDeps) -> 
             "Running as a compiled application. Skipping venv relaunch check."
         )
 
-    preflight_check_args = deps.build_preflight_args()
-    preflight_ok = deps.handle_check(preflight_check_args)
-    last_check = deps.get_last_check_extra() or {}
-    preflight_fix_attempted = bool(last_check.get("fix_mode"))
-    preflight_overridden = False
-
-    if not preflight_ok:
-        telemetry.capture(
-            "session_start_check_failed",
-            properties={
-                "$set": {"installation_status": "failed"},
-                "fix_attempted": preflight_fix_attempted,
-            },
-        )
-
-        can_prompt_override = (
-            preflight_fix_attempted and deps.stdin_isatty() and not deps.get_env("CI")
-        )
-        if can_prompt_override:
-            telemetry.capture(
-                "session_start_override_prompt_shown",
-                properties={
-                    "fix_attempted": True,
-                    "missing_tools_count": int(
-                        last_check.get("missing_tools_count") or 0
-                    ),
-                    "tool_version_issues_count": int(
-                        last_check.get("tool_version_issues_count") or 0
-                    ),
-                    "missing_system_packages_count": int(
-                        last_check.get("missing_system_packages_count") or 0
-                    ),
-                },
-            )
-            print_warning(
-                "Some issues remain even after attempting automatic fixes. "
-                "Starting anyway is not recommended and may be unsafe (results may be unreliable)."
-            )
-            docs_url = (
-                "https://www.adscanpro.com/docs/guides/troubleshooting"
-                "?utm_source=cli&utm_medium=start_preflight_failed"
-            )
-            print_info(
-                "💡 Troubleshooting guide: "
-                f"[link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
-            )
-            deps.track_docs_link_shown("start_preflight_failed", docs_url)
-            print_info(
-                "Need help? Open an issue: https://github.com/ADscanPro/adscan/issues"
-            )
-            print_info("Or ask in Discord: https://discord.com/invite/fXBR3P8H74")
-
-            proceed_anyway = deps.confirm_ask(
-                "Start ADscan anyway (NOT recommended / potentially unsafe)?",
-                False,
-            )
-            if not proceed_anyway:
-                telemetry.capture(
-                    "session_start_override_declined",
-                    properties={
-                        "fix_attempted": True,
-                        "missing_tools_count": int(
-                            last_check.get("missing_tools_count") or 0
-                        ),
-                        "tool_version_issues_count": int(
-                            last_check.get("tool_version_issues_count") or 0
-                        ),
-                        "missing_system_packages_count": int(
-                            last_check.get("missing_system_packages_count") or 0
-                        ),
-                        "unsafe_override": False,
-                    },
-                )
-                deps.exit(1)
-            telemetry.capture(
-                "session_start_override_accepted",
-                properties={
-                    "fix_attempted": True,
-                    "missing_tools_count": int(
-                        last_check.get("missing_tools_count") or 0
-                    ),
-                    "tool_version_issues_count": int(
-                        last_check.get("tool_version_issues_count") or 0
-                    ),
-                    "missing_system_packages_count": int(
-                        last_check.get("missing_system_packages_count") or 0
-                    ),
-                    "unsafe_override": True,
-                },
-            )
-            preflight_overridden = True
-        else:
-            print_error("ADscan preflight checks failed.")
-            print_info("Run: adscan check --fix")
-            docs_url = (
-                "https://www.adscanpro.com/docs/guides/troubleshooting"
-                "?utm_source=cli&utm_medium=start_preflight_failed"
-            )
-            print_info(
-                "💡 Troubleshooting guide: "
-                f"[link={docs_url}]adscanpro.com/docs/guides/troubleshooting[/link]"
-            )
-            deps.track_docs_link_shown("start_preflight_failed", docs_url)
-            print_info(
-                "Need help? Open an issue: https://github.com/ADscanPro/adscan/issues"
-            )
-            print_info("Or ask in Discord: https://discord.com/invite/fXBR3P8H74")
-            deps.exit(1)
-    else:
-        telemetry.capture(
-            "session_start_check_passed",
-            properties={
-                "$set": {"installation_status": "success"},
-                "fix_attempted": preflight_fix_attempted,
-            },
-        )
+    preflight_result = run_session_preflight(
+        config=SessionPreflightConfig(
+            command_name="start",
+            docs_utm_medium="start_preflight_failed",
+            allow_unsafe_override=True,
+        ),
+        deps=SessionPreflightDeps(
+            build_preflight_args=deps.build_preflight_args,
+            handle_check=deps.handle_check,
+            get_last_check_extra=deps.get_last_check_extra,
+            track_docs_link_shown=deps.track_docs_link_shown,
+            confirm_ask=deps.confirm_ask,
+            exit=deps.exit,
+            stdin_isatty=deps.stdin_isatty,
+            get_env=deps.get_env,
+        ),
+    )
+    preflight_ok = preflight_result.passed
+    preflight_fix_attempted = preflight_result.fix_attempted
+    preflight_overridden = preflight_result.overridden
 
     try:
         prepend_tools_to_path(tools_install_dir=config.tools_install_dir)

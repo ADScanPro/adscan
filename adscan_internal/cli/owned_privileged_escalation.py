@@ -52,8 +52,6 @@ def _membership_rank(membership: dict[str, object]) -> int:
         return 3
     if bool(membership.get("Administrators")):
         return 2
-    if bool(membership.get("account_operators")):
-        return 1
     if bool(membership.get("backup_operators")):
         return 1
     return 0

@@ -43,6 +43,9 @@ from adscan_internal.ligolo_manager import (
 
 
 _MINIMUM_HASHCAT_VERSION = (7, 1, 2)
+_JOHN_AVX2_REQUIRED_RE = re.compile(r"avx2 is required for this build", re.IGNORECASE)
+
+
 @dataclass(frozen=True)
 class CheckFailureRecoveryGuidance:
     """User-facing recovery guidance for failed `adscan check` runs."""
@@ -1124,9 +1127,19 @@ def check_system_packages(
         deps.print_error("System package validation issues detected:")
         for issue in package_issues:
             deps.print_error(f"  - {issue}")
-        deps.print_instruction(
-            "Install a working hashcat binary via PATH (>= 7.1.2), for example from the official release."
-        )
+        if any("John the Ripper" in issue for issue in package_issues):
+            if config.full_container_runtime:
+                deps.print_instruction(
+                    "Run on the host: adscan update (refreshes the runtime image with the compatible John wrapper build)."
+                )
+            else:
+                deps.print_instruction(
+                    "Refresh ADscan so John the Ripper is rebuilt with a compatible CPU baseline or wrapper."
+                )
+        else:
+            deps.print_instruction(
+                "Install a working hashcat binary via PATH (>= 7.1.2), for example from the official release."
+            )
         return False, []
 
     deps.print_success("Essential system packages seem to be installed.")
@@ -1349,12 +1362,22 @@ def _normalize_missing_system_packages_for_runtime(
                     )
                     normalized_missing.remove("john")
                 else:
+                    stdout_text = (getattr(result, "stdout", "") or "").strip()
+                    stderr_text = (getattr(result, "stderr", "") or "").strip()
                     deps.print_info_debug(
                         "[check] John candidate did not pass build-info probe: "
                         f"path={john_executable}, returncode={getattr(result, 'returncode', None)}, "
-                        f"stdout={(getattr(result, 'stdout', '') or '').strip()[:200]!r}, "
-                        f"stderr={(getattr(result, 'stderr', '') or '').strip()[:200]!r}"
+                        f"stdout={stdout_text[:200]!r}, "
+                        f"stderr={stderr_text[:200]!r}"
                     )
+                    if _JOHN_AVX2_REQUIRED_RE.search(stdout_text) or _JOHN_AVX2_REQUIRED_RE.search(
+                        stderr_text
+                    ):
+                        issues.append(
+                            "John the Ripper is present but incompatible with the CPU exposed by this host/VM "
+                            "(the current binary requires AVX2)."
+                        )
+                        normalized_missing.remove("john")
 
     if "hashcat" in normalized_missing:
         hashcat_executable = shutil.which("hashcat")
@@ -1437,6 +1460,48 @@ def _normalize_missing_system_packages_for_runtime(
                     deps.print_info_debug(
                         "[check] FreeRDP candidate did not pass version probe: "
                         f"path={freerdp_executable}, returncode={getattr(result, 'returncode', None)}, "
+                        f"stdout={(getattr(result, 'stdout', '') or '').strip()[:200]!r}, "
+                        f"stderr={(getattr(result, 'stderr', '') or '').strip()[:200]!r}"
+                    )
+
+    if "medusa" in normalized_missing:
+        medusa_executable = shutil.which("medusa")
+        if medusa_executable:
+            medusa_executable = os.path.realpath(medusa_executable)
+            try:
+                result = deps.run_command(
+                    [medusa_executable, "-d"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except Exception as exc:  # noqa: BLE001
+                deps.telemetry_capture_exception(exc)
+                deps.print_info_debug(
+                    f"[check] Failed to probe Medusa candidate {medusa_executable}: {exc}"
+                )
+            else:
+                combined_output = "\n".join(
+                    [
+                        getattr(result, "stdout", "") or "",
+                        getattr(result, "stderr", "") or "",
+                    ]
+                ).strip()
+                if (
+                    result
+                    and getattr(result, "returncode", 1) == 0
+                    and "rdp" in combined_output.lower()
+                ):
+                    deps.print_success(
+                        "Medusa is available via PATH "
+                        f"({medusa_executable}, RDP module detected)"
+                    )
+                    normalized_missing.remove("medusa")
+                else:
+                    deps.print_info_debug(
+                        "[check] Medusa candidate did not pass module probe: "
+                        f"path={medusa_executable}, returncode={getattr(result, 'returncode', None)}, "
                         f"stdout={(getattr(result, 'stdout', '') or '').strip()[:200]!r}, "
                         f"stderr={(getattr(result, 'stderr', '') or '').strip()[:200]!r}"
                     )

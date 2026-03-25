@@ -264,7 +264,7 @@ def _sanitize_acl_paths_for_attack_graph(
             runtime_graph,
             start_node_id=source_id,
             max_depth=sanitize_depth,
-            target_mode="impact",
+            target_mode="tier0",
         )
 
         source_report = {
@@ -1601,14 +1601,6 @@ def run_bloodhound_attack_paths(
             lambda: _get_roastable_user_edges(service, target_domain, max_results=1000),
         ),
         (
-            "ACL/ACE Relationships",
-            "get_low_priv_acl_paths",
-            lambda: service.get_low_priv_acl_paths(
-                target_domain,
-                max_results=None,
-            ),
-        ),  # type: ignore[attr-defined]
-        (
             "Access & Sessions",
             "get_low_priv_access_paths",
             lambda: service.get_low_priv_access_paths(target_domain, max_results=1000),
@@ -1625,6 +1617,14 @@ def run_bloodhound_attack_paths(
             "get_low_priv_delegation_paths",
             lambda: service.get_low_priv_delegation_paths(
                 target_domain, max_results=1000
+            ),
+        ),  # type: ignore[attr-defined]
+        (
+            "ACL/ACE Relationships",
+            "get_low_priv_acl_paths",
+            lambda: service.get_low_priv_acl_paths(
+                target_domain,
+                max_results=None,
             ),
         ),  # type: ignore[attr-defined]
     ]
@@ -2375,7 +2375,7 @@ def run_bloodhound_attack_paths(
             max_depth=max(ATTACK_PATHS_MAX_DEPTH_USER, max_depth),
             max_display=20,
             target="all",
-            target_mode="impact",
+            target_mode="tier0",
         )
     else:
         # Fallback: use the global shell-aware domain-path computation so this
@@ -2397,7 +2397,7 @@ def run_bloodhound_attack_paths(
             max_depth=max(max_depth, ATTACK_PATHS_MAX_DEPTH_DOMAIN),
             max_paths=20,
             target="highvalue",
-            target_mode="impact",
+            target_mode="tier0",
         )
         if display_paths:
             print_attack_paths_summary(
@@ -2477,7 +2477,7 @@ def run_show_attack_paths(
     max_display: int = 10,
     max_depth: int = ATTACK_PATHS_MAX_DEPTH_USER,
     target: str = "highvalue",
-    target_mode: str = "impact",
+    target_mode: str = "tier0",
     allow_execution: bool = True,
     max_path_steps: int | None = None,
     no_cache: bool = False,

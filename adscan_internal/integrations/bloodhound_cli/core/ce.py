@@ -1499,6 +1499,15 @@ class BloodHoundCEClient(BloodHoundClient):
             ")"
         )
 
+    def _build_tier_zero_filter(self, *, alias: str) -> str:
+        """Return a Cypher predicate that identifies Tier Zero nodes only."""
+        return (
+            "("
+            f"'admin_tier_0' IN split(coalesce({alias}.system_tags, ''), ' ') "
+            f"OR coalesce({alias}.isTierZero, false) = true"
+            ")"
+        )
+
     def _build_named_node_filter(self, *, alias: str) -> str:
         """Return a Cypher predicate that excludes stub/incomplete nodes without a name.
 
@@ -1625,14 +1634,39 @@ class BloodHoundCEClient(BloodHoundClient):
               AND NOT {high_value_predicate}
         """
 
+    def _build_non_tier_zero_source_filter(
+        self,
+        *,
+        source_alias: str,
+        domain_value: str,
+        match_domain_by_name_suffix: bool = False,
+    ) -> str:
+        """Return a predicate for enabled non-TierZero principals, including high-value pivots."""
+        domain_predicate = self._build_domain_filter(
+            alias=source_alias,
+            domain_value=domain_value,
+            match_domain_by_name_suffix=match_domain_by_name_suffix,
+        )
+        enabled_predicate = self._build_enabled_filter(
+            alias=source_alias, default_true=True
+        )
+        tier_zero_predicate = self._build_tier_zero_filter(alias=source_alias)
+
+        return f"""
+              AND ({source_alias}:User OR {source_alias}:Group OR {source_alias}:Computer)
+              AND {domain_predicate}
+              AND {enabled_predicate}
+              AND NOT {tier_zero_predicate}
+        """
+
     def get_low_priv_acl_paths(
         self, domain: str, *, max_results: int | None = None
     ) -> List[Dict]:
-        """Return ACL/ACE-derived single-step paths from low-priv users.
+        """Return ACL/ACE-derived single-step paths from non-TierZero principals.
 
         This query enumerates ACL-relevant relationships (r.isacl=true) that can
-        be exercised by low-priv users either directly or through nested group
-        membership (MemberOf*0..).
+        be exercised by non-TierZero principals either directly or through
+        nested group membership (MemberOf*0..).
 
         It returns paths for visualization in the UI, but we post-process the
         response into single-step "effective" paths shaped as:
@@ -1740,7 +1774,7 @@ class BloodHoundCEClient(BloodHoundClient):
         """Execute the shared low-priv ACL query with optional target/source filters."""
         allowed_relations = self._get_low_priv_acl_allowed_relations()
         domain_value = domain.replace("'", "\\'")
-        source_filter = self._build_low_priv_source_filter(
+        source_filter = self._build_non_tier_zero_source_filter(
             source_alias="s",
             domain_value=domain_value,
             match_domain_by_name_suffix=True,
