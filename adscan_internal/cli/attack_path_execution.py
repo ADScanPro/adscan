@@ -86,6 +86,10 @@ from adscan_internal.services.attack_step_support_registry import (
     SUPPORTED_RELATION_NOTES,
     classify_relation_support,
 )
+from adscan_internal.workspaces import domain_subpath, write_json_file
+
+
+ATTACK_PATH_SNAPSHOT_FILENAME = "attack_paths_snapshot.json"
 
 
 def _normalize_account(value: str) -> str:
@@ -136,6 +140,192 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     except (TypeError, ValueError):
         value = default
     return max(minimum, value)
+
+
+def persist_attack_path_snapshot(
+    shell: Any,
+    domain: str,
+    *,
+    summaries: list[dict[str, Any]] | None,
+    scope: str,
+    target: str,
+    target_mode: str,
+    search_mode_label: str | None = None,
+) -> None:
+    """Persist the latest CLI-computed attack-path summaries for web consumption.
+
+    This is best-effort only and must never affect the existing CLI flow.
+    """
+    if not summaries:
+        return
+
+    try:
+        workspace_cwd = (
+            shell._get_workspace_cwd()
+            if hasattr(shell, "_get_workspace_cwd")
+            else getattr(shell, "current_workspace_dir", os.getcwd())
+        )
+        output_path = domain_subpath(
+            workspace_cwd,
+            shell.domains_dir,
+            domain,
+            ATTACK_PATH_SNAPSHOT_FILENAME,
+        )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        snapshot_paths: list[dict[str, Any]] = []
+        for index, summary in enumerate(summaries, start=1):
+            if not isinstance(summary, dict):
+                continue
+            nodes = summary.get("nodes") if isinstance(summary.get("nodes"), list) else []
+            relations = (
+                summary.get("relations")
+                if isinstance(summary.get("relations"), list)
+                else []
+            )
+            steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
+            snapshot_paths.append(
+                {
+                    "id": str(summary.get("id") or f"{scope}:{index}:{summary.get('source')}->{summary.get('target')}"),
+                    "index": index,
+                    "source": str(summary.get("source") or ""),
+                    "target": str(summary.get("target") or ""),
+                    "length": int(summary.get("length") or 0),
+                    "status": str(summary.get("status") or "theoretical"),
+                    "is_high_value": bool(summary.get("target_is_high_value")),
+                    "is_tier_zero": bool(
+                        summary.get("target_is_high_value")
+                        or summary.get("is_tier_zero")
+                    ),
+                    "nodes": [str(node or "") for node in nodes],
+                    "relations": [str(relation or "") for relation in relations],
+                    "steps": steps,
+                }
+            )
+
+        payload = {
+            "schema_version": "1.0",
+            "generated_at": datetime.now(UTC).isoformat(),
+            "domain": domain,
+            "scope": scope,
+            "target": target,
+            "target_mode": target_mode,
+            "search_mode_label": search_mode_label,
+            "path_count": len(snapshot_paths),
+            "paths": snapshot_paths,
+        }
+        write_json_file(output_path, payload)
+        print_info_debug(
+            "[attack_paths] snapshot persisted: "
+            f"domain={mark_sensitive(domain, 'domain')} "
+            f"scope={scope} count={len(snapshot_paths)}"
+        )
+    except Exception as exc:  # pragma: no cover - best effort only
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[attack_paths] snapshot persistence failed: {exc}")
+
+
+def _attack_path_event_id(summary: dict[str, Any]) -> str:
+    """Return a stable best-effort identifier for one attack path summary."""
+    path_id = str(summary.get("id") or "").strip()
+    if path_id:
+        return path_id
+    source = str(summary.get("source") or "unknown-source").strip()
+    target = str(summary.get("target") or "unknown-target").strip()
+    length = int(summary.get("length") or 0)
+    return f"{source}->{target}:{length}"
+
+
+def _count_executable_steps(
+    steps: list[dict[str, Any]],
+    *,
+    non_executable_actions: set[str],
+    dangerous_actions: set[str],
+) -> int:
+    """Return the number of executable steps in one path summary."""
+    total = 0
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip().lower()
+        if not action:
+            continue
+        if action in non_executable_actions or action in dangerous_actions:
+            continue
+        total += 1
+    return total
+
+
+def _record_attack_path_execution_event(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    event_stage: str,
+    message: str,
+    step_index: int | None = None,
+    total_steps: int | None = None,
+    executable_step_index: int | None = None,
+    last_executable_idx: int | None = None,
+    action: str | None = None,
+    from_label: str | None = None,
+    to_label: str | None = None,
+    step_status: str | None = None,
+    reason: str | None = None,
+    actor: str | None = None,
+    target_host: str | None = None,
+    search_mode_label: str | None = None,
+) -> None:
+    """Persist one structured attack-path execution event for web/live consumers.
+
+    This is best-effort only and must never alter the existing CLI execution flow.
+    """
+    try:
+        from adscan_internal.pro.services.report_service import record_technical_event
+
+        details = {
+            "source": "attack_path_execution",
+            "event_stage": str(event_stage or "").strip(),
+            "path_id": _attack_path_event_id(summary),
+            "path_source": str(summary.get("source") or "").strip(),
+            "path_target": str(summary.get("target") or "").strip(),
+            "path_length": int(summary.get("length") or 0),
+            "path_status": str(summary.get("status") or "theoretical").strip(),
+            "is_high_value": bool(summary.get("target_is_high_value")),
+            "is_tier_zero": bool(
+                summary.get("target_is_high_value") or summary.get("is_tier_zero")
+            ),
+            "step_index": int(step_index) if step_index is not None else None,
+            "total_steps": int(total_steps) if total_steps is not None else None,
+            "executable_step_index": (
+                int(executable_step_index)
+                if executable_step_index is not None
+                else None
+            ),
+            "last_executable_idx": (
+                int(last_executable_idx)
+                if last_executable_idx is not None
+                else None
+            ),
+            "action": str(action or "").strip() or None,
+            "from": str(from_label or "").strip() or None,
+            "to": str(to_label or "").strip() or None,
+            "step_status": str(step_status or "").strip() or None,
+            "reason": str(reason or "").strip() or None,
+            "actor": str(actor or "").strip() or None,
+            "target_host": str(target_host or "").strip() or None,
+            "search_mode_label": str(search_mode_label or "").strip() or None,
+        }
+        details = {key: value for key, value in details.items() if value not in {None, ""}}
+        record_technical_event(
+            shell,
+            domain,
+            event_type="attack_path_execution",
+            message=message,
+            details=details,
+        )
+    except Exception as exc:  # pragma: no cover - best effort only
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[attack_paths] execution event persistence failed: {exc}")
 
 
 _AUTO_REFRESH_AFFECTED_USERS_THRESHOLD = _env_int(
@@ -642,6 +832,7 @@ def _choose_custom_attack_path_start_step(
 def _resolve_attack_path_start_step(
     shell: Any,
     *,
+    domain: str,
     steps: list[dict[str, Any]],
     executable_indices: list[int],
     non_executable_actions: set[str],
@@ -660,6 +851,7 @@ def _resolve_attack_path_start_step(
         return first_executable_idx
 
     first_pending_idx: int | None = None
+    first_non_success_idx: int | None = None
     completed_steps = 0
     for step_idx, step_item in enumerate(steps, start=1):
         if not isinstance(step_item, dict):
@@ -673,14 +865,65 @@ def _resolve_attack_path_start_step(
         if step_status == "success":
             completed_steps += 1
             continue
-        first_pending_idx = step_idx
-        break
+        if first_non_success_idx is None:
+            first_non_success_idx = step_idx
+        if step_status in {"", "discovered", "theoretical"}:
+            first_pending_idx = step_idx
+            break
 
-    default_start_idx = first_pending_idx or first_executable_idx
+    domain_auth = (
+        str(getattr(shell, "domains_data", {}).get(domain, {}).get("auth") or "")
+        .strip()
+        .lower()
+    )
+    domain_pwned = domain_auth == "pwned"
+
+    default_start_idx = first_pending_idx or first_non_success_idx or first_executable_idx
     non_interactive = is_non_interactive(shell)
 
+    if domain_pwned and first_pending_idx is None:
+        if non_interactive:
+            print_info_debug(
+                "[attack_paths] no fresh steps remain for pwned domain; skipping path re-execution: "
+                f"domain={mark_sensitive(domain, 'domain')}"
+            )
+            return None
+        if not hasattr(shell, "_questionary_select"):
+            print_info(
+                "No fresh executable steps remain in this attack path. "
+                "Skipping re-execution because the domain is already compromised."
+            )
+            print_info_verbose(
+                "Use ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS=1 or choose a custom "
+                "start step to force re-execution."
+            )
+            return None
+
+        options = [
+            "Skip execution (Recommended)",
+            f"Re-run from step #{first_executable_idx}",
+            "Choose custom start step",
+        ]
+        choice = shell._questionary_select(
+            "This path has no fresh executable steps left. What do you want to do?",
+            options,
+            default_idx=0,
+        )
+        if choice is None or choice == 0:
+            return None
+        if choice == 1:
+            return first_executable_idx
+        if choice == 2:
+            return _choose_custom_attack_path_start_step(
+                shell,
+                steps=steps,
+                executable_indices=executable_indices,
+                default_step_idx=first_non_success_idx or first_executable_idx,
+            )
+        return None
+
     # If no pending steps, default to not re-execute unless explicitly requested.
-    if first_pending_idx is None:
+    if first_non_success_idx is None:
         if non_interactive:
             return None
         if not hasattr(shell, "_questionary_select"):
@@ -721,9 +964,15 @@ def _resolve_attack_path_start_step(
     if non_interactive:
         return default_start_idx
 
+    resume_label = (
+        "first pending step"
+        if first_pending_idx is not None
+        else "first non-success step"
+    )
+
     if not hasattr(shell, "_questionary_select"):
         print_info(
-            f"Resuming from step #{default_start_idx} (first non-success step)."
+            f"Resuming from step #{default_start_idx} ({resume_label})."
         )
         print_info_verbose(
             f"Skipping {completed_steps} previously successful step(s)."
@@ -745,7 +994,7 @@ def _resolve_attack_path_start_step(
         return None
     if choice == 0:
         print_info(
-            f"Resuming from step #{default_start_idx} (first non-success step)."
+            f"Resuming from step #{default_start_idx} ({resume_label})."
         )
         return default_start_idx
     if choice == 1:
@@ -1907,6 +2156,15 @@ def execute_selected_attack_path(
         ]
 
         if blocked:
+            _record_attack_path_execution_event(
+                shell,
+                domain=domain,
+                summary=summary,
+                event_stage="path_blocked",
+                message="Attack path execution blocked by policy-protected steps.",
+                step_status="blocked",
+                reason=", ".join(blocked),
+            )
             _mark_blocked_steps(
                 kinds={k: v for k, v in dangerous_actions.items()},
                 kind_label="dangerous",
@@ -1978,6 +2236,15 @@ def execute_selected_attack_path(
             return False
 
         if unsupported:
+            _record_attack_path_execution_event(
+                shell,
+                domain=domain,
+                summary=summary,
+                event_stage="path_blocked",
+                message="Attack path execution blocked because one or more steps are not implemented.",
+                step_status="blocked",
+                reason=", ".join(unsupported),
+            )
             unsupported_actions = {
                 str(action).strip().lower(): "Not implemented yet in ADscan"
                 for action in unsupported
@@ -2054,6 +2321,15 @@ def execute_selected_attack_path(
 
         execution_started = False
         if not isinstance(steps, list) or not steps:
+            _record_attack_path_execution_event(
+                shell,
+                domain=domain,
+                summary=summary,
+                event_stage="path_unavailable",
+                message="Attack path execution unavailable because no steps were present.",
+                step_status="unavailable",
+                reason="no_steps_available",
+            )
             print_warning("Cannot execute this path: no steps available.")
             return False
 
@@ -2073,13 +2349,39 @@ def execute_selected_attack_path(
         last_executable_idx = executable_indices[-1] if executable_indices else 0
         resume_from_step_idx = _resolve_attack_path_start_step(
             shell,
+            domain=domain,
             steps=steps,
             executable_indices=executable_indices,
             non_executable_actions=non_executable_actions,
             dangerous_actions=dangerous_actions,
         )
         if resume_from_step_idx is None:
+            _record_attack_path_execution_event(
+                shell,
+                domain=domain,
+                summary=summary,
+                event_stage="path_cancelled",
+                message="Attack path execution cancelled before any step was started.",
+                step_status="cancelled",
+            )
             return False
+
+        total_executable_steps = _count_executable_steps(
+            steps,
+            non_executable_actions=non_executable_actions,
+            dangerous_actions=dangerous_actions,
+        )
+        _record_attack_path_execution_event(
+            shell,
+            domain=domain,
+            summary=summary,
+            event_stage="path_started",
+            message="Attack path execution started.",
+            step_index=resume_from_step_idx,
+            total_steps=total_executable_steps,
+            last_executable_idx=last_executable_idx,
+            step_status="running",
+        )
 
         def _run_runtime_followups(
             *,
@@ -2207,9 +2509,31 @@ def execute_selected_attack_path(
             )
             from_label = str(details.get("from") or "")
             to_label = str(details.get("to") or "")
+            executable_step_position = 0
+            if executable_indices:
+                try:
+                    executable_step_position = executable_indices.index(idx) + 1
+                except ValueError:
+                    executable_step_position = 0
 
             if key in {"adminto", "sqladmin", "canrdp", "canpsremote"}:
                 if not to_label:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: missing target host.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="missing_target_host",
+                    )
                     print_warning(f"Cannot execute {action}: missing target host.")
                     return execution_started
 
@@ -2229,6 +2553,22 @@ def execute_selected_attack_path(
                 )
                 if not exec_username or not password:
                     marked_user = mark_sensitive(exec_username or from_label, "user")
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: no usable credential context was available.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="missing_execution_credential",
+                    )
                     print_warning(
                         f"Cannot execute this step: no stored domain credential found for {marked_user}."
                     )
@@ -2246,6 +2586,22 @@ def execute_selected_attack_path(
                     shell, domain, node_label=to_label
                 )
                 if not isinstance(target_host, str) or not target_host.strip():
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: target node is not a resolvable host.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="target_not_resolvable_host",
+                    )
                     print_warning(
                         f"Cannot execute {action}: target node is not a resolvable host."
                     )
@@ -2294,6 +2650,23 @@ def execute_selected_attack_path(
                 print_info_verbose(f"Command: {command}")
 
                 execution_started = True
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_attempting",
+                    message=f"Attempting {action} on {to_label or target_host}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="attempting",
+                    actor=exec_username,
+                    target_host=target_host,
+                )
                 with _active_step_context(
                     action=action,
                     from_label=from_label,
@@ -2323,6 +2696,24 @@ def execute_selected_attack_path(
                     )
                     if not ok:
                         marked_host = mark_sensitive(target_host, "hostname")
+                        _record_attack_path_execution_event(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                            event_stage="step_failed",
+                            message=f"{action} did not confirm access on {to_label or target_host}.",
+                            step_index=idx,
+                            total_steps=total_executable_steps,
+                            executable_step_index=executable_step_position,
+                            last_executable_idx=last_executable_idx,
+                            action=action,
+                            from_label=from_label,
+                            to_label=to_label,
+                            step_status="failed",
+                            actor=exec_username,
+                            target_host=target_host,
+                            reason="access_not_confirmed",
+                        )
                         print_warning(
                             f"{action} check did not confirm access on {marked_host}. Stopping this path."
                         )
@@ -2336,6 +2727,23 @@ def execute_selected_attack_path(
                         to_label=to_label,
                         status="success",
                         notes={"username": exec_username, "target": target_host},
+                    )
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_succeeded",
+                        message=f"{action} succeeded against {to_label or target_host}.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="success",
+                        actor=exec_username,
+                        target_host=target_host,
                     )
 
                     if key == "adminto":
@@ -2357,6 +2765,22 @@ def execute_selected_attack_path(
 
             if key in ACL_ACE_RELATIONS:
                 if not from_label or not to_label:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: missing path endpoint details.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="missing_from_to_details",
+                    )
                     print_warning(f"Cannot execute {action}: missing from/to details.")
                     return execution_started
 
@@ -2373,6 +2797,22 @@ def execute_selected_attack_path(
                 if not exec_context:
                     marked_from = mark_sensitive(from_label, "node")
                     marked_to = mark_sensitive(to_label, "node")
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: no usable execution credential context was available.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="no_usable_execution_context",
+                    )
                     print_warning(
                         f"Cannot execute {action} ({marked_from} -> {marked_to}): "
                         "no usable execution credential context available."
@@ -2388,6 +2828,23 @@ def execute_selected_attack_path(
 
                 supported, reason = describe_ace_step_support(exec_context)
                 if not supported:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: target type is not supported for this step.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason=reason or "unsupported_target_type",
+                        actor=exec_context.exec_username,
+                    )
                     # Show the same "not implemented" UX: action is mapped in general,
                     # but not for this target object type.
                     _mark_blocked_step(
@@ -2468,6 +2925,22 @@ def execute_selected_attack_path(
                     return False
 
                 execution_started = True
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_attempting",
+                    message=f"Attempting {action} on {to_label}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="attempting",
+                    actor=exec_context.exec_username,
+                )
                 with _active_step_context(
                     action=action,
                     from_label=from_label,
@@ -2517,6 +2990,22 @@ def execute_selected_attack_path(
                                     status="success",
                                     notes={"user": exec_context.exec_username},
                                 )
+                            _record_attack_path_execution_event(
+                                shell,
+                                domain=domain,
+                                summary=summary,
+                                event_stage="step_succeeded",
+                                message=f"{action} succeeded on {to_label}.",
+                                step_index=idx,
+                                total_steps=total_executable_steps,
+                                executable_step_index=executable_step_position,
+                                last_executable_idx=last_executable_idx,
+                                action=action,
+                                from_label=from_label,
+                                to_label=to_label,
+                                step_status="success",
+                                actor=exec_context.exec_username,
+                            )
                         elif ace_result is False:
                             if hasattr(
                                 shell, "_update_active_attack_graph_step_status"
@@ -2536,10 +3025,43 @@ def execute_selected_attack_path(
                                     status="failed",
                                     notes={"user": exec_context.exec_username},
                                 )
+                            _record_attack_path_execution_event(
+                                shell,
+                                domain=domain,
+                                summary=summary,
+                                event_stage="step_failed",
+                                message=f"{action} failed on {to_label}.",
+                                step_index=idx,
+                                total_steps=total_executable_steps,
+                                executable_step_index=executable_step_position,
+                                last_executable_idx=last_executable_idx,
+                                action=action,
+                                from_label=from_label,
+                                to_label=to_label,
+                                step_status="failed",
+                                actor=exec_context.exec_username,
+                            )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
                         print_warning(f"Error while executing {action} step.")
                         print_exception(show_locals=False, exception=exc)
+                        _record_attack_path_execution_event(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                            event_stage="step_failed",
+                            message=f"{action} raised an exception during execution.",
+                            step_index=idx,
+                            total_steps=total_executable_steps,
+                            executable_step_index=executable_step_position,
+                            last_executable_idx=last_executable_idx,
+                            action=action,
+                            from_label=from_label,
+                            to_label=to_label,
+                            step_status="failed",
+                            actor=exec_context.exec_username,
+                            reason=str(exc),
+                        )
                         if hasattr(shell, "_update_active_attack_graph_step_status"):
                             try:
                                 shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
@@ -2573,11 +3095,43 @@ def execute_selected_attack_path(
 
             if key in {"passwordspray", "useraspass", "blankpassword", "computerpre2k"}:
                 if not to_label:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: missing target principal.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="missing_target_principal",
+                    )
                     print_warning(f"Cannot execute {action}: missing target principal.")
                     return execution_started
 
                 target_user = _normalize_account(to_label)
                 if not target_user:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: invalid target principal.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="invalid_target_principal",
+                    )
                     print_warning(f"Cannot execute {action}: invalid target principal.")
                     return execution_started
 
@@ -2592,6 +3146,21 @@ def execute_selected_attack_path(
                 )
 
                 execution_started = True
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_attempting",
+                    message=f"Attempting {action} against {target_user}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="attempting",
+                )
                 with _active_step_context(
                     action=action,
                     from_label=from_label,
@@ -2643,6 +3212,22 @@ def execute_selected_attack_path(
                         )
 
                     if not attempted:
+                        _record_attack_path_execution_event(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                            event_stage="step_blocked",
+                            message=f"Cannot execute {action}: spray mode could not be started.",
+                            step_index=idx,
+                            total_steps=total_executable_steps,
+                            executable_step_index=executable_step_position,
+                            last_executable_idx=last_executable_idx,
+                            action=action,
+                            from_label=from_label,
+                            to_label=to_label,
+                            step_status="blocked",
+                            reason="spray_mode_could_not_start",
+                        )
                         print_warning(
                             f"Cannot execute {action}: spray mode "
                             f"{marked_spray_type} could not be started."
@@ -2662,6 +3247,22 @@ def execute_selected_attack_path(
                         username=target_user,
                     )
                     if not recovered_credential:
+                        _record_attack_path_execution_event(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                            event_stage="step_failed",
+                            message=f"{action} did not recover credentials for {target_user}.",
+                            step_index=idx,
+                            total_steps=total_executable_steps,
+                            executable_step_index=executable_step_position,
+                            last_executable_idx=last_executable_idx,
+                            action=action,
+                            from_label=from_label,
+                            to_label=to_label,
+                            step_status="failed",
+                            reason="credential_not_recovered",
+                        )
                         if hasattr(shell, "_update_active_attack_graph_step_status"):
                             try:
                                 shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
@@ -2714,18 +3315,81 @@ def execute_selected_attack_path(
                             )
                         except Exception as exc:  # noqa: BLE001
                             telemetry.capture_exception(exc)
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_succeeded",
+                        message=f"{action} recovered credentials for {target_user}.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="success",
+                        actor=target_user,
+                    )
                 continue
 
             if key in {"kerberoasting", "asreproasting"}:
                 if not to_label:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: missing target user.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="missing_target_user",
+                    )
                     print_warning(f"Cannot execute {action}: missing target user.")
                     return execution_started
                 target_user = _normalize_account(to_label)
                 if not target_user:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: invalid target user.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="invalid_target_user",
+                    )
                     print_warning(f"Cannot execute {action}: invalid target user.")
                     return execution_started
 
                 execution_started = True
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_attempting",
+                    message=f"Attempting {action} against {target_user}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="attempting",
+                )
                 ok = False
                 with _active_step_context(
                     action=action,
@@ -2743,10 +3407,42 @@ def execute_selected_attack_path(
                         )
                 if not ok:
                     marked_user = mark_sensitive(target_user, "user")
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_failed",
+                        message=f"{action} did not recover credentials for {target_user}.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="failed",
+                        reason="credential_not_recovered",
+                    )
                     print_warning(
                         f"{action} did not recover credentials for {marked_user}. Stopping this path."
                     )
                     return True
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_succeeded",
+                    message=f"{action} recovered credentials for {target_user}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="success",
+                    actor=target_user,
+                )
                 last_outcome = get_last_ace_execution_outcome(shell) or {}
                 _apply_execution_outcome_context_handoff(last_outcome)
                 if idx == last_executable_idx:
@@ -3990,9 +4686,36 @@ def execute_selected_attack_path(
                 continue
 
             # Unknown supported key shouldn't happen due to pre-check, but keep safe.
+            _record_attack_path_execution_event(
+                shell,
+                domain=domain,
+                summary=summary,
+                event_stage="step_blocked",
+                message=f"Cannot execute this step yet: {action}",
+                step_index=idx,
+                total_steps=total_executable_steps,
+                executable_step_index=executable_step_position,
+                last_executable_idx=last_executable_idx,
+                action=action,
+                from_label=from_label,
+                to_label=to_label,
+                step_status="blocked",
+                reason="unknown_supported_step",
+            )
             print_warning(f"Cannot execute this step yet: {action}")
             return execution_started
 
+        if execution_started:
+            _record_attack_path_execution_event(
+                shell,
+                domain=domain,
+                summary=summary,
+                event_stage="path_completed",
+                message="Attack path execution finished.",
+                total_steps=total_executable_steps,
+                last_executable_idx=last_executable_idx,
+                step_status="completed",
+            )
         return execution_started
 
     finally:
@@ -4207,6 +4930,7 @@ def offer_attack_paths_with_non_high_value_fallback(
     default_execute_all: bool = False,
     execute_only_statuses: set[str] | None = None,
     retry_attempted: bool = False,
+    snapshot_scope: str | None = None,
 ) -> bool:
     """Offer attack paths, with optional HV-first + fallback broadening.
 
@@ -4265,6 +4989,9 @@ def offer_attack_paths_with_non_high_value_fallback(
                 execute_only_statuses=execute_only_statuses,
                 retry_attempted=retry_attempted,
                 recompute_summaries=direct_compute,
+                snapshot_scope=snapshot_scope or start_norm or "domain",
+                snapshot_target="all",
+                snapshot_target_mode=target_mode,
             )
         return offer_attack_paths_for_execution_summaries(
             shell,
@@ -4279,6 +5006,9 @@ def offer_attack_paths_with_non_high_value_fallback(
             execute_only_statuses=execute_only_statuses,
             retry_attempted=retry_attempted,
             recompute_summaries=direct_compute,
+            snapshot_scope=snapshot_scope or start_norm or "domain",
+            snapshot_target=target,
+            snapshot_target_mode=target_mode,
         )
 
     primary_compute = _build_attack_path_summary_provider(
@@ -4317,6 +5047,9 @@ def offer_attack_paths_with_non_high_value_fallback(
             execute_only_statuses=execute_only_statuses,
             retry_attempted=retry_attempted,
             recompute_summaries=primary_compute,
+            snapshot_scope=snapshot_scope or start_norm or "domain",
+            snapshot_target="highvalue",
+            snapshot_target_mode=target_mode,
         )
 
     _print_no_attack_paths_warning(
@@ -4422,6 +5155,9 @@ def offer_attack_paths_with_non_high_value_fallback(
         execute_only_statuses=execute_only_statuses,
         retry_attempted=retry_attempted,
         recompute_summaries=fallback_compute,
+        snapshot_scope=snapshot_scope or start_norm or "domain",
+        snapshot_target="all",
+        snapshot_target_mode=target_mode,
     )
 
 
@@ -4439,6 +5175,9 @@ def _offer_two_section_attack_paths(
     execute_only_statuses: set[str] | None = None,
     retry_attempted: bool = False,
     recompute_summaries: Any = None,
+    snapshot_scope: str = "domain",
+    snapshot_target: str = "all",
+    snapshot_target_mode: str = "tier0",
 ) -> bool:
     """Display attack paths in two sections: high-value targets first, then non-HV pivots.
 
@@ -4473,6 +5212,9 @@ def _offer_two_section_attack_paths(
         execute_only_statuses=execute_only_statuses,
         retry_attempted=retry_attempted,
         recompute_summaries=_recompute_sorted,
+        snapshot_scope=snapshot_scope,
+        snapshot_target=snapshot_target,
+        snapshot_target_mode=snapshot_target_mode,
     )
 
 
@@ -4536,6 +5278,9 @@ def offer_attack_paths_for_execution_for_principals(
             execute_only_statuses=execute_only_statuses,
             retry_attempted=retry_attempted,
             recompute_summaries=_compute_summaries,
+            snapshot_scope="principals",
+            snapshot_target="all",
+            snapshot_target_mode=target_mode,
         )
 
     return offer_attack_paths_for_execution_summaries(
@@ -4551,6 +5296,9 @@ def offer_attack_paths_for_execution_for_principals(
         execute_only_statuses=execute_only_statuses,
         retry_attempted=retry_attempted,
         recompute_summaries=_compute_summaries,
+        snapshot_scope="principals",
+        snapshot_target=target,
+        snapshot_target_mode=target_mode,
     )
 
 
@@ -4569,6 +5317,10 @@ def offer_attack_paths_for_execution_summaries(
     execute_only_statuses: set[str] | None = None,
     retry_attempted: bool = False,
     recompute_summaries: Callable[[], list[dict[str, Any]]] | None = None,
+    snapshot_scope: str = "domain",
+    snapshot_target: str = "highvalue",
+    snapshot_target_mode: str = "tier0",
+    auto_continue_theoretical_in_non_interactive: bool = False,
 ) -> bool:
     """Shared UX loop for showing/executing already computed path summaries.
 
@@ -4662,6 +5414,15 @@ def offer_attack_paths_for_execution_summaries(
         summaries = [s for s in summaries if s.get("target_is_high_value")] + [
             s for s in summaries if not s.get("target_is_high_value")
         ]
+    persist_attack_path_snapshot(
+        shell,
+        domain,
+        summaries=summaries,
+        scope=snapshot_scope,
+        target=snapshot_target,
+        target_mode=snapshot_target_mode,
+        search_mode_label=search_mode_label,
+    )
     print_info_debug(
         f"[attack_paths] summaries refreshed: domain={marked_domain} count={len(summaries)}"
     )
@@ -4713,10 +5474,12 @@ def offer_attack_paths_for_execution_summaries(
 
     executed = False
 
-    # In non-interactive contexts, we run a single selection cycle and return.
-    # The selection logic is the same as interactive: the default option is applied
-    # by the selector implementation (or by our fallback).
-    single_pass = non_interactive
+    # In non-interactive contexts we usually run a single selection cycle and
+    # return. CI can opt into a safer chained mode that executes one
+    # theoretical path at a time, recomputes, and repeats until no theoretical
+    # candidates remain. This avoids the redundancy of a static "execute all"
+    # batch while still converging to a fixpoint automatically.
+    single_pass = non_interactive and not auto_continue_theoretical_in_non_interactive
 
     while True:
         options = [
@@ -5064,6 +5827,32 @@ def offer_attack_paths_for_execution_summaries(
                 summaries = [s for s in summaries if s.get("target_is_high_value")] + [
                     s for s in summaries if not s.get("target_is_high_value")
                 ]
+            persist_attack_path_snapshot(
+                shell,
+                domain,
+                summaries=summaries,
+                scope=snapshot_scope,
+                target=snapshot_target,
+                target_mode=snapshot_target_mode,
+                search_mode_label=search_mode_label,
+            )
+            if (
+                non_interactive
+                and auto_continue_theoretical_in_non_interactive
+                and not any(
+                    _is_theoretical_status(summary.get("status"))
+                    and _status_allowed_by_filter(
+                        str(summary.get("status") or "theoretical").strip().lower(),
+                        desired_statuses_set,
+                    )
+                    for summary in summaries
+                )
+            ):
+                print_info_debug(
+                    "[attack_paths] auto-continue converged: "
+                    f"domain={marked_domain} no theoretical summaries remain"
+                )
+                return True
             actionable_paths = [
                 summary
                 for summary in summaries

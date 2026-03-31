@@ -32,6 +32,7 @@ def list_workspaces(workspaces_dir: str) -> list[str]:
             entry
             for entry in os.listdir(workspaces_dir)
             if os.path.isdir(os.path.join(workspaces_dir, entry))
+            and not entry.startswith(".")
         ]
     )
 

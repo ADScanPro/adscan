@@ -157,7 +157,7 @@ def parse_netexec_laps_credentials(output: str) -> list[tuple[str, str, str]]:
 
     normalized = normalize_cli_output(output)
     pattern = re.compile(
-        r"Computer:\s*(\S+?)\$\s+User:\s*(\S+)\s+Password:\s*([^\s]+)",
+        r"Computer:\s*(\S+?)\$\s+User:\s*(\S*)\s+Password:\s*([^\s]+)",
         re.IGNORECASE | re.DOTALL,
     )
     return [

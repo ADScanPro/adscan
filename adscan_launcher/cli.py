@@ -267,6 +267,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "(below 1.0 GB)."
         ),
     )
+    start.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch the Textual-based TUI instead of the default prompt_toolkit shell.",
+    )
 
     ci = sub.add_parser("ci", help="Run `adscan ci` inside the container")
     ci.add_argument(
@@ -365,6 +370,10 @@ def _consume_trailing_global_flags(
             continue
         if token == "--allow-low-memory" and cmd in low_memory_supported_cmds:
             setattr(ns, "allow_low_memory", True)
+            idx += 1
+            continue
+        if token == "--tui" and cmd == "start":
+            setattr(ns, "tui", True)
             idx += 1
             continue
         if token.startswith("--image="):
@@ -1245,6 +1254,7 @@ def main(argv: list[str] | None = None) -> None:
                     pull_timeout_seconds=int(pull_timeout),
                     bloodhound_stack_mode=resolved_stack_mode,
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
+                    tui=bool(getattr(ns, "tui", False)),
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),

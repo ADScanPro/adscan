@@ -1789,6 +1789,51 @@ def print_info_debug(message: Union[str, Text], panel: bool = False, icon: str =
             _print_logger_format_fallback("DEBUG", message, level_color="cyan")
 
 
+def print_event_debug(message: Union[str, Text], panel: bool = False, icon: str = "◈"):
+    """Print structured-event diagnostics with a dedicated debug channel.
+
+    This uses the exact same debug/telemetry path as ``print_info_debug``:
+    ``logger.debug`` for file logging + telemetry-aware handlers, plus the same
+    DEBUG fallback behavior when the Rich console handler is unavailable. The
+    only difference is UX: event diagnostics are prefixed distinctly so they
+    stand out from general debug noise.
+
+    Args:
+        message: Message to display.
+        panel: Kept for API symmetry; currently unused.
+        icon: Optional event icon prefix for fallback rendering.
+    """
+    import logging
+
+    global _debug_mode
+    plain_text = _extract_plain_text(message)
+    logger = _get_logger()
+    event_message = f"[events] {plain_text}"
+
+    if isinstance(message, Text):
+        logger.debug(event_message, stacklevel=2)
+    else:
+        logger.debug(event_message, stacklevel=2)
+
+    try:
+        from .logging_config import _console_handler
+
+        if _console_handler is None or _console_handler.level > logging.DEBUG:
+            if _debug_mode:
+                _print_logger_format_fallback(
+                    "DEBUG",
+                    f"{icon} [events] {plain_text}",
+                    level_color="magenta",
+                )
+    except (ImportError, AttributeError):
+        if _debug_mode:
+            _print_logger_format_fallback(
+                "DEBUG",
+                f"{icon} [events] {plain_text}",
+                level_color="magenta",
+            )
+
+
 def print_cypher_query(query: str) -> None:
     """Print a Cypher query in a clean, copy-paste-friendly format.
 

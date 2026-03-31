@@ -5084,6 +5084,7 @@ def handle_start_docker(
     pull_timeout_seconds: int | None = None,
     bloodhound_stack_mode: str | None = None,
     allow_low_memory: bool = False,
+    tui: bool = False,
 ) -> int:
     """Start ADscan inside Docker and return the docker exit code."""
     _emit_docker_runtime_context(command_name="start")
@@ -5212,6 +5213,8 @@ def handle_start_docker(
                 adscan_args.append("--verbose")
             if debug:
                 adscan_args.append("--debug")
+            if tui:
+                adscan_args.append("--tui")
 
             cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
             print_info_debug(f"[docker] start: {shell_quote_cmd(cmd)}")

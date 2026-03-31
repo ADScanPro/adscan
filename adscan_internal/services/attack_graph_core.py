@@ -15,6 +15,7 @@ Notes:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
@@ -67,6 +68,31 @@ def display_record_signature(record: dict[str, Any]) -> tuple[tuple[str, ...], t
         str(relation or "").strip().lower() for relation in (record.get("relations") or [])
     )
     return nodes, relations
+
+
+def _display_record_exact_signature(
+    record: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Return an exact dedupe signature for a display record.
+
+    Display records in this pipeline already carry string labels/relations, so
+    ``tuple(...)`` is enough and avoids repeated coercion on very large lists.
+    """
+    cached = record.get("_exact_signature")
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and isinstance(cached[0], tuple)
+        and isinstance(cached[1], tuple)
+    ):
+        return cached  # type: ignore[return-value]
+    nodes = record.get("nodes")
+    rels = record.get("relations")
+    if not isinstance(nodes, list) or not isinstance(rels, list):
+        return None
+    nodes_sig = tuple(nodes)
+    rels_sig = tuple(rels)
+    return nodes_sig, rels_sig
 
 
 def load_attack_graph(path: Path) -> dict[str, Any] | None:
@@ -169,6 +195,26 @@ def compute_display_paths_for_domain_unfiltered(
     if mode not in {"tier0", "impact"}:
         mode = "tier0"
 
+    high_value_reachable_node_ids: set[str] | None = None
+    effective_start_node_ids = (
+        {str(node_id) for node_id in start_node_ids if str(node_id).strip()}
+        if start_node_ids
+        else None
+    )
+    if target == "highvalue":
+        high_value_reachable_node_ids = _build_high_value_reachable_node_ids(
+            graph,
+            mode=mode,
+        )
+        if not high_value_reachable_node_ids:
+            return []
+        if effective_start_node_ids is None:
+            effective_start_node_ids = set(high_value_reachable_node_ids)
+        else:
+            effective_start_node_ids &= high_value_reachable_node_ids
+            if not effective_start_node_ids:
+                return []
+
     computed = compute_maximal_attack_paths(
         graph,
         max_depth=max_depth,
@@ -176,7 +222,8 @@ def compute_display_paths_for_domain_unfiltered(
         # Always compute all paths and apply filtering/promotion after.
         target="all",
         terminal_mode=mode,
-        start_node_ids=start_node_ids,
+        start_node_ids=effective_start_node_ids,
+        reachable_node_ids=high_value_reachable_node_ids,
     )
 
     results: list[dict[str, Any]] = []
@@ -254,12 +301,10 @@ def filter_contained_paths_for_domain_listing(
 
     normalized: list[tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]] = []
     for record in records:
-        nodes = record.get("nodes")
-        rels = record.get("relations")
-        if not isinstance(nodes, list) or not isinstance(rels, list):
+        sig = _display_record_exact_signature(record)
+        if sig is None:
             continue
-        nodes_t = tuple(str(n) for n in nodes)
-        rels_t = tuple(str(r) for r in rels)
+        nodes_t, rels_t = sig
         normalized.append((nodes_t, rels_t, record))
 
     if not keep_shortest:
@@ -388,6 +433,15 @@ def compute_display_paths_for_start_node(
     if mode not in {"tier0", "impact"}:
         mode = "tier0"
 
+    high_value_reachable_node_ids: set[str] | None = None
+    if target == "highvalue":
+        high_value_reachable_node_ids = _build_high_value_reachable_node_ids(
+            graph,
+            mode=mode,
+        )
+        if start_node_id not in high_value_reachable_node_ids:
+            return []
+
     computed = compute_maximal_attack_paths_from_start(
         graph,
         start_node_id=start_node_id,
@@ -395,6 +449,7 @@ def compute_display_paths_for_start_node(
         max_paths=max_paths,
         target="all",
         terminal_mode=mode,
+        reachable_node_ids=high_value_reachable_node_ids,
     )
 
     results: list[dict[str, Any]] = []
@@ -630,6 +685,149 @@ def _iter_outgoing_edges_with_virtual_local_reuse(
     return next_edges
 
 
+def _build_high_value_terminal_candidate_ids(
+    nodes_map: dict[str, Any],
+    edges: list[dict[str, Any]],
+    *,
+    mode: str,
+) -> set[str]:
+    """Return nodes whose paths can survive high-value filtering/promotion.
+
+    This includes:
+    - direct high-value / tier-0 targets, and
+    - User/Computer nodes that can be promoted by one MemberOf hop to a
+      privileged group, matching ``_try_promote_target_via_membership_edges``.
+    """
+    required_rank = 1 if mode == "impact" else 3
+    direct_high_value_ids: set[str] = set()
+    promotable_terminal_ids: set[str] = set()
+
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        is_high_value = (
+            _node_is_impact_high_value(node)
+            if mode == "impact"
+            else _node_is_tier0(node)
+        )
+        if is_high_value:
+            direct_high_value_ids.add(str(node_id))
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "").strip().lower() != "memberof":
+            continue
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        if not from_id or not to_id:
+            continue
+        principal_node = nodes_map.get(from_id)
+        group_node = nodes_map.get(to_id)
+        if not isinstance(principal_node, dict) or not isinstance(group_node, dict):
+            continue
+        if str(principal_node.get("kind") or "") not in {"User", "Computer"}:
+            continue
+        if str(group_node.get("kind") or "") != "Group":
+            continue
+        if _node_high_value_rank(group_node) < required_rank:
+            continue
+        promotable_terminal_ids.add(from_id)
+
+    return direct_high_value_ids | promotable_terminal_ids
+
+
+def _build_reverse_reachable_node_ids(
+    nodes_map: dict[str, Any],
+    adjacency: dict[str, list[dict[str, Any]]],
+    *,
+    target_node_ids: set[str],
+    local_reuse_by_node: dict[str, list[dict[str, Any]]],
+    local_reuse_existing_pairs: set[tuple[str, str]],
+    local_reuse_useful_nodes: set[str],
+) -> set[str]:
+    """Return nodes that can reach any target node via DFS-visible edges.
+
+    Uses the same outgoing-edge expansion logic as DFS, including virtual local
+    reuse edges. The expansion is computed with an empty path prefix, which
+    slightly over-approximates actual DFS reachability but never undercuts it,
+    making it safe for pruning.
+    """
+    if not target_node_ids:
+        return set()
+
+    reverse_adjacency: dict[str, set[str]] = {}
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        for edge in _iter_outgoing_edges_with_virtual_local_reuse(
+            str(node_id),
+            adjacency=adjacency,
+            acc_steps=[],
+            local_reuse_by_node=local_reuse_by_node,
+            local_reuse_existing_pairs=local_reuse_existing_pairs,
+            local_reuse_useful_nodes=local_reuse_useful_nodes,
+        ):
+            if not isinstance(edge, dict):
+                continue
+            to_id = str(edge.get("to") or "").strip()
+            if not to_id:
+                continue
+            reverse_adjacency.setdefault(to_id, set()).add(str(node_id))
+
+    reachable: set[str] = set(target_node_ids)
+    pending = list(target_node_ids)
+    while pending:
+        current = pending.pop()
+        for predecessor in reverse_adjacency.get(current, ()):
+            if predecessor in reachable:
+                continue
+            reachable.add(predecessor)
+            pending.append(predecessor)
+    return reachable
+
+
+def _build_high_value_reachable_node_ids(
+    graph: dict[str, Any],
+    *,
+    mode: str,
+) -> set[str]:
+    """Return nodes that can reach a high-value or promotable terminal."""
+    nodes_map = graph.get("nodes")
+    edges = graph.get("edges")
+    if not isinstance(nodes_map, dict) or not isinstance(edges, list):
+        return set()
+
+    adjacency: dict[str, list[dict[str, Any]]] = {}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        relation = str(edge.get("relation") or "").strip()
+        if not from_id or not to_id or not relation:
+            continue
+        adjacency.setdefault(from_id, []).append(edge)
+
+    local_reuse_by_node, local_reuse_existing_pairs = (
+        _build_local_reuse_virtual_state(nodes_map, edges)
+    )
+    local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
+    target_node_ids = _build_high_value_terminal_candidate_ids(
+        nodes_map,
+        edges,
+        mode=mode,
+    )
+    return _build_reverse_reachable_node_ids(
+        nodes_map,
+        adjacency,
+        target_node_ids=target_node_ids,
+        local_reuse_by_node=local_reuse_by_node,
+        local_reuse_existing_pairs=local_reuse_existing_pairs,
+        local_reuse_useful_nodes=local_reuse_useful_nodes,
+    )
+
+
 def _is_same_local_reuse_cluster_chain(
     previous_step: AttackPathStep | None,
     next_edge: dict[str, Any],
@@ -653,6 +851,233 @@ def _is_same_local_reuse_cluster_chain(
     return prev_cluster == next_cluster
 
 
+# ---------------------------------------------------------------------------
+# Parallel DFS infrastructure
+#
+# Activated by the ADSCAN_ATTACK_PATH_WORKERS env var:
+#   0   → sequential (default, safe)
+#   -1  → auto (cpu_count workers)
+#   N>0 → use N worker processes (capped at cpu_count and source count)
+#
+# Uses spawn context for PyInstaller compatibility.  The graph data structures
+# are sent to each worker process ONCE via the pool initializer (not per task),
+# so only the per-batch source list is pickled on every task dispatch.
+# ---------------------------------------------------------------------------
+
+def _read_attack_path_workers() -> int:
+    try:
+        return int(os.getenv("ADSCAN_ATTACK_PATH_WORKERS", "0").strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+_ATTACK_PATH_WORKERS: int = _read_attack_path_workers()
+
+# Per-worker state — populated once per worker process by _dfs_worker_init.
+_W_ADJACENCY: dict[str, list[dict[str, Any]]] = {}
+_W_LOCAL_REUSE_BY_NODE: dict[str, list[dict[str, Any]]] = {}
+_W_LOCAL_REUSE_EXISTING_PAIRS: set[tuple[str, str]] = set()
+_W_LOCAL_REUSE_USEFUL_NODES: set[str] = set()
+_W_TERMINAL_SET: set[str] = set()
+
+
+def _dfs_worker_init(
+    adjacency: dict[str, list[dict[str, Any]]],
+    local_reuse_by_node: dict[str, list[dict[str, Any]]],
+    local_reuse_existing_pairs: set[tuple[str, str]],
+    local_reuse_useful_nodes: set[str],
+    terminal_set: set[str],
+) -> None:
+    """Populate per-worker globals. Called once per worker process by the pool initializer."""
+    global _W_ADJACENCY, _W_LOCAL_REUSE_BY_NODE  # noqa: PLW0603
+    global _W_LOCAL_REUSE_EXISTING_PAIRS, _W_LOCAL_REUSE_USEFUL_NODES, _W_TERMINAL_SET  # noqa: PLW0603
+    _W_ADJACENCY = adjacency
+    _W_LOCAL_REUSE_BY_NODE = local_reuse_by_node
+    _W_LOCAL_REUSE_EXISTING_PAIRS = local_reuse_existing_pairs
+    _W_LOCAL_REUSE_USEFUL_NODES = local_reuse_useful_nodes
+    _W_TERMINAL_SET = terminal_set
+
+
+def _dfs_sources_batch_worker(
+    sources_batch: list[str],
+    target: str,
+    max_depth: int,
+    max_paths_cap: int | None,
+) -> list[AttackPath]:
+    """Run the DFS for a batch of source nodes using per-worker state.
+
+    This is a module-level function so it is picklable for multiprocessing.
+    The heavy data structures (adjacency, local-reuse indexes, terminal set)
+    are already loaded into the worker process via the pool initializer;
+    only the cheap per-task arguments are serialized on each dispatch.
+    """
+    adjacency = _W_ADJACENCY
+    local_reuse_by_node = _W_LOCAL_REUSE_BY_NODE
+    local_reuse_existing_pairs = _W_LOCAL_REUSE_EXISTING_PAIRS
+    local_reuse_useful_nodes = _W_LOCAL_REUSE_USEFUL_NODES
+    terminal_set = _W_TERMINAL_SET
+
+    paths: list[AttackPath] = []
+    seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
+
+    def emit(acc_steps: list[AttackPathStep]) -> None:
+        if not acc_steps:
+            return
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
+        if target == "highvalue" and acc_steps[-1].to_id not in terminal_set:
+            return
+        if target == "lowpriv" and acc_steps[-1].to_id in terminal_set:
+            return
+        signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
+        if signature in seen_signatures:
+            return
+        seen_signatures.add(signature)
+        paths.append(
+            AttackPath(
+                steps=list(acc_steps),
+                source_id=acc_steps[0].from_id,
+                target_id=acc_steps[-1].to_id,
+            )
+        )
+
+    def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
+        depth = len(acc_steps)
+        if depth >= max_depth or (depth > 0 and current in terminal_set):
+            emit(acc_steps)
+            return
+        next_edges = _iter_outgoing_edges_with_virtual_local_reuse(
+            current,
+            adjacency=adjacency,
+            acc_steps=acc_steps,
+            local_reuse_by_node=local_reuse_by_node,
+            local_reuse_existing_pairs=local_reuse_existing_pairs,
+            local_reuse_useful_nodes=local_reuse_useful_nodes,
+        )
+        if not next_edges:
+            emit(acc_steps)
+            return
+        extended = False
+        for edge in next_edges:
+            last_step = acc_steps[-1] if acc_steps else None
+            if _is_same_local_reuse_cluster_chain(last_step, edge):
+                continue
+            to_id = str(edge.get("to") or "")
+            if not to_id or to_id in visited:
+                continue
+            step = AttackPathStep(
+                from_id=current,
+                relation=str(edge.get("relation") or ""),
+                to_id=to_id,
+                status=str(edge.get("status") or "discovered"),
+                notes=edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
+            )
+            visited.add(to_id)
+            acc_steps.append(step)
+            dfs(to_id, visited, acc_steps)
+            acc_steps.pop()
+            visited.remove(to_id)
+            extended = True
+        if not extended:
+            emit(acc_steps)
+
+    for source in sources_batch:
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            break
+        dfs(source, visited={source}, acc_steps=[])
+
+    return paths
+
+
+def _effective_domain_dfs_workers(n_sources: int) -> int:
+    """Return the effective worker count for a domain DFS of *n_sources* sources.
+
+    Returns 0 when parallelism is disabled or the source set is too small to
+    amortise the spawn overhead (fewer than 2 sources per worker).
+    """
+    if _ATTACK_PATH_WORKERS == 0 or n_sources < 2:
+        return 0
+    cpu = os.cpu_count() or 1
+    if _ATTACK_PATH_WORKERS < 0:
+        candidates = min(cpu, n_sources)
+    else:
+        candidates = min(_ATTACK_PATH_WORKERS, cpu, n_sources)
+    # Require at least 2 sources per worker to make parallelism worthwhile.
+    while candidates > 1 and n_sources // candidates < 2:
+        candidates -= 1
+    return candidates if candidates >= 2 else 0
+
+
+def _run_parallel_domain_dfs(
+    sources: list[str],
+    adjacency: dict[str, list[dict[str, Any]]],
+    local_reuse_by_node: dict[str, list[dict[str, Any]]],
+    local_reuse_existing_pairs: set[tuple[str, str]],
+    local_reuse_useful_nodes: set[str],
+    terminal_set: set[str],
+    target: str,
+    max_depth: int,
+    max_paths_cap: int | None,
+    n_workers: int,
+) -> list[AttackPath]:
+    """Distribute the DFS over *n_workers* spawn-context processes.
+
+    Graph data is sent to each worker once via the pool initializer.
+    Each task only carries a small source-batch list.
+    Results are merged and globally deduplicated in the main process.
+    Falls back to sequential on any error.
+    """
+    import concurrent.futures
+    import multiprocessing
+
+    # Distribute sources across workers (round-robin keeps ordering predictable).
+    batches: list[list[str]] = [[] for _ in range(n_workers)]
+    for i, src in enumerate(sources):
+        batches[i % n_workers].append(src)
+    batches = [b for b in batches if b]
+
+    ctx = multiprocessing.get_context("spawn")
+    all_paths: list[AttackPath] = []
+    seen_sigs: set[tuple[tuple[str, str, str], ...]] = set()
+
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=ctx,
+            initializer=_dfs_worker_init,
+            initargs=(
+                adjacency,
+                local_reuse_by_node,
+                local_reuse_existing_pairs,
+                local_reuse_useful_nodes,
+                terminal_set,
+            ),
+        ) as pool:
+            futures = [
+                pool.submit(_dfs_sources_batch_worker, batch, target, max_depth, max_paths_cap)
+                for batch in batches
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                for path in future.result():
+                    sig = tuple((s.from_id, s.relation, s.to_id) for s in path.steps)
+                    if sig not in seen_sigs:
+                        seen_sigs.add(sig)
+                        all_paths.append(path)
+                        if max_paths_cap is not None and len(all_paths) >= max_paths_cap:
+                            # Cancel remaining futures (best-effort).
+                            for f in futures:
+                                f.cancel()
+                            return all_paths
+    except Exception:  # noqa: BLE001
+        # Any failure (spawn unavailable, worker crash, etc.) → fall back to
+        # sequential; the caller will redo the DFS serially.
+        return []
+
+    return all_paths
+
+
 def compute_maximal_attack_paths(
     graph: dict[str, Any],
     *,
@@ -661,6 +1086,7 @@ def compute_maximal_attack_paths(
     target: str = "highvalue",
     terminal_mode: str = "tier0",
     start_node_ids: set[str] | None = None,
+    reachable_node_ids: set[str] | None = None,
 ) -> list[AttackPath]:
     """Compute maximal paths up to depth for a full-domain graph."""
     if max_depth <= 0:
@@ -719,11 +1145,18 @@ def compute_maximal_attack_paths(
         if start_node_ids
         else set()
     )
+    allowed_reachable_ids: set[str] = (
+        {str(node_id) for node_id in reachable_node_ids if str(node_id).strip()}
+        if reachable_node_ids
+        else set()
+    )
     sources: list[str] = []
     for node_id, node in nodes_map.items():
         if not isinstance(node, dict):
             continue
         if allowed_start_ids and node_id not in allowed_start_ids:
+            continue
+        if allowed_reachable_ids and node_id not in allowed_reachable_ids:
             continue
         if outgoing.get(node_id, 0) <= 0:
             continue
@@ -732,6 +1165,42 @@ def compute_maximal_attack_paths(
         if _node_is_effectively_high_value(node):
             continue
         sources.append(node_id)
+
+    # --- Parallel DFS (domain scope) -----------------------------------------
+    # When ADSCAN_ATTACK_PATH_WORKERS != 0 and the source set is large enough,
+    # distribute the per-source DFS across spawn-context worker processes.
+    # Worker processes receive the pre-built adjacency and local-reuse indexes
+    # via the pool initializer (pickled once per worker, not per task).
+    # On any failure the result list is empty and we fall through to sequential.
+    n_workers = _effective_domain_dfs_workers(len(sources))
+    if n_workers >= 2:
+        from adscan_internal.rich_output import print_info_debug  # noqa: PLC0415
+        print_info_debug(
+            f"[domain-dfs] parallel: {n_workers} workers / {len(sources)} sources"
+        )
+        terminal_set = {
+            node_id
+            for node_id, node in nodes_map.items()
+            if isinstance(node, dict) and is_terminal(node_id)
+        }
+        parallel_paths = _run_parallel_domain_dfs(
+            sources,
+            adjacency,
+            local_reuse_by_node,
+            local_reuse_existing_pairs,
+            local_reuse_useful_nodes,
+            terminal_set,
+            target,
+            max_depth,
+            max_paths_cap,
+            n_workers,
+        )
+        if parallel_paths or not sources:
+            return parallel_paths
+        # Fall through to sequential if parallel returned nothing unexpectedly.
+        from adscan_internal.rich_output import print_info_debug  # noqa: PLC0415
+        print_info_debug("[domain-dfs] parallel returned empty, falling back to sequential")
+    # --- Sequential DFS (default / fallback) ---------------------------------
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
@@ -783,6 +1252,8 @@ def compute_maximal_attack_paths(
             to_id = str(edge.get("to") or "")
             if not to_id or to_id in visited:
                 continue
+            if allowed_reachable_ids and to_id not in allowed_reachable_ids:
+                continue
             step = AttackPathStep(
                 from_id=current,
                 relation=str(edge.get("relation") or ""),
@@ -816,6 +1287,7 @@ def compute_maximal_attack_paths_from_start(
     max_paths: int | None = None,
     target: str = "highvalue",
     terminal_mode: str = "tier0",
+    reachable_node_ids: set[str] | None = None,
 ) -> list[AttackPath]:
     """Compute maximal paths starting from a specific node."""
     if max_depth <= 0 or not start_node_id:
@@ -847,6 +1319,13 @@ def compute_maximal_attack_paths_from_start(
         _build_local_reuse_virtual_state(nodes_map, edges)
     )
     local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
+    allowed_reachable_ids: set[str] = (
+        {str(node_id) for node_id in reachable_node_ids if str(node_id).strip()}
+        if reachable_node_ids
+        else set()
+    )
+    if allowed_reachable_ids and start_node_id not in allowed_reachable_ids:
+        return []
 
     mode = (terminal_mode or "tier0").strip().lower()
     if mode not in {"tier0", "impact"}:
@@ -909,6 +1388,8 @@ def compute_maximal_attack_paths_from_start(
                 continue
             to_id = str(edge.get("to") or "")
             if not to_id or to_id in visited:
+                continue
+            if allowed_reachable_ids and to_id not in allowed_reachable_ids:
                 continue
             step = AttackPathStep(
                 from_id=current,
@@ -1060,6 +1541,7 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
     return {
         "nodes": nodes,
         "relations": relations,
+        "_exact_signature": (tuple(nodes), tuple(relations)),
         "length": sum(
             1
             for rel in relations

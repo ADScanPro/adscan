@@ -24,6 +24,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.cli.ci_events import emit_phase
 from adscan_internal.cli.session_preflight import (
     SessionPreflightConfig,
     SessionPreflightDeps,
@@ -157,8 +158,10 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 "Auto mode not found. Please configure it using 'set auto <value>'."
             )
             return False
+        emit_phase("dns_validation")
         if not shell.do_check_dns(args.domain, args.dc_ip):
             return False
+        emit_phase("dns_configuration")
         shell.do_clear_all(None)
         shell.scan_mode = None
         shell.do_start_auth(
@@ -214,8 +217,11 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
 
     success = _run_auto_auth() if args.mode == "auth" else _run_auto_unauth()
 
-    flags_valid = False
-    if success and shell.current_workspace_dir:
+    should_validate_flags = (
+        success and str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    )
+    flags_valid = not should_validate_flags
+    if should_validate_flags and shell.current_workspace_dir:
         flags_dir = os.path.join(shell.current_workspace_dir, "flags")
         user_flag_path = os.path.join(flags_dir, "user.txt")
         root_flag_path = os.path.join(flags_dir, "root.txt")
@@ -256,6 +262,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
 
     report_file_path = None
     if success and flags_valid and getattr(args, "generate_report", False):
+        emit_phase("report_generation")
         print_info("Generating report as requested...")
         if shell.current_workspace_dir:
             report_json_path = os.path.join(shell.current_workspace_dir, "report.json")
@@ -268,12 +275,15 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         else:
             print_warning("Workspace directory not available, cannot generate report")
 
-    if success and flags_valid:
+    if success and flags_valid and should_validate_flags:
         print_success("CI scan finished successfully with flags validated.")
         exit_code = 0
-    elif success and not flags_valid:
+    elif success and not flags_valid and should_validate_flags:
         print_error("CI scan completed but flags validation failed.")
         exit_code = 2
+    elif success:
+        print_success("CI scan finished successfully.")
+        exit_code = 0
     else:
         print_error("CI scan failed. Check the logs above for details.")
         exit_code = 1

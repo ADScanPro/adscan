@@ -7,8 +7,10 @@ It performs no I/O and does not depend on shell context.
 
 from __future__ import annotations
 
+import time
 import os
 import re
+import logging
 from typing import Any, Callable, Iterable
 import json
 
@@ -17,6 +19,219 @@ from adscan_internal.services import attack_graph_core
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
+
+# ---------------------------------------------------------------------------
+# Parallel principals infrastructure
+#
+# Activated by ADSCAN_ATTACK_PATH_WORKERS (same env var as attack_graph_core):
+#   0   → sequential (default, safe)
+#   -1  → auto (cpu_count workers)
+#   N>0 → use N worker processes (capped at cpu_count and principal count)
+#
+# The graph + snapshot are sent to each worker once via the pool initializer;
+# only the per-task username string is pickled per dispatch.
+# ---------------------------------------------------------------------------
+
+def _read_principal_workers() -> int:
+    try:
+        return int(os.getenv("ADSCAN_ATTACK_PATH_WORKERS", "0").strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+_PRINCIPAL_WORKERS: int = _read_principal_workers()
+
+
+def _read_phase_profiling_enabled() -> bool:
+    """Return whether per-phase attack-path profiling logs are enabled."""
+    return str(os.getenv("ADSCAN_ATTACK_PATH_PROFILE_PHASES", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+_ATTACK_PATH_PHASE_PROFILING_ENABLED = _read_phase_profiling_enabled()
+
+# Per-worker state for principal parallelism.
+_PW_GRAPH: dict[str, Any] = {}
+_PW_DOMAIN: str = ""
+_PW_SNAPSHOT: dict[str, Any] | None = None
+_PW_MAX_DEPTH: int = 7
+_PW_MAX_PATHS: int | None = None
+_PW_TARGET: str = "highvalue"
+_PW_TARGET_MODE: str = "tier0"
+_PW_FILTER_SHORTEST: bool = True
+_GROUP_MEMBERSHIP_INDEX_CACHE: dict[
+    tuple[int, str, int], tuple[dict[str, int], dict[str, list[str]]]
+] = {}
+_GROUP_MEMBER_INDEX_CACHE: dict[
+    tuple[int, str, bool, bool],
+    tuple[dict[str, set[str]], dict[str, set[str]], bool],
+] = {}
+
+
+def _log_phase_timing(
+    *,
+    scope: str,
+    phase: str,
+    started_at: float,
+    records: list[dict[str, Any]] | None = None,
+) -> None:
+    """Emit one debug timing line for a pipeline phase when profiling is enabled."""
+    if not _ATTACK_PATH_PHASE_PROFILING_ENABLED:
+        return
+    suffix = ""
+    if isinstance(records, list):
+        suffix = f" records={len(records)}"
+    print_info_debug(
+        f"[attack-paths-profile] scope={scope} phase={phase} "
+        f"elapsed={max(0.0, time.monotonic() - started_at):.6f}s{suffix}"
+    )
+
+
+def _debug_logging_enabled() -> bool:
+    """Return whether attack-path debug logs are currently enabled."""
+    return logging.getLogger("adscan").isEnabledFor(logging.DEBUG)
+
+
+def _string_tuple(values: list[Any]) -> tuple[str, ...]:
+    """Return a tuple of strings for a display-record sequence.
+
+    Display records in this pipeline already carry strings, so converting via
+    ``tuple(...)`` avoids per-element coercion overhead on very large path sets.
+    """
+    return tuple(values)
+
+
+def _record_exact_signature(
+    record: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Return or build the exact path signature for one display record."""
+    cached = record.get("_exact_signature")
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and isinstance(cached[0], tuple)
+        and isinstance(cached[1], tuple)
+    ):
+        return cached  # type: ignore[return-value]
+
+    nodes = record.get("nodes")
+    rels = record.get("relations")
+    if not isinstance(nodes, list) or not isinstance(rels, list):
+        return None
+    signature = (_string_tuple(nodes), _string_tuple(rels))
+    record["_exact_signature"] = signature
+    return signature
+
+
+def _principal_worker_init(
+    graph: dict[str, Any],
+    domain: str,
+    snapshot: dict[str, Any] | None,
+    max_depth: int,
+    max_paths: int | None,
+    target: str,
+    target_mode: str,
+    filter_shortest_paths: bool,
+) -> None:
+    """Populate per-worker globals. Called once per worker process by the pool initializer."""
+    global _PW_GRAPH, _PW_DOMAIN, _PW_SNAPSHOT  # noqa: PLW0603
+    global _PW_MAX_DEPTH, _PW_MAX_PATHS, _PW_TARGET, _PW_TARGET_MODE, _PW_FILTER_SHORTEST  # noqa: PLW0603
+    _PW_GRAPH = graph
+    _PW_DOMAIN = domain
+    _PW_SNAPSHOT = snapshot
+    _PW_MAX_DEPTH = max_depth
+    _PW_MAX_PATHS = max_paths
+    _PW_TARGET = target
+    _PW_TARGET_MODE = target_mode
+    _PW_FILTER_SHORTEST = filter_shortest_paths
+
+
+def _compute_paths_for_principal_worker(username: str) -> list[dict[str, Any]]:
+    """Compute attack paths for one principal using per-worker state.
+
+    Module-level so it is picklable for multiprocessing dispatch.
+    """
+    return compute_display_paths_for_user(
+        _PW_GRAPH,
+        domain=_PW_DOMAIN,
+        snapshot=_PW_SNAPSHOT,
+        username=username,
+        max_depth=_PW_MAX_DEPTH,
+        max_paths=_PW_MAX_PATHS,
+        target=_PW_TARGET,
+        target_mode=_PW_TARGET_MODE,
+        filter_shortest_paths=_PW_FILTER_SHORTEST,
+    )
+
+
+def _effective_principal_workers(n_principals: int) -> int:
+    """Return the effective worker count for *n_principals* principals.
+
+    Returns 0 when parallelism is disabled or the principal count is too
+    small to offset the process-spawn overhead (threshold: ≥ 3 principals).
+    """
+    if _PRINCIPAL_WORKERS == 0 or n_principals < 3:
+        return 0
+    cpu = os.cpu_count() or 1
+    if _PRINCIPAL_WORKERS < 0:
+        return min(cpu, n_principals)
+    return min(_PRINCIPAL_WORKERS, cpu, n_principals)
+
+
+def _run_parallel_principals(
+    principals: list[str],
+    graph: dict[str, Any],
+    domain: str,
+    snapshot: dict[str, Any] | None,
+    max_depth: int,
+    max_paths: int | None,
+    target: str,
+    target_mode: str,
+    filter_shortest_paths: bool,
+    n_workers: int,
+) -> list[dict[str, Any]] | None:
+    """Run per-principal DFS in parallel with spawn-context workers.
+
+    The graph and snapshot are sent to each worker once via the pool
+    initializer.  Each task only carries the principal username string.
+
+    Returns the aggregated list of raw records on success, or None on any
+    error (caller should fall back to sequential).
+    """
+    import concurrent.futures
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    all_records: list[dict[str, Any]] = []
+
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=ctx,
+            initializer=_principal_worker_init,
+            initargs=(
+                graph,
+                domain,
+                snapshot,
+                max_depth,
+                max_paths,
+                target,
+                target_mode,
+                filter_shortest_paths,
+            ),
+        ) as pool:
+            futures = {pool.submit(_compute_paths_for_principal_worker, u): u for u in principals}
+            for future in concurrent.futures.as_completed(futures):
+                records = future.result()
+                all_records.extend(records)
+    except Exception:  # noqa: BLE001
+        return None
+
+    return all_records
 
 
 _EMPTY_GROUP_WHITELIST = {
@@ -296,6 +511,11 @@ def _graph_has_persisted_memberships(graph: dict[str, Any]) -> bool:
     return False
 
 
+def _graph_has_materialized_terminal_memberships(graph: dict[str, Any]) -> bool:
+    """Return True when terminal runtime memberships were already materialized."""
+    return bool(graph.get("_attack_paths_terminal_memberships_materialized"))
+
+
 def _find_node_id_by_label(graph: dict[str, Any], label: str) -> str | None:
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     if not isinstance(nodes_map, dict):
@@ -345,12 +565,50 @@ def _find_node_id_by_label(graph: dict[str, Any], label: str) -> str | None:
     return matches[0][1]
 
 
-def _ensure_group_node_id(graph: dict[str, Any], *, domain: str, label: str) -> str:
+def _build_node_id_index_by_canonical_label(
+    graph: dict[str, Any],
+    *,
+    domain: str,
+) -> dict[str, str]:
+    """Build one canonical label -> node_id index for exact label lookups.
+
+    This is intentionally lighter than ``_find_node_id_by_label``: it preserves
+    the first observed node id for one canonical label and is used only inside
+    hot paths that repeatedly resolve or create group nodes during runtime
+    membership expansion.
+    """
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    if not isinstance(nodes_map, dict):
+        return {}
+
+    result: dict[str, str] = {}
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        canonical_label = _canonical_membership_label(
+            domain, _canonical_node_label(node)
+        )
+        if canonical_label and canonical_label not in result:
+            result[canonical_label] = str(node_id)
+    return result
+
+
+def _ensure_group_node_id(
+    graph: dict[str, Any],
+    *,
+    domain: str,
+    label: str,
+    node_id_by_label: dict[str, str] | None = None,
+) -> str:
     nodes_map = graph.get("nodes")
     if not isinstance(nodes_map, dict):
         return ""
     canonical = _canonical_membership_label(domain, label)
-    existing = _find_node_id_by_label(graph, canonical)
+    existing = None
+    if node_id_by_label is not None:
+        existing = node_id_by_label.get(canonical)
+    if not existing:
+        existing = _find_node_id_by_label(graph, canonical)
     if existing:
         return existing
     node_id = f"name:{canonical}"
@@ -360,6 +618,8 @@ def _ensure_group_node_id(graph: dict[str, Any], *, domain: str, label: str) -> 
         "kind": "Group",
         "properties": {"name": canonical, "domain": str(domain or "").strip().upper()},
     }
+    if node_id_by_label is not None and canonical:
+        node_id_by_label[canonical] = node_id
     return node_id
 
 
@@ -448,6 +708,12 @@ def build_group_membership_index(
     ):
         return {}, {}
 
+    if principal_labels is None:
+        cache_key = (id(snapshot), str(domain or "").strip().upper(), int(sample_limit))
+        cached = _GROUP_MEMBERSHIP_INDEX_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
     principals: list[str] = []
     if principal_labels is None:
         if isinstance(user_to_groups, dict):
@@ -493,7 +759,10 @@ def build_group_membership_index(
                 if principal not in sample and len(sample) < sample_limit:
                     sample.append(principal)
 
-    return counts, samples
+    result = (counts, samples)
+    if principal_labels is None:
+        _GROUP_MEMBERSHIP_INDEX_CACHE[cache_key] = result
+    return result
 
 
 def build_group_member_index(
@@ -533,6 +802,16 @@ def build_group_member_index(
 
     if not has_users and not has_computers:
         return {}, {}, False
+
+    cache_key = (
+        id(snapshot),
+        str(domain or "").strip().upper(),
+        bool(exclude_tier0),
+        bool(include_computers),
+    )
+    cached = _GROUP_MEMBER_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     user_group_members: dict[str, set[str]] = {}
     computer_group_members: dict[str, set[str]] = {}
@@ -585,7 +864,9 @@ def build_group_member_index(
                 continue
             _add_to_index(computer_group_members, canonical_computer, direct_groups)
 
-    return user_group_members, computer_group_members, has_users or has_computers
+    result = (user_group_members, computer_group_members, has_users or has_computers)
+    _GROUP_MEMBER_INDEX_CACHE[cache_key] = result
+    return result
 
 
 def _strip_leading_relations(
@@ -622,6 +903,7 @@ def _strip_leading_relations(
     new_record: dict[str, Any] = dict(record)
     new_record["nodes"] = new_nodes
     new_record["relations"] = new_rels
+    new_record["_exact_signature"] = (tuple(new_nodes), tuple(new_rels))
     new_record["length"] = sum(
         1
         for rel in new_rels
@@ -699,6 +981,7 @@ def _strip_leading_steps(
     new_record: dict[str, Any] = dict(record)
     new_record["nodes"] = new_nodes
     new_record["relations"] = new_rels
+    new_record["_exact_signature"] = (tuple(new_nodes), tuple(new_rels))
     new_record["length"] = sum(
         1
         for rel in new_rels
@@ -728,46 +1011,59 @@ def collapse_memberof_prefixes(
         snapshot, domain, principal_labels=principal_labels, sample_limit=sample_limit
     )
     grouped: dict[tuple[tuple[str, ...], tuple[str, ...]], dict[str, Any]] = {}
+    group_label_cache: dict[str, str] = {}
 
     for record in records:
         nodes = record.get("nodes")
         rels = record.get("relations")
         if not isinstance(nodes, list) or not isinstance(rels, list):
             continue
-        collapsed_record = record
-        if rels and str(rels[0]) == "MemberOf" and len(nodes) > 1 and counts:
-            group_label = _canonical_membership_label(domain, str(nodes[1]))
-            member_count = counts.get(group_label, 0)
-            if member_count > 1:
-                collapsed_record, _ = _strip_leading_relations(
-                    record, relations_to_strip={"MemberOf"}
-                )
-                sample_users = samples.get(group_label, [])
-                if sample_users:
-                    collapsed_record = dict(collapsed_record)
-                    collapsed_record["applies_to_users"] = sample_users
+        collapse_leading_memberof = False
+        sample_users: list[str] = []
+        strip_count = 0
+        if rels and rels[0] == "MemberOf" and len(nodes) > 1 and counts:
+            raw_group_label = str(nodes[1])
+            group_label = group_label_cache.get(raw_group_label)
+            if group_label is None:
+                group_label = _canonical_membership_label(domain, raw_group_label)
+                group_label_cache[raw_group_label] = group_label
+            if counts.get(group_label, 0) > 1:
+                collapse_leading_memberof = True
+                for relation in rels:
+                    if relation == "MemberOf":
+                        strip_count += 1
+                        continue
+                    break
+                if sample_limit > 0:
+                    sample_users = samples.get(group_label, [])
 
-        collapsed_nodes = collapsed_record.get("nodes")
-        collapsed_rels = collapsed_record.get("relations")
-        if not isinstance(collapsed_nodes, list) or not isinstance(
-            collapsed_rels, list
-        ):
+        if collapse_leading_memberof:
+            key = (tuple(nodes[strip_count:]), tuple(rels[strip_count:]))
+            existing = grouped.get(key)
+            if existing and isinstance(existing, dict):
+                if sample_users:
+                    applies = existing.get("applies_to_users")
+                    if isinstance(applies, list):
+                        merged = list(dict.fromkeys(applies + sample_users))
+                        existing["applies_to_users"] = merged[:sample_limit]
+                    else:
+                        existing["applies_to_users"] = sample_users[:sample_limit]
+                continue
+
+            collapsed_record, _ = _strip_leading_relations(
+                record, relations_to_strip={"MemberOf"}
+            )
+            if sample_users:
+                collapsed_record = dict(collapsed_record)
+                collapsed_record["applies_to_users"] = sample_users[:sample_limit]
+            grouped[key] = collapsed_record
             continue
-        key = (
-            tuple(str(n) for n in collapsed_nodes),
-            tuple(str(r) for r in collapsed_rels),
-        )
-        existing = grouped.get(key)
-        if existing and isinstance(existing, dict):
-            applies = existing.get("applies_to_users")
-            incoming = collapsed_record.get("applies_to_users")
-            if isinstance(applies, list) and isinstance(incoming, list):
-                merged = list(dict.fromkeys(applies + incoming))
-                existing["applies_to_users"] = merged[:sample_limit]
-            elif isinstance(incoming, list):
-                existing["applies_to_users"] = incoming[:sample_limit]
+
+        key = _record_exact_signature(record)
+        if key is None:
             continue
-        grouped[key] = collapsed_record
+        if key not in grouped:
+            grouped[key] = record
 
     return list(grouped.values())
 
@@ -916,7 +1212,9 @@ def dedupe_exact_display_paths(
         rels = record.get("relations")
         if not isinstance(nodes, list) or not isinstance(rels, list):
             continue
-        key = (tuple(str(n) for n in nodes), tuple(str(r) for r in rels))
+        key = _record_exact_signature(record)
+        if key is None:
+            continue
         if key in seen:
             continue
         seen.add(key)
@@ -970,9 +1268,25 @@ def minimize_display_paths(
 
     principal_groups_cache: dict[str, set[str]] = {}
     ancestor_cache: dict[str, set[str]] = {}
+    canonical_label_cache: dict[str, str] = {}
+    principal_groups_by_label_cache: dict[str, set[str]] = {}
+    user_principal_labels = (
+        set(user_to_groups.keys()) if isinstance(user_to_groups, dict) else set()
+    )
+    computer_principal_labels = (
+        set(computer_to_groups.keys()) if isinstance(computer_to_groups, dict) else set()
+    )
+
+    def canonical_label(value: str) -> str:
+        cached = canonical_label_cache.get(value)
+        if cached is not None:
+            return cached
+        cached = _canonical_membership_label(domain, value)
+        canonical_label_cache[value] = cached
+        return cached
 
     def principal_group_closure(principal_label: str) -> set[str]:
-        canonical_principal = _canonical_membership_label(domain, principal_label)
+        canonical_principal = canonical_label(principal_label)
         cached = principal_groups_cache.get(canonical_principal)
         if cached is not None:
             return cached
@@ -1001,6 +1315,18 @@ def minimize_display_paths(
         principal_groups_cache[canonical_principal] = groups
         return groups
 
+    def principal_group_closure_by_label(principal_label: str) -> set[str]:
+        cached = principal_groups_by_label_cache.get(principal_label)
+        if cached is not None:
+            return cached
+        cached = principal_group_closure(principal_label)
+        principal_groups_by_label_cache[principal_label] = cached
+        return cached
+
+    def is_membership_principal(label: str) -> bool:
+        canonical = canonical_label(label)
+        return canonical in user_principal_labels or canonical in computer_principal_labels
+
     # When scope is not explicitly supplied (legacy callers), default to an empty
     # string so that scope-gated minimizations (leading_memberof, domain-only) are
     # NOT applied.  Callers that want domain-scope behaviour must pass scope="domain".
@@ -1020,25 +1346,28 @@ def minimize_display_paths(
         f"[bh-minimize] scope={scope_norm!r} principal_count={principal_count}"
         f" → active rules: {', '.join(_active_rules)} | {len(records)} path(s)"
     )
+    debug_enabled = _debug_logging_enabled()
     minimized: list[dict[str, Any]] = []
     for record in records:
         orig_nodes = record.get("nodes") or []
         updated = _minimize_display_record_by_redundant_memberof(
             record,
-            domain=domain,
-            principal_group_closure=principal_group_closure,
-            user_to_groups=user_to_groups,
-            computer_to_groups=computer_to_groups,
+            principal_group_closure_by_label=principal_group_closure_by_label,
+            is_membership_principal=is_membership_principal,
+            canonical_label=canonical_label,
         )
         if updated is None:
-            orig_path = " → ".join(str(n) for n in orig_nodes)
-            print_info_debug(f"[bh-minimize] eliminated (redundant_memberof): {orig_path!r}")
+            if debug_enabled:
+                orig_path = " → ".join(str(n) for n in orig_nodes)
+                print_info_debug(
+                    f"[bh-minimize] eliminated (redundant_memberof): {orig_path!r}"
+                )
             continue
         updated = _minimize_display_record_by_repeated_labels(updated)
         if _apply_leading_memberof:
             updated = _minimize_display_record_by_leading_memberof(updated)
         final = _recompute_status(updated)
-        if final.get("meta", {}).get("minimized"):
+        if debug_enabled and final.get("meta", {}).get("minimized"):
             orig_path = " → ".join(str(n) for n in orig_nodes)
             new_path = " → ".join(str(n) for n in (final.get("nodes") or []))
             reason = final.get("meta", {}).get("minimized_reason", "")
@@ -1072,6 +1401,7 @@ def _strip_display_record_prefix(
     new_rels = list(rels[start_node_index:])
     new_record["nodes"] = new_nodes
     new_record["relations"] = new_rels
+    new_record["_exact_signature"] = (tuple(new_nodes), tuple(new_rels))
 
     if isinstance(new_record.get("source"), str):
         new_record["source"] = str(new_nodes[0])
@@ -1111,10 +1441,9 @@ def _strip_display_record_prefix(
 def _minimize_display_record_by_redundant_memberof(
     record: dict[str, Any],
     *,
-    domain: str,
-    principal_group_closure: Callable[[str], set[str]],
-    user_to_groups: object,
-    computer_to_groups: object,
+    principal_group_closure_by_label: Callable[[str], set[str]],
+    is_membership_principal: Callable[[str], bool],
+    canonical_label: Callable[[str], str],
 ) -> dict[str, Any] | None:
     """Eliminate display records that contain redundant MemberOf prefix pivots.
 
@@ -1144,18 +1473,8 @@ def _minimize_display_record_by_redundant_memberof(
         if rel_idx >= len(nodes):
             break
         current = str(nodes[rel_idx] or "").strip()
-        canonical = ""
-        is_principal = False
-        if current:
-            canonical = _canonical_membership_label(domain, current)
-            if isinstance(user_to_groups, dict) and canonical in user_to_groups:
-                is_principal = True
-            if (
-                not is_principal
-                and isinstance(computer_to_groups, dict)
-                and canonical in computer_to_groups
-            ):
-                is_principal = True
+        canonical = canonical_label(current) if current else ""
+        is_principal = bool(current) and is_membership_principal(current)
 
         # CHECK the outgoing edge FIRST, before adding this node's groups.
         # The check-before-add order is critical: it ensures that at rel_idx=0
@@ -1164,7 +1483,7 @@ def _minimize_display_record_by_redundant_memberof(
         # membership hop as redundant.  All other MemberOf edges at rel_idx > 0
         # are evaluated against groups already accumulated by prior nodes.
         if str(rel or "").strip().lower() == "memberof" and rel_idx + 1 < len(nodes):
-            group_label = _canonical_membership_label(domain, str(nodes[rel_idx + 1]))
+            group_label = canonical_label(str(nodes[rel_idx + 1]))
             if group_label and group_label in satisfied_groups:
                 redundant_memberof_indices.append(rel_idx)
 
@@ -1174,7 +1493,7 @@ def _minimize_display_record_by_redundant_memberof(
         # group the start node already belongs to, that hop is redundant.
         if is_principal and canonical and canonical not in seen_principals:
             seen_principals.add(canonical)
-            satisfied_groups.update(principal_group_closure(current))
+            satisfied_groups.update(principal_group_closure_by_label(current))
 
     if not redundant_memberof_indices:
         return record
@@ -1194,17 +1513,19 @@ def _minimize_display_record_by_repeated_labels(
     if not isinstance(nodes, list) or not isinstance(rels, list) or len(nodes) <= 1:
         return record
 
+    lowered_nodes = [str(node or "").strip().lower() for node in nodes]
+    if len(lowered_nodes) == len(set(lowered_nodes)):
+        return record
+
     last_seen: dict[str, int] = {}
-    for idx, node in enumerate(nodes):
-        label = str(node or "").strip().lower()
+    for idx, label in enumerate(lowered_nodes):
         if not label:
             continue
         last_seen[label] = idx
 
     # Find the latest index that repeats some earlier label.
     start_idx = 0
-    for idx, node in enumerate(nodes):
-        label = str(node or "").strip().lower()
+    for idx, label in enumerate(lowered_nodes):
         if not label:
             continue
         last_idx = last_seen.get(label, idx)
@@ -1302,6 +1623,8 @@ def _inject_memberof_edges_from_snapshot(
     *,
     principal_node_ids: set[str],
     recursive: bool,
+    node_id_by_label: dict[str, str] | None = None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None = None,
 ) -> int:
     if not snapshot:
         return 0
@@ -1329,6 +1652,10 @@ def _inject_memberof_edges_from_snapshot(
         snapshot.get("group_to_parents") if isinstance(snapshot, dict) else {}
     )
     ancestor_cache: dict[str, set[str]] = {}
+    resolved_node_id_by_label = node_id_by_label or _build_node_id_index_by_canonical_label(
+        runtime_graph,
+        domain=domain,
+    )
 
     injected = 0
     for node_id in principal_node_ids:
@@ -1351,19 +1678,27 @@ def _inject_memberof_edges_from_snapshot(
             continue
 
         group_labels: set[str] = set()
-        for group in direct_groups:
-            group_label = _canonical_membership_label(domain, group)
-            if not group_label:
-                continue
-            group_labels.add(group_label)
-            if recursive:
-                parents = _expand_group_ancestors(
-                    domain, group_label, group_to_parents, ancestor_cache
-                )
-                group_labels.update(parents)
+        if recursive and recursive_groups_by_principal:
+            group_labels.update(recursive_groups_by_principal.get(label, ()))
+        else:
+            for group in direct_groups:
+                group_label = _canonical_membership_label(domain, group)
+                if not group_label:
+                    continue
+                group_labels.add(group_label)
+                if recursive:
+                    parents = _expand_group_ancestors(
+                        domain, group_label, group_to_parents, ancestor_cache
+                    )
+                    group_labels.update(parents)
 
         for group_label in group_labels:
-            gid = _ensure_group_node_id(runtime_graph, domain=domain, label=group_label)
+            gid = _ensure_group_node_id(
+                runtime_graph,
+                domain=domain,
+                label=group_label,
+                node_id_by_label=resolved_node_id_by_label,
+            )
             if not gid:
                 continue
             key = (node_id, gid)
@@ -1385,6 +1720,84 @@ def _inject_memberof_edges_from_snapshot(
     return injected
 
 
+def _build_attack_potential_node_ids(
+    graph: dict[str, Any],
+    *,
+    domain: str | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> set[str]:
+    """Return the set of node_ids that have at least one non-context outgoing edge.
+
+    Used to pre-filter principals before running the DFS: any principal whose
+    node_id is NOT in this set can never produce an attack path, so the DFS
+    call (and the entire post-processing pipeline) can be skipped entirely.
+
+    When a membership snapshot is available, principals with direct snapshot
+    group memberships are also considered attack-capable because the runtime
+    pipeline may inject ``MemberOf`` edges for them before DFS execution.
+
+    Cost: O(E) single pass over edges plus an optional O(V) snapshot-aware pass
+    over graph nodes — computed once per principals batch.
+    """
+    result: set[str] = set()
+    context_reverse: dict[str, set[str]] = {}
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        relation = str(edge.get("relation") or "").strip().lower()
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        if relation in _CONTEXT_RELATIONS_LOWER:
+            if from_id and to_id:
+                context_reverse.setdefault(to_id, set()).add(from_id)
+            continue
+        if from_id:
+            result.add(from_id)
+
+    if result and context_reverse:
+        stack = list(result)
+        while stack:
+            target_id = stack.pop()
+            for source_id in context_reverse.get(target_id, ()):
+                if source_id in result:
+                    continue
+                result.add(source_id)
+                stack.append(source_id)
+
+    if not snapshot or not domain:
+        return result
+
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    if not isinstance(nodes_map, dict):
+        return result
+
+    user_to_groups = snapshot.get("user_to_groups")
+    computer_to_groups = snapshot.get("computer_to_groups")
+    if not isinstance(user_to_groups, dict) and not isinstance(computer_to_groups, dict):
+        return result
+
+    for node_id, node in nodes_map.items():
+        if not isinstance(node, dict):
+            continue
+        kind = _node_kind(node)
+        if kind not in {"User", "Computer"}:
+            continue
+        canonical_label = _canonical_membership_label(
+            domain,
+            _canonical_node_label(node),
+        )
+        if not canonical_label:
+            continue
+        direct_groups: list[str] = []
+        if kind == "User" and isinstance(user_to_groups, dict):
+            direct_groups = user_to_groups.get(canonical_label, []) or []
+        elif kind == "Computer" and isinstance(computer_to_groups, dict):
+            direct_groups = computer_to_groups.get(canonical_label, []) or []
+        if isinstance(direct_groups, list) and direct_groups:
+            result.add(str(node_id))
+    return result
+
+
 def compute_display_paths_for_domain(
     graph: dict[str, Any],
     *,
@@ -1396,7 +1809,9 @@ def compute_display_paths_for_domain(
     target_mode: str = "tier0",
     expand_terminal_memberships: bool = True,
     start_node_ids: set[str] | None = None,
+    materialized_artifacts: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    pipeline_started_at = time.monotonic()
     runtime_graph: dict[str, Any] = dict(graph)
     runtime_graph["nodes"] = dict(
         graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
@@ -1409,6 +1824,7 @@ def compute_display_paths_for_domain(
         expand_terminal_memberships
         and snapshot
         and not _graph_has_persisted_memberships(runtime_graph)
+        and not _graph_has_materialized_terminal_memberships(runtime_graph)
     ):
         candidate_to_ids: set[str] = set()
         for edge in runtime_graph["edges"]:
@@ -1428,11 +1844,22 @@ def compute_display_paths_for_domain(
             snapshot,
             principal_node_ids=candidate_to_ids,
             recursive=True,
+            node_id_by_label=(
+                materialized_artifacts.get("node_id_by_label")
+                if isinstance(materialized_artifacts, dict)
+                else None
+            ),
+            recursive_groups_by_principal=(
+                materialized_artifacts.get("recursive_groups_by_principal")
+                if isinstance(materialized_artifacts, dict)
+                else None
+            ),
         )
 
     mode = (target_mode or "tier0").strip().lower()
     if mode not in {"tier0", "impact"}:
         mode = "tier0"
+    unfiltered_started_at = time.monotonic()
     unfiltered = attack_graph_core.compute_display_paths_for_domain_unfiltered(
         runtime_graph,
         max_depth=max_depth,
@@ -1441,6 +1868,13 @@ def compute_display_paths_for_domain(
         target_mode=mode,
         start_node_ids=start_node_ids,
     )
+    _log_phase_timing(
+        scope="domain",
+        phase="compute_display_paths_for_domain_unfiltered",
+        started_at=unfiltered_started_at,
+        records=unfiltered,
+    )
+    collapsed_started_at = time.monotonic()
     collapsed = collapse_memberof_prefixes(
         unfiltered,
         domain,
@@ -1448,7 +1882,21 @@ def compute_display_paths_for_domain(
         principal_labels=None,
         sample_limit=0,
     )
+    _log_phase_timing(
+        scope="domain",
+        phase="collapse_memberof_prefixes",
+        started_at=collapsed_started_at,
+        records=collapsed,
+    )
+    minimized_started_at = time.monotonic()
     minimized = minimize_display_paths(collapsed, domain=domain, snapshot=snapshot)
+    _log_phase_timing(
+        scope="domain",
+        phase="minimize_display_paths",
+        started_at=minimized_started_at,
+        records=minimized,
+    )
+    annotated_started_at = time.monotonic()
     annotated = apply_affected_user_metadata(
         minimized,
         graph=runtime_graph,
@@ -1456,8 +1904,34 @@ def compute_display_paths_for_domain(
         snapshot=snapshot,
         filter_empty=True,
     )
+    _log_phase_timing(
+        scope="domain",
+        phase="apply_affected_user_metadata",
+        started_at=annotated_started_at,
+        records=annotated,
+    )
+    deduped_started_at = time.monotonic()
     deduped = dedupe_exact_display_paths(annotated)
+    _log_phase_timing(
+        scope="domain",
+        phase="dedupe_exact_display_paths",
+        started_at=deduped_started_at,
+        records=deduped,
+    )
+    filtered_started_at = time.monotonic()
     filtered, _ = attack_graph_core.filter_contained_paths_for_domain_listing(deduped)
+    _log_phase_timing(
+        scope="domain",
+        phase="filter_contained_paths_for_domain_listing",
+        started_at=filtered_started_at,
+        records=filtered,
+    )
+    _log_phase_timing(
+        scope="domain",
+        phase="total_pipeline",
+        started_at=pipeline_started_at,
+        records=filtered,
+    )
     return filtered
 
 
@@ -1474,7 +1948,9 @@ def compute_display_paths_for_start_node(
     expand_start_memberships: bool = True,
     expand_terminal_memberships: bool = True,
     filter_shortest_paths: bool = True,
+    materialized_artifacts: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    pipeline_started_at = time.monotonic()
     runtime_graph: dict[str, Any] = dict(graph)
     runtime_graph["nodes"] = dict(
         graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
@@ -1507,10 +1983,15 @@ def compute_display_paths_for_start_node(
                 _inject_memberof_edges_from_snapshot(
                     runtime_graph,
                     domain,
-                    snapshot,
-                    principal_node_ids={start_node_id},
-                    recursive=False,
-                )
+                snapshot,
+                principal_node_ids={start_node_id},
+                recursive=False,
+                node_id_by_label=(
+                    materialized_artifacts.get("node_id_by_label")
+                    if isinstance(materialized_artifacts, dict)
+                    else None
+                ),
+            )
         else:
             _inject_memberof_edges_from_snapshot(
                 runtime_graph,
@@ -1518,9 +1999,24 @@ def compute_display_paths_for_start_node(
                 snapshot,
                 principal_node_ids={start_node_id},
                 recursive=True,
+                node_id_by_label=(
+                    materialized_artifacts.get("node_id_by_label")
+                    if isinstance(materialized_artifacts, dict)
+                    else None
+                ),
+                recursive_groups_by_principal=(
+                    materialized_artifacts.get("recursive_groups_by_principal")
+                    if isinstance(materialized_artifacts, dict)
+                    else None
+                ),
             )
 
-    if expand_terminal_memberships and snapshot and not has_persisted:
+    if (
+        expand_terminal_memberships
+        and snapshot
+        and not has_persisted
+        and not _graph_has_materialized_terminal_memberships(runtime_graph)
+    ):
         candidate_to_ids: set[str] = set()
         for edge in runtime_graph["edges"]:
             if not isinstance(edge, dict):
@@ -1539,11 +2035,22 @@ def compute_display_paths_for_start_node(
             snapshot,
             principal_node_ids=candidate_to_ids,
             recursive=True,
+            node_id_by_label=(
+                materialized_artifacts.get("node_id_by_label")
+                if isinstance(materialized_artifacts, dict)
+                else None
+            ),
+            recursive_groups_by_principal=(
+                materialized_artifacts.get("recursive_groups_by_principal")
+                if isinstance(materialized_artifacts, dict)
+                else None
+            ),
         )
 
     mode = (target_mode or "tier0").strip().lower()
     if mode not in {"tier0", "impact"}:
         mode = "tier0"
+    raw_started_at = time.monotonic()
     records = attack_graph_core.compute_display_paths_for_start_node(
         runtime_graph,
         start_node_id=start_node_id,
@@ -1552,21 +2059,32 @@ def compute_display_paths_for_start_node(
         target=target,
         target_mode=mode,
     )
-
-    minimized_records = minimize_display_paths(
-        records, domain=domain, snapshot=snapshot
+    _log_phase_timing(
+        scope="start_node",
+        phase="compute_display_paths_for_start_node",
+        started_at=raw_started_at,
+        records=records,
     )
+
     print_info_debug(
         f"[attack_paths_core] Raw paths for start_node_id={start_node_id}: "
         f"{json.dumps([r.get('source') for r in records])}"
     )
+    minimized_started_at = time.monotonic()
     minimized_records = minimize_display_paths(
         records, domain=domain, snapshot=snapshot
+    )
+    _log_phase_timing(
+        scope="start_node",
+        phase="minimize_display_paths",
+        started_at=minimized_started_at,
+        records=minimized_records,
     )
     print_info_debug(
         f"[attack_paths_core] After minimize_display_paths: "
         f"{json.dumps([r.get('source') for r in minimized_records])}"
     )
+    annotated_started_at = time.monotonic()
     annotated = apply_affected_user_metadata(
         minimized_records,
         graph=runtime_graph,
@@ -1574,16 +2092,41 @@ def compute_display_paths_for_start_node(
         snapshot=snapshot,
         filter_empty=True,
     )
+    _log_phase_timing(
+        scope="start_node",
+        phase="apply_affected_user_metadata",
+        started_at=annotated_started_at,
+        records=annotated,
+    )
     print_info_debug(
         f"[attack_paths_core] After apply_affected_user_metadata: "
         f"{json.dumps([r.get('source') for r in annotated])}"
     )
     if filter_shortest_paths:
+        filtered_started_at = time.monotonic()
         filtered = filter_shortest_paths_for_principals(annotated)
+        _log_phase_timing(
+            scope="start_node",
+            phase="filter_shortest_paths_for_principals",
+            started_at=filtered_started_at,
+            records=filtered,
+        )
+        _log_phase_timing(
+            scope="start_node",
+            phase="total_pipeline",
+            started_at=pipeline_started_at,
+            records=filtered,
+        )
         print_info_debug(
             f"[attack_paths_core] After filter_shortest_paths_for_principals: {len(filtered)}"
         )
         return filtered
+    _log_phase_timing(
+        scope="start_node",
+        phase="total_pipeline",
+        started_at=pipeline_started_at,
+        records=annotated,
+    )
     return annotated
 
 
@@ -1598,6 +2141,7 @@ def compute_display_paths_for_user(
     target: str = "highvalue",
     target_mode: str = "tier0",
     filter_shortest_paths: bool = True,
+    materialized_artifacts: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     start_node_id = _find_node_id_by_label(graph, username)
     if not start_node_id:
@@ -1612,6 +2156,7 @@ def compute_display_paths_for_user(
         target=target,
         target_mode=target_mode,
         filter_shortest_paths=filter_shortest_paths,
+        materialized_artifacts=materialized_artifacts,
     )
 
 
@@ -1628,31 +2173,93 @@ def compute_display_paths_for_principals(
     target_mode: str = "tier0",
     filter_shortest_paths: bool = True,
 ) -> list[dict[str, Any]]:
+    pipeline_started_at = time.monotonic()
     normalized_principals = [str(p or "").strip().lower() for p in principals]
     normalized_principals = [p for p in normalized_principals if p]
     if not normalized_principals:
         return []
 
-    all_records: list[dict[str, Any]] = []
+    # --- Pre-filter: skip principals with no attack-relevant outgoing edges --
+    # Build once O(E), then filter the principal list in O(P) before any DFS.
+    attack_potential_ids = _build_attack_potential_node_ids(
+        graph,
+        domain=domain,
+        snapshot=snapshot,
+    )
+    principals_with_potential = []
     for username in normalized_principals:
-        remaining = None
-        if isinstance(max_paths, int) and max_paths > 0:
-            remaining = max_paths - len(all_records)
-            if remaining <= 0:
-                break
-        records = compute_display_paths_for_user(
-            graph,
-            domain=domain,
-            snapshot=snapshot,
-            username=username,
-            max_depth=max_depth,
-            max_paths=remaining,
-            target=target,
-            target_mode=target_mode,
-            filter_shortest_paths=filter_shortest_paths,
+        node_id = _find_node_id_by_label(graph, username)
+        if node_id and node_id in attack_potential_ids:
+            principals_with_potential.append(username)
+    skipped = len(normalized_principals) - len(principals_with_potential)
+    if skipped:
+        print_info_debug(
+            f"[principals-dfs] pre-filter: skipped {skipped}/{len(normalized_principals)} "
+            f"principals with no attack-relevant outgoing edges"
         )
-        all_records.extend(records)
+    if not principals_with_potential:
+        return []
+    normalized_principals = principals_with_potential
 
+    # --- Parallel principals DFS ---------------------------------------------
+    # When ADSCAN_ATTACK_PATH_WORKERS != 0 and there are enough principals,
+    # dispatch each principal's DFS to a separate worker process.  The graph
+    # and snapshot are sent via the pool initializer (once per worker).
+    # max_paths budget is not enforced per-principal in parallel mode (the
+    # global cap is approximate); the post-processing pipeline handles it.
+    all_records: list[dict[str, Any]] = []
+    n_workers = _effective_principal_workers(len(normalized_principals))
+    if n_workers >= 2:
+        print_info_debug(
+            f"[principals-dfs] parallel: {n_workers} workers / {len(normalized_principals)} principals"
+        )
+        parallel_result = _run_parallel_principals(
+            normalized_principals,
+            graph,
+            domain,
+            snapshot,
+            max_depth,
+            max_paths,
+            target,
+            target_mode,
+            filter_shortest_paths,
+            n_workers,
+        )
+        if parallel_result is not None:
+            all_records = parallel_result
+        else:
+            print_info_debug("[principals-dfs] parallel failed, falling back to sequential")
+            n_workers = 0  # fall through to sequential
+
+    if n_workers < 2:
+        # --- Sequential DFS (default / fallback) ----------------------------
+        for username in normalized_principals:
+            remaining = None
+            if isinstance(max_paths, int) and max_paths > 0:
+                remaining = max_paths - len(all_records)
+                if remaining <= 0:
+                    break
+            records = compute_display_paths_for_user(
+                graph,
+                domain=domain,
+                snapshot=snapshot,
+                username=username,
+                max_depth=max_depth,
+                max_paths=remaining,
+                target=target,
+                target_mode=target_mode,
+                filter_shortest_paths=filter_shortest_paths,
+            )
+            all_records.extend(records)
+
+    raw_started_at = pipeline_started_at
+    _log_phase_timing(
+        scope="principals",
+        phase="compute_display_paths_for_principals_raw",
+        started_at=raw_started_at,
+        records=all_records,
+    )
+    collapsed_started_at = time.monotonic()
     collapsed_records = collapse_memberof_prefixes(
         all_records,
         domain,
@@ -1660,9 +2267,23 @@ def compute_display_paths_for_principals(
         principal_labels=normalized_principals,
         sample_limit=membership_sample_max,
     )
+    _log_phase_timing(
+        scope="principals",
+        phase="collapse_memberof_prefixes",
+        started_at=collapsed_started_at,
+        records=collapsed_records,
+    )
+    minimized_started_at = time.monotonic()
     minimized = minimize_display_paths(
         collapsed_records, domain=domain, snapshot=snapshot
     )
+    _log_phase_timing(
+        scope="principals",
+        phase="minimize_display_paths",
+        started_at=minimized_started_at,
+        records=minimized,
+    )
+    annotated_started_at = time.monotonic()
     annotated = apply_affected_user_metadata(
         minimized,
         graph=graph,
@@ -1670,6 +2291,32 @@ def compute_display_paths_for_principals(
         snapshot=snapshot,
         filter_empty=True,
     )
+    _log_phase_timing(
+        scope="principals",
+        phase="apply_affected_user_metadata",
+        started_at=annotated_started_at,
+        records=annotated,
+    )
     if filter_shortest_paths:
-        return filter_shortest_paths_for_principals(annotated)
+        filtered_started_at = time.monotonic()
+        filtered = filter_shortest_paths_for_principals(annotated)
+        _log_phase_timing(
+            scope="principals",
+            phase="filter_shortest_paths_for_principals",
+            started_at=filtered_started_at,
+            records=filtered,
+        )
+        _log_phase_timing(
+            scope="principals",
+            phase="total_pipeline",
+            started_at=pipeline_started_at,
+            records=filtered,
+        )
+        return filtered
+    _log_phase_timing(
+        scope="principals",
+        phase="total_pipeline",
+        started_at=pipeline_started_at,
+        records=annotated,
+    )
     return annotated

@@ -1841,7 +1841,7 @@ def run_rid_cycling(shell: Any, *, domain: str) -> None:
     guest_auth = _build_guest_auth_nxc(shell, domain=domain)
     command = (
         f"{shell.netexec_path} smb {shell.domains_data[domain]['pdc']} "
-        f"{guest_auth} --rid-brute 2000 --log "
+        f"{guest_auth} --rid-brute 2000 --timeout 60 --smb-timeout 30 --log "
         f"{rid_log}"
     )
     print_info_debug(f"Command: {command}")

@@ -7,6 +7,8 @@ separate from the LDAP service layer.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import re
@@ -39,6 +41,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.core import AuthMode
+from adscan_internal.cli.ci_events import emit_event
 from adscan_internal.cli.common import SECRET_MODE, build_lab_event_fields
 from adscan_internal.cli.ntlm_hash_finding_flow import (
     render_ntlm_hash_findings_flow,
@@ -63,6 +66,17 @@ from adscan_internal.rich_output import (
     print_panel_with_table,
 )
 from adscan_internal.services import EnumerationService
+from adscan_internal.services.kerberos_username_wordlist_service import (
+    LINKEDIN_SUPPORTED_PATTERN_KEYS,
+    SUPPORTED_KERBEROS_PATTERN_KEYS,
+    KerberosUsernameWordlistService,
+    KerberosWordlistSourceMetadata,
+    format_supported_pattern_label,
+)
+from adscan_internal.services.linkedin_username_discovery_service import (
+    CachedLinkedInSessionProvider,
+    LinkedInUsernameDiscoveryService,
+)
 from adscan_internal.services.enumeration.ldap import LDAPAnonymousUserRecord
 from adscan_internal.services.credsweeper_service import (
     CREDSWEEPER_RULES_PROFILE_LDAP_DESCRIPTION,
@@ -139,7 +153,16 @@ class LdapShell(Protocol):
         self, message: str, options: list[str], default_idx: int = 0
     ) -> int | None: ...
 
+    def _questionary_checkbox(
+        self,
+        title: str,
+        options: list[str],
+        default_values: list[str] | None = None,
+    ) -> list[str] | None: ...
+
     def _generate_user_permutations_interactive(self, domain: str) -> str | None: ...
+
+    def _open_fullscreen_editor(self, title: str, initial_text: str) -> str | None: ...
 
     def ask_for_kerberos_user_enum(
         self, domain: str, relaunch: bool = False
@@ -1520,6 +1543,20 @@ def run_ldap_active_users(shell: LdapShell, target_domain: str) -> list[str] | N
     except Exception as e:  # pragma: no cover
         telemetry.capture_exception(e)
 
+    try:
+        emit_event(
+            "coverage",
+            phase="domain_analysis",
+            phase_label="Domain Analysis",
+            category="identity_inventory",
+            domain=target_domain,
+            metric_type="enabled_users",
+            count=len(usernames),
+            message=f"Enabled identity inventory updated: {len(usernames)} active users discovered.",
+        )
+    except Exception as exc:  # pragma: no cover
+        telemetry.capture_exception(exc)
+
     return usernames
 
 
@@ -2378,10 +2415,8 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
     shell.domains_data[domain]["auth"] = "user_enum"
 
     # Wordlist selection via interactive menu
-    options = [
-        "Build a custom wordlist based on some known name and surnames",
-        "Use a general common username wordlist",
-    ]
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    options = _get_kerberos_wordlist_strategy_options(workspace_type)
     choice_idx = shell._questionary_select(
         "Select an option for Kerberos enumeration", options
     )
@@ -2390,11 +2425,15 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         return
 
     if choice_idx == 0:
-        wordlist = shell._generate_user_permutations_interactive(domain)
+        wordlist = _build_targeted_kerberos_wordlist(shell, domain)
+        if not wordlist:
+            return
+    elif choice_idx == 1:
+        wordlist = _resolve_general_kerberos_username_wordlist(domain)
         if not wordlist:
             return
     else:
-        wordlist = _prompt_kerberos_username_wordlist(shell, domain)
+        wordlist = _prompt_custom_kerberos_username_wordlist(shell, domain)
         if not wordlist:
             return
 
@@ -2403,6 +2442,14 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         workspace_cwd, shell.domains_dir, domain, shell.kerberos_dir
     )
     os.makedirs(kerberos_dir, exist_ok=True)
+    should_continue = _prompt_for_repeated_kerberos_wordlist_if_needed(
+        shell=shell,
+        domain=domain,
+        kerberos_dir=Path(kerberos_dir),
+        wordlist_path=Path(wordlist),
+    )
+    if not should_continue:
+        return
     output_file = Path(os.path.join(kerberos_dir, "enum_users.log"))
 
     wordlist_name = os.path.basename(wordlist) if os.path.exists(wordlist) else wordlist
@@ -2437,6 +2484,12 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         scan_id=None,
         timeout=300,
     )
+    _record_kerberos_wordlist_attempt(
+        domain=domain,
+        kerberos_dir=Path(kerberos_dir),
+        wordlist_path=Path(wordlist),
+        valid_users_count=len(sorted(set(users))),
+    )
 
     if not users:
         print_warning("No Kerberos users were discovered.")
@@ -2466,11 +2519,222 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
     _show_kerberos_enum_shortcut_hint(shell, domain)
 
 
-def _prompt_kerberos_username_wordlist(
+def _compute_file_sha256(path: Path) -> str | None:
+    """Return a stable SHA-256 digest for one file, or ``None`` if unreadable."""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        marked_path = mark_sensitive(str(path), "path")
+        print_info_debug(
+            f"[ldap] Could not hash Kerberos wordlist {marked_path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
+
+
+def _resolve_kerberos_enum_history_path(kerberos_dir: Path) -> Path:
+    """Return the history artifact path for Kerberos user enumeration attempts."""
+    return kerberos_dir / "enum_users_history.json"
+
+
+def _load_kerberos_enum_history(kerberos_dir: Path) -> dict:
+    """Load Kerberos enumeration history, returning an empty payload on errors."""
+    history_path = _resolve_kerberos_enum_history_path(kerberos_dir)
+    payload: dict[str, object] = {"schema_version": 1, "runs": []}
+    if not history_path.exists():
+        return payload
+    try:
+        loaded = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        telemetry.capture_exception(exc)
+        marked_path = mark_sensitive(str(history_path), "path")
+        print_info_debug(
+            f"[ldap] Could not load Kerberos enum history {marked_path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return payload
+    if isinstance(loaded, dict):
+        loaded.setdefault("schema_version", 1)
+        loaded.setdefault("runs", [])
+        if isinstance(loaded.get("runs"), list):
+            return loaded
+    return payload
+
+
+def _record_kerberos_wordlist_attempt(
+    *,
+    domain: str,
+    kerberos_dir: Path,
+    wordlist_path: Path,
+    valid_users_count: int,
+) -> None:
+    """Persist one Kerberos username enumeration attempt for cheap exact-match warnings."""
+    digest = _compute_file_sha256(wordlist_path)
+    if not digest:
+        return
+    history_path = _resolve_kerberos_enum_history_path(kerberos_dir)
+    history_payload = _load_kerberos_enum_history(kerberos_dir)
+    runs = history_payload.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+
+    try:
+        line_count = 0
+        with wordlist_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in handle:
+                line_count += 1
+    except OSError:
+        line_count = 0
+
+    runs.append(
+        {
+            "domain": domain,
+            "wordlist_path": str(wordlist_path),
+            "wordlist_name": wordlist_path.name,
+            "wordlist_sha256": digest,
+            "wordlist_line_count": line_count,
+            "valid_users_count": valid_users_count,
+            "tested_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    history_payload["runs"] = runs[-200:]
+    try:
+        history_path.write_text(
+            json.dumps(history_payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        marked_path = mark_sensitive(str(history_path), "path")
+        print_info_debug(f"[ldap] Kerberos enum history updated at {marked_path}")
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        marked_path = mark_sensitive(str(history_path), "path")
+        print_info_debug(
+            f"[ldap] Could not persist Kerberos enum history {marked_path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _find_prior_kerberos_wordlist_attempt(
+    *,
+    domain: str,
+    kerberos_dir: Path,
+    wordlist_path: Path,
+) -> dict[str, object] | None:
+    """Return the most recent prior attempt using the exact same wordlist content."""
+    digest = _compute_file_sha256(wordlist_path)
+    if not digest:
+        return None
+    payload = _load_kerberos_enum_history(kerberos_dir)
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        return None
+    for entry in reversed(runs):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("domain") or "").strip().lower() != domain.strip().lower():
+            continue
+        if str(entry.get("wordlist_sha256") or "") != digest:
+            continue
+        return entry
+    return None
+
+
+def _prompt_for_repeated_kerberos_wordlist_if_needed(
+    *,
+    shell: LdapShell,
+    domain: str,
+    kerberos_dir: Path,
+    wordlist_path: Path,
+) -> bool:
+    """Warn when the exact same Kerberos username list was already tested recently."""
+    prior_attempt = _find_prior_kerberos_wordlist_attempt(
+        domain=domain,
+        kerberos_dir=kerberos_dir,
+        wordlist_path=wordlist_path,
+    )
+    if not prior_attempt:
+        return True
+
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_wordlist = mark_sensitive(wordlist_path.name, "path")
+    tested_at = str(prior_attempt.get("tested_at") or "unknown time")
+    valid_users_count = int(prior_attempt.get("valid_users_count") or 0)
+    line_count = int(prior_attempt.get("wordlist_line_count") or 0)
+    history_rel = domain_relpath(
+        shell._get_workspace_cwd(),
+        shell.domains_dir,
+        domain,
+        shell.kerberos_dir,
+        "enum_users_history.json",
+    )
+    marked_history = mark_sensitive(history_rel, "path")
+    print_panel(
+        (
+            f"Domain: {marked_domain}\n"
+            f"Wordlist: {marked_wordlist}\n"
+            f"This exact username list was already tested previously.\n"
+            f"Previous run: {tested_at}\n"
+            f"Candidates in list: {line_count}\n"
+            f"Valid usernames found previously: {valid_users_count}\n"
+            f"History artifact: {marked_history}"
+        ),
+        title="♻️ Kerberos Username List Already Tested",
+        border_style=BRAND_COLORS["warning"],
+    )
+    options = [
+        "Run this exact list again",
+        "Go back and choose another wordlist strategy",
+    ]
+    choice_idx = shell._questionary_select(
+        f"This exact Kerberos username list was already tested for {marked_domain}.",
+        options,
+        default_idx=0,
+    )
+    return choice_idx == 0
+
+
+def _get_kerberos_wordlist_strategy_options(workspace_type: str) -> list[str]:
+    """Return top-level Kerberos username wordlist strategy options."""
+    focused_label = (
+        "Generate a focused corporate username wordlist"
+        if workspace_type == "audit"
+        else "Generate a targeted username wordlist"
+    )
+    return [
+        f"{focused_label} (Recommended)",
+        "Use a general common username wordlist",
+        "Use my own username wordlist",
+    ]
+
+
+def _resolve_general_kerberos_username_wordlist(domain: str) -> str | None:
+    """Return the built-in general Kerberos username wordlist."""
+    service = KerberosUsernameWordlistService()
+    path = service.get_general_common_wordlist_path()
+    marked_domain = mark_sensitive(domain, "domain")
+    if path is None:
+        print_warning(
+            "The built-in general Kerberos username wordlist is not available in this runtime. "
+            f"Use a custom wordlist instead for {marked_domain}."
+        )
+        return None
+    marked_path = mark_sensitive(str(path), "path")
+    print_info(
+        f"Using the built-in general Kerberos username wordlist for {marked_domain}: {marked_path}"
+    )
+    return str(path)
+
+
+def _prompt_custom_kerberos_username_wordlist(
     shell: LdapShell,
     domain: str,
 ) -> str | None:
-    """Prompt until a valid Kerberos username wordlist is selected or skipped."""
+    """Prompt until a valid custom Kerberos username wordlist is selected or skipped."""
 
     in_container_runtime = is_full_container_runtime(shell)
     marked_domain = mark_sensitive(domain, "domain")
@@ -2495,7 +2759,7 @@ def _prompt_kerberos_username_wordlist(
         if not wordlist:
             wordlist = (
                 Prompt.ask(
-                    f"Specify the path of the username wordlist for domain {marked_domain}:"
+                    f"Specify the path of the custom username wordlist for domain {marked_domain}:"
                 )
                 or ""
             ).strip()
@@ -2532,6 +2796,320 @@ def _prompt_kerberos_username_wordlist(
             )
             _show_kerberos_enum_shortcut_hint(shell, domain)
             return None
+
+
+def _prompt_kerberos_username_pattern(shell: LdapShell, domain: str) -> str | None:
+    """Prompt for a known corporate username format."""
+    sample_domain = mark_sensitive(domain, "domain")
+    sample_name = "John Smith"
+    option_map: dict[str, str] = {}
+    options: list[str] = []
+    for pattern_key in SUPPORTED_KERBEROS_PATTERN_KEYS:
+        label = format_supported_pattern_label(pattern_key, sample_value=sample_name)
+        options.append(label)
+        option_map[label] = pattern_key
+
+    idx = shell._questionary_select(
+        f"Select the username format used in {sample_domain}",
+        options,
+        default_idx=0,
+    )
+    if idx is None:
+        print_error("Username format selection cancelled.")
+        return None
+    return option_map[options[idx]]
+
+
+def _collect_name_pairs_interactive(
+    shell: LdapShell,
+    domain: str,
+) -> list[tuple[str, str]] | None:
+    """Collect first/last name pairs for targeted username generation."""
+    options = [
+        "Use a file with 'Firstname Lastname' entries",
+        "Enter names interactively",
+    ]
+    choice = shell._questionary_select(
+        f"Select how to provide employee names for {mark_sensitive(domain, 'domain')}",
+        options,
+    )
+    if choice is None:
+        print_error("Selection cancelled.")
+        return None
+
+    names: list[tuple[str, str]] = []
+    if choice == 0:
+        path = _prompt_custom_kerberos_username_wordlist(shell, domain)
+        if not path:
+            return None
+        with open(path, encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    names.append((parts[0], parts[-1]))
+    else:
+        initial = "# Enter each 'Firstname Lastname' on a new line\n"
+        text = shell._open_fullscreen_editor(
+            f"Kerberos user entries for {domain}", initial
+        )
+        if text is None:
+            print_error("User entry cancelled.")
+            return None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                names.append((parts[0], parts[-1]))
+
+    if not names:
+        print_warning("No usable first/last-name pairs were provided.")
+        return None
+    return names
+
+
+def _prompt_linkedin_ready(shell: LdapShell) -> bool:
+    """Guide the operator through the LinkedIn login step."""
+    print_panel(
+        "\n".join(
+            [
+                "A browser window will open for LinkedIn authentication.",
+                "",
+                "1. Log in to LinkedIn in that browser.",
+                "2. Leave the browser open.",
+                "3. Return here and confirm when the session is ready.",
+            ]
+        ),
+        title="[bold cyan]LinkedIn Employee Discovery[/bold cyan]",
+        border_style="cyan",
+        expand=False,
+    )
+    return Confirm.ask("Have you completed the LinkedIn login in the browser?", default=True)
+
+
+def _prompt_validated_linkedin_company_slug(shell: LdapShell) -> str | None:
+    """Prompt for a LinkedIn company slug and validate it before continuing."""
+    linkedin_service = LinkedInUsernameDiscoveryService()
+    while True:
+        company_slug = (
+            Prompt.ask(
+                "Specify the LinkedIn company slug "
+                "(for https://www.linkedin.com/company/<slug>/)",
+                default="",
+            )
+            or ""
+        ).strip().strip("/")
+        if not company_slug:
+            print_warning("Skipping LinkedIn source because no company slug was provided.")
+            return None
+
+        marked_slug = mark_sensitive(company_slug, "company")
+        validation_result = linkedin_service.validate_company_slug_public(company_slug)
+        if validation_result is True:
+            print_info(f"LinkedIn company slug validated successfully: {marked_slug}")
+            return company_slug
+        if validation_result is None:
+            print_warning(
+                f"Could not validate the LinkedIn company slug {marked_slug} pre-login. "
+                "Continuing anyway."
+            )
+            return company_slug
+
+        print_warning(
+            f"The LinkedIn company slug {marked_slug} does not appear to exist."
+        )
+        options = [
+            "Re-enter the LinkedIn company slug (Recommended)",
+            "Skip LinkedIn employee discovery",
+        ]
+        choice_idx = shell._questionary_select(
+            "LinkedIn company slug validation failed. How do you want to proceed?",
+            options,
+            default_idx=0,
+        )
+        if choice_idx == 1:
+            return None
+
+
+def _build_targeted_kerberos_wordlist(shell: LdapShell, domain: str) -> str | None:
+    """Build a focused Kerberos username wordlist based on workspace type and known format."""
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    marked_domain = mark_sensitive(domain, "domain")
+    wordlist_service = KerberosUsernameWordlistService()
+    kerberos_dir = Path(
+        domain_subpath(
+            shell._get_workspace_cwd(),
+            shell.domains_dir,
+            domain,
+            shell.kerberos_dir,
+        )
+    )
+
+    knows_format = Confirm.ask(
+        f"Do you know the username format used in {marked_domain}?",
+        default=(workspace_type == "audit"),
+    )
+    if not knows_format:
+        fallback_options = [
+            "Use the built-in general common username wordlist (Recommended)",
+            "Use my own username wordlist",
+        ]
+        fallback_idx = shell._questionary_select(
+            "Username format unknown. How do you want to continue?",
+            fallback_options,
+            default_idx=0,
+        )
+        if fallback_idx is None:
+            print_error("Selection cancelled.")
+            return None
+        if fallback_idx == 0:
+            return _resolve_general_kerberos_username_wordlist(domain)
+        return _prompt_custom_kerberos_username_wordlist(shell, domain)
+
+    pattern_key = _prompt_kerberos_username_pattern(shell, domain)
+    if not pattern_key:
+        return None
+
+    if workspace_type == "audit":
+        source_options = [
+            "Statistically likely usernames",
+            "LinkedIn company employees",
+            "Known employee names / manual generation",
+        ]
+        default_sources = ["Statistically likely usernames"]
+    else:
+        source_options = [
+            "Statistically likely usernames",
+            "Known employee names / manual generation",
+        ]
+        default_sources = ["Statistically likely usernames"]
+
+    selected_sources = shell._questionary_checkbox(
+        f"Select the username sources to use for {marked_domain}",
+        source_options,
+        default_values=default_sources,
+    )
+    if not selected_sources:
+        print_warning("No username sources were selected.")
+        return None
+
+    merged_candidates: set[str] = set()
+    source_metadata: list[KerberosWordlistSourceMetadata] = []
+
+    if "Statistically likely usernames" in selected_sources:
+        stat_path = wordlist_service.get_statistically_likely_wordlist_path(pattern_key)
+        if stat_path is None:
+            print_warning(
+                f"No statistically-likely wordlist is available for the "
+                f"'{USERNAME_PATTERN_LABELS.get(pattern_key, pattern_key)}' format."
+            )
+        else:
+            stat_candidates = wordlist_service.load_candidates_from_file(stat_path)
+            merged_candidates.update(stat_candidates)
+            source_metadata.append(
+                KerberosWordlistSourceMetadata(
+                    source="statistically_likely_usernames",
+                    pattern_key=pattern_key,
+                    candidate_count=len(stat_candidates),
+                    details={"path": str(stat_path)},
+                )
+            )
+
+    if "Known employee names / manual generation" in selected_sources:
+        names = _collect_name_pairs_interactive(shell, domain)
+        if names:
+            generated_candidates = wordlist_service.generate_candidates_from_names(
+                names,
+                pattern_key=pattern_key,
+            )
+            merged_candidates.update(generated_candidates)
+            source_metadata.append(
+                KerberosWordlistSourceMetadata(
+                    source="manual_names",
+                    pattern_key=pattern_key,
+                    candidate_count=len(generated_candidates),
+                    details={"name_pairs": len(names)},
+                )
+            )
+
+    if "LinkedIn company employees" in selected_sources:
+        if pattern_key not in LINKEDIN_SUPPORTED_PATTERN_KEYS:
+            print_warning(
+                f"LinkedIn generation does not support the "
+                f"'{USERNAME_PATTERN_LABELS.get(pattern_key, pattern_key)}' format yet."
+            )
+        else:
+            company_slug = _prompt_validated_linkedin_company_slug(shell)
+            if not company_slug:
+                print_info("Skipping LinkedIn employee discovery.")
+            else:
+                try:
+                    session_cache_path = kerberos_dir / "linkedin_session.json"
+                    linkedin_service = LinkedInUsernameDiscoveryService(
+                        cache_provider=CachedLinkedInSessionProvider(session_cache_path)
+                    )
+                    company_info, employees = linkedin_service.login_and_collect(
+                        company_slug=company_slug,
+                        wait_for_user_ready=lambda: _prompt_linkedin_ready(shell),
+                        geoblast=True,
+                    )
+                    raw_name_lines = []
+                    for employee in employees:
+                        raw_name_lines.append(employee.full_name)
+
+                    if raw_name_lines:
+                        generated_candidates = wordlist_service.generate_candidates_from_linkedin_names(
+                            raw_name_lines,
+                            pattern_key=pattern_key,
+                        )
+                        merged_candidates.update(generated_candidates)
+                        (kerberos_dir / f"linkedin_{company_slug}_raw_names.txt").write_text(
+                            "\n".join(sorted(set(raw_name_lines))) + "\n",
+                            encoding="utf-8",
+                        )
+                        source_metadata.append(
+                            KerberosWordlistSourceMetadata(
+                                source="linkedin_employees",
+                                pattern_key=pattern_key,
+                                candidate_count=len(generated_candidates),
+                                details={
+                                    "company_slug": company_slug,
+                                    "company_name": company_info.name,
+                                    "staff_count": company_info.staff_count,
+                                    "raw_profiles": len(employees),
+                                    "usable_full_names": len(raw_name_lines),
+                                },
+                            )
+                        )
+                    else:
+                        print_warning(
+                            "LinkedIn employee discovery completed, but no usable employee names "
+                            "were extracted from the returned profiles."
+                        )
+                except Exception as exc:
+                    telemetry.capture_exception(exc)
+                    print_warning(f"LinkedIn employee discovery failed: {exc}")
+
+    if not merged_candidates:
+        print_warning(
+            f"No username candidates were generated for {marked_domain}. "
+            "Try another source selection or use a custom wordlist."
+        )
+        return None
+
+    output_path = wordlist_service.write_generated_wordlist(
+        kerberos_dir=kerberos_dir,
+        output_name="kerberos_user_candidates.txt",
+        candidates=merged_candidates,
+        metadata=source_metadata,
+        domain=domain,
+    )
+    marked_output = mark_sensitive(str(output_path), "path")
+    print_success(
+        f"Generated {len(merged_candidates)} focused Kerberos username candidates at {marked_output}"
+    )
+    return str(output_path)
 
 
 def _show_kerberos_enum_shortcut_hint(shell: LdapShell, domain: str) -> None:

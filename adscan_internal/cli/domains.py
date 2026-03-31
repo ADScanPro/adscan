@@ -29,6 +29,7 @@ from adscan_internal.rich_output import (
     print_success,
     print_warning,
 )
+from adscan_internal.cli.ci_events import emit_phase
 from adscan_internal.cli.dns import (
     confirm_domain_pdc_mapping,
     finalize_domain_context,
@@ -232,6 +233,7 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
         password = shell.domains_data[domain]["password"]
         pdc = shell.domains_data[domain]["pdc"]
 
+        emit_phase("trust_enumeration")
         print_operation_header(
             "Trust Enumeration",
             details={

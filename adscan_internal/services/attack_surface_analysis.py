@@ -61,7 +61,11 @@ def _path_relations(path: dict[str, Any]) -> list[str]:
     relations = path.get("relations")
     if not isinstance(relations, list):
         return []
-    return [str(r).strip().lower() for r in relations if str(r).strip().lower() != "memberof"]
+    return [
+        str(r).strip().lower()
+        for r in relations
+        if str(r).strip().lower() != "memberof"
+    ]
 
 
 def _path_nodes(path: dict[str, Any]) -> list[str]:
@@ -74,21 +78,24 @@ def _path_nodes(path: dict[str, Any]) -> list[str]:
 
 # ── Public data structures ─────────────────────────────────────────────────────
 
+
 @dataclass
 class NodeCentralityEntry:
     """A node that appears in one or more attack paths."""
+
     node_id: str
-    path_count: int                      # number of paths passing through this node
-    worst_status: str                    # most severe status among paths using this node
-    worst_status_severity: int           # numeric severity (0 = most severe)
-    is_entry_point: bool = False         # True if node appears as path source
-    is_tier0_target: bool = False        # True if node appears as path target (last node)
-    is_intermediate: bool = False        # True if node is neither source nor target
+    path_count: int  # number of paths passing through this node
+    worst_status: str  # most severe status among paths using this node
+    worst_status_severity: int  # numeric severity (0 = most severe)
+    is_entry_point: bool = False  # True if node appears as path source
+    is_tier0_target: bool = False  # True if node appears as path target (last node)
+    is_intermediate: bool = False  # True if node is neither source nor target
 
 
 @dataclass
 class RelationCentralityEntry:
     """A relation/step type that appears in one or more attack paths."""
+
     relation: str
     path_count: int
     worst_status: str
@@ -108,15 +115,16 @@ class RemediationTarget:
     2. remediation_complexity (ascending) — lowest effort first when equal
     3. worst_status_severity (ascending) — confirmed exploited paths first
     """
-    target_id: str                        # node_id or relation name
-    target_label: str                     # human-readable
-    target_type: str                      # "node" | "relation"
-    paths_eliminated: int                 # paths that become invalid if this is fixed
+
+    target_id: str  # node_id or relation name
+    target_label: str  # human-readable
+    target_type: str  # "node" | "relation"
+    paths_eliminated: int  # paths that become invalid if this is fixed
     total_paths: int
-    elimination_rate: float               # paths_eliminated / total_paths
+    elimination_rate: float  # paths_eliminated / total_paths
     worst_status: str
-    remediation_complexity: str           # low | medium | high | very_high
-    remediation_complexity_rank: int      # 0–3 for sorting
+    remediation_complexity: str  # low | medium | high | very_high
+    remediation_complexity_rank: int  # 0–3 for sorting
     remediation_effort: str
     can_fully_mitigate: bool = True
 
@@ -124,12 +132,13 @@ class RemediationTarget:
 @dataclass
 class AttackSurfaceAnalysis:
     """Complete attack surface analysis for one domain."""
+
     domain: str
     total_paths: int
-    paths_by_status: dict[str, int]        # status -> count
-    node_centrality: list[NodeCentralityEntry]          # sorted by path_count desc
+    paths_by_status: dict[str, int]  # status -> count
+    node_centrality: list[NodeCentralityEntry]  # sorted by path_count desc
     relation_centrality: list[RelationCentralityEntry]  # sorted by path_count desc
-    remediation_priority: list[RemediationTarget]       # sorted by priority
+    remediation_priority: list[RemediationTarget]  # sorted by priority
     # Raw data (for graph rendering)
     unique_nodes: set[str] = field(default_factory=set)
     unique_relations: set[str] = field(default_factory=set)
@@ -138,6 +147,7 @@ class AttackSurfaceAnalysis:
 
 
 # ── Core analysis ──────────────────────────────────────────────────────────────
+
 
 def compute_attack_surface_analysis(
     paths: list[dict[str, Any]],
@@ -158,6 +168,7 @@ def compute_attack_surface_analysis(
         from adscan_internal.services.attack_step_catalog import (
             get_step_metadata,
         )
+
         _has_step_meta = True
     except ImportError:
         _has_step_meta = False
@@ -198,8 +209,8 @@ def compute_attack_surface_analysis(
 
         for i, node_id in enumerate(nodes):
             all_nodes.add(node_id)
-            is_entry = (i == 0)
-            is_target = (i == len(nodes) - 1)
+            is_entry = i == 0
+            is_target = i == len(nodes) - 1
             is_intermediate = not is_entry and not is_target
 
             if is_entry:
@@ -258,22 +269,27 @@ def compute_attack_surface_analysis(
     total = len([p for p in paths if isinstance(p, dict)])
 
     # ── Pass 2: build NodeCentralityEntry list ───────────────────────────────
-    _sev_to_status = {v: k for k, v in _STATUS_SEVERITY.items() if k in
-                      {"exploited", "blocked", "unsupported", "attempted", "theoretical"}}
+    _sev_to_status = {
+        v: k
+        for k, v in _STATUS_SEVERITY.items()
+        if k in {"exploited", "blocked", "unsupported", "attempted", "theoretical"}
+    }
 
     node_centrality: list[NodeCentralityEntry] = []
     for node_id, d in node_data.items():
         worst_sev = d["worst_severity"]
         worst_status = _sev_to_status.get(worst_sev, "theoretical")
-        node_centrality.append(NodeCentralityEntry(
-            node_id=node_id,
-            path_count=d["path_count"],
-            worst_status=worst_status,
-            worst_status_severity=worst_sev,
-            is_entry_point=d["is_entry"],
-            is_tier0_target=d["is_target"],
-            is_intermediate=d["is_intermediate"],
-        ))
+        node_centrality.append(
+            NodeCentralityEntry(
+                node_id=node_id,
+                path_count=d["path_count"],
+                worst_status=worst_status,
+                worst_status_severity=worst_sev,
+                is_entry_point=d["is_entry"],
+                is_tier0_target=d["is_target"],
+                is_intermediate=d["is_intermediate"],
+            )
+        )
     node_centrality.sort(key=lambda e: (-e.path_count, e.worst_status_severity))
 
     # ── Pass 3: build RelationCentralityEntry list ───────────────────────────
@@ -281,15 +297,17 @@ def compute_attack_surface_analysis(
     for rel_key, d in rel_data.items():
         worst_sev = d["worst_severity"]
         worst_status = _sev_to_status.get(worst_sev, "theoretical")
-        relation_centrality.append(RelationCentralityEntry(
-            relation=rel_key,
-            path_count=d["path_count"],
-            worst_status=worst_status,
-            worst_status_severity=worst_sev,
-            remediation_complexity=d["remediation_complexity"],
-            remediation_effort=d["remediation_effort"],
-            can_fully_mitigate=d["can_fully_mitigate"],
-        ))
+        relation_centrality.append(
+            RelationCentralityEntry(
+                relation=rel_key,
+                path_count=d["path_count"],
+                worst_status=worst_status,
+                worst_status_severity=worst_sev,
+                remediation_complexity=d["remediation_complexity"],
+                remediation_effort=d["remediation_effort"],
+                can_fully_mitigate=d["can_fully_mitigate"],
+            )
+        )
     relation_centrality.sort(key=lambda e: (-e.path_count, e.worst_status_severity))
 
     # ── Pass 4: Remediation priority list ───────────────────────────────────
@@ -310,20 +328,23 @@ def compute_attack_surface_analysis(
             continue
         complexity_rank = _COMPLEXITY_ORDER.get(entry.remediation_complexity, 1)
         elimination_rate = entry.path_count / total if total else 0.0
-        remediation_targets.append(RemediationTarget(
-            target_id=entry.relation,
-            target_label=entry.relation.upper() if not entry.remediation_effort
-                         else _friendly_rel_label(entry.relation),
-            target_type="relation",
-            paths_eliminated=entry.path_count,
-            total_paths=total,
-            elimination_rate=elimination_rate,
-            worst_status=entry.worst_status,
-            remediation_complexity=entry.remediation_complexity,
-            remediation_complexity_rank=complexity_rank,
-            remediation_effort=entry.remediation_effort,
-            can_fully_mitigate=entry.can_fully_mitigate,
-        ))
+        remediation_targets.append(
+            RemediationTarget(
+                target_id=entry.relation,
+                target_label=entry.relation.upper()
+                if not entry.remediation_effort
+                else _friendly_rel_label(entry.relation),
+                target_type="relation",
+                paths_eliminated=entry.path_count,
+                total_paths=total,
+                elimination_rate=elimination_rate,
+                worst_status=entry.worst_status,
+                remediation_complexity=entry.remediation_complexity,
+                remediation_complexity_rank=complexity_rank,
+                remediation_effort=entry.remediation_effort,
+                can_fully_mitigate=entry.can_fully_mitigate,
+            )
+        )
 
     # Node-based targets (intermediate nodes with high centrality)
     for entry in node_centrality:
@@ -332,22 +353,24 @@ def compute_attack_surface_analysis(
         if entry.path_count < 2:
             continue  # single-path nodes: not worth listing separately
         elimination_rate = entry.path_count / total if total else 0.0
-        remediation_targets.append(RemediationTarget(
-            target_id=entry.node_id,
-            target_label=entry.node_id,
-            target_type="node",
-            paths_eliminated=entry.path_count,
-            total_paths=total,
-            elimination_rate=elimination_rate,
-            worst_status=entry.worst_status,
-            remediation_complexity="medium",   # node-level: ACL/config fix
-            remediation_complexity_rank=1,
-            remediation_effort=(
-                f"Remediate the vulnerabilities or ACL misconfigurations that "
-                f"allow {entry.path_count} attack path(s) to pass through this object."
-            ),
-            can_fully_mitigate=True,
-        ))
+        remediation_targets.append(
+            RemediationTarget(
+                target_id=entry.node_id,
+                target_label=entry.node_id,
+                target_type="node",
+                paths_eliminated=entry.path_count,
+                total_paths=total,
+                elimination_rate=elimination_rate,
+                worst_status=entry.worst_status,
+                remediation_complexity="medium",  # node-level: ACL/config fix
+                remediation_complexity_rank=1,
+                remediation_effort=(
+                    f"Remediate the vulnerabilities or ACL misconfigurations that "
+                    f"allow {entry.path_count} attack path(s) to pass through this object."
+                ),
+                can_fully_mitigate=True,
+            )
+        )
 
     remediation_targets.sort(
         key=lambda t: (
@@ -374,21 +397,40 @@ def compute_attack_surface_analysis(
 def _friendly_rel_label(rel: str) -> str:
     """Return a human-readable label for a relation key."""
     label_map = {
-        "adcsesc1": "ADCS ESC1", "adcsesc2": "ADCS ESC2", "adcsesc3": "ADCS ESC3",
-        "adcsesc4": "ADCS ESC4", "adcsesc6": "ADCS ESC6", "adcsesc8": "ADCS ESC8",
-        "adcsesc9": "ADCS ESC9", "adcsesc10": "ADCS ESC10", "adcsesc13": "ADCS ESC13",
+        "adcsesc1": "ADCS ESC1",
+        "adcsesc2": "ADCS ESC2",
+        "adcsesc3": "ADCS ESC3",
+        "adcsesc4": "ADCS ESC4",
+        "adcsesc6": "ADCS ESC6",
+        "adcsesc8": "ADCS ESC8",
+        "adcsesc9": "ADCS ESC9",
+        "adcsesc10": "ADCS ESC10",
+        "adcsesc13": "ADCS ESC13",
         "adcsesc15": "ADCS ESC15",
-        "genericall": "GenericAll", "genericwrite": "GenericWrite",
-        "writedacl": "WriteDACL", "writeowner": "WriteOwner",
-        "forcechangepassword": "ForceChangePassword", "addmember": "AddMember",
-        "readlapspassword": "ReadLAPSPassword", "readgmsapassword": "ReadGMSAPassword",
-        "dcsync": "DCSync", "goldencert": "GoldenCert",
-        "adminto": "AdminTo", "kerberoasting": "Kerberoasting",
-        "asreproasting": "ASREPRoasting", "zerologon": "Zerologon",
-        "nopac": "NoPac", "printnightmare": "PrintNightmare",
-        "dfscoerce": "DFSCoerce", "petitpotam": "PetitPotam",
-        "printerbug": "PrinterBug", "mseven": "MS17-010", "ms17-010": "MS17-010",
-        "sqladmin": "SQLAdmin", "allowedtodelegate": "UnconstrainedDelegation",
+        "genericall": "GenericAll",
+        "genericwrite": "GenericWrite",
+        "writedacl": "WriteDACL",
+        "writeowner": "WriteOwner",
+        "forcechangepassword": "ForceChangePassword",
+        "addmember": "AddMember",
+        "readlapspassword": "ReadLAPSPassword",
+        "readgmsapassword": "ReadGMSAPassword",
+        "dcsync": "DCSync",
+        "goldencert": "GoldenCert",
+        "adminto": "AdminTo",
+        "kerberoasting": "Kerberoasting",
+        "asreproasting": "ASREPRoasting",
+        "zerologon": "Zerologon",
+        "nopac": "NoPac",
+        "printnightmare": "PrintNightmare",
+        "dfscoerce": "DFSCoerce",
+        "petitpotam": "PetitPotam",
+        "printerbug": "PrinterBug",
+        "mseven": "MS17-010",
+        "ms17-010": "MS17-010",
+        "sqladmin": "SQLAdmin",
+        "allowedtodelegate": "ConstrainedDelegation",
+        "coercetotgt": "UnconstrainedDelegation",
         "allowedtoactonbehalfofotheridentity": "RBCD",
     }
     return label_map.get(str(rel).lower(), str(rel))

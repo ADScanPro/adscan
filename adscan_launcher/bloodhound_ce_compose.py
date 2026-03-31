@@ -911,9 +911,9 @@ def compose_up(compose_path: Path) -> bool:
 
         print_error("Failed to start BloodHound CE containers.")
         if proc.stderr:
-            print_info_debug(f"[bloodhound-ce] up stderr:\n{proc.stderr}")
+            print_info(f"[bloodhound-ce] up stderr:\n{proc.stderr}")
         if proc.stdout:
-            print_info_debug(f"[bloodhound-ce] up stdout:\n{proc.stdout}")
+            print_info(f"[bloodhound-ce] up stdout:\n{proc.stdout}")
         return False
     except Exception as exc:
         telemetry.capture_exception(exc)

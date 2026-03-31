@@ -44,6 +44,16 @@ from adscan_internal.ligolo_manager import (
 
 _MINIMUM_HASHCAT_VERSION = (7, 1, 2)
 _JOHN_AVX2_REQUIRED_RE = re.compile(r"avx2 is required for this build", re.IGNORECASE)
+_RUNTIME_MANAGED_JOHN_PATHS = (
+    "/opt/adscan/tools/john/run/john",
+    "/opt/adscan/bin/john",
+)
+_REQUIRED_JOHN_CONVERTERS = (
+    "keepass2john",
+    "zip2john",
+    "pfx2john",
+    "ansible2john",
+)
 
 
 @dataclass(frozen=True)
@@ -180,6 +190,71 @@ def get_check_failure_recovery_guidance(
         instruction="Try: adscan check --fix",
         interactive_prompt="Try to fix automatically now (runs `adscan check --fix`)?",
     )
+
+
+def _resolve_runtime_managed_john_converter_path(converter_name: str) -> str | None:
+    """Resolve one runtime-managed ``*2john`` converter path."""
+    normalized_name = str(converter_name or "").strip()
+    if not normalized_name:
+        return None
+
+    candidates = [
+        shutil.which(normalized_name),
+        shutil.which(f"{normalized_name}.py"),
+        shutil.which(f"{normalized_name}.pl"),
+        f"/opt/adscan/bin/{normalized_name}",
+        f"/opt/adscan/bin/{normalized_name}.py",
+        f"/opt/adscan/bin/{normalized_name}.pl",
+        f"/opt/adscan/tools/john/run/{normalized_name}",
+        f"/opt/adscan/tools/john/run/{normalized_name}.py",
+        f"/opt/adscan/tools/john/run/{normalized_name}.pl",
+    ]
+    for candidate in candidates:
+        normalized_candidate = str(candidate or "").strip()
+        if normalized_candidate and os.path.exists(normalized_candidate) and os.access(
+            normalized_candidate, os.X_OK
+        ):
+            return os.path.realpath(normalized_candidate)
+    return None
+
+
+def _validate_runtime_managed_john_converters(
+    *,
+    john_executable: str,
+    deps: Any,
+) -> list[str]:
+    """Validate the John converters ADscan uses for artifact cracking."""
+    normalized_john = str(john_executable or "").strip()
+    if not normalized_john:
+        return []
+    if normalized_john not in _RUNTIME_MANAGED_JOHN_PATHS and not normalized_john.startswith(
+        "/opt/adscan/"
+    ):
+        return []
+
+    missing_converters: list[str] = []
+    for converter_name in _REQUIRED_JOHN_CONVERTERS:
+        converter_path = _resolve_runtime_managed_john_converter_path(converter_name)
+        if converter_path:
+            deps.print_info_debug(
+                "[check] Found required John converter: "
+                f"{converter_name} -> {converter_path}"
+            )
+            continue
+        missing_converters.append(converter_name)
+
+    if not missing_converters:
+        deps.print_success(
+            "Required John artifact converters are available "
+            f"({', '.join(_REQUIRED_JOHN_CONVERTERS)})"
+        )
+        return []
+
+    return [
+        "John the Ripper runtime is missing required artifact converters: "
+        + ", ".join(missing_converters)
+        + "."
+    ]
 
 
 def should_offer_interactive_check_repair(
@@ -1361,6 +1436,12 @@ def _normalize_missing_system_packages_for_runtime(
                         f"John the Ripper is available via PATH ({john_executable})"
                     )
                     normalized_missing.remove("john")
+                    issues.extend(
+                        _validate_runtime_managed_john_converters(
+                            john_executable=john_executable,
+                            deps=deps,
+                        )
+                    )
                 else:
                     stdout_text = (getattr(result, "stdout", "") or "").strip()
                     stderr_text = (getattr(result, "stderr", "") or "").strip()

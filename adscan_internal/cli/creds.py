@@ -35,6 +35,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import BRAND_COLORS, mark_sensitive, print_panel
+from adscan_internal.cli.ci_events import emit_event, emit_phase
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.cli.cracking import (
     handle_hash_cracking,
@@ -606,8 +607,8 @@ def handle_auth_and_optional_privs(
             return support.compromise_semantics, support.compromise_effort
         return "other", "other"
 
-    def _is_terminal_direct_compromise_attack_step() -> bool:
-        """Return True for a terminal direct-compromise step in a supported search."""
+    def _get_terminal_attack_path_search_mode() -> str | None:
+        """Return the normalized terminal search mode when the active step is last."""
         context = get_attack_path_step_context(shell)
         search_mode = str(context.get("search_mode_label") or "").strip().lower()
         compromise_semantics, compromise_effort = (
@@ -621,37 +622,44 @@ def handle_auth_and_optional_privs(
                 "[creds] terminal pivot check: invalid attack-path step context "
                 f"context={mark_sensitive(str(context), 'detail')}"
             )
-            return False
-        is_terminal_direct_compromise = (
-            search_mode in {"pivot search", "high-value search"}
+            return None
+        terminal_mode = (
+            search_mode
+            if search_mode in {"pivot search", "high-value search"}
             and step_index > 0
             and step_index == last_executable_idx
-            and compromise_semantics == "direct_target_compromise"
+            else None
         )
         print_info_debug(
-            "[creds] terminal direct-compromise check: "
+            "[creds] terminal attack-path check: "
             f"search_mode={mark_sensitive(search_mode or 'none', 'detail')} "
             f"compromise_semantics={mark_sensitive(compromise_semantics, 'detail')} "
             f"compromise_effort={mark_sensitive(compromise_effort, 'detail')} "
             f"step_index={step_index} last_executable_idx={last_executable_idx} "
-            f"result={is_terminal_direct_compromise!r}"
+            f"result={mark_sensitive(terminal_mode or 'none', 'detail')}"
         )
-        return is_terminal_direct_compromise
+        return terminal_mode
 
     def _is_terminal_pivot_attack_step() -> bool:
-        """Return True when the active step is the final actionable pivot step."""
-        context = get_attack_path_step_context(shell)
-        search_mode = str(context.get("search_mode_label") or "").strip().lower()
-        is_terminal_pivot = (
-            search_mode == "pivot search"
-            and _is_terminal_direct_compromise_attack_step()
-        )
+        """Return True when the active step is the final pivot-search step."""
+        terminal_mode = _get_terminal_attack_path_search_mode()
+        is_terminal_pivot = terminal_mode == "pivot search"
         print_info_debug(
             "[creds] terminal pivot check: "
-            f"search_mode={mark_sensitive(search_mode or 'none', 'detail')} "
+            f"search_mode={mark_sensitive(terminal_mode or 'none', 'detail')} "
             f"result={is_terminal_pivot!r}"
         )
         return is_terminal_pivot
+
+    def _resolve_active_step_target_principal() -> str | None:
+        """Return the normalized principal represented by the step target node."""
+        active = getattr(shell, "_active_attack_graph_step", None)
+        if not isinstance(active, ActiveAttackGraphStep):
+            return None
+        target_label = str(getattr(active, "to_label", "") or "").strip()
+        if not target_label:
+            return None
+        return normalize_samaccountname(target_label)
 
     def _resolve_active_step_execution_user() -> str | None:
         """Best-effort extraction of the 'execution user' for the active step."""
@@ -686,15 +694,6 @@ def handle_auth_and_optional_privs(
                 "(attack path execution inactive)"
             )
             return False
-        followup_context = get_attack_path_followup_context(shell)
-        if followup_context:
-            print_info_debug(
-                "[creds] terminal pivot follow-up gate: disabled "
-                "(nested attack-path follow-up active; defering to potential "
-                "new-principal privilege assessment flow) "
-                f"context={mark_sensitive(str(followup_context), 'detail')}"
-            )
-            return False
         if not _is_terminal_pivot_attack_step():
             print_info_debug(
                 "[creds] terminal pivot follow-up gate: disabled "
@@ -703,12 +702,12 @@ def handle_auth_and_optional_privs(
             return False
 
         normalized_user = normalize_samaccountname(user)
-        active_step_user = _resolve_active_step_execution_user()
+        target_principal = _resolve_active_step_target_principal()
         step_context = get_attack_path_step_context(shell)
         print_info_debug(
             "[creds] terminal pivot follow-up evaluation: "
             f"user={mark_sensitive(normalized_user or user, 'user')} "
-            f"active_step_user={mark_sensitive(active_step_user or 'N/A', 'user')} "
+            f"target_principal={mark_sensitive(target_principal or 'N/A', 'user')} "
             f"step_context={mark_sensitive(str(step_context), 'detail')}"
         )
         if not normalized_user:
@@ -717,10 +716,10 @@ def handle_auth_and_optional_privs(
                 "(credential user could not be normalized)"
             )
             return False
-        if active_step_user and normalized_user == active_step_user:
+        if target_principal and normalized_user != target_principal:
             print_info_debug(
                 "[creds] skipping terminal pivot user follow-ups "
-                "(credential belongs to active step execution user)"
+                "(credential does not match the target node principal)"
             )
             return False
 
@@ -852,17 +851,60 @@ def handle_auth_and_optional_privs(
         if not user or (cred is None) or (cred == "" and not allow_empty_credentials):
             continue
         try:
+            if updated_auth_status == "pwned":
+                print_info_debug(
+                    "[creds] skipping attack-path privilege UX because domain is pwned"
+                )
+                continue
+            terminal_search_mode = _get_terminal_attack_path_search_mode()
+            normalized_user = normalize_samaccountname(user)
+            target_principal = _resolve_active_step_target_principal()
+
+            if terminal_search_mode == "pivot search":
+                if _run_terminal_pivot_user_followups(user, cred):
+                    continue
+                if target_principal and normalized_user == target_principal:
+                    print_info_debug(
+                        "[creds] terminal pivot path resolved expected target principal; "
+                        "keeping lightweight follow-up flow only"
+                    )
+                    continue
+
+            if (
+                terminal_search_mode == "high-value search"
+                and normalized_user
+            ):
+                print_info_debug(
+                    "[creds] enabling ask_for_user_privs for terminal high-value path "
+                    f"user={mark_sensitive(normalized_user, 'user')}"
+                )
+                shell.ask_for_user_privs(domain, user, cred)
+                continue
+
+            if (
+                terminal_search_mode == "pivot search"
+                and normalized_user
+                and normalized_user != target_principal
+            ):
+                print_info_debug(
+                    "[creds] enabling ask_for_user_privs for terminal pivot path "
+                    "because credential differs from target node principal "
+                    f"user={mark_sensitive(normalized_user, 'user')} "
+                    f"target_principal={mark_sensitive(target_principal or 'N/A', 'user')}"
+                )
+                shell.ask_for_user_privs(domain, user, cred)
+                continue
+
             if _run_terminal_pivot_user_followups(user, cred):
                 continue
             force_full_user_privs_from_attack_context = (
                 _should_force_full_user_privs_from_attack_context(user)
             )
-            normalized_user = normalize_samaccountname(user)
             should_force_high_value_terminal_user_privs = False
             if (
                 is_attack_path_execution_active(shell)
                 and not force_full_user_privs_from_attack_context
-                and _is_terminal_direct_compromise_attack_step()
+                and terminal_search_mode == "high-value search"
                 and normalized_user
             ):
                 should_force_high_value_terminal_user_privs = (
@@ -1109,6 +1151,7 @@ def add_credential(
     import time
 
     if not os.path.exists(os.path.join("domains", domain)):
+        emit_phase("domain_setup")
         marked_domain = mark_sensitive(domain, "domain")
         marked_pdc_ip = mark_sensitive(pdc_ip, "ip") if pdc_ip else None
         print_info_verbose(
@@ -1215,6 +1258,26 @@ def add_credential(
                 shell.ask_for_mssql_steal(domain, host, user, cred, "false")
             elif service == "smb" and prompt_local_reuse_after:
                 shell.ask_for_local_cred_reuse(domain, user, cred)
+
+            try:
+                emit_event(
+                    "credential",
+                    phase="credential_analysis",
+                    phase_label="Credential Analysis",
+                    category="identity_compromise",
+                    username=user,
+                    domain=domain,
+                    host=host,
+                    service=service,
+                    credential_type="hash" if is_hash else "password",
+                    scope="local",
+                    verification_status=(
+                        "verified" if verify_local_credential else "trusted_import"
+                    ),
+                    message=f"Local access established for {user} on {host}.",
+                )
+            except Exception as exc:  # pragma: no cover - best effort eventing
+                telemetry.capture_exception(exc)
 
             if source_steps and credential_source_verified:
                 try:
@@ -1460,6 +1523,24 @@ def add_credential(
             except Exception as e:
                 telemetry.capture_exception(e)
                 # Telemetry failures shouldn't break the credential addition flow
+
+            try:
+                emit_event(
+                    "credential",
+                    phase="credential_analysis",
+                    phase_label="Credential Analysis",
+                    category="identity_compromise",
+                    username=user,
+                    domain=domain,
+                    credential_type="hash" if is_hash else "password",
+                    scope="domain",
+                    verification_status=(
+                        "verified" if verify_credential or credential_verified else "trusted_import"
+                    ),
+                    message=f"Access established for {user}@{domain}.",
+                )
+            except Exception as exc:  # pragma: no cover - best effort eventing
+                telemetry.capture_exception(exc)
 
         if source_steps and (credential_verified or credential_source_verified):
             try:

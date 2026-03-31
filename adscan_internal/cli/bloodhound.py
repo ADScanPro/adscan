@@ -34,6 +34,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.bloodhound_ce_compose import BLOODHOUND_CE_DEFAULT_WEB_PORT
+from adscan_internal.cli.ci_events import emit_event, emit_phase
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.rich_output import mark_passthrough, mark_sensitive, print_panel
 from adscan_internal.services.attack_graph_service import (
@@ -1027,6 +1028,8 @@ def run_bloodhound_collector(
             f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
         )
         return []
+
+    emit_phase("graph_collection")
 
     # Resolve BloodHound workspace directory under the current workspace.
     workspace_cwd = shell._get_workspace_cwd()
@@ -2384,6 +2387,9 @@ def run_bloodhound_attack_paths(
         from adscan_internal.services.attack_graph_service import (
             get_attack_path_summaries,
         )
+        from adscan_internal.cli.attack_path_execution import (
+            persist_attack_path_snapshot,
+        )
 
         print_info_debug(
             "[attack_paths] Phase 2 falling back to domain-wide summaries because no owned users are stored: "
@@ -2400,6 +2406,15 @@ def run_bloodhound_attack_paths(
             target_mode="tier0",
         )
         if display_paths:
+            persist_attack_path_snapshot(
+                shell,
+                target_domain,
+                summaries=display_paths,
+                scope="domain",
+                target="highvalue",
+                target_mode="tier0",
+                search_mode_label="High-Value Search",
+            )
             print_attack_paths_summary(
                 target_domain,
                 display_paths,
@@ -3632,6 +3647,16 @@ def run_bloodhound_all_users(shell: BloodHoundShell, target_domain: str) -> None
             "enabled_users.txt",
             source="bloodhound_enabled_users",
         )
+        emit_event(
+            "coverage",
+            phase="domain_analysis",
+            phase_label="Domain Analysis",
+            category="identity_inventory",
+            domain=target_domain,
+            metric_type="enabled_users",
+            count=len(users),
+            message=f"Enabled identity inventory updated: {len(users)} active users discovered.",
+        )
         return
     except Exception as e:
         telemetry.capture_exception(e)
@@ -4139,6 +4164,16 @@ def run_bloodhound_computers_all(shell: BloodHoundShell, target_domain: str) -> 
         return
     try:
         computers = shell._get_bloodhound_service().get_computers(domain=target_domain)
+        emit_event(
+            "coverage",
+            phase="domain_analysis",
+            phase_label="Domain Analysis",
+            category="host_inventory",
+            domain=target_domain,
+            metric_type="enabled_hosts",
+            count=len(computers),
+            message=f"Enabled host inventory updated: {len(computers)} active computers discovered.",
+        )
         shell._process_bloodhound_computers_list(
             target_domain, "enabled_computers.txt", computers
         )
@@ -4349,6 +4384,16 @@ def execute_bloodhound_laps(
                 print_success(
                     f"LAPS-enabled inventory generated for domain {marked_domain} ({count} hosts)."
                 )
+                emit_event(
+                    "coverage",
+                    phase="domain_analysis",
+                    phase_label="Domain Analysis",
+                    category="laps_inventory",
+                    domain=domain,
+                    metric_type="laps_enabled_hosts",
+                    count=count,
+                    message=f"Managed local administrator protection confirmed on {count} hosts.",
+                )
                 dc_file = None
                 non_dc_file = None
                 if dc_list:
@@ -4376,6 +4421,16 @@ def execute_bloodhound_laps(
                 marked_domain = mark_sensitive(domain, "domain")
                 print_success(
                     f"LAPS-missing inventory generated for domain {marked_domain} ({count} hosts)."
+                )
+                emit_event(
+                    "coverage",
+                    phase="domain_analysis",
+                    phase_label="Domain Analysis",
+                    category="laps_inventory",
+                    domain=domain,
+                    metric_type="laps_missing_hosts",
+                    count=count,
+                    message=f"Managed local administrator protection is missing on {count} hosts.",
                 )
                 dc_file = None
                 non_dc_file = None

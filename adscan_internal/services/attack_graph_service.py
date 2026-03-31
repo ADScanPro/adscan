@@ -23,6 +23,16 @@ from adscan_internal.workspaces import domain_subpath, read_json_file, write_jso
 from adscan_internal.workspaces.computers import load_enabled_computer_samaccounts
 
 from adscan_internal.services import attack_graph_core, attack_paths_core
+from adscan_internal.services.attack_paths_materialized_cache import (
+    MaterializedAttackPathArtifacts,
+    MaterializedPreparedRuntimeGraph,
+    build_attack_path_artifact_fingerprint,
+    invalidate_attack_path_artifacts,
+    load_materialized_attack_path_artifacts,
+    load_materialized_prepared_runtime_graph,
+    persist_materialized_attack_path_artifacts,
+    persist_materialized_prepared_runtime_graph,
+)
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
     classify_relation_support,
@@ -35,6 +45,7 @@ from adscan_internal.services.membership_snapshot import (
     membership_snapshot_path as _membership_snapshot_path,
     snapshot_has_sid_metadata as _snapshot_has_sid_metadata,
 )
+from adscan_internal.services.high_value import normalize_samaccountname
 from adscan_internal.services.cache_metrics import (
     copy_stats,
     increment_scoped_stats,
@@ -183,6 +194,19 @@ _ATTACK_PATHS_CACHE_STATS: dict[str, int] = {
     "invalidations": 0,
 }
 _ATTACK_PATHS_CACHE_DOMAIN_STATS: dict[str, dict[str, int]] = {}
+_ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED = os.getenv(
+    "ADSCAN_ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+_ATTACK_PATHS_MATERIALIZED_CACHE: OrderedDict[
+    tuple[str, str], MaterializedAttackPathArtifacts
+] = OrderedDict()
+_ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE: OrderedDict[
+    tuple[str, str], MaterializedPreparedRuntimeGraph
+] = OrderedDict()
+_ATTACK_PATHS_MATERIALIZED_CACHE_MAX_ENTRIES = _env_int(
+    "ADSCAN_ATTACK_PATHS_MATERIALIZED_CACHE_MAX_ENTRIES",
+    16,
+)
 
 
 def _cache_stats_inc(domain: str, key: str, by: int = 1) -> None:
@@ -213,7 +237,6 @@ def _maintenance_key(version: int) -> str:
 
 # In-process set to avoid redundant BH CE legacy sync checks within a session.
 _bh_ce_sync_done_domains: set[str] = set()
-
 
 
 def _ensure_bh_ce_legacy_sync(shell: object, domain: str) -> None:
@@ -1603,11 +1626,13 @@ def resolve_group_user_members(
 
     snapshot = _load_membership_snapshot(shell, domain)
     if isinstance(snapshot, dict):
-        group_members, _computers, has_users = attack_paths_core.build_group_member_index(
-            snapshot,
-            domain,
-            exclude_tier0=False,
-            include_computers=False,
+        group_members, _computers, has_users = (
+            attack_paths_core.build_group_member_index(
+                snapshot,
+                domain,
+                exclude_tier0=False,
+                include_computers=False,
+            )
         )
         if has_users:
             members_labels = group_members.get(canonical_group, set()) or set()
@@ -1933,6 +1958,323 @@ def _invalidate_attack_paths_cache(domain: str, *, reason: str) -> None:
         )
 
 
+def _materialized_cache_get(
+    domain: str,
+    *,
+    fingerprint: str,
+) -> MaterializedAttackPathArtifacts | None:
+    """Return a matching in-memory materialized artifact bundle."""
+    if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED:
+        return None
+    key = (str(domain or "").strip().lower(), fingerprint)
+    cached = _ATTACK_PATHS_MATERIALIZED_CACHE.get(key)
+    if cached is None:
+        return None
+    _ATTACK_PATHS_MATERIALIZED_CACHE.move_to_end(key)
+    return cached
+
+
+def _materialized_cache_put(
+    domain: str,
+    artifacts: MaterializedAttackPathArtifacts,
+) -> None:
+    """Store a materialized artifact bundle in the bounded in-memory cache."""
+    if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED:
+        return
+    key = (str(domain or "").strip().lower(), artifacts.fingerprint)
+    _ATTACK_PATHS_MATERIALIZED_CACHE[key] = artifacts
+    _ATTACK_PATHS_MATERIALIZED_CACHE.move_to_end(key)
+    while (
+        len(_ATTACK_PATHS_MATERIALIZED_CACHE)
+        > _ATTACK_PATHS_MATERIALIZED_CACHE_MAX_ENTRIES
+    ):
+        _ATTACK_PATHS_MATERIALIZED_CACHE.popitem(last=False)
+
+
+def _invalidate_materialized_attack_path_cache(domain: str) -> None:
+    """Invalidate in-memory + on-disk materialized artifacts for a domain."""
+    domain_key = str(domain or "").strip().lower()
+    keys = list(_ATTACK_PATHS_MATERIALIZED_CACHE.keys())
+    for key in keys:
+        if key and str(key[0] or "").strip().lower() == domain_key:
+            _ATTACK_PATHS_MATERIALIZED_CACHE.pop(key, None)
+    runtime_keys = list(_ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.keys())
+    for key in runtime_keys:
+        if key and str(key[0] or "").strip().lower() == domain_key:
+            _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.pop(key, None)
+
+
+def _build_recursive_membership_closure(
+    domain: str,
+    snapshot: dict[str, Any],
+) -> dict[str, tuple[str, ...]]:
+    """Build ``principal -> recursive groups`` from the membership snapshot."""
+    user_to_groups = snapshot.get("user_to_groups")
+    computer_to_groups = snapshot.get("computer_to_groups")
+    group_to_parents = snapshot.get("group_to_parents")
+    if not isinstance(user_to_groups, dict) and not isinstance(computer_to_groups, dict):
+        return {}
+
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] = {}
+    ancestor_cache: dict[str, set[str]] = {}
+    direct_maps = []
+    if isinstance(user_to_groups, dict):
+        direct_maps.append(user_to_groups)
+    if isinstance(computer_to_groups, dict):
+        direct_maps.append(computer_to_groups)
+
+    for direct_map in direct_maps:
+        for principal_label, direct_groups in direct_map.items():
+            if not isinstance(direct_groups, list):
+                continue
+            principal = attack_paths_core._canonical_membership_label(  # noqa: SLF001
+                domain,
+                principal_label,
+            )
+            if not principal:
+                continue
+            expanded: set[str] = set()
+            for group_label in direct_groups:
+                canonical_group = attack_paths_core._canonical_membership_label(  # noqa: SLF001
+                    domain,
+                    group_label,
+                )
+                if not canonical_group:
+                    continue
+                expanded.add(canonical_group)
+                expanded.update(
+                    attack_paths_core._expand_group_ancestors(  # noqa: SLF001
+                        domain,
+                        canonical_group,
+                        group_to_parents if isinstance(group_to_parents, dict) else {},
+                        ancestor_cache,
+                    )
+                )
+            if expanded:
+                recursive_groups_by_principal[principal] = tuple(sorted(expanded))
+    return recursive_groups_by_principal
+
+
+def _load_or_build_materialized_attack_path_artifacts(
+    shell: object,
+    *,
+    domain: str,
+    base_graph: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+) -> MaterializedAttackPathArtifacts | None:
+    """Load or build reusable derived artifacts for attack-path runtime stitching."""
+    if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED or not snapshot:
+        return None
+
+    graph_path = _graph_path(shell, domain)
+    snapshot_path = _membership_snapshot_path(shell, domain)
+    fingerprint = build_attack_path_artifact_fingerprint(
+        graph_path=graph_path,
+        snapshot_path=snapshot_path,
+        schema_version=ATTACK_GRAPH_SCHEMA_VERSION,
+    )
+
+    cached = _materialized_cache_get(domain, fingerprint=fingerprint)
+    if cached is not None:
+        return cached
+
+    loaded = load_materialized_attack_path_artifacts(
+        shell=shell,
+        domain=domain,
+        fingerprint=fingerprint,
+    )
+    if loaded is not None:
+        _materialized_cache_put(domain, loaded)
+        print_info_debug(
+            f"[attack_paths] materialized artifacts cache hit: "
+            f"domain={mark_sensitive(domain, 'domain')} format={loaded.storage_format}"
+        )
+        return loaded
+
+    node_id_by_label = attack_paths_core._build_node_id_index_by_canonical_label(  # noqa: SLF001
+        base_graph,
+        domain=domain,
+    )
+    recursive_groups_by_principal = _build_recursive_membership_closure(domain, snapshot)
+    built = MaterializedAttackPathArtifacts(
+        fingerprint=fingerprint,
+        node_id_by_label=node_id_by_label,
+        recursive_groups_by_principal=recursive_groups_by_principal,
+        storage_format="memory",
+    )
+    persist_materialized_attack_path_artifacts(
+        shell=shell,
+        domain=domain,
+        artifacts=built,
+    )
+    persisted = load_materialized_attack_path_artifacts(
+        shell=shell,
+        domain=domain,
+        fingerprint=fingerprint,
+    )
+    final = persisted or built
+    _materialized_cache_put(domain, final)
+    return final
+
+
+def _prepared_runtime_graph_cache_get(
+    domain: str,
+    *,
+    fingerprint: str,
+) -> MaterializedPreparedRuntimeGraph | None:
+    """Return a matching in-memory prepared runtime graph bundle."""
+    if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED:
+        return None
+    key = (str(domain or "").strip().lower(), fingerprint)
+    cached = _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.get(key)
+    if cached is None:
+        return None
+    _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.move_to_end(key)
+    return cached
+
+
+def _prepared_runtime_graph_cache_put(
+    domain: str,
+    prepared_graph: MaterializedPreparedRuntimeGraph,
+) -> None:
+    """Store a prepared runtime graph in the bounded in-memory cache."""
+    if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED:
+        return
+    key = (str(domain or "").strip().lower(), prepared_graph.fingerprint)
+    _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE[key] = prepared_graph
+    _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.move_to_end(key)
+    while (
+        len(_ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE)
+        > _ATTACK_PATHS_MATERIALIZED_CACHE_MAX_ENTRIES
+    ):
+        _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.popitem(last=False)
+
+
+def _build_prepared_runtime_graph(
+    *,
+    base_graph: dict[str, Any],
+    domain: str,
+    snapshot: dict[str, Any] | None,
+    expand_terminal_memberships: bool,
+    materialized_artifacts: MaterializedAttackPathArtifacts | None,
+) -> dict[str, Any]:
+    """Build a reusable runtime graph with terminal memberships already expanded."""
+    runtime_graph: dict[str, Any] = dict(base_graph)
+    runtime_graph["nodes"] = dict(
+        base_graph.get("nodes") if isinstance(base_graph.get("nodes"), dict) else {}
+    )
+    runtime_graph["edges"] = list(
+        base_graph.get("edges") if isinstance(base_graph.get("edges"), list) else []
+    )
+    if (
+        expand_terminal_memberships
+        and snapshot
+        and not attack_paths_core._graph_has_persisted_memberships(runtime_graph)  # noqa: SLF001
+    ):
+        candidate_to_ids: set[str] = set()
+        for edge in runtime_graph["edges"]:
+            if not isinstance(edge, dict):
+                continue
+            if (
+                str(edge.get("relation") or "") == "MemberOf"
+                and str(edge.get("edge_type") or "") == "runtime"
+            ):
+                continue
+            to_id = str(edge.get("to") or "")
+            if to_id:
+                candidate_to_ids.add(to_id)
+        attack_paths_core._inject_memberof_edges_from_snapshot(  # noqa: SLF001
+            runtime_graph,
+            domain,
+            snapshot,
+            principal_node_ids=candidate_to_ids,
+            recursive=True,
+            node_id_by_label=(
+                materialized_artifacts.node_id_by_label
+                if materialized_artifacts is not None
+                else None
+            ),
+            recursive_groups_by_principal=(
+                materialized_artifacts.recursive_groups_by_principal
+                if materialized_artifacts is not None
+                else None
+            ),
+        )
+    runtime_graph["_attack_paths_terminal_memberships_materialized"] = True
+    return runtime_graph
+
+
+def _load_or_build_prepared_runtime_graph(
+    shell: object,
+    *,
+    domain: str,
+    base_graph: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+    expand_terminal_memberships: bool,
+    materialized_artifacts: MaterializedAttackPathArtifacts | None,
+) -> dict[str, Any]:
+    """Load or build a reusable prepared runtime graph for local DFS scopes."""
+    if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED:
+        return _build_prepared_runtime_graph(
+            base_graph=base_graph,
+            domain=domain,
+            snapshot=snapshot,
+            expand_terminal_memberships=expand_terminal_memberships,
+            materialized_artifacts=materialized_artifacts,
+        )
+
+    graph_path = _graph_path(shell, domain)
+    snapshot_path = _membership_snapshot_path(shell, domain)
+    fingerprint = build_attack_path_artifact_fingerprint(
+        graph_path=graph_path,
+        snapshot_path=snapshot_path,
+        schema_version=f"{ATTACK_GRAPH_SCHEMA_VERSION}:prepared:{int(expand_terminal_memberships)}",
+    )
+
+    cached = _prepared_runtime_graph_cache_get(domain, fingerprint=fingerprint)
+    if cached is not None:
+        return dict(cached.graph)
+
+    loaded = load_materialized_prepared_runtime_graph(
+        shell=shell,
+        domain=domain,
+        fingerprint=fingerprint,
+    )
+    if loaded is not None:
+        _prepared_runtime_graph_cache_put(domain, loaded)
+        print_info_debug(
+            f"[attack_paths] prepared runtime graph cache hit: "
+            f"domain={mark_sensitive(domain, 'domain')} format={loaded.storage_format}"
+        )
+        return dict(loaded.graph)
+
+    prepared_graph = _build_prepared_runtime_graph(
+        base_graph=base_graph,
+        domain=domain,
+        snapshot=snapshot,
+        expand_terminal_memberships=expand_terminal_memberships,
+        materialized_artifacts=materialized_artifacts,
+    )
+    built = MaterializedPreparedRuntimeGraph(
+        fingerprint=fingerprint,
+        graph=prepared_graph,
+        storage_format="memory",
+    )
+    persist_materialized_prepared_runtime_graph(
+        shell=shell,
+        domain=domain,
+        prepared_graph=built,
+    )
+    persisted = load_materialized_prepared_runtime_graph(
+        shell=shell,
+        domain=domain,
+        fingerprint=fingerprint,
+    )
+    final = persisted or built
+    _prepared_runtime_graph_cache_put(domain, final)
+    return dict(final.graph)
+
+
 def get_attack_paths_cache_stats(
     *,
     domain: str | None = None,
@@ -1997,7 +2339,10 @@ def _build_group_member_index(
     """Build group -> members index (recursive) for users and optionally computers."""
     snapshot = _load_membership_snapshot(shell, domain)
     return attack_paths_core.build_group_member_index(
-        snapshot, domain, exclude_tier0=exclude_tier0, include_computers=include_computers
+        snapshot,
+        domain,
+        exclude_tier0=exclude_tier0,
+        include_computers=include_computers,
     )
 
 
@@ -2055,8 +2400,10 @@ def _apply_affected_user_metadata(
             if canonical:
                 label_kind_map[canonical] = _node_kind(node)
 
-    group_members, _computer_group_members, has_users = attack_paths_core.build_group_member_index(
-        snapshot, domain, exclude_tier0=True, include_computers=False
+    group_members, _computer_group_members, has_users = (
+        attack_paths_core.build_group_member_index(
+            snapshot, domain, exclude_tier0=True, include_computers=False
+        )
     )
     broad_group_names = {
         "DOMAIN USERS",
@@ -2442,25 +2789,39 @@ def get_certipy_adcs_paths(
             return "Group"
         return "User"
 
-    def _principal_is_tier0(label: str) -> bool:
-        if not loaded_graph:
-            return False
+    def _resolve_principal_node(
+        *, principal_label: str, principal_domain: str, principal_name: str
+    ) -> dict[str, Any] | None:
         try:
-            node_id = _find_node_id_by_label(loaded_graph, label)
-            if not node_id:
-                return False
-            nodes_map = (
-                loaded_graph.get("nodes")
-                if isinstance(loaded_graph.get("nodes"), dict)
-                else {}
+            node = _resolve_bloodhound_principal_node(
+                shell,
+                principal_domain,
+                principal_label,
+                entry_kind=_infer_principal_kind(principal_name).lower(),
+                graph=loaded_graph,
+                lookup_name=principal_name,
             )
-            node = nodes_map.get(node_id) if isinstance(nodes_map, dict) else None
             if not isinstance(node, dict):
-                return False
-            return _node_is_tier0(node)
+                print_info_debug(
+                    f"[attack_graph] certipy principal lookup miss: "
+                    f"label={mark_sensitive(principal_label, 'user')} "
+                    f"kind={_infer_principal_kind(principal_name)}"
+                )
+                return None
+            return node
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            return False
+            return None
+
+    def _principal_is_tier0(
+        *, principal_label: str, principal_domain: str, principal_name: str
+    ) -> bool:
+        node = _resolve_principal_node(
+            principal_label=principal_label,
+            principal_domain=principal_domain,
+            principal_name=principal_name,
+        )
+        return isinstance(node, dict) and _node_is_tier0(node)
 
     edges: list[dict[str, Any]] = []
     for entry in templates.values():
@@ -2488,6 +2849,12 @@ def get_certipy_adcs_paths(
                             domain=principal_domain, group_name=group_name
                         )
                         if not group_label:
+                            continue
+                        if _principal_is_tier0(
+                            principal_label=group_label,
+                            principal_domain=principal_domain,
+                            principal_name=group_name,
+                        ):
                             continue
                         group_node = {
                             "name": group_label,
@@ -2531,7 +2898,11 @@ def get_certipy_adcs_paths(
                 )
                 if not principal_label:
                     continue
-                if _principal_is_tier0(principal_label):
+                if _principal_is_tier0(
+                    principal_label=principal_label,
+                    principal_domain=principal_domain,
+                    principal_name=principal_name,
+                ):
                     continue
                 kind = _infer_principal_kind(principal_name)
                 principal_node = {
@@ -3931,6 +4302,8 @@ def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None
 
     write_json_file(path, graph)
     _invalidate_attack_paths_cache(domain, reason="graph_saved")
+    _invalidate_materialized_attack_path_cache(domain)
+    invalidate_attack_path_artifacts(shell, domain)
     try:
         domains_data = getattr(shell, "domains_data", None)
         if isinstance(domains_data, dict):
@@ -4244,8 +4617,12 @@ def upsert_edge(
             # force_opengraph=True, so native edges are not re-created as custom ones.
             if force_opengraph or status_changed:
                 _record_edge_in_bloodhound_ce(
-                    from_id, to_id, relation_norm, edge,
-                    graph=graph, force_opengraph=force_opengraph,
+                    from_id,
+                    to_id,
+                    relation_norm,
+                    edge,
+                    graph=graph,
+                    force_opengraph=force_opengraph,
                 )
             return edge
 
@@ -4266,7 +4643,14 @@ def upsert_edge(
         "last_seen": now,
     }
     edges.append(entry)
-    _record_edge_in_bloodhound_ce(from_id, to_id, relation_norm, entry, graph=graph, force_opengraph=force_opengraph)
+    _record_edge_in_bloodhound_ce(
+        from_id,
+        to_id,
+        relation_norm,
+        entry,
+        graph=graph,
+        force_opengraph=force_opengraph,
+    )
     if log_creation:
         try:
 
@@ -4348,7 +4732,11 @@ def _build_opengraph_ref(
         if isinstance(nodes_map, dict):
             node = nodes_map.get(node_id)
             if isinstance(node, dict):
-                props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+                props = (
+                    node.get("properties")
+                    if isinstance(node.get("properties"), dict)
+                    else {}
+                )
                 # Prefer SID (most reliable match in BH CE)
                 object_id = (
                     node.get("objectId")
@@ -4399,7 +4787,9 @@ def _record_edge_in_bloodhound_ce(
             missed the edge, and for re-syncing existing local edges to BH CE.
     """
     try:
-        from adscan_internal.services import bh_opengraph_sync  # local import avoids circular dep
+        from adscan_internal.services import (
+            bh_opengraph_sync,
+        )  # local import avoids circular dep
         from adscan_internal.services.attack_step_catalog import get_bh_native_relations
 
         # Skip native BH edges — they already exist in the BH graph from collector runs.
@@ -4546,7 +4936,9 @@ def record_credential_source_steps(
             continue
         entry_label = str(step.entry_label or "").strip()
         notes = step.notes if isinstance(step.notes, dict) else {}
-        entry_kind = str(step.entry_kind or notes.get("entry_kind") or "").strip().lower()
+        entry_kind = (
+            str(step.entry_kind or notes.get("entry_kind") or "").strip().lower()
+        )
 
         use_computer_entry = False
         if entry_kind == "computer":
@@ -4673,7 +5065,9 @@ def compute_maximal_attack_paths(
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
-        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
+        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
+            target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
+        ):
             return
         signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
         if signature in seen_signatures:
@@ -5195,9 +5589,51 @@ def _resolve_bloodhound_principal_entry(
     entry_kind: str | None = None,
 ) -> str | None:
     """Best-effort resolve an arbitrary entry label to a real BH-backed principal node."""
-    label_clean = str(label or "").strip()
-    if not label_clean or not hasattr(shell, "_get_bloodhound_service"):
+    node_record = _resolve_bloodhound_principal_node(
+        shell,
+        domain,
+        label,
+        entry_kind=entry_kind,
+        graph=graph,
+    )
+    if not isinstance(node_record, dict):
         return None
+    upsert_nodes(graph, [node_record])
+    return _node_id(node_record)
+
+
+def _resolve_bloodhound_principal_node(
+    shell: object,
+    domain: str,
+    label: str,
+    *,
+    entry_kind: str | None = None,
+    graph: dict[str, Any] | None = None,
+    lookup_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Best-effort resolve a principal to a BH-backed node record.
+
+    Resolution order:
+    1. Existing attack-graph node by label when ``graph`` is provided.
+    2. BloodHound service lookup by principal kind.
+    """
+    label_clean = str(label or "").strip()
+    if not label_clean:
+        return None
+
+    if isinstance(graph, dict):
+        node_id = _find_node_id_by_label(graph, label_clean)
+        if node_id:
+            nodes_map = (
+                graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+            )
+            node = nodes_map.get(node_id) if isinstance(nodes_map, dict) else None
+            if isinstance(node, dict):
+                return node
+
+    if not hasattr(shell, "_get_bloodhound_service"):
+        return None
+
     try:
         service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001
@@ -5207,6 +5643,7 @@ def _resolve_bloodhound_principal_entry(
         return None
 
     normalized = _normalize_account(label_clean)
+    lookup_name_clean = str(lookup_name or "").strip() or label_clean
     domain_upper = str(domain or "").strip().upper()
     kind_hint = str(entry_kind or "").strip().lower()
     candidates: list[tuple[int, dict[str, Any]]] = []
@@ -5245,7 +5682,9 @@ def _resolve_bloodhound_principal_entry(
         try:
             _append_candidate(
                 "User",
-                service.get_user_node_by_samaccountname(domain, normalized),  # type: ignore[attr-defined]
+                service.get_user_node_by_samaccountname(  # type: ignore[attr-defined]
+                    domain, normalize_samaccountname(lookup_name_clean) or normalized
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -5253,7 +5692,9 @@ def _resolve_bloodhound_principal_entry(
         try:
             _append_candidate(
                 "Group",
-                service.get_group_node_by_samaccountname(domain, label_clean),  # type: ignore[attr-defined]
+                service.get_group_node_by_samaccountname(  # type: ignore[attr-defined]
+                    domain, lookup_name_clean
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -5261,7 +5702,7 @@ def _resolve_bloodhound_principal_entry(
         try:
             _append_candidate(
                 "Computer",
-                service.get_computer_node_by_name(domain, label_clean),  # type: ignore[attr-defined]
+                service.get_computer_node_by_name(domain, lookup_name_clean),  # type: ignore[attr-defined]
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -5269,9 +5710,7 @@ def _resolve_bloodhound_principal_entry(
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0])
-    node_record = candidates[0][1]
-    upsert_nodes(graph, [node_record])
-    return _node_id(node_record)
+    return candidates[0][1]
 
 
 def resolve_entry_label_for_auth(auth_username: str | None) -> str:
@@ -5383,9 +5822,7 @@ def ensure_domain_node_for_domain(
     graph: dict[str, Any],
 ) -> str:
     """Ensure a canonical Domain node exists for one domain."""
-    node_record = resolve_domain_node_record_for_domain(
-        shell, domain, graph=graph
-    )
+    node_record = resolve_domain_node_record_for_domain(shell, domain, graph=graph)
     upsert_nodes(graph, [node_record])
     return _node_id(node_record)
 
@@ -7061,11 +7498,15 @@ def upsert_password_spray_entry_edge(
         relation = "ComputerPre2k"
     elif spray_category_clean in {"useraspass", "useraspass_lower", "useraspass_upper"}:
         relation = "UserAsPass"
-    elif spray_category_clean == "blank_password" or spray_type_clean == "blank password":
+    elif (
+        spray_category_clean == "blank_password" or spray_type_clean == "blank password"
+    ):
         relation = "BlankPassword"
 
     graph = load_attack_graph(shell, domain)
-    effective_entry_label = "Domain Users" if relation == "ComputerPre2k" else entry_label
+    effective_entry_label = (
+        "Domain Users" if relation == "ComputerPre2k" else entry_label
+    )
     entry_id = ensure_entry_node_for_domain(
         shell,
         domain,
@@ -7209,7 +7650,9 @@ def update_roast_entry_edge_status(
         edge["notes"] = notes
         save_attack_graph(shell, domain, graph)
         if status_changed:
-            _record_edge_in_bloodhound_ce(entry_id, principal_id, relation, edge, graph=graph)
+            _record_edge_in_bloodhound_ce(
+                entry_id, principal_id, relation, edge, graph=graph
+            )
         return True
 
     notes: dict[str, Any] = {}
@@ -7681,7 +8124,9 @@ def compute_maximal_attack_paths_from_start(
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
-        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (target == "lowpriv" and is_terminal(acc_steps[-1].to_id)):
+        if (target == "highvalue" and not is_terminal(acc_steps[-1].to_id)) or (
+            target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
+        ):
             return
         signature = tuple((s.from_id, s.relation, s.to_id) for s in acc_steps)
         if signature in seen_signatures:
@@ -7822,6 +8267,7 @@ def _stitch_principal_memberships_for_runtime_paths(
     principal_node_ids: set[str],
     snapshot: dict[str, Any] | None,
     scope: str,
+    materialized_artifacts: MaterializedAttackPathArtifacts | None = None,
 ) -> tuple[int, int]:
     """Ensure principals have outgoing membership edges in runtime graph.
 
@@ -7842,6 +8288,16 @@ def _stitch_principal_memberships_for_runtime_paths(
             snapshot,
             principal_node_ids=missing,
             recursive=True,
+            node_id_by_label=(
+                materialized_artifacts.node_id_by_label
+                if materialized_artifacts is not None
+                else None
+            ),
+            recursive_groups_by_principal=(
+                materialized_artifacts.recursive_groups_by_principal
+                if materialized_artifacts is not None
+                else None
+            ),
         )
         missing = _node_ids_without_memberof_edges(runtime_graph, node_ids=missing)
 
@@ -8018,7 +8474,9 @@ def _apply_local_postprocessing_pipeline(
     _label_to_node = _build_snapshot_label_to_node(snapshot, base_graph=_base_graph)
 
     # Log scope / rule matrix (mirrors BH CE pipeline header).
-    _apply_leading = scope == "domain" or (scope in {"owned", "principals"} and _is_multi)
+    _apply_leading = scope == "domain" or (
+        scope in {"owned", "principals"} and _is_multi
+    )
     _minimize_rules = "redundant_memberof + repeated_labels" + (
         " + leading_memberof" if _apply_leading else ""
     )
@@ -8093,7 +8551,9 @@ def _apply_local_postprocessing_pipeline(
             )
         records = _terminal_mo_kept
     print_attack_paths_summary_debug(
-        domain, records, stage_label=f"2/6 · after terminal-memberof filter [{target!r}]"
+        domain,
+        records,
+        stage_label=f"2/6 · after terminal-memberof filter [{target!r}]",
     )
 
     # Stage 2b: Owned-terminal filter.
@@ -8143,7 +8603,8 @@ def _apply_local_postprocessing_pipeline(
             f"{n_minimized} record(s) modified"
         )
     print_attack_paths_summary_debug(
-        domain, records,
+        domain,
+        records,
         stage_label=f"3/6 · after minimize (scope={scope}, {n_minimized} record(s) modified)",
     )
 
@@ -8167,7 +8628,8 @@ def _apply_local_postprocessing_pipeline(
         )
     records = deduped
     print_attack_paths_summary_debug(
-        domain, records,
+        domain,
+        records,
         stage_label=f"4/6 · after dedup [{scope}] ({n_dedup_removed} removed)",
     )
 
@@ -8195,8 +8657,13 @@ def _apply_local_postprocessing_pipeline(
     #   all target modes (--all, --highvalue, --lowpriv).
     if scope not in {"domain"}:
         _is_hv = lambda rec: _record_terminal_is_hv(rec, _label_to_node)  # noqa: E731
-        result, n_contained = attack_graph_core.filter_contained_paths_for_domain_listing(
-            records, keep_shortest=True, is_hv_terminal=_is_hv, preserve_prefix_paths=True
+        result, n_contained = (
+            attack_graph_core.filter_contained_paths_for_domain_listing(
+                records,
+                keep_shortest=True,
+                is_hv_terminal=_is_hv,
+                preserve_prefix_paths=True,
+            )
         )
         if n_contained:
             print_info_debug(
@@ -8205,14 +8672,17 @@ def _apply_local_postprocessing_pipeline(
             )
         records = result
         print_attack_paths_summary_debug(
-            domain, records,
+            domain,
+            records,
             stage_label=(
                 f"6/6 · after contained filter [hv-aware, {scope}] ({n_contained} removed)"
             ),
         )
     else:
-        result, n_contained = attack_graph_core.filter_contained_paths_for_domain_listing(
-            records, keep_shortest=False
+        result, n_contained = (
+            attack_graph_core.filter_contained_paths_for_domain_listing(
+                records, keep_shortest=False
+            )
         )
         if n_contained:
             print_info_debug(
@@ -8221,7 +8691,8 @@ def _apply_local_postprocessing_pipeline(
             )
         records = result
         print_attack_paths_summary_debug(
-            domain, records,
+            domain,
+            records,
             stage_label=(
                 f"6/6 · after contained filter [keep_longest, domain] ({n_contained} removed)"
             ),
@@ -8238,7 +8709,9 @@ def _apply_local_postprocessing_pipeline(
     print_info_debug(
         f"[local-pipeline] hv-tag: {_hv_count} high-value, {len(records) - _hv_count} pivot"
     )
-    print_info_debug(f"[local-pipeline] final: {len(records)} attack path(s) after all post-processing")
+    print_info_debug(
+        f"[local-pipeline] final: {len(records)} attack path(s) after all post-processing"
+    )
 
     return records
 
@@ -8289,7 +8762,9 @@ def compute_display_paths_for_user(
             bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
         ),
     )
-    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="user", no_cache=no_cache)
+    cached = _attack_paths_cache_get(
+        cache_key, domain=domain, scope="user", no_cache=no_cache
+    )
     if cached is not None:
         cached = _filter_zero_length_display_paths(cached, domain=domain, scope="user")
         cached = _apply_affected_user_metadata(shell, domain, cached)
@@ -8305,12 +8780,31 @@ def compute_display_paths_for_user(
         return cached
 
     base_graph = load_attack_graph(shell, domain)
-    runtime_graph: dict[str, Any] = dict(base_graph)
+    snapshot = _load_membership_snapshot(shell, domain)
+    materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
+        shell,
+        domain=domain,
+        base_graph=base_graph,
+        snapshot=snapshot,
+    )
+    prepared_graph = _load_or_build_prepared_runtime_graph(
+        shell,
+        domain=domain,
+        base_graph=base_graph,
+        snapshot=snapshot,
+        expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
+        materialized_artifacts=materialized_artifacts,
+    )
+    runtime_graph: dict[str, Any] = dict(prepared_graph)
     runtime_graph["nodes"] = dict(
-        base_graph.get("nodes") if isinstance(base_graph.get("nodes"), dict) else {}
+        prepared_graph.get("nodes")
+        if isinstance(prepared_graph.get("nodes"), dict)
+        else {}
     )
     runtime_graph["edges"] = list(
-        base_graph.get("edges") if isinstance(base_graph.get("edges"), list) else []
+        prepared_graph.get("edges")
+        if isinstance(prepared_graph.get("edges"), list)
+        else []
     )
 
     start_node_id = _find_node_id_by_label(runtime_graph, username)
@@ -8318,8 +8812,6 @@ def compute_display_paths_for_user(
         start_node_id = ensure_user_node_for_domain(
             shell, domain, runtime_graph, username=str(username or "").strip()
         )
-
-    snapshot = _load_membership_snapshot(shell, domain)
     _stitch_principal_memberships_for_runtime_paths(
         shell,
         domain=domain,
@@ -8327,6 +8819,7 @@ def compute_display_paths_for_user(
         principal_node_ids={start_node_id} if start_node_id else set(),
         snapshot=snapshot,
         scope="user",
+        materialized_artifacts=materialized_artifacts,
     )
     if (
         not snapshot
@@ -8367,6 +8860,14 @@ def compute_display_paths_for_user(
             target_mode=target_mode,
             expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
             filter_shortest_paths=False,
+            materialized_artifacts=(
+                {
+                    "node_id_by_label": materialized_artifacts.node_id_by_label,
+                    "recursive_groups_by_principal": materialized_artifacts.recursive_groups_by_principal,
+                }
+                if materialized_artifacts is not None
+                else None
+            ),
         )
     )
     _dfs_elapsed = time.monotonic() - _dfs_t0
@@ -8439,7 +8940,9 @@ def compute_display_paths_for_domain(
             bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
         ),
     )
-    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="domain", no_cache=no_cache)
+    cached = _attack_paths_cache_get(
+        cache_key, domain=domain, scope="domain", no_cache=no_cache
+    )
     if cached is not None:
         cached = _filter_zero_length_display_paths(
             cached, domain=domain, scope="domain"
@@ -8457,18 +8960,35 @@ def compute_display_paths_for_domain(
         return cached
 
     base_graph = load_attack_graph(shell, domain)
-    runtime_graph: dict[str, Any] = dict(base_graph)
+    snapshot = _load_membership_snapshot(shell, domain)
+    materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
+        shell,
+        domain=domain,
+        base_graph=base_graph,
+        snapshot=snapshot,
+    )
+    prepared_graph = _load_or_build_prepared_runtime_graph(
+        shell,
+        domain=domain,
+        base_graph=base_graph,
+        snapshot=snapshot,
+        expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
+        materialized_artifacts=materialized_artifacts,
+    )
+    runtime_graph: dict[str, Any] = dict(prepared_graph)
     runtime_graph["nodes"] = dict(
-        base_graph.get("nodes") if isinstance(base_graph.get("nodes"), dict) else {}
+        prepared_graph.get("nodes")
+        if isinstance(prepared_graph.get("nodes"), dict)
+        else {}
     )
     runtime_graph["edges"] = list(
-        base_graph.get("edges") if isinstance(base_graph.get("edges"), list) else []
+        prepared_graph.get("edges")
+        if isinstance(prepared_graph.get("edges"), list)
+        else []
     )
     start_node_ids = _resolve_domain_enabled_low_priv_user_start_ids(
         shell, domain, runtime_graph
     )
-
-    snapshot = _load_membership_snapshot(shell, domain)
     if (
         ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS
         and not snapshot
@@ -8501,6 +9021,14 @@ def compute_display_paths_for_domain(
             target_mode=target_mode,
             expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
             start_node_ids=start_node_ids,
+            materialized_artifacts=(
+                {
+                    "node_id_by_label": materialized_artifacts.node_id_by_label,
+                    "recursive_groups_by_principal": materialized_artifacts.recursive_groups_by_principal,
+                }
+                if materialized_artifacts is not None
+                else None
+            ),
         )
     )
     _dfs_elapsed = time.monotonic() - _dfs_t0
@@ -8564,7 +9092,9 @@ def _resolve_domain_enabled_low_priv_user_start_ids(
         if _node_is_effectively_high_value(node):
             continue
 
-        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        )
         node_domain = str(props.get("domain") or "").strip().upper()
         if not node_domain:
             label = _canonical_node_label(node)
@@ -8574,7 +9104,10 @@ def _resolve_domain_enabled_low_priv_user_start_ids(
             continue
 
         normalized_username = _normalize_account(_canonical_node_label(node))
-        if normalized_enabled_users and normalized_username not in normalized_enabled_users:
+        if (
+            normalized_enabled_users
+            and normalized_username not in normalized_enabled_users
+        ):
             continue
         start_node_ids.add(str(node_id))
 
@@ -8797,7 +9330,7 @@ def _sync_bh_owned_principals(
         print_info_debug(
             f"[bh-engine] Owned sync input for {mark_sensitive(domain, 'domain')}: "
             f"{owned_usernames!r}"
-)
+        )
         marked, unmarked = client.sync_owned_principals(domain, owned_usernames)
         if marked or unmarked:
             print_info_debug(
@@ -8848,27 +9381,33 @@ def _is_bh_available(shell: object) -> bool:
         return False
 
 
-def _ask_or_get_attack_path_engine(shell: object) -> str:
-    """Return the attack-path engine to use.
+def _ask_or_get_attack_path_engine(shell: object) -> tuple[str, int]:
+    """Return the attack-path engine and worker override to use.
 
-    In production (non-dev) always returns ``"local"`` — local DFS is faster
-    and has no dependency on BH CE data being present for the domain.
+    In production (non-dev) always returns ``("local", -1)`` — local DFS is
+    faster and has no dependency on BH CE data being present for the domain.
     In development mode (``ADSCAN_SESSION_ENV=dev``) shows an interactive
     questionary selector so engineers can compare engines:
       - BloodHound CE (only when connected)
       - Local Python DFS (default)
       - rustworkx Rust-backed DFS (dev benchmark)
 
+    For Local and rustworkx engines a second sub-selector appears to choose
+    between Sequential (0 workers) and Parallel (auto, -1) so that engineers
+    can benchmark both modes back-to-back.
+
     Returns:
-        ``"bloodhound"``, ``"local"``, or ``"rustworkx"``.
+        Tuple of (engine, dev_workers) where engine is ``"bloodhound"``,
+        ``"local"``, or ``"rustworkx"`` and dev_workers is the worker count
+        override (-1 = auto, 0 = sequential, used only for this computation).
     """
     # In production (non-dev) always use local DFS — faster and no BH data dependency.
     is_dev = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
     if not is_dev:
-        return "local"
+        return "local", -1
 
     if not hasattr(shell, "_questionary_select"):
-        return "local"
+        return "local", -1
 
     bh_available = _is_bh_available(shell)
     if bh_available:
@@ -8892,15 +9431,30 @@ def _ask_or_get_attack_path_engine(shell: object) -> str:
             default_idx=default_idx,
         )
     except Exception:  # noqa: BLE001
-        return "local"
+        return "local", -1
 
     if bh_available:
         if idx == 0:
-            return "bloodhound"
-        if idx == 2:
-            return "rustworkx"
-        return "local"
-    return "rustworkx" if idx == 1 else "local"
+            return "bloodhound", -1
+        engine = "rustworkx" if idx == 2 else "local"
+    else:
+        engine = "rustworkx" if idx == 1 else "local"
+
+    # For local engines, ask whether to use sequential or parallel execution.
+    try:
+        parallelism_idx = shell._questionary_select(  # type: ignore[attr-defined]
+            "Parallelism mode  [dev benchmark]:",
+            [
+                "Parallel  (auto workers)",
+                "Sequential  (single process)",
+            ],
+            default_idx=0,
+        )
+    except Exception:  # noqa: BLE001
+        return engine, -1
+
+    dev_workers = 0 if parallelism_idx == 1 else -1
+    return engine, dev_workers
 
 
 def _compute_rustworkx_display_paths(
@@ -9068,7 +9622,9 @@ def _compute_bh_attack_paths(
     _bh_t0 = time.perf_counter()
     try:
         scope_norm = str(scope or "domain").strip().lower()
-        effective_depth = _effective_max_depth(max_depth, scope=scope_norm, target=target)
+        effective_depth = _effective_max_depth(
+            max_depth, scope=scope_norm, target=target
+        )
         print_info_debug(
             f"[bh-pipeline] effective_depth={effective_depth} "
             f"(requested={max_depth} scope={scope_norm!r} target={target!r})"
@@ -9088,7 +9644,9 @@ def _compute_bh_attack_paths(
             owned = get_owned_domain_usernames_for_attack_paths(shell, domain)
             if not owned:
                 return []
-            principals = owned  # unify owned list into principals for downstream filters
+            principals = (
+                owned  # unify owned list into principals for downstream filters
+            )
             # Sync BH owned state — domains_data is the source of truth.
             _sync_bh_owned_principals(shell, domain, owned)
             bh_paths = client.get_attack_paths_from_owned(
@@ -9146,7 +9704,9 @@ def _compute_bh_attack_paths(
         display_records, graph = client._bh_paths_to_display_records(
             bh_paths, domain=domain, max_paths=max_paths
         )
-        print_info_debug(f"[bh-pipeline] after conversion: {len(display_records)} display record(s)")
+        print_info_debug(
+            f"[bh-pipeline] after conversion: {len(display_records)} display record(s)"
+        )
         # Build label-to-node index early — used by both stage 5 (containment
         # filter HV-awareness) and stage 6 (HV tagging).
         _label_to_node: dict[str, dict] = {
@@ -9174,7 +9734,11 @@ def _compute_bh_attack_paths(
         # ALL(n IN nodes(p) WHERE single(m IN nodes(p) WHERE id(m) = id(n)))
         # single() avoids the nested list comprehension scoping issue that caused
         # "Variable `x` not defined" with the original predicate on Neo4j 4.4.
-        print_attack_paths_summary_debug(domain, display_records, stage_label="1/5 · raw BH (acyclic filter in Cypher)")
+        print_attack_paths_summary_debug(
+            domain,
+            display_records,
+            stage_label="1/5 · raw BH (acyclic filter in Cypher)",
+        )
 
         # Stage 1b: Owned-terminal filter.
         # BH CE has no terminal-MemberOf trim stage (handled in Cypher WHERE), so
@@ -9216,14 +9780,17 @@ def _compute_bh_attack_paths(
             scope=scope_norm,
             principal_count=_principal_count,
         )
-        n_minimized = sum(1 for r in display_records if r.get("meta", {}).get("minimized"))
+        n_minimized = sum(
+            1 for r in display_records if r.get("meta", {}).get("minimized")
+        )
         if n_minimized or n_before_min != len(display_records):
             print_info_debug(
                 f"[bh-pipeline] minimize: {n_before_min} → {len(display_records)}, {n_minimized} record(s) modified"
             )
         print_attack_paths_summary_debug(
-            domain, display_records,
-            stage_label=f"2/5 · after minimize (scope={scope_norm}, {n_minimized} record(s) modified)"
+            domain,
+            display_records,
+            stage_label=f"2/5 · after minimize (scope={scope_norm}, {n_minimized} record(s) modified)",
         )
 
         # Safety-net dedup: minimize_display_paths may still collapse distinct
@@ -9243,10 +9810,13 @@ def _compute_bh_attack_paths(
                     f"[bh-pipeline]   dedup removed: {' → '.join(rec.get('nodes') or [])}"
                 )
         if n_dedup_removed:
-            print_info_debug(f"[bh-pipeline] dedup: removed {n_dedup_removed} duplicate(s) → {len(deduped)} remain")
+            print_info_debug(
+                f"[bh-pipeline] dedup: removed {n_dedup_removed} duplicate(s) → {len(deduped)} remain"
+            )
         print_attack_paths_summary_debug(
-            domain, deduped,
-            stage_label=f"3/5 · after dedup [{scope_norm}] ({n_dedup_removed} removed)"
+            domain,
+            deduped,
+            stage_label=f"3/5 · after dedup [{scope_norm}] ({n_dedup_removed} removed)",
         )
 
         annotated = attack_paths_core.apply_affected_user_metadata(
@@ -9256,7 +9826,11 @@ def _compute_bh_attack_paths(
             snapshot=snapshot,
             filter_empty=True,
         )
-        print_attack_paths_summary_debug(domain, annotated, stage_label=f"4/5 · after annotate_affected_users [{scope_norm}]")
+        print_attack_paths_summary_debug(
+            domain,
+            annotated,
+            stage_label=f"4/5 · after annotate_affected_users [{scope_norm}]",
+        )
 
         # Apply scope-specific path-reduction rules.
         #
@@ -9266,8 +9840,13 @@ def _compute_bh_attack_paths(
         #   Applies to all non-domain scopes and all target modes.
         if scope_norm not in {"domain"}:
             _is_hv = lambda rec: _record_terminal_is_hv(rec, _label_to_node)  # noqa: E731
-            result, n_contained = attack_graph_core.filter_contained_paths_for_domain_listing(
-                annotated, keep_shortest=True, is_hv_terminal=_is_hv, preserve_prefix_paths=True
+            result, n_contained = (
+                attack_graph_core.filter_contained_paths_for_domain_listing(
+                    annotated,
+                    keep_shortest=True,
+                    is_hv_terminal=_is_hv,
+                    preserve_prefix_paths=True,
+                )
             )
             if n_contained:
                 print_info_debug(
@@ -9276,12 +9855,15 @@ def _compute_bh_attack_paths(
             else:
                 result = annotated
             print_attack_paths_summary_debug(
-                domain, result,
-                stage_label=f"5/5 · after contained filter [hv-aware, {scope_norm}] ({n_contained if n_contained else 0} removed)"
+                domain,
+                result,
+                stage_label=f"5/5 · after contained filter [hv-aware, {scope_norm}] ({n_contained if n_contained else 0} removed)",
             )
         else:
-            result, n_contained = attack_graph_core.filter_contained_paths_for_domain_listing(
-                annotated, keep_shortest=False
+            result, n_contained = (
+                attack_graph_core.filter_contained_paths_for_domain_listing(
+                    annotated, keep_shortest=False
+                )
             )
             if n_contained:
                 print_info_debug(
@@ -9290,11 +9872,14 @@ def _compute_bh_attack_paths(
             else:
                 result = annotated
             print_attack_paths_summary_debug(
-                domain, result,
-                stage_label=f"5/5 · after contained filter [keep_longest, domain] ({n_contained if n_contained else 0} removed)"
+                domain,
+                result,
+                stage_label=f"5/5 · after contained filter [keep_longest, domain] ({n_contained if n_contained else 0} removed)",
             )
 
-        print_info_debug(f"[bh-pipeline] final: {len(result)} attack path(s) after all post-processing")
+        print_info_debug(
+            f"[bh-pipeline] final: {len(result)} attack path(s) after all post-processing"
+        )
 
         # HV tagging — _label_to_node already built above.
         _hv_count = 0
@@ -9347,11 +9932,56 @@ def get_attack_path_summaries(
     """
     scope_norm = str(scope or "domain").strip().lower()
 
-    # In dev mode an interactive selector lets engineers compare all three engines.
-    # In production this always returns "local" without prompting.
-    _engine = _ask_or_get_attack_path_engine(shell)
+    # In dev mode an interactive selector lets engineers compare all three engines
+    # and choose sequential vs parallel execution.  In production always returns
+    # ("local", -1) without prompting.
+    _engine, _dev_workers = _ask_or_get_attack_path_engine(shell)
 
-    if _engine == "bloodhound":
+    # Temporarily override the worker count for this computation when a dev
+    # override was selected (dev mode only — in production _dev_workers == -1
+    # which matches the module default, so there is no observable difference).
+    _prev_graph_workers = attack_graph_core._ATTACK_PATH_WORKERS  # noqa: SLF001
+    _prev_principal_workers = attack_paths_core._PRINCIPAL_WORKERS  # noqa: SLF001
+    attack_graph_core._ATTACK_PATH_WORKERS = _dev_workers  # noqa: SLF001
+    attack_paths_core._PRINCIPAL_WORKERS = _dev_workers  # noqa: SLF001
+
+    try:
+        return _compute_attack_path_summaries_inner(
+            shell,
+            domain,
+            scope_norm=scope_norm,
+            engine=_engine,
+            username=username,
+            principals=principals,
+            max_depth=max_depth,
+            max_paths=max_paths,
+            target=target,
+            target_mode=target_mode,
+            membership_sample_max=membership_sample_max,
+            no_cache=no_cache,
+        )
+    finally:
+        attack_graph_core._ATTACK_PATH_WORKERS = _prev_graph_workers  # noqa: SLF001
+        attack_paths_core._PRINCIPAL_WORKERS = _prev_principal_workers  # noqa: SLF001
+
+
+def _compute_attack_path_summaries_inner(
+    shell: object,
+    domain: str,
+    *,
+    scope_norm: str,
+    engine: str,
+    username: str | None,
+    principals: list[str] | None,
+    max_depth: int,
+    max_paths: int | None,
+    target: str,
+    target_mode: str,
+    membership_sample_max: int,
+    no_cache: bool,
+) -> list[dict[str, Any]]:
+    """Inner implementation of compute_attack_path_summaries, engine-dispatched."""
+    if engine == "bloodhound":
         bh_result = _compute_bh_attack_paths(
             shell,
             domain,
@@ -9365,7 +9995,7 @@ def get_attack_path_summaries(
         if bh_result is not None:
             return bh_result
 
-    if _engine == "rustworkx":
+    if engine == "rustworkx":
         return _compute_rustworkx_display_paths(
             shell,
             domain,
@@ -9434,8 +10064,10 @@ def get_attack_path_summaries(
             no_cache=no_cache,
         )
     else:
-        raise ValueError(f"Unsupported attack path summary scope: {scope!r}")
-    print_info_debug(f"[engine=local-dfs] {len(local_result)} path(s) in {time.perf_counter() - _local_t0:.2f}s")
+        raise ValueError(f"Unsupported attack path summary scope: {scope_norm!r}")
+    print_info_debug(
+        f"[engine=local-dfs] {len(local_result)} path(s) in {time.perf_counter() - _local_t0:.2f}s"
+    )
     return local_result
 
 
@@ -9577,7 +10209,9 @@ def compute_display_paths_for_principals(
             str(target_mode or "tier0").strip().lower(),
         ),
     )
-    cached = _attack_paths_cache_get(cache_key, domain=domain, scope="principals", no_cache=no_cache)
+    cached = _attack_paths_cache_get(
+        cache_key, domain=domain, scope="principals", no_cache=no_cache
+    )
     if cached is not None:
         cached = _filter_zero_length_display_paths(
             cached, domain=domain, scope="principals"
@@ -9622,12 +10256,30 @@ def compute_display_paths_for_principals(
     )
 
     base_graph = load_attack_graph(shell, domain)
-    runtime_graph: dict[str, Any] = dict(base_graph)
+    materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
+        shell,
+        domain=domain,
+        base_graph=base_graph,
+        snapshot=snapshot,
+    )
+    prepared_graph = _load_or_build_prepared_runtime_graph(
+        shell,
+        domain=domain,
+        base_graph=base_graph,
+        snapshot=snapshot,
+        expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
+        materialized_artifacts=materialized_artifacts,
+    )
+    runtime_graph: dict[str, Any] = dict(prepared_graph)
     runtime_graph["nodes"] = dict(
-        base_graph.get("nodes") if isinstance(base_graph.get("nodes"), dict) else {}
+        prepared_graph.get("nodes")
+        if isinstance(prepared_graph.get("nodes"), dict)
+        else {}
     )
     runtime_graph["edges"] = list(
-        base_graph.get("edges") if isinstance(base_graph.get("edges"), list) else []
+        prepared_graph.get("edges")
+        if isinstance(prepared_graph.get("edges"), list)
+        else []
     )
     # Coverage-first default: keep BloodHound resolution unless an operator
     # explicitly enables synthetic batch mode for performance experiments.
@@ -9689,6 +10341,7 @@ def compute_display_paths_for_principals(
         principal_node_ids=principal_node_ids,
         snapshot=snapshot,
         scope="principals",
+        materialized_artifacts=materialized_artifacts,
     )
     _dfs_t0 = time.monotonic()
     records = _sort_display_paths(
@@ -9895,7 +10548,11 @@ def _determine_path_type(steps: list[AttackPathStep]) -> str:
         return "kerberos"
 
     # Check for delegation
-    delegation_relations = {"allowedtodelegate", "allowedtoactonbehalfofotheridentity"}
+    delegation_relations = {
+        "allowedtodelegate",
+        "coercetotgt",
+        "allowedtoactonbehalfofotheridentity",
+    }
     if any(r in delegation_relations for r in relations):
         return "delegation"
 

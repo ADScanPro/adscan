@@ -36,6 +36,7 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
+from adscan_internal.cli.ci_events import emit_event
 from adscan_internal.cli.target_scope_warning import confirm_large_target_scope
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.workspaces import domain_subpath
@@ -1535,6 +1536,32 @@ def _show_network_reachability_summary(
             "Current-vantage TCP discovery: "
             f"{responsive_ips}/{total_ips} IP(s) responded and {no_response_ips} produced no response."
         )
+
+    try:
+        emit_event(
+            "coverage",
+            phase="domain_analysis",
+            phase_label="Domain Analysis",
+            category="network_coverage",
+            domain=str(payload.get("domain") or ""),
+            metric_type="network_reachability",
+            total_ips=total_ips,
+            reachable_ips=responsive_ips,
+            unreachable_ips=no_response_ips,
+            open_service_ips=int(summary.get("open_service_ips") or 0),
+            important_port_scan_performed=port_scan_performed,
+            possible_segments=len(possible_segment_clusters),
+            message=(
+                f"Network reachability updated: {responsive_ips}/{total_ips} resolved IPs responded"
+                + (
+                    f", {int(summary.get('open_service_ips') or 0)} exposed important services."
+                    if port_scan_performed
+                    else "."
+                )
+            ),
+        )
+    except Exception as exc:  # pragma: no cover
+        telemetry.capture_exception(exc)
 
     likely_down_entries = [
         entry

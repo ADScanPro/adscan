@@ -372,6 +372,9 @@ class NetExecRunner:
             upper = output.upper()
             return any(token in upper for token in patterns)
 
+        def _has_connection_reset_by_peer(output: str) -> bool:
+            return "CONNECTION RESET BY PEER" in output.upper()
+
         def _resolve_domain_info(known_domain: str | None) -> dict[str, object]:
             domains_data = getattr(ctx.state_owner, "domains_data", {}) or {}
             if not isinstance(domains_data, dict) or not known_domain:
@@ -841,6 +844,7 @@ class NetExecRunner:
                 )
                 has_schema_mismatch = "Schema mismatch detected" in combined_output
                 has_wrong_realm = "KDC_ERR_WRONG_REALM" in combined_output
+                has_connection_reset = _has_connection_reset_by_peer(combined_output)
 
                 if has_schema_mismatch:
                     if (
@@ -873,7 +877,43 @@ class NetExecRunner:
                     schema_mismatch_detected = True
                     break
 
-                if not has_clock_skew and not has_sched_error and not has_wrong_realm:
+                if (
+                    has_connection_reset
+                    and " -k" in f" {current_command} "
+                ):
+                    connection_reset_fallback_attempted = getattr(
+                        ctx.state_owner,
+                        "_netexec_connection_reset_ntlm_fallback_attempted",
+                        False,
+                    )
+                    if not connection_reset_fallback_attempted:
+                        fallback_command = _build_no_output_kerberos_fallback_command(
+                            current_command
+                        )
+                        if fallback_command and fallback_command != current_command:
+                            setattr(
+                                ctx.state_owner,
+                                "_netexec_connection_reset_ntlm_fallback_attempted",
+                                True,
+                            )
+                            print_warning(
+                                "Kerberos NetExec command hit 'Connection reset by peer'. "
+                                "Retrying once with NTLM fallback."
+                            )
+                            print_info_debug(
+                                "[netexec] Connection-reset NTLM fallback command: "
+                                f"{fallback_command}"
+                            )
+                            current_command = fallback_command
+                            needs_retry = True
+                            break
+
+                if (
+                    not has_clock_skew
+                    and not has_sched_error
+                    and not has_wrong_realm
+                    and not needs_retry
+                ):
                     # Log a concise summary and truncated preview of the NetExec output.
                     try:
                         exit_code, stdout_count, stderr_count, duration_text = (

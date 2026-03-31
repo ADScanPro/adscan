@@ -66,7 +66,6 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles import Style as PromptStyle
-from rich.align import Align
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, IntPrompt, Prompt
@@ -106,6 +105,7 @@ from adscan_internal import (
     print_exception,
     TelemetryAwareConsole,
 )
+from adscan_internal.cli.ci_events import emit_phase
 from adscan_internal.logging_config import init_logging
 from adscan_internal.ssl_certificates import configure_ssl_certificates
 from adscan_internal.subprocess_env import (
@@ -9041,6 +9041,47 @@ def handle_install(install_args=None):
     )
 
 
+def _make_create_shell(*, use_tui: bool):
+    """Return a ``create_shell`` factory for ``StartSessionDeps``.
+
+    When ``use_tui`` is True the factory wraps the PentestShell in a
+    ``TuiShellWrapper`` so that ``shell.run()`` launches the Textual TUI
+    instead of the default prompt_toolkit REPL. If the optional TUI
+    dependency is missing, degrade gracefully to the default shell.
+    """
+
+    def _factory(console_instance, license_mode):
+        shell = PentestShell(
+            console_instance=console_instance,
+            license_mode=license_mode,
+        )
+        if use_tui:
+            try:
+                from adscan_internal.tui.app import create_tui_shell_wrapper
+            except ModuleNotFoundError as exc:
+                if exc.name == "textual":
+                    print_warning(
+                        "TUI dependencies are not available in this runtime. "
+                        "Falling back to the default shell."
+                    )
+                    print_instruction(
+                        "Install/build a runtime image that includes TUI support "
+                        "to use `adscan start --tui`."
+                    )
+                    print_warning_debug(
+                        f"TUI import failed because optional dependency "
+                        f"'{exc.name}' is missing."
+                    )
+                    telemetry.capture_exception(exc)
+                    return shell
+                raise
+
+            return create_tui_shell_wrapper(shell)
+        return shell
+
+    return _factory
+
+
 # --- Modified handle_start() ---
 def handle_start(args: argparse.Namespace | None = None) -> None:
     is_frozen = getattr(sys, "frozen", False)
@@ -9071,9 +9112,8 @@ def handle_start(args: argparse.Namespace | None = None) -> None:
             resolve_license_mode=lambda requested: _resolve_license_mode(
                 requested_pro=requested
             ),
-            create_shell=lambda console_instance, license_mode: PentestShell(
-                console_instance=console_instance,
-                license_mode=license_mode,
+            create_shell=_make_create_shell(
+                use_tui=bool(getattr(args, "tui", False)),
             ),
             console=console,
             is_first_run=is_first_run,
@@ -13002,6 +13042,19 @@ class PentestShell:
 
     def run(self):
         """Main loop for the interactive shell using prompt-toolkit."""
+        if not self.current_workspace:
+            print_panel(
+                "[bold]ADscan cannot enter the interactive shell without an active workspace.[/bold]\n\n"
+                "Start the session again and select or create a workspace first.\n\n"
+                "[dim]This guardrail prevents partial failures later when commands try to save "
+                "credentials, domain state, or artifacts into workspace-scoped paths.[/dim]",
+                title="[bold]Workspace Required[/bold]",
+                border_style="red",
+                padding=(1, 2),
+            )
+            print_warning("Interactive shell not started because no workspace is active.")
+            return
+
         history_path = self._resolve_prompt_history_path_for_workspace(
             self.current_workspace_dir
         )
@@ -13470,57 +13523,47 @@ class PentestShell:
 
     def show_intro(self):
         # pylint: disable=invalid-name
-        from adscan_internal.rich_output import BRAND_COLORS
+        from rich.rule import Rule
+        from adscan_internal.branding import (
+            ADSCAN_LINKS,
+            ADSCAN_TAGLINE,
+            build_gradient_ascii,
+        )
+        from adscan_core.theme import ADSCAN_PRIMARY, ADSCAN_PRIMARY_DIM
 
-        BIG_ASCII = """\
-
-   █████████   ██████████
-  ███░░░░░███ ░░███░░░░███
- ░███    ░███  ░███   ░░███  █████   ██████   ██████   ████████
- ░███████████  ░███    ░███ ███░░   ███░░███ ░░░░░███ ░░███░░███
- ░███░░░░░███  ░███    ░███░░█████ ░███ ░░░   ███████  ░███ ░███
- ░███    ░███  ░███    ███  ░░░░███░███  ███ ███░░███  ░███ ░███
- █████   █████ ██████████   ██████ ░░██████ ░░████████ ████ █████
-░░░░░   ░░░░░ ░░░░░░░░░░   ░░░░░░   ░░░░░░   ░░░░░░░░░░░░░░░░░
-        """
         version_tag = _format_runtime_version_tag(self.license_mode)
 
-        if self.console.width >= 100:
-            # Colour-fade the ASCII banner using ADscan brand color
-            lines = BIG_ASCII.splitlines()
-            gradient_text = Text()
-            total = len(lines) - 1 or 1
-            for idx, line in enumerate(lines):
-                blend = idx / total
-                # Interpolation between ADscan brand cyan (#00D4FF) and white (#ffffff)
-                # Extract RGB from brand color
-                brand_r, brand_g, brand_b = 0x00, 0xD4, 0xFF
-                r = int(brand_r + (0xFF - brand_r) * blend)
-                g = int(brand_g + (0xFF - brand_g) * blend)
-                b = int(brand_b + (0xFF - brand_b) * blend)
-                color = f"#{r:02x}{g:02x}{b:02x}"
-                gradient_text.append(line + "\n", style=color)
-            self.console.print(gradient_text)
-        else:
-            # Use brand color for compact banner
-            self.console.print(Align.center(f"[bold {BRAND_COLORS['info']}]ADscan[/]"))
+        # ASCII logo with brand gradient (shared with Textual TUI splash)
+        self.console.print(build_gradient_ascii(self.console.width))
 
-        # Use brand color for version info
-        print_info(f"[bold]ADscan {version_tag}[/bold]")
-        raw_url = "https://github.com/ADscanPro/adscan"
-        url = mark_passthrough(raw_url)
-        print_info(f"[link={raw_url}]🔗 GitHub[/link] [dim]{url}[/dim]")
-        self.console.print()  # Empty line
-        print_info("[bold]💪 Automate Harder! 💪[/bold]")
-        self.console.print()  # Empty line
-        print_info("[dim]©  2026 Yeray Martín - Macroblond44[/dim]")
-        linkedin_url = "https://linkedin.com/in/yeray-martín-domínguez-324a64223"
-        discord_url = "https://discord.gg/fXBR3P8H74"
-        raw_linkedin_url = mark_passthrough(linkedin_url)
-        raw_discord_url = mark_passthrough(discord_url)
-        print_info(
-            f"[dim]💬 Feedback, bugs or ideas? → [link={raw_linkedin_url}]LinkedIn[/link] | [link={raw_discord_url}]Discord[/link][/dim]"
+        # Version + edition on one clean line
+        license_mode = str(getattr(self, "license_mode", "LITE") or "LITE").upper()
+        badge_style = f"bold {ADSCAN_PRIMARY}" if license_mode == "PRO" else "bold #d29922"
+        self.console.print(
+            f"  [bold {ADSCAN_PRIMARY}]ADscan[/bold {ADSCAN_PRIMARY}]"
+            f"  [dim]{version_tag}[/dim]"
+            f"  [{badge_style}]{license_mode}[/{badge_style}]"
         )
+
+        # Tagline (shared with Textual TUI)
+        self.console.print(
+            f"  [italic {ADSCAN_PRIMARY_DIM}]{ADSCAN_TAGLINE}[/italic {ADSCAN_PRIMARY_DIM}]"
+        )
+
+        # Separator
+        self.console.print(Rule(style=f"dim {ADSCAN_PRIMARY}"))
+
+        # Links footer — compact, single line
+        raw_gh  = ADSCAN_LINKS["github"]
+        raw_dc  = ADSCAN_LINKS["discord"]
+        raw_li  = ADSCAN_LINKS["linkedin"]
+        self.console.print(
+            f"  [dim][link={raw_gh}]🔗 GitHub[/link]"
+            f"  ·  [link={raw_dc}]💬 Discord[/link]"
+            f"  ·  [link={raw_li}]💼 LinkedIn[/link][/dim]"
+            f"  [dim]·  © 2026 Yeray Martín[/dim]"
+        )
+        self.console.print()
 
     def do_set(self, args):
         """
@@ -15318,6 +15361,7 @@ class PentestShell:
         )
 
         # ========== PHASE 1: Domain Analysis ==========
+        emit_phase("domain_analysis")
         print_phase_header(
             "Domain Analysis",
             phase_number=1,
@@ -15431,6 +15475,7 @@ class PentestShell:
             return
 
         # ========== PHASE 2: Attack Paths Discovery ==========
+        emit_phase("attack_paths_discovery")
         print_phase_header(
             "Attack Paths Discovery",
             phase_number=2,
@@ -15512,6 +15557,7 @@ class PentestShell:
             return
 
         # ========== PHASE 4: Roasting & Cracking ==========
+        emit_phase("roasting_&_cracking")
         print_phase_header(
             "Roasting & Cracking",
             phase_number=4,
@@ -15751,12 +15797,6 @@ class PentestShell:
                     ATTACK_PATHS_MAX_DEPTH_DOMAIN,
                 )
 
-                default_execute_all = bool(
-                    os.getenv("CI")
-                    or os.getenv("GITHUB_ACTIONS")
-                    or (not sys.stdin.isatty())
-                    or getattr(self, "auto", False)
-                )
                 print_panel(
                     content=(
                         "The domain is already compromised. ADscan will now offer the remaining "
@@ -15781,11 +15821,10 @@ class PentestShell:
                     domain,
                     summaries=summaries,
                     max_display=20,
-                    allow_execute_all=True,
-                    default_execute_all=default_execute_all,
                     execute_only_statuses={"theoretical"},
                     retry_attempted=False,
                     recompute_summaries=_compute_summaries,
+                    auto_continue_theoretical_in_non_interactive=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
@@ -28821,6 +28860,11 @@ def handle_ci(args):
 
 
 if __name__ == "__main__":
+    # Required for multiprocessing with spawn context inside a PyInstaller binary.
+    # Must be called before any other code in the __main__ block.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     init_sentry()
     _cleanup_legacy_adscan_sudo_alias()
     # ADscan can be run as a normal user. Commands that require privileges will
@@ -28932,6 +28976,11 @@ if __name__ == "__main__":
         "--debug",
         action="store_true",
         help="Enable debug mode.",
+    )
+    start_parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch the Textual-based TUI instead of the default prompt_toolkit shell.",
     )
     # Non-interactive CI scan for automated testing
     ci_parser = subparsers.add_parser(

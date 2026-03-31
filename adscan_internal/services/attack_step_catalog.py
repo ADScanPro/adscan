@@ -79,7 +79,9 @@ class AttackStepCatalogEntry:
     )
     detection_event_ids: tuple[str, ...] = ()  # Windows Event IDs for SOC detection
     bh_native: bool = False  # True = edge exists natively in BloodHound CE's graph
-    bh_cypher_names: tuple[str, ...] = ()  # Cypher relationship type(s) for BH CE queries
+    bh_cypher_names: tuple[
+        str, ...
+    ] = ()  # Cypher relationship type(s) for BH CE queries
 
 
 def _entry(
@@ -352,18 +354,17 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "allowedtodelegate",
         support_kind="supported",
-        support_reason="Kerberos delegation exploitation (constrained/unconstrained)",
+        support_reason="Kerberos constrained delegation enumeration/exploitation",
         category="delegation",
-        description="Abuse delegation rights to obtain elevated service tickets",
-        vuln_key="unconstrained_delegation",
+        description="Abuse AllowedToDelegate paths to impersonate users to delegated services",
+        vuln_key="constrained_delegation",
         remediation_complexity="high",
         remediation_effort=(
-            "Remove unconstrained delegation from the account if not required. "
-            "For DCs: cannot be removed (architecturally required). "
-            "Mitigate by marking sensitive accounts with 'Account is sensitive and cannot be delegated', "
-            "blocking coercion techniques via firewall rules on DC ports (135, 139, 445)."
+            "Audit msDS-AllowedToDelegateTo and remove unnecessary delegated SPNs. "
+            "Restrict protocol transition (TrustedToAuthForDelegation) to services that require it. "
+            "Mark privileged and sensitive accounts as 'Account is sensitive and cannot be delegated'."
         ),
-        can_fully_mitigate=False,
+        can_fully_mitigate=True,
         mitre_technique_id="T1558",
         mitre_technique_name="Steal or Forge Kerberos Tickets",
         detection_event_ids=("4769",),
@@ -414,6 +415,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         support_reason="Not implemented yet in ADscan",
         category="delegation",
         description="Coerce a target into providing a usable TGT for delegation abuse",
+        vuln_key="unconstrained_delegation",
         remediation_complexity="medium",
         remediation_effort=(
             "Block authentication coercion by disabling vulnerable RPC endpoints. "
@@ -607,6 +609,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc1",
         support_kind="supported",
         support_reason="Request an authentication certificate via ADCS ESC1",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="Enroll exploitable template and authenticate as target",
         vuln_key="adcs_esc1",
@@ -626,6 +630,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc2",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC2 privilege escalation path",
         vuln_key="adcs_esc2",
@@ -645,6 +651,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc3",
         support_kind="supported",
         support_reason="Request an agent certificate and impersonate a target via ADCS ESC3",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="Use enrollment agent cert to request impersonation certs",
         vuln_key="adcs_esc3",
@@ -664,6 +672,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc4",
         support_kind="supported",
         support_reason="Make a certificate template vulnerable via ADCS ESC4",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="Modify template permissions/configuration for abuse",
         vuln_key="adcs_esc4",
@@ -683,6 +693,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc5",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC5 privilege escalation path",
         vuln_key="adcs_esc5",
@@ -702,6 +714,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc6",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC6 privilege escalation path",
         vuln_key="adcs_esc6",
@@ -721,6 +735,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc7",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC7 privilege escalation path",
         vuln_key="adcs_esc7",
@@ -740,6 +756,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc8",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC8 privilege escalation path",
         vuln_key="adcs_esc8",
@@ -760,6 +778,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc9",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC9 privilege escalation path",
         vuln_key="adcs_esc9",
@@ -780,6 +800,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc10",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC10 privilege escalation path",
         vuln_key="adcs_esc10",
@@ -799,6 +821,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc11",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC11 privilege escalation path",
         vuln_key="adcs_esc11",
@@ -818,6 +842,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc13",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC13 privilege escalation path",
         vuln_key="adcs_esc13",
@@ -837,6 +863,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "adcsesc15",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="ADCS ESC15 privilege escalation path",
         vuln_key="adcs_esc15",
@@ -1508,9 +1536,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
 )
 
 ATTACK_STEP_CATALOG: dict[str, AttackStepCatalogEntry] = {
-    entry.relation: entry
-    for entry in _CATALOG_ENTRIES
-    if entry.relation
+    entry.relation: entry for entry in _CATALOG_ENTRIES if entry.relation
 }
 
 _RELATION_ALIASES_BY_KEY: dict[str, str] = {

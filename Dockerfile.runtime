@@ -31,7 +31,7 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 RUN cargo install --locked --version 2.4.7 rusthound-ce
 
 ###############################################################################
-# John the Ripper build stage (generic x86_64 for VM/host compatibility)
+# John the Ripper build stage (generic john binary + official converters)
 ###############################################################################
 FROM debian:trixie-slim AS john_builder
 
@@ -62,7 +62,11 @@ RUN set -eux; \
     cd /opt/adscan/tools/john/src && \
     make -s -f Makefile.legacy clean && \
     make -sj"$(nproc)" -f Makefile.legacy linux-x86-64 && \
-    cp /opt/adscan/tools/john/run/john /opt/adscan/tools/john/run/john-generic && \
+    cp /opt/adscan/tools/john/run/john /tmp/john-generic && \
+    ./configure --disable-native-tests --enable-simd=sse2 >/dev/null && \
+    make -s clean && \
+    make -sj"$(nproc)" && \
+    cp /tmp/john-generic /opt/adscan/tools/john/run/john-generic && \
     ln -sf /opt/adscan/tools/john/run/john-generic /opt/adscan/tools/john/run/john \
   ); \
   chmod +x /opt/adscan/tools/john/run/john /opt/adscan/tools/john/run/john-generic
@@ -112,6 +116,8 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       python3-pip \
       python3-venv \
       python3-dev \
+      chromium \
+      chromium-driver \
       nodejs \
       npm \
       build-essential \
@@ -391,10 +397,12 @@ RUN set -eux; \
   7z x -y -o/opt/adscan/wordlists /opt/adscan/wordlists/hashmob.net_2025.medium.found.7z; \
   curl -fsSL https://weakpass.com/download/1938/kaonashi14M.txt.7z -o /opt/adscan/wordlists/kaonashi14M.txt.7z; \
   7z x -y -o/opt/adscan/wordlists /opt/adscan/wordlists/kaonashi14M.txt.7z; \
+  mkdir -p /usr/share/wordlists; \
+  git clone --depth 1 https://github.com/insidetrust/statistically-likely-usernames.git /usr/share/wordlists/statistically-likely-usernames; \
   rm -f /opt/adscan/wordlists/kerberoast_pws.xz; \
   rm -f /opt/adscan/wordlists/hashmob.net_2025.medium.found.7z; \
   rm -f /opt/adscan/wordlists/kaonashi14M.txt.7z; \
-  chmod -R 0777 /opt/adscan/wordlists
+  chmod -R 0777 /opt/adscan/wordlists /usr/share/wordlists/statistically-likely-usernames
 
 # RustHound-CE (Kerberos-capable build)
 COPY --from=rusthound_builder /usr/local/cargo/bin/rusthound-ce /usr/local/bin/rusthound-ce
@@ -431,6 +439,7 @@ RUN set -eux; \
     psutil==7.2.2 \
     rich==13.9.4 \
     python-docx==1.2.0 \
+    openpyxl==3.1.5 \
     netifaces==0.11.0 \
     neo4j==6.1.0 \
     posthog==7.9.3 \
@@ -453,7 +462,10 @@ RUN set -eux; \
     requests==2.32.5 \
     matplotlib==3.10.8 \
     graphviz==0.21 \
-    rustworkx==0.15.1
+    pyarrow==21.0.0 \
+    rustworkx==0.15.1 \
+    selenium==4.31.0 \
+    textual==0.80.1
 
 COPY adscan.py /opt/adscan-src/adscan.py
 COPY adscan_core /opt/adscan-src/adscan_core
