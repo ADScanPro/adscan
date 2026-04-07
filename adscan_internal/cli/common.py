@@ -1,4 +1,4 @@
-"""Common CLI helpers for telemetry context, workspace selection, first-run, and shared constants.
+"""Common CLI helpers for telemetry context, workspace selection, onboarding, and shared constants.
 
 This module provides shared functionality used across CLI commands to avoid
 circular dependencies and duplicate code.
@@ -16,7 +16,11 @@ from adscan_core.lab_context import (
 )
 from adscan_internal.path_utils import get_adscan_state_dir
 from adscan_internal.telemetry import TELEMETRY_ID
-from adscan_internal.rich_output import mark_sensitive, print_info_debug, print_panel
+from adscan_internal.rich_output import (
+    mark_sensitive,
+    print_info_debug,
+    print_panel,
+)
 from rich.text import Text
 
 
@@ -27,6 +31,22 @@ from rich.text import Text
 import os
 
 SECRET_MODE: bool = os.getenv("ADSCAN_SECRET_MODE") == "1"  # pylint: disable=invalid-name
+
+_WORKSPACE_ONBOARDING_KEY = "workspace_onboarding"
+_WORKSPACE_SCAN_STARTED_KEY = "start_scan_completed"
+_WORKSPACE_FIRST_START_COMMAND_KEY = "first_start_command"
+_WORKSPACE_SCAN_EVIDENCE_KEYS = {
+    "auth",
+    "pdc",
+    "pdc_hostname",
+    "dcs",
+    "dcs_hostnames",
+    "username",
+    "password",
+    "hash",
+    "base_dn",
+    "phase1_complete",
+}
 
 DomainContextPolicy = Literal[
     "auto_by_signature",
@@ -39,10 +59,12 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "ask": "exempt",
     "add_auths": "exempt",
     "attack_paths": "requires_initialized_domain",
+    "reset_attack_path_statuses": "requires_initialized_domain",
     "attack_steps": "requires_initialized_domain",
     "bloodhound_attack_paths": "requires_initialized_domain",
     "cat": "exempt",
     "cd": "exempt",
+    "check_dc_ntlm_auth_type": "requires_initialized_domain",
     "check_dns": "exempt",
     "clear": "exempt",
     "clear_all": "exempt",
@@ -256,26 +278,87 @@ def mark_first_run_complete() -> None:
         pass
 
 
+def _get_workspace_onboarding_state(shell: Any) -> dict[str, Any]:
+    """Return the mutable onboarding state stored in workspace variables."""
+    variables = getattr(shell, "variables", None)
+    if not isinstance(variables, dict):
+        variables = {}
+        setattr(shell, "variables", variables)
+
+    onboarding_state = variables.get(_WORKSPACE_ONBOARDING_KEY)
+    if not isinstance(onboarding_state, dict):
+        onboarding_state = {}
+        variables[_WORKSPACE_ONBOARDING_KEY] = onboarding_state
+
+    return onboarding_state
+
+
+def _workspace_has_scan_evidence(shell: Any) -> bool:
+    """Return ``True`` when the workspace already contains scan-derived state.
+
+    This protects existing workspaces created before the onboarding state key
+    existed. Mature workspaces should not start showing the getting-started
+    panel again just because the new flag is missing.
+    """
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        return False
+
+    for domain_data in domains_data.values():
+        if not isinstance(domain_data, dict):
+            continue
+        for key in _WORKSPACE_SCAN_EVIDENCE_KEYS:
+            value = domain_data.get(key)
+            if value in (None, "", [], {}, False):
+                continue
+            return True
+    return False
+
+
+def should_show_workspace_getting_started(shell: Any) -> bool:
+    """Return whether the getting-started helper should still be shown.
+
+    The helper remains visible until the operator has successfully started an
+    authenticated or unauthenticated scan in the workspace. For legacy
+    workspaces, existing scan evidence suppresses the helper automatically.
+    """
+    if not getattr(shell, "current_workspace", None):
+        return False
+
+    onboarding_state = _get_workspace_onboarding_state(shell)
+    if onboarding_state.get(_WORKSPACE_SCAN_STARTED_KEY):
+        return False
+
+    return not _workspace_has_scan_evidence(shell)
+
+
+def mark_workspace_start_scan_completed(shell: Any, command_name: str) -> None:
+    """Persist that the workspace has already launched its first scan flow."""
+    onboarding_state = _get_workspace_onboarding_state(shell)
+    onboarding_state[_WORKSPACE_SCAN_STARTED_KEY] = True
+    onboarding_state.setdefault(_WORKSPACE_FIRST_START_COMMAND_KEY, command_name)
+
+
 def show_first_run_helper(
     track_docs_link_shown: Any | None = None,
 ) -> None:
-    """Show getting started helper on first run only.
+    """Show the getting-started helper until the workspace launches a scan.
 
     Args:
         track_docs_link_shown: Optional function to track when docs link is shown.
                               If provided, should accept (context: str, url: str).
     """
     helper_text = Text.from_markup(
-        "💡 [bold]New to ADscan?[/bold]\n\n"
-        "Quick Start:\n"
-        "  1. Create workspace:  [cyan]workspace create my_pentest[/cyan]\n"
-        "  2. Start scan:        [cyan]start_unauth[/cyan] (no creds) or [cyan]start_auth[/cyan] (with creds)\n"
-        "  3. Initialize domain: [cyan]start_auth[/cyan] before using [cyan]creds save[/cyan]\n"
-        "  4. Add extra creds:   [cyan]creds save <domain> <username> <password_or_hash>[/cyan]\n\n"
+        "💡 [bold]This workspace has not started a scan yet.[/bold]\n\n"
+        "Commands to type:\n"
+        "  • Start unauth scan: [cyan]start_unauth[/cyan]\n"
+        "  • Start auth scan:   [cyan]start_auth[/cyan]\n"
+        "  • Save more creds:   [cyan]creds save <domain> <username> <password_or_hash>[/cyan]\n"
         "📚 Full documentation: [link=https://www.adscanpro.com/docs?utm_source=cli&utm_medium=first_run]"
         "www.adscanpro.com/docs[/link]\n"
         "   (Installation, guides, troubleshooting, and more)\n\n"
-        "[dim]Type 'help' for available commands[/dim]"
+        "[dim]Tip: This panel disappears automatically after the first successful "
+        "`start_unauth` or `start_auth` in this workspace.[/dim]"
     )
 
     print_panel(

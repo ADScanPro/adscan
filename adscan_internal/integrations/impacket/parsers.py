@@ -110,6 +110,62 @@ def parse_kerberoast_output(output: str) -> List[KerberoastHash]:
     return hashes
 
 
+def extract_kerberoast_candidate_users(output: str) -> List[str]:
+    """Extract roastable usernames from GetUserSPNs stdout.
+
+    This parser handles both:
+    - raw hash output (``$krb5tgs$...``)
+    - tabular SPN listings returned by GetUserSPNs before/without hashes in stdout
+    """
+    if not output:
+        return []
+
+    discovered: List[str] = []
+    seen: set[str] = set()
+
+    for item in parse_kerberoast_output(output):
+        if not item.hash_value.strip():
+            continue
+        username = item.username.strip()
+        if username and username.lower() not in seen:
+            discovered.append(username)
+            seen.add(username.lower())
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if (
+            lowered.startswith("serviceprincipalname")
+            or set(line) == {"-"}
+            or lowered.startswith("impacket ")
+            or lowered.startswith("[-]")
+            or lowered.startswith("[*]")
+            or "ccache file is not found" in lowered
+            or "no entries found" in lowered
+            or "$krb5tgs$" in lowered
+        ):
+            continue
+
+        columns = re.split(r"\s{2,}", line)
+        if len(columns) < 2:
+            continue
+        if all(column and set(column) == {"-"} for column in columns):
+            continue
+
+        username = columns[1].strip()
+        if not username or username.lower() == "name":
+            continue
+        lowered_username = username.lower()
+        if lowered_username in seen:
+            continue
+        discovered.append(username)
+        seen.add(lowered_username)
+
+    return discovered
+
+
 def parse_asreproast_output(output: str) -> List[ASREPHash]:
     """Parse GetNPUsers output for AS-REP Roast hashes.
 

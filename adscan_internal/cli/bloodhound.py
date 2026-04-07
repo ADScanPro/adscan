@@ -11,6 +11,7 @@ import os
 import sys
 import re
 import shlex
+import shutil
 from datetime import datetime, timezone
 
 from rich.prompt import Confirm, Prompt
@@ -36,16 +37,33 @@ from adscan_internal import (
 from adscan_internal.bloodhound_ce_compose import BLOODHOUND_CE_DEFAULT_WEB_PORT
 from adscan_internal.cli.ci_events import emit_event, emit_phase
 from adscan_internal.cli.common import build_lab_event_fields
+from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.rich_output import mark_passthrough, mark_sensitive, print_panel
+from adscan_internal.services.high_value import (
+    UserRiskFlags,
+    classify_users_tier0_high_value,
+    normalize_samaccountname,
+)
+from adscan_internal.services.adcs_path_display import (
+    format_adcs_templates_summary,
+    resolve_adcs_display_target,
+)
+from adscan_internal.services.adcs_target_filter import (
+    domain_has_adcs_for_attack_steps,
+    path_contains_adcs_dependent_node,
+)
 from adscan_internal.services.attack_graph_service import (
     ATTACK_PATHS_MAX_DEPTH_DOMAIN,
     ATTACK_PATHS_MAX_DEPTH_USER,
+    get_netlogon_write_support_paths,
 )
-from adscan_internal.workspaces import domain_subpath
+from adscan_internal.workspaces import domain_relpath, domain_subpath, write_json_file
 
 
 _RUSTHOUND_COLLECTOR_TIMEOUT_SECONDS = 1800
 _BLOODHOUND_CE_PY_COLLECTOR_TIMEOUT_SECONDS = 3600
+_BLOODHOUND_CE_UPLOAD_TIMEOUT_SECONDS = 1800
+_BLOODHOUND_CE_UPLOAD_MAX_ATTEMPTS = 2
 # Compute-time path cap for `attack_paths` UX.
 # Set to `None` (default) for unlimited path computation, or to a positive int.
 ATTACK_PATHS_COMPUTE_DEFAULT_MAX: int | None = None
@@ -56,6 +74,7 @@ def get_bloodhound_collector_timeout_seconds(tool_name: str) -> int:
     specific_env_names = {
         "rusthound-ce": "ADSCAN_BLOODHOUND_RUSTHOUND_TIMEOUT",
         "bloodhound-ce-python": "ADSCAN_BLOODHOUND_CE_PY_TIMEOUT",
+        "certihound": "ADSCAN_BLOODHOUND_CERTIHOUND_TIMEOUT",
     }
     specific_env = specific_env_names.get(tool_name)
     candidates = []
@@ -75,8 +94,98 @@ def get_bloodhound_collector_timeout_seconds(tool_name: str) -> int:
     defaults = {
         "rusthound-ce": _RUSTHOUND_COLLECTOR_TIMEOUT_SECONDS,
         "bloodhound-ce-python": _BLOODHOUND_CE_PY_COLLECTOR_TIMEOUT_SECONDS,
+        "certihound": _RUSTHOUND_COLLECTOR_TIMEOUT_SECONDS,
     }
     return defaults.get(tool_name, _BLOODHOUND_CE_PY_COLLECTOR_TIMEOUT_SECONDS)
+
+
+def _resolve_requested_bloodhound_collectors(shell: object) -> list[str]:
+    """Return the BloodHound collectors that should run for the current session.
+
+    In non-dev sessions, run the current production collector pair. In dev
+    sessions, allow engineers to choose the collector subset interactively via
+    Questionary checkbox.
+    """
+    default_collectors = ["bloodhound-ce-python"]
+    is_dev = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
+    checkbox = getattr(shell, "_questionary_checkbox", None)
+    if not is_dev or not callable(checkbox):
+        return default_collectors
+
+    label_to_collector = {
+        "bloodhound-python-ce": "bloodhound-ce-python",
+        "rusthound-ce": "rusthound-ce",
+        "certihound": "certihound",
+    }
+    options = list(label_to_collector.keys())
+
+    available_defaults: list[str] = []
+    if getattr(shell, "bloodhound_ce_py_path", None):
+        available_defaults.append("bloodhound-python-ce")
+    if not available_defaults:
+        available_defaults = ["bloodhound-python-ce"]
+
+    try:
+        selected_labels = checkbox(
+            "Select BloodHound collectors to run:",
+            options,
+            default_values=available_defaults,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[bloodhound] collector selector failed; using defaults: {exc}"
+        )
+        return default_collectors
+
+    if selected_labels is None:
+        return default_collectors
+    if not selected_labels:
+        print_warning(
+            "No BloodHound collectors selected in dev mode; falling back to the default pair."
+        )
+        return default_collectors
+
+    selected_collectors = [
+        label_to_collector[label]
+        for label in options
+        if label in selected_labels and label in label_to_collector
+    ]
+    return selected_collectors or default_collectors
+
+
+def _resolve_certihound_executable_path() -> str | None:
+    """Return the preferred CertiHound CLI path when available."""
+    runtime_candidate = "/opt/adscan/venv/bin/certihound"
+    if os.path.exists(runtime_candidate) and os.access(runtime_candidate, os.X_OK):
+        return runtime_candidate
+    return shutil.which("certihound")
+
+
+def get_bloodhound_ce_upload_timeout_seconds() -> int:
+    """Return BloodHound CE ingestion wait timeout in seconds."""
+    raw = os.getenv("ADSCAN_BLOODHOUND_CE_UPLOAD_TIMEOUT", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                return parsed
+        except (TypeError, ValueError):
+            pass
+    return _BLOODHOUND_CE_UPLOAD_TIMEOUT_SECONDS
+
+
+def get_bloodhound_ce_upload_max_attempts() -> int:
+    """Return the bounded number of CE upload attempts per ZIP artifact."""
+    raw = os.getenv("ADSCAN_BLOODHOUND_CE_UPLOAD_MAX_ATTEMPTS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                return max(1, min(parsed, 5))
+        except (TypeError, ValueError):
+            pass
+    return _BLOODHOUND_CE_UPLOAD_MAX_ATTEMPTS
 
 
 def _get_attack_paths_step_sample_limit() -> int:
@@ -134,6 +243,162 @@ def _bloodhound_node_display_label(node: object) -> str:
     return str(name or "").strip()
 
 
+def _bloodhound_node_primary_kind(node: object) -> str:
+    """Return the primary BloodHound kind for one node payload."""
+    if not isinstance(node, dict):
+        return ""
+    kind = node.get("kind") or node.get("labels") or node.get("type")
+    if isinstance(kind, list) and kind:
+        preferred = {
+            "User",
+            "Computer",
+            "Group",
+            "Domain",
+            "GPO",
+            "OU",
+            "Container",
+            "CertTemplate",
+            "EnterpriseCA",
+            "AIACA",
+            "RootCA",
+            "NTAuthStore",
+        }
+        for entry in kind:
+            entry_text = str(entry or "").strip()
+            if entry_text in preferred:
+                return entry_text
+        return str(kind[0] or "").strip()
+    if isinstance(kind, str):
+        return kind.strip()
+    properties = node.get("properties")
+    if isinstance(properties, dict):
+        fallback = properties.get("type") or properties.get("objecttype")
+        if isinstance(fallback, str):
+            return fallback.strip()
+    return ""
+
+
+def _write_acl_object_control_coverage_sidecar(
+    shell: BloodHoundShell,
+    *,
+    domain: str,
+    valid_entries: list[dict[str, Any]],
+    direct_entries: list[dict[str, Any]],
+    promoted_entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Persist compact object-control coverage derived from raw ACL inventory."""
+    from adscan_internal.services.attack_graph_service import _node_id
+    from adscan_internal.workspaces import write_json_file
+
+    direct_signatures: set[tuple[str, str, str]] = set()
+    promoted_signatures: set[tuple[str, str, str]] = set()
+    for entry in direct_entries:
+        nodes = entry.get("nodes") or []
+        rels = entry.get("rels") or []
+        if len(nodes) < 2 or not rels:
+            continue
+        if not isinstance(nodes[0], dict) or not isinstance(nodes[1], dict):
+            continue
+        direct_signatures.add(
+            (
+                _node_id(nodes[0]),
+                _node_id(nodes[1]),
+                str(rels[0] or "").strip().lower(),
+            )
+        )
+    for entry in promoted_entries:
+        nodes = entry.get("nodes") or []
+        rels = entry.get("rels") or []
+        if len(nodes) < 2 or not rels:
+            continue
+        if not isinstance(nodes[0], dict) or not isinstance(nodes[1], dict):
+            continue
+        promoted_signatures.add(
+            (
+                _node_id(nodes[0]),
+                _node_id(nodes[1]),
+                str(rels[0] or "").strip().lower(),
+            )
+        )
+
+    coverage_records: list[dict[str, Any]] = []
+    seen_records: set[tuple[str, str, str]] = set()
+    summary = {
+        "records_total": 0,
+        "retained_direct": 0,
+        "retained_promoted": 0,
+        "dropped": 0,
+    }
+
+    for entry in valid_entries:
+        nodes = entry.get("nodes") or []
+        rels = entry.get("rels") or []
+        if len(nodes) < 2 or not rels:
+            continue
+        if not isinstance(nodes[0], dict) or not isinstance(nodes[1], dict):
+            continue
+        relation = str(rels[0] or "").strip()
+        relation_norm = relation.lower()
+        if relation_norm not in {"genericall", "genericwrite"}:
+            continue
+        target_kind = _bloodhound_node_primary_kind(nodes[1])
+        if target_kind.lower() != "user":
+            continue
+        source_id = _node_id(nodes[0])
+        target_id = _node_id(nodes[1])
+        if not source_id or not target_id:
+            continue
+        signature = (source_id, target_id, relation_norm)
+        if signature in seen_records:
+            continue
+        seen_records.add(signature)
+        if signature in direct_signatures:
+            disposition = "retained_direct"
+        elif signature in promoted_signatures:
+            disposition = "retained_promoted"
+        else:
+            disposition = "dropped"
+        summary["records_total"] += 1
+        summary[disposition] += 1
+        coverage_records.append(
+            {
+                "source_id": source_id,
+                "source": _bloodhound_node_display_label(nodes[0]),
+                "target_id": target_id,
+                "target": _bloodhound_node_display_label(nodes[1]),
+                "relation": relation,
+                "target_kind": target_kind,
+                "disposition": disposition,
+            }
+        )
+
+    payload = {
+        "schema_version": "acl-object-control-coverage-1.0",
+        "domain": domain,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "coverage": coverage_records,
+        "summary": summary,
+    }
+    output_path = domain_subpath(
+        shell._get_workspace_cwd(),
+        shell.domains_dir,
+        domain,
+        "BH",
+        "acl_object_control_coverage.json",
+    )
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    write_json_file(output_path, payload)
+    print_info_debug(
+        "[bloodhound] ACL object-control coverage: "
+        f"total={summary['records_total']} "
+        f"retained_direct={summary['retained_direct']} "
+        f"retained_promoted={summary['retained_promoted']} "
+        f"dropped={summary['dropped']} "
+        f"path={mark_sensitive(output_path, 'path')}"
+    )
+    return payload
+
+
 def _sanitize_acl_paths_for_attack_graph(
     shell: BloodHoundShell,
     *,
@@ -155,14 +420,15 @@ def _sanitize_acl_paths_for_attack_graph(
         _node_id,
         add_bloodhound_path_edges,
     )
-    from adscan_internal.workspaces import write_json_file
-
     threshold = _get_acl_sanitization_threshold()
     sanitize_depth = max(max_depth, _get_acl_sanitization_depth())
 
     valid_entries: list[dict[str, Any]] = []
     source_to_entries: dict[str, list[dict[str, Any]]] = defaultdict(list)
     source_to_label: dict[str, str] = {}
+    has_adcs: bool | None = None
+    adcs_filtered_rows = 0
+    adcs_filtered_samples: list[dict[str, str]] = []
 
     for entry in raw_paths:
         if not isinstance(entry, dict):
@@ -173,8 +439,23 @@ def _sanitize_acl_paths_for_attack_graph(
             continue
         if len(nodes) < 2 or not rels:
             continue
-        if not isinstance(nodes[0], dict):
+        if not isinstance(nodes[0], dict) or not isinstance(nodes[1], dict):
             continue
+        target_label = _bloodhound_node_display_label(nodes[1])
+        if path_contains_adcs_dependent_node(nodes, domain, skip_first=True):
+            if has_adcs is None:
+                has_adcs = domain_has_adcs_for_attack_steps(shell, domain)
+            if not has_adcs:
+                adcs_filtered_rows += 1
+                if len(adcs_filtered_samples) < 20:
+                    adcs_filtered_samples.append(
+                        {
+                            "source": _bloodhound_node_display_label(nodes[0]),
+                            "relation": str(rels[0] or ""),
+                            "target": target_label,
+                        }
+                    )
+                continue
         source_id = _node_id(nodes[0])
         if not source_id:
             continue
@@ -199,11 +480,26 @@ def _sanitize_acl_paths_for_attack_graph(
         "dropped_sources": [],
         "final_retained_sources_count": 0,
         "fully_dropped_sources_count": 0,
+        "adcs_filtered_rows": adcs_filtered_rows,
+        "adcs_filtered_samples": adcs_filtered_samples,
     }
 
     if threshold <= 0 or not valid_entries:
         report["direct_sources"] = len(source_to_entries)
         report["direct_acl_rows"] = len(valid_entries)
+        try:
+            _write_acl_object_control_coverage_sidecar(
+                shell,
+                domain=domain,
+                valid_entries=valid_entries,
+                direct_entries=valid_entries,
+                promoted_entries=[],
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[bloodhound] failed to write ACL object-control coverage: {exc}"
+            )
         return valid_entries, report
 
     direct_entries: list[dict[str, Any]] = []
@@ -233,6 +529,19 @@ def _sanitize_acl_paths_for_attack_graph(
     }
 
     if not noisy_entries:
+        try:
+            _write_acl_object_control_coverage_sidecar(
+                shell,
+                domain=domain,
+                valid_entries=valid_entries,
+                direct_entries=direct_entries,
+                promoted_entries=[],
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[bloodhound] failed to write ACL object-control coverage: {exc}"
+            )
         return valid_entries, report
 
     runtime_graph: dict[str, Any] = dict(graph)
@@ -371,12 +680,34 @@ def _sanitize_acl_paths_for_attack_graph(
         telemetry.capture_exception(exc)
         print_info_debug(f"[bloodhound] failed to write ACL sanitization report: {exc}")
 
+    try:
+        _write_acl_object_control_coverage_sidecar(
+            shell,
+            domain=domain,
+            valid_entries=valid_entries,
+            direct_entries=direct_entries,
+            promoted_entries=noisy_rows,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[bloodhound] failed to write ACL object-control coverage: {exc}"
+        )
+
     print_info_debug(
         "[bloodhound] ACL sanitization: "
         f"total={report['total_acl_rows']} direct={report['direct_acl_rows']} "
         f"promoted={report['promoted_acl_rows']} dropped={report['dropped_acl_rows']} "
+        f"adcs_filtered={report['adcs_filtered_rows']} "
         f"threshold={threshold} depth={sanitize_depth}"
     )
+    for item in report["adcs_filtered_samples"][:20]:
+        print_info_debug(
+            "[bloodhound] ACL ADCS-filtered step: "
+            f"{mark_sensitive(str(item.get('source') or ''), 'user')} -> "
+            f"{str(item.get('relation') or '')} -> "
+            f"{mark_sensitive(str(item.get('target') or ''), 'user')}"
+        )
     print_info_debug(
         "[bloodhound] ACL sanitization final sources: "
         f"retained={report['final_retained_sources_count']} "
@@ -628,6 +959,13 @@ class BloodHoundShell(Protocol):
     def _questionary_select(
         self, title: str, options: list[str], default_idx: int = 0
     ) -> int | None: ...
+
+    def _questionary_checkbox(
+        self,
+        title: str,
+        options: list[str],
+        default_values: list[str] | None = None,
+    ) -> list[str] | None: ...
 
     def dns_find_dcs(self, target_domain: str) -> None: ...
 
@@ -901,10 +1239,12 @@ def upload_bloodhound_ce_zip_files(
             )
         return False
 
+    upload_timeout = get_bloodhound_ce_upload_timeout_seconds()
+    upload_max_attempts = get_bloodhound_ce_upload_max_attempts()
+
     print_info("Uploading ZIP files to BloodHound CE automatically")
     overall_success = True
 
-    uploads: list[tuple[str, str, int | None]] = []
     for zip_file_path in zip_paths:
         zip_name = os.path.basename(zip_file_path)
         collector_label = "Unknown collector"
@@ -912,77 +1252,97 @@ def upload_bloodhound_ce_zip_files(
             collector_label = "rusthound-ce"
         elif "bloodhound-ce-python" in zip_name:
             collector_label = "bloodhound-ce-python"
+        elif "certihound" in zip_name:
+            collector_label = "certihound"
 
         marked_zip_path = mark_sensitive(zip_file_path, "path")
         print_info_verbose(
             f"Submitting BloodHound ZIP upload job ({collector_label}): {marked_zip_path}"
         )
-        try:
-            service = shell._get_bloodhound_service()
-            job_id = service.start_upload_job(zip_file_path)
-            uploads.append((zip_file_path, collector_label, job_id))
-            if job_id is None:
-                overall_success = False
-                print_warning(
-                    f"Failed to start upload job for ZIP ({collector_label})."
-                )
-                last_error = None
-                if hasattr(service, "get_last_client_error"):
-                    try:
-                        last_error = service.get_last_client_error()
-                    except Exception as exc:  # noqa: BLE001
-                        telemetry.capture_exception(exc)
-                if not last_error and hasattr(service, "get_last_query_error"):
-                    try:
-                        last_error = service.get_last_query_error()
-                    except Exception as exc:  # noqa: BLE001
-                        telemetry.capture_exception(exc)
-                if last_error:
+        success = False
+        service = None
+        for attempt in range(1, upload_max_attempts + 1):
+            job_id: int | None = None
+            try:
+                service = shell._get_bloodhound_service()
+                job_id = service.start_upload_job(zip_file_path)
+                if job_id is None:
+                    print_warning(
+                        f"Failed to start upload job for ZIP ({collector_label})."
+                    )
+                    last_error = None
+                    if hasattr(service, "get_last_client_error"):
+                        try:
+                            last_error = service.get_last_client_error()
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                    if not last_error and hasattr(service, "get_last_query_error"):
+                        try:
+                            last_error = service.get_last_query_error()
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                    if last_error:
+                        print_info_debug(
+                            "[bloodhound-ce] upload job start failure details: "
+                            f"collector={collector_label}, "
+                            f"file={marked_zip_path}, "
+                            f"attempt={attempt}/{upload_max_attempts}, "
+                            f"error={mark_sensitive(str(last_error), 'error')}"
+                        )
+                else:
+                    print_info_verbose(
+                        f"Upload job created for ({collector_label}): job_id={job_id}"
+                    )
+                    print_info_verbose(
+                        f"Waiting for ingestion of ZIP ({collector_label}): "
+                        f"{marked_zip_path} (job_id={job_id}, attempt={attempt}/{upload_max_attempts})"
+                    )
+                    success = service.wait_for_upload_job(
+                        int(job_id),
+                        poll_interval=5,
+                        timeout=upload_timeout,
+                    )
+                    if success:
+                        print_success(
+                            f"ZIP file ({collector_label}) uploaded to BloodHound CE successfully!"
+                        )
+                        break
+
+                    last_error = None
+                    if hasattr(service, "get_last_client_error"):
+                        try:
+                            last_error = service.get_last_client_error()
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                    if not last_error and hasattr(service, "get_last_query_error"):
+                        try:
+                            last_error = service.get_last_query_error()
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
                     print_info_debug(
-                        "[bloodhound-ce] upload job start failure details: "
+                        "[bloodhound-ce] upload ingestion attempt failed: "
                         f"collector={collector_label}, "
                         f"file={marked_zip_path}, "
-                        f"error={mark_sensitive(str(last_error), 'error')}"
+                        f"job_id={job_id}, "
+                        f"attempt={attempt}/{upload_max_attempts}, "
+                        f"timeout={upload_timeout}s, "
+                        f"error={mark_sensitive(str(last_error or 'unknown'), 'error')}"
                     )
-            else:
-                print_info_verbose(
-                    f"Upload job created for ({collector_label}): job_id={job_id}"
+            except Exception as exc:
+                telemetry.capture_exception(exc)
+                print_warning(
+                    "Automatic upload to BloodHound CE failed. Please upload the ZIP file manually."
                 )
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            overall_success = False
-            uploads.append((zip_file_path, collector_label, None))
-            print_warning(
-                "Automatic upload to BloodHound CE failed. Please upload the ZIP file manually."
-            )
-            print_exception(show_locals=False, exception=exc)
+                print_exception(show_locals=False, exception=exc)
+                success = False
 
-    for zip_file_path, collector_label, job_id in uploads:
-        if job_id is None:
-            continue
-        marked_zip_path = mark_sensitive(zip_file_path, "path")
-        print_info_verbose(
-            f"Waiting for ingestion of ZIP ({collector_label}): {marked_zip_path} (job_id={job_id})"
-        )
-        try:
-            success = shell._get_bloodhound_service().wait_for_upload_job(
-                int(job_id),
-                poll_interval=5,
-                timeout=1800,
-            )
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_warning(
-                "Automatic upload to BloodHound CE failed. Please upload the ZIP file manually."
-            )
-            print_exception(show_locals=False, exception=exc)
-            success = False
+            if attempt < upload_max_attempts:
+                print_warning(
+                    f"ZIP file upload did not complete successfully for ({collector_label}). "
+                    f"Retrying upload ({attempt + 1}/{upload_max_attempts})..."
+                )
 
-        if success:
-            print_success(
-                f"ZIP file ({collector_label}) uploaded to BloodHound CE successfully!"
-            )
-        else:
+        if not success:
             overall_success = False
             print_warning(
                 "ZIP file upload did not complete successfully. Check BloodHound CE UI and upload manually if needed."
@@ -1131,234 +1491,365 @@ def run_bloodhound_collector(
 
     upn = _format_upn(username, resolved_auth_domain)
 
-    # Choose BloodHound collector based on installed mode
-    display_command = ""
-
-    # Ensure Kerberos environment is ready before attempting Kerberos authentication
-    kerberos_env_ready = shell._ensure_kerberos_environment_for_command(
-        target_domain, resolved_auth_domain, username, "rusthound-ce -k"
-    )
-
-    if kerberos_env_ready:
-        marked_username = mark_sensitive(username, "user")
-        marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
-        print_info_verbose(
-            f"Using Kerberos authentication for {marked_username}@{marked_domain_1}"
-        )
-        command = (
-            "rusthound-ce "
-            f"-d {shlex.quote(target_domain)} -k -c All "
-            f"-f {shlex.quote(dc_fqdn)} -n {shlex.quote(dns_ip)} --zip --ldaps"
-        )
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        marked_pdc_host = mark_sensitive(pdc_hostname, "hostname")
-        marked_pdc_ip = mark_sensitive(dns_ip, "ip")
-        display_command = (
-            "rusthound-ce -d "
-            f"{marked_target_domain} -k -c All -f "
-            f"{marked_pdc_host}.{marked_target_domain} "
-            f"-n {marked_pdc_ip} --zip --ldaps"
-        )
-    else:
-        marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
-        marked_username = mark_sensitive(username, "user")
-        print_warning(
-            f"No Kerberos ticket found for {marked_username}@{marked_domain_1}, using password authentication."
-        )
-        if is_hash:
-            print_warning(
-                "Only an NTLM hash is available for this credential; rusthound-ce password fallback requires a cleartext password."
-            )
-            return []
-        command = (
-            "rusthound-ce "
-            f"-d {shlex.quote(target_domain)} "
-            f"-u {shlex.quote(upn)} -p {shlex.quote(password)} "
-            f"-f {shlex.quote(dc_fqdn)} -n {shlex.quote(dns_ip)} "
-            "-c All --zip --ldaps"
-        )
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        marked_upn = mark_sensitive(upn, "user")
-        marked_dc_fqdn = mark_sensitive(dc_fqdn, "hostname")
-        marked_dns_ip = mark_sensitive(dns_ip, "ip")
-        marked_password = mark_sensitive(shlex.quote(password), "password")
-        display_command = (
-            f"rusthound-ce -d {marked_target_domain} -u {marked_upn} -p {marked_password} "
-            f"-f {marked_dc_fqdn} -n {marked_dns_ip} -c All --zip --ldaps"
-        )
-
-    bh_mode = get_bloodhound_mode()
-    auth_type = "Kerberos" if bh_mode == "ce" and kerberos_env_ready else "Password"
-
-    print_operation_header(
-        "BloodHound Collection",
-        details={
-            "Domain": target_domain,
-            "Authentication": auth_type,
-            "Collection Type": "All",
-            "Output": f"domains/{target_domain}/BH/",
-        },
-        icon="🩸",
-    )
-
-    print_info_debug(f"Command: {display_command or command}")
-    _print_collector_long_running_notice(
-        "rusthound-ce",
-        target_domain,
-        timeout_seconds=get_bloodhound_collector_timeout_seconds("rusthound-ce"),
-    )
-
-    # When using Kerberos, clock skew must be corrected against the KDC/PDC of the
-    # realm that issues the tickets (auth_domain), not necessarily the target domain.
-    # This is critical for multi-domain / cross-realm collection.
-    sync_domain = resolved_auth_domain if kerberos_env_ready else None
     zip_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     generated_zip_paths: list[str] = []
-
-    rusthound_zip = f"{target_domain}_rusthound-ce_{zip_timestamp}.zip"
-    generated_zip_paths.append(os.path.join(bh_dir, rusthound_zip))
-    shell.execute_bloodhound_collector(
-        command,
-        target_domain,
-        bh_dir=bh_dir,
-        sync_domain=sync_domain,
-        fallback_username=username,
-        fallback_password=password if not is_hash else None,
-        fallback_auth_domain=resolved_auth_domain,
-        dc_fqdn=dc_fqdn,
-        dns_ip=dns_ip,
-        allow_password_fallback=bool(kerberos_env_ready),
-        zip_filename=rusthound_zip,
-    )
-
-    if not shell.bloodhound_ce_py_path:
-        print_info_verbose(
-            "bloodhound-ce-python not found; skipping secondary collector."
-        )
-        shell.domains_data.setdefault(target_domain, {})["bh_zip_paths"] = (
-            generated_zip_paths
-        )
-        return generated_zip_paths
-
-    # Run BloodHound CE Python collector after rusthound-ce.
-    ce_py_command = ""
-    ce_py_display_command = ""
-
-    kerberos_env_ready_py = shell._ensure_kerberos_environment_for_command(
-        target_domain, resolved_auth_domain, username, "bloodhound-ce-python -k"
-    )
-
-    if kerberos_env_ready_py:
-        marked_username = mark_sensitive(username, "user")
-        marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
-        print_info_verbose(
-            f"Using Kerberos authentication for {marked_username}@{marked_domain_1}"
-        )
-        marked_upn = mark_sensitive(upn, "user")
-        ce_py_command = (
-            f"{shlex.quote(shell.bloodhound_ce_py_path)} "
-            f"-d {shlex.quote(target_domain)} -u {shlex.quote(upn)} -k -no-pass -c All "
-            f"-dc {shlex.quote(dc_fqdn)} -ns {shlex.quote(dns_ip)} "
-            "--zip --use-ldaps"
-        )
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        marked_dc_fqdn = mark_sensitive(dc_fqdn, "hostname")
-        marked_dns_ip = mark_sensitive(dns_ip, "ip")
-        ce_py_display_command = (
-            f"{shell.bloodhound_ce_py_path} -d {marked_target_domain} -u {marked_upn} -k -no-pass -c All "
-            f"-dc {marked_dc_fqdn} -ns {marked_dns_ip} --zip --use-ldaps"
-        )
-    else:
-        marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
-        marked_username = mark_sensitive(username, "user")
-        print_warning(
-            f"No Kerberos ticket found for {marked_username}@{marked_domain_1}, using password authentication."
-        )
-        if is_hash:
-            print_warning(
-                "Only an NTLM hash is available for this credential; bloodhound-ce-python requires a cleartext password for password auth."
+    requested_collectors = _resolve_requested_bloodhound_collectors(shell)
+    for collector_name in requested_collectors:
+        if collector_name == "rusthound-ce":
+            kerberos_env_ready = shell._ensure_kerberos_environment_for_command(
+                target_domain, resolved_auth_domain, username, "rusthound-ce -k"
             )
-            shell.domains_data.setdefault(target_domain, {})["bh_zip_paths"] = (
-                generated_zip_paths
+            if kerberos_env_ready:
+                marked_username = mark_sensitive(username, "user")
+                marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
+                print_info_verbose(
+                    f"Using Kerberos authentication for {marked_username}@{marked_domain_1}"
+                )
+                command = (
+                    "rusthound-ce "
+                    f"-d {shlex.quote(target_domain)} -k -c All "
+                    f"-f {shlex.quote(dc_fqdn)} -n {shlex.quote(dns_ip)} --zip --ldaps"
+                )
+                marked_target_domain = mark_sensitive(target_domain, "domain")
+                marked_pdc_host = mark_sensitive(pdc_hostname, "hostname")
+                marked_pdc_ip = mark_sensitive(dns_ip, "ip")
+                display_command = (
+                    "rusthound-ce -d "
+                    f"{marked_target_domain} -k -c All -f "
+                    f"{marked_pdc_host}.{marked_target_domain} "
+                    f"-n {marked_pdc_ip} --zip --ldaps"
+                )
+            else:
+                marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
+                marked_username = mark_sensitive(username, "user")
+                print_warning(
+                    f"No Kerberos ticket found for {marked_username}@{marked_domain_1}, using password authentication."
+                )
+                if is_hash:
+                    print_warning(
+                        "Only an NTLM hash is available for this credential; rusthound-ce password fallback requires a cleartext password."
+                    )
+                    continue
+                command = (
+                    "rusthound-ce "
+                    f"-d {shlex.quote(target_domain)} "
+                    f"-u {shlex.quote(upn)} -p {shlex.quote(password)} "
+                    f"-f {shlex.quote(dc_fqdn)} -n {shlex.quote(dns_ip)} "
+                    "-c All --zip --ldaps"
+                )
+                marked_target_domain = mark_sensitive(target_domain, "domain")
+                marked_upn = mark_sensitive(upn, "user")
+                marked_dc_fqdn = mark_sensitive(dc_fqdn, "hostname")
+                marked_dns_ip = mark_sensitive(dns_ip, "ip")
+                marked_password = mark_sensitive(shlex.quote(password), "password")
+                display_command = (
+                    f"rusthound-ce -d {marked_target_domain} -u {marked_upn} -p {marked_password} "
+                    f"-f {marked_dc_fqdn} -n {marked_dns_ip} -c All --zip --ldaps"
+                )
+
+            bh_mode = get_bloodhound_mode()
+            auth_type = (
+                "Kerberos" if bh_mode == "ce" and kerberos_env_ready else "Password"
             )
-            return generated_zip_paths
-        ce_py_command = (
-            f"{shlex.quote(shell.bloodhound_ce_py_path)} "
-            f"-d {shlex.quote(target_domain)} "
-            f"-u {shlex.quote(upn)} -p {shlex.quote(password)} "
-            f"-c All -dc {shlex.quote(dc_fqdn)} -ns {shlex.quote(dns_ip)} "
-            "--zip --use-ldaps"
-        )
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        marked_upn = mark_sensitive(upn, "user")
-        marked_dc_fqdn = mark_sensitive(dc_fqdn, "hostname")
-        marked_dns_ip = mark_sensitive(dns_ip, "ip")
-        marked_password = mark_sensitive(shlex.quote(password), "password")
-        ce_py_display_command = (
-            f"{shell.bloodhound_ce_py_path} -d {marked_target_domain} -u {marked_upn} -p {marked_password} "
-            f"-c All -dc {marked_dc_fqdn} -ns {marked_dns_ip} --zip --use-ldaps"
-        )
+            print_operation_header(
+                "BloodHound Collection",
+                details={
+                    "Domain": target_domain,
+                    "Authentication": auth_type,
+                    "Collector": "rusthound-ce",
+                    "Collection Type": "All",
+                    "Output": f"domains/{target_domain}/BH/",
+                },
+                icon="🩸",
+            )
+            print_info_debug(f"Command: {display_command or command}")
+            _print_collector_long_running_notice(
+                "rusthound-ce",
+                target_domain,
+                timeout_seconds=get_bloodhound_collector_timeout_seconds("rusthound-ce"),
+            )
+            sync_domain = resolved_auth_domain if kerberos_env_ready else None
+            rusthound_zip = f"{target_domain}_rusthound-ce_{zip_timestamp}.zip"
+            generated_zip_paths.append(os.path.join(bh_dir, rusthound_zip))
+            shell.execute_bloodhound_collector(
+                command,
+                target_domain,
+                bh_dir=bh_dir,
+                sync_domain=sync_domain,
+                fallback_username=username,
+                fallback_password=password if not is_hash else None,
+                fallback_auth_domain=resolved_auth_domain,
+                dc_fqdn=dc_fqdn,
+                dns_ip=dns_ip,
+                allow_password_fallback=bool(kerberos_env_ready),
+                zip_filename=rusthound_zip,
+            )
+            continue
 
-    print_operation_header(
-        "BloodHound Collection",
-        details={
-            "Domain": target_domain,
-            "Authentication": "Kerberos" if kerberos_env_ready_py else "Password",
-            "Collector": "bloodhound-ce-python",
-            "Collection Type": "All",
-            "Output": f"domains/{target_domain}/BH/",
-        },
-        icon="🩸",
-    )
+        if collector_name == "bloodhound-ce-python":
+            if not shell.bloodhound_ce_py_path:
+                print_info_verbose(
+                    "bloodhound-ce-python not found; skipping this collector."
+                )
+                continue
 
-    print_info_debug(f"Command: {ce_py_display_command or ce_py_command}")
-    _print_collector_long_running_notice(
-        "bloodhound-ce-python",
-        target_domain,
-        timeout_seconds=get_bloodhound_collector_timeout_seconds(
-            "bloodhound-ce-python"
-        ),
-    )
+            kerberos_env_ready_py = shell._ensure_kerberos_environment_for_command(
+                target_domain,
+                resolved_auth_domain,
+                username,
+                "bloodhound-ce-python -k",
+            )
+            if kerberos_env_ready_py:
+                marked_username = mark_sensitive(username, "user")
+                marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
+                print_info_verbose(
+                    f"Using Kerberos authentication for {marked_username}@{marked_domain_1}"
+                )
+                marked_upn = mark_sensitive(upn, "user")
+                ce_py_command = (
+                    f"{shlex.quote(shell.bloodhound_ce_py_path)} "
+                    f"-d {shlex.quote(target_domain)} -u {shlex.quote(upn)} -k -no-pass -c All "
+                    f"-dc {shlex.quote(dc_fqdn)} -ns {shlex.quote(dns_ip)} "
+                    "--zip --use-ldaps"
+                )
+                marked_target_domain = mark_sensitive(target_domain, "domain")
+                marked_dc_fqdn = mark_sensitive(dc_fqdn, "hostname")
+                marked_dns_ip = mark_sensitive(dns_ip, "ip")
+                ce_py_display_command = (
+                    f"{shell.bloodhound_ce_py_path} -d {marked_target_domain} -u {marked_upn} -k -no-pass -c All "
+                    f"-dc {marked_dc_fqdn} -ns {marked_dns_ip} --zip --use-ldaps"
+                )
+            else:
+                marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
+                marked_username = mark_sensitive(username, "user")
+                print_warning(
+                    f"No Kerberos ticket found for {marked_username}@{marked_domain_1}, using password authentication."
+                )
+                if is_hash:
+                    print_warning(
+                        "Only an NTLM hash is available for this credential; bloodhound-ce-python requires a cleartext password for password auth."
+                    )
+                    continue
+                ce_py_command = (
+                    f"{shlex.quote(shell.bloodhound_ce_py_path)} "
+                    f"-d {shlex.quote(target_domain)} "
+                    f"-u {shlex.quote(upn)} -p {shlex.quote(password)} "
+                    f"-c All -dc {shlex.quote(dc_fqdn)} -ns {shlex.quote(dns_ip)} "
+                    "--zip --use-ldaps"
+                )
+                marked_target_domain = mark_sensitive(target_domain, "domain")
+                marked_upn = mark_sensitive(upn, "user")
+                marked_dc_fqdn = mark_sensitive(dc_fqdn, "hostname")
+                marked_dns_ip = mark_sensitive(dns_ip, "ip")
+                marked_password = mark_sensitive(shlex.quote(password), "password")
+                ce_py_display_command = (
+                    f"{shell.bloodhound_ce_py_path} -d {marked_target_domain} -u {marked_upn} -p {marked_password} "
+                    f"-c All -dc {marked_dc_fqdn} -ns {marked_dns_ip} --zip --use-ldaps"
+                )
 
-    fallback_password_command = None
-    fallback_password_display = None
-    if kerberos_env_ready_py and not is_hash:
-        marked_target_domain = mark_sensitive(target_domain, "domain")
-        marked_upn = mark_sensitive(upn, "user")
-        marked_dc_fqdn = mark_sensitive(dc_fqdn, "hostname")
-        marked_dns_ip = mark_sensitive(dns_ip, "ip")
-        fallback_password_command = (
-            f"{shlex.quote(shell.bloodhound_ce_py_path)} "
-            f"-d {shlex.quote(target_domain)} "
-            f"-u {shlex.quote(upn)} -p {shlex.quote(password)} "
-            f"-c All -dc {shlex.quote(dc_fqdn)} -ns {shlex.quote(dns_ip)} "
-            "--zip --use-ldaps"
-        )
-        fallback_password_display = (
-            f"{shell.bloodhound_ce_py_path} -d {marked_target_domain} -u {marked_upn} -p [REDACTED] "
-            f"-c All -dc {marked_dc_fqdn} -ns {marked_dns_ip} --zip --use-ldaps"
-        )
+            print_operation_header(
+                "BloodHound Collection",
+                details={
+                    "Domain": target_domain,
+                    "Authentication": "Kerberos"
+                    if kerberos_env_ready_py
+                    else "Password",
+                    "Collector": "bloodhound-ce-python",
+                    "Collection Type": "All",
+                    "Output": f"domains/{target_domain}/BH/",
+                },
+                icon="🩸",
+            )
+            print_info_debug(
+                f"Command: {ce_py_display_command or ce_py_command}"
+            )
+            _print_collector_long_running_notice(
+                "bloodhound-ce-python",
+                target_domain,
+                timeout_seconds=get_bloodhound_collector_timeout_seconds(
+                    "bloodhound-ce-python"
+                ),
+            )
 
-    sync_domain = resolved_auth_domain if kerberos_env_ready_py else None
-    ce_py_zip = f"{target_domain}_bloodhound-ce-python_{zip_timestamp}.zip"
-    generated_zip_paths.append(os.path.join(bh_dir, ce_py_zip))
-    shell.execute_bloodhound_collector(
-        ce_py_command,
-        target_domain,
-        tool_name="bloodhound-ce-python",
-        ldaps_flag="--use-ldaps",
-        bh_dir=bh_dir,
-        sync_domain=sync_domain,
-        fallback_username=username,
-        fallback_password=password if not is_hash else None,
-        fallback_auth_domain=resolved_auth_domain,
-        dc_fqdn=dc_fqdn,
-        dns_ip=dns_ip,
-        allow_password_fallback=bool(kerberos_env_ready_py),
-        zip_filename=ce_py_zip,
-        password_fallback_command=fallback_password_command,
-        password_fallback_display=fallback_password_display,
-    )
+            fallback_password_command = None
+            fallback_password_display = None
+            if kerberos_env_ready_py and not is_hash:
+                marked_target_domain = mark_sensitive(target_domain, "domain")
+                marked_upn = mark_sensitive(upn, "user")
+                marked_dc_fqdn = mark_sensitive(dc_fqdn, "hostname")
+                marked_dns_ip = mark_sensitive(dns_ip, "ip")
+                fallback_password_command = (
+                    f"{shlex.quote(shell.bloodhound_ce_py_path)} "
+                    f"-d {shlex.quote(target_domain)} "
+                    f"-u {shlex.quote(upn)} -p {shlex.quote(password)} "
+                    f"-c All -dc {shlex.quote(dc_fqdn)} -ns {shlex.quote(dns_ip)} "
+                    "--zip --use-ldaps"
+                )
+                fallback_password_display = (
+                    f"{shell.bloodhound_ce_py_path} -d {marked_target_domain} -u {marked_upn} -p [REDACTED] "
+                    f"-c All -dc {marked_dc_fqdn} -ns {marked_dns_ip} --zip --use-ldaps"
+                )
+
+            sync_domain = resolved_auth_domain if kerberos_env_ready_py else None
+            ce_py_zip = f"{target_domain}_bloodhound-ce-python_{zip_timestamp}.zip"
+            generated_zip_paths.append(os.path.join(bh_dir, ce_py_zip))
+            shell.execute_bloodhound_collector(
+                ce_py_command,
+                target_domain,
+                tool_name="bloodhound-ce-python",
+                ldaps_flag="--use-ldaps",
+                bh_dir=bh_dir,
+                sync_domain=sync_domain,
+                fallback_username=username,
+                fallback_password=password if not is_hash else None,
+                fallback_auth_domain=resolved_auth_domain,
+                dc_fqdn=dc_fqdn,
+                dns_ip=dns_ip,
+                allow_password_fallback=bool(kerberos_env_ready_py),
+                zip_filename=ce_py_zip,
+                password_fallback_command=fallback_password_command,
+                password_fallback_display=fallback_password_display,
+            )
+            continue
+
+        if collector_name == "certihound":
+            from adscan_internal.services.certihound_library_service import (
+                CertiHoundLibraryService,
+                is_certihound_library_available,
+            )
+
+            resolved_certihound_path = _resolve_certihound_executable_path()
+            certihound_path = resolved_certihound_path or "certihound"
+            kerberos_env_ready_certihound = (
+                shell._ensure_kerberos_environment_for_command(
+                    target_domain,
+                    resolved_auth_domain,
+                    username,
+                    "certihound -k",
+                )
+            )
+            certihound_dc_target = (
+                dc_fqdn if kerberos_env_ready_certihound and dc_fqdn else dns_ip
+            )
+            if kerberos_env_ready_certihound:
+                marked_username = mark_sensitive(username, "user")
+                marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
+                print_info_verbose(
+                    f"Using Kerberos authentication for {marked_username}@{marked_domain_1}"
+                )
+                certihound_command = (
+                    f"{shlex.quote(certihound_path)} "
+                    f"-d {shlex.quote(target_domain)} -k "
+                    f"--dc {shlex.quote(certihound_dc_target)} --ldaps "
+                    f"-o {shlex.quote(bh_dir)} --format zip"
+                )
+                marked_target_domain = mark_sensitive(target_domain, "domain")
+                marked_dc_target = mark_sensitive(
+                    certihound_dc_target,
+                    "hostname" if certihound_dc_target == dc_fqdn else "ip",
+                )
+                certihound_display_command = (
+                    f"{certihound_path} -d {marked_target_domain} -k "
+                    f"--dc {marked_dc_target} --ldaps -o {mark_sensitive(bh_dir, 'path')} --format zip"
+                )
+            else:
+                marked_domain_1 = mark_sensitive(resolved_auth_domain, "domain")
+                marked_username = mark_sensitive(username, "user")
+                print_warning(
+                    f"No Kerberos ticket found for {marked_username}@{marked_domain_1}, using password authentication."
+                )
+                if is_hash:
+                    print_warning(
+                        "Only an NTLM hash is available for this credential; certihound requires a cleartext password for password auth."
+                    )
+                    continue
+                certihound_command = (
+                    f"{shlex.quote(certihound_path)} "
+                    f"-d {shlex.quote(target_domain)} "
+                    f"-u {shlex.quote(upn)} -p {shlex.quote(password)} "
+                    f"--dc {shlex.quote(certihound_dc_target)} --ldaps "
+                    f"-o {shlex.quote(bh_dir)} --format zip"
+                )
+                marked_target_domain = mark_sensitive(target_domain, "domain")
+                marked_upn = mark_sensitive(upn, "user")
+                marked_password = mark_sensitive(shlex.quote(password), "password")
+                marked_dc_ip = mark_sensitive(certihound_dc_target, "ip")
+                certihound_display_command = (
+                    f"{certihound_path} -d {marked_target_domain} -u {marked_upn} -p {marked_password} "
+                    f"--dc {marked_dc_ip} --ldaps -o {mark_sensitive(bh_dir, 'path')} --format zip"
+                )
+
+            print_operation_header(
+                "BloodHound Collection",
+                details={
+                    "Domain": target_domain,
+                    "Authentication": "Kerberos"
+                    if kerberos_env_ready_certihound
+                    else "Password",
+                    "Collector": "certihound",
+                    "Collection Type": "ADCS",
+                    "Output": f"domains/{target_domain}/BH/",
+                },
+                icon="🩸",
+            )
+            print_info_debug(
+                f"Command: {certihound_display_command or certihound_command}"
+            )
+            _print_collector_long_running_notice(
+                "certihound",
+                target_domain,
+                timeout_seconds=get_bloodhound_collector_timeout_seconds("certihound"),
+            )
+
+            certihound_zip = f"{target_domain}_certihound_{zip_timestamp}.zip"
+            certihound_zip_path = os.path.join(bh_dir, certihound_zip)
+
+            if is_certihound_library_available():
+                print_info_verbose("Using CertiHound Python library collector.")
+                library_service = CertiHoundLibraryService()
+                collected_zip_path = library_service.collect_adcs_zip(
+                    target_domain=target_domain,
+                    dc_address=certihound_dc_target,
+                    output_dir=bh_dir,
+                    zip_filename=certihound_zip,
+                    username=None if kerberos_env_ready_certihound else upn,
+                    password=None if kerberos_env_ready_certihound else password,
+                    use_kerberos=kerberos_env_ready_certihound,
+                    use_ldaps=True,
+                )
+                if collected_zip_path:
+                    generated_zip_paths.append(collected_zip_path)
+                    print_success_verbose(
+                        "CertiHound library collection completed: "
+                        f"{mark_sensitive(collected_zip_path, 'path')}"
+                    )
+                    continue
+                print_warning(
+                    "CertiHound library collection failed; falling back to CLI."
+                )
+
+            if not resolved_certihound_path:
+                print_info_verbose("certihound not found; skipping this collector.")
+                continue
+
+            sync_domain = (
+                resolved_auth_domain if kerberos_env_ready_certihound else None
+            )
+            generated_zip_paths.append(certihound_zip_path)
+            shell.execute_bloodhound_collector(
+                certihound_command,
+                target_domain,
+                tool_name="certihound",
+                bh_dir=bh_dir,
+                sync_domain=sync_domain,
+                fallback_username=username,
+                fallback_password=password if not is_hash else None,
+                fallback_auth_domain=resolved_auth_domain,
+                dc_fqdn=dc_fqdn,
+                dns_ip=dns_ip,
+                allow_password_fallback=False,
+                zip_filename=certihound_zip,
+            )
 
     shell.domains_data.setdefault(target_domain, {})["bh_zip_paths"] = (
         generated_zip_paths
@@ -1445,31 +1936,49 @@ def _load_certipy_adcs_discovery(
     return paths, templates
 
 
-def _get_adcs_escalation_paths_for_domain(
+def _load_certihound_adcs_discovery(
     shell: BloodHoundShell,
     *,
-    service: object,
     target_domain: str,
     graph: dict[str, Any] | None = None,
-    max_results: int = 1000,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Return ADCS escalation paths split by source (BloodHound vs Certipy)."""
-    bh_paths: list[dict[str, Any]] = []
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load CertiHound direct detections and return ADCS paths + template metadata."""
+    paths: list[dict[str, Any]] = []
+    templates: dict[str, Any] = {}
     try:
-        bh_paths = (
-            service.get_low_priv_adcs_paths(  # type: ignore[attr-defined]
-                target_domain, max_results=max_results
-            )
-            or []
+        from adscan_internal.services.attack_graph_service import (
+            get_certihound_adcs_paths,
+            get_certihound_template_metadata,
         )
+
+        paths = get_certihound_adcs_paths(shell, target_domain, graph=graph)
+        templates = get_certihound_template_metadata(shell, target_domain)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        bh_paths = []
+        print_info_debug(f"[adcs] CertiHound detection load failed: {exc}")
+    return paths, templates
 
-    certipy_paths, certipy_templates = _load_certipy_adcs_discovery(
-        shell, target_domain=target_domain, graph=graph
-    )
-    return bh_paths, certipy_paths, certipy_templates
+
+def _load_writable_user_attribute_discovery(
+    shell: BloodHoundShell,
+    *,
+    target_domain: str,
+    graph: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Load custom writable-attribute attack steps discovered via LDAP ACL parsing."""
+    paths: list[dict[str, Any]] = []
+    try:
+        from adscan_internal.services.attack_graph_service import (
+            get_writable_user_attribute_paths,
+        )
+
+        paths = get_writable_user_attribute_paths(shell, target_domain, graph=graph)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[writable-attrs] Writable-attribute discovery load failed: {exc}"
+        )
+    return paths
 
 
 def run_enumerate_user_aces(shell: BloodHoundShell, args: str) -> None:
@@ -1553,50 +2062,78 @@ def run_bloodhound_attack_paths(
 
     service = shell._get_bloodhound_service()
 
-    adcs_bh_paths: list[dict[str, Any]] | None = None
+    adcs_certihound_paths: list[dict[str, Any]] | None = None
+    adcs_certihound_templates: dict[str, Any] | None = None
     adcs_certipy_paths: list[dict[str, Any]] | None = None
     adcs_certipy_templates: dict[str, Any] | None = None
+    writable_user_attribute_paths: list[dict[str, Any]] | None = None
+
+    def _ensure_adcs_certihound_loaded() -> None:
+        nonlocal adcs_certihound_paths
+        nonlocal adcs_certihound_templates
+        if adcs_certihound_paths is not None:
+            return
+        adcs_certihound_paths, adcs_certihound_templates = (
+            _load_certihound_adcs_discovery(
+                shell,
+                target_domain=target_domain,
+                graph=graph,
+            )
+        )
+
+    def _ensure_adcs_certipy_loaded() -> None:
+        nonlocal adcs_certipy_paths
+        nonlocal adcs_certipy_templates
+        if adcs_certipy_paths is not None:
+            return
+        adcs_certipy_paths, adcs_certipy_templates = _load_certipy_adcs_discovery(
+            shell,
+            target_domain=target_domain,
+            graph=graph,
+        )
+
+    def _get_adcs_certihound_paths() -> list[dict[str, Any]]:
+        _ensure_adcs_certihound_loaded()
+        return list(adcs_certihound_paths or [])
 
     def _get_adcs_certipy_paths() -> list[dict[str, Any]]:
-        nonlocal adcs_bh_paths, adcs_certipy_paths, adcs_certipy_templates
-        if adcs_bh_paths is None or adcs_certipy_paths is None:
-            (
-                adcs_bh_paths,
-                adcs_certipy_paths,
-                adcs_certipy_templates,
-            ) = _get_adcs_escalation_paths_for_domain(
-                shell,
-                service=service,
-                target_domain=target_domain,
-                graph=graph,
-            )
+        _ensure_adcs_certipy_loaded()
         return list(adcs_certipy_paths or [])
 
-    def _get_adcs_bloodhound_paths() -> list[dict[str, Any]]:
-        nonlocal adcs_bh_paths, adcs_certipy_paths, adcs_certipy_templates
-        if adcs_bh_paths is None or adcs_certipy_paths is None:
-            (
-                adcs_bh_paths,
-                adcs_certipy_paths,
-                adcs_certipy_templates,
-            ) = _get_adcs_escalation_paths_for_domain(
+    def _ensure_writable_user_attributes_loaded() -> None:
+        nonlocal writable_user_attribute_paths
+        if writable_user_attribute_paths is not None:
+            return
+        writable_user_attribute_paths = _load_writable_user_attribute_discovery(
+            shell,
+            target_domain=target_domain,
+            graph=graph,
+        )
+
+    def _get_writable_user_attribute_paths() -> list[dict[str, Any]]:
+        _ensure_writable_user_attributes_loaded()
+        return list(writable_user_attribute_paths or [])
+
+    def _get_netlogon_write_support_paths() -> list[dict[str, Any]]:
+        return list(
+            get_netlogon_write_support_paths(
                 shell,
-                service=service,
-                target_domain=target_domain,
+                target_domain,
                 graph=graph,
             )
-        return list(adcs_bh_paths or [])
+            or []
+        )
 
     steps: list[tuple[str, str, callable]] = [
+        (
+            "ADCS Escalation (CertiHound)",
+            "get_certihound_adcs_paths",
+            _get_adcs_certihound_paths,
+        ),
         (
             "ADCS Escalation (Certipy)",
             "get_certipy_adcs_paths",
             _get_adcs_certipy_paths,
-        ),
-        (
-            "ADCS Escalation (BloodHound)",
-            "get_low_priv_adcs_paths",
-            _get_adcs_bloodhound_paths,
         ),
         (
             "Roastable Users",
@@ -1630,14 +2167,36 @@ def run_bloodhound_attack_paths(
                 max_results=None,
             ),
         ),  # type: ignore[attr-defined]
+        (
+            "Writable Logon Scripts",
+            "get_writable_user_attribute_paths",
+            _get_writable_user_attribute_paths,
+        ),
+        (
+            "NETLOGON Write Access",
+            "get_netlogon_write_support_paths",
+            _get_netlogon_write_support_paths,
+        ),
     ]
-    total_steps = len(steps) + 2
+    total_steps = len(steps) + 1
     step_offset = 0
 
     unique_paths = 0
     graph = load_attack_graph(shell, target_domain)
     sample_limit = _get_attack_paths_step_sample_limit()
     show_samples = _get_attack_paths_step_show_samples()
+
+    def _graph_has_attack_relation(relation_name: str) -> bool:
+        """Return whether the current attack graph already contains the relation."""
+        edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+        target_relation = str(relation_name or "").strip().lower()
+        if not target_relation:
+            return False
+        return any(
+            isinstance(edge, dict)
+            and str(edge.get("relation") or "").strip().lower() == target_relation
+            for edge in edges
+        )
 
     # ADCS discovery happens in Phase 1 (Domain Analysis).
 
@@ -1796,171 +2355,31 @@ def run_bloodhound_attack_paths(
                 return f"{left.strip().upper()}@{right.strip().upper()}"
         return f"{raw.upper()}@{target_domain.upper()}"
 
-    def _persist_membership_snapshot() -> tuple[int, int, int]:
-        """Persist direct user/group and group/parent memberships to JSON."""
-        client = getattr(service, "client", None)
-        execute_query = getattr(client, "execute_query", None)
-        if not callable(execute_query):
-            print_info_debug(
-                "[bloodhound] Membership snapshot skipped: CE client unavailable."
-            )
-            return 0, 0, 0
-
-        user_query = f"""
-        MATCH p=(u:User)-[:MemberOf]->(g:Group)
-        WHERE toLower(coalesce(u.name, "")) ENDS WITH toLower('@{target_domain}')
-        RETURN p
-        """
-        computer_query = f"""
-        MATCH p=(c:Computer)-[:MemberOf]->(g:Group)
-        WHERE toLower(coalesce(c.domain, "")) = toLower('{target_domain}')
-        RETURN p
-        """
-        group_query = f"""
-        MATCH p=(g:Group)-[:MemberOf]->(pg:Group)
-        WHERE toLower(coalesce(g.name, "")) ENDS WITH toLower('@{target_domain}')
-        RETURN p
-        """
-
-        from datetime import datetime, timezone
-        from adscan_internal.services.attack_graph_service import (
-            add_bloodhound_path_edges,
-        )
-
-        membership_graph: dict[str, object] = {
-            "domain": target_domain,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "schema_version": "membership-1.0",
-            "nodes": {},
-            "edges": [],
-            "version": 2,
-        }
-
-        def _append_graph_data(graph_data: dict[str, object], *, label: str) -> int:
-            if not isinstance(graph_data, dict):
-                return 0
-            nodes_map = graph_data.get("nodes", {})
-            edges = graph_data.get("edges", [])
-            if not isinstance(nodes_map, dict) or not isinstance(edges, list):
-                return 0
-            print_info_debug(
-                f"[bloodhound] Membership snapshot {label} nodes={len(nodes_map)} edges={len(edges)}"
-            )
-            if nodes_map:
-                sample_key = next(iter(nodes_map.keys()))
-                print_info_debug(
-                    f"[bloodhound] Membership snapshot {label} node key type: {type(sample_key)}"
-                )
-            if nodes_map:
-                sample_node = next(iter(nodes_map.values()))
-                print_info_debug(
-                    f"[bloodhound] Membership snapshot {label} node sample keys: "
-                    f"{list(sample_node.keys()) if isinstance(sample_node, dict) else type(sample_node)}"
-                )
-            if edges:
-                print_info_debug(
-                    f"[bloodhound] Membership snapshot {label} edge sample: {edges[0]}"
-                )
-
-            def _lookup_node(key: object) -> dict | None:
-                if key in nodes_map:
-                    node = nodes_map.get(key)
-                    return node if isinstance(node, dict) else None
-                str_key = str(key)
-                node = nodes_map.get(str_key)
-                return node if isinstance(node, dict) else None
-
-            added = 0
-            skipped_missing_nodes = 0
-            missing_examples: list[dict[str, object]] = []
-            for edge in edges:
-                if not isinstance(edge, dict):
-                    continue
-                relation = edge.get("label") or edge.get("kind") or ""
-                if str(relation) != "MemberOf":
-                    continue
-                source = edge.get("source")
-                target = edge.get("target")
-                if not source or not target:
-                    continue
-                src_node = _lookup_node(source)
-                dst_node = _lookup_node(target)
-                if not isinstance(src_node, dict) or not isinstance(dst_node, dict):
-                    skipped_missing_nodes += 1
-                    if len(missing_examples) < 3:
-                        missing_examples.append(
-                            {
-                                "source": source,
-                                "target": target,
-                                "source_type": type(source).__name__,
-                                "target_type": type(target).__name__,
-                                "label": relation,
-                            }
-                        )
-                    continue
-                add_bloodhound_path_edges(
-                    membership_graph,
-                    nodes=[src_node, dst_node],
-                    relations=["MemberOf"],
-                    status="discovered",
-                    edge_type="membership_snapshot",
-                    log_creation=False,
-                    shell=shell,
-                )
-                added += 1
-            if skipped_missing_nodes:
-                print_info_debug(
-                    f"[bloodhound] Membership snapshot {label} skipped {skipped_missing_nodes} "
-                    "edges due to missing nodes."
-                )
-                if missing_examples:
-                    print_info_debug(
-                        f"[bloodhound] Membership snapshot {label} missing node examples: "
-                        f"{missing_examples}"
-                    )
-            return added
-
-        user_edges = 0
-        computer_edges = 0
-        group_edges = 0
-        try:
-            user_graph = client.execute_query_with_relationships(user_query)
-            user_edges = _append_graph_data(user_graph, label="user")
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-
-        try:
-            computer_graph = client.execute_query_with_relationships(computer_query)
-            computer_edges = _append_graph_data(computer_graph, label="computer")
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-
-        try:
-            group_graph = client.execute_query_with_relationships(group_query)
-            group_edges = _append_graph_data(group_graph, label="group")
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-
-        memberships = membership_graph
-
-        from adscan_internal.workspaces import domain_subpath, write_json_file
-
-        workspace_cwd = (
-            shell._get_workspace_cwd()
-            if hasattr(shell, "_get_workspace_cwd")
-            else getattr(shell, "current_workspace_dir", os.getcwd())
-        )
-        output_path = domain_subpath(
-            workspace_cwd, shell.domains_dir, target_domain, "memberships.json"
-        )
-        write_json_file(output_path, memberships)
-        return user_edges, group_edges, computer_edges
-
     for idx, (title, method_name, runner) in enumerate(steps, start=1):
         step_number = idx + step_offset
         print_step_status(
             title, status="running", step_number=step_number, total_steps=total_steps
         )
+        if (
+            method_name == "get_netlogon_write_support_paths"
+            and not _graph_has_attack_relation("WriteLogonScript")
+        ):
+            marked_domain = mark_sensitive(target_domain, "domain")
+            print_info_debug(
+                "[bloodhound] skipping NETLOGON write validation: "
+                f"reason=no_writelogonscript_edges domain={marked_domain}"
+            )
+            print_step_status(
+                title,
+                status="completed",
+                step_number=step_number,
+                total_steps=total_steps,
+                details="skipped=no WriteLogonScript attack steps",
+            )
+            print_info(
+                f"{title}: skipped; no WriteLogonScript attack steps require prerequisite validation."
+            )
+            continue
         raw_paths = None
         try:
             raw_paths = runner()
@@ -1983,21 +2402,15 @@ def run_bloodhound_attack_paths(
             continue
 
         certipy_templates: dict[str, Any] = {}
-        if method_name in {"get_low_priv_adcs_paths", "get_certipy_adcs_paths"}:
+        certihound_templates: dict[str, Any] = {}
+        if method_name in {
+            "get_certihound_adcs_paths",
+            "get_certipy_adcs_paths",
+        }:
             if isinstance(adcs_certipy_templates, dict):
                 certipy_templates = adcs_certipy_templates
-            else:
-                try:
-                    from adscan_internal.services.attack_graph_service import (
-                        get_certipy_template_metadata,
-                    )
-
-                    certipy_templates = get_certipy_template_metadata(
-                        shell, target_domain
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    telemetry.capture_exception(exc)
-                    certipy_templates = {}
+            if isinstance(adcs_certihound_templates, dict):
+                certihound_templates = adcs_certihound_templates
 
         print_info_debug(
             f"[bloodhound] {method_name} rows: {len(raw_paths) if raw_paths else 0}"
@@ -2105,21 +2518,56 @@ def run_bloodhound_attack_paths(
                         f"for {marked_domain}; JSON may be stale or scoped differently."
                     )
                     warned_relation_mismatches.add(rel_upper)
+            entry_notes = (
+                entry.get("notes_by_relation_index")
+                if isinstance(entry.get("notes_by_relation_index"), dict)
+                else {}
+            )
+            if entry_notes:
+                for note_idx, note_value in entry_notes.items():
+                    if not isinstance(note_idx, int) or not isinstance(note_value, dict):
+                        continue
+                    merged_note = dict(note_value)
+                    existing_note = notes_by_relation_index.get(note_idx)
+                    if isinstance(existing_note, dict):
+                        existing_note.update(merged_note)
+                        merged_note = existing_note
+                    template_summary = format_adcs_templates_summary(
+                        merged_note,
+                        template_metadata=certihound_templates,
+                    )
+                    if template_summary:
+                        merged_note.setdefault("templates_summary", template_summary)
+                    notes_by_relation_index[note_idx] = merged_note
+
             added_edges = add_bloodhound_path_edges(
                 graph,
                 nodes=[node for node in nodes if isinstance(node, dict)],
                 relations=relation_names,
                 status="discovered",
-                edge_type="entry_vector"
-                if str(method_name) == "get_roastable_user_edges"
-                else "bloodhound_ce",
+                edge_type=(
+                    "entry_vector"
+                    if str(method_name) == "get_roastable_user_edges"
+                    else "custom_acl"
+                    if str(method_name)
+                    in {
+                        "get_writable_user_attribute_paths",
+                        "get_netlogon_write_support_paths",
+                    }
+                    else "bloodhound_ce"
+                ),
                 notes_by_relation_index=notes_by_relation_index or None,
                 log_creation=False,
                 shell=shell,
                 # Certipy-discovered ADCS paths must always be uploaded to BH CE
                 # even when the relation is a native BH type, because BH CE's own
                 # collector may not have detected the edge in this environment.
-                force_opengraph=str(method_name) == "get_certipy_adcs_paths",
+                force_opengraph=str(method_name)
+                in {
+                    "get_certipy_adcs_paths",
+                    "get_writable_user_attribute_paths",
+                    "get_netlogon_write_support_paths",
+                },
             )
             recorded_steps += int(added_edges or 0)
             if added_edges:
@@ -2131,9 +2579,18 @@ def run_bloodhound_attack_paths(
                         break
                     left = _bloodhound_node_display_label(nodes[rel_idx])
                     right = _bloodhound_node_display_label(nodes[rel_idx + 1])
+                    step_note = notes_by_relation_index.get(rel_idx)
+                    display_right = resolve_adcs_display_target(
+                        rel,
+                        step_note if isinstance(step_note, dict) else None,
+                        fallback_target=right,
+                    )
                     if not left or not right or not rel:
                         continue
-                    step_str = f"{mark_sensitive(left, 'user')} -> {str(rel)} -> {mark_sensitive(right, 'user')}"
+                    step_str = (
+                        f"{mark_sensitive(left, 'node')} -> {str(rel)} -> "
+                        f"{mark_sensitive(display_right or right, 'node')}"
+                    )
                     if step_str in sampled_seen:
                         continue
                     sampled_seen.add(step_str)
@@ -2198,42 +2655,10 @@ def run_bloodhound_attack_paths(
                 title_text = f"{title} - discovered steps (showing {len(sampled_steps)}/{recorded_steps})"
             print_info_list(sampled_steps, title=title_text, icon="→")
 
-    membership_step = total_steps - 1
-    print_step_status(
-        "Membership Snapshot",
-        status="running",
-        step_number=membership_step,
-        total_steps=total_steps,
-    )
-    try:
-        user_count, group_count, computer_count = _persist_membership_snapshot()
-        print_step_status(
-            "Membership Snapshot",
-            status="completed",
-            step_number=membership_step,
-            total_steps=total_steps,
-            details=f"users={user_count}, computers={computer_count}, groups={group_count}",
-        )
-        print_info(
-            "Membership Snapshot: "
-            f"membership steps recorded={user_count + group_count + computer_count} "
-            f"(users={user_count}, computers={computer_count}, groups={group_count})."
-        )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc, show_locals=False)
-        print_step_status(
-            "Membership Snapshot",
-            status="failed",
-            step_number=membership_step,
-            total_steps=total_steps,
-            details="membership export failed",
-        )
-
     print_step_status(
         "Entry Node Reconciliation",
         status="running",
-        step_number=total_steps,
+        step_number=total_steps - 1,
         total_steps=total_steps,
     )
     try:
@@ -2247,7 +2672,7 @@ def run_bloodhound_attack_paths(
         print_step_status(
             "Entry Node Reconciliation",
             status="completed",
-            step_number=total_steps,
+            step_number=total_steps - 1,
             total_steps=total_steps,
             details=f"reconciled={reconciled}",
         )
@@ -2257,7 +2682,7 @@ def run_bloodhound_attack_paths(
         print_step_status(
             "Entry Node Reconciliation",
             status="failed",
-            step_number=total_steps,
+            step_number=total_steps - 1,
             total_steps=total_steps,
             details="reconciliation failed",
         )
@@ -2339,14 +2764,14 @@ def run_bloodhound_attack_paths(
             f"[attack_paths] skipping owned-user path prompt for {marked_domain}: domain is pwned"
         )
         return
-    owned_users = get_owned_domain_usernames_for_attack_paths(shell, target_domain)
-    if owned_users:
+    owned_principals = get_owned_domain_usernames_for_attack_paths(shell, target_domain)
+    if owned_principals:
         print_info_debug(
-            "[attack_paths] owned-user candidates for Phase 2: "
+            "[attack_paths] owned-principal candidates for Phase 2: "
             f"domain={mark_sensitive(target_domain, 'domain')} "
-            f"users={', '.join(mark_sensitive(user, 'user') for user in owned_users)}"
+            f"principals={', '.join(mark_sensitive(user, 'user') for user in owned_principals)}"
         )
-    if owned_users:
+    if owned_principals:
         try:
             from adscan_internal.cli.owned_privileged_escalation import (
                 offer_owned_privileged_escalation,
@@ -2368,8 +2793,8 @@ def run_bloodhound_attack_paths(
 
         marked_domain = mark_sensitive(target_domain, "domain")
         print_info(
-            "Searching for attack paths from owned users in "
-            f"{marked_domain} (users: {len(owned_users)})"
+            "Searching for attack paths from owned principals in "
+            f"{marked_domain} (accounts: {len(owned_principals)})"
         )
         offer_attack_paths_with_non_high_value_fallback(
             shell,
@@ -2480,6 +2905,162 @@ def run_bloodhound_attack_paths(
         telemetry.capture_exception(exc)
 
     print_success(f"Attack paths recorded: {unique_paths} (domain {marked_domain})")
+
+
+def persist_bloodhound_membership_snapshot(
+    shell: BloodHoundShell, target_domain: str
+) -> tuple[int, int, int]:
+    """Persist direct BloodHound MemberOf relationships to `memberships.json`.
+
+    This snapshot belongs to Phase 1 domain inventory because it captures static
+    domain membership state alongside users, computers and LAPS coverage.
+    """
+    if target_domain not in shell.domains:
+        marked_domain = mark_sensitive(target_domain, "domain")
+        print_error(
+            f"Domain '{marked_domain}' is not configured. Please add or select a valid domain."
+        )
+        return 0, 0, 0
+
+    service = shell._get_bloodhound_service()
+    client = getattr(service, "client", None)
+    execute_query = getattr(client, "execute_query", None)
+    if not callable(execute_query):
+        print_info_debug(
+            "[bloodhound] Membership snapshot skipped: CE client unavailable."
+        )
+        return 0, 0, 0
+
+    user_query = f"""
+    MATCH p=(u:User)-[:MemberOf]->(g:Group)
+    WHERE toLower(coalesce(u.name, "")) ENDS WITH toLower('@{target_domain}')
+    RETURN p
+    """
+    computer_query = f"""
+    MATCH p=(c:Computer)-[:MemberOf]->(g:Group)
+    WHERE toLower(coalesce(c.domain, "")) = toLower('{target_domain}')
+    RETURN p
+    """
+    group_query = f"""
+    MATCH p=(g:Group)-[:MemberOf]->(pg:Group)
+    WHERE toLower(coalesce(g.name, "")) ENDS WITH toLower('@{target_domain}')
+    RETURN p
+    """
+
+    from datetime import datetime, timezone
+    from adscan_internal.services.attack_graph_service import add_bloodhound_path_edges
+    from adscan_internal.workspaces import domain_subpath, write_json_file
+
+    membership_graph: dict[str, object] = {
+        "domain": target_domain,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "schema_version": "membership-1.0",
+        "nodes": {},
+        "edges": [],
+        "version": 2,
+    }
+
+    def _append_graph_data(graph_data: dict[str, object], *, label: str) -> int:
+        if not isinstance(graph_data, dict):
+            return 0
+        nodes_map = graph_data.get("nodes", {})
+        edges = graph_data.get("edges", [])
+        if not isinstance(nodes_map, dict) or not isinstance(edges, list):
+            return 0
+        print_info_debug(
+            f"[bloodhound] Membership snapshot {label} nodes={len(nodes_map)} edges={len(edges)}"
+        )
+
+        def _lookup_node(key: object) -> dict | None:
+            if key in nodes_map:
+                node = nodes_map.get(key)
+                return node if isinstance(node, dict) else None
+            str_key = str(key)
+            node = nodes_map.get(str_key)
+            return node if isinstance(node, dict) else None
+
+        added = 0
+        skipped_missing_nodes = 0
+        missing_examples: list[dict[str, object]] = []
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            relation = edge.get("label") or edge.get("kind") or ""
+            if str(relation) != "MemberOf":
+                continue
+            source = edge.get("source")
+            target = edge.get("target")
+            if not source or not target:
+                continue
+            src_node = _lookup_node(source)
+            dst_node = _lookup_node(target)
+            if not isinstance(src_node, dict) or not isinstance(dst_node, dict):
+                skipped_missing_nodes += 1
+                if len(missing_examples) < 3:
+                    missing_examples.append(
+                        {
+                            "source": source,
+                            "target": target,
+                            "source_type": type(source).__name__,
+                            "target_type": type(target).__name__,
+                            "label": relation,
+                        }
+                    )
+                continue
+            add_bloodhound_path_edges(
+                membership_graph,
+                nodes=[src_node, dst_node],
+                relations=["MemberOf"],
+                status="discovered",
+                edge_type="membership_snapshot",
+                log_creation=False,
+                shell=shell,
+            )
+            added += 1
+
+        if skipped_missing_nodes:
+            print_info_debug(
+                f"[bloodhound] Membership snapshot {label} skipped {skipped_missing_nodes} "
+                "edges due to missing nodes."
+            )
+            if missing_examples:
+                print_info_debug(
+                    f"[bloodhound] Membership snapshot {label} missing node examples: "
+                    f"{missing_examples}"
+                )
+        return added
+
+    user_edges = 0
+    computer_edges = 0
+    group_edges = 0
+    try:
+        user_graph = client.execute_query_with_relationships(user_query)
+        user_edges = _append_graph_data(user_graph, label="user")
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+    try:
+        computer_graph = client.execute_query_with_relationships(computer_query)
+        computer_edges = _append_graph_data(computer_graph, label="computer")
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+    try:
+        group_graph = client.execute_query_with_relationships(group_query)
+        group_edges = _append_graph_data(group_graph, label="group")
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+    workspace_cwd = (
+        shell._get_workspace_cwd()
+        if hasattr(shell, "_get_workspace_cwd")
+        else getattr(shell, "current_workspace_dir", os.getcwd())
+    )
+    output_path = domain_subpath(
+        workspace_cwd, shell.domains_dir, target_domain, "memberships.json"
+    )
+    write_json_file(output_path, membership_graph)
+    return user_edges, group_edges, computer_edges
 
 
 def run_show_attack_paths(
@@ -2642,12 +3223,13 @@ def run_show_attack_paths(
         from adscan_internal.services.attack_step_support_registry import (
             build_path_priority_key,
         )
+        from adscan_internal.cli.attack_path_execution import (
+            _sort_target_priority_groups,
+        )
 
         sorted_paths = sorted(paths, key=build_path_priority_key)
         if show_sections:
-            return [p for p in sorted_paths if p.get("target_is_high_value")] + [
-                p for p in sorted_paths if not p.get("target_is_high_value")
-            ]
+            return _sort_target_priority_groups(sorted_paths)
         return sorted_paths
 
     def _compute_paths() -> list[dict[str, Any]]:
@@ -3075,6 +3657,7 @@ def enumerate_user_aces(
                     "dominio_destino": target_domain_value,
                     "acl": ace.get("relation", ""),
                     "target_enabled": bool(ace.get("targetEnabled", True)),
+                    "target_object_id": ace.get("targetObjectId", ""),
                 }
             )
 
@@ -3113,6 +3696,7 @@ def enumerate_user_aces(
                         "dominio_destino": target_domain_value,
                         "acl": ace.get("relation", ""),
                         "target_enabled": bool(ace.get("targetEnabled", True)),
+                        "target_object_id": ace.get("targetObjectId", ""),
                     }
                 )
 
@@ -3765,6 +4349,510 @@ def ask_for_bloodhound_users(shell: BloodHoundShell, target_domain: str) -> None
 # ============================================================================
 
 
+def _segment_password_policy_users(
+    shell: BloodHoundShell,
+    *,
+    domain: str,
+    users: list[str],
+) -> dict[str, object]:
+    """Split risky users into Tier-0, high-value, and low-priv segments."""
+    ordered_users: list[str] = []
+    normalized_to_display: dict[str, str] = {}
+    for user in users:
+        display = str(user or "").strip()
+        normalized = normalize_samaccountname(display)
+        if not display or not normalized or normalized in normalized_to_display:
+            continue
+        normalized_to_display[normalized] = display
+        ordered_users.append(display)
+
+    flags = classify_users_tier0_high_value(
+        shell,
+        domain=domain,
+        usernames=ordered_users,
+    )
+
+    tier0_users: list[str] = []
+    high_value_users: list[str] = []
+    low_priv_users: list[str] = []
+    for user in ordered_users:
+        normalized = normalize_samaccountname(user)
+        risk = flags.get(normalized, UserRiskFlags())
+        if risk.is_tier0:
+            tier0_users.append(user)
+        elif risk.is_high_value:
+            high_value_users.append(user)
+        else:
+            low_priv_users.append(user)
+
+    return {
+        "all_users": ordered_users or None,
+        "tier0_users": tier0_users or None,
+        "high_value_users": high_value_users or None,
+        "low_priv_users": low_priv_users or None,
+        "total_count": len(ordered_users),
+        "tier0_count": len(tier0_users),
+        "high_value_count": len(high_value_users),
+        "low_priv_count": len(low_priv_users),
+    }
+
+
+def _persist_password_policy_segment_artifacts(
+    shell: BloodHoundShell,
+    *,
+    domain: str,
+    base_filename: str,
+    segmented_users: dict[str, object],
+) -> dict[str, str]:
+    """Write segmented user lists to workspace artifacts."""
+    base_name = os.path.splitext(base_filename)[0]
+    artifact_paths: dict[str, str] = {}
+    mapping = {
+        "tier0_users": f"{base_name}_tier0.txt",
+        "high_value_users": f"{base_name}_highvalue.txt",
+        "low_priv_users": f"{base_name}_lowpriv.txt",
+    }
+    for segment_key, filename in mapping.items():
+        users = segmented_users.get(segment_key)
+        if isinstance(users, list) and users:
+            artifact_paths[segment_key] = shell._write_user_list_file(
+                domain,
+                filename,
+                users,
+            )
+    return artifact_paths
+
+
+def _render_password_policy_user_summary(
+    *,
+    domain: str,
+    title: str,
+    segmented_users: dict[str, object],
+    artifact_paths: dict[str, str],
+) -> None:
+    """Render one premium summary for password policy hygiene findings."""
+    total_count = int(segmented_users.get("total_count") or 0)
+    tier0_users = segmented_users.get("tier0_users") or []
+    high_value_users = segmented_users.get("high_value_users") or []
+    low_priv_users = segmented_users.get("low_priv_users") or []
+
+    tier0_count = int(segmented_users.get("tier0_count") or 0)
+    high_value_count = int(segmented_users.get("high_value_count") or 0)
+    low_priv_count = int(segmented_users.get("low_priv_count") or 0)
+
+    marked_domain = mark_sensitive(domain, "domain")
+    if total_count == 0:
+        print_panel(
+            "\n".join(
+                [
+                    f"Domain: {marked_domain}",
+                    "Risk posture: No matching users identified",
+                    "Tier-0 users: 0",
+                    "High-value users: 0",
+                    "Low-priv users: 0",
+                ]
+            ),
+            title=title,
+            border_style="green",
+            fit=True,
+        )
+        return
+
+    risk_posture = (
+        "Critical: Tier-0 users affected"
+        if tier0_count
+        else "High: High-value users affected"
+        if high_value_count
+        else "Moderate: Limited to low-priv users"
+    )
+    border_style = "red" if tier0_count else "yellow" if high_value_count else "cyan"
+    print_panel(
+        "\n".join(
+            [
+                f"Domain: {marked_domain}",
+                f"Risk posture: {risk_posture}",
+                f"Total affected users: {total_count}",
+                f"Tier-0 users: {tier0_count}",
+                f"High-value users: {high_value_count}",
+                f"Low-priv users: {low_priv_count}",
+                "",
+                "Artifacts",
+                f"- Tier-0 subset: {mark_sensitive(artifact_paths.get('tier0_users', 'N/A'), 'path') if artifact_paths.get('tier0_users') else 'N/A'}",
+                f"- High-value subset: {mark_sensitive(artifact_paths.get('high_value_users', 'N/A'), 'path') if artifact_paths.get('high_value_users') else 'N/A'}",
+                f"- Low-priv subset: {mark_sensitive(artifact_paths.get('low_priv_users', 'N/A'), 'path') if artifact_paths.get('low_priv_users') else 'N/A'}",
+            ]
+        ),
+        title=title,
+        border_style=border_style,
+        fit=True,
+    )
+
+    table = Table(title="Risk Breakdown", show_header=True, header_style="bold magenta")
+    table.add_column("Segment", style="cyan")
+    table.add_column("Count", justify="right", style="white")
+    table.add_column("Assessment", style="white", max_width=68)
+    table.add_row(
+        "Tier-0",
+        str(tier0_count),
+        (
+            "Accounts in the Tier-0 boundary were identified. This materially increases "
+            "exposure because these principals can often lead directly to domain compromise."
+            if tier0_count
+            else "No Tier-0 principals were identified."
+        ),
+    )
+    table.add_row(
+        "High-value",
+        str(high_value_count),
+        (
+            "High-value identities outside Tier-0 are exposed and should be prioritised "
+            "after Tier-0 remediation."
+            if high_value_count
+            else "No additional high-value principals were identified."
+        ),
+    )
+    table.add_row(
+        "Low-priv",
+        str(low_priv_count),
+        (
+            "The remaining exposure is limited to low-privileged users, but still reflects "
+            "weak directory hygiene and should be remediated."
+            if low_priv_count
+            else "No low-privileged users were identified."
+        ),
+    )
+    print_table(table)
+
+    if isinstance(tier0_users, list) and tier0_users:
+        print_info_list(
+            [mark_sensitive(user, "user") for user in tier0_users[:5]],
+            title=f"Tier-0 sample ({tier0_count} total)",
+            icon="🔴",
+        )
+    if isinstance(high_value_users, list) and high_value_users:
+        print_info_list(
+            [mark_sensitive(user, "user") for user in high_value_users[:5]],
+            title=f"High-value sample ({high_value_count} total)",
+            icon="🟠",
+        )
+    if isinstance(low_priv_users, list) and low_priv_users:
+        print_info_list(
+            [mark_sensitive(user, "user") for user in low_priv_users[:5]],
+            title=f"Low-priv sample ({low_priv_count} total)",
+            icon="🟢",
+        )
+
+
+def _build_segmented_user_details(
+    raw_records: list[dict[str, object]],
+    segmented_users: dict[str, object],
+) -> dict[str, list[dict[str, object]]]:
+    """Attach per-user metadata to Tier-0/high-value/low-priv segments."""
+    records_by_normalized: dict[str, dict[str, object]] = {}
+    for record in raw_records:
+        if not isinstance(record, dict):
+            continue
+        normalized = normalize_samaccountname(str(record.get("samaccountname") or ""))
+        if normalized:
+            records_by_normalized[normalized] = record
+
+    details: dict[str, list[dict[str, object]]] = {}
+    for segment_key in ("tier0_users", "high_value_users", "low_priv_users"):
+        users = segmented_users.get(segment_key)
+        if not isinstance(users, list):
+            continue
+        rows: list[dict[str, object]] = []
+        for user in users:
+            normalized = normalize_samaccountname(str(user or ""))
+            row = dict(records_by_normalized.get(normalized) or {})
+            row["samaccountname"] = user
+            rows.append(row)
+        details[segment_key] = rows
+    return details
+
+
+def _render_stale_enabled_user_summary(
+    *,
+    domain: str,
+    title: str,
+    segmented_users: dict[str, object],
+    artifact_paths: dict[str, str],
+    stale_days: int,
+) -> None:
+    """Render one premium summary for enabled-but-stale users."""
+    total_count = int(segmented_users.get("total_count") or 0)
+    tier0_count = int(segmented_users.get("tier0_count") or 0)
+    high_value_count = int(segmented_users.get("high_value_count") or 0)
+    low_priv_count = int(segmented_users.get("low_priv_count") or 0)
+
+    marked_domain = mark_sensitive(domain, "domain")
+    if total_count == 0:
+        print_panel(
+            "\n".join(
+                [
+                    f"Domain: {marked_domain}",
+                    f"Threshold: {stale_days} days",
+                    "Hygiene posture: No stale enabled users identified",
+                    "Tier-0 users: 0",
+                    "High-value users: 0",
+                    "Low-priv users: 0",
+                ]
+            ),
+            title=title,
+            border_style="green",
+            fit=True,
+        )
+        return
+
+    posture = (
+        "Critical: Tier-0 users remain enabled despite prolonged inactivity"
+        if tier0_count
+        else "High: High-value users appear stale and still enabled"
+        if high_value_count
+        else "Moderate: Exposure limited to low-privileged stale accounts"
+    )
+    border_style = "red" if tier0_count else "yellow" if high_value_count else "cyan"
+    print_panel(
+        "\n".join(
+            [
+                f"Domain: {marked_domain}",
+                f"Threshold: {stale_days} days without observed logon activity",
+                f"Hygiene posture: {posture}",
+                f"Total stale enabled users: {total_count}",
+                f"Tier-0 users: {tier0_count}",
+                f"High-value users: {high_value_count}",
+                f"Low-priv users: {low_priv_count}",
+                "",
+                "Artifacts",
+                f"- Tier-0 subset: {mark_sensitive(artifact_paths.get('tier0_users', 'N/A'), 'path') if artifact_paths.get('tier0_users') else 'N/A'}",
+                f"- High-value subset: {mark_sensitive(artifact_paths.get('high_value_users', 'N/A'), 'path') if artifact_paths.get('high_value_users') else 'N/A'}",
+                f"- Low-priv subset: {mark_sensitive(artifact_paths.get('low_priv_users', 'N/A'), 'path') if artifact_paths.get('low_priv_users') else 'N/A'}",
+            ]
+        ),
+        title=title,
+        border_style=border_style,
+        fit=True,
+    )
+
+    table = Table(title="Stale Identity Breakdown", show_header=True, header_style="bold magenta")
+    table.add_column("Segment", style="cyan")
+    table.add_column("Count", justify="right", style="white")
+    table.add_column("Assessment", style="white", max_width=72)
+    table.add_row(
+        "Tier-0",
+        str(tier0_count),
+        (
+            "These identities belong to the Tier-0 boundary and should almost never remain enabled without recent use."
+            if tier0_count
+            else "No stale Tier-0 principals were identified."
+        ),
+    )
+    table.add_row(
+        "High-value",
+        str(high_value_count),
+        (
+            "High-value identities appear unused for a prolonged period and should be validated or disabled."
+            if high_value_count
+            else "No stale additional high-value principals were identified."
+        ),
+    )
+    table.add_row(
+        "Low-priv",
+        str(low_priv_count),
+        (
+            "Inactive enabled low-privilege accounts increase attack surface for password attacks and should be cleaned up."
+            if low_priv_count
+            else "No stale low-privileged principals were identified."
+        ),
+    )
+    print_table(table)
+
+
+def _load_workspace_user_list(
+    shell: BloodHoundShell,
+    *,
+    domain: str,
+    filename: str,
+) -> list[str]:
+    """Load one workspace user list file preserving display values."""
+    workspace_cwd = shell._get_workspace_cwd()
+    file_path = domain_subpath(workspace_cwd, shell.domains_dir, domain, filename)
+    if not os.path.exists(file_path):
+        return []
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+            return [line.strip() for line in handle if line.strip()]
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[user-lists] failed to read {file_path}: {exc}")
+        return []
+
+
+def _calculate_tier0_highvalue_sprawl(
+    *,
+    enabled_users: list[str],
+    tier0_highvalue_users: list[str],
+) -> dict[str, object]:
+    """Calculate Tier-0/high-value sprawl metrics from two user inventories."""
+    enabled_unique = sorted({str(user).strip() for user in enabled_users if str(user).strip()})
+    enabled_keys = {normalize_samaccountname(user) for user in enabled_unique}
+    enabled_keys.discard(None)  # type: ignore[arg-type]
+
+    privileged_unique = sorted(
+        {str(user).strip() for user in tier0_highvalue_users if str(user).strip()}
+    )
+    privileged_in_enabled: list[str] = []
+    for user in privileged_unique:
+        normalized = normalize_samaccountname(user)
+        if normalized and normalized in enabled_keys:
+            privileged_in_enabled.append(user)
+
+    enabled_count = len(enabled_unique)
+    privileged_count = len(privileged_in_enabled)
+    ratio = (privileged_count / enabled_count) if enabled_count else 0.0
+
+    if privileged_count >= 20 or ratio >= 0.20:
+        posture = "Critical: Tier-0 / high-value identity sprawl"
+        exceeds_threshold = True
+    elif privileged_count >= 10 or ratio >= 0.10:
+        posture = "High: Privileged identity concentration is elevated"
+        exceeds_threshold = True
+    elif privileged_count >= 5 and ratio >= 0.05:
+        posture = "Moderate: Privileged identity footprint should be reduced"
+        exceeds_threshold = True
+    else:
+        posture = "Controlled: No material Tier-0 / high-value sprawl detected"
+        exceeds_threshold = False
+
+    return {
+        "enabled_user_count": enabled_count,
+        "tier0_highvalue_count": privileged_count,
+        "tier0_highvalue_ratio": round(ratio, 4),
+        "tier0_highvalue_percentage": round(ratio * 100, 2),
+        "tier0_highvalue_users": privileged_in_enabled or None,
+        "exceeds_threshold": exceeds_threshold,
+        "posture": posture,
+    }
+
+
+def _render_tier0_highvalue_sprawl_summary(
+    *,
+    domain: str,
+    metrics: dict[str, object],
+) -> None:
+    """Render a premium summary for Tier-0/high-value identity sprawl."""
+    enabled_count = int(metrics.get("enabled_user_count") or 0)
+    privileged_count = int(metrics.get("tier0_highvalue_count") or 0)
+    percentage = float(metrics.get("tier0_highvalue_percentage") or 0.0)
+    posture = str(metrics.get("posture") or "Unknown")
+    privileged_users = metrics.get("tier0_highvalue_users") or []
+
+    border_style = (
+        "red"
+        if percentage >= 20 or privileged_count >= 20
+        else "yellow"
+        if bool(metrics.get("exceeds_threshold"))
+        else "green"
+    )
+    print_panel(
+        "\n".join(
+            [
+                f"Domain: {mark_sensitive(domain, 'domain')}",
+                f"Enabled users: {enabled_count}",
+                f"Tier-0 / high-value users: {privileged_count}",
+                f"Privileged ratio: {percentage:.2f}%",
+                f"Assessment: {posture}",
+            ]
+        ),
+        title="Tier-0 / High-Value Identity Sprawl",
+        border_style=border_style,
+        fit=True,
+    )
+
+    table = Table(title="Privileged Identity Concentration", show_header=True, header_style="bold magenta")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right", style="white")
+    table.add_column("Interpretation", style="white", max_width=72)
+    table.add_row(
+        "Enabled users",
+        str(enabled_count),
+        "Active identity baseline used for hygiene ratio calculations.",
+    )
+    table.add_row(
+        "Tier-0 / High-Value users",
+        str(privileged_count),
+        "Users sourced from admins.txt (Tier-0 / high-value union).",
+    )
+    table.add_row(
+        "Privileged ratio",
+        f"{percentage:.2f}%",
+        (
+            "Elevated privileged identity concentration increases standing access and the blast radius of credential compromise."
+            if bool(metrics.get("exceeds_threshold"))
+            else "Privileged identity concentration appears comparatively contained."
+        ),
+    )
+    print_table(table)
+
+    if isinstance(privileged_users, list) and privileged_users:
+        print_info_list(
+            [mark_sensitive(user, "user") for user in privileged_users[:8]],
+            title=f"Tier-0 / High-Value sample ({privileged_count} total)",
+            icon="🔶",
+        )
+
+
+def run_bloodhound_tier0_highvalue_sprawl(shell: BloodHoundShell, domain: str) -> None:
+    """Assess Tier-0/high-value identity concentration using current inventories."""
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info(
+        f"Assessing Tier-0 / high-value identity concentration on domain {marked_domain}"
+    )
+    try:
+        enabled_users = _load_workspace_user_list(
+            shell,
+            domain=domain,
+            filename="enabled_users.txt",
+        )
+        if not enabled_users:
+            print_info_debug(
+                "[identity-sprawl] enabled_users.txt missing or empty; querying BloodHound."
+            )
+            enabled_users = shell._get_bloodhound_service().get_users(domain=domain)
+            shell._write_user_list_file(domain, "enabled_users.txt", enabled_users)
+
+        tier0_highvalue_users = _load_workspace_user_list(
+            shell,
+            domain=domain,
+            filename="admins.txt",
+        )
+        if not tier0_highvalue_users:
+            print_info_debug(
+                "[identity-sprawl] admins.txt missing or empty; querying BloodHound high-value users."
+            )
+            tier0_highvalue_users = shell._get_bloodhound_service().get_users(
+                domain=domain,
+                filter_type="high_value",
+            )
+            shell._write_user_list_file(domain, "admins.txt", tier0_highvalue_users)
+
+        metrics = _calculate_tier0_highvalue_sprawl(
+            enabled_users=enabled_users,
+            tier0_highvalue_users=tier0_highvalue_users,
+        )
+        execute_bloodhound_tier0_highvalue_sprawl(
+            shell,
+            domain=domain,
+            metrics=metrics,
+        )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_error(
+            "Failed to assess Tier-0 / high-value identity concentration."
+        )
+        print_exception(show_locals=False, exception=exc)
+
+
 def run_bloodhound_pwdneverexpires(shell: BloodHoundShell, domain: str) -> None:
     """Create a list of users with password never expires in the specified domain.
 
@@ -3815,6 +4903,44 @@ def run_bloodhound_passnotreq(shell: BloodHoundShell, domain: str) -> None:
         print_exception(show_locals=False, exception=exc)
 
 
+def run_bloodhound_stale_enabled_users(
+    shell: BloodHoundShell,
+    domain: str,
+    *,
+    stale_days: int = 180,
+) -> None:
+    """Create a list of enabled users with stale logon activity in the domain."""
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info(
+        f"Searching for enabled stale users on domain {marked_domain} "
+        f"(threshold: {stale_days} days)"
+    )
+    try:
+        records = shell._get_bloodhound_service().get_stale_enabled_users(
+            domain=domain,
+            stale_days=stale_days,
+        )
+        users = [
+            str(record.get("samaccountname") or "").strip()
+            for record in records
+            if isinstance(record, dict) and str(record.get("samaccountname") or "").strip()
+        ]
+        shell._write_user_list_file(domain, "stale_enabled_users.txt", users)
+        execute_bloodhound_stale_enabled_users(
+            shell,
+            None,
+            domain,
+            "stale_enabled_users.txt",
+            users=users,
+            records=records,
+            stale_days=stale_days,
+        )
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_error("Failed to query BloodHound for stale enabled users.")
+        print_exception(show_locals=False, exception=exc)
+
+
 def execute_bloodhound_passnotreq(
     shell: BloodHoundShell,
     command: str | None,
@@ -3859,22 +4985,225 @@ def execute_bloodhound_passnotreq(
         # Define the key to update based on the file
         if file == "passnotreq.txt":
             key = "password_not_req"
-            title = "Users with Password Not Required"
+            title = "Password Not Required Risk Segmentation"
         elif file == "pwdneverexpires.txt":
             key = "password_never_expires"
-            title = "Users with Password Never Expires"
+            title = "Password Never Expires Risk Segmentation"
         else:
             key = file
             title = "Users"
 
-        value = users if users else None
+        segmented_users = _segment_password_policy_users(
+            shell,
+            domain=domain,
+            users=users or [],
+        )
+        artifact_paths = _persist_password_policy_segment_artifacts(
+            shell,
+            domain=domain,
+            base_filename=file,
+            segmented_users=segmented_users,
+        )
+        value = segmented_users if users else False
         shell.update_report_field(domain, key, value)
-        shell._display_items(users or [], title)
+        _render_password_policy_user_summary(
+            domain=domain,
+            title=title,
+            segmented_users=segmented_users,
+            artifact_paths=artifact_paths,
+        )
     except Exception as e:
         telemetry.capture_exception(e)
         marked_domain = mark_sensitive(domain, "domain")
         print_error(
             f"Error creating the user list via BloodHound for domain {marked_domain}: {str(e)}"
+        )
+        print_exception(show_locals=False, exception=e)
+
+
+def execute_bloodhound_stale_enabled_users(
+    shell: BloodHoundShell,
+    command: str | None,
+    domain: str,
+    file: str,
+    *,
+    users: list[str] | None = None,
+    records: list[dict[str, object]] | None = None,
+    stale_days: int = 180,
+) -> None:
+    """Execute stale-enabled-user rendering and persist structured evidence."""
+    try:
+        if users is None:
+            print_info_verbose(f"Executing BloodHound command for {file}: {command}")
+            completed_process = shell.run_command(command, timeout=300)
+            if completed_process.returncode != 0:
+                marked_domain = mark_sensitive(domain, "domain")
+                print_error(
+                    f"Error creating the stale-enabled-user list via BloodHound for domain {marked_domain}:"
+                )
+                if completed_process.stderr:
+                    print_error(completed_process.stderr.strip())
+                return
+            workspace_cwd = shell._get_workspace_cwd()
+            users_file = domain_subpath(workspace_cwd, shell.domains_dir, domain, file)
+            with open(users_file, "r", encoding="utf-8") as handle:
+                users = [line.strip() for line in handle if line.strip()]
+
+        segmented_users = _segment_password_policy_users(
+            shell,
+            domain=domain,
+            users=users or [],
+        )
+        segmented_details = _build_segmented_user_details(records or [], segmented_users)
+        artifact_paths = _persist_password_policy_segment_artifacts(
+            shell,
+            domain=domain,
+            base_filename=file,
+            segmented_users=segmented_users,
+        )
+        details = {
+            **segmented_users,
+            "stale_days_threshold": stale_days,
+            "segmented_details": segmented_details,
+        }
+        value = segmented_users if users else False
+        shell.update_report_field(domain, "stale_enabled_users", value)
+        try:
+            from adscan_internal.services.report_service import record_technical_finding
+
+            record_technical_finding(
+                shell,
+                domain,
+                key="stale_enabled_users",
+                value=bool(users),
+                details=details,
+                evidence=[
+                    {
+                        "type": "artifact",
+                        "summary": "BloodHound stale enabled users list",
+                        "artifact_path": domain_relpath(
+                            shell.domains_dir, domain, file
+                        ),
+                    }
+                ],
+            )
+        except Exception as exc:  # pragma: no cover
+            if not handle_optional_report_service_exception(
+                exc,
+                action="Technical finding sync",
+                debug_printer=print_info_debug,
+                prefix="[stale-users]",
+            ):
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[stale-users] Failed to persist technical finding: {exc}"
+                )
+
+        _render_stale_enabled_user_summary(
+            domain=domain,
+            title="Stale Enabled Users Risk Segmentation",
+            segmented_users=segmented_users,
+            artifact_paths=artifact_paths,
+            stale_days=stale_days,
+        )
+    except Exception as e:
+        telemetry.capture_exception(e)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"Error creating the stale-enabled-user list via BloodHound for domain {marked_domain}: {str(e)}"
+        )
+        print_exception(show_locals=False, exception=e)
+
+
+def execute_bloodhound_tier0_highvalue_sprawl(
+    shell: BloodHoundShell,
+    *,
+    domain: str,
+    metrics: dict[str, object],
+) -> None:
+    """Persist and render Tier-0/high-value identity concentration metrics."""
+    try:
+        affected_users = metrics.get("tier0_highvalue_users")
+        if not isinstance(affected_users, list):
+            affected_users = []
+
+        artifact_path = shell._write_user_list_file(
+            domain,
+            "tier0_highvalue_sprawl.txt",
+            affected_users,
+        )
+        value = {
+            **metrics,
+            "artifact_path": domain_relpath(
+                shell.domains_dir,
+                domain,
+                "tier0_highvalue_sprawl.txt",
+            ),
+        }
+        shell.update_report_field(domain, "tier0_highvalue_sprawl", value)
+        try:
+            from adscan_internal.services.report_service import record_technical_finding
+
+            record_technical_finding(
+                shell,
+                domain,
+                key="tier0_highvalue_sprawl",
+                value=bool(metrics.get("exceeds_threshold")),
+                details=value,
+                evidence=[
+                    {
+                        "type": "artifact",
+                        "summary": "Enabled user inventory used for sprawl baseline",
+                        "artifact_path": domain_relpath(
+                            shell.domains_dir,
+                            domain,
+                            "enabled_users.txt",
+                        ),
+                    },
+                    {
+                        "type": "artifact",
+                        "summary": "Tier-0 / high-value user inventory",
+                        "artifact_path": domain_relpath(
+                            shell.domains_dir,
+                            domain,
+                            "admins.txt",
+                        ),
+                    },
+                    {
+                        "type": "artifact",
+                        "summary": "Tier-0 / high-value users within enabled-user baseline",
+                        "artifact_path": domain_relpath(
+                            shell.domains_dir,
+                            domain,
+                            "tier0_highvalue_sprawl.txt",
+                        ),
+                    },
+                ],
+            )
+        except Exception as exc:  # pragma: no cover
+            if not handle_optional_report_service_exception(
+                exc,
+                action="Technical finding sync",
+                debug_printer=print_info_debug,
+                prefix="[identity-sprawl]",
+            ):
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[identity-sprawl] Failed to persist technical finding: {exc}"
+                )
+
+        print_info_debug(
+            f"[identity-sprawl] Wrote intersection artifact to {mark_sensitive(artifact_path, 'path')}"
+        )
+        _render_tier0_highvalue_sprawl_summary(
+            domain=domain,
+            metrics=metrics,
+        )
+    except Exception as e:
+        telemetry.capture_exception(e)
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"Error assessing Tier-0 / high-value identity concentration for domain {marked_domain}: {str(e)}"
         )
         print_exception(show_locals=False, exception=e)
 
@@ -4134,6 +5463,7 @@ def run_bloodhound_computers(shell: BloodHoundShell, target_domain: str) -> None
         )
         return
     run_bloodhound_computers_all(shell, target_domain)
+    persist_bloodhound_membership_snapshot(shell, target_domain)
     if shell.type == "ctf":
         return
     if shell.auto:

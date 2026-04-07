@@ -223,12 +223,9 @@ class ImpacketRunner:
         clean_pdc = strip_sensitive_markers(str(pdc))
         args.extend(["-dc-ip", clean_pdc])
 
-        # NOTE: In old_adscan.py do_kerberoast (line 26732), the command includes a pipeline
-        # for filtering output. The full command is:
-        # GetUserSPNs.py -request {auth} -target-domain {domain} -outputfile ... | awk '{print $2}' | grep -vE 'Name|v0.|---|CCache|Principal:' | awk '!seen[$0]++' | awk 'NF'
-        # We need to add this pipeline to the command string when request=True
-        
-        # Build the command with pipeline like old_adscan.py
+        # Build the raw command and parse stdout in Python. This avoids relying
+        # on shell pipelines for candidate extraction and keeps outputfile
+        # validation separate from stdout inspection.
         script_path = Path(ctx.impacket_scripts_dir) / "GetUserSPNs.py"
         if not ctx.validate_script_exists(str(script_path)):
             print_error(
@@ -236,21 +233,13 @@ class ImpacketRunner:
                 "Please check Impacket installation."
             )
             return None
-        
-        # Build command string
+
         cleaned_args = [strip_sensitive_markers(str(arg)) for arg in args]
         command_parts = [str(script_path)] + cleaned_args
         command = shlex.join(command_parts)
-        
-        # Add pipeline when request=True (like old_adscan.py line 26732)
-        if request:
-            pipeline = " | awk '{print $2}' | grep -vE 'Name|v0.|---|CCache|Principal:' | awk '!seen[$0]++' | awk 'NF'"
-            command += pipeline
-        
-        # Show full command in debug output (no truncation)
+
         print_info_debug(f"[impacket] Running GetUserSPNs.py: {command}")
-        
-        # Execute command directly with pipeline
+
         result = self._execute_command(
             command,
             timeout=timeout,

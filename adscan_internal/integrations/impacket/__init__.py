@@ -47,6 +47,7 @@ from .parsers import (
     ASREPHash,
     NTLMHash,
     parse_kerberoast_output,
+    extract_kerberoast_candidate_users,
     parse_asreproast_output,
     parse_secretsdump_output,
     extract_usernames_from_kerberoast,
@@ -75,6 +76,7 @@ __all__ = [
     "NTLMHash",
     # Parser functions
     "parse_kerberoast_output",
+    "extract_kerberoast_candidate_users",
     "parse_asreproast_output",
     "parse_secretsdump_output",
     "extract_usernames_from_kerberoast",

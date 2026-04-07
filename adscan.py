@@ -107,6 +107,12 @@ from adscan_internal import (
 )
 from adscan_internal.cli.ci_events import emit_phase
 from adscan_internal.logging_config import init_logging
+from adscan_internal.reporting_compat import (
+    handle_optional_report_service_exception,
+    load_optional_pro_attr,
+    load_optional_report_service_attr,
+    is_optional_report_service_import_error,
+)
 from adscan_internal.ssl_certificates import configure_ssl_certificates
 from adscan_internal.subprocess_env import (
     command_needs_clean_env as _command_needs_clean_env,
@@ -189,6 +195,11 @@ from adscan_internal.rich_output import (
     questionary_select_index,
     set_prompt_auto_mode,
 )
+from adscan_internal.interactive_requests import (
+    is_remote_interaction_enabled,
+    request_confirm as request_remote_confirm,
+    request_select as request_remote_select,
+)
 from adscan_internal.update_manager import (
     UpdateContext,
     offer_updates_for_command,
@@ -198,6 +209,7 @@ from adscan_core.lab_catalog import (
     get_labs_for_provider as get_catalog_labs_for_provider,
     is_lab_whitelisted as is_catalog_lab_whitelisted,
 )
+from adscan_core.console_runtime import build_rich_console as _build_rich_console
 from adscan_core.lab_context import build_lab_telemetry_fields
 from adscan_internal.services.dns_discovery_service import (
     is_dns_resolution_error,
@@ -788,7 +800,7 @@ def _process_exit_cleanup():
     global _SESSION_CAPTURE_FINALIZED
     if _SESSION_CAPTURE_FINALIZED:
         return
-    shell = ACTIVE_SHELL
+    shell = globals().get("ACTIVE_SHELL")
     command_type = _resolve_command_type(shell)
     if not _is_session_capture_allowed(command_type):
         _SESSION_CAPTURE_FINALIZED = True
@@ -2211,6 +2223,12 @@ EXTERNAL_TOOLS_CONFIG = {
         "req_file": "requirements.txt",
         "check_path": "responder/Responder.py",
     },
+    "coercer": {
+        "url": "https://github.com/p0dalirius/Coercer.git",
+        "type": "git",
+        "req_file": "requirements.txt",
+        "check_path": "coercer/Coercer.py",
+    },
     "massdns": {
         "url": "https://github.com/blechschmidt/massdns.git",
         "type": "git_make",
@@ -3127,7 +3145,7 @@ PipToolsConfig = {  # pylint: disable=invalid-name
 
 # --- Rich Console Initialization ---
 # Primary console for user-facing output (no recording needed here).
-console = Console(theme=ADSCAN_THEME)
+console = _build_rich_console(theme=ADSCAN_THEME)
 
 # Dedicated telemetry console that records everything rendered via the Rich
 # helpers and logging. This console is never shown directly to the user; we
@@ -3147,13 +3165,15 @@ try:
     else:
         # First execution or console not set yet - create new console
         _telemetry_buffer = StringIO()
-        TELEMETRY_CONSOLE = Console(
-            record=True, theme=ADSCAN_THEME, file=_telemetry_buffer
+        TELEMETRY_CONSOLE = _build_rich_console(
+            theme=ADSCAN_THEME, record=True, file=_telemetry_buffer
         )
 except (ImportError, AttributeError):
     # rich_output not available or _telemetry_console not accessible - create new
     _telemetry_buffer = StringIO()
-    TELEMETRY_CONSOLE = Console(record=True, theme=ADSCAN_THEME, file=_telemetry_buffer)
+    TELEMETRY_CONSOLE = _build_rich_console(
+        theme=ADSCAN_THEME, record=True, file=_telemetry_buffer
+    )
 
 install_rich_traceback()
 VERBOSE_MODE = os.getenv("ADSCAN_VERBOSE_MODE") == "1"  # pylint: disable=invalid-name
@@ -3812,6 +3832,7 @@ from adscan_internal.cli.common import (  # noqa: E402
     build_cli_runtime_snapshot,
     normalize_command_alias,
     normalize_help_alias,
+    should_show_workspace_getting_started,
 )
 
 
@@ -9560,7 +9581,13 @@ class PentestShell:
             return _fallback_selection()
         return selected
 
-    def _questionary_select(self, title: str, options: list[str], default_idx: int = 0):
+    def _questionary_select(
+        self,
+        title: str,
+        options: list[str],
+        default_idx: int = 0,
+        context: dict[str, object] | None = None,
+    ):
         """Interactive menu using Questionary to choose an option.
         Returns the index of the selected option or None if cancelled.
 
@@ -9574,6 +9601,28 @@ class PentestShell:
         Returns:
             int | None: Index of selected option or None if cancelled
         """
+        remote_context = dict(context or {})
+        allow_remote_interaction = bool(
+            remote_context.pop("remote_interaction", False)
+        )
+        if allow_remote_interaction:
+            remote_selection = request_remote_select(
+                title=title,
+                options=options,
+                default_idx=default_idx,
+                timeout_result=None,
+                context={
+                    "source": "prompt",
+                    "prompt_kind": "select",
+                    "session_command_type": getattr(self, "session_command_type", None),
+                    **remote_context,
+                },
+            )
+            if remote_selection is not None:
+                return remote_selection
+            if is_remote_interaction_enabled():
+                return None
+
         print()
         return questionary_select_index(
             title=title,
@@ -9581,6 +9630,37 @@ class PentestShell:
             default_idx=default_idx,
             shell=self,
         )
+
+    def _questionary_confirm(
+        self,
+        prompt: str,
+        *,
+        default: bool = False,
+        timeout_result: bool | None = None,
+        context: dict[str, object] | None = None,
+    ) -> bool | None:
+        """Request a yes/no decision with optional remote delegation."""
+        remote_context = dict(context or {})
+        allow_remote_interaction = bool(
+            remote_context.pop("remote_interaction", False)
+        )
+        if allow_remote_interaction:
+            remote_confirmation = request_remote_confirm(
+                prompt=prompt,
+                default=default,
+                timeout_result=timeout_result,
+                context={
+                    "source": "prompt",
+                    "prompt_kind": "confirm",
+                    "session_command_type": getattr(self, "session_command_type", None),
+                    **remote_context,
+                },
+            )
+            if remote_confirmation is not None:
+                return remote_confirmation
+            if is_remote_interaction_enabled():
+                return timeout_result
+        return Confirm.ask(prompt, default=default)
 
     def _questionary_checkbox(
         self,
@@ -10067,7 +10147,7 @@ class PentestShell:
     neo4j_port = "7687"
     neo4j_db_user = "neo4j"
     neo4j_db_password = "neo4j"
-    report_file = "report.json"
+    report_file = "technical_report.json"
     report = {}
     technical_report_file = "technical_report.json"
     technical_report = {}
@@ -10303,6 +10383,7 @@ class PentestShell:
         self.lsa_reaper_python = get_external_tool_python("LSA-Reaper")
         self.pkinittools_python = get_external_tool_python("PKINITtools")
         self.responder_python = get_external_tool_python("responder")
+        self.coercer_python = get_external_tool_python("coercer")
 
         # Add more tool paths here as needed, for example:
         # self.dploot_path = get_tool_executable_path("dploot")
@@ -10715,13 +10796,34 @@ class PentestShell:
             auto_save_thread.start()
             self.background_tasks.append(auto_save_thread)  # Ensure thread is tracked
             self._auto_save_thread_started = True
-        if os.path.exists(self.report_file):
+        if os.path.exists(self.technical_report_file):
             try:
-                with open(self.report_file, "r", encoding="utf-8") as f:
-                    self.report = json.load(f)
+                with open(self.technical_report_file, "r", encoding="utf-8") as f:
+                    technical_report = json.load(f)
+                build_report_model = load_optional_pro_attr(
+                    "adscan_internal.pro.reporting.report_builder",
+                    "build_report_model",
+                    action="Technical report cache hydration",
+                    debug_printer=print_info_debug,
+                    prefix="[report-cache]",
+                )
+                if not callable(build_report_model):
+                    build_report_model = None
+
+                if build_report_model is not None:
+                    model = build_report_model(technical_report)
+                    self.report = {
+                        entry["name"]: {
+                            "vulnerabilities": entry.get("vulnerabilities", {})
+                        }
+                        for entry in model.get("domains", [])
+                        if isinstance(entry, dict) and entry.get("name")
+                    }
             except Exception as e:
                 telemetry.capture_exception(e)
-                print_error("Error loading {self.report_file}: {e}")
+                print_error(
+                    f"Error loading technical report cache: {self.technical_report_file}"
+                )
         # Only load legacy Neo4j configuration when operating in legacy mode.
         if get_bloodhound_mode() == "legacy":
             legacy_cfg: LegacyNeo4jConfig | None = load_legacy_neo4j_config(
@@ -11218,7 +11320,7 @@ class PentestShell:
                         # Create a new Console instance specifically for this input operation
                         # This helps ensure Rich's input handling is not affected by shared state
                         # or terminal modes potentially set by prompt_toolkit via self.console.
-                        input_console = Console(theme=ADSCAN_THEME)
+                        input_console = _build_rich_console(theme=ADSCAN_THEME)
 
                         # Comparisons reverted to strings to match what queued_prompt sends
                         if prompt_type_for_queue == "choice":
@@ -13148,7 +13250,7 @@ class PentestShell:
         )  # Smart domain + credential completer
 
         # List of commands that expect a domain as their first argument
-        commands_expecting_domain = ["start_auth"]
+        commands_expecting_domain = ["start_auth", "reset_attack_path_statuses"]
         domain_prefixes = [
             "smb",
             "ldap",
@@ -13496,6 +13598,15 @@ class PentestShell:
                         print_exception(show_locals=True, exception=e)
                 else:
                     print_warning(f"Unknown command: {command_name}")
+                    if should_show_workspace_getting_started(self):
+                        print_info(
+                            "This workspace has not started a scan yet. "
+                            "Run `start_unauth` or `start_auth` to begin."
+                        )
+                        print_info(
+                            "Need examples? Type `help` or open "
+                            "https://www.adscanpro.com/docs"
+                        )
                     print_info(
                         "If you want to execute a command, use the 'system' command. "
                         "Example: system ping 127.0.0.1"
@@ -13554,14 +13665,20 @@ class PentestShell:
         self.console.print(Rule(style=f"dim {ADSCAN_PRIMARY}"))
 
         # Links footer — compact, single line
-        raw_gh  = ADSCAN_LINKS["github"]
-        raw_dc  = ADSCAN_LINKS["discord"]
-        raw_li  = ADSCAN_LINKS["linkedin"]
+        raw_docs = ADSCAN_LINKS["docs"]
+        raw_gh = ADSCAN_LINKS["github"]
+        raw_dc = ADSCAN_LINKS["discord"]
+        raw_li = ADSCAN_LINKS["linkedin"]
         self.console.print(
-            f"  [dim][link={raw_gh}]🔗 GitHub[/link]"
+            f"  [dim][link={raw_docs}]📚 Docs[/link]"
+            f"  ·  [link={raw_gh}]🔗 GitHub[/link]"
             f"  ·  [link={raw_dc}]💬 Discord[/link]"
             f"  ·  [link={raw_li}]💼 LinkedIn[/link][/dim]"
             f"  [dim]·  © 2026 Yeray Martín[/dim]"
+        )
+        self.console.print(
+            "  [dim]Quick start in this workspace: "
+            "[bold]start_unauth[/bold] or [bold]start_auth[/bold][/dim]"
         )
         self.console.print()
 
@@ -14230,6 +14347,11 @@ class PentestShell:
             select_cred,
             show_creds,
         )
+        from adscan_internal.cli.attack_path_execution import (
+            clear_writelogonscript_manual_validation,
+            match_writelogonscript_manual_validation,
+            _attempt_writelogonscript_cleanup_if_ready,
+        )
         from adscan_internal.rich_output import print_error, print_instruction
 
         command_parts = args.split()
@@ -14285,7 +14407,39 @@ class PentestShell:
                     ):
                         run_start_auth(self, None)
                 return
-            add_credential(self, domain, user, cred, host, service)
+            pending_manual_validation = None
+            trusted_manual_validation = False
+            if not is_local_target:
+                pending_manual_validation = match_writelogonscript_manual_validation(
+                    self,
+                    domain=domain,
+                    username=user,
+                    credential=cred,
+                )
+                trusted_manual_validation = pending_manual_validation is not None
+            add_credential(
+                self,
+                domain,
+                user,
+                cred,
+                host,
+                service,
+                trusted_manual_validation=trusted_manual_validation,
+            )
+            if trusted_manual_validation and isinstance(pending_manual_validation, dict):
+                _attempt_writelogonscript_cleanup_if_ready(
+                    self,
+                    domain=domain,
+                    summary=pending_manual_validation.get("summary")
+                    if isinstance(pending_manual_validation.get("summary"), dict)
+                    else {"steps": []},
+                )
+                clear_writelogonscript_manual_validation(
+                    self,
+                    domain=domain,
+                    username=user,
+                    credential=cred,
+                )
         else:
             print_error(
                 f"Unknown 'creds' subcommand: '{command}'. Use 'help creds' for available subcommands."
@@ -14573,6 +14727,7 @@ class PentestShell:
         force_authenticated_enumeration: bool = False,
         prompt_when_already_authenticated: bool = False,
         allow_empty_credential: bool = False,
+        trusted_manual_validation: bool = False,
     ):
         """Add a credential (domain or local) delegating to the CLI helper for reuse."""
         from adscan_internal.cli.creds import add_credential
@@ -14596,6 +14751,7 @@ class PentestShell:
             force_authenticated_enumeration=force_authenticated_enumeration,
             prompt_when_already_authenticated=prompt_when_already_authenticated,
             allow_empty_credential=allow_empty_credential,
+            trusted_manual_validation=trusted_manual_validation,
         )
 
     def add_credentials_batch(
@@ -15514,7 +15670,7 @@ class PentestShell:
         )
 
         step_num = 1
-        total_quickwin_steps = 2 + (2 if self.type == "audit" else 0)
+        total_quickwin_steps = 3 + (2 if self.type == "audit" else 0)
 
         if _run_step(
             "Timeroast Candidate Check",
@@ -15552,6 +15708,15 @@ class PentestShell:
                 total_steps=total_quickwin_steps,
             ):
                 return
+            step_num += 1
+
+        if _run_step(
+            "DC NTLM Auth-Type Check",
+            lambda: self.ask_for_dc_ntlm_auth_type_quick_win(domain),
+            step_number=step_num,
+            total_steps=total_quickwin_steps,
+        ):
+            return
 
         if stop_after_phase == 3:
             return
@@ -15743,9 +15908,18 @@ class PentestShell:
             )
 
             # Keep the existing broader CVE scan UX here for audit.
-            _run_step("CVE Vulnerability Scan", lambda: self.ask_for_enum_cve(domain))
+            if _run_step(
+                "CVE Vulnerability Scan",
+                lambda: self.ask_for_enum_cve(domain),
+                step_number=1,
+                total_steps=2,
+            ):
+                return
             _run_step(
-                "Configuration Enumeration", lambda: self.ask_for_enum_configs(domain)
+                "Configuration Enumeration",
+                lambda: self.ask_for_enum_configs(domain),
+                step_number=2,
+                total_steps=2,
             )
 
         # ========== User Privilege Assessment ==========
@@ -16019,6 +16193,20 @@ class PentestShell:
         from adscan_internal.cli.bloodhound import run_bloodhound_passnotreq
 
         run_bloodhound_passnotreq(self, domain)
+
+    def do_bloodhound_stale_enabled_users(self, domain, *, stale_days: int = 180):
+        """Wrapper for stale enabled user hygiene check."""
+        from adscan_internal.cli.bloodhound import run_bloodhound_stale_enabled_users
+
+        run_bloodhound_stale_enabled_users(self, domain, stale_days=stale_days)
+
+    def do_bloodhound_tier0_highvalue_sprawl(self, domain):
+        """Wrapper for Tier-0/high-value identity concentration check."""
+        from adscan_internal.cli.bloodhound import (
+            run_bloodhound_tier0_highvalue_sprawl,
+        )
+
+        run_bloodhound_tier0_highvalue_sprawl(self, domain)
 
     def execute_bloodhound_passnotreq(
         self, command, domain, file, users: list[str] | None = None
@@ -16864,6 +17052,22 @@ class PentestShell:
     def do_stop_responder(self, _arg):
         """Stop the running Responder process."""
         stop_responder(self)
+
+    def do_check_dc_ntlm_auth_type(self, args):
+        """Coerce the current domain PDC and classify NTLMv1 vs NTLMv2.
+
+        Usage:
+            check_dc_ntlm_auth_type <domain> [--timeout=<seconds>] [--trigger-timeout=<seconds>] [--method=<method_name>]
+        """
+        from adscan_internal.cli.ntlm_capture import run_check_dc_ntlm_auth_type
+
+        run_check_dc_ntlm_auth_type(self, args)
+
+    def ask_for_dc_ntlm_auth_type_quick_win(self, target_domain):
+        """Run the Phase 3 DC NTLM auth-type quick win."""
+        from adscan_internal.cli.ntlm_capture import run_ntlm_auth_type_quick_win
+
+        return run_ntlm_auth_type_quick_win(self, target_domain)
 
     def ask_for_asreproast(self, target_domain, *, auto_crack: bool = True):
         """Prompt user to perform AS-REP Roasting attack."""
@@ -18323,6 +18527,24 @@ class PentestShell:
 
         return run_pass_policy(self, domain=domain)
 
+    def do_netexec_smbv1(self, domain):
+        """Audit SMBv1 exposure across the selected SMB target scope."""
+        from adscan_internal.cli.smb import run_smbv1_audit
+
+        return run_smbv1_audit(self, domain=domain)
+
+    def do_netexec_obsolete(self, domain):
+        """Audit obsolete operating systems exposed in LDAP for the domain."""
+        from adscan_internal.cli.ldap import run_netexec_obsolete
+
+        return run_netexec_obsolete(self, domain=domain)
+
+    def do_netexec_ldap_security(self, domain):
+        """Audit LDAP signing and channel binding posture on known Domain Controllers."""
+        from adscan_internal.cli.ldap import run_netexec_ldap_security
+
+        return run_netexec_ldap_security(self, domain=domain)
+
     def cracking(self, type, domain, hash, failed=False):
         from adscan_internal.cli.cracking import run_cracking
 
@@ -19421,6 +19643,18 @@ class PentestShell:
 
         execute_netexec_pass_policy(shell=self, command=command, domain=domain)
 
+    def execute_netexec_smbv1(self, command, domain):
+        """Execute the NetExec SMBv1 audit command."""
+        from adscan_internal.cli.smb import execute_netexec_smbv1
+
+        execute_netexec_smbv1(shell=self, command=command, domain=domain)
+
+    def execute_netexec_obsolete(self, command, domain):
+        """Execute the NetExec LDAP obsolete-module command."""
+        from adscan_internal.cli.ldap import execute_netexec_obsolete
+
+        execute_netexec_obsolete(shell=self, command=command, domain=domain)
+
     def execute_rdp_access(self, command):
         """Execute an RDP access command.
 
@@ -20413,7 +20647,12 @@ class PentestShell:
                                 else None,
                             )
                         except Exception as exc:  # pragma: no cover
-                            telemetry.capture_exception(exc)
+                            if not handle_optional_report_service_exception(
+                                exc,
+                                action="Technical finding sync",
+                                debug_printer=print_info_debug,
+                            ):
+                                telemetry.capture_exception(exc)
                 elif type == "autologin":
                     parsed_autologin = parse_netexec_gpp_autologin_credentials(
                         output_str
@@ -20464,7 +20703,12 @@ class PentestShell:
                                 else None,
                             )
                         except Exception as exc:  # pragma: no cover
-                            telemetry.capture_exception(exc)
+                            if not handle_optional_report_service_exception(
+                                exc,
+                                action="Technical finding sync",
+                                debug_printer=print_info_debug,
+                            ):
+                                telemetry.capture_exception(exc)
 
                 if found_passwords:
                     print_success("Passwords found in SYSVOL (GPP).")
@@ -21228,6 +21472,12 @@ class PentestShell:
 
         return is_user_dc(self, domain, target_host)
 
+    def get_user_dc_role(self, domain, target_host):
+        """Classify a machine account as writable DC, RODC, or not a DC."""
+        from adscan_internal.cli.dns import get_user_dc_role
+
+        return get_user_dc_role(self, domain, target_host)
+
     def do_is_user_dc(self, args):
         """
         Interactive command that verifies if a host is a Domain Controller.
@@ -21294,9 +21544,16 @@ class PentestShell:
                 print_info_debug(
                     f"[admin-count] Detected machine account: {marked_username}"
                 )
-                if self.is_user_dc(domain, username):
+                dc_role = self.get_user_dc_role(domain, username)
+                if dc_role == "writable_dc":
                     print_warning(f"{marked_username} is a Domain Controller")
                     return self.dcsync(domain, username, password)
+                if dc_role == "rodc":
+                    print_warning(
+                        f"{marked_username} is a Read-Only Domain Controller and "
+                        "requires follow-up steps before domain compromise."
+                    )
+                    return False
             else:
                 print_info_debug(
                     f"[admin-count] Not a machine account: {marked_username}"
@@ -21339,10 +21596,18 @@ class PentestShell:
         try:
             # Check if it is a machine account
             if is_machine_account(username):
-                if self.is_user_dc(domain, username):
+                dc_role = self.get_user_dc_role(domain, username)
+                if dc_role == "writable_dc":
                     marked_username = mark_sensitive(username, "user")
                     print_warning(f"{marked_username} is a Domain Controller")
                     return self.dcsync(domain, username, password)
+                if dc_role == "rodc":
+                    marked_username = mark_sensitive(username, "user")
+                    print_warning(
+                        f"{marked_username} is a Read-Only Domain Controller and "
+                        "requires follow-up steps before domain compromise."
+                    )
+                    return False
 
             # If not a machine account, continue with checking adminCount via CLI helper
             from adscan_internal.cli.ldap import run_ldap_admincount_and_signing
@@ -21662,11 +21927,12 @@ class PentestShell:
 
                 if group_sids:
                     from adscan_internal.services.privileged_group_classifier import (
-                        classify_privileged_membership_from_group_sids,
+                        classify_privileged_membership,
                     )
 
-                    privileged_groups = classify_privileged_membership_from_group_sids(
-                        group_sids
+                    privileged_groups = classify_privileged_membership(
+                        group_sids=group_sids,
+                        group_names=group_names,
                     ).as_dict()
                     privileged_groups["groups"] = []
                     print_info_debug(
@@ -21766,22 +22032,94 @@ class PentestShell:
     ):
         """Execute follow-up actions based on privileged group membership."""
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.services.adcs_target_filter import (
+            domain_has_adcs_for_attack_steps,
+        )
+        from adscan_internal.services.privileged_group_classifier import (
+            PrivilegedFollowupOption,
+            resolve_privileged_followup_decision,
+            resolve_privileged_followup_options,
+        )
 
         summary = None
         privileged_groups = {
             "domain_admin": bool(membership.get("domain_admin")),
             "backup_operators": bool(membership.get("backup_operators")),
             "Administrators": bool(membership.get("Administrators")),
+            "cert_publishers": bool(membership.get("cert_publishers")),
+            "key_admins": bool(membership.get("key_admins")),
+            "enterprise_key_admins": bool(membership.get("enterprise_key_admins")),
+            "exchange_trusted_subsystem": bool(
+                membership.get("exchange_trusted_subsystem")
+            ),
+            "exchange_windows_permissions": bool(
+                membership.get("exchange_windows_permissions")
+            ),
             "account_operators": bool(membership.get("account_operators")),
         }
+        has_adcs = domain_has_adcs_for_attack_steps(self, domain)
+        followup_decision = resolve_privileged_followup_decision(
+            privileged_groups,
+            adcs_available=has_adcs,
+        )
+        followup_options = resolve_privileged_followup_options(
+            privileged_groups,
+            adcs_available=has_adcs,
+        )
         marked_username = mark_sensitive(username, "user")
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(
             "[priv-groups] executing follow-up actions for "
-            f"{marked_username}@{marked_domain}: source={source} flags={privileged_groups}"
+            f"{marked_username}@{marked_domain}: source={source} flags={privileged_groups} "
+            f"primary={followup_decision.primary_key} rank={followup_decision.highest_rank} "
+            f"adcs_available={has_adcs}"
         )
 
-        if privileged_groups["domain_admin"]:
+        def _select_followup_option(
+            options: tuple[PrivilegedFollowupOption, ...],
+        ) -> PrivilegedFollowupOption | None:
+            actionable = [option for option in options if option.actionable]
+            if not actionable:
+                return None
+            if len(actionable) == 1 or _should_disable_interactive_prompts(self):
+                return actionable[0]
+
+            selector = getattr(self, "_questionary_select", None)
+            if not callable(selector):
+                return actionable[0]
+
+            labels = [
+                (
+                    f"{option.label} (Recommended)"
+                    if index == 0
+                    else option.label
+                )
+                for index, option in enumerate(actionable)
+            ]
+            choice_idx = selector(
+                (
+                    f"Multiple privileged follow-ups are available for "
+                    f"{marked_username}@{marked_domain}. Which one do you want to run?"
+                ),
+                labels,
+                default_idx=0,
+            )
+            if not isinstance(choice_idx, int) or not (0 <= choice_idx < len(actionable)):
+                return actionable[0]
+            return actionable[choice_idx]
+
+        selected_followup = _select_followup_option(followup_options)
+        selected_key = selected_followup.key if selected_followup else None
+        print_info_debug(
+            "[priv-groups] follow-up selection: "
+            f"matched={tuple(option.key for option in followup_options)} "
+            f"selected={selected_key!r}"
+        )
+
+        if selected_followup is None:
+            return privileged_groups
+
+        if selected_key == "domain_admin":
             print_warning(
                 f"The user {marked_username} is a member of the Domain Admins group"
             )
@@ -21800,24 +22138,26 @@ class PentestShell:
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
                 print_info_debug(f"[backup-ops] cleanup helper failed: {exc}")
-            try:
-                from adscan_internal.services.report_service import (
-                    record_technical_event,
-                )
-
-                record_technical_event(
-                    self,
-                    domain,
-                    event_type="domain_compromise",
-                    message="Domain Admin compromise via privileged group membership",
-                    details={
-                        "username": username,
-                        "domain": domain,
-                        "source": source,
-                    },
-                )
-            except Exception as _e:  # pragma: no cover
-                telemetry.capture_exception(_e)
+            record_technical_event = load_optional_report_service_attr(
+                "record_technical_event",
+                action="Technical event sync",
+                debug_printer=print_info_debug,
+            )
+            if callable(record_technical_event):
+                try:
+                    record_technical_event(
+                        self,
+                        domain,
+                        event_type="domain_compromise",
+                        message="Domain Admin compromise via privileged group membership",
+                        details={
+                            "username": username,
+                            "domain": domain,
+                            "source": source,
+                        },
+                    )
+                except Exception as _e:  # pragma: no cover
+                    telemetry.capture_exception(_e)
             try:
                 duration_seconds: float | None = None
                 duration_minutes: float | None = None
@@ -21927,7 +22267,7 @@ class PentestShell:
             self.ask_for_raise_child(domain, username, password)
             return privileged_groups
 
-        if privileged_groups["Administrators"]:
+        if selected_key == "Administrators":
             print_warning(
                 f"The user {marked_username} is a member of the Administrators group"
             )
@@ -21935,7 +22275,7 @@ class PentestShell:
                 self.ask_for_flags(domain, username, password)
             self.ask_for_dcsync(domain, username, password)
 
-        if privileged_groups["backup_operators"]:
+        if selected_key == "backup_operators":
             print_warning(
                 f"The user {marked_username} is a member of the Backup Operators group"
             )
@@ -21960,6 +22300,63 @@ class PentestShell:
                 telemetry.capture_exception(exc)
                 print_info_debug(f"[backup-ops] escalation helper failed: {exc}")
 
+        if selected_key == "account_operators":
+            print_warning(
+                f"The user {marked_username} is a member of the Account Operators group"
+            )
+            try:
+                from adscan_internal.cli.account_operators_escalation import (
+                    offer_account_operators_escalation,
+                )
+
+                offer_account_operators_escalation(
+                    self,
+                    domain=domain,
+                    username=username,
+                    password=password,
+                )
+            except Exception as exc:  # pragma: no cover - best effort
+                telemetry.capture_exception(exc)
+                print_info_debug(f"[acct-ops] escalation helper failed: {exc}")
+
+        if selected_key == "exchange_windows_permissions":
+            print_warning(
+                f"The user {marked_username} is a member of the Exchange Windows Permissions group"
+            )
+            try:
+                from adscan_internal.cli.account_operators_escalation import (
+                    offer_exchange_windows_permissions_escalation,
+                )
+
+                offer_exchange_windows_permissions_escalation(
+                    self,
+                    domain=domain,
+                    username=username,
+                    password=password,
+                )
+            except Exception as exc:  # pragma: no cover - best effort
+                telemetry.capture_exception(exc)
+                print_info_debug(f"[exchange-windows-permissions] escalation helper failed: {exc}")
+
+        if selected_key == "exchange_trusted_subsystem":
+            print_warning(
+                f"The user {marked_username} is a member of the Exchange Trusted Subsystem group"
+            )
+            try:
+                from adscan_internal.cli.account_operators_escalation import (
+                    offer_exchange_trusted_subsystem_escalation,
+                )
+
+                offer_exchange_trusted_subsystem_escalation(
+                    self,
+                    domain=domain,
+                    username=username,
+                    password=password,
+                )
+            except Exception as exc:  # pragma: no cover - best effort
+                telemetry.capture_exception(exc)
+                print_info_debug(f"[exchange-trusted-subsystem] escalation helper failed: {exc}")
+
         return privileged_groups
 
     def _check_privileged_groups_with_bloodhound(self, domain, username):
@@ -21971,10 +22368,11 @@ class PentestShell:
             )
             # Prefer SID/RID based classification when possible (language-agnostic).
             from adscan_internal.services.privileged_group_classifier import (
-                classify_privileged_membership_from_group_sids,
+                classify_privileged_membership,
             )
 
             group_sids: list[str] = []
+            group_distinguished_names: list[str] = []
             resolver_fn = getattr(service, "get_group_node_by_samaccountname", None)
             if callable(resolver_fn):
                 from typing import Callable, cast
@@ -21997,9 +22395,28 @@ class PentestShell:
                         )
                         if isinstance(sid, str) and sid.strip():
                             group_sids.append(sid.strip())
+                        distinguished_name = (
+                            node.get("distinguishedname")
+                            or node.get("distinguishedName")
+                            or (node.get("properties") or {}).get("distinguishedname")
+                            or (node.get("properties") or {}).get("distinguishedName")
+                        )
+                        if (
+                            isinstance(distinguished_name, str)
+                            and distinguished_name.strip()
+                        ):
+                            group_distinguished_names.append(
+                                distinguished_name.strip()
+                            )
+                        else:
+                            group_distinguished_names.append("")
 
             if group_sids:
-                membership = classify_privileged_membership_from_group_sids(group_sids)
+                membership = classify_privileged_membership(
+                    group_sids=group_sids,
+                    group_names=groups,
+                    group_distinguished_names=group_distinguished_names,
+                )
                 result = membership.as_dict()
                 result["groups"] = []
                 return result
@@ -22026,7 +22443,7 @@ class PentestShell:
                 run_ldap_groupmembership_privileged,
             )
             from adscan_internal.services.privileged_group_classifier import (
-                classify_privileged_membership_from_group_sids,
+                classify_privileged_membership,
             )
 
             clear_exact_ldap_connection_timeout_state(self)
@@ -22038,7 +22455,9 @@ class PentestShell:
                 auth_password=password,
             )
             if group_sids is not None:
-                membership = classify_privileged_membership_from_group_sids(group_sids)
+                membership = classify_privileged_membership(
+                    group_sids=group_sids,
+                )
                 result = membership.as_dict()
                 # Keep the legacy shape for any downstream consumers.
                 result["groups"] = []
@@ -22152,6 +22571,12 @@ class PentestShell:
             "domain_admin": bool((privileged_groups or {}).get("domain_admin")),
             "Administrators": bool((privileged_groups or {}).get("Administrators")),
             "backup_operators": bool((privileged_groups or {}).get("backup_operators")),
+            "exchange_trusted_subsystem": bool(
+                (privileged_groups or {}).get("exchange_trusted_subsystem")
+            ),
+            "exchange_windows_permissions": bool(
+                (privileged_groups or {}).get("exchange_windows_permissions")
+            ),
             "account_operators": bool(
                 (privileged_groups or {}).get("account_operators")
             ),
@@ -22223,11 +22648,21 @@ class PentestShell:
             any("account operators" in g["group"] for g in groups)
             or "account operators" in lowered_text
         )
+        exchange_windows_permissions = (
+            any("exchange windows permissions" in g["group"] for g in groups)
+            or "exchange windows permissions" in lowered_text
+        )
+        exchange_trusted_subsystem = (
+            any("exchange trusted subsystem" in g["group"] for g in groups)
+            or "exchange trusted subsystem" in lowered_text
+        )
 
         return {
             "domain_admin": domain_admin,
             "Administrators": administrators,
             "backup_operators": backup_operators,
+            "exchange_trusted_subsystem": exchange_trusted_subsystem,
+            "exchange_windows_permissions": exchange_windows_permissions,
             "account_operators": account_operators,
             "groups": groups,
         }
@@ -22316,7 +22751,13 @@ class PentestShell:
         from adscan_internal.cli.attack_path_execution import (
             offer_attack_paths_with_non_high_value_fallback,
         )
+        from adscan_internal.services.adcs_target_filter import (
+            domain_has_adcs_for_attack_steps,
+        )
         from adscan_internal.services.attack_graph_service import ATTACK_PATHS_MAX_DEPTH_USER
+        from adscan_internal.services.privileged_group_classifier import (
+            resolve_privileged_followup_decision,
+        )
 
         if self.domains_data[domain]["auth"] == "pwned" and self.type == "ctf":
             return
@@ -22356,22 +22797,15 @@ class PentestShell:
                 privileged_groups = self.check_privileged_groups(
                     domain, username, password
                 )
-
-                # If the user is already privileged (e.g. Domain Admins, Backup Operators,
-                # Administrators), don't show "attack paths" from them:
-                # the fastest path is to use the privilege directly (DCSync, etc.).
-                #
-                # This avoids noisy/irrelevant paths such as `MemberOf -> Kerberoasting -> ...`.
-                is_privileged_member = any(
-                    bool(privileged_groups.get(key))
-                    for key in (
-                        "domain_admin",
-                        "backup_operators",
-                        "Administrators",
-                    )
+                has_adcs = domain_has_adcs_for_attack_steps(self, domain)
+                followup_decision = resolve_privileged_followup_decision(
+                    privileged_groups,
+                    adcs_available=has_adcs,
                 )
-                if not is_privileged_member:
-                    _offer_attack_paths()
+
+                # If the user is already privileged, direct follow-up beats
+                # showing noisy attack paths from that same user.
+                if followup_decision.skip_attack_path_search:
                     if self.domains_data.get(domain, {}).get("auth") == "pwned":
                         print_info_verbose(
                             f"Skipping user privilege enumeration for {marked_username}: domain is already pwned."
@@ -22379,7 +22813,8 @@ class PentestShell:
                         return
 
                     print_info_verbose(
-                        f"Skipping attack path search for {marked_username}: user is already privileged."
+                        f"Skipping attack path search for {marked_username}: "
+                        f"user is already privileged via {followup_decision.primary_key}."
                     )
 
                     if auto_mode:
@@ -22402,6 +22837,8 @@ class PentestShell:
                             print_info_verbose(
                                 f"Post-auth service enumeration for user {marked_username} has been cancelled."
                             )
+                else:
+                    _offer_attack_paths()
             else:
                 live_membership = self.check_privileged_groups(
                     domain,
@@ -22410,15 +22847,12 @@ class PentestShell:
                     execute_actions=False,
                     prefer_live_ldap=True,
                 )
-                is_live_privileged_member = any(
-                    bool((live_membership or {}).get(key))
-                    for key in (
-                        "domain_admin",
-                        "backup_operators",
-                        "Administrators",
-                    )
+                has_adcs = domain_has_adcs_for_attack_steps(self, domain)
+                live_followup_decision = resolve_privileged_followup_decision(
+                    live_membership or {},
+                    adcs_available=has_adcs,
                 )
-                if is_live_privileged_member:
+                if live_followup_decision.skip_attack_path_search:
                     print_info_debug(
                         "[user-privs] Live LDAP membership indicates privileged access "
                         f"for {marked_username}@{marked_domain} despite adminCount/cache check."
@@ -22431,6 +22865,18 @@ class PentestShell:
                         "ldap-live-admincount-bypass",
                     )
                     return
+                if live_followup_decision.should_run_enrichment_followup:
+                    print_info_debug(
+                        "[user-privs] Running non-blocking privileged enrichment "
+                        f"for {marked_username}@{marked_domain}."
+                    )
+                    self._handle_privileged_group_membership(
+                        domain,
+                        username,
+                        password,
+                        live_membership,
+                        "ldap-live-enrichment",
+                    )
 
                 # If the user does not have adminCount=1, ask if privilege enumeration should be executed
                 _offer_attack_paths()
@@ -23041,6 +23487,11 @@ class PentestShell:
 
     def _filter_aces_by_adcs_requirement(self, aces):
         """Filters ACEs requiring ADCS and returns tuples of (filtered, skipped)."""
+        from adscan_internal.services.adcs_target_filter import (
+            domain_has_adcs_for_attack_steps,
+            target_requires_adcs,
+        )
+
         filtered_aces = []
         skipped_aces = []
         for ace in aces:
@@ -23060,17 +23511,21 @@ class PentestShell:
                 continue
 
             target_type = ace.get("tipodestino", "").lower()
-            target_name = ace.get("destino", "").lower()
-            if target_type == "group" and target_name in (
-                "key admins",
-                "enterprise key admins",
+            target_name = str(ace.get("destino") or "").strip()
+            target_domain = str(ace.get("dominio_destino") or "").strip()
+            if target_type == "group" and target_requires_adcs(
+                {
+                    "name": (
+                        f"{target_name}@{target_domain.upper()}"
+                        if target_name and target_domain
+                        else target_name
+                    ),
+                    "target_object_id": ace.get("target_object_id"),
+                    "targetObjectId": ace.get("target_object_id"),
+                },
+                target_domain,
             ):
-                target_domain = ace.get("dominio_destino")
-                has_adcs = False
-                if target_domain:
-                    has_adcs = self._detect_adcs(
-                        target_domain, silent=True, emit_telemetry=False
-                    )
+                has_adcs = domain_has_adcs_for_attack_steps(self, target_domain)
                 if not has_adcs:
                     marked_target_domain = mark_sensitive(target_domain, "domain")
                     print_info_verbose(
@@ -24577,6 +25032,20 @@ class PentestShell:
             relation_filter=relation_filter,
         )
 
+    def do_reset_attack_path_statuses(self, args):
+        """Reset persisted attack-path statuses for local testing.
+
+        Usage:
+            reset_attack_path_statuses [domain]
+
+        This clears persisted runtime attack-path outcomes for the selected
+        domain and returns them to the default baseline used by a fresh run.
+        When the domain is omitted, ADscan uses the current shell domain.
+        """
+        from adscan_internal.cli.attack_path_reset import run_reset_attack_path_statuses
+
+        run_reset_attack_path_statuses(self, args)
+
     def do_validate_attack_graph(self, args):
         """Validate attack graph exploitation edges against technical findings.
 
@@ -24775,6 +25244,8 @@ class PentestShell:
                     return "rusthound-ce"
                 if "bloodhound-ce-python" in value:
                     return "bloodhound-ce-python"
+                if "certihound" in value:
+                    return "certihound"
                 return None
 
             def _pick_zip_source_for_success(
@@ -25811,8 +26282,23 @@ class PentestShell:
             print_info("Report initialization is available with ADscan Report License.")
             print_info("Learn more: https://www.adscanpro.com/reports")
 
+    @staticmethod
+    def _is_optional_report_service_import_error(exc: Exception) -> bool:
+        """Return whether ``exc`` is the expected LITE build reporting import failure."""
+        return is_optional_report_service_import_error(exc)
+
+    def _handle_optional_report_service_exception(
+        self, exc: Exception, *, action: str
+    ) -> bool:
+        """Suppress expected report-service import failures in LITE builds."""
+        return handle_optional_report_service_exception(
+            exc,
+            action=action,
+            debug_printer=print_info_debug,
+        )
+
     def update_report_for_domain(self, domain):
-        """Initialize or update the vulnerability report for a specific domain.
+        """Ensure a domain exists in the technical report and local cache.
 
         This is a wrapper around the report service function to maintain
         backward compatibility with existing code.
@@ -25828,7 +26314,6 @@ class PentestShell:
             update_report_for_domain_helper(self, domain)
             return
         except ImportError:
-            # LITE fallback: keep legacy report.json writable without report service.
             if not isinstance(getattr(self, "report", None), dict):
                 self.report = {}
             domain_entry = self.report.setdefault(domain, {})
@@ -25849,41 +26334,27 @@ class PentestShell:
         # Ensure the domain exists in the report, initializing it with the template if needed
         self.update_report_for_domain(domain)
 
-        # Update the requested field
+        # Update the requested field in the in-memory cache
         self.report[domain]["vulnerabilities"][key] = value
-
-        # Save the updated report to the file
-        try:
-            with open(self.report_file, "w", encoding="utf-8") as f:
-                json.dump(self.report, f, indent=4)
-            # print_success(f"Field '{key}' updated for domain {domain}: {value}")
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error saving the report.")
-            print_exception(show_locals=False, exception=e)
 
         try:
             from adscan_internal.services.report_service import (
-                sync_technical_finding_from_legacy,
+                record_technical_finding,
             )
 
-            sync_technical_finding_from_legacy(self, domain, key, value)
-        except ImportError as exc:
-            # Expected in LITE/public builds where PRO reporting modules are absent.
-            print_info_debug(
-                "[report] Technical report sync unavailable in this build; "
-                f"skipping legacy sync ({type(exc).__name__})."
-            )
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_info_debug(
-                "[report] Failed to sync technical report update from legacy report "
-                f"field '{key}' ({type(exc).__name__}: {exc})"
-            )
+            record_technical_finding(self, domain, key=key, value=value)
+        except Exception as e:
+            if self._handle_optional_report_service_exception(
+                e, action="Technical report sync"
+            ):
+                return
+            telemetry.capture_exception(e)
+            print_error("Error updating the technical report.")
+            print_exception(show_locals=False, exception=e)
 
     def add_report(self, domain, vuln_info):
         """
-        Adds or updates the report entry for a specific domain.
+        Adds or updates one technical finding for a specific domain.
 
         Args:
             domain (str): Domain name.
@@ -25897,27 +26368,41 @@ class PentestShell:
         """
         from adscan_internal.rich_output import mark_sensitive
 
-        # If the domain does not yet exist in the report, create the initial entry
-        if domain not in self.report:
-            self.report[domain] = {"vulnerabilities": []}
+        self.update_report_for_domain(domain)
 
-        # Add the new vulnerability to the list
-        self.report[domain]["vulnerabilities"].append(vuln_info)
-
-        # Immediately save the report to the file
         try:
-            with open(self.report_file, "w", encoding="utf-8") as f:
-                json.dump(self.report, f, indent=4)
+            from adscan_internal.services.report_service import (
+                record_technical_finding,
+            )
+
+            key = str(vuln_info.get("tipo") or vuln_info.get("key") or "").strip()
+            value = vuln_info.get("resultado")
+            details = (
+                vuln_info if isinstance(vuln_info, dict) else {"value": str(vuln_info)}
+            )
+            if key:
+                self.report[domain]["vulnerabilities"][key] = value
+                record_technical_finding(
+                    self,
+                    domain,
+                    key=key,
+                    value=value,
+                    details=details,
+                )
             marked_domain = mark_sensitive(domain, "domain")
-            print_success(f"Report updated for domain {marked_domain}.")
+            print_success(f"Technical report updated for domain {marked_domain}.")
         except Exception as e:
+            if self._handle_optional_report_service_exception(
+                e, action="Technical report sync"
+            ):
+                return
             telemetry.capture_exception(e)
-            print_error("Error saving the report.")
+            print_error("Error updating the technical report.")
             print_exception(show_locals=False, exception=e)
 
     def do_generate_report(self, args):
         """
-        Generates a Word or PDF report from the JSON report file (self.report_file) using report_generator module.
+        Generates a Word or PDF report from the technical report JSON using report_generator module.
 
         The report uses the template.docx file if available (bundled with PyInstaller or in project root).
         The report includes detailed vulnerability information with CWE, CVSS, descriptions, remediation, etc.
@@ -25967,7 +26452,7 @@ class PentestShell:
         # Check if report_file is set
         if not self.report_file:
             print_error(
-                "No report file specified. Run a scan first to generate report.json"
+                "No report file specified. Run a scan first to generate technical_report.json"
             )
             return None
 
@@ -26018,7 +26503,7 @@ class PentestShell:
         # Delegate to CLI helper
         return run_generate_report(
             self,
-            self.report_file,
+            self.technical_report_file,
             format_arg,
             profile_arg,
             frameworks=frameworks_arg,
@@ -27731,10 +28216,14 @@ class PentestShell:
     def do_clear_all(self, arg):
         """
         Clears the current workspace by deleting all files and folders,
-        except for the files 'variables.json' and 'report.json'.
+        except for the files 'variables.json' and 'technical_report.json'.
         Resets the authentication values for each domain and clears the domains list.
         """
-        protected_files = ["variables.json", "report.json", ".adscan_history"]
+        protected_files = [
+            "variables.json",
+            "technical_report.json",
+            ".adscan_history",
+        ]
 
         # Obtain a list of all files and folders in the current directory
         current_dir = os.getcwd()
@@ -28009,7 +28498,12 @@ class PentestShell:
                 "netexec_cve_all",
                 "netexec_cve_dcs",
             ],
-            "Responder": ["responder", "clear_responder_db", "stop_responder"],
+            "Responder": [
+                "responder",
+                "clear_responder_db",
+                "stop_responder",
+                "check_dc_ntlm_auth_type",
+            ],
             "Flags": ["get_flags"],
             "MSSQL": [
                 "mssql_steal_ntlmv2",
@@ -28058,6 +28552,11 @@ class PentestShell:
             "Help": ["help"],
             "ACL": ["enumerate_user_aces", "enum_cross_domain_acl"],
             "Reporting": ["initialize_report"],
+            "Attack Paths": [
+                "attack_paths",
+                "attack_steps",
+                "reset_attack_path_statuses",
+            ],
             "WinRM": [
                 "check_firefox_credentials",
                 "show_powershell_history",
@@ -28085,7 +28584,7 @@ class PentestShell:
             "ADCS": "Operations and privileges over ADCS.",
             "Delegations": "Delegation management and exploitation.",
             "CVE": "Search and exploitation of vulnerabilities (CVE).",
-            "Responder": "Usage and management of Responder.",
+            "Responder": "Responder usage plus NTLM capture/coercion probes.",
             "Flags": "Retrieval of domain flags.",
             "MSSQL": "Exploitation and management of MSSQL.",
             "Credential Harvesting": "Dumping credentials and sensitive data.",
@@ -28099,6 +28598,7 @@ class PentestShell:
             "Help": "Tool help and documentation.",
             "ACL": "ACL enumeration",
             "Reporting": "Report generation",
+            "Attack Paths": "Attack-path exploration and local status reset helpers.",
             "WinRM": "Enumeration and exploitation with WinRM",
             "Other Enum": "Other types of enumeration",
         }
@@ -29148,7 +29648,8 @@ if __name__ == "__main__":
     # Set global verbose mode (VERBOSE_MODE) if --verbose is passed with start/install/auto command
     if (
         hasattr(args, "command")
-        and args.command in ("start", "ci", "install", "check")
+        and args.command
+        in ("start", "ci", "install", "check")
         and hasattr(args, "verbose")
         and args.verbose
     ):
@@ -29163,7 +29664,8 @@ if __name__ == "__main__":
     # Debug mode (public in OSS launcher/runtime; does not enable SECRET_MODE).
     if (
         hasattr(args, "command")
-        and args.command in ("start", "ci", "install", "check")
+        and args.command
+        in ("start", "ci", "install", "check")
         and hasattr(args, "debug")
         and args.debug
     ):

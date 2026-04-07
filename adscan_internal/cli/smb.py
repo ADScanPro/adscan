@@ -47,6 +47,7 @@ from adscan_internal import (
     print_warning_debug,
     telemetry,
 )
+from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.integrations.netexec.parsers import (
     parse_smb_share_map,
     parse_smb_usernames,
@@ -54,6 +55,7 @@ from adscan_internal.integrations.netexec.parsers import (
     summarize_share_map,
 )
 from adscan_internal.text_utils import strip_ansi_codes
+from adscan_internal.spraying import parse_netexec_lockout_threshold_result
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.cli.target_scope_warning import (
     confirm_large_target_scope,
@@ -152,6 +154,7 @@ from adscan_internal.workspaces.subpaths import domain_path, domain_relpath
 _SMB_HOST_IDENTITY_RE = re.compile(
     r"^\s*SMB\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+(?P<hostname>\S+)\s+"
 )
+_SMB_BANNER_FIELD_RE = re.compile(r"\(([^:()]+):([^)]+)\)")
 _SMB_GUEST_SESSION_RE = re.compile(
     r"^\s*SMB\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+(?P<hostname>\S+)\s+"
     r"\[\+\].*\(\s*Guest\s*\)",
@@ -167,6 +170,154 @@ _VALID_SMB_MAPPING_MODES = {
     _SMB_MAPPING_MODE_REUSE,
 }
 _SMB_RCLONE_MAPPING_CACHE_MAX_AGE_AUDIT = timedelta(hours=4)
+
+
+def parse_netexec_smbv1_output(output: str) -> dict[str, object]:
+    """Parse NetExec SMB banner lines to identify hosts with SMBv1 enabled."""
+    normalized = strip_ansi_codes(output or "").strip()
+    if not normalized:
+        return {}
+
+    entries: list[dict[str, str]] = []
+    all_hosts: list[str] = []
+    smbv1_hosts: list[str] = []
+    seen_all: set[str] = set()
+    seen_smbv1: set[str] = set()
+
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line or "(smbv1:" not in line.lower():
+            continue
+
+        match = _SMB_HOST_IDENTITY_RE.match(line)
+        if not match:
+            continue
+
+        ip = match.group("ip")
+        hostname = match.group("hostname")
+        field_map: dict[str, str] = {}
+        for field_match in _SMB_BANNER_FIELD_RE.finditer(line):
+            key = str(field_match.group(1) or "").strip().lower()
+            value = str(field_match.group(2) or "").strip()
+            if key:
+                field_map[key] = value
+
+        smbv1_value = field_map.get("smbv1")
+        signing_value = field_map.get("signing")
+        null_auth_value = field_map.get("null auth")
+        host_label = hostname or ip
+
+        entry = {
+            "host": host_label,
+            "ip": ip,
+            "hostname": hostname,
+            "smbv1": str(smbv1_value or ""),
+            "signing": str(signing_value or ""),
+            "null_auth": str(null_auth_value or ""),
+            "raw_line": line,
+        }
+        entries.append(entry)
+
+        host_key = host_label.lower()
+        if host_key not in seen_all:
+            seen_all.add(host_key)
+            all_hosts.append(host_label)
+
+        if str(smbv1_value or "").strip().lower() == "true" and host_key not in seen_smbv1:
+            seen_smbv1.add(host_key)
+            smbv1_hosts.append(host_label)
+
+    return {
+        "raw_output": normalized,
+        "count": len(smbv1_hosts),
+        "all_hosts": all_hosts,
+        "hosts": smbv1_hosts,
+        "entries": entries,
+    }
+
+
+def _render_smbv1_summary(domain: str, summary: dict[str, object]) -> None:
+    """Render a premium SMBv1 exposure summary."""
+    all_hosts = summary.get("all_computers") if isinstance(summary.get("all_computers"), list) else []
+    dc_hosts = summary.get("dcs") if isinstance(summary.get("dcs"), list) else []
+    non_dc_hosts = summary.get("non_dcs") if isinstance(summary.get("non_dcs"), list) else []
+
+    assessment = "No SMBv1 exposure detected"
+    if dc_hosts:
+        assessment = "Critical: SMBv1 enabled on Domain Controllers"
+    elif non_dc_hosts:
+        assessment = "Risky: SMBv1 enabled on domain hosts"
+
+    print_panel(
+        (
+            f"Domain: {mark_sensitive(domain, 'domain')}\n"
+            f"Hosts evaluated: {len(all_hosts)}\n"
+            f"Hosts with SMBv1 enabled: {len(dc_hosts) + len(non_dc_hosts)}\n"
+            f"Domain Controllers with SMBv1: {len(dc_hosts)}\n"
+            f"Non-DC hosts with SMBv1: {len(non_dc_hosts)}\n"
+            f"Assessment: {assessment}"
+        ),
+        title="SMBv1 Exposure Posture",
+    )
+
+    if not (dc_hosts or non_dc_hosts):
+        return
+
+    table = Table(show_header=True, header_style=f"bold {BRAND_COLORS['info']}")
+    table.add_column("Segment")
+    table.add_column("Count", justify="right")
+    table.add_column("Sample")
+    table.add_row(
+        "Domain Controllers",
+        str(len(dc_hosts)),
+        ", ".join(mark_sensitive(host, "host") for host in dc_hosts[:5]) or "None",
+    )
+    table.add_row(
+        "Non-DC Hosts",
+        str(len(non_dc_hosts)),
+        ", ".join(mark_sensitive(host, "host") for host in non_dc_hosts[:5]) or "None",
+    )
+    print_panel_with_table(
+        table,
+        title="Hosts with SMBv1 Enabled",
+        border_style=BRAND_COLORS["warning"] if dc_hosts or non_dc_hosts else BRAND_COLORS["info"],
+    )
+
+
+def _record_smbv1_finding(shell: Any, *, domain: str, parsed: dict[str, object]) -> None:
+    """Persist SMBv1 exposure evidence into the technical report."""
+    if not parsed:
+        return
+
+    try:
+        from adscan_internal.services.report_service import record_technical_finding
+
+        artifact_path = domain_relpath(shell.domains_dir, domain, "smb", "smbv1.log")
+        record_technical_finding(
+            shell,
+            domain,
+            key="smbv1_enabled",
+            value=bool(parsed.get("hosts")),
+            details=parsed,
+            evidence=[
+                {
+                    "type": "artifact",
+                    "summary": "NetExec SMB banner output with SMBv1 posture",
+                    "artifact_path": artifact_path,
+                }
+            ],
+        )
+    except Exception as exc:  # pragma: no cover
+        if not handle_optional_report_service_exception(
+            exc,
+            action="Technical finding sync",
+            debug_printer=print_warning_debug,
+            prefix="[smbv1]",
+        ):
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"[smbv1] Failed to persist technical finding: {type(exc).__name__}: {exc}"
+            )
 
 
 def _is_globally_excluded_mapping_share(share_name: str) -> bool:
@@ -717,7 +868,13 @@ def execute_netexec_shares(
                         else None,
                     )
                 except Exception as exc:  # pragma: no cover
-                    telemetry.capture_exception(exc)
+                    if not handle_optional_report_service_exception(
+                        exc,
+                        action="Technical finding sync",
+                        debug_printer=print_info_debug,
+                        prefix="[smb-guest]",
+                    ):
+                        telemetry.capture_exception(exc)
 
             if read_shares:
                 shell.ask_for_smb_shares_read(
@@ -2018,6 +2175,11 @@ def execute_netexec_pass_policy(shell: Any, *, command: str, domain: str) -> Non
             if completed_process.stdout:
                 clean_stdout = strip_ansi_codes(completed_process.stdout)
                 shell.console.print(clean_stdout.strip())
+                _record_password_policy_finding(
+                    shell,
+                    domain=domain,
+                    command_output=clean_stdout,
+                )
             else:
                 print_error(
                     "Command executed successfully, but no output to display for password policy."
@@ -2037,6 +2199,134 @@ def execute_netexec_pass_policy(shell: Any, *, command: str, domain: str) -> Non
         telemetry.capture_exception(e)
         print_error("Error executing netexec for password policy.")
         print_exception(show_locals=False, exception=e)
+
+
+_PASS_POLICY_INTEGER_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "minimum_password_length": (
+        re.compile(r"(?i)\bminimum\s+password\s+length\s*:\s*(\d+)\b"),
+    ),
+    "password_history_length": (
+        re.compile(r"(?i)\bpassword\s+history\s+length\s*:\s*(\d+)\b"),
+    ),
+    "maximum_password_age_days": (
+        re.compile(r"(?i)\bmaximum\s+password\s+age\s*:\s*(\d+)\b"),
+    ),
+    "minimum_password_age_days": (
+        re.compile(r"(?i)\bminimum\s+password\s+age\s*:\s*(\d+)\b"),
+    ),
+}
+
+_PASS_POLICY_MINUTES_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "reset_account_lockout_counter_minutes": (
+        re.compile(r"(?i)\breset\s+account\s+lockout\s+counter\s*:\s*(\d+)\s+minutes?\b"),
+    ),
+    "locked_account_duration_minutes": (
+        re.compile(r"(?i)\blocked\s+account\s+duration\s*:\s*(\d+)\s+minutes?\b"),
+    ),
+}
+
+
+def parse_netexec_password_policy(output: str) -> dict[str, Any]:
+    """Parse a best-effort structured password policy from NetExec output."""
+    normalized = strip_ansi_codes(output or "").strip()
+    if not normalized:
+        return {}
+
+    parsed: dict[str, Any] = {"raw_output": normalized}
+
+    for field_name, patterns in _PASS_POLICY_INTEGER_PATTERNS.items():
+        for pattern in patterns:
+            match = pattern.search(normalized)
+            if match:
+                try:
+                    parsed[field_name] = int(match.group(1))
+                except ValueError:
+                    pass
+                break
+
+    for field_name, patterns in _PASS_POLICY_MINUTES_PATTERNS.items():
+        for pattern in patterns:
+            match = pattern.search(normalized)
+            if match:
+                try:
+                    parsed[field_name] = int(match.group(1))
+                except ValueError:
+                    pass
+                break
+
+    complexity_match = re.search(
+        r"(?i)\bcomplexity\s*:\s*(enabled|disabled)\b",
+        normalized,
+    )
+    if complexity_match:
+        parsed["complexity_enabled"] = complexity_match.group(1).lower() == "enabled"
+
+    lockout_result = parse_netexec_lockout_threshold_result(normalized)
+    if lockout_result.threshold is not None:
+        parsed["account_lockout_threshold"] = lockout_result.threshold
+        parsed["lockout_threshold_known"] = True
+        parsed["lockout_enforced"] = lockout_result.threshold > 0
+    elif lockout_result.explicit_none:
+        parsed["account_lockout_threshold"] = None
+        parsed["lockout_threshold_known"] = True
+        parsed["lockout_enforced"] = False
+    else:
+        parsed["lockout_threshold_known"] = False
+
+    forced_logoff_match = re.search(
+        r"(?i)\bforced\s+log\s+off\s+time\s*:\s*([^\r\n]+)",
+        normalized,
+    )
+    if forced_logoff_match:
+        parsed["forced_logoff_time"] = forced_logoff_match.group(1).strip()
+
+    return parsed
+
+
+def _record_password_policy_finding(
+    shell: Any,
+    *,
+    domain: str,
+    command_output: str,
+) -> None:
+    """Persist password policy evidence into the technical report."""
+    parsed_policy = parse_netexec_password_policy(command_output)
+    if not parsed_policy:
+        return
+
+    try:
+        from adscan_internal.services.report_service import record_technical_finding
+        from adscan_internal.workspaces.subpaths import domain_path
+
+        workspace_cwd = shell._get_workspace_cwd()
+        ldap_dir = domain_path(workspace_cwd, shell.domains_dir, domain, "ldap")
+        artifact_path = os.path.join(ldap_dir, "pass_policy.log")
+
+        record_technical_finding(
+            shell,
+            domain,
+            key="password_policy",
+            value=True,
+            details=parsed_policy,
+            evidence=[
+                {
+                    "type": "artifact",
+                    "summary": "NetExec password policy output",
+                    "artifact_path": artifact_path,
+                }
+            ],
+        )
+    except Exception as exc:  # pragma: no cover
+        if not handle_optional_report_service_exception(
+            exc,
+            action="Technical finding sync",
+            debug_printer=print_warning_debug,
+            prefix="[pass-pol]",
+        ):
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"[pass-pol] Failed to persist technical finding: {type(exc).__name__}: {exc}"
+            )
 
 
 def run_pass_policy(shell: Any, *, domain: str) -> None:
@@ -2090,6 +2380,162 @@ def run_pass_policy(shell: Any, *, domain: str) -> None:
     )
     print_info_verbose(f"Displaying password policy for domain {marked_domain}")
     execute_netexec_pass_policy(shell, command=command, domain=domain)
+
+
+def execute_netexec_smbv1(shell: Any, *, command: str, domain: str) -> None:
+    """Execute a multi-host SMB sweep and record hosts with SMBv1 enabled."""
+    try:
+        completed_process = shell._run_netexec(
+            command,
+            domain=domain,
+            timeout=1800,
+            operation_kind="smbv1_posture",
+            service="smb",
+            target_count=shell._infer_service_command_target_count(command)
+            if hasattr(shell, "_infer_service_command_target_count")
+            else None,
+        )
+
+        if completed_process.returncode != 0:
+            print_error(
+                f"Error auditing SMBv1 exposure. Return code: {completed_process.returncode}"
+            )
+            error_message = (
+                strip_ansi_codes(completed_process.stderr or "").strip()
+                if completed_process.stderr
+                else strip_ansi_codes(completed_process.stdout or "").strip()
+            )
+            if error_message:
+                print_error(f"Details: {error_message}")
+            return
+
+        clean_stdout = strip_ansi_codes(completed_process.stdout or "").strip()
+        if clean_stdout:
+            shell.console.print(clean_stdout)
+
+        parsed = parse_netexec_smbv1_output(clean_stdout)
+        all_hosts = parsed.get("all_hosts") if isinstance(parsed.get("all_hosts"), list) else []
+        vulnerable_hosts = parsed.get("hosts") if isinstance(parsed.get("hosts"), list) else []
+
+        dc_hosts: list[str] = []
+        non_dc_hosts: list[str] = []
+        for host in vulnerable_hosts:
+            is_dc = False
+            if hasattr(shell, "is_computer_dc"):
+                try:
+                    is_dc = bool(shell.is_computer_dc(domain, host))
+                except Exception as exc:  # pragma: no cover
+                    if not handle_optional_report_service_exception(
+                        exc,
+                        action="Technical finding sync",
+                        debug_printer=print_info_debug,
+                        prefix="[smb-null]",
+                    ):
+                        telemetry.capture_exception(exc)
+            if is_dc:
+                dc_hosts.append(host)
+            else:
+                non_dc_hosts.append(host)
+
+        summary = {
+            "all_computers": all_hosts or None,
+            "dcs": dc_hosts or None,
+            "non_dcs": non_dc_hosts or None,
+            "entries": parsed.get("entries") if isinstance(parsed.get("entries"), list) else None,
+            "count": len(vulnerable_hosts),
+            "domain_controller_count": len(dc_hosts),
+            "non_domain_controller_count": len(non_dc_hosts),
+        }
+
+        smb_dir = domain_path(shell._get_workspace_cwd(), shell.domains_dir, domain, "smb")
+        os.makedirs(smb_dir, exist_ok=True)
+        vulnerable_file = os.path.join(smb_dir, "smbv1_enabled.txt")
+        vulnerable_dcs_file = os.path.join(smb_dir, "smbv1_enabled_dcs.txt")
+        vulnerable_non_dcs_file = os.path.join(smb_dir, "smbv1_enabled_non_dcs.txt")
+        for path, hosts in (
+            (vulnerable_file, vulnerable_hosts),
+            (vulnerable_dcs_file, dc_hosts),
+            (vulnerable_non_dcs_file, non_dc_hosts),
+        ):
+            with open(path, "w", encoding="utf-8") as handle:
+                if hosts:
+                    handle.write("\n".join(hosts) + "\n")
+
+        value_to_store = {
+            "all_computers": vulnerable_hosts or None,
+            "dcs": dc_hosts or None,
+            "non_dcs": non_dc_hosts or None,
+        }
+        shell.update_report_field(domain, "smbv1_enabled", value_to_store)
+        _record_smbv1_finding(shell, domain=domain, parsed=summary)
+        _render_smbv1_summary(domain, summary)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error("Error executing NetExec SMBv1 audit.")
+        print_exception(show_locals=False, exception=exc)
+
+
+def run_smbv1_audit(shell: Any, *, domain: str) -> None:
+    """Audit SMBv1 exposure across the selected SMB host scope."""
+    if not shell.netexec_path:
+        print_error(
+            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
+        )
+        return
+
+    workspace_dir = getattr(shell, "current_workspace_dir", None) or os.getcwd()
+    domain_data = shell.domains_data.get(domain, {})
+    scope_preference = resolve_domain_service_scope_preference(
+        shell,
+        workspace_dir=workspace_dir,
+        domains_dir=shell.domains_dir,
+        domain=domain,
+        service="smb",
+        domain_data=domain_data,
+        prompt_title="Choose the target scope for SMB multi-host checks:",
+    )
+    targets_file, source = resolve_domain_service_target_file(
+        workspace_dir,
+        shell.domains_dir,
+        domain,
+        service="smb",
+        domain_data=domain_data,
+        scope_preference=scope_preference,
+    )
+    if not targets_file:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(f"No host targets are available for domain {marked_domain}.")
+        return
+
+    targeting_notice = consume_service_targeting_fallback_notice(
+        shell,
+        workspace_dir=workspace_dir,
+        domains_dir=shell.domains_dir,
+        domain=domain,
+        service="smb",
+        source=source,
+    )
+    if targeting_notice:
+        print_info(targeting_notice)
+
+    command = (
+        f"{shell.netexec_path} smb {shlex.quote(targets_file)} "
+        f"-t 20 --timeout 30 --smb-timeout 10 --log domains/{domain}/smb/smbv1.log"
+    )
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info(
+        f"Auditing SMBv1 exposure in domain {marked_domain}"
+    )
+    print_info_debug(
+        f"[smb] using domain target file source={source} "
+        f"for {marked_domain}: {mark_sensitive(targets_file, 'path')}"
+    )
+    print_info(
+        f"SMBv1 audit scope: {mark_sensitive(source, 'detail')} "
+        f"({count_target_file_entries(targets_file)} target(s))"
+    )
+    print_info_debug(f"Command: {command}")
+    execute_netexec_smbv1(shell, command=command, domain=domain)
 
 
 def run_smb_scan(shell: Any, *, domain: str) -> None:

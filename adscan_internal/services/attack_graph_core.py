@@ -21,6 +21,18 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
+from adscan_internal.services.domain_controller_classifier import (
+    RODC_TARGET_PRIORITY_RANK,
+    node_is_rodc_computer,
+)
+from adscan_internal.services.adcs_target_filter import is_adcs_tier_zero_group
+from adscan_internal.services.privileged_group_classifier import (
+    is_dependency_only_tier_zero_group,
+    is_future_followup_tier_zero_group,
+    is_followup_terminal_group,
+    is_graph_extension_group,
+)
+
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
 )
@@ -247,9 +259,30 @@ def compute_display_paths_for_domain_unfiltered(
                 continue
 
         record = path_to_display_record(graph, candidate)
-        record["target_is_high_value"] = _path_target_is_high_value(
-            graph, candidate.target_id, mode=mode
+        nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+        target_node = (
+            nodes_map.get(str(candidate.target_id or ""))
+            if isinstance(nodes_map, dict)
+            else None
         )
+        priority_class = (
+            _node_target_priority_class(target_node)
+            if isinstance(target_node, dict)
+            else "pivot"
+        )
+        record["target_priority_class"] = priority_class
+        record["target_priority_rank"] = (
+            _node_target_priority_rank(target_node)
+            if isinstance(target_node, dict)
+            else 100
+        )
+        record["target_terminal_class"] = (
+            _node_target_terminal_class(target_node)
+            if isinstance(target_node, dict)
+            else "pivot"
+        )
+        record["is_tier_zero"] = priority_class == "tierzero"
+        record["target_is_high_value"] = priority_class in {"tierzero", "highvalue"}
         nodes = record.get("nodes")
         rels = record.get("relations")
         if not isinstance(nodes, list) or not isinstance(rels, list):
@@ -473,9 +506,30 @@ def compute_display_paths_for_start_node(
                 continue
 
         record = path_to_display_record(graph, candidate)
-        record["target_is_high_value"] = _path_target_is_high_value(
-            graph, candidate.target_id, mode=mode
+        nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+        target_node = (
+            nodes_map.get(str(candidate.target_id or ""))
+            if isinstance(nodes_map, dict)
+            else None
         )
+        priority_class = (
+            _node_target_priority_class(target_node)
+            if isinstance(target_node, dict)
+            else "pivot"
+        )
+        record["target_priority_class"] = priority_class
+        record["target_priority_rank"] = (
+            _node_target_priority_rank(target_node)
+            if isinstance(target_node, dict)
+            else 100
+        )
+        record["target_terminal_class"] = (
+            _node_target_terminal_class(target_node)
+            if isinstance(target_node, dict)
+            else "pivot"
+        )
+        record["is_tier_zero"] = priority_class == "tierzero"
+        record["target_is_high_value"] = priority_class in {"tierzero", "highvalue"}
         nodes = record.get("nodes")
         rels = record.get("relations")
         if not isinstance(nodes, list) or not isinstance(rels, list):
@@ -1137,8 +1191,8 @@ def compute_maximal_attack_paths(
         if not isinstance(node, dict):
             return False
         if mode == "impact":
-            return _node_is_impact_high_value(node)
-        return _node_is_tier0(node)
+            return _node_is_terminal_target(node, mode=mode)
+        return _node_is_terminal_target(node, mode=mode)
 
     allowed_start_ids: set[str] = (
         {str(node_id) for node_id in start_node_ids if str(node_id).strip()}
@@ -1336,8 +1390,8 @@ def compute_maximal_attack_paths_from_start(
         if not isinstance(node, dict):
             return False
         if mode == "impact":
-            return _node_is_impact_high_value(node)
-        return _node_is_tier0(node)
+            return _node_is_terminal_target(node, mode=mode)
+        return _node_is_terminal_target(node, mode=mode)
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str], ...]] = set()
@@ -1592,21 +1646,8 @@ def _path_target_is_high_value(
     return _node_is_tier0(node)
 
 
-def _node_is_tier0(node: dict[str, Any]) -> bool:
-    if bool(node.get("isTierZero")):
-        return True
-    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    if bool(props.get("isTierZero")):
-        return True
-    tags = node.get("system_tags") or props.get("system_tags") or []
-    if isinstance(tags, str):
-        tags = [tags]
-    return any(str(tag).lower() == "admin_tier_0" for tag in tags)
-
-
-def _node_is_privileged_group(node: dict[str, Any]) -> bool:
-    if str(node.get("kind") or "") != "Group":
-        return False
+def _extract_node_sid_and_rid(node: dict[str, Any]) -> tuple[str | None, int | None]:
+    """Return normalized SID and RID for one graph node when available."""
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     candidates = [
         props.get("objectid"),
@@ -1620,7 +1661,8 @@ def _node_is_privileged_group(node: dict[str, Any]) -> bool:
             sid = value.strip()
             break
     if not sid:
-        return False
+        return None, None
+
     sid_upper = sid.strip().upper()
     sid_idx = sid_upper.find("S-1-")
     if sid_idx != -1:
@@ -1629,6 +1671,40 @@ def _node_is_privileged_group(node: dict[str, Any]) -> bool:
         rid = int(sid_upper.rsplit("-", 1)[-1])
     except Exception:
         rid = None
+    return sid_upper, rid
+
+
+def _node_is_tier0(node: dict[str, Any]) -> bool:
+    if bool(node.get("isTierZero")):
+        return True
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    if bool(props.get("isTierZero")):
+        return True
+    tags = node.get("system_tags") or props.get("system_tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    if any(str(tag).lower() == "admin_tier_0" for tag in tags):
+        return True
+    if is_adcs_tier_zero_group(node):
+        return True
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    if is_dependency_only_tier_zero_group(
+        sid=str(props.get("objectid") or node.get("objectid") or ""),
+        name=str(props.get("name") or node.get("label") or ""),
+    ):
+        return True
+    return is_future_followup_tier_zero_group(
+        sid=str(props.get("objectid") or node.get("objectid") or ""),
+        name=str(props.get("name") or node.get("label") or ""),
+    )
+
+
+def _node_is_privileged_group(node: dict[str, Any]) -> bool:
+    if str(node.get("kind") or "") != "Group":
+        return False
+    sid_upper, rid = _extract_node_sid_and_rid(node)
+    if not sid_upper:
+        return False
 
     builtin_privileged_rids = {544, 548, 549, 550, 551}
     if rid in builtin_privileged_rids and sid_upper.startswith("S-1-5-32-"):
@@ -1648,9 +1724,7 @@ def _node_is_effectively_high_value(node: dict[str, Any]) -> bool:
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     if _node_is_tier0(node):
         return True
-    if bool(node.get("highvalue")) or bool(props.get("highvalue")):
-        return True
-    return _node_is_privileged_group(node)
+    return bool(node.get("highvalue")) or bool(props.get("highvalue"))
 
 
 def _node_is_enabled_user(node: dict[str, Any]) -> bool:
@@ -1671,18 +1745,130 @@ def _node_is_impact_high_value(node: dict[str, Any]) -> bool:
 
 def _node_high_value_rank(node: dict[str, Any]) -> int:
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    if bool(node.get("isTierZero")) or bool(props.get("isTierZero")):
-        return 3
-    tags = node.get("system_tags") or props.get("system_tags") or []
-    if isinstance(tags, str):
-        tags = [tags]
-    if any(str(tag).lower() == "admin_tier_0" for tag in tags):
+    if _node_is_tier0(node):
         return 3
     if bool(node.get("highvalue")) or bool(props.get("highvalue")):
         return 2
-    if _node_is_privileged_group(node):
-        return 1
     return 0
+
+
+def _node_target_priority_class(node: dict[str, Any]) -> str:
+    """Return BH-backed target criticality for one node."""
+    if _node_is_tier0(node):
+        return "tierzero"
+    if _node_is_effectively_high_value(node):
+        return "highvalue"
+    return "pivot"
+
+
+def _node_target_priority_rank(node: dict[str, Any]) -> int:
+    """Return a stable priority rank within BH target criticality classes."""
+    priority_class = _node_target_priority_class(node)
+    sid_upper, rid = _extract_node_sid_and_rid(node)
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    group_name = str(props.get("name") or node.get("label") or "")
+    distinguished_name = str(props.get("distinguishedname") or "")
+    terminal_class = _node_target_terminal_class(node)
+
+    if terminal_class == "graph_extension":
+        if is_graph_extension_group(
+            sid=sid_upper,
+            name=group_name,
+            distinguished_name=distinguished_name,
+        ):
+            if rid == 548 and isinstance(sid_upper, str) and sid_upper.startswith("S-1-5-32-"):
+                return 10
+            return 15
+        return 19
+
+    if terminal_class == "followup_terminal":
+        if node_is_rodc_computer(node):
+            return RODC_TARGET_PRIORITY_RANK
+        if is_followup_terminal_group(sid=sid_upper, name=group_name):
+            if rid == 551 and isinstance(sid_upper, str) and sid_upper.startswith("S-1-5-32-"):
+                return 20
+            if rid == 1101:
+                return 30
+        return 35
+
+    if terminal_class == "dependency_only":
+        return 32
+    if terminal_class == "future_followup":
+        return 31
+
+    if priority_class == "tierzero":
+        return 0
+    if priority_class == "highvalue":
+        if bool(node.get("highvalue")) or bool(props.get("highvalue")):
+            return 40
+        return 60
+    return 100
+
+
+def _node_target_terminal_class(node: dict[str, Any]) -> str:
+    """Return ADscan's terminal-behaviour class for one node.
+
+    This is intentionally distinct from ``_node_target_priority_class``:
+    - priority class answers "how important is this target for UX ordering?"
+    - terminal class answers "should path discovery stop when reaching it?"
+
+    Classes:
+        ``direct_compromise``:
+            Reaching this node is a direct domain-compromise style outcome.
+        ``followup_terminal``:
+            Reaching this node is valuable and can terminate a path because a
+            dedicated follow-up/exploitation chain starts there.
+        ``graph_extension``:
+            Reaching this node should *not* terminate path discovery because it
+            primarily unlocks additional ACL/graph enrichment and the user
+            benefits more from seeing the downstream direct-compromise options.
+        ``dependency_only``:
+            BloodHound classifies this group as Tier Zero due to local security
+            dependency on DCs, but ADscan currently has no abuse/follow-up path
+            to run from it, so it should not terminate discovery.
+        ``future_followup``:
+            BloodHound classifies this group as Tier Zero and ADscan expects to
+            support a dedicated follow-up later, but that follow-up is not
+            implemented yet, so it remains non-terminal for now.
+        ``pivot``:
+            Not a terminal-worthy target.
+    """
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    group_name = str(props.get("name") or node.get("label") or "")
+    distinguished_name = str(props.get("distinguishedname") or "")
+    sid_upper, rid = _extract_node_sid_and_rid(node)
+    priority_class = _node_target_priority_class(node)
+
+    if node_is_rodc_computer(node):
+        return "followup_terminal"
+    if is_graph_extension_group(
+        sid=sid_upper,
+        name=group_name,
+        distinguished_name=distinguished_name,
+    ):
+        return "graph_extension"
+    if is_followup_terminal_group(sid=sid_upper, name=group_name):
+        return "followup_terminal"
+    if is_future_followup_tier_zero_group(sid=sid_upper, name=group_name):
+        return "future_followup"
+    if is_dependency_only_tier_zero_group(sid=sid_upper, name=group_name):
+        return "dependency_only"
+    if priority_class == "tierzero":
+        return "direct_compromise"
+    if priority_class != "highvalue":
+        return "pivot"
+
+    return "followup_terminal"
+
+
+def _node_is_terminal_target(node: dict[str, Any], *, mode: str = "tier0") -> bool:
+    """Return True when one node should terminate ADscan path discovery."""
+    terminal_class = _node_target_terminal_class(node)
+    if terminal_class == "direct_compromise":
+        return True
+    if terminal_class == "followup_terminal":
+        return True
+    return False
 
 
 def _try_promote_target_via_membership_edges(

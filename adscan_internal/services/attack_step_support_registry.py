@@ -136,14 +136,19 @@ def describe_path_compromise_effort(relations: Iterable[str]) -> str:
 
 def build_path_priority_key(
     record: dict[str, object],
-) -> tuple[int, int, int, int, int, str, str]:
+) -> tuple[int, int, int, int, int, int, int, int, int, str, str]:
     """Return a semantics-aware sort key for attack-path display ordering.
 
-    Ordering after status is driven primarily by aggregate compromise effort, so
-    multi-step low-effort paths beat shorter but materially harder paths such as
-    single-step Kerberoasting. Terminal compromise semantics are then used as a
-    secondary tie-breaker, followed by executable length and stable labels.
+    Ordering is deterministic and target-aware:
+    BloodHound criticality decides the main UX bucket (Tier-0, High-Value,
+    Pivot), while ADscan terminality decides whether a target is a direct
+    compromise, a follow-up terminal, or a graph-extension waypoint.
     """
+    priority_class_order = {
+        "tierzero": 0,
+        "highvalue": 1,
+        "pivot": 2,
+    }
     status_order = {
         "theoretical": 0,
         "unavailable": 1,
@@ -177,7 +182,45 @@ def build_path_priority_key(
         if str(record.get("length", "")).isdigit()
         else len(actionable_support)
     )
+    target_priority_class = str(
+        record.get("target_priority_class")
+        or ("tierzero" if record.get("is_tier_zero") else "highvalue" if record.get("target_is_high_value") else "pivot")
+    ).strip().lower()
+    terminal_class_order = {
+        "direct_compromise": 0,
+        "followup_terminal": 1,
+        "graph_extension": 2,
+        "pivot": 3,
+    }
+    target_followup_status = str(
+        record.get("target_followup_status") or ""
+    ).strip().lower()
+    if not target_followup_status:
+        target_followup_status = {
+            "direct_compromise": "actionable",
+            "followup_terminal": "theoretical",
+            "graph_extension": "theoretical",
+            "future_followup": "unsupported",
+            "dependency_only": "unavailable",
+        }.get(str(record.get("target_terminal_class") or "pivot").strip().lower(), "unavailable")
+    target_followup_status_order = {
+        "actionable": 0,
+        "theoretical": 1,
+        "unsupported": 2,
+        "unavailable": 3,
+    }
+    target_terminal_class = str(
+        record.get("target_terminal_class") or "pivot"
+    ).strip().lower()
+    try:
+        target_priority_rank = int(record.get("target_priority_rank", 100))
+    except (TypeError, ValueError):
+        target_priority_rank = 100
     return (
+        priority_class_order.get(target_priority_class, 2),
+        terminal_class_order.get(target_terminal_class, 3),
+        target_followup_status_order.get(target_followup_status, 3),
+        target_priority_rank,
         status_order.get(str(record.get("status") or "").strip().lower(), 3),
         aggregate_effort_score,
         COMPROMISE_SEMANTICS_PRIORITY.get(terminal_semantics, 2),

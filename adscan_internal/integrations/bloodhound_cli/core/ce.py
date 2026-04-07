@@ -31,6 +31,14 @@ from adscan_internal.rich_output import (
 )
 
 
+def _safe_truncate(value: str, limit: int = 1200) -> str:
+    """Return a bounded diagnostic string suitable for debug logs."""
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...[truncated]"
+
+
 def _get_default_admin_password() -> str:
     """Return default BloodHound CE admin password override if set."""
     return (
@@ -532,6 +540,78 @@ class BloodHoundCEClient(BloodHoundClient):
         except Exception:
             return []
 
+    @staticmethod
+    def _normalize_graph_node(raw_node: Dict) -> Dict:
+        """Normalize one graph node from the CE graph payload into ADscan shape."""
+        props = raw_node.get("properties") if isinstance(raw_node.get("properties"), dict) else {}
+        labels = raw_node.get("kinds") or raw_node.get("labels") or []
+        kind = str(raw_node.get("kind") or "").strip()
+        if not kind and isinstance(labels, list):
+            kind = next(
+                (
+                    str(label or "").strip()
+                    for label in labels
+                    if str(label or "").strip() in {"Group", "User", "Computer", "OU"}
+                ),
+                "",
+            )
+        is_tier_zero = bool(
+            raw_node.get("isTierZero")
+            or props.get("isTierZero")
+            or props.get("highvalue")
+            or "admin_tier_0" in str(props.get("system_tags") or "")
+        )
+        highvalue = bool(
+            props.get("highvalue")
+            or "admin_tier_0" in str(props.get("system_tags") or "")
+        )
+        label = str(
+            props.get("name")
+            or raw_node.get("label")
+            or raw_node.get("objectId")
+            or ""
+        ).strip()
+        return {
+            "label": label,
+            "kind": kind,
+            "objectId": str(raw_node.get("objectId") or props.get("objectid") or ""),
+            "isTierZero": is_tier_zero,
+            "highvalue": highvalue,
+            "properties": props,
+        }
+
+    def get_tierzero_objects_in_ou(
+        self,
+        domain: str,
+        ou_distinguished_name: str,
+    ) -> List[Dict]:
+        """Return Tier Zero/high-value Group/User/Computer objects contained in one OU."""
+        try:
+            sanitized_ou_dn = ou_distinguished_name.replace("'", "\\'")
+            domain_value = domain.replace("'", "\\'")
+            high_value_filter = self._build_high_value_filter(alias="n")
+            cypher_query = f"""
+            MATCH (ou:OU)
+            WHERE toLower(ou.distinguishedname) = toLower('{sanitized_ou_dn}')
+            MATCH (n)
+            WHERE (n:Group OR n:User OR n:Computer)
+              AND {high_value_filter}
+              AND toUpper(coalesce(n.domain, '')) = '{domain_value.upper()}'
+              AND toLower(coalesce(n.distinguishedname, '')) CONTAINS toLower(ou.distinguishedname)
+            RETURN n
+            """
+            graph_data = self.execute_query_with_relationships(cypher_query)
+            nodes_data = graph_data.get("nodes") if isinstance(graph_data, dict) else None
+            if not isinstance(nodes_data, dict):
+                return []
+            return [
+                self._normalize_graph_node(node_data)
+                for node_data in nodes_data.values()
+                if isinstance(node_data, dict)
+            ]
+        except Exception:
+            return []
+
     def get_computers(self, domain: str, laps: Optional[bool] = None) -> List[str]:
         """Get enabled computers using CySQL query"""
         try:
@@ -778,6 +858,77 @@ class BloodHoundCEClient(BloodHoundClient):
 
             return users
 
+        except Exception:
+            return []
+
+    def get_stale_enabled_users(
+        self, domain: str, stale_days: int = 180
+    ) -> List[Dict]:
+        """Get enabled users that appear stale based on last logon age."""
+        try:
+            domain_value = str(domain or "").strip().replace("'", "\\'")
+            stale_days_value = max(1, int(stale_days or 180))
+            stale_seconds = stale_days_value * 24 * 60 * 60
+            current_epoch = int(time.time())
+
+            cypher_query = f"""
+            MATCH (u:User)
+            WHERE u.enabled = true
+              AND toUpper(u.domain) = '{domain_value.upper()}'
+              AND (
+                (
+                  coalesce(u.lastlogon, 0) > 0
+                  AND ({current_epoch} - u.lastlogon) >= {stale_seconds}
+                )
+                OR
+                (
+                  coalesce(u.lastlogon, 0) = 0
+                  AND coalesce(u.whencreated, 0) > 0
+                  AND ({current_epoch} - u.whencreated) >= {stale_seconds}
+                )
+              )
+            RETURN u
+            ORDER BY coalesce(u.lastlogon, 0) ASC
+            """
+
+            result = self.execute_query(cypher_query)
+            stale_users: List[Dict] = []
+            if result and isinstance(result, list):
+                for node_properties in result:
+                    if not isinstance(node_properties, dict):
+                        continue
+                    samaccountname = node_properties.get("samaccountname") or node_properties.get("name", "")
+                    if samaccountname and "@" in samaccountname:
+                        samaccountname = samaccountname.split("@")[0]
+                    if not samaccountname:
+                        continue
+                    lastlogon = node_properties.get("lastlogon")
+                    whencreated = node_properties.get("whencreated")
+                    last_seen_seconds = (
+                        int(lastlogon)
+                        if isinstance(lastlogon, (int, float)) and int(lastlogon) > 0
+                        else (
+                            int(whencreated)
+                            if isinstance(whencreated, (int, float)) and int(whencreated) > 0
+                            else None
+                        )
+                    )
+                    days_since_last_seen = None
+                    if last_seen_seconds is not None:
+                        days_since_last_seen = int((current_epoch - last_seen_seconds) // 86400)
+
+                    stale_users.append(
+                        {
+                            "samaccountname": samaccountname,
+                            "lastlogon": lastlogon,
+                            "whencreated": whencreated,
+                            "days_since_last_seen": days_since_last_seen,
+                            "stale_days_threshold": stale_days_value,
+                            "never_logged_on": not bool(lastlogon),
+                        }
+                    )
+
+            return stale_users
         except Exception:
             return []
 
@@ -1194,6 +1345,20 @@ class BloodHoundCEClient(BloodHoundClient):
                         "target": target_name,
                         "targetType": target_kind,
                         "relation": edge_label,
+                        "sourceObjectId": str(
+                            source_props.get("objectid")
+                            or source_props.get("objectId")
+                            or source_node.get("objectid")
+                            or source_node.get("objectId")
+                            or ""
+                        ),
+                        "targetObjectId": str(
+                            target_props.get("objectid")
+                            or target_props.get("objectId")
+                            or target_node.get("objectid")
+                            or target_node.get("objectId")
+                            or ""
+                        ),
                         "sourceDomain": source_domain_value.lower()
                         if source_domain_value != "N/A"
                         else "N/A",
@@ -1426,21 +1591,17 @@ class BloodHoundCEClient(BloodHoundClient):
                 alias="u",
                 domain_value=domain_value,
             )
-            source_enabled_filter = self._build_enabled_filter(
-                alias="u", default_true=True
-            )
-            source_high_value_filter = self._build_high_value_filter(alias="u")
             edge_filter = self._build_bh_edge_type_filter()
             acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
 
             named_target_filter = f"\n  AND {self._build_named_node_filter(alias='h')}"
 
             if target == "highvalue":
-                target_clause = f"  AND {self._build_high_value_filter(alias='h')}"
+                target_clause = f"  AND {self._build_terminal_target_filter(alias='h')}"
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = ""
             elif target == "lowpriv":
-                target_clause = f"  AND NOT {self._build_high_value_filter(alias='h')}"
+                target_clause = f"  AND NOT {self._build_terminal_target_filter(alias='h')}"
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=False)}"
             else:  # "all"
@@ -1452,8 +1613,7 @@ class BloodHoundCEClient(BloodHoundClient):
             cypher_query = f"""
             MATCH p=(u:User)-[{edge_filter}*1..{depth}]->(h)
             WHERE {source_domain_filter}
-              AND {source_enabled_filter}
-              AND NOT {source_high_value_filter}{target_clause}{named_target_filter}
+              {target_clause}{named_target_filter}
             WITH p, nodes(p) AS ns
             WHERE {acyclic_filter}{no_intermediate_hv}{no_terminal_memberof}
             RETURN ns AS path_nodes, relationships(p) AS rels{limit_clause}
@@ -1496,6 +1656,38 @@ class BloodHoundCEClient(BloodHoundClient):
             f"coalesce({alias}.highvalue, false) = true "
             f"OR 'admin_tier_0' IN split(coalesce({alias}.system_tags, ''), ' ') "
             f"OR coalesce({alias}.isTierZero, false) = true"
+            ")"
+        )
+
+    def _build_graph_extension_filter(self, *, alias: str) -> str:
+        """Return a predicate for ADscan graph-extension HV targets.
+
+        These nodes are still high-value for UX purposes but should not terminate
+        path discovery because their main value comes from extending the graph
+        toward downstream direct-compromise targets.
+        """
+        sid_expr = f"toUpper(coalesce({alias}.objectid, coalesce({alias}.objectId, '')))"
+        dn_expr = f"toUpper(coalesce({alias}.distinguishedname, ''))"
+        return (
+            "("
+            f"{sid_expr} = 'S-1-5-32-548' "
+            f"OR ({dn_expr} CONTAINS 'OU=MICROSOFT EXCHANGE SECURITY GROUPS,' "
+            f"AND ({sid_expr} ENDS WITH '-1119' OR {sid_expr} ENDS WITH '-1121'))"
+            ")"
+        )
+
+    def _build_terminal_target_filter(self, *, alias: str) -> str:
+        """Return a predicate for nodes where ADscan should stop path discovery.
+
+        BloodHound remains the source of truth for target criticality
+        (tier-zero/high-value). ADscan layers one extra semantic on top:
+        some critical groups are ``graph_extension`` targets that should not
+        terminate pathing because they primarily unlock downstream paths.
+        """
+        return (
+            "("
+            f"{self._build_high_value_filter(alias=alias)} "
+            f"AND NOT {self._build_graph_extension_filter(alias=alias)}"
             ")"
         )
 
@@ -1549,12 +1741,8 @@ class BloodHoundCEClient(BloodHoundClient):
         if not except_highvalue_terminal:
             return base
         ns = nodes_alias
-        terminal_hv = (
-            f"coalesce(last({ns}).highvalue, false) = true"
-            f" OR 'admin_tier_0' IN split(coalesce(last({ns}).system_tags, ''), ' ')"
-            f" OR coalesce(last({ns}).isTierZero, false) = true"
-        )
-        return f"({base} OR ({terminal_hv}))"
+        terminal_target = self._build_terminal_target_filter(alias=f"last({ns})")
+        return f"({base} OR ({terminal_target}))"
 
     def _build_no_intermediate_high_value_filter(self, *, nodes_alias: str = "nodes(p)") -> str:
         """Return a predicate ensuring only the terminal node can be high-value.
@@ -1577,7 +1765,7 @@ class BloodHoundCEClient(BloodHoundClient):
         Only meaningful when ``target="highvalue"`` or ``target="lowpriv"``; callers
         should skip this filter in ``--all`` mode.
         """
-        hv = self._build_high_value_filter(alias="n")
+        hv = self._build_terminal_target_filter(alias="n")
         ns = nodes_alias
         return f"ALL(n IN {ns} WHERE n = last({ns}) OR NOT ({hv}))"
 
@@ -1604,6 +1792,111 @@ class BloodHoundCEClient(BloodHoundClient):
         ns = nodes_alias
         return f"ALL(n IN {ns} WHERE single(m IN {ns} WHERE id(m) = id(n)))"
 
+    def _build_group_paths_to_tier_zero_query(
+        self,
+        *,
+        domain: str,
+        source_group_name: str,
+        max_depth: int,
+        max_results: int,
+    ) -> str:
+        """Return a Cypher query for one high-value group -> terminal path discovery.
+
+        The terminal set is ADscan-defined: any BloodHound high-value/Tier-0
+        node except graph-extension groups such as Account Operators or
+        Exchange Windows Permissions.
+        """
+        group_name = str(source_group_name or "").strip().replace("'", "\\'")
+        terminal_target_filter = self._build_terminal_target_filter(alias="t")
+        acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
+        depth = max(1, int(max_depth))
+        limit_value = max(1, min(int(max_results), 5000))
+        return (
+            "MATCH p=(s:Group)-[:GenericAll|GenericWrite|WriteOwner|WriteDacl|"
+            f"AddMember|ForceChangePassword|DCSync*1..{depth}]->(t) "
+            f"WHERE toLower(coalesce(s.name,'')) = toLower('{group_name}') "
+            "AND s<>t "
+            f"AND {terminal_target_filter} "
+            "WITH p, t, nodes(p) AS ns "
+            f"WHERE {acyclic_filter} "
+            "RETURN p "
+            "ORDER BY length(p), toLower(coalesce(t.name,'')) "
+            f"LIMIT {limit_value}"
+        )
+
+    def get_group_paths_to_tier_zero_graph(
+        self,
+        domain: str,
+        *,
+        source_group_name: str,
+        max_depth: int = 5,
+        max_results: int = 100,
+    ) -> Dict:
+        """Return a relationship-rich graph for one group -> Tier Zero path set."""
+        try:
+            cypher_query = self._build_group_paths_to_tier_zero_query(
+                domain=domain,
+                source_group_name=source_group_name,
+                max_depth=max_depth,
+                max_results=max_results,
+            )
+            return self.execute_query_with_relationships(cypher_query)
+        except Exception as exc:  # pragma: no cover - best effort
+            self._debug(
+                "account operators path query failed",
+                domain=domain,
+                error=str(exc),
+            )
+            return {}
+
+    def get_account_operators_paths_to_tier_zero_graph(
+        self,
+        domain: str,
+        *,
+        max_depth: int = 5,
+        max_results: int = 100,
+    ) -> Dict:
+        """Return a relationship-rich graph for Account Operators -> Tier Zero paths."""
+        domain_upper = (domain or "").strip().upper()
+        return self.get_group_paths_to_tier_zero_graph(
+            domain,
+            source_group_name=f"ACCOUNT OPERATORS@{domain_upper}",
+            max_depth=max_depth,
+            max_results=max_results,
+        )
+
+    def get_exchange_windows_permissions_paths_to_tier_zero_graph(
+        self,
+        domain: str,
+        *,
+        max_depth: int = 5,
+        max_results: int = 100,
+    ) -> Dict:
+        """Return a relationship-rich graph for Exchange Windows Permissions -> Tier Zero paths."""
+        domain_upper = (domain or "").strip().upper()
+        return self.get_group_paths_to_tier_zero_graph(
+            domain,
+            source_group_name=f"EXCHANGE WINDOWS PERMISSIONS@{domain_upper}",
+            max_depth=max_depth,
+            max_results=max_results,
+        )
+
+    def get_exchange_trusted_subsystem_paths_to_tier_zero_graph(
+        self,
+        domain: str,
+        *,
+        max_depth: int = 5,
+        max_results: int = 100,
+    ) -> Dict:
+        """Return a relationship-rich graph for Exchange Trusted Subsystem -> Tier Zero paths."""
+        domain_upper = (domain or "").strip().upper()
+        return self.get_group_paths_to_tier_zero_graph(
+            domain,
+            source_group_name=f"EXCHANGE TRUSTED SUBSYSTEM@{domain_upper}",
+            max_depth=max_depth,
+            max_results=max_results,
+        )
+
     def _build_low_priv_source_filter(
         self,
         *,
@@ -1616,21 +1909,23 @@ class BloodHoundCEClient(BloodHoundClient):
         This keeps low-priv filtering consistent across User/Group/Computer
         sources so Tier Zero/high-value principals are excluded regardless of
         source kind.
+
+        We intentionally do NOT require the source to be enabled. Phase 2
+        attack steps are used as structural building blocks for later path
+        composition, and a disabled source can still become usable after a
+        preceding compromise step (for example after taking control of the
+        account and re-enabling it).
         """
         domain_predicate = self._build_domain_filter(
             alias=source_alias,
             domain_value=domain_value,
             match_domain_by_name_suffix=match_domain_by_name_suffix,
         )
-        enabled_predicate = self._build_enabled_filter(
-            alias=source_alias, default_true=True
-        )
         high_value_predicate = self._build_high_value_filter(alias=source_alias)
 
         return f"""
               AND ({source_alias}:User OR {source_alias}:Group OR {source_alias}:Computer)
               AND {domain_predicate}
-              AND {enabled_predicate}
               AND NOT {high_value_predicate}
         """
 
@@ -1641,21 +1936,23 @@ class BloodHoundCEClient(BloodHoundClient):
         domain_value: str,
         match_domain_by_name_suffix: bool = False,
     ) -> str:
-        """Return a predicate for enabled non-TierZero principals, including high-value pivots."""
+        """Return a predicate for non-TierZero principals, including high-value pivots.
+
+        Like ``_build_low_priv_source_filter``, this deliberately does not
+        require the source to be enabled because disabled principals can still
+        participate in valid downstream attack steps after an upstream
+        compromise and re-enable action.
+        """
         domain_predicate = self._build_domain_filter(
             alias=source_alias,
             domain_value=domain_value,
             match_domain_by_name_suffix=match_domain_by_name_suffix,
-        )
-        enabled_predicate = self._build_enabled_filter(
-            alias=source_alias, default_true=True
         )
         tier_zero_predicate = self._build_tier_zero_filter(alias=source_alias)
 
         return f"""
               AND ({source_alias}:User OR {source_alias}:Group OR {source_alias}:Computer)
               AND {domain_predicate}
-              AND {enabled_predicate}
               AND NOT {tier_zero_predicate}
         """
 
@@ -1907,12 +2204,16 @@ class BloodHoundCEClient(BloodHoundClient):
                 source_alias="s",
                 domain_value=domain_value,
             )
+            target_enabled_filter = self._build_enabled_filter(
+                alias="t", default_true=True
+            )
 
             cypher_query = f"""
             MATCH p=(s)-[r]->(t)
             WHERE 1=1
               {source_filter}
               AND type(r) IN {sorted(allowed_relations)!r}
+              AND {target_enabled_filter}
             RETURN p
             LIMIT {limit_value}
             """
@@ -2005,13 +2306,16 @@ class BloodHoundCEClient(BloodHoundClient):
                 source_alias="s",
                 domain_value=domain_value,
             )
+            target_enabled_filter = self._build_enabled_filter(
+                alias="t", default_true=True
+            )
 
             cypher_query = f"""
             MATCH p=(s)-[r]->(t)
             WHERE 1=1
               {source_filter}
               AND type(r) IN {sorted(allowed_relations)!r}
-              AND (t.enabled = true)
+              AND {target_enabled_filter}
             RETURN p
             LIMIT {limit_value}
             """
@@ -2458,12 +2762,12 @@ class BloodHoundCEClient(BloodHoundClient):
             named_target_filter = f"\n  AND {self._build_named_node_filter(alias='h')}"
 
             if target == "highvalue":
-                target_filter = self._build_high_value_filter(alias="h")
+                target_filter = self._build_terminal_target_filter(alias="h")
                 where_target = f"  AND {target_filter}"
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = ""
             elif target == "lowpriv":
-                where_target = f"  AND NOT {self._build_high_value_filter(alias='h')}"
+                where_target = f"  AND NOT {self._build_terminal_target_filter(alias='h')}"
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=False)}"
             else:  # "all"
@@ -2518,7 +2822,6 @@ class BloodHoundCEClient(BloodHoundClient):
             domain_filter = self._build_domain_filter(
                 alias="s", domain_value=domain_value
             )
-            source_high_value_filter = self._build_high_value_filter(alias="s")
             edge_filter = self._build_bh_edge_type_filter()
             non_membership_filter = self._build_non_membership_path_filter(path_alias="p")
             acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
@@ -2526,12 +2829,12 @@ class BloodHoundCEClient(BloodHoundClient):
             named_target_filter = f"\n              AND {self._build_named_node_filter(alias='h')}"
 
             if target == "highvalue":
-                target_filter = self._build_high_value_filter(alias="h")
+                target_filter = self._build_terminal_target_filter(alias="h")
                 where_target = f"\n              AND {target_filter}"
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = ""
             elif target == "lowpriv":
-                where_target = f"\n              AND NOT {self._build_high_value_filter(alias='h')}"
+                where_target = f"\n              AND NOT {self._build_terminal_target_filter(alias='h')}"
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=False)}"
             else:  # "all"
@@ -2544,7 +2847,7 @@ class BloodHoundCEClient(BloodHoundClient):
             MATCH p=(s)-[{edge_filter}*1..{depth}]->(h)
             WHERE {domain_filter}
               AND COALESCE(s.system_tags, '') CONTAINS 'owned'
-              AND NOT {source_high_value_filter}{where_target}{named_target_filter}
+              {where_target}{named_target_filter}
             WITH p, nodes(p) AS ns
             WHERE {non_membership_filter}
               AND {acyclic_filter}{no_intermediate_hv}{no_terminal_memberof}
@@ -2964,7 +3267,12 @@ class BloodHoundCEClient(BloodHoundClient):
             return None
 
     def wait_for_file_upload_job(
-        self, job_id: int, *, poll_interval: int = 5, timeout_seconds: int = 1800
+        self,
+        job_id: int,
+        *,
+        poll_interval: int = 5,
+        timeout_seconds: int = 1800,
+        heartbeat_seconds: int = 60,
     ) -> bool:
         """Wait for ingestion of a specific file upload job."""
         import time
@@ -2972,9 +3280,33 @@ class BloodHoundCEClient(BloodHoundClient):
         try:
             start_time = time.time()
             last_status = None
+            last_heartbeat = start_time
 
             print_info("Waiting for ingestion to complete...")
             print_info_debug(f"[bloodhound-ce] waiting for ingestion: job_id={job_id}")
+
+            def _format_job_snapshot(job: Dict | None) -> str:
+                """Return a concise job snapshot for diagnostics."""
+                if not isinstance(job, dict):
+                    return "job=(missing)"
+                interesting_keys = (
+                    "id",
+                    "status",
+                    "status_message",
+                    "created_at",
+                    "updated_at",
+                    "file_name",
+                    "file_size",
+                    "user_id",
+                )
+                snapshot = {
+                    key: job.get(key)
+                    for key in interesting_keys
+                    if key in job and job.get(key) not in (None, "")
+                }
+                if not snapshot:
+                    snapshot = job
+                return f"job={snapshot}"
 
             while True:
                 job = self.get_file_upload_job(job_id)
@@ -2986,9 +3318,14 @@ class BloodHoundCEClient(BloodHoundClient):
                 else:
                     status = job.get("status")
                     status_message = job.get("status_message", "")
+                    elapsed_seconds = int(time.time() - start_time)
 
                     if status != last_status:
                         print_info(f"Job status: {status} - {status_message}")
+                        print_info_debug(
+                            f"[bloodhound-ce] upload job state change: job_id={job_id} "
+                            f"elapsed={elapsed_seconds}s {_format_job_snapshot(job)}"
+                        )
                         last_status = status
 
                     # Terminal statuses: -1 invalid, 2 complete, 3 canceled, 4 timed out,
@@ -3014,11 +3351,36 @@ class BloodHoundCEClient(BloodHoundClient):
                             f"Upload failed with status {status}: {status_message}"
                         )
                         print_error(self._last_error)
+                        print_info_debug(
+                            f"[bloodhound-ce] upload job terminal failure: job_id={job_id} "
+                            f"elapsed={elapsed_seconds}s {_format_job_snapshot(job)}"
+                        )
                         return False
+
+                    if heartbeat_seconds > 0 and (time.time() - last_heartbeat) >= heartbeat_seconds:
+                        print_info(
+                            f"Still waiting for ingestion... elapsed={elapsed_seconds}s, "
+                            f"job_id={job_id}, status={status}"
+                        )
+                        print_info_debug(
+                            f"[bloodhound-ce] upload job heartbeat: job_id={job_id} "
+                            f"elapsed={elapsed_seconds}s {_format_job_snapshot(job)}"
+                        )
+                        last_heartbeat = time.time()
 
                 if time.time() - start_time > timeout_seconds:
                     self._last_error = f"Upload wait timed out after {timeout_seconds}s for job_id={job_id}."
                     print_error(f"Timeout after {timeout_seconds} seconds")
+                    timeout_job = self.get_file_upload_job(job_id)
+                    print_info_debug(
+                        f"[bloodhound-ce] upload job timeout: job_id={job_id} "
+                        f"elapsed={int(time.time() - start_time)}s {_format_job_snapshot(timeout_job)}"
+                    )
+                    diagnostics = self._collect_ingestion_timeout_diagnostics()
+                    if diagnostics:
+                        print_info_debug(
+                            f"[bloodhound-ce] ingestion timeout diagnostics: {diagnostics}"
+                        )
                     return False
 
                 time.sleep(max(1, poll_interval))
@@ -3027,6 +3389,63 @@ class BloodHoundCEClient(BloodHoundClient):
             self._last_error = f"Upload wait failed with exception: {e}"
             print_error(f"Error in upload wait: {e}")
             return False
+
+    def _collect_ingestion_timeout_diagnostics(self) -> str:
+        """Return best-effort BloodHound CE stack diagnostics for stalled ingestion."""
+        try:
+            from adscan_launcher.bloodhound_ce_compose import (
+                _compose_base_args,
+                docker_available,
+                get_bloodhound_compose_path,
+                run_docker,
+            )
+        except Exception as exc:
+            return f"compose_diagnostics_unavailable import_error={_safe_truncate(exc)}"
+
+        try:
+            if not docker_available():
+                return "docker_unavailable"
+
+            compose_path = get_bloodhound_compose_path()
+            compose_args = _compose_base_args(compose_path)
+
+            ps_result = run_docker(
+                [*compose_args, "ps"],
+                check=False,
+                capture_output=True,
+                timeout=15,
+            )
+            ps_stdout = _safe_truncate(getattr(ps_result, "stdout", "") or "")
+            ps_stderr = _safe_truncate(getattr(ps_result, "stderr", "") or "")
+            diagnostics: list[str] = [
+                f"compose_path={compose_path}",
+                f"ps_rc={getattr(ps_result, 'returncode', 'unknown')}",
+            ]
+            if ps_stdout:
+                diagnostics.append(f"ps_stdout={ps_stdout}")
+            if ps_stderr:
+                diagnostics.append(f"ps_stderr={ps_stderr}")
+
+            for service_name in ("bloodhound", "graph-db", "postgres"):
+                logs_result = run_docker(
+                    [*compose_args, "logs", "--tail", "20", service_name],
+                    check=False,
+                    capture_output=True,
+                    timeout=20,
+                )
+                logs_stdout = _safe_truncate(getattr(logs_result, "stdout", "") or "")
+                logs_stderr = _safe_truncate(getattr(logs_result, "stderr", "") or "")
+                diagnostics.append(
+                    f"{service_name}_logs_rc={getattr(logs_result, 'returncode', 'unknown')}"
+                )
+                if logs_stdout:
+                    diagnostics.append(f"{service_name}_logs={logs_stdout}")
+                if logs_stderr:
+                    diagnostics.append(f"{service_name}_logs_err={logs_stderr}")
+
+            return " | ".join(diagnostics)
+        except Exception as exc:
+            return f"compose_diagnostics_failed error={_safe_truncate(exc)}"
 
     def upsert_opengraph_edge(self, edge: Dict) -> bool:
         """Upsert a single custom edge into BH CE via a Cypher MERGE mutation.

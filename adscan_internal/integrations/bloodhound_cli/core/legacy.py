@@ -140,6 +140,62 @@ class BloodHoundLegacyClient(BloodHoundClient):
         results = self.execute_query(query, domain=domain)
         return [record["samaccountname"] for record in results]
 
+    def get_stale_enabled_users(
+        self, domain: str, stale_days: int = 180
+    ) -> List[Dict]:
+        """Legacy client best-effort stale-user query."""
+        current_epoch = int(time.time())
+        stale_seconds = max(1, int(stale_days or 180)) * 24 * 60 * 60
+        query = """
+        MATCH (u:User)
+        WHERE u.enabled = true AND toLower(u.domain) = toLower($domain)
+          AND (
+            (coalesce(u.lastlogon, 0) > 0 AND ($current_epoch - u.lastlogon) >= $stale_seconds)
+            OR
+            (coalesce(u.lastlogon, 0) = 0 AND coalesce(u.whencreated, 0) > 0
+             AND ($current_epoch - u.whencreated) >= $stale_seconds)
+          )
+        RETURN u.samaccountname AS samaccountname, u.lastlogon AS lastlogon, u.whencreated AS whencreated
+        """
+        results = self.execute_query(
+            query,
+            domain=domain,
+            current_epoch=current_epoch,
+            stale_seconds=stale_seconds,
+        )
+        records: List[Dict] = []
+        for record in results:
+            if not isinstance(record, dict):
+                continue
+            sam = record.get("samaccountname")
+            if not sam:
+                continue
+            lastlogon = record.get("lastlogon")
+            whencreated = record.get("whencreated")
+            last_seen_seconds = (
+                int(lastlogon)
+                if isinstance(lastlogon, (int, float)) and int(lastlogon) > 0
+                else (
+                    int(whencreated)
+                    if isinstance(whencreated, (int, float)) and int(whencreated) > 0
+                    else None
+                )
+            )
+            days_since_last_seen = None
+            if last_seen_seconds is not None:
+                days_since_last_seen = int((current_epoch - last_seen_seconds) // 86400)
+            records.append(
+                {
+                    "samaccountname": sam,
+                    "lastlogon": lastlogon,
+                    "whencreated": whencreated,
+                    "days_since_last_seen": days_since_last_seen,
+                    "stale_days_threshold": max(1, int(stale_days or 180)),
+                    "never_logged_on": not bool(lastlogon),
+                }
+            )
+        return records
+
     def get_domain_node(self, domain: str) -> Optional[Dict]:
         """Return the BloodHound `:Domain` node properties for a domain (best-effort)."""
         query = """
@@ -411,6 +467,8 @@ class BloodHoundLegacyClient(BloodHoundClient):
             target: target,
             targetType: targetType,
             type: type(r1),
+            sourceObjectId: coalesce(n.objectid, n.objectId, ''),
+            targetObjectId: coalesce(m.objectid, m.objectId, ''),
             sourceDomain: sourceDomain,
             targetDomain: targetDomain,
             targetEnabled: m.enabled
@@ -490,6 +548,8 @@ class BloodHoundLegacyClient(BloodHoundClient):
             target: target,
             targetType: targetType,
             type: type(r1),
+            sourceObjectId: coalesce(n.objectid, n.objectId, ''),
+            targetObjectId: coalesce(m.objectid, m.objectId, ''),
             sourceDomain: sourceDomain,
             targetDomain: targetDomain,
             targetEnabled: m.enabled

@@ -335,6 +335,11 @@ RUN set -eux; \
   /opt/adscan/tool_venvs/responder/venv/bin/python -m pip install --no-cache-dir -U pip; \
   /opt/adscan/tool_venvs/responder/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/responder/requirements.txt; \
   \
+  git clone --depth 1 https://github.com/p0dalirius/Coercer.git /opt/adscan/tools/coercer; \
+  python3 -m venv /opt/adscan/tool_venvs/coercer/venv; \
+  /opt/adscan/tool_venvs/coercer/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  /opt/adscan/tool_venvs/coercer/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/coercer/requirements.txt; \
+  \
   git clone https://github.com/jmk-foofus/medusa.git /opt/adscan/tools/medusa; \
   git -C /opt/adscan/tools/medusa checkout "${MEDUSA_COMMIT}"; \
   git clone --branch "${FREERDP_VERSION}" --depth 1 https://github.com/FreeRDP/FreeRDP.git /opt/adscan/tools/freerdp; \
@@ -452,6 +457,8 @@ RUN set -eux; \
     pypsrp==0.9.0 \
     pydantic-settings==2.13.1 \
     pydantic-ai==1.62.0 \
+    certihound==0.3.0 \
+    gssapi==1.10.1 \
     python-magic==0.4.27 \
     markitdown==0.1.5 \
     credsweeper==${CREDSWEEPER_VERSION} \

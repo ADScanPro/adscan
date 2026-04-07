@@ -3871,10 +3871,10 @@ def _send_session_to_vercel(
         payload.update(_vercel_metadata_fields(metadata))
         payload.update(_vercel_timestamp_fields(started_at, finished_at))
 
-        print_info_debug(
-            f"Sending session recording to Vercel via n8n proxy (session_id={session_id})",
-        )
-        print_info_debug(f"Vercel proxy URL: {vercel_proxy_url}")
+        # print_info_debug(
+        #     f"Sending session recording to Vercel via n8n proxy (session_id={session_id})",
+        # )
+        # print_info_debug(f"Vercel proxy URL: {vercel_proxy_url}")
         print_info_debug(f"Payload size: HTML={len(html_content)} bytes")
         print_info_debug(
             f"Vercel payload context: {_summarize_vercel_payload_context(payload)}",
@@ -3899,7 +3899,7 @@ def _send_session_to_vercel(
         # Parse response
         try:
             result = response.json()
-            print_info_debug(f"Vercel proxy response: {result}")
+            # print_info_debug(f"Vercel proxy response: {result}")
 
             # Extract session ID from response
             stored_session_id = result.get("session_id") or session_id
@@ -3911,7 +3911,7 @@ def _send_session_to_vercel(
                     f"https://sessions.adscanpro.com/sessions/{stored_session_id}"
                 )
 
-            print_info_debug(f"Session stored successfully via n8n: {session_url}")
+            # print_info_debug(f"Session stored successfully via n8n: {session_url}")
             return session_url
         except (ValueError, json.JSONDecodeError) as e:
             print_warning_debug(f"Vercel proxy response is not valid JSON: {e}")

@@ -265,7 +265,9 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         emit_phase("report_generation")
         print_info("Generating report as requested...")
         if shell.current_workspace_dir:
-            report_json_path = os.path.join(shell.current_workspace_dir, "report.json")
+            report_json_path = os.path.join(
+                shell.current_workspace_dir, "technical_report.json"
+            )
             report_format = getattr(args, "report_format", "word")
             report_file_path = run_generate_report(
                 shell, report_json_path, report_format
@@ -339,11 +341,11 @@ def run_generate_report(
     report_profile: str = "full",
     frameworks: Optional[list] = None,
 ) -> Optional[str]:
-    """Generate a Word or PDF report from JSON report file.
+    """Generate a Word or PDF report from technical report JSON.
 
     Args:
         shell: Shell instance with license_mode and event_bus
-        report_file: Path to JSON report file
+        report_file: Path to technical_report.json
         report_format: Format to generate ("word" or "pdf")
         report_profile: Report profile ("full", "technical", "executive")
         frameworks: Compliance frameworks to include. Valid values: "ens",
@@ -373,14 +375,10 @@ def run_generate_report(
 
     workspace_dir = Path(os.path.dirname(report_file)) if report_file else Path.cwd()
 
-    # Prefer technical_report.json when available (attack paths + findings).
-    technical_report = workspace_dir / "technical_report.json"
     report_path = Path(report_file)
-    if technical_report.exists():
-        report_path = technical_report
-        print_info_verbose(
-            f"Using technical report source: {mark_sensitive(str(report_path), 'path')}"
-        )
+    print_info_verbose(
+        f"Using technical report source: {mark_sensitive(str(report_path), 'path')}"
+    )
 
     report_service = ReportService(
         event_bus=getattr(shell, "event_bus", None),

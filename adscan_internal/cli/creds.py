@@ -35,6 +35,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import BRAND_COLORS, mark_sensitive, print_panel
+from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.cli.ci_events import emit_event, emit_phase
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.cli.cracking import (
@@ -592,6 +593,9 @@ def handle_auth_and_optional_privs(
     from adscan_internal.services.attack_step_support_registry import (
         classify_relation_support,
     )
+    from adscan_internal.services.privileged_group_classifier import (
+        resolve_privileged_followup_decision,
+    )
 
     def _resolve_active_step_compromise_metadata() -> tuple[str, str]:
         """Return normalized compromise semantics and effort for the active step."""
@@ -625,7 +629,7 @@ def handle_auth_and_optional_privs(
             return None
         terminal_mode = (
             search_mode
-            if search_mode in {"pivot search", "high-value search"}
+            if search_mode in {"pivot search", "high-value search", "tier-0 search"}
             and step_index > 0
             and step_index == last_executable_idx
             else None
@@ -660,6 +664,14 @@ def handle_auth_and_optional_privs(
         if not target_label:
             return None
         return normalize_samaccountname(target_label)
+
+    def _resolve_terminal_effective_target_basis_primary() -> dict[str, object]:
+        """Return the normalized primary effective-target-basis record."""
+        context = get_attack_path_step_context(shell)
+        payload = context.get("effective_target_basis_primary")
+        if isinstance(payload, dict):
+            return dict(payload)
+        return {}
 
     def _resolve_active_step_execution_user() -> str | None:
         """Best-effort extraction of the 'execution user' for the active step."""
@@ -770,6 +782,64 @@ def handle_auth_and_optional_privs(
         )
         return True
 
+    def _run_terminal_effective_privileged_followups(user: str, credential: str) -> bool:
+        """Run direct privileged follow-ups when terminal target basis already explains them."""
+        if not is_attack_path_execution_active(shell):
+            return False
+
+        terminal_search_mode = _get_terminal_attack_path_search_mode()
+        if terminal_search_mode not in {"tier-0 search", "high-value search"}:
+            return False
+
+        normalized_user = normalize_samaccountname(user)
+        target_principal = _resolve_active_step_target_principal()
+        if not normalized_user or not target_principal or normalized_user != target_principal:
+            return False
+
+        basis_primary = _resolve_terminal_effective_target_basis_primary()
+        basis_kind = str(
+            basis_primary.get("basis_kind")
+            or get_attack_path_step_context(shell).get("effective_target_basis_kind")
+            or ""
+        ).strip().lower()
+        if basis_kind != "member_of":
+            return False
+
+        marked_user = mark_sensitive(normalized_user, "user")
+        marked_basis = mark_sensitive(
+            str(basis_primary.get("target_label") or "unknown"),
+            "detail",
+        )
+        membership = shell.check_privileged_groups(
+            domain,
+            user,
+            credential,
+            execute_actions=False,
+        )
+        decision = resolve_privileged_followup_decision(membership or {})
+        if not (
+            decision.skip_attack_path_search or decision.should_run_enrichment_followup
+        ):
+            print_info_debug(
+                "[creds] terminal privileged follow-up bypass disabled "
+                f"(user={marked_user}, basis={marked_basis}, actionable=False)"
+            )
+            return False
+
+        print_info_debug(
+            "[creds] terminal privileged follow-up bypass enabled "
+            f"(search_mode={mark_sensitive(terminal_search_mode, 'detail')}, "
+            f"user={marked_user}, basis={marked_basis}, primary={decision.primary_key})"
+        )
+        shell._handle_privileged_group_membership(  # type: ignore[attr-defined]
+            domain,
+            user,
+            credential,
+            membership,
+            "attack-path-effective-target-basis",
+        )
+        return True
+
     def _should_force_full_user_privs_from_attack_context(user: str) -> bool:
         """Return True when attack-path context should promote a full user pivot.
 
@@ -870,12 +940,17 @@ def handle_auth_and_optional_privs(
                     )
                     continue
 
-            if (
-                terminal_search_mode == "high-value search"
-                and normalized_user
-            ):
+            if _run_terminal_effective_privileged_followups(user, cred):
+                continue
+
+            if terminal_search_mode in {"high-value search", "tier-0 search"} and normalized_user:
+                mode_label = (
+                    "high-value"
+                    if terminal_search_mode == "high-value search"
+                    else "tier-0"
+                )
                 print_info_debug(
-                    "[creds] enabling ask_for_user_privs for terminal high-value path "
+                    f"[creds] enabling ask_for_user_privs for terminal {mode_label} path "
                     f"user={mark_sensitive(normalized_user, 'user')}"
                 )
                 shell.ask_for_user_privs(domain, user, cred)
@@ -904,7 +979,7 @@ def handle_auth_and_optional_privs(
             if (
                 is_attack_path_execution_active(shell)
                 and not force_full_user_privs_from_attack_context
-                and terminal_search_mode == "high-value search"
+                and terminal_search_mode in {"high-value search", "tier-0 search"}
                 and normalized_user
             ):
                 should_force_high_value_terminal_user_privs = (
@@ -1065,6 +1140,7 @@ def add_credential(
     force_authenticated_enumeration: bool = False,
     prompt_when_already_authenticated: bool = False,
     allow_empty_credential: bool = False,
+    trusted_manual_validation: bool = False,
 ) -> None:
     """Add a credential to the workspace.
 
@@ -1110,6 +1186,11 @@ def add_credential(
             value instead of rejecting it as empty input. This is reserved for
             flows such as blank-password spraying where an empty secret is the
             candidate being verified.
+        trusted_manual_validation: When True, skip the live verification step and
+            treat the credential as already validated by the operator. This is
+            reserved for controlled flows such as manual confirmation of one
+            staged WriteLogonScript password where another automatic LDAP check
+            would risk locking the account.
     """
     from adscan_internal import print_operation_header
     from adscan_internal.services.credential_store_service import (
@@ -1167,7 +1248,7 @@ def add_credential(
         )
         shell.create_sub_workspace_for_domain(domain, pdc_ip=pdc_ip)
         time.sleep(1)
-        if verify_credential:
+        if verify_credential and not trusted_manual_validation:
             if _verify_domain_credentials(
                 shell,
                 domain,
@@ -1200,6 +1281,12 @@ def add_credential(
                                 f"[ui_silent] Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
                             )
                 return
+        if trusted_manual_validation:
+            credential_verified = True
+            print_info_verbose(
+                "[creds] Skipping live domain verification because the credential "
+                "was manually validated by the operator."
+            )
         shell.domains_data[domain]["username"] = user
         shell.domains_data[domain]["password"] = cred
         # Create necessary directories
@@ -1349,7 +1436,13 @@ def add_credential(
             cred, is_hash = handle_hash_cracking(shell, domain, user, cred)
 
         # Verify domain credentials before adding them (skip when domain is already pwned)
-        if verify_credential and not credential_verified:
+        if trusted_manual_validation:
+            credential_verified = True
+            print_info_verbose(
+                "[creds] Treating domain credential as manually validated; "
+                "live verification skipped."
+            )
+        elif verify_credential and not credential_verified:
             if _verify_domain_credentials(
                 shell,
                 domain,
@@ -1535,7 +1628,11 @@ def add_credential(
                     credential_type="hash" if is_hash else "password",
                     scope="domain",
                     verification_status=(
-                        "verified" if verify_credential or credential_verified else "trusted_import"
+                        "manually_validated"
+                        if trusted_manual_validation
+                        else "verified"
+                        if verify_credential or credential_verified
+                        else "trusted_import"
                     ),
                     message=f"Access established for {user}@{domain}.",
                 )
@@ -2572,7 +2669,13 @@ def process_cpassword_text(
                 )
                 report_recorded = True
             except Exception as exc:  # pragma: no cover
-                telemetry.capture_exception(exc)
+                if not handle_optional_report_service_exception(
+                    exc,
+                    action="Technical finding sync",
+                    debug_printer=print_info_debug,
+                    prefix="[gpp]",
+                ):
+                    telemetry.capture_exception(exc)
 
         print_success(f"cpassword found{source_label}: {cpassword_value}")
         plaintext_password = decrypt_cpassword(cpassword_value)
@@ -3710,7 +3813,13 @@ def handle_found_credentials(
             evidence=evidence_entries or None,
         )
     except Exception as exc:  # pragma: no cover
-        telemetry.capture_exception(exc)
+        if not handle_optional_report_service_exception(
+            exc,
+            action="Technical finding sync",
+            debug_printer=print_info_debug,
+            prefix="[smb-share-secrets]",
+        ):
+            telemetry.capture_exception(exc)
 
     if saved_files:
         print_success("Credentials saved to smb/spidering/ directory:")

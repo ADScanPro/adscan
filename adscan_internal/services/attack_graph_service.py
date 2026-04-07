@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, cast
 
 from adscan_internal import telemetry
+from adscan_internal.reporting_compat import load_optional_report_service_attr
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_info,
@@ -23,6 +24,17 @@ from adscan_internal.workspaces import domain_subpath, read_json_file, write_jso
 from adscan_internal.workspaces.computers import load_enabled_computer_samaccounts
 
 from adscan_internal.services import attack_graph_core, attack_paths_core
+from adscan_internal.services.privileged_group_classifier import (
+    classify_privileged_membership,
+    is_dependency_only_tier_zero_group,
+    is_followup_terminal_group,
+    is_future_followup_tier_zero_group,
+    is_graph_extension_group,
+    normalize_group_name,
+    normalize_sid,
+    privileged_followup_order_for_group_name,
+    resolve_privileged_followup_decision,
+)
 from adscan_internal.services.attack_paths_materialized_cache import (
     MaterializedAttackPathArtifacts,
     MaterializedPreparedRuntimeGraph,
@@ -45,11 +57,25 @@ from adscan_internal.services.membership_snapshot import (
     membership_snapshot_path as _membership_snapshot_path,
     snapshot_has_sid_metadata as _snapshot_has_sid_metadata,
 )
-from adscan_internal.services.high_value import normalize_samaccountname
+from adscan_internal.services.high_value import (
+    classify_users_tier0_high_value,
+    normalize_samaccountname,
+)
 from adscan_internal.services.cache_metrics import (
     copy_stats,
     increment_scoped_stats,
     reset_stats,
+)
+from adscan_internal.services.adcs_path_display import (
+    format_adcs_templates_summary,
+    resolve_adcs_display_target,
+)
+from adscan_internal.services.adcs_target_filter import (
+    is_adcs_tier_zero_group,
+    domain_has_adcs_for_attack_steps,
+)
+from adscan_internal.services.ldap_transport_service import (
+    prepare_kerberos_ldap_environment,
 )
 
 
@@ -81,6 +107,7 @@ ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 _CERTIPY_TEMPLATE_CACHE: dict[str, dict[str, Any]] = {}
+_CERTIHOUND_TEMPLATE_CACHE: dict[str, dict[str, Any]] = {}
 _REPORT_SYNC_FN: Callable[[object, str, dict[str, Any]], None] | None | bool = None
 
 
@@ -386,6 +413,26 @@ def get_enabled_users_for_domain(
         )
         return users
     return None
+
+
+def get_domain_users_for_domain(
+    shell: object,
+    domain: str,
+) -> set[str] | None:
+    """Return domain users from membership data without applying enabled filtering."""
+    snapshot = _load_membership_snapshot(shell, domain)
+    if not isinstance(snapshot, dict):
+        return None
+    user_to_groups = snapshot.get("user_to_groups")
+    if not isinstance(user_to_groups, dict):
+        return None
+    users = {
+        normalized
+        for label in user_to_groups.keys()
+        if isinstance(label, str) and str(label).strip()
+        if (normalized := normalize_samaccountname(_membership_label_to_name(label)))
+    }
+    return users or None
 
 
 def get_enabled_computers_for_domain(
@@ -1276,25 +1323,21 @@ def resolve_user_sid(shell: object, domain: str, username: str) -> str | None:
                 return sid.strip()
 
     try:
-        service = getattr(shell, "_get_bloodhound_service", None)
-        if service:
-            bh_service = service()
-            resolver = getattr(bh_service, "get_user_node_by_samaccountname", None)
-            if callable(resolver):
-                node = resolver(domain, username)
-                if isinstance(node, dict):
-                    sid = (
-                        node.get("objectid")
-                        or node.get("objectId")
-                        or (node.get("properties") or {}).get("objectid")
-                        or (node.get("properties") or {}).get("objectId")
-                    )
-                    if isinstance(sid, str) and sid.strip():
-                        print_info_debug(
-                            f"[membership] user SID resolved from BloodHound for "
-                            f"{marked_user}@{marked_domain}: {mark_sensitive(sid, 'user')}"
-                        )
-                        return sid.strip()
+        node = _resolve_bloodhound_principal_node(
+            shell,
+            domain,
+            _canonical_membership_label(domain, username),
+            entry_kind="user",
+            graph=None,
+            lookup_name=username,
+        )
+        sid = _extract_node_object_id(node)
+        if isinstance(sid, str) and sid.strip():
+            print_info_debug(
+                f"[membership] user SID resolved from BloodHound for "
+                f"{marked_user}@{marked_domain}: {mark_sensitive(sid, 'user')}"
+            )
+            return sid.strip()
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
 
@@ -2055,6 +2098,51 @@ def _build_recursive_membership_closure(
     return recursive_groups_by_principal
 
 
+def _build_recursive_group_ancestor_closure(
+    domain: str,
+    snapshot: dict[str, Any],
+) -> dict[str, tuple[str, ...]]:
+    """Build ``group -> recursive parent groups`` from the membership snapshot."""
+    group_to_parents = snapshot.get("group_to_parents")
+    if not isinstance(group_to_parents, dict):
+        return {}
+
+    ancestor_cache: dict[str, set[str]] = {}
+    recursive_parents_by_group: dict[str, tuple[str, ...]] = {}
+    for group_label in group_to_parents:
+        canonical_group = attack_paths_core._canonical_membership_label(  # noqa: SLF001
+            domain,
+            group_label,
+        )
+        if not canonical_group:
+            continue
+        expanded = attack_paths_core._expand_group_ancestors(  # noqa: SLF001
+            domain,
+            canonical_group,
+            group_to_parents,
+            ancestor_cache,
+        )
+        if expanded:
+            recursive_parents_by_group[canonical_group] = tuple(sorted(expanded))
+    return recursive_parents_by_group
+
+
+def _apply_recursive_target_priority_overrides(
+    graph: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+    *,
+    domain: str,
+) -> bool:
+    """No-op compatibility shim.
+
+    BloodHound is the source of truth for target criticality (tier-zero/high-value).
+    ADscan now layers follow-up/terminal semantics on top of that instead of
+    mutating criticality recursively in the local graph.
+    """
+    _ = graph, snapshot, domain
+    return False
+
+
 def _load_or_build_materialized_attack_path_artifacts(
     shell: object,
     *,
@@ -2721,6 +2809,1308 @@ def _extract_certipy_object_control_principals(entry: dict[str, Any]) -> set[str
     return principals
 
 
+def _certihound_detection_report_path(domain_dir: str) -> str | None:
+    """Return the canonical cache path for CertiHound detection results."""
+    if not domain_dir:
+        return None
+    adcs_dir = os.path.join(domain_dir, "adcs")
+    if not os.path.isdir(adcs_dir):
+        return None
+    return os.path.join(adcs_dir, "certihound_detections.json")
+
+
+def _writable_attribute_report_path(
+    domain_dir: str,
+) -> str | None:
+    """Return the canonical writable-attribute cache path for one domain."""
+    if not domain_dir:
+        return None
+    acl_dir = os.path.join(domain_dir, "acl")
+    if not os.path.isdir(acl_dir):
+        try:
+            os.makedirs(acl_dir, exist_ok=True)
+        except OSError:
+            return None
+    return os.path.join(acl_dir, "writable_attributes_domain.json")
+
+
+def _load_writable_attribute_report(
+    domain_dir: str,
+) -> dict[str, Any] | None:
+    """Load cached writable-attribute findings when present."""
+    report_path = _writable_attribute_report_path(domain_dir)
+    if not report_path or not os.path.exists(report_path):
+        return None
+    try:
+        report = read_json_file(report_path)
+        return report if isinstance(report, dict) else None
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return None
+
+
+def _persist_writable_attribute_report(
+    domain_dir: str,
+    report: dict[str, Any],
+) -> None:
+    """Persist writable-attribute findings for one domain."""
+    report_path = _writable_attribute_report_path(domain_dir)
+    if not report_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        write_json_file(report_path, report)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+
+def _load_certihound_detection_report(domain_dir: str) -> dict[str, Any] | None:
+    """Load cached CertiHound detections from the workspace when present."""
+    report_path = _certihound_detection_report_path(domain_dir)
+    if not report_path or not os.path.exists(report_path):
+        return None
+    try:
+        report = read_json_file(report_path)
+        return report if isinstance(report, dict) else None
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return None
+
+
+def _persist_certihound_detection_report(domain_dir: str, report: dict[str, Any]) -> None:
+    """Persist CertiHound detections to the canonical workspace cache file."""
+    report_path = _certihound_detection_report_path(domain_dir)
+    if not report_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        write_json_file(report_path, report)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+
+def _resolve_certihound_detection_report(
+    shell: object,
+    domain: str,
+) -> dict[str, Any] | None:
+    """Load or build a CertiHound-backed ADCS detection report for one domain."""
+    from adscan_internal.services import CredentialStoreService
+    from adscan_internal.services.certihound_detection_service import (
+        CertiHoundDetectionService,
+    )
+
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return None
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    domain_dir = domain_data.get("dir") if isinstance(domain_data, dict) else None
+    if not isinstance(domain_dir, str) or not domain_dir:
+        return None
+
+    cached_report = _load_certihound_detection_report(domain_dir)
+    if isinstance(cached_report, dict):
+        return cached_report
+
+    creds = CredentialStoreService.resolve_auth_credentials(
+        getattr(shell, "domains_data", {}),
+        target_domain=domain_key,
+        primary_domain=getattr(shell, "domain", None),
+    )
+    if not creds:
+        print_info_debug(
+            "[adcs] No credentials available for CertiHound detection; skipping."
+        )
+        return None
+    username, password, auth_domain = creds
+
+    kerberos_ready = bool(
+        getattr(shell, "domains_data", {}).get(domain_key, {}).get("kerberos_tickets")
+    )
+    if kerberos_ready:
+        kerberos_ready = prepare_kerberos_ldap_environment(
+            operation_name="CertiHound detection",
+            target_domain=domain_key,
+            workspace_dir=str(
+                getattr(shell, "current_workspace_dir", "")
+                or getattr(shell, "_get_workspace_cwd", lambda: "")()
+                or ""
+            ),
+            username=str(username),
+            user_domain=str(auth_domain or domain_key),
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+        )
+    dc_fqdn = domain_data.get("pdc_hostname_fqdn") or domain_data.get("pdc_fqdn")
+    if not dc_fqdn:
+        pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip()
+        if pdc_hostname:
+            dc_fqdn = (
+                pdc_hostname if "." in pdc_hostname else f"{pdc_hostname}.{domain_key}"
+            )
+    dc_ip = str(domain_data.get("pdc") or "").strip()
+    dc_target = dc_fqdn if kerberos_ready and dc_fqdn else dc_ip
+    if not dc_target:
+        print_info_debug(
+            "[adcs] Missing DC target for CertiHound detection; skipping."
+        )
+        return None
+
+    service = CertiHoundDetectionService()
+    report = service.build_detection_report(
+        target_domain=domain_key,
+        dc_address=str(dc_target),
+        username=None if kerberos_ready else str(username),
+        password=None if kerberos_ready else str(password),
+        use_kerberos=kerberos_ready,
+        use_ldaps=True,
+    )
+    if not isinstance(report, dict):
+        return None
+
+    _persist_certihound_detection_report(domain_dir, report)
+    return report
+
+
+def _resolve_writable_attribute_report(
+    shell: object,
+    domain: str,
+) -> dict[str, Any] | None:
+    """Load or build domain-scope writable-attribute findings for one domain."""
+    from adscan_internal.services import CredentialStoreService
+    from adscan_internal.services.domain_writable_attribute_detection_service import (
+        DomainWritableAttributeDetectionService,
+    )
+
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return None
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain_key, {})
+    domain_dir = domain_data.get("dir") if isinstance(domain_data, dict) else None
+    if not isinstance(domain_dir, str) or not domain_dir:
+        return None
+
+    creds = CredentialStoreService.resolve_auth_credentials(
+        getattr(shell, "domains_data", {}),
+        target_domain=domain_key,
+        primary_domain=getattr(shell, "domain", None),
+    )
+    if not creds:
+        print_info_debug(
+            "[writable-attrs] No credentials available for writable-attribute discovery; skipping."
+        )
+        return None
+    username, password, auth_domain = creds
+
+    cached_report = _load_writable_attribute_report(domain_dir)
+    if isinstance(cached_report, dict):
+        return cached_report
+
+    kerberos_ready = bool(
+        getattr(shell, "domains_data", {}).get(domain_key, {}).get("kerberos_tickets")
+    )
+    if kerberos_ready:
+        kerberos_ready = prepare_kerberos_ldap_environment(
+            operation_name="Domain writable-attribute detection",
+            target_domain=domain_key,
+            workspace_dir=str(
+                getattr(shell, "current_workspace_dir", "")
+                or getattr(shell, "_get_workspace_cwd", lambda: "")()
+                or ""
+            ),
+            username=str(username),
+            user_domain=str(auth_domain or domain_key),
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+        )
+    pdc_ip = str(domain_data.get("pdc") or "").strip()
+    dc_fqdn = domain_data.get("pdc_hostname_fqdn") or domain_data.get("pdc_fqdn")
+    if not dc_fqdn:
+        pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip()
+        if pdc_hostname:
+            dc_fqdn = (
+                pdc_hostname if "." in pdc_hostname else f"{pdc_hostname}.{domain_key}"
+            )
+    dc_target = dc_fqdn if kerberos_ready and dc_fqdn else pdc_ip
+    if not dc_target:
+        print_info_debug(
+            "[writable-attrs] Missing DC target for writable-attribute discovery; skipping."
+        )
+        return None
+
+    print_info_debug(
+        f"[writable-attrs] attempting domain-wide writable-attribute discovery for "
+        f"{mark_sensitive(domain_key, 'domain')} via {mark_sensitive(str(dc_target), 'host')}"
+    )
+    report = DomainWritableAttributeDetectionService().build_user_attribute_write_report(
+        dc_address=str(dc_target),
+        target_domain=domain_key,
+        username=None if kerberos_ready else str(username),
+        password=None if kerberos_ready else str(password),
+        use_kerberos=kerberos_ready,
+        use_ldaps=True,
+    )
+    if not isinstance(report, dict):
+        return None
+
+    _persist_writable_attribute_report(domain_dir, report=report)
+    return report
+
+
+def _resolve_current_token_principal_labels(
+    shell: object,
+    *,
+    domain: str,
+    username: str,
+) -> set[str]:
+    """Resolve canonical labels represented by the current authenticated token."""
+    domain_key = str(domain or "").strip()
+    username_clean = normalize_samaccountname(username)
+    if not domain_key or not username_clean:
+        return set()
+    labels = {
+        _canonical_membership_label(domain_key, username_clean),
+        _canonical_membership_label(domain_key, "Authenticated Users"),
+        _canonical_membership_label(domain_key, "Everyone"),
+    }
+    try:
+        recursive_groups = _attack_path_get_recursive_groups(
+            shell,
+            domain=domain_key,
+            samaccountname=username_clean,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        recursive_groups = []
+    for group_name in recursive_groups:
+        label = _canonical_membership_label(domain_key, group_name)
+        if label:
+            labels.add(label)
+    return {label for label in labels if label}
+
+
+def get_netlogon_write_support_paths(
+    shell: object,
+    domain: str,
+    *,
+    graph: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate NETLOGON prerequisites for existing ``WriteLogonScript`` edges."""
+    from adscan_internal.services import CredentialStoreService
+    from adscan_internal.services.smb_path_access_service import SMBPathAccessService
+
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return []
+    graph_data = graph if isinstance(graph, dict) else load_attack_graph(shell, domain_key)
+
+    report = _resolve_writable_attribute_report(shell, domain_key)
+    if not isinstance(report, dict):
+        return []
+    findings = report.get("findings")
+    if not isinstance(findings, list) or not findings:
+        return []
+
+    creds = CredentialStoreService.resolve_auth_credentials(
+        getattr(shell, "domains_data", {}),
+        target_domain=domain_key,
+        primary_domain=getattr(shell, "domain", None),
+    )
+    if not creds:
+        print_info_debug(
+            "[smb-path] No credentials available for NETLOGON write validation; skipping."
+        )
+        return []
+    username, password, auth_domain = creds
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain_key, {})
+    dc_fqdn = domain_data.get("pdc_hostname_fqdn") or domain_data.get("pdc_fqdn")
+    if not dc_fqdn:
+        pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip()
+        if pdc_hostname:
+            dc_fqdn = (
+                pdc_hostname if "." in pdc_hostname else f"{pdc_hostname}.{domain_key}"
+            )
+    dc_target = str(dc_fqdn or domain_data.get("pdc") or "").strip()
+    if not dc_target:
+        print_info_debug(
+            "[smb-path] Missing DC target for NETLOGON write validation; skipping."
+        )
+        return []
+
+    kerberos_ready = bool(
+        getattr(shell, "domains_data", {}).get(domain_key, {}).get("kerberos_tickets")
+    )
+    if kerberos_ready:
+        kerberos_ready = prepare_kerberos_ldap_environment(
+            operation_name="NETLOGON write validation",
+            target_domain=domain_key,
+            workspace_dir=str(
+                getattr(shell, "current_workspace_dir", "")
+                or getattr(shell, "_get_workspace_cwd", lambda: "")()
+                or ""
+            ),
+            username=str(username),
+            user_domain=str(auth_domain or domain_key),
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+        )
+
+    probe_service = SMBPathAccessService()
+    staging_candidates = _build_writelogonscript_staging_candidates(domain_key)
+    candidate_snapshots: list[tuple[dict[str, str], Any]] = []
+    for candidate in staging_candidates:
+        security_snapshot = probe_service.collect_security_snapshot(
+            target_host=dc_target,
+            share_name=candidate["share"],
+            directory_path=candidate["path"],
+            username=str(username),
+            password=str(password),
+            auth_domain=str(auth_domain or domain_key),
+            use_kerberos=kerberos_ready,
+            kdc_host=dc_target if kerberos_ready else None,
+        )
+        candidate_snapshots.append((candidate, security_snapshot))
+        if (
+            not security_snapshot.share_descriptor_readable
+            or not security_snapshot.path_descriptor_readable
+        ):
+            print_info_debug(
+                f"[smb-path] {candidate['name']} ACL snapshot incomplete for "
+                f"{mark_sensitive(domain_key, 'domain')}: "
+                f"share_sd={security_snapshot.share_descriptor_readable} "
+                f"path_sd={security_snapshot.path_descriptor_readable} "
+                f"status={security_snapshot.status_code or '-'} "
+                f"error={security_snapshot.error_message or '-'}"
+            )
+
+    seen_source_labels: set[str] = set()
+    seen_source_ids: set[str] = set()
+    principals_evaluated = 0
+    validated_edges = 0
+    unavailable_edges = 0
+    unknown_edges = 0
+    graph_changed = False
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        principal_sid = str(finding.get("principal_sid") or "").strip()
+        if not principal_sid:
+            continue
+        should_skip, _, principal_node = _evaluate_lowpriv_source_principal(
+            shell,
+            domain=domain_key,
+            object_id=principal_sid,
+            preferred_kind="group",
+            graph=graph,
+            skip_on_unresolved=True,
+        )
+        if should_skip or not isinstance(principal_node, dict):
+            continue
+        source_label = str(principal_node.get("name") or "").strip()
+        if not source_label:
+            continue
+        if source_label.upper() in seen_source_labels:
+            continue
+        source_object_id = normalize_sid(
+            _extract_node_object_id(principal_node) or principal_sid
+        )
+        if not source_object_id:
+            continue
+        if source_object_id in seen_source_ids:
+            continue
+        seen_source_ids.add(source_object_id)
+        principals_evaluated += 1
+        candidate_notes: list[dict[str, Any]] = []
+        selected_candidate: dict[str, Any] | None = None
+        all_candidates_denied = True
+        for candidate, security_snapshot in candidate_snapshots:
+            base_notes = {
+                "name": candidate["name"],
+                "host": dc_target,
+                "share": candidate["share"],
+                "path": candidate["path"],
+                "source": "smb_acl_snapshot",
+                "detector": "impacket_smb_acl",
+                "validated_via_username": str(username),
+                "auth_mode": security_snapshot.auth_mode,
+                "share_descriptor_readable": security_snapshot.share_descriptor_readable,
+                "path_descriptor_readable": security_snapshot.path_descriptor_readable,
+                "share_backing_path": security_snapshot.share_backing_path,
+            }
+            if (
+                not security_snapshot.share_descriptor_readable
+                or not security_snapshot.path_descriptor_readable
+            ):
+                candidate_notes.append(
+                    {
+                        **base_notes,
+                        "validation": "unknown",
+                        "reason": f"{candidate['name']} share/path security descriptor could not be fully read",
+                    }
+                )
+                all_candidates_denied = False
+                continue
+
+            acl_result = probe_service.evaluate_snapshot_write_access(
+                snapshot=security_snapshot,
+                principal_sid=source_object_id,
+            )
+            effective_can_write = bool(
+                acl_result.share_allows_write and acl_result.path_allows_write
+            )
+            candidate_result = {
+                **base_notes,
+                "validation": "validated" if effective_can_write else "denied",
+                "share_allows_write": acl_result.share_allows_write,
+                "path_allows_write": acl_result.path_allows_write,
+                "matched_share_sids": list(acl_result.matched_share_sids),
+                "matched_path_sids": list(acl_result.matched_path_sids),
+            }
+            candidate_notes.append(candidate_result)
+            if effective_can_write and selected_candidate is None:
+                selected_candidate = candidate_result
+            if effective_can_write:
+                all_candidates_denied = False
+            elif candidate_result["validation"] != "denied":
+                all_candidates_denied = False
+
+        validation_state = "unknown"
+        reason = "No staging share candidate could be validated."
+        top_level_notes: dict[str, Any] = {
+            "source": "smb_acl_snapshot",
+            "detector": "impacket_smb_acl",
+            "host": dc_target,
+            "validated_via_username": str(username),
+            "staging_candidates": candidate_notes,
+        }
+        primary_candidate = selected_candidate or (candidate_notes[0] if candidate_notes else None)
+        if isinstance(primary_candidate, dict):
+            top_level_notes.update(
+                {
+                    "share": primary_candidate.get("share"),
+                    "path": primary_candidate.get("path"),
+                    "auth_mode": primary_candidate.get("auth_mode"),
+                    "share_descriptor_readable": primary_candidate.get("share_descriptor_readable"),
+                    "path_descriptor_readable": primary_candidate.get("path_descriptor_readable"),
+                    "share_backing_path": primary_candidate.get("share_backing_path"),
+                    "share_allows_write": primary_candidate.get("share_allows_write"),
+                    "path_allows_write": primary_candidate.get("path_allows_write"),
+                    "matched_share_sids": primary_candidate.get("matched_share_sids", []),
+                    "matched_path_sids": primary_candidate.get("matched_path_sids", []),
+                }
+            )
+        if selected_candidate is not None:
+            validation_state = "validated"
+            reason = (
+                f"{selected_candidate['name']} share and path ACLs allow write for the source principal"
+            )
+            top_level_notes.update(
+                {
+                    "selected_staging_candidate": selected_candidate.get("name"),
+                }
+            )
+            seen_source_labels.add(source_label.upper())
+        elif all_candidates_denied and candidate_notes:
+            validation_state = "denied"
+            reason = (
+                "No supported staging share/path candidate provides write access for the source principal"
+            )
+        else:
+            validation_state = "unknown"
+            reason = (
+                "Supported staging share/path candidates could not be fully validated for the source principal"
+            )
+
+        updated = _annotate_writelogonscript_prerequisite_status(
+            graph_data,
+            source_object_id=source_object_id,
+            validation_state=validation_state,
+            notes={
+                **top_level_notes,
+                "reason": reason,
+            },
+        )
+        if validation_state == "validated":
+            validated_edges += updated
+        elif validation_state == "denied":
+            unavailable_edges += updated
+        else:
+            unknown_edges += updated
+        graph_changed = graph_changed or bool(updated)
+
+    print_info_debug(
+        f"[attack_graph] NETLOGON prerequisite validation for {mark_sensitive(domain_key, 'domain')}: "
+        f"principals_evaluated={principals_evaluated} "
+        f"validated_edges={validated_edges} "
+        f"unavailable_edges={unavailable_edges} "
+        f"unknown_edges={unknown_edges}"
+    )
+    if graph_changed and graph is None:
+        save_attack_graph(shell, domain_key, graph_data)
+    return []
+
+
+def _build_writelogonscript_staging_candidates(domain: str) -> list[dict[str, str]]:
+    """Return supported SMB staging locations for logon-script abuse."""
+    domain_key = str(domain or "").strip().strip("\\/")
+    return [
+        {"name": "NETLOGON", "share": "NETLOGON", "path": ""},
+        {
+            "name": "SYSVOL scripts",
+            "share": "SYSVOL",
+            "path": f"{domain_key}\\scripts" if domain_key else "scripts",
+        },
+    ]
+
+
+def _annotate_writelogonscript_prerequisite_status(
+    graph: dict[str, Any],
+    *,
+    source_object_id: str,
+    validation_state: str,
+    notes: dict[str, Any],
+) -> int:
+    """Update matching ``WriteLogonScript`` edges with NETLOGON prerequisite state."""
+    source_key = normalize_sid(str(source_object_id or "").strip())
+    state = str(validation_state or "").strip().lower()
+    desired_status = {
+        "validated": "discovered",
+        "unknown": "discovered",
+        "denied": "unavailable",
+    }.get(state)
+    if not source_key or not desired_status:
+        return 0
+
+    edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+    if not edges:
+        return 0
+
+    changed = 0
+    now = _utc_now_iso()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if str(edge.get("relation") or "").strip().lower() != "writelogonscript":
+            continue
+        if normalize_sid(str(edge.get("from") or "").strip()) != source_key:
+            continue
+
+        existing_notes = edge.get("notes")
+        if not isinstance(existing_notes, dict):
+            existing_notes = {}
+        merged_notes = dict(existing_notes)
+        merged_notes.update(notes)
+        merged_notes["netlogon_validation"] = state
+        merged_notes["netlogon_validation_checked_at"] = now
+        edge["notes"] = merged_notes
+
+        current_status = str(edge.get("status") or "discovered").strip().lower()
+        if current_status not in {"success", "attempted", "failed", "error"}:
+            edge["status"] = desired_status
+        edge["last_seen"] = now
+        changed += 1
+
+    return changed
+
+
+def _infer_kind_from_label(label: str) -> str:
+    """Infer a principal kind from a normalized BloodHound-style label."""
+    label_clean = str(label or "").strip()
+    if not label_clean:
+        return "Unknown"
+    left = label_clean.split("@", 1)[0].strip()
+    if left.endswith("$"):
+        return "Computer"
+    if " " in left:
+        return "Group"
+    return "User"
+
+
+def _build_synthetic_principal_node_from_sid(
+    *,
+    domain: str,
+    sid: str,
+    label: str | None,
+) -> dict[str, Any]:
+    """Build a synthetic principal node when BH-backed resolution is unavailable."""
+    resolved_label = str(label or sid or "").strip()
+    kind = _infer_kind_from_label(resolved_label)
+    return {
+        "name": resolved_label,
+        "kind": [kind],
+        "objectId": sid,
+        "properties": {
+            "name": resolved_label,
+            "domain": str(domain or "").strip().upper(),
+            "objectid": sid,
+        },
+    }
+
+
+def _build_certihound_enterpriseca_node(
+    *,
+    domain: str,
+    object_id: str,
+    details: dict[str, Any],
+) -> dict[str, Any]:
+    """Build an EnterpriseCA node from CertiHound detection metadata."""
+    ca_name = str(
+        details.get("enterpriseca_name")
+        or details.get("enterpriseca")
+        or object_id
+        or "EnterpriseCA"
+    ).strip()
+    canonical_name = ca_name if "@" in ca_name else f"{ca_name.upper()}@{domain.upper()}"
+    return {
+        "name": canonical_name,
+        "kind": ["EnterpriseCA"],
+        "objectId": object_id,
+        "properties": {
+            "name": canonical_name,
+            "domain": str(domain or "").strip().upper(),
+            "objectid": object_id,
+            "distinguishedname": details.get("enterpriseca"),
+            "caname": ca_name,
+            "highvalue": True,
+        },
+        "isTierZero": True,
+    }
+
+
+def get_certihound_adcs_paths(
+    shell: object,
+    domain: str,
+    *,
+    graph: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build ADCS escalation edges from CertiHound direct detections."""
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return []
+
+    report = _resolve_certihound_detection_report(shell, domain_key)
+    if not isinstance(report, dict):
+        return []
+
+    loaded_graph = graph
+    if loaded_graph is None:
+        try:
+            loaded_graph = load_attack_graph(shell, domain_key)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            loaded_graph = None
+
+    snapshot = _load_membership_snapshot(shell, domain_key)
+    domain_node = resolve_domain_node_record_for_domain(
+        shell,
+        domain_key,
+        graph=loaded_graph,
+    )
+
+    edges: list[dict[str, Any]] = []
+    raw_edges = report.get("edges")
+    if not isinstance(raw_edges, list):
+        return []
+
+    for entry in raw_edges:
+        if not isinstance(entry, dict):
+            continue
+        relation = str(entry.get("relation") or "").strip()
+        start_object_id = str(entry.get("start_object_id") or "").strip()
+        details = entry.get("details") if isinstance(entry.get("details"), dict) else {}
+        if not relation or not start_object_id:
+            continue
+
+        start_node: dict[str, Any] | None = None
+        if start_object_id.upper().startswith("S-1-"):
+            principal_label = _resolve_group_label_for_sid(
+                snapshot=snapshot,
+                domain=domain_key,
+                target_sid=start_object_id,
+            )
+            if principal_label:
+                start_node = _resolve_bloodhound_principal_node(
+                    shell,
+                    domain_key,
+                    principal_label,
+                    object_id=start_object_id,
+                    entry_kind=_infer_kind_from_label(principal_label).lower(),
+                    graph=loaded_graph,
+                    lookup_name=principal_label.split("@", 1)[0],
+                )
+            if not isinstance(start_node, dict):
+                start_node = _build_synthetic_principal_node_from_sid(
+                    domain=domain_key,
+                    sid=start_object_id,
+                    label=principal_label,
+                )
+        else:
+            start_node = _build_certihound_enterpriseca_node(
+                domain=domain_key,
+                object_id=start_object_id,
+                details=details,
+            )
+
+        notes = dict(details) if isinstance(details, dict) else {}
+        notes.setdefault("source", "certihound")
+        notes.setdefault("detector", "certihound")
+
+        edges.append(
+            {
+                "nodes": [start_node, domain_node],
+                "rels": [relation],
+                "notes_by_relation_index": {0: notes},
+            }
+        )
+
+    print_info_debug(
+        f"[attack_graph] certihound-derived ADCS paths for {mark_sensitive(domain_key, 'domain')}: "
+        f"count={len(edges)}"
+    )
+    return edges
+
+
+def _resolve_principal_label_from_sid(
+    shell: object,
+    *,
+    domain: str,
+    sid: str,
+    preferred_kind: str | None = None,
+) -> str | None:
+    """Resolve one SID to a canonical membership label when possible."""
+    sid_clean = str(sid or "").strip()
+    if not sid_clean:
+        return None
+    snapshot = _load_membership_snapshot(shell, domain)
+    if isinstance(snapshot, dict):
+        label = _resolve_group_label_for_sid(snapshot, domain, sid_clean)
+        if label:
+            return label
+    node = _resolve_bloodhound_principal_node(
+        shell,
+        domain,
+        sid_clean,
+        object_id=sid_clean,
+        entry_kind=(preferred_kind or "").strip().lower() or None,
+        graph=None,
+        lookup_name=sid_clean,
+    )
+    if not isinstance(node, dict):
+        return None
+    node_name = str(node.get("name") or "").strip()
+    if not node_name:
+        return None
+    return _canonical_membership_label(domain, node_name)
+
+
+def _resolve_principal_node_from_sid(
+    shell: object,
+    *,
+    domain: str,
+    sid: str,
+    preferred_kind: str = "group",
+) -> dict[str, Any] | None:
+    """Resolve one principal node from a SID using BH-backed lookup helpers."""
+    domain_key = str(domain or "").strip()
+    sid_clean = str(sid or "").strip().upper()
+    if not domain_key or not sid_clean:
+        return None
+
+    label = _resolve_principal_label_from_sid(
+        shell,
+        domain=domain_key,
+        sid=sid_clean,
+        preferred_kind=preferred_kind,
+    )
+    if not label:
+        return None
+
+    principal_name = _membership_label_to_name(label)
+    return _resolve_bloodhound_principal_node(
+        shell,
+        domain_key,
+        label,
+        object_id=sid_clean,
+        entry_kind=preferred_kind,
+        graph=None,
+        lookup_name=principal_name or sid_clean,
+    )
+
+
+def _looks_like_sid(value: str) -> bool:
+    """Return whether one string looks like a SID value."""
+    candidate = str(value or "").strip().upper()
+    return bool(candidate) and candidate.startswith("S-1-")
+
+
+def _is_non_emittable_builtin_sid(sid: str) -> bool:
+    """Return whether one SID is a builtin/system principal we never emit."""
+    sid_clean = str(sid or "").strip().upper()
+    if not sid_clean:
+        return False
+    well_known = {
+        "S-1-5-18",  # LOCAL SYSTEM
+        "S-1-5-19",  # LOCAL SERVICE
+        "S-1-5-20",  # NETWORK SERVICE
+    }
+    return sid_clean in well_known
+
+
+def _is_population_wide_lowpriv_trustee_sid(shell: object, *, domain: str, sid: str) -> bool:
+    """Return whether one trustee SID intentionally expands to the enabled low-priv population."""
+    sid_clean = str(sid or "").strip().upper()
+    if not sid_clean:
+        return False
+    if sid_clean in {"S-1-5-11", "S-1-1-0"}:
+        return True
+    domain_sid = _load_domain_sid_from_domains_data(shell, domain)
+    if not domain_sid:
+        snapshot = _load_membership_snapshot(shell, domain)
+        if isinstance(snapshot, dict):
+            domain_sid = _resolve_domain_sid(shell, domain, snapshot)
+    return bool(domain_sid) and sid_clean == f"{domain_sid.upper()}-513"
+
+
+def _evaluate_lowpriv_source_principal(
+    shell: object,
+    *,
+    domain: str,
+    object_id: str | None = None,
+    label: str | None = None,
+    principal_name: str | None = None,
+    preferred_kind: str = "group",
+    graph: dict[str, Any] | None = None,
+    skip_on_unresolved: bool = True,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    """Evaluate whether one source principal should be skipped for low-priv pathing."""
+    object_id_clean = str(object_id or "").strip().upper()
+    if object_id_clean and _is_non_emittable_builtin_sid(object_id_clean):
+        return True, "builtin_or_system_principal", None
+
+    node: dict[str, Any] | None = None
+    if object_id_clean:
+        node = _resolve_principal_node_from_sid(
+            shell,
+            domain=domain,
+            sid=object_id_clean,
+            preferred_kind=preferred_kind,
+        )
+    else:
+        label_clean = str(label or "").strip()
+        if label_clean:
+            node = _resolve_bloodhound_principal_node(
+                shell,
+                domain,
+                label_clean,
+                object_id=object_id_clean or None,
+                entry_kind=preferred_kind,
+                graph=graph,
+                lookup_name=principal_name or label_clean,
+            )
+
+    if not isinstance(node, dict):
+        if skip_on_unresolved:
+            return True, "unresolved_principal", None
+        return False, None, None
+
+    if _node_is_effectively_high_value(node):
+        return True, "privileged_principal", node
+
+    return False, None, node
+
+
+def _expand_low_priv_usernames_from_trustee_sid(
+    shell: object,
+    *,
+    domain: str,
+    principal_sid: str,
+    candidate_users: set[str] | None,
+) -> set[str]:
+    """Expand one trustee SID into candidate user sources for Phase 2."""
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return set()
+
+    sid_clean = str(principal_sid or "").strip().upper()
+    if not sid_clean:
+        return set()
+
+    domain_sid = _load_domain_sid_from_domains_data(shell, domain_key)
+    if not domain_sid:
+        snapshot = _load_membership_snapshot(shell, domain_key)
+        if isinstance(snapshot, dict):
+            domain_sid = _resolve_domain_sid(shell, domain_key, snapshot)
+
+    if sid_clean in {"S-1-5-11", "S-1-1-0"}:
+        return set(candidate_users or set())
+    if domain_sid and sid_clean == f"{domain_sid.upper()}-513":
+        return set(resolve_group_members_by_rid(shell, domain_key, 513) or [])
+
+    label = _resolve_principal_label_from_sid(
+        shell,
+        domain=domain_key,
+        sid=sid_clean,
+        preferred_kind="group",
+    )
+    if not label:
+        return set()
+
+    principal_name = _membership_label_to_name(label)
+    if not principal_name:
+        return set()
+
+    direct_user_sid = resolve_user_sid(shell, domain_key, principal_name)
+    if direct_user_sid and direct_user_sid.upper() == sid_clean:
+        normalized = normalize_samaccountname(principal_name)
+        if normalized and (candidate_users is None or normalized in candidate_users):
+            return {normalized}
+        return set()
+
+    snapshot = _load_membership_snapshot(shell, domain_key)
+    if not isinstance(snapshot, dict):
+        return set()
+
+    candidate_usernames = candidate_users or get_domain_users_for_domain(shell, domain_key) or set()
+    expanded: set[str] = set()
+    target_group_label = _canonical_membership_label(domain_key, label)
+    for username in candidate_usernames:
+        recursive_labels = _snapshot_get_recursive_group_labels(shell, domain_key, username)
+        if recursive_labels and target_group_label in recursive_labels:
+            normalized = normalize_samaccountname(username)
+            if normalized:
+                expanded.add(normalized)
+    return expanded
+
+
+def _index_existing_user_object_control_relations(
+    graph: dict[str, Any] | None,
+) -> set[tuple[str, str]]:
+    """Return source/target pairs already covered by GenericAll/GenericWrite.
+
+    The writable-attribute detector can discover ``scriptPath`` writes even when
+    BloodHound already produced a broader object-control edge for the same
+    source-target pair. In those cases the graph should prefer the canonical
+    ACL relation and suppress the narrower ``WriteLogonScript`` attack step.
+    """
+    if not isinstance(graph, dict):
+        return set()
+
+    indexed_pairs: set[tuple[str, str]] = set()
+    raw_edges = graph.get("edges")
+    if not isinstance(raw_edges, list):
+        return indexed_pairs
+
+    raw_nodes = graph.get("nodes")
+    node_index: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_nodes, list):
+        for node in raw_nodes:
+            if not isinstance(node, dict):
+                continue
+            object_id = str(node.get("objectId") or "").strip()
+            if object_id:
+                node_index[object_id] = node
+
+    for edge in raw_edges:
+        if not isinstance(edge, dict):
+            continue
+        relation = str(edge.get("relation") or "").strip().lower()
+        if relation not in {"genericall", "genericwrite"}:
+            continue
+
+        source_id = str(edge.get("from") or "").strip()
+        target_id = str(edge.get("to") or "").strip()
+        if not source_id or not target_id:
+            continue
+
+        target_node = node_index.get(target_id)
+        target_kinds = (
+            target_node.get("kind")
+            if isinstance(target_node, dict)
+            else None
+        )
+        if isinstance(target_kinds, list) and target_kinds:
+            if not any(str(kind).strip().lower() == "user" for kind in target_kinds):
+                continue
+
+        indexed_pairs.add((source_id.upper(), target_id.upper()))
+
+    return indexed_pairs
+
+
+def _acl_object_control_coverage_path(shell: object, domain: str) -> str:
+    """Return the compact ACL object-control coverage sidecar path."""
+    workspace_cwd = (
+        shell._get_workspace_cwd()  # type: ignore[attr-defined]
+        if hasattr(shell, "_get_workspace_cwd")
+        else getattr(shell, "current_workspace_dir", os.getcwd())
+    )
+    domains_dir = getattr(shell, "domains_dir", "domains")
+    return domain_subpath(
+        workspace_cwd,
+        domains_dir,
+        domain,
+        "BH",
+        "acl_object_control_coverage.json",
+    )
+
+
+def _load_acl_object_control_inventory_pairs(
+    shell: object,
+    domain: str,
+) -> set[tuple[str, str]]:
+    """Return source/target pairs covered by raw GenericAll/GenericWrite ACLs."""
+    path = _acl_object_control_coverage_path(shell, domain)
+    if not os.path.exists(path):
+        return set()
+
+    try:
+        payload = read_json_file(path)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[attack_graph] failed to read ACL object-control coverage sidecar: {exc}"
+        )
+        return set()
+
+    coverage = payload.get("coverage")
+    if not isinstance(coverage, list):
+        return set()
+
+    indexed_pairs: set[tuple[str, str]] = set()
+    for record in coverage:
+        if not isinstance(record, dict):
+            continue
+        relation = str(record.get("relation") or "").strip().lower()
+        if relation not in {"genericall", "genericwrite"}:
+            continue
+        target_kind = str(record.get("target_kind") or "").strip().lower()
+        if target_kind and target_kind != "user":
+            continue
+        source_id = str(record.get("source_id") or "").strip()
+        target_id = str(record.get("target_id") or "").strip()
+        if not source_id or not target_id:
+            continue
+        indexed_pairs.add((source_id.upper(), target_id.upper()))
+
+    if indexed_pairs:
+        print_info_debug(
+            "[attack_graph] loaded ACL object-control coverage sidecar: "
+            f"pairs={len(indexed_pairs)} "
+            f"path={mark_sensitive(path, 'path')}"
+        )
+    return indexed_pairs
+
+
+def get_writable_user_attribute_paths(
+    shell: object,
+    domain: str,
+    *,
+    graph: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build attack-step edges from domain-wide writable user attributes."""
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return []
+
+    report = _resolve_writable_attribute_report(shell, domain_key)
+    if not isinstance(report, dict):
+        return []
+
+    raw_findings = report.get("findings")
+    if not isinstance(raw_findings, list):
+        return []
+
+    resolved_rows: list[dict[str, Any]] = []
+    target_usernames: set[str] = set()
+    discard_counters: dict[str, int] = {
+        "findings_collected": len(raw_findings),
+        "skipped_invalid_row": 0,
+        "skipped_privileged_principal": 0,
+        "skipped_builtin_or_system_principal": 0,
+        "skipped_unresolved_principal": 0,
+        "skipped_subsumed_by_acl_inventory": 0,
+        "skipped_subsumed_by_graph_fallback": 0,
+        "skipped_target_tier0": 0,
+        "skipped_self_edge": 0,
+        "edges_emitted": 0,
+    }
+    drop_samples: dict[str, int] = {}
+    inventory_acl_pairs = _load_acl_object_control_inventory_pairs(shell, domain_key)
+    graph_fallback_acl_pairs = _index_existing_user_object_control_relations(graph)
+
+    def _sample_drop(reason: str, message: str) -> None:
+        count = drop_samples.get(reason, 0)
+        if count < 3:
+            print_info_debug(message)
+        drop_samples[reason] = count + 1
+
+    for finding in raw_findings:
+        if not isinstance(finding, dict):
+            discard_counters["skipped_invalid_row"] += 1
+            continue
+        relation = str(finding.get("relation") or "").strip()
+        principal_sid = str(finding.get("principal_sid") or "").strip()
+        target_username = str(finding.get("target_username") or "").strip()
+        if not relation or not principal_sid or not target_username:
+            discard_counters["skipped_invalid_row"] += 1
+            continue
+
+        should_skip, skip_reason, principal_node = _evaluate_lowpriv_source_principal(
+            shell,
+            domain=domain_key,
+            object_id=principal_sid,
+            preferred_kind="group",
+            graph=graph,
+            skip_on_unresolved=True,
+        )
+        if should_skip:
+            if skip_reason == "privileged_principal":
+                discard_counters["skipped_privileged_principal"] += 1
+            elif skip_reason == "builtin_or_system_principal":
+                discard_counters["skipped_builtin_or_system_principal"] += 1
+            else:
+                discard_counters["skipped_unresolved_principal"] += 1
+            _sample_drop(
+                skip_reason or "skipped_source",
+                f"[attack_graph] writable-attrs drop: "
+                f"reason={skip_reason or 'unknown'} "
+                f"principal_sid={mark_sensitive(principal_sid, 'user')} "
+                f"target={mark_sensitive(target_username, 'user')}",
+            )
+            continue
+
+        target_norm = normalize_samaccountname(target_username)
+        if not target_norm:
+            discard_counters["skipped_invalid_row"] += 1
+            continue
+
+        resolved_rows.append(
+            {
+                "finding": finding,
+                "target_norm": target_norm,
+                "source_node": principal_node,
+            }
+        )
+        target_usernames.add(target_norm)
+
+    if not resolved_rows:
+        return []
+
+    target_risk_flags = classify_users_tier0_high_value(
+        shell,
+        domain=domain_key,
+        usernames=sorted(target_usernames),
+    )
+
+    edges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in resolved_rows:
+        finding = row["finding"]
+        relation = str(finding.get("relation") or "").strip()
+        target_username = str(finding.get("target_username") or "").strip()
+        target_norm = normalize_samaccountname(target_username)
+        target_flags = target_risk_flags.get(target_norm)
+        if target_flags and target_flags.is_tier0:
+            discard_counters["skipped_target_tier0"] += 1
+            continue
+
+        target_label = f"{target_username.upper()}@{domain_key.upper()}"
+        target_node: dict[str, Any] = {
+            "name": target_label,
+            "kind": ["User"],
+            "objectId": str(finding.get("target_object_id") or "").strip() or None,
+            "properties": {
+                "name": target_label,
+                "samaccountname": target_username,
+                "domain": domain_key.upper(),
+                "distinguishedname": finding.get("target_dn"),
+                "highvalue": bool(target_flags.is_high_value) if target_flags else False,
+                "isTierZero": bool(target_flags.is_tier0) if target_flags else False,
+                "objectid": str(finding.get("target_object_id") or "").strip() or None,
+            },
+        }
+        if target_node.get("objectId") in {"", None}:
+            target_node.pop("objectId", None)
+            target_node["properties"].pop("objectid", None)
+
+        source_node = row.get("source_node")
+        if not isinstance(source_node, dict):
+            discard_counters["skipped_unresolved_principal"] += 1
+            continue
+        source_name = str(source_node.get("name") or "").strip()
+        if source_name and source_name.upper() == target_label.upper():
+            discard_counters["skipped_self_edge"] += 1
+            continue
+        source_object_id = str(source_node.get("objectId") or "").strip()
+        target_object_id = str(finding.get("target_object_id") or "").strip()
+        if (
+            relation.lower() == "writelogonscript"
+            and source_object_id
+            and target_object_id
+        ):
+            source_target_pair = (source_object_id.upper(), target_object_id.upper())
+            if source_target_pair in inventory_acl_pairs:
+                discard_counters["skipped_subsumed_by_acl_inventory"] += 1
+                _sample_drop(
+                    "subsumed_by_acl_inventory",
+                    "[attack_graph] writable-attrs drop: "
+                    "reason=subsumed_by_acl_inventory "
+                    f"source={mark_sensitive(source_name or source_object_id, 'user')} "
+                    f"target={mark_sensitive(target_label, 'user')}",
+                )
+                continue
+            if source_target_pair in graph_fallback_acl_pairs:
+                discard_counters["skipped_subsumed_by_graph_fallback"] += 1
+                _sample_drop(
+                    "subsumed_by_graph_fallback",
+                    "[attack_graph] writable-attrs drop: "
+                    "reason=subsumed_by_graph_fallback "
+                    f"source={mark_sensitive(source_name or source_object_id, 'user')} "
+                    f"target={mark_sensitive(target_label, 'user')}",
+                )
+                continue
+
+        notes = {
+            "source": "ldap_attribute_acl",
+            "detector": "ldap_acl",
+            "attribute": str(finding.get("attribute") or "").strip() or "scriptPath",
+            "target_dn": str(finding.get("target_dn") or "").strip(),
+            "principal_sid": str(finding.get("principal_sid") or "").strip(),
+            "applies_to_all_properties": bool(
+                finding.get("applies_to_all_properties")
+            ),
+            "is_inherited": bool(finding.get("is_inherited")),
+        }
+        sig = (
+            source_name.upper(),
+            relation.lower(),
+            normalize_samaccountname(target_username),
+        )
+        if sig in seen:
+            continue
+        seen.add(sig)
+        edges.append(
+            {
+                "nodes": [source_node, target_node],
+                "rels": [relation],
+                "notes_by_relation_index": {0: notes},
+            }
+        )
+        discard_counters["edges_emitted"] += 1
+
+    print_info_debug(
+        f"[attack_graph] writable-attribute paths for {mark_sensitive(domain_key, 'domain')}: "
+        f"count={len(edges)}"
+    )
+    print_info_debug(
+        "[attack_graph] writable-attribute summary: "
+        + " ".join(f"{key}={value}" for key, value in discard_counters.items())
+    )
+    return edges
+
+
 def get_certipy_adcs_paths(
     shell: object,
     domain: str,
@@ -2789,40 +4179,6 @@ def get_certipy_adcs_paths(
             return "Group"
         return "User"
 
-    def _resolve_principal_node(
-        *, principal_label: str, principal_domain: str, principal_name: str
-    ) -> dict[str, Any] | None:
-        try:
-            node = _resolve_bloodhound_principal_node(
-                shell,
-                principal_domain,
-                principal_label,
-                entry_kind=_infer_principal_kind(principal_name).lower(),
-                graph=loaded_graph,
-                lookup_name=principal_name,
-            )
-            if not isinstance(node, dict):
-                print_info_debug(
-                    f"[attack_graph] certipy principal lookup miss: "
-                    f"label={mark_sensitive(principal_label, 'user')} "
-                    f"kind={_infer_principal_kind(principal_name)}"
-                )
-                return None
-            return node
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            return None
-
-    def _principal_is_tier0(
-        *, principal_label: str, principal_domain: str, principal_name: str
-    ) -> bool:
-        node = _resolve_principal_node(
-            principal_label=principal_label,
-            principal_domain=principal_domain,
-            principal_name=principal_name,
-        )
-        return isinstance(node, dict) and _node_is_tier0(node)
-
     edges: list[dict[str, Any]] = []
     for entry in templates.values():
         if not isinstance(entry, dict):
@@ -2850,11 +4206,16 @@ def get_certipy_adcs_paths(
                         )
                         if not group_label:
                             continue
-                        if _principal_is_tier0(
-                            principal_label=group_label,
-                            principal_domain=principal_domain,
+                        should_skip, _, _ = _evaluate_lowpriv_source_principal(
+                            shell,
+                            domain=principal_domain,
+                            label=group_label,
                             principal_name=group_name,
-                        ):
+                            preferred_kind="group",
+                            graph=loaded_graph,
+                            skip_on_unresolved=False,
+                        )
+                        if should_skip:
                             continue
                         group_node = {
                             "name": group_label,
@@ -2898,13 +4259,18 @@ def get_certipy_adcs_paths(
                 )
                 if not principal_label:
                     continue
-                if _principal_is_tier0(
-                    principal_label=principal_label,
-                    principal_domain=principal_domain,
-                    principal_name=principal_name,
-                ):
-                    continue
                 kind = _infer_principal_kind(principal_name)
+                should_skip, _, _ = _evaluate_lowpriv_source_principal(
+                    shell,
+                    domain=principal_domain,
+                    label=principal_label,
+                    principal_name=principal_name,
+                    preferred_kind=kind.lower(),
+                    graph=loaded_graph,
+                    skip_on_unresolved=False,
+                )
+                if should_skip:
+                    continue
                 principal_node = {
                     "name": principal_label,
                     "kind": [kind],
@@ -3083,6 +4449,34 @@ def get_certipy_template_metadata(shell: object, domain: str) -> dict[str, Any]:
     return metadata
 
 
+def get_certihound_template_metadata(shell: object, domain: str) -> dict[str, Any]:
+    """Load CertiHound detection metadata keyed by template name."""
+    domain_key = str(domain or "").strip().lower()
+    if not domain_key:
+        return {}
+    if domain_key in _CERTIHOUND_TEMPLATE_CACHE:
+        return _CERTIHOUND_TEMPLATE_CACHE[domain_key]
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    domain_dir = domain_data.get("dir") if isinstance(domain_data, dict) else None
+    if not isinstance(domain_dir, str) or not domain_dir:
+        return {}
+
+    report = _resolve_certihound_detection_report(shell, domain)
+    if not isinstance(report, dict):
+        return {}
+    templates = report.get("templates")
+    if not isinstance(templates, dict):
+        return {}
+
+    _CERTIHOUND_TEMPLATE_CACHE[domain_key] = templates
+    print_info_debug(
+        f"[attack_graph] Loaded certihound template metadata for {mark_sensitive(domain, 'domain')}: "
+        f"templates={len(templates)}"
+    )
+    return templates
+
+
 def _canonical_account_identifier(value: str) -> str:
     """Normalize an AD principal identifier to a stable, domain-local form.
 
@@ -3230,32 +4624,13 @@ def _node_kind(node: dict[str, Any]) -> str:
 
 
 def _node_is_high_value(node: dict[str, Any]) -> bool:
-    if bool(node.get("isTierZero")):
-        return True
-    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    if bool(props.get("isTierZero")):
-        return True
-    tags = node.get("system_tags") or props.get("system_tags") or []
-    if isinstance(tags, str):
-        tags = [tags]
-    return any(str(tag).lower() == "admin_tier_0" for tag in tags)
+    return _node_is_tier0(node)
 
 
 def _node_is_tier0(node: dict[str, Any]) -> bool:
-    """Return True when node represents a Tier-0 (domain-compromise) target.
-
-    We treat Tier-0 as:
-      - explicit `isTierZero` markers (node or properties)
-      - `admin_tier_0` system tag (node or properties)
-
-    Notes:
-        We intentionally exclude BloodHound's `highvalue` flag here because
-        it can represent "high impact" targets that do not necessarily imply
-        domain compromise (e.g. some built-in operator groups).
-    """
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     if bool(node.get("isTierZero")):
         return True
-    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     if bool(props.get("isTierZero")):
         return True
     tags = node.get("system_tags") or props.get("system_tags") or []
@@ -3333,14 +4708,12 @@ def _node_is_privileged_group(node: dict[str, Any]) -> bool:
 
 
 def _node_is_effectively_high_value(node: dict[str, Any]) -> bool:
-    # "Effective high value" is an "impact" concept: include BloodHound's
-    # broader `highvalue` marker plus our SID/RID privileged-group heuristics.
+    # BloodHound is the source of truth for criticality.  ADscan adds
+    # follow-up/terminal semantics on top, but does not mutate high-value state.
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     if _node_is_tier0(node):
         return True
-    if bool(node.get("highvalue")) or bool(props.get("highvalue")):
-        return True
-    return _node_is_privileged_group(node)
+    return bool(node.get("highvalue")) or bool(props.get("highvalue"))
 
 
 def _node_is_enabled_user(node: dict[str, Any]) -> bool:
@@ -3928,29 +5301,17 @@ def _inject_runtime_recursive_memberof_edges(
             return existing_id
 
         try:
-            if hasattr(shell, "_get_bloodhound_service"):
-                service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
-                resolver = getattr(service, "get_group_node_by_samaccountname", None)
-                if callable(resolver):
-                    sam = _extract_group_name_from_bh(group_clean)
-                    props = resolver(domain, sam)
-                    if isinstance(props, dict) and (
-                        props.get("samaccountname")
-                        or props.get("name")
-                        or props.get("objectid")
-                    ):
-                        node_record = {
-                            "name": str(
-                                props.get("name")
-                                or props.get("samaccountname")
-                                or group_clean
-                            ),
-                            "kind": ["Group"],
-                            "objectId": props.get("objectid") or props.get("objectId"),
-                            "properties": props,
-                        }
-                        upsert_nodes(runtime_graph, [node_record])
-                        return _node_id(node_record)
+            node_record = _resolve_bloodhound_principal_node(
+                shell,
+                domain,
+                group_clean,
+                entry_kind="group",
+                graph=None,
+                lookup_name=_extract_group_name_from_bh(group_clean),
+            )
+            if isinstance(node_record, dict):
+                upsert_nodes(runtime_graph, [node_record])
+                return _node_id(node_record)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
 
@@ -4057,6 +5418,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
             maintenance = _get_attack_graph_maintenance_state(data)
             maintenance_target = _maintenance_key(_ATTACK_GRAPH_MAINTENANCE_VERSION)
             maintenance_version = str(maintenance.get("normalization") or "").strip()
+            snapshot = _load_membership_snapshot(shell, domain)
 
             repaired = False
             normalized = False
@@ -4064,6 +5426,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
             kind_normalized = False
             metadata_updated = 0
             reuse_notes_compacted = 0
+            target_priority_overrides_updated = False
 
             # These maintenance passes are expensive on large graphs and should
             # run only once per maintenance version.
@@ -4074,13 +5437,18 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                 repaired = _repair_duplicate_nodes_by_label(data)
                 normalized = _normalize_user_computer_labels(data)
                 domain_normalized = _normalize_domain_labels(data)
-                snapshot = _load_membership_snapshot(shell, domain)
                 kind_normalized = _normalize_principal_kinds_from_snapshot(
                     data, snapshot
                 )
                 metadata_updated = _refresh_attack_graph_edge_metadata(data)
                 reuse_notes_compacted = _compact_local_reuse_edge_notes(data)
                 maintenance["normalization"] = maintenance_target
+
+            target_priority_overrides_updated = _apply_recursive_target_priority_overrides(
+                data,
+                snapshot,
+                domain=domain,
+            )
 
             if (
                 maintenance_version != maintenance_target
@@ -4090,6 +5458,7 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                 or kind_normalized
                 or metadata_updated
                 or reuse_notes_compacted
+                or target_priority_overrides_updated
             ):
                 try:
                     marked_domain = mark_sensitive(domain, "domain")
@@ -4108,6 +5477,8 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                         parts.append("classified edge metadata")
                     if reuse_notes_compacted:
                         parts.append("compacted local reuse notes")
+                    if target_priority_overrides_updated:
+                        parts.append("updated recursive target priority overrides")
                     action = ", ".join(parts) if parts else "updated"
                     print_info_debug(
                         f"[attack_graph] {action} in {marked_domain} attack graph."
@@ -4126,6 +5497,11 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                 _normalize_principal_kinds_from_snapshot(migrated, snapshot)
                 _refresh_attack_graph_edge_metadata(migrated)
                 _compact_local_reuse_edge_notes(migrated)
+                _apply_recursive_target_priority_overrides(
+                    migrated,
+                    snapshot,
+                    domain=domain,
+                )
                 maintenance = _get_attack_graph_maintenance_state(migrated)
                 maintenance["normalization"] = _maintenance_key(
                     _ATTACK_GRAPH_MAINTENANCE_VERSION
@@ -4327,19 +5703,16 @@ def _sync_attack_graph_findings_best_effort(
         return
 
     if _REPORT_SYNC_FN is None:
-        try:
-            from adscan_internal.services.report_service import (
-                sync_attack_graph_findings,
-            )
-
-            _REPORT_SYNC_FN = sync_attack_graph_findings
-        except Exception as exc:  # pragma: no cover - best effort
+        sync_attack_graph_findings = load_optional_report_service_attr(
+            "sync_attack_graph_findings",
+            action="Technical findings sync",
+            debug_printer=print_info_debug,
+            prefix="[attack_graph]",
+        )
+        if not callable(sync_attack_graph_findings):
             _REPORT_SYNC_FN = False
-            print_info_debug(
-                "[attack_graph] Technical findings sync unavailable "
-                f"(report_service missing): {type(exc).__name__}: {exc}"
-            )
             return
+        _REPORT_SYNC_FN = sync_attack_graph_findings
 
     try:
         assert callable(_REPORT_SYNC_FN)
@@ -4442,6 +5815,108 @@ def refresh_attack_graph_execution_support(
         "to_blocked": to_blocked,
         "to_unsupported": to_unsupported,
         "to_discovered": to_discovered,
+        "metadata_updated": metadata_updated,
+    }
+
+
+def reset_attack_graph_execution_statuses(
+    shell: object, domain: str
+) -> dict[str, int]:
+    """Reset persisted edge execution states to their support-derived defaults.
+
+    This helper is intended for local testing workflows where operators want to
+    clear all runtime execution outcomes and return the graph to the same status
+    baseline produced by a fresh enumeration.
+
+    Returns:
+        Counts describing how many edges were updated.
+    """
+    graph = load_attack_graph(shell, domain)
+    edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+    if not edges:
+        return {"changed": 0}
+
+    changed = 0
+    to_blocked = 0
+    to_unsupported = 0
+    to_discovered = 0
+    attempts_cleared = 0
+    metadata_updated = 0
+    version = getattr(telemetry, "VERSION", "unknown")
+
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation = str(edge.get("relation") or "").strip()
+        if not relation:
+            continue
+
+        category, vuln_key = _classify_edge_relation(relation)
+        if "discovered_at" not in edge:
+            first_seen = edge.get("first_seen")
+            edge["discovered_at"] = first_seen or _utc_now_iso()
+            changed += 1
+            metadata_updated += 1
+        if edge.get("category") != category or edge.get("vuln_key") != vuln_key:
+            edge["category"] = category
+            edge["vuln_key"] = vuln_key
+            changed += 1
+            metadata_updated += 1
+
+        support = classify_relation_support(relation)
+        desired_status = "discovered"
+        desired_notes: dict[str, Any] = {
+            "exec_support": support.kind,
+            "exec_support_version": version,
+        }
+        if support.kind == "policy_blocked":
+            desired_status = "blocked"
+            desired_notes.update(
+                {
+                    "blocked_kind": "dangerous",
+                    "reason": support.reason,
+                    "exec_support": "policy_blocked",
+                }
+            )
+        elif support.kind == "unsupported":
+            desired_status = "unsupported"
+            desired_notes.update(
+                {
+                    "blocked_kind": "unsupported",
+                    "reason": support.reason,
+                    "exec_support": "unsupported",
+                }
+            )
+
+        current_status = str(edge.get("status") or "discovered").strip().lower()
+        if desired_status != current_status:
+            edge["status"] = desired_status
+            changed += 1
+            if desired_status == "blocked":
+                to_blocked += 1
+            elif desired_status == "unsupported":
+                to_unsupported += 1
+            else:
+                to_discovered += 1
+
+        existing_notes = edge.get("notes")
+        if not isinstance(existing_notes, dict):
+            existing_notes = {}
+        if "attempts" in existing_notes:
+            existing_notes.pop("attempts", None)
+            attempts_cleared += 1
+            changed += 1
+        existing_notes.update(desired_notes)
+        edge["notes"] = existing_notes
+
+    if changed:
+        save_attack_graph(shell, domain, graph)
+    return {
+        "changed": changed,
+        "to_blocked": to_blocked,
+        "to_unsupported": to_unsupported,
+        "to_discovered": to_discovered,
+        "attempts_cleared": attempts_cleared,
         "metadata_updated": metadata_updated,
     }
 
@@ -5404,15 +6879,34 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
     for idx, step in enumerate(path.steps, start=1):
         step_status = step.status
         relation_key = str(step.relation or "").strip().lower()
+        step_details = {
+            "from": label(step.from_id),
+            "to": label(step.to_id),
+            **(step.notes or {}),
+        }
+        if relation_key.startswith("adcs") or relation_key in {
+            "coerceandrelayntlmtoadcs",
+            "goldencert",
+        }:
+            step_details.setdefault(
+                "templates_summary",
+                format_adcs_templates_summary(step_details),
+            )
+            display_to = resolve_adcs_display_target(
+                step.relation,
+                step_details,
+                fallback_target=str(step_details.get("to") or ""),
+            )
+            if display_to and display_to != str(step_details.get("to") or ""):
+                step_details.setdefault("impact_target", str(step_details.get("to") or ""))
+                step_details["display_to"] = display_to
         steps_for_ui.append(
             {
                 "step": idx,
                 "action": step.relation,
                 "status": step_status,
                 "details": {
-                    "from": label(step.from_id),
-                    "to": label(step.to_id),
-                    **(step.notes or {}),
+                    **step_details,
                     **(
                         {
                             "blocked_kind": "dangerous",
@@ -5602,11 +7096,29 @@ def _resolve_bloodhound_principal_entry(
     return _node_id(node_record)
 
 
+def _extract_node_object_id(node: dict[str, Any] | None) -> str | None:
+    """Return the objectId/objectid value from a node record or node props."""
+    if not isinstance(node, dict):
+        return None
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    for value in (
+        node.get("objectId"),
+        node.get("objectid"),
+        props.get("objectId"),
+        props.get("objectid"),
+    ):
+        cleaned = str(value or "").strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
 def _resolve_bloodhound_principal_node(
     shell: object,
     domain: str,
     label: str,
     *,
+    object_id: str | None = None,
     entry_kind: str | None = None,
     graph: dict[str, Any] | None = None,
     lookup_name: str | None = None,
@@ -5615,7 +7127,8 @@ def _resolve_bloodhound_principal_node(
 
     Resolution order:
     1. Existing attack-graph node by label when ``graph`` is provided.
-    2. BloodHound service lookup by principal kind.
+    2. Centralized BloodHound service lookup (objectid-first, then kind-aware).
+    3. Legacy per-kind fallback when the service does not expose the unified resolver.
     """
     label_clean = str(label or "").strip()
     if not label_clean:
@@ -5644,8 +7157,33 @@ def _resolve_bloodhound_principal_node(
 
     normalized = _normalize_account(label_clean)
     lookup_name_clean = str(lookup_name or "").strip() or label_clean
-    domain_upper = str(domain or "").strip().upper()
     kind_hint = str(entry_kind or "").strip().lower()
+
+    if hasattr(service, "get_principal_node"):
+        try:
+            node_props = service.get_principal_node(  # type: ignore[attr-defined]
+                domain,
+                label=label_clean,
+                object_id=object_id,
+                kind_hint=kind_hint or None,
+                lookup_name=lookup_name_clean,
+            )
+            if isinstance(node_props, dict):
+                kind_map = {"user": "User", "group": "Group", "computer": "Computer"}
+                node_kind = kind_map.get(kind_hint, "Group" if " " in label_clean else "User")
+                canonical_name = str(node_props.get("name") or label_clean).strip() or label_clean
+                return {
+                    "name": canonical_name,
+                    "kind": [node_kind],
+                    "objectId": node_props.get("objectid") or node_props.get("objectId") or object_id or None,
+                    "properties": node_props,
+                }
+            if object_id and (_looks_like_sid(lookup_name_clean) or lookup_name_clean.upper() == str(object_id).strip().upper()):
+                return None
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+    domain_upper = str(domain or "").strip().upper()
     candidates: list[tuple[int, dict[str, Any]]] = []
 
     def _append_candidate(kind: str, node_props: dict[str, Any] | None) -> None:
@@ -7900,14 +9438,24 @@ def reconcile_entry_nodes(shell: object, domain: str, graph: dict[str, Any]) -> 
         node_props: dict[str, Any] | None = None
         if kind == "Domain" and hasattr(service, "get_domain_node"):
             node_props = service.get_domain_node(domain)  # type: ignore[attr-defined]
-        elif kind == "User" and hasattr(service, "get_user_node_by_samaccountname"):
-            sam = _normalize_account(label)
-            node_props = service.get_user_node_by_samaccountname(domain, sam)  # type: ignore[attr-defined]
-        elif kind == "Computer" and hasattr(service, "get_computer_node_by_fqdn"):
-            node_props = service.get_computer_node_by_fqdn(domain, label)  # type: ignore[attr-defined]
-        elif kind == "Group" and hasattr(service, "get_group_node_by_samaccountname"):
-            group_name = _extract_group_name_from_bh(label)
-            node_props = service.get_group_node_by_samaccountname(domain, group_name)  # type: ignore[attr-defined]
+        elif kind in {"User", "Computer", "Group"}:
+            lookup_name = label
+            if kind == "User":
+                lookup_name = _normalize_account(label)
+            elif kind == "Group":
+                lookup_name = _extract_group_name_from_bh(label)
+            node_record = _resolve_bloodhound_principal_node(
+                shell,
+                domain,
+                label,
+                object_id=_extract_node_object_id(node),
+                entry_kind=kind.lower(),
+                graph=None,
+                lookup_name=lookup_name,
+            )
+            node_props = (
+                node_record.get("properties") if isinstance(node_record, dict) else None
+            )
 
         if not isinstance(node_props, dict) or not (
             node_props.get("name")
@@ -8396,7 +9944,7 @@ def _trim_trailing_memberof_edges(
         if except_hv:
             tgt_label = str(nodes[-1]) if nodes else ""
             tgt_node = label_to_node.get(tgt_label) or {}
-            if attack_graph_core._node_is_effectively_high_value(tgt_node):  # noqa: SLF001
+            if attack_graph_core._node_target_priority_class(tgt_node) != "pivot":  # noqa: SLF001
                 break  # HV terminal — stop trimming, keep as-is
         # Remove the last node and last relation.
         nodes = nodes[:-1]
@@ -8431,7 +9979,836 @@ def _record_terminal_is_hv(
         when the target cannot be resolved.
     """
     tgt_node = label_to_node.get(str(rec.get("target") or "")) or {}
-    return attack_graph_core._node_is_effectively_high_value(tgt_node)  # noqa: SLF001
+    return (
+        attack_graph_core._node_target_priority_class(tgt_node) != "pivot"  # noqa: SLF001
+    )
+
+
+def _record_terminal_is_terminal_target(
+    rec: dict[str, Any],
+    label_to_node: dict[str, Any],
+) -> bool:
+    """Return True when *rec*'s terminal should stop path discovery."""
+    tgt_node = label_to_node.get(str(rec.get("target") or "")) or {}
+    return attack_graph_core._node_is_terminal_target(tgt_node)  # noqa: SLF001
+
+
+def _annotate_record_target_priority(
+    record: dict[str, Any],
+    *,
+    target_node: dict[str, Any] | None,
+    shell: object | None = None,
+    domain: str | None = None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None = None,
+    ou_contained_tierzero_groups_cache: dict[str, tuple[dict[str, Any], ...]] | None = None,
+    adcs_available: bool | None = None,
+) -> None:
+    """Annotate one display record with ADscan-owned target priority fields."""
+    node = target_node if isinstance(target_node, dict) else {}
+    target_priority_class = attack_graph_core._node_target_priority_class(node)  # noqa: SLF001
+    target_priority_rank = attack_graph_core._node_target_priority_rank(node)  # noqa: SLF001
+    target_terminal_class = attack_graph_core._node_target_terminal_class(node)  # noqa: SLF001
+
+    effective_terminal = _resolve_effective_principal_terminal_annotation(
+        node,
+        domain=domain,
+        recursive_groups_by_principal=recursive_groups_by_principal,
+    )
+    if effective_terminal is not None:
+        target_terminal_class, target_priority_rank = effective_terminal
+    else:
+        effective_terminal = _resolve_effective_ou_terminal_annotation(
+            node,
+            shell=shell,
+            domain=domain,
+            ou_contained_tierzero_groups_cache=ou_contained_tierzero_groups_cache,
+            recursive_groups_by_principal=recursive_groups_by_principal,
+        )
+        if effective_terminal is not None:
+            target_terminal_class, target_priority_rank = effective_terminal
+
+    target_followup_status = _resolve_target_followup_status(
+        node,
+        target_terminal_class=target_terminal_class,
+        domain=domain,
+        recursive_groups_by_principal=recursive_groups_by_principal,
+        shell=shell,
+        ou_contained_tierzero_groups_cache=ou_contained_tierzero_groups_cache,
+        adcs_available=adcs_available,
+    )
+
+    record["target_priority_class"] = target_priority_class
+    record["target_priority_rank"] = target_priority_rank
+    record["target_terminal_class"] = target_terminal_class
+    record["target_followup_status"] = target_followup_status
+    record["is_tier_zero"] = target_priority_class == "tierzero"
+    record["target_is_high_value"] = target_priority_class in {"tierzero", "highvalue"}
+    _annotate_effective_target_basis(
+        record,
+        node=node,
+        shell=shell,
+        domain=domain,
+        recursive_groups_by_principal=recursive_groups_by_principal,
+        ou_contained_tierzero_groups_cache=ou_contained_tierzero_groups_cache,
+    )
+
+
+def _resolve_effective_principal_terminal_annotation(
+    node: dict[str, Any],
+    *,
+    domain: str | None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None,
+) -> tuple[str, int] | None:
+    """Return effective terminal semantics for a principal via recursive memberships."""
+    if not isinstance(node, dict) or not recursive_groups_by_principal or not domain:
+        return None
+
+    base_terminal_class = attack_graph_core._node_target_terminal_class(node)  # noqa: SLF001
+    if base_terminal_class != "direct_compromise":
+        return None
+
+    kind = attack_paths_core._node_kind(node)  # noqa: SLF001
+    if kind not in {"User", "Computer"}:
+        return None
+
+    canonical_label = attack_paths_core._canonical_membership_label(  # noqa: SLF001
+        domain,
+        attack_paths_core._canonical_node_label(node),  # noqa: SLF001
+    )
+    if not canonical_label:
+        return None
+
+    recursive_groups = recursive_groups_by_principal.get(canonical_label) or ()
+    if not recursive_groups:
+        return None
+
+    membership = classify_privileged_membership(group_names=recursive_groups)
+    decision = resolve_privileged_followup_decision(membership)
+
+    if any(
+        (
+            membership.domain_admin,
+            membership.administrators,
+            membership.cert_publishers,
+            membership.key_admins,
+            membership.enterprise_key_admins,
+        )
+    ):
+        return None
+
+    if membership.backup_operators:
+        return ("followup_terminal", 20)
+    if membership.dns_admins:
+        return ("followup_terminal", 30)
+    if membership.account_operators:
+        return ("graph_extension", 10)
+    if any(
+        (
+            membership.exchange_windows_permissions,
+            membership.exchange_trusted_subsystem,
+        )
+    ):
+        return ("graph_extension", 15)
+    if decision.future_followup_keys:
+        return ("future_followup", 31)
+    if decision.dependency_only_keys:
+        return ("dependency_only", 32)
+    return None
+
+
+def _resolve_effective_principal_membership(
+    node: dict[str, Any],
+    *,
+    domain: str | None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None,
+):
+    """Return recursive privileged membership for a final principal target."""
+    if not isinstance(node, dict) or not recursive_groups_by_principal or not domain:
+        return None
+
+    kind = attack_paths_core._node_kind(node)  # noqa: SLF001
+    if kind not in {"User", "Computer"}:
+        return None
+
+    canonical_label = attack_paths_core._canonical_membership_label(  # noqa: SLF001
+        domain,
+        attack_paths_core._canonical_node_label(node),  # noqa: SLF001
+    )
+    if not canonical_label:
+        return None
+
+    recursive_groups = recursive_groups_by_principal.get(canonical_label) or ()
+    if not recursive_groups:
+        return None
+    return classify_privileged_membership(group_names=recursive_groups)
+
+
+_DIRECT_GROUP_REASON_DISPLAY_NAMES = {
+    "administrators": "Administrators",
+    "cert publishers": "Cert Publishers",
+    "domain admins": "Domain Admins",
+    "domain controllers": "Domain Controllers",
+    "enterprise admins": "Enterprise Admins",
+    "enterprise key admins": "Enterprise Key Admins",
+    "incoming forest trust builders": "Incoming Forest Trust Builders",
+    "key admins": "Key Admins",
+    "read-only domain controllers": "Read-Only Domain Controllers",
+    "schema admins": "Schema Admins",
+}
+
+_EFFECTIVE_GROUP_REASON_DISPLAY_NAMES = {
+    "account operators": "Account Operators",
+    "backup operators": "Backup Operators",
+    "cert publishers": "Cert Publishers",
+    "cryptographic operators": "Cryptographic Operators",
+    "distributed com users": "Distributed COM Users",
+    "dnsadmins": "DNSAdmins",
+    "domain admins": "Domain Admins",
+    "enterprise key admins": "Enterprise Key Admins",
+    "exchange trusted subsystem": "Exchange Trusted Subsystem",
+    "exchange windows permissions": "Exchange Windows Permissions",
+    "incoming forest trust builders": "Incoming Forest Trust Builders",
+    "key admins": "Key Admins",
+    "performance log users": "Performance Log Users",
+}
+
+_SYNTHETIC_GROUP_REASON_SIDS = {
+    "account operators": "S-1-5-32-548",
+    "administrators": "S-1-5-32-544",
+    "backup operators": "S-1-5-32-551",
+    "cert publishers": "S-1-5-21-0-0-0-517",
+    "cryptographic operators": "S-1-5-21-0-0-0-569",
+    "distributed com users": "S-1-5-32-562",
+    "dnsadmins": "S-1-5-21-0-0-0-1101",
+    "domain admins": "S-1-5-21-0-0-0-512",
+    "domain controllers": "S-1-5-21-0-0-0-516",
+    "enterprise admins": "S-1-5-21-0-0-0-519",
+    "enterprise key admins": "S-1-5-21-0-0-0-527",
+    "exchange trusted subsystem": "S-1-5-21-0-0-0-1119",
+    "exchange windows permissions": "S-1-5-21-0-0-0-1121",
+    "incoming forest trust builders": "S-1-5-32-557",
+    "key admins": "S-1-5-21-0-0-0-526",
+    "performance log users": "S-1-5-32-559",
+    "read-only domain controllers": "S-1-5-21-0-0-0-521",
+    "schema admins": "S-1-5-21-0-0-0-518",
+}
+
+
+def _normalize_effective_target_basis_label(value: str) -> str:
+    """Return a stable normalized label used to dedupe reason metadata."""
+    return normalize_group_name(value)
+
+
+def _display_effective_target_basis_label(value: str) -> str:
+    """Return one compact human-readable label for target-basis rendering."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "Unknown"
+    normalized = _normalize_effective_target_basis_label(raw)
+    if normalized in _DIRECT_GROUP_REASON_DISPLAY_NAMES:
+        return _DIRECT_GROUP_REASON_DISPLAY_NAMES[normalized]
+    if normalized in _EFFECTIVE_GROUP_REASON_DISPLAY_NAMES:
+        return _EFFECTIVE_GROUP_REASON_DISPLAY_NAMES[normalized]
+    return raw
+
+
+def _build_effective_target_basis_record(
+    *,
+    basis_kind: str,
+    target_kind: str,
+    target_label: str,
+    terminal_class: str,
+    priority_rank: int,
+) -> dict[str, Any]:
+    """Return one normalized effective-target-basis explanation record."""
+    display_label = _display_effective_target_basis_label(target_label)
+    return {
+        "basis_kind": basis_kind,
+        "target_kind": str(target_kind or "").strip(),
+        "target_label": display_label,
+        "normalized_target_label": _normalize_effective_target_basis_label(
+            display_label
+        ),
+        "terminal_class": str(terminal_class or "pivot").strip().lower(),
+        "priority_rank": int(priority_rank),
+    }
+
+
+def _build_effective_target_basis_record_from_node(
+    node: dict[str, Any],
+    *,
+    basis_kind: str,
+) -> dict[str, Any] | None:
+    """Return explanation metadata for one node when it carries target semantics."""
+    if not isinstance(node, dict):
+        return None
+    target_kind = attack_paths_core._node_kind(node)  # noqa: SLF001
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    target_label = str(props.get("name") or node.get("label") or "").strip()
+    if not target_label:
+        return None
+    return _build_effective_target_basis_record(
+        basis_kind=basis_kind,
+        target_kind=target_kind,
+        target_label=target_label,
+        terminal_class=attack_graph_core._node_target_terminal_class(node),  # noqa: SLF001
+        priority_rank=attack_graph_core._node_target_priority_rank(node),  # noqa: SLF001
+    )
+
+
+def _build_synthetic_tierzero_group_node(group_label: str) -> dict[str, Any] | None:
+    """Return a synthetic Tier Zero group node for one recognized membership label."""
+    raw = str(group_label or "").strip()
+    if not raw:
+        return None
+
+    normalized = normalize_group_name(raw)
+    is_recognized = normalized in _DIRECT_GROUP_REASON_DISPLAY_NAMES or any(
+        (
+            is_graph_extension_group(name=raw),
+            is_followup_terminal_group(name=raw),
+            is_future_followup_tier_zero_group(name=raw),
+            is_dependency_only_tier_zero_group(name=raw),
+            normalized in _EFFECTIVE_GROUP_REASON_DISPLAY_NAMES,
+        )
+    )
+    if not is_recognized:
+        return None
+
+    return {
+        "kind": "Group",
+        "label": raw,
+        "isTierZero": True,
+        "properties": {
+            "name": raw,
+            "isTierZero": True,
+            "objectid": _SYNTHETIC_GROUP_REASON_SIDS.get(normalized, ""),
+        },
+    }
+
+
+def _dedupe_effective_target_basis_records(
+    records: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return records deduped by basis kind, label, terminal class, and rank."""
+    deduped: OrderedDict[tuple[str, str, str, int], dict[str, Any]] = OrderedDict()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        basis_kind = str(record.get("basis_kind") or "").strip().lower()
+        normalized_target_label = str(
+            record.get("normalized_target_label")
+            or _normalize_effective_target_basis_label(
+                str(record.get("target_label") or "")
+            )
+        ).strip()
+        terminal_class = str(record.get("terminal_class") or "pivot").strip().lower()
+        try:
+            priority_rank = int(record.get("priority_rank", 100))
+        except (TypeError, ValueError):
+            priority_rank = 100
+        if not basis_kind or not normalized_target_label:
+            continue
+        key = (
+            basis_kind,
+            normalized_target_label,
+            terminal_class,
+            priority_rank,
+        )
+        deduped.setdefault(key, record)
+    return list(deduped.values())
+
+
+def _effective_target_basis_sort_key(
+    record: dict[str, Any],
+) -> tuple[int, int, int, str]:
+    """Return one deterministic ordering key for effective target basis records."""
+    terminal_class = str(record.get("terminal_class") or "pivot").strip().lower()
+    try:
+        priority_rank = int(record.get("priority_rank", 100))
+    except (TypeError, ValueError):
+        priority_rank = 100
+    direct_bias = 0 if terminal_class == "direct_compromise" else 1
+    label = str(record.get("target_label") or "").casefold()
+    privileged_order = privileged_followup_order_for_group_name(
+        str(record.get("target_label") or "")
+    )
+    if privileged_order is None:
+        privileged_order = 999
+    return (direct_bias, privileged_order, priority_rank, label)
+
+
+def _select_effective_target_basis_records(
+    records: Iterable[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Return primary + extra explanation records using stable premium ordering."""
+    deduped = _dedupe_effective_target_basis_records(records)
+    if not deduped:
+        return None, []
+    ordered = sorted(deduped, key=_effective_target_basis_sort_key)
+    return ordered[0], ordered[1:]
+
+
+def _collect_effective_principal_basis_records(
+    node: dict[str, Any],
+    *,
+    domain: str | None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None,
+) -> list[dict[str, Any]]:
+    """Return normalized explanation records for a principal target."""
+    if not isinstance(node, dict) or not recursive_groups_by_principal or not domain:
+        return []
+
+    kind = attack_paths_core._node_kind(node)  # noqa: SLF001
+    if kind not in {"User", "Computer"}:
+        return []
+
+    canonical_label = attack_paths_core._canonical_membership_label(  # noqa: SLF001
+        domain,
+        attack_paths_core._canonical_node_label(node),  # noqa: SLF001
+    )
+    if not canonical_label:
+        return []
+
+    recursive_groups = recursive_groups_by_principal.get(canonical_label) or ()
+    if not recursive_groups:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for recursive_group in recursive_groups:
+        synthetic_group = _build_synthetic_tierzero_group_node(str(recursive_group or ""))
+        if synthetic_group is None:
+            continue
+        record = _build_effective_target_basis_record_from_node(
+            synthetic_group,
+            basis_kind="member_of",
+        )
+        if record is not None:
+            records.append(record)
+    return _dedupe_effective_target_basis_records(records)
+
+
+def _resolve_effective_contained_object_annotation(
+    node: dict[str, Any],
+    *,
+    domain: str | None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None,
+) -> tuple[str, int]:
+    """Return effective terminal semantics for one contained Tier Zero OU object."""
+    effective_terminal = _resolve_effective_principal_terminal_annotation(
+        node,
+        domain=domain,
+        recursive_groups_by_principal=recursive_groups_by_principal,
+    )
+    if effective_terminal is not None:
+        return effective_terminal
+    return (
+        attack_graph_core._node_target_terminal_class(node),  # noqa: SLF001
+        attack_graph_core._node_target_priority_rank(node),  # noqa: SLF001
+    )
+
+
+def _extract_node_distinguished_name(node: dict[str, Any]) -> str:
+    """Return one normalized distinguished name for a graph node when present."""
+    if not isinstance(node, dict):
+        return ""
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    return str(
+        props.get("distinguishedname")
+        or props.get("distinguishedName")
+        or node.get("distinguishedname")
+        or node.get("distinguishedName")
+        or ""
+    ).strip()
+
+
+def _load_ou_contained_tierzero_objects(
+    shell: object,
+    *,
+    domain: str,
+    ou_distinguished_name: str,
+) -> tuple[dict[str, Any], ...]:
+    """Return best-effort tier-zero objects contained inside one OU via BloodHound."""
+    domain_clean = str(domain or "").strip()
+    ou_dn = str(ou_distinguished_name or "").strip()
+    if not domain_clean or not ou_dn or not hasattr(shell, "_get_bloodhound_service"):
+        return ()
+    try:
+        service = shell._get_bloodhound_service()  # type: ignore[attr-defined]
+        get_objects = getattr(service, "get_tierzero_objects_in_ou", None)
+        if not callable(get_objects):
+            return ()
+        rows = get_objects(domain_clean, ou_dn)
+        if not rows:
+            return ()
+
+        objects: list[dict[str, Any]] = []
+        for row in rows:
+            node_data = row
+            props = (
+                node_data.get("properties")
+                if isinstance(node_data.get("properties"), dict)
+                else {}
+            )
+            labels = node_data.get("kinds") or node_data.get("labels")
+            node_kind = ""
+            if isinstance(labels, list):
+                for label in labels:
+                    label_clean = str(label or "").strip()
+                    if label_clean in {"Group", "User", "Computer"}:
+                        node_kind = label_clean
+                        break
+            if not node_kind:
+                node_kind = str(node_data.get("kind") or "").strip()
+            name = str(
+                props.get("name") or node_data.get("name") or node_data.get("label") or ""
+            ).strip()
+            objectid = str(
+                props.get("objectid")
+                or node_data.get("objectid")
+                or props.get("objectId")
+                or node_data.get("objectId")
+                or node_data.get("id")
+                or ""
+            ).strip()
+            distinguishedname = str(
+                props.get("distinguishedname")
+                or node_data.get("distinguishedname")
+                or props.get("distinguishedName")
+                or node_data.get("distinguishedName")
+                or ""
+            ).strip()
+            if not node_kind or not any((name, objectid, distinguishedname)):
+                continue
+            is_tier_zero = bool(
+                node_data.get("isTierZero")
+                or props.get("isTierZero")
+                or node_data.get("istierzero")
+                or props.get("istierzero")
+                or node_data.get("highvalue")
+                or props.get("highvalue")
+                or "admin_tier_0" in str(node_data.get("system_tags") or "")
+                or "admin_tier_0" in str(props.get("system_tags") or "")
+            )
+            highvalue = bool(
+                node_data.get("highvalue")
+                or props.get("highvalue")
+                or "admin_tier_0" in str(node_data.get("system_tags") or "")
+                or "admin_tier_0" in str(props.get("system_tags") or "")
+            )
+            objects.append(
+                {
+                    "kind": node_kind,
+                    "label": name or objectid or distinguishedname,
+                    "isTierZero": is_tier_zero,
+                    "highvalue": highvalue,
+                    "properties": {
+                        "name": name or objectid or distinguishedname,
+                        "objectid": objectid,
+                        "distinguishedname": distinguishedname,
+                        "isTierZero": is_tier_zero,
+                        "highvalue": highvalue,
+                    },
+                }
+            )
+        return tuple(objects)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return ()
+
+
+def _collect_effective_ou_basis_records(
+    node: dict[str, Any],
+    *,
+    shell: object | None,
+    domain: str | None,
+    ou_contained_tierzero_groups_cache: dict[str, tuple[dict[str, Any], ...]] | None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return normalized explanation records for a Tier Zero OU target."""
+    if not isinstance(node, dict) or shell is None or not domain:
+        return []
+    if attack_paths_core._node_kind(node) != "OU":  # noqa: SLF001
+        return []
+
+    distinguished_name = _extract_node_distinguished_name(node)
+    if not distinguished_name:
+        return []
+
+    cache_key = distinguished_name.casefold()
+    contained_objects = (
+        ou_contained_tierzero_groups_cache.get(cache_key)
+        if isinstance(ou_contained_tierzero_groups_cache, dict)
+        else None
+    )
+    if contained_objects is None:
+        contained_objects = _load_ou_contained_tierzero_objects(
+            shell,
+            domain=domain,
+            ou_distinguished_name=distinguished_name,
+        )
+        if isinstance(ou_contained_tierzero_groups_cache, dict):
+            ou_contained_tierzero_groups_cache[cache_key] = contained_objects
+
+    if not contained_objects:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for contained_node in contained_objects:
+        contained_kind = attack_paths_core._node_kind(contained_node)  # noqa: SLF001
+        if contained_kind in {"User", "Computer"}:
+            principal_records = _collect_effective_principal_basis_records(
+                contained_node,
+                domain=domain,
+                recursive_groups_by_principal=recursive_groups_by_principal,
+            )
+            if principal_records:
+                for principal_record in principal_records:
+                    records.append(
+                        {
+                            **principal_record,
+                            "basis_kind": "contains",
+                        }
+                    )
+                continue
+
+        contained_record = _build_effective_target_basis_record_from_node(
+            contained_node,
+            basis_kind="contains",
+        )
+        if contained_record is not None:
+            records.append(contained_record)
+    return _dedupe_effective_target_basis_records(records)
+
+
+def _annotate_effective_target_basis(
+    record: dict[str, Any],
+    *,
+    node: dict[str, Any],
+    shell: object | None,
+    domain: str | None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None,
+    ou_contained_tierzero_groups_cache: dict[str, tuple[dict[str, Any], ...]] | None,
+) -> None:
+    """Annotate one attack-path record with explainable effective-target metadata."""
+    basis_records: list[dict[str, Any]] = []
+    kind = attack_paths_core._node_kind(node)  # noqa: SLF001
+    if kind in {"User", "Computer"}:
+        basis_records = _collect_effective_principal_basis_records(
+            node,
+            domain=domain,
+            recursive_groups_by_principal=recursive_groups_by_principal,
+        )
+    elif kind == "OU":
+        basis_records = _collect_effective_ou_basis_records(
+            node,
+            shell=shell,
+            domain=domain,
+            ou_contained_tierzero_groups_cache=ou_contained_tierzero_groups_cache,
+            recursive_groups_by_principal=recursive_groups_by_principal,
+        )
+
+    primary_record, extra_records = _select_effective_target_basis_records(basis_records)
+    record["effective_target_basis_kind"] = (
+        str(primary_record.get("basis_kind") or "").strip().lower()
+        if isinstance(primary_record, dict)
+        else ""
+    )
+    record["effective_target_basis_primary"] = primary_record
+    record["effective_target_basis_extras"] = extra_records
+    record["effective_target_basis_count"] = len(basis_records)
+
+
+def _resolve_effective_ou_terminal_annotation(
+    node: dict[str, Any],
+    *,
+    shell: object | None,
+    domain: str | None,
+    ou_contained_tierzero_groups_cache: dict[str, tuple[dict[str, Any], ...]] | None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None = None,
+) -> tuple[str, int] | None:
+    """Return effective terminal semantics for a Tier Zero OU via contained objects."""
+    if not isinstance(node, dict) or shell is None or not domain:
+        return None
+    base_terminal_class = attack_graph_core._node_target_terminal_class(node)  # noqa: SLF001
+    if base_terminal_class != "direct_compromise":
+        return None
+    if attack_paths_core._node_kind(node) != "OU":  # noqa: SLF001
+        return None
+
+    distinguished_name = _extract_node_distinguished_name(node)
+    if not distinguished_name:
+        return None
+
+    cache_key = distinguished_name.casefold()
+    cached_groups = (
+        ou_contained_tierzero_groups_cache.get(cache_key)
+        if isinstance(ou_contained_tierzero_groups_cache, dict)
+        else None
+    )
+    if cached_groups is None:
+        cached_groups = _load_ou_contained_tierzero_objects(
+            shell,
+            domain=domain,
+            ou_distinguished_name=distinguished_name,
+        )
+        if isinstance(ou_contained_tierzero_groups_cache, dict):
+            ou_contained_tierzero_groups_cache[cache_key] = cached_groups
+
+    if not cached_groups:
+        return None
+
+    candidates: list[tuple[str, int]] = []
+    for group_node in cached_groups:
+        terminal_class, rank = _resolve_effective_contained_object_annotation(
+            group_node,
+            domain=domain,
+            recursive_groups_by_principal=recursive_groups_by_principal,
+        )
+        if terminal_class == "direct_compromise":
+            return None
+        if terminal_class in {
+            "followup_terminal",
+            "graph_extension",
+            "future_followup",
+            "dependency_only",
+        }:
+            candidates.append((terminal_class, rank))
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[1])
+
+
+def _resolve_target_followup_status(
+    node: dict[str, Any],
+    *,
+    target_terminal_class: str,
+    domain: str | None,
+    recursive_groups_by_principal: dict[str, tuple[str, ...]] | None,
+    shell: object | None,
+    ou_contained_tierzero_groups_cache: dict[str, tuple[dict[str, Any], ...]] | None,
+    adcs_available: bool | None,
+) -> str:
+    """Return ADscan execution readiness for one terminal target.
+
+    This is intentionally separate from ``target_terminal_class``:
+    - terminal class = what the target means in the graph
+    - followup status = how actionable that target is in ADscan today
+    """
+    terminal = str(target_terminal_class or "pivot").strip().lower()
+    if not isinstance(node, dict):
+        return "unavailable"
+
+    effective_membership = _resolve_effective_principal_membership(
+        node,
+        domain=domain,
+        recursive_groups_by_principal=recursive_groups_by_principal,
+    )
+
+    if effective_membership is not None:
+        if effective_membership.dns_admins:
+            return "unsupported"
+        if any(
+            (
+                effective_membership.account_operators,
+                effective_membership.exchange_windows_permissions,
+                effective_membership.exchange_trusted_subsystem,
+                effective_membership.backup_operators,
+            )
+        ):
+            return "theoretical"
+        decision = resolve_privileged_followup_decision(
+            effective_membership,
+            adcs_available=adcs_available,
+        )
+        if decision.future_followup_keys:
+            return "unsupported"
+        if decision.dependency_only_keys:
+            return "unavailable"
+        if is_adcs_tier_zero_group(node) and adcs_available is False:
+            return "unavailable"
+
+    if (
+        isinstance(node, dict)
+        and shell is not None
+        and attack_paths_core._node_kind(node) == "OU"  # noqa: SLF001
+    ):
+        effective_terminal = _resolve_effective_ou_terminal_annotation(
+            node,
+            shell=shell,
+            domain=domain,
+            ou_contained_tierzero_groups_cache=ou_contained_tierzero_groups_cache,
+            recursive_groups_by_principal=recursive_groups_by_principal,
+        )
+        if effective_terminal is not None:
+            effective_terminal_class, _ = effective_terminal
+            if effective_terminal_class == "graph_extension":
+                return "theoretical"
+            if effective_terminal_class == "followup_terminal":
+                distinguished_name = _extract_node_distinguished_name(node)
+                cache_key = distinguished_name.casefold()
+                contained_groups = (
+                    ou_contained_tierzero_groups_cache.get(cache_key)
+                    if isinstance(ou_contained_tierzero_groups_cache, dict)
+                    else ()
+                ) or ()
+                for group_node in contained_groups:
+                    contained_terminal_class, _ = (
+                        _resolve_effective_contained_object_annotation(
+                            group_node,
+                            domain=domain,
+                            recursive_groups_by_principal=recursive_groups_by_principal,
+                        )
+                    )
+                    if contained_terminal_class != "followup_terminal":
+                        continue
+                    membership = _resolve_effective_principal_membership(
+                        group_node,
+                        domain=domain,
+                        recursive_groups_by_principal=recursive_groups_by_principal,
+                    )
+                    if membership is None:
+                        sid_upper, _ = attack_graph_core._extract_node_sid_and_rid(group_node)  # noqa: SLF001
+                        props = (
+                            group_node.get("properties")
+                            if isinstance(group_node.get("properties"), dict)
+                            else {}
+                        )
+                        group_name = str(
+                            props.get("name") or group_node.get("label") or ""
+                        )
+                        membership = classify_privileged_membership(
+                            group_sids=[sid_upper],
+                            group_names=[group_name],
+                        )
+                    if membership.dns_admins:
+                        return "unsupported"
+                return "theoretical"
+            if effective_terminal_class == "future_followup":
+                return "unsupported"
+            if effective_terminal_class == "dependency_only":
+                return "unavailable"
+
+    if terminal == "direct_compromise":
+        if is_adcs_tier_zero_group(node) and adcs_available is False:
+            return "unavailable"
+        return "actionable"
+    if terminal == "followup_terminal":
+        sid_upper, _ = attack_graph_core._extract_node_sid_and_rid(node)  # noqa: SLF001
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        group_name = str(props.get("name") or node.get("label") or "")
+        membership = classify_privileged_membership(group_sids=[sid_upper], group_names=[group_name])
+        if membership.dns_admins:
+            return "unsupported"
+        return "theoretical"
+    if terminal == "graph_extension":
+        return "theoretical"
+    if terminal == "future_followup":
+        return "unsupported"
+    if terminal == "dependency_only":
+        return "unavailable"
+    return "unavailable"
 
 
 def _apply_local_postprocessing_pipeline(
@@ -8454,11 +10831,12 @@ def _apply_local_postprocessing_pipeline(
         1.  Debug log raw output
         2.  terminal-MemberOf filter + trim (target=all/lowpriv; mirrors BH CE Cypher filter)
         2b. owned-terminal filter — after trim (terminals may change), before minimize
-        3.  minimize_display_paths (redundant_memberof, repeated_labels)
-        4.  Safety-net dedup (exact key)
-        5.  apply_affected_user_metadata
-        6.  filter_contained_paths (HV-aware keep_shortest or keep_longest by scope)
-        7.  target_is_high_value tagging via snapshot nodes
+        3.  ADCS-dependent terminal filter
+        4.  minimize_display_paths (redundant_memberof, repeated_labels)
+        5.  Safety-net dedup (exact key)
+        6.  apply_affected_user_metadata
+        7.  filter_contained_paths (HV-aware keep_shortest or keep_longest by scope)
+        8.  target_is_high_value tagging via snapshot nodes
 
     Stage ordering rationale: BH CE applies the non-terminal MemberOf filter at the Cypher
     level (before any Python post-processing). In local we mirror this by running it as the
@@ -8472,6 +10850,9 @@ def _apply_local_postprocessing_pipeline(
     # only carries user/group data; domain terminals like ESSOS.LOCAL are only in the attack graph.
     _base_graph = load_attack_graph(shell, domain)
     _label_to_node = _build_snapshot_label_to_node(snapshot, base_graph=_base_graph)
+    _recursive_groups_by_principal = (
+        _build_recursive_membership_closure(domain, snapshot) if snapshot else None
+    )
 
     # Log scope / rule matrix (mirrors BH CE pipeline header).
     _apply_leading = scope == "domain" or (
@@ -8506,6 +10887,14 @@ def _apply_local_postprocessing_pipeline(
         _terminal_mo_trimmed = 0
         _terminal_mo_discarded = 0
         _terminal_mo_kept: list[dict[str, Any]] = []
+        _terminal_mo_discarded_debug = attack_paths_core.SampledDebugLogger(
+            prefix="[local-pipeline]",
+            summary_label="terminal-memberof discarded",
+        )
+        _terminal_mo_trimmed_debug = attack_paths_core.SampledDebugLogger(
+            prefix="[local-pipeline]",
+            summary_label="terminal-memberof trimmed",
+        )
         for rec in records:
             rels = rec.get("relations") or rec.get("rels") or []
             last_rel = str(rels[-1] if rels else "").strip().lower()
@@ -8531,18 +10920,20 @@ def _apply_local_postprocessing_pipeline(
             )
             if trimmed is None:
                 _terminal_mo_discarded += 1
-                print_info_debug(
+                _terminal_mo_discarded_debug.log(
                     f"[local-pipeline]   terminal-memberof discarded (degenerate after trim): "
                     f"{' → '.join(rec.get('nodes') or [])}"
                 )
             else:
                 _terminal_mo_trimmed += 1
                 _terminal_mo_kept.append(trimmed)
-                print_info_debug(
+                _terminal_mo_trimmed_debug.log(
                     f"[local-pipeline]   terminal-memberof trimmed: "
                     f"{' → '.join(rec.get('nodes') or [])} "
                     f"→→ {' → '.join(trimmed.get('nodes') or [])}"
                 )
+        _terminal_mo_discarded_debug.flush()
+        _terminal_mo_trimmed_debug.flush()
         if _terminal_mo_trimmed or _terminal_mo_discarded:
             print_info_debug(
                 f"[local-pipeline] terminal-memberof [{target!r}, except_hv={_except_hv_terminal}]: "
@@ -8570,16 +10961,21 @@ def _apply_local_postprocessing_pipeline(
     if owned_labels and _is_multi:
         _owned_removed = 0
         _owned_kept: list[dict[str, Any]] = []
+        _owned_removed_debug = attack_paths_core.SampledDebugLogger(
+            prefix="[local-pipeline]",
+            summary_label="owned-terminal removed",
+        )
         for rec in records:
             term = _normalize_account(str(rec.get("target") or ""))
             if term in owned_labels:
                 _owned_removed += 1
-                print_info_debug(
+                _owned_removed_debug.log(
                     f"[local-pipeline]   owned-terminal removed: "
                     f"{' → '.join(rec.get('nodes') or [])}"
                 )
             else:
                 _owned_kept.append(rec)
+        _owned_removed_debug.flush()
         if _owned_removed:
             print_info_debug(
                 f"[local-pipeline] owned-terminal filter: removed {_owned_removed} path(s) "
@@ -8612,6 +11008,10 @@ def _apply_local_postprocessing_pipeline(
     seen: set[tuple[Any, ...]] = set()
     deduped: list[dict[str, Any]] = []
     n_dedup_removed = 0
+    _dedup_removed_debug = attack_paths_core.SampledDebugLogger(
+        prefix="[local-pipeline]",
+        summary_label="dedup removed",
+    )
     for rec in records:
         key = attack_graph_core.display_record_signature(rec)
         if key not in seen:
@@ -8619,9 +11019,10 @@ def _apply_local_postprocessing_pipeline(
             deduped.append(rec)
         else:
             n_dedup_removed += 1
-            print_info_debug(
+            _dedup_removed_debug.log(
                 f"[local-pipeline]   dedup removed: {' → '.join(rec.get('nodes') or [])}"
             )
+    _dedup_removed_debug.flush()
     if n_dedup_removed:
         print_info_debug(
             f"[local-pipeline] dedup: removed {n_dedup_removed} duplicate(s) → {len(deduped)} remain"
@@ -8673,8 +11074,8 @@ def _apply_local_postprocessing_pipeline(
         records = result
         print_attack_paths_summary_debug(
             domain,
-            records,
-            stage_label=(
+                records,
+                stage_label=(
                 f"6/6 · after contained filter [hv-aware, {scope}] ({n_contained} removed)"
             ),
         )
@@ -8692,22 +11093,35 @@ def _apply_local_postprocessing_pipeline(
         records = result
         print_attack_paths_summary_debug(
             domain,
-            records,
-            stage_label=(
+                records,
+                stage_label=(
                 f"6/6 · after contained filter [keep_longest, domain] ({n_contained} removed)"
             ),
         )
 
-    # Stage 7: HV tagging using snapshot node data (mirrors BH CE graph-based tagging).
+    # Stage 7: target-priority tagging using ADscan-owned semantics.
+    _adcs_available = domain_has_adcs_for_attack_steps(shell, domain)
+    _ou_contained_tierzero_groups_cache: dict[str, tuple[dict[str, Any], ...]] = {}
+    _tier0_count = 0
     _hv_count = 0
     for rec in records:
         tgt_node = _label_to_node.get(str(rec.get("target") or "")) or {}
-        is_hv = attack_graph_core._node_is_effectively_high_value(tgt_node)  # noqa: SLF001
-        rec["target_is_high_value"] = is_hv
-        if is_hv:
+        _annotate_record_target_priority(
+            rec,
+            target_node=tgt_node,
+            shell=shell,
+            domain=domain,
+            recursive_groups_by_principal=_recursive_groups_by_principal,
+            ou_contained_tierzero_groups_cache=_ou_contained_tierzero_groups_cache,
+            adcs_available=_adcs_available,
+        )
+        if rec.get("target_priority_class") == "tierzero":
+            _tier0_count += 1
+        elif rec.get("target_priority_class") == "highvalue":
             _hv_count += 1
     print_info_debug(
-        f"[local-pipeline] hv-tag: {_hv_count} high-value, {len(records) - _hv_count} pivot"
+        f"[local-pipeline] priority-tag: {_tier0_count} tierzero, {_hv_count} high-value, "
+        f"{len(records) - _tier0_count - _hv_count} pivot"
     )
     print_info_debug(
         f"[local-pipeline] final: {len(records)} attack path(s) after all post-processing"
@@ -9712,6 +12126,7 @@ def _compute_bh_attack_paths(
         _label_to_node: dict[str, dict] = {
             v.get("label", k): v for k, v in (graph.get("nodes") or {}).items()
         }
+        _recursive_groups_by_principal: dict[str, tuple[str, ...]] | None = None
         # Log the full rule matrix for this scope so debug output is self-explanatory.
         _apply_leading = scope_norm == "domain" or (
             scope_norm in {"owned", "principals"} and _is_multi
@@ -9737,7 +12152,7 @@ def _compute_bh_attack_paths(
         print_attack_paths_summary_debug(
             domain,
             display_records,
-            stage_label="1/5 · raw BH (acyclic filter in Cypher)",
+            stage_label="1/6 · raw BH (acyclic filter in Cypher)",
         )
 
         # Stage 1b: Owned-terminal filter.
@@ -9748,16 +12163,21 @@ def _compute_bh_attack_paths(
             _bh_owned_labels = frozenset(_normalize_account(p) for p in principals)
             _bh_owned_removed = 0
             _bh_owned_kept: list[dict[str, Any]] = []
+            _bh_owned_removed_debug = attack_paths_core.SampledDebugLogger(
+                prefix="[bh-pipeline]",
+                summary_label="owned-terminal removed",
+            )
             for rec in display_records:
                 term = _normalize_account(str(rec.get("target") or ""))
                 if term in _bh_owned_labels:
                     _bh_owned_removed += 1
-                    print_info_debug(
+                    _bh_owned_removed_debug.log(
                         f"[bh-pipeline]   owned-terminal removed: "
                         f"{' → '.join(rec.get('nodes') or [])}"
                     )
                 else:
                     _bh_owned_kept.append(rec)
+            _bh_owned_removed_debug.flush()
             if _bh_owned_removed:
                 print_info_debug(
                     f"[bh-pipeline] owned-terminal filter: removed {_bh_owned_removed} path(s) "
@@ -9766,6 +12186,11 @@ def _compute_bh_attack_paths(
             display_records = _bh_owned_kept
 
         snapshot = _load_membership_snapshot(shell, domain)
+        _recursive_groups_by_principal = (
+            _build_recursive_membership_closure(domain, snapshot)
+            if snapshot
+            else None
+        )
 
         # minimize_display_paths applies scope-aware rules to clean up display paths:
         #   domain              → redundant_memberof + repeated_labels + leading_memberof
@@ -9799,6 +12224,10 @@ def _compute_bh_attack_paths(
         seen: set[tuple] = set()
         deduped: list[dict[str, Any]] = []
         n_dedup_removed = 0
+        _bh_dedup_removed_debug = attack_paths_core.SampledDebugLogger(
+            prefix="[bh-pipeline]",
+            summary_label="dedup removed",
+        )
         for rec in display_records:
             key = attack_graph_core.display_record_signature(rec)
             if key not in seen:
@@ -9806,9 +12235,10 @@ def _compute_bh_attack_paths(
                 deduped.append(rec)
             else:
                 n_dedup_removed += 1
-                print_info_debug(
+                _bh_dedup_removed_debug.log(
                     f"[bh-pipeline]   dedup removed: {' → '.join(rec.get('nodes') or [])}"
                 )
+        _bh_dedup_removed_debug.flush()
         if n_dedup_removed:
             print_info_debug(
                 f"[bh-pipeline] dedup: removed {n_dedup_removed} duplicate(s) → {len(deduped)} remain"
@@ -9881,16 +12311,29 @@ def _compute_bh_attack_paths(
             f"[bh-pipeline] final: {len(result)} attack path(s) after all post-processing"
         )
 
-        # HV tagging — _label_to_node already built above.
+        # Target-priority tagging — _label_to_node already built above.
+        _adcs_available = domain_has_adcs_for_attack_steps(shell, domain)
+        _ou_contained_tierzero_groups_cache: dict[str, tuple[dict[str, Any], ...]] = {}
+        _tier0_count = 0
         _hv_count = 0
         for rec in result:
             tgt_node = _label_to_node.get(str(rec.get("target") or "")) or {}
-            is_hv = attack_graph_core._node_is_effectively_high_value(tgt_node)  # noqa: SLF001
-            rec["target_is_high_value"] = is_hv
-            if is_hv:
+            _annotate_record_target_priority(
+                rec,
+                target_node=tgt_node,
+                shell=shell,
+                domain=domain,
+                recursive_groups_by_principal=_recursive_groups_by_principal,
+                ou_contained_tierzero_groups_cache=_ou_contained_tierzero_groups_cache,
+                adcs_available=_adcs_available,
+            )
+            if rec.get("target_priority_class") == "tierzero":
+                _tier0_count += 1
+            elif rec.get("target_priority_class") == "highvalue":
                 _hv_count += 1
         print_info_debug(
-            f"[bh-pipeline] hv-tag: {_hv_count} high-value, {len(result) - _hv_count} pivot"
+            f"[bh-pipeline] priority-tag: {_tier0_count} tierzero, {_hv_count} high-value, "
+            f"{len(result) - _tier0_count - _hv_count} pivot"
         )
 
         _bh_elapsed = time.perf_counter() - _bh_t0

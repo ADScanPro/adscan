@@ -35,7 +35,7 @@ bh_native / bh_cypher_names:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 
@@ -82,6 +82,8 @@ class AttackStepCatalogEntry:
     bh_cypher_names: tuple[
         str, ...
     ] = ()  # Cypher relationship type(s) for BH CE queries
+    requires_execution_context: bool = False
+    counts_for_execution_readiness: bool = False
 
 
 def _entry(
@@ -102,6 +104,8 @@ def _entry(
     detection_event_ids: tuple[str, ...] = (),
     bh_native: bool = False,
     bh_cypher_names: tuple[str, ...] = (),
+    requires_execution_context: bool = False,
+    counts_for_execution_readiness: bool = False,
 ) -> AttackStepCatalogEntry:
     """Build a normalized catalog entry."""
     return AttackStepCatalogEntry(
@@ -121,6 +125,8 @@ def _entry(
         detection_event_ids=detection_event_ids,
         bh_native=bh_native,
         bh_cypher_names=bh_cypher_names,
+        requires_execution_context=requires_execution_context,
+        counts_for_execution_readiness=counts_for_execution_readiness,
     )
 
 
@@ -860,6 +866,27 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         bh_cypher_names=("ADCSESC13",),
     ),
     _entry(
+        "adcsesc14",
+        support_kind="unsupported",
+        support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
+        category="adcs",
+        description="ADCS ESC14 privilege escalation path",
+        vuln_key="adcs_esc14",
+        remediation_complexity="high",
+        remediation_effort=(
+            "Remove weak explicit certificate mappings from altSecurityIdentities, "
+            "and enforce strong certificate binding."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1649",
+        mitre_technique_name="Steal or Forge Authentication Certificates",
+        detection_event_ids=("5136", "4886", "4887"),
+        bh_native=False,
+        bh_cypher_names=("ADCSESC14",),
+    ),
+    _entry(
         "adcsesc15",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
@@ -879,6 +906,48 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4886", "4887"),
         bh_native=False,
         bh_cypher_names=("ADCSESC15",),
+    ),
+    _entry(
+        "adcsesc16",
+        support_kind="unsupported",
+        support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
+        category="adcs",
+        description="ADCS ESC16 privilege escalation path",
+        vuln_key="adcs_esc16",
+        remediation_complexity="high",
+        remediation_effort=(
+            "Re-enable szOID_NTDS_CA_SECURITY_EXT on the CA and enforce strong "
+            "certificate binding on domain controllers."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1649",
+        mitre_technique_name="Steal or Forge Authentication Certificates",
+        detection_event_ids=("4886", "4887"),
+        bh_native=False,
+        bh_cypher_names=("ADCSESC16",),
+    ),
+    _entry(
+        "adcsesc17",
+        support_kind="unsupported",
+        support_reason="Not implemented yet in ADscan",
+        compromise_semantics="indirect_target_compromise",
+        compromise_effort="high",
+        category="adcs",
+        description="ADCS ESC17 privilege escalation path",
+        vuln_key="adcs_esc17",
+        remediation_complexity="high",
+        remediation_effort=(
+            "Restrict enrollment on Server Authentication templates and disable "
+            "enrollee-supplied subject names where not strictly required."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1557",
+        mitre_technique_name="Adversary-in-the-Middle",
+        detection_event_ids=("4886", "4887"),
+        bh_native=False,
+        bh_cypher_names=("ADCSESC17",),
     ),
     _entry(
         "coerceandrelayntlmtoadcs",
@@ -1161,6 +1230,46 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("5136",),
         bh_native=True,
         bh_cypher_names=("WriteSPN",),
+    ),
+    _entry(
+        "writelogonscript",
+        support_kind="supported",
+        support_reason=(
+            "Discovered via LDAP ACL analysis with prerequisite validation against "
+            "NETLOGON share/path access"
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
+        category="acl_ace",
+        description="Write the user's logon script path to attacker-controlled content",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Remove write access to the scriptPath attribute for non-privileged principals. "
+            "Audit user objects for unexpected logon scripts and restrict writable SMB shares "
+            "that could host malicious script content."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1098",
+        mitre_technique_name="Account Manipulation",
+        detection_event_ids=("5136",),
+    ),
+    _entry(
+        "writesmbpath",
+        support_kind="supported",
+        support_reason="Validated theoretically via Impacket SMB share ACL and path ACL analysis",
+        compromise_semantics="context_only",
+        compromise_effort="none",
+        category="acl_ace",
+        description="Theoretical write access to an SMB share/path that can host attack payloads",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Remove write permissions from non-privileged principals on sensitive SMB paths such as "
+            "NETLOGON and SYSVOL. Restrict payload staging locations to tightly controlled admins only."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1105",
+        mitre_technique_name="Ingress Tool Transfer",
+        detection_event_ids=("5145",),
     ),
     _entry(
         "addkeycredentiallink",
@@ -1539,6 +1648,47 @@ ATTACK_STEP_CATALOG: dict[str, AttackStepCatalogEntry] = {
     entry.relation: entry for entry in _CATALOG_ENTRIES if entry.relation
 }
 
+_RELATIONS_REQUIRING_EXECUTION_CONTEXT: frozenset[str] = frozenset(
+    {
+        "adminto",
+        "sqladmin",
+        "canrdp",
+        "canpsremote",
+        "allowedtodelegate",
+        "adcsesc1",
+        "adcsesc3",
+        "adcsesc4",
+        "dumplsa",
+        "dumpdpapi",
+        "genericall",
+        "genericwrite",
+        "forcechangepassword",
+        "addself",
+        "addmember",
+        "readgmsapassword",
+        "readlapspassword",
+        "writedacl",
+        "writeowner",
+        "writespn",
+        "dcsync",
+        "kerberoasting",
+        "writelogonscript",
+    }
+)
+_RELATIONS_COUNTING_FOR_EXECUTION_READINESS: frozenset[str] = frozenset(
+    _RELATIONS_REQUIRING_EXECUTION_CONTEXT | {"asreproasting"}
+)
+for _relation, _entry_value in list(ATTACK_STEP_CATALOG.items()):
+    ATTACK_STEP_CATALOG[_relation] = replace(
+        _entry_value,
+        requires_execution_context=(
+            _relation in _RELATIONS_REQUIRING_EXECUTION_CONTEXT
+        ),
+        counts_for_execution_readiness=(
+            _relation in _RELATIONS_COUNTING_FOR_EXECUTION_READINESS
+        ),
+    )
+
 _RELATION_ALIASES_BY_KEY: dict[str, str] = {
     # BloodHound CE ADCS relation variants.
     "adcsesc6a": "adcsesc6",
@@ -1591,6 +1741,22 @@ def get_relation_notes_by_support_kind(support_kind: SupportKind) -> dict[str, s
         for relation, entry in ATTACK_STEP_CATALOG.items()
         if entry.support_kind == support_kind
     }
+
+
+def relation_requires_execution_context(relation: str) -> bool:
+    """Return whether a relation needs an execution credential context."""
+    entry = get_attack_step_entry(relation)
+    if entry is None:
+        return False
+    return bool(entry.requires_execution_context)
+
+
+def relation_counts_for_execution_readiness(relation: str) -> bool:
+    """Return whether a relation should gate attack-path readiness checks."""
+    entry = get_attack_step_entry(relation)
+    if entry is None:
+        return False
+    return bool(entry.counts_for_execution_readiness)
 
 
 def get_exploitation_relation_vuln_keys() -> dict[str, str]:

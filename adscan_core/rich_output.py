@@ -4949,6 +4949,37 @@ def print_delegations_summary(
     _console.print()
 
 
+def _format_effective_target_basis_compact(
+    path: dict[str, object] | None,
+) -> tuple[str, str]:
+    """Return compact primary/extras strings for effective target basis rendering."""
+    if not isinstance(path, dict):
+        return "", ""
+    primary = path.get("effective_target_basis_primary")
+    if not isinstance(primary, dict):
+        return "", ""
+    basis_kind = str(primary.get("basis_kind") or "").strip().lower()
+    basis_kind_display = "MemberOf" if basis_kind == "member_of" else "Contains"
+    target_label = str(primary.get("target_label") or "").strip()
+    if not target_label:
+        return "", ""
+    primary_text = f"Reason: {basis_kind_display} -> {target_label}"
+
+    extras = path.get("effective_target_basis_extras")
+    if not isinstance(extras, list) or not extras:
+        return primary_text, ""
+    extra_labels = [
+        str(extra.get("target_label") or "").strip()
+        for extra in extras
+        if isinstance(extra, dict) and str(extra.get("target_label") or "").strip()
+    ]
+    if not extra_labels:
+        return primary_text, ""
+    extras_summary = f"(+{len(extra_labels)} more)"
+    detail_text = f"Also: {', '.join(extra_labels)}"
+    return f"{primary_text} {extras_summary}", detail_text
+
+
 def print_attack_paths_summary(
     domain: str,
     paths: List[Dict[str, object]],
@@ -4961,12 +4992,13 @@ def print_attack_paths_summary(
 ) -> None:
     """Render attack paths in a clear, compact summary.
 
-    When ``show_sections=True`` the table is split into a high-value section
-    (normal styling) and a pivot/non-HV section (dim styling) separated by a
-    horizontal rule.  Paths must already be sorted HV-first by the caller.
+    When ``show_sections=True`` the table is split into Tier-0, High-Value,
+    and Pivot sections. Paths must already be grouped in that order by the
+    caller.
     """
     from rich.table import Table
     from rich.text import Text
+    from adscan_internal.services.adcs_path_display import resolve_adcs_display_target
 
     if not paths:
         return
@@ -4976,38 +5008,66 @@ def print_attack_paths_summary(
 
     visible = paths[:show_count]
 
-    # Compute total HV/non-HV from the FULL list (not just visible) so that the
-    # header always reflects the true scope even when max_display clips pivot paths.
-    total_hv = sum(1 for p in paths if p.get("target_is_high_value")) if show_sections else 0
-    total_nonhv = total - total_hv if show_sections else 0
-    visible_hv = sum(1 for p in visible if p.get("target_is_high_value")) if show_sections else 0
-    visible_nonhv = show_count - visible_hv if show_sections else 0
-    # Both sections exist in the DATA (regardless of visibility).
-    _has_both_sections = show_sections and total_hv > 0 and total_nonhv > 0
-    # Whether the separator is visible in the rendered table.
-    _separator_visible = _has_both_sections and visible_hv > 0 and visible_nonhv > 0
+    def _target_priority_class(path: Dict[str, object]) -> str:
+        value = str(path.get("target_priority_class") or "").strip().lower()
+        if value in {"tierzero", "highvalue", "pivot"}:
+            return value
+        if bool(path.get("is_tier_zero")):
+            return "tierzero"
+        if bool(path.get("target_is_high_value")):
+            return "highvalue"
+        return "pivot"
+
+    total_by_class = (
+        {
+            "tierzero": sum(1 for p in paths if _target_priority_class(p) == "tierzero"),
+            "highvalue": sum(1 for p in paths if _target_priority_class(p) == "highvalue"),
+            "pivot": sum(1 for p in paths if _target_priority_class(p) == "pivot"),
+        }
+        if show_sections
+        else {"tierzero": 0, "highvalue": 0, "pivot": 0}
+    )
+    visible_by_class = (
+        {
+            "tierzero": sum(1 for p in visible if _target_priority_class(p) == "tierzero"),
+            "highvalue": sum(1 for p in visible if _target_priority_class(p) == "highvalue"),
+            "pivot": sum(1 for p in visible if _target_priority_class(p) == "pivot"),
+        }
+        if show_sections
+        else {"tierzero": 0, "highvalue": 0, "pivot": 0}
+    )
+    visible_classes = [
+        priority_class
+        for priority_class in ("tierzero", "highvalue", "pivot")
+        if visible_by_class[priority_class] > 0
+    ]
 
     summary_text = Text()
-    if show_sections and _has_both_sections:
-        summary_text.append("🎯 High-Value: ", style="bold white")
-        # Show "X/total" when the limit clips some HV paths, otherwise just X.
-        hv_label = f"{visible_hv}/{total_hv}" if visible_hv < total_hv else str(total_hv)
-        summary_text.append(hv_label, style=f"bold {BRAND_COLORS['warning']}")
-        summary_text.append("   ⚠ Pivot: ", style="bold white")
-        pivot_label = (
-            f"{visible_nonhv}/{total_nonhv}" if visible_nonhv < total_nonhv else str(total_nonhv)
-        )
-        pivot_style = BRAND_COLORS["info"] if visible_nonhv > 0 else "dim"
-        summary_text.append(pivot_label, style=f"bold {pivot_style}")
+    if show_sections:
+        for idx, (label, icon, style_key) in enumerate(
+            (
+                ("Tier-0", "🔥", "error"),
+                ("High-Value", "🎯", "warning"),
+                ("Pivot", "⚠", "info"),
+            )
+        ):
+            priority_class = ("tierzero", "highvalue", "pivot")[idx]
+            if idx > 0:
+                summary_text.append("   ", style="dim")
+            summary_text.append(f"{icon} {label}: ", style="bold white")
+            visible_count = visible_by_class[priority_class]
+            total_count = total_by_class[priority_class]
+            count_label = (
+                f"{visible_count}/{total_count}"
+                if 0 < visible_count < total_count
+                else str(total_count)
+            )
+            count_style = BRAND_COLORS[style_key] if total_count > 0 else "dim"
+            summary_text.append(count_label, style=f"bold {count_style}")
         summary_text.append("   Showing: ", style="bold white")
         summary_text.append(str(show_count), style=f"bold {BRAND_COLORS['success']}")
         if show_count < total:
             summary_text.append(f"/{total}", style="dim")
-    elif show_sections and total_hv == 0 and total_nonhv > 0:
-        summary_text.append("⚠ Pivot Paths Found: ", style="bold white")
-        summary_text.append(str(total_nonhv), style=f"bold {BRAND_COLORS['info']}")
-        summary_text.append("  Showing: ", style="bold white")
-        summary_text.append(str(show_count), style=f"bold {BRAND_COLORS['success']}")
     else:
         summary_text.append("Attack Paths Found: ", style="bold white")
         summary_text.append(str(total), style=f"bold {BRAND_COLORS['warning']}")
@@ -5111,12 +5171,23 @@ def print_attack_paths_summary(
                 rel,
                 details=step_details,
             )
+            next_label = str(nodes_to_render[idx + 1])
+            if isinstance(step_details, dict):
+                next_label = str(
+                    step_details.get("display_to")
+                    or resolve_adcs_display_target(
+                        rel,
+                        step_details,
+                        fallback_target=next_label,
+                    )
+                    or next_label
+                )
             chain.append(" → ", style="dim")
             chain.append(rel_label, style=BRAND_COLORS["warning"])
             chain.append(" → ", style="dim")
             chain.append(
                 _mark_path_node(
-                    format_node_label(str(nodes_to_render[idx + 1]), domain)
+                    format_node_label(next_label, domain)
                 )
             )
         if not truncated and len(nodes) > len(rels) + 1:
@@ -5168,14 +5239,6 @@ def print_attack_paths_summary(
             return Text("Disabled", style=BRAND_COLORS["error"])
         return Text("", style="dim")
 
-    # Pre-compute the last HV row index for section separator placement.
-    # Only meaningful when both sections are actually visible in the table.
-    last_hv_row = -1
-    if _separator_visible:
-        for _i, _p in enumerate(visible):
-            if _p.get("target_is_high_value"):
-                last_hv_row = _i
-
     for idx, path in enumerate(paths[:show_count], start=1):
         nodes = path.get("nodes", [])
         rels = path.get("relations", [])
@@ -5188,6 +5251,10 @@ def print_attack_paths_summary(
             steps = []
 
         path_str = _format_inline_chain(nodes, rels, steps)
+        basis_primary, _ = _format_effective_target_basis_compact(path)
+        if basis_primary:
+            path_str.append("\n", style="dim")
+            path_str.append(basis_primary, style="dim")
         length = path.get("length", len(rels))
         status = str(path.get("status") or "theoretical")
 
@@ -5212,13 +5279,17 @@ def print_attack_paths_summary(
             state_cell = _format_target_state_cell(meta)
         exec_cell = _format_exec_cell(meta if isinstance(meta, dict) else None)
 
-        is_nonhv_row = _has_both_sections and not path.get("target_is_high_value")
-        is_last_hv = _separator_visible and (idx - 1) == last_hv_row
-        row_style = "dim" if is_nonhv_row else ""
+        priority_class = _target_priority_class(path)
+        row_style = "dim" if priority_class == "pivot" else ""
+        idx_style = (
+            BRAND_COLORS["error"]
+            if priority_class == "tierzero"
+            else BRAND_COLORS["warning"]
+            if priority_class == "highvalue"
+            else None
+        )
         idx_cell: str | Text = (
-            Text(str(idx), style=f"bold {BRAND_COLORS['warning']}")
-            if _has_both_sections and not is_nonhv_row
-            else str(idx)
+            Text(str(idx), style=f"bold {idx_style}") if idx_style else str(idx)
         )
         row = [
             idx_cell,
@@ -5231,7 +5302,13 @@ def print_attack_paths_summary(
             status,
             str(length),
         ]
-        table.add_row(*row, style=row_style, end_section=is_last_hv)
+        end_section = (
+            show_sections
+            and idx < show_count
+            and priority_class != _target_priority_class(paths[idx])
+            and priority_class in visible_classes
+        )
+        table.add_row(*row, style=row_style, end_section=end_section)
 
     print_table(table, spacing="both")
 
@@ -5523,6 +5600,7 @@ def print_attack_path_detail(
     """Render a detailed single attack path breakdown."""
     from rich.table import Table
     from rich.text import Text
+    from adscan_internal.services.adcs_path_display import resolve_adcs_display_target
     from adscan_internal.services.attack_step_support_registry import (
         classify_path_compromise_semantics,
         describe_path_compromise_effort,
@@ -5651,6 +5729,23 @@ def print_attack_path_detail(
         execution_target_enabled_source = str(
             meta.get("execution_target_enabled_source") or ""
         ).strip()
+        execution_target_viability_status = str(
+            meta.get("execution_target_viability_status") or ""
+        ).strip()
+        execution_target_viability_summary = str(
+            meta.get("execution_target_viability_summary") or ""
+        ).strip()
+        execution_target_reachable = meta.get("execution_target_reachable")
+        execution_target_reachable_source = str(
+            meta.get("execution_target_reachable_source") or ""
+        ).strip()
+        execution_target_matched_ips = meta.get("execution_target_matched_ips")
+        execution_target_vantage_mode = str(
+            meta.get("execution_target_vantage_mode") or ""
+        ).strip()
+        execution_target_execution_advisory = str(
+            meta.get("execution_target_execution_advisory") or ""
+        ).strip()
         if execution_support_status.lower() == "unsupported":
             support_summary = Text()
             support_summary.append("Execution Support: ", style="bold white")
@@ -5703,6 +5798,82 @@ def print_attack_path_detail(
                         style=BRAND_COLORS["warning"],
                     )
                 _get_console().print(advisory_summary)
+        if execution_support_target_kind.lower() == "computer" and (
+            execution_target_viability_status or isinstance(execution_target_reachable, bool)
+        ):
+            viability_summary = Text()
+            viability_summary.append("Target Viability: ", style="bold white")
+            if execution_target_viability_status == "reachable_from_current_vantage":
+                viability_summary.append(
+                    "Reachable from current vantage",
+                    style=BRAND_COLORS["success"],
+                )
+            elif execution_target_viability_status == "resolved_but_unreachable":
+                viability_summary.append(
+                    "Resolved but unreachable from current vantage",
+                    style=BRAND_COLORS["error"],
+                )
+            elif execution_target_viability_status == "enabled_but_unresolved":
+                viability_summary.append(
+                    "Enabled inventory entry without IP resolution",
+                    style=BRAND_COLORS["warning"],
+                )
+            elif execution_target_viability_status == "not_in_enabled_inventory":
+                viability_summary.append(
+                    "Missing from enabled computer inventory",
+                    style=BRAND_COLORS["error"],
+                )
+            elif execution_target_viability_status == "enabled_inventory_only":
+                viability_summary.append(
+                    "Enabled inventory only",
+                    style=BRAND_COLORS["info"],
+                )
+            elif execution_target_viability_summary:
+                viability_summary.append(
+                    execution_target_viability_summary,
+                    style=BRAND_COLORS["info"],
+                )
+            else:
+                viability_summary.append("Unknown", style="dim")
+
+            if execution_target_vantage_mode:
+                viability_summary.append(" via ", style="dim")
+                viability_summary.append(
+                    execution_target_vantage_mode,
+                    style=BRAND_COLORS["info"],
+                )
+            elif execution_target_reachable_source:
+                viability_summary.append(" via ", style="dim")
+                viability_summary.append(
+                    execution_target_reachable_source,
+                    style=BRAND_COLORS["info"],
+                )
+            _get_console().print(viability_summary)
+
+            detail_fragments: list[str] = []
+            if execution_target_viability_summary:
+                detail_fragments.append(execution_target_viability_summary)
+            if (
+                isinstance(execution_target_matched_ips, (list, tuple))
+                and execution_target_matched_ips
+            ):
+                detail_fragments.append(
+                    "matched IPs: "
+                    + ", ".join(str(item) for item in execution_target_matched_ips[:3])
+                )
+            if detail_fragments:
+                viability_detail = Text()
+                viability_detail.append("Viability Details: ", style="bold white")
+                viability_detail.append("  ".join(detail_fragments), style="dim")
+                _get_console().print(viability_detail)
+            if execution_target_execution_advisory:
+                viability_advisory = Text()
+                viability_advisory.append("Execution Advisory: ", style="bold white")
+                viability_advisory.append(
+                    execution_target_execution_advisory,
+                    style=BRAND_COLORS["warning"],
+                )
+                _get_console().print(viability_advisory)
         if path_compromise_semantics == "access_capability_only":
             advisory_summary = Text()
             advisory_summary.append("Execution Advisory: ", style="bold white")
@@ -5781,6 +5952,22 @@ def print_attack_path_detail(
                 )
             _get_console().print(readiness_summary)
 
+    basis_primary, basis_detail = _format_effective_target_basis_compact(path)
+    if basis_primary:
+        basis_summary = Text()
+        basis_summary.append("Effective Target Basis: ", style="bold white")
+        basis_summary.append(
+            basis_primary.removeprefix("Reason: "), style=BRAND_COLORS["warning"]
+        )
+        _get_console().print(basis_summary)
+        if basis_detail:
+            basis_extra_summary = Text()
+            basis_extra_summary.append("Also: ", style="bold white")
+            basis_extra_summary.append(
+                basis_detail.removeprefix("Also: "), style=BRAND_COLORS["info"]
+            )
+            _get_console().print(basis_extra_summary)
+
     steps = path.get("steps", [])
     if not isinstance(steps, list):
         steps = []
@@ -5848,7 +6035,21 @@ def print_attack_path_detail(
                 str(idx),
                 _mark_node(from_node),
                 format_relation_display(rel_name, details=details),
-                _mark_node(to_node),
+                _mark_node(
+                    str(
+                        (
+                            details.get("display_to")
+                            if isinstance(details, dict)
+                            else ""
+                        )
+                        or resolve_adcs_display_target(
+                            rel_name,
+                            details if isinstance(details, dict) else None,
+                            fallback_target=to_node,
+                        )
+                        or to_node
+                    )
+                ),
                 *(
                     [format_relation_source_context(rel_name, details=details)]
                     if has_source_context
@@ -5875,7 +6076,17 @@ def print_attack_path_detail(
                 str(idx),
                 _mark_node(from_label),
                 format_relation_display(action, details=details),
-                _mark_node(to_label),
+                _mark_node(
+                    str(
+                        details.get("display_to")
+                        or resolve_adcs_display_target(
+                            action,
+                            details,
+                            fallback_target=to_label,
+                        )
+                        or to_label
+                    )
+                ),
                 *(
                     [format_relation_source_context(action, details=details)]
                     if has_source_context

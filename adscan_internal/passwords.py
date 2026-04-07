@@ -5,7 +5,11 @@ from __future__ import annotations
 import secrets
 import string
 
-CLI_SAFE_PASSWORD_SYMBOLS = "!#$%^&*_+="
+# Keep symbols deliberately conservative. These passwords are often embedded in
+# shell-built commands, batch files, PowerShell one-liners, or third-party
+# tooling, so we avoid characters that commonly trigger escaping or expansion in
+# cmd.exe, PowerShell, POSIX shells, or argument parsers.
+CLI_SAFE_PASSWORD_SYMBOLS = "#$*+-=_"
 CLI_SAFE_PASSWORD_ALNUM = string.ascii_lowercase + string.ascii_uppercase + string.digits
 
 
@@ -19,6 +23,7 @@ def generate_strong_password(length: int = 12) -> str:
     - no whitespace
     - no quotes/backslashes
     - no leading hyphen
+    - no shell/meta characters such as ^, &, %, |, <, >, !, (, ), ;, :, @
     """
     if length < 12:
         length = 12

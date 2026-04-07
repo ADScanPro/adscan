@@ -40,6 +40,7 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
+from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.core import AuthMode
 from adscan_internal.cli.ci_events import emit_event
 from adscan_internal.cli.common import SECRET_MODE, build_lab_event_fields
@@ -205,6 +206,648 @@ class LdapShell(Protocol):
     credsweeper_path: str | None
 
     base_dn: str | None
+
+
+_IP_TOKEN_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_OBSOLETE_OS_PATTERN = re.compile(
+    r"(?i)\b(windows(?:\s+server)?\s+[0-9a-z][0-9a-z .\-]*?(?:r2)?)(?=\s+is\s+obsolete\b|\s*$)"
+)
+_NETEXEC_LDAP_FIELD_PATTERN = re.compile(r"\(([^:()]+):([^)]+)\)")
+
+
+def parse_netexec_obsolete_output(output: str) -> dict[str, object]:
+    """Parse NetExec LDAP obsolete-module output into structured evidence."""
+    try:
+        from adscan_internal.text_utils import strip_ansi_codes
+    except Exception:  # pragma: no cover
+        def strip_ansi_codes(value: str) -> str:
+            return value
+
+    normalized = strip_ansi_codes(output or "").strip()
+    if not normalized:
+        return {}
+
+    entries: list[dict[str, str]] = []
+    seen_hosts: set[str] = set()
+    hosts: list[str] = []
+
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line or "obsolete" not in line.lower():
+            continue
+
+        entry: dict[str, str] = {"raw_line": line}
+        tokens = line.split()
+
+        host: str | None = None
+        if len(tokens) >= 4 and tokens[0].upper() in {"LDAP", "SMB"}:
+            if _IP_TOKEN_PATTERN.match(tokens[1]) and tokens[2].isdigit():
+                host = tokens[3]
+
+        if not host:
+            host_match = re.search(
+                r"(?i)\b([a-z0-9][a-z0-9_.-]*\.[a-z0-9.-]+|[a-z0-9][a-z0-9_-]{1,63})\b",
+                line,
+            )
+            if host_match:
+                candidate = host_match.group(1)
+                if candidate.lower() not in {"ldap", "smb", "obsolete", "module"}:
+                    host = candidate
+
+        if host:
+            entry["host"] = host
+            host_key = host.lower()
+            if host_key not in seen_hosts:
+                seen_hosts.add(host_key)
+                hosts.append(host)
+
+        os_match = _OBSOLETE_OS_PATTERN.search(line)
+        if os_match:
+            entry["operating_system"] = os_match.group(1).strip()
+
+        entries.append(entry)
+
+    return {
+        "raw_output": normalized,
+        "count": len(hosts),
+        "hosts": hosts,
+        "entries": entries,
+    }
+
+
+def _is_ldap_signing_hardened(value: str | None) -> bool:
+    """Return whether the reported LDAP signing posture looks hardened."""
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized not in {"none", "false", "disabled", "off", "no"}
+
+
+def _is_ldap_channel_binding_hardened(value: str | None) -> bool:
+    """Return whether the reported channel binding posture looks hardened."""
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized not in {
+        "none",
+        "false",
+        "disabled",
+        "off",
+        "no",
+        "never",
+        "no tls cert",
+        "not supported",
+    }
+
+
+def parse_netexec_ldap_security_output(output: str) -> dict[str, object]:
+    """Parse NetExec LDAP banner lines into signing/channel binding posture."""
+    try:
+        from adscan_internal.text_utils import strip_ansi_codes
+    except Exception:  # pragma: no cover
+        def strip_ansi_codes(value: str) -> str:
+            return value
+
+    normalized = strip_ansi_codes(output or "").strip()
+    if not normalized:
+        return {}
+
+    entries: list[dict[str, object]] = []
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if (
+            not line
+            or "(signing:" not in line.lower()
+            or "(channel binding:" not in line.lower()
+        ):
+            continue
+
+        entry: dict[str, object] = {"raw_line": line}
+        tokens = line.split()
+        if len(tokens) >= 4 and tokens[0].upper() == "LDAP":
+            if _IP_TOKEN_PATTERN.match(tokens[1]) and tokens[2].isdigit():
+                entry["target_ip"] = tokens[1]
+                entry["port"] = tokens[2]
+                entry["target_name"] = tokens[3]
+
+        field_map: dict[str, str] = {}
+        for match in _NETEXEC_LDAP_FIELD_PATTERN.finditer(line):
+            key = str(match.group(1) or "").strip().lower()
+            value = str(match.group(2) or "").strip()
+            if key:
+                field_map[key] = value
+
+        signing = field_map.get("signing")
+        channel_binding = field_map.get("channel binding")
+        if signing is not None:
+            entry["signing"] = signing
+            entry["signing_hardened"] = _is_ldap_signing_hardened(signing)
+        if channel_binding is not None:
+            entry["channel_binding"] = channel_binding
+            entry["channel_binding_hardened"] = _is_ldap_channel_binding_hardened(
+                channel_binding
+            )
+        if "name" in field_map:
+            entry["server_name"] = field_map["name"]
+        if "domain" in field_map:
+            entry["domain_name"] = field_map["domain"]
+
+        entries.append(entry)
+
+    if not entries:
+        return {}
+
+    insecure_signing_targets: list[str] = []
+    insecure_channel_binding_targets: list[str] = []
+    risky_targets: list[str] = []
+
+    for entry in entries:
+        target_name = str(
+            entry.get("server_name")
+            or entry.get("target_name")
+            or entry.get("target_ip")
+            or "unknown"
+        )
+        signing_hardened = bool(entry.get("signing_hardened"))
+        channel_binding_hardened = bool(entry.get("channel_binding_hardened"))
+        if not signing_hardened:
+            insecure_signing_targets.append(target_name)
+        if not channel_binding_hardened:
+            insecure_channel_binding_targets.append(target_name)
+        if not signing_hardened or not channel_binding_hardened:
+            risky_targets.append(target_name)
+
+    return {
+        "raw_output": normalized,
+        "dc_count": len(entries),
+        "entries": entries,
+        "insecure_signing_targets": insecure_signing_targets,
+        "insecure_channel_binding_targets": insecure_channel_binding_targets,
+        "risky_targets": risky_targets,
+    }
+
+
+def _build_ldap_security_targets(shell: LdapShell, *, domain: str) -> list[dict[str, str]]:
+    """Build a stable per-DC target list for LDAP posture checks."""
+    domain_info = shell.domains_data.get(domain, {})
+    targets: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _append_target(connect_target: str, display_name: str) -> None:
+        normalized_target = str(connect_target or "").strip().lower()
+        normalized_display = str(display_name or "").strip().lower()
+        if not normalized_target:
+            return
+        key = normalized_display or normalized_target
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(
+            {
+                "connect_target": connect_target,
+                "display_name": display_name or connect_target,
+            }
+        )
+
+    hostname_candidates: list[str] = []
+    pdc_hostname = str(domain_info.get("pdc_hostname") or "").strip()
+    if pdc_hostname:
+        hostname_candidates.append(pdc_hostname)
+    for hostname in domain_info.get("dcs_hostnames") or []:
+        cleaned = str(hostname or "").strip()
+        if cleaned:
+            hostname_candidates.append(cleaned)
+
+    if hostname_candidates:
+        for hostname in hostname_candidates:
+            fqdn = hostname if "." in hostname else f"{hostname}.{domain}"
+            display_name = hostname.split(".", 1)[0]
+            _append_target(fqdn, display_name)
+        return targets
+
+    ip_candidates: list[str] = []
+    pdc_ip = str(domain_info.get("pdc") or "").strip()
+    if pdc_ip:
+        ip_candidates.append(pdc_ip)
+    for dc_ip in domain_info.get("dcs") or []:
+        cleaned = str(dc_ip or "").strip()
+        if cleaned:
+            ip_candidates.append(cleaned)
+
+    for address in ip_candidates:
+        _append_target(address, address)
+    return targets
+
+
+def _summarize_ldap_security_entries(
+    dc_results: list[dict[str, object]],
+) -> dict[str, object]:
+    """Aggregate per-DC LDAP posture observations into one finding payload."""
+    entries: list[dict[str, object]] = []
+    insecure_signing_targets: list[str] = []
+    insecure_channel_binding_targets: list[str] = []
+    risky_targets: list[str] = []
+
+    for result in dc_results:
+        target_label = str(result.get("target_label") or "").strip()
+        parsed = (
+            result.get("parsed")
+            if isinstance(result.get("parsed"), dict)
+            else {}
+        )
+        per_target_entries = parsed.get("entries") if isinstance(parsed, dict) else None
+        if not isinstance(per_target_entries, list) or not per_target_entries:
+            entries.append(
+                {
+                    "target": target_label,
+                    "reachable": False,
+                    "signing": None,
+                    "channel_binding": None,
+                }
+            )
+            risky_targets.append(target_label or "unknown")
+            continue
+
+        entry = dict(per_target_entries[0])
+        entry["target"] = target_label or entry.get("server_name") or entry.get("target_name")
+        entries.append(entry)
+
+        effective_target = str(entry.get("target") or target_label or "unknown")
+        if not bool(entry.get("signing_hardened")):
+            insecure_signing_targets.append(effective_target)
+        if not bool(entry.get("channel_binding_hardened")):
+            insecure_channel_binding_targets.append(effective_target)
+        if (
+            not bool(entry.get("signing_hardened"))
+            or not bool(entry.get("channel_binding_hardened"))
+        ):
+            risky_targets.append(effective_target)
+
+    return {
+        "dc_count": len(entries),
+        "entries": entries,
+        "insecure_signing_targets": insecure_signing_targets,
+        "insecure_channel_binding_targets": insecure_channel_binding_targets,
+        "risky_targets": risky_targets,
+    }
+
+
+def _render_ldap_security_summary(
+    shell: LdapShell,
+    *,
+    domain: str,
+    summary: dict[str, object],
+) -> None:
+    """Render a premium LDAP signing/channel binding summary."""
+    entries = summary.get("entries") if isinstance(summary.get("entries"), list) else []
+    dc_count = int(summary.get("dc_count") or 0)
+    insecure_signing = summary.get("insecure_signing_targets") or []
+    insecure_channel_binding = summary.get("insecure_channel_binding_targets") or []
+    risky_targets = summary.get("risky_targets") or []
+
+    risk_label = "Hardened"
+    if risky_targets:
+        risk_label = "Risky posture detected"
+
+    print_panel(
+        (
+            f"Domain: {mark_sensitive(domain, 'domain')}\n"
+            f"DCs checked: {dc_count}\n"
+            f"DCs without LDAP signing hardening: {len(insecure_signing)}\n"
+            f"DCs without channel binding hardening: {len(insecure_channel_binding)}\n"
+            f"DCs requiring remediation: {len(risky_targets)}\n"
+            f"Assessment: {risk_label}"
+        ),
+        title="LDAP Security Posture",
+    )
+
+    if not entries:
+        return
+
+    table = Table(show_header=True, header_style=f"bold {BRAND_COLORS['info']}")
+    table.add_column("DC")
+    table.add_column("Signing")
+    table.add_column("Channel Binding")
+    table.add_column("Risk")
+
+    for entry in entries:
+        target = mark_sensitive(str(entry.get("target") or "unknown"), "host")
+        signing = str(entry.get("signing") or "Unknown")
+        channel_binding = str(entry.get("channel_binding") or "Unknown")
+        if not bool(entry.get("reachable", True)):
+            risk = "Unreachable"
+        elif bool(entry.get("signing_hardened")) and bool(
+            entry.get("channel_binding_hardened")
+        ):
+            risk = "Hardened"
+        else:
+            risk = "Remediate"
+        table.add_row(target, signing, channel_binding, risk)
+
+    print_panel_with_table(
+        table,
+        title="LDAP Signing and Channel Binding by Domain Controller",
+        border_style=BRAND_COLORS["info"],
+    )
+
+
+def _record_ldap_security_posture_finding(
+    shell: LdapShell,
+    *,
+    domain: str,
+    summary: dict[str, object],
+) -> None:
+    """Persist LDAP signing/channel binding posture into the technical report."""
+    if not summary:
+        return
+
+    try:
+        from adscan_internal.services.report_service import record_technical_finding
+
+        workspace_cwd = shell._get_workspace_cwd()
+        artifact_path = domain_subpath(
+            workspace_cwd,
+            shell.domains_dir,
+            domain,
+            "ldap",
+            "ldap_security_posture.log",
+        )
+        record_technical_finding(
+            shell,
+            domain,
+            key="ldap_security_posture",
+            value=bool(summary.get("risky_targets")),
+            details=summary,
+            evidence=[
+                {
+                    "type": "artifact",
+                    "summary": "NetExec LDAP banner output with signing/channel binding posture",
+                    "artifact_path": artifact_path,
+                }
+            ],
+        )
+    except Exception as exc:  # pragma: no cover
+        if not handle_optional_report_service_exception(
+            exc,
+            action="Technical finding sync",
+            debug_printer=print_info_debug,
+            prefix="[ldap-security]",
+        ):
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                "[ldap-security] Failed to persist technical finding: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+
+def _record_obsolete_computers_finding(
+    shell: LdapShell,
+    *,
+    domain: str,
+    command_output: str,
+) -> None:
+    """Persist obsolete-computer evidence into the technical report."""
+    parsed = parse_netexec_obsolete_output(command_output)
+    if not parsed:
+        return
+
+    try:
+        from adscan_internal.services.report_service import record_technical_finding
+
+        workspace_cwd = shell._get_workspace_cwd()
+        ldap_dir = domain_subpath(workspace_cwd, shell.domains_dir, domain, "ldap")
+        artifact_path = os.path.join(ldap_dir, "obsolete.log")
+
+        record_technical_finding(
+            shell,
+            domain,
+            key="obsolete_computers",
+            value=bool(parsed.get("hosts")),
+            details=parsed,
+            evidence=[
+                {
+                    "type": "artifact",
+                    "summary": "NetExec obsolete operating systems output",
+                    "artifact_path": artifact_path,
+                }
+            ],
+        )
+    except Exception as exc:  # pragma: no cover
+        if not handle_optional_report_service_exception(
+            exc,
+            action="Technical finding sync",
+            debug_printer=print_info_debug,
+            prefix="[obsolete]",
+        ):
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[obsolete] Failed to persist technical finding: {type(exc).__name__}: {exc}"
+            )
+
+
+def execute_netexec_obsolete(shell: LdapShell, *, command: str, domain: str) -> None:
+    """Execute NetExec obsolete-module command and persist structured results."""
+    try:
+        completed_process = shell._run_netexec(
+            command,
+            domain=domain,
+            timeout=900,
+            operation_kind="obsolete_os",
+            service="ldap",
+            target_count=1,
+        )
+
+        if completed_process.returncode != 0:
+            print_error(
+                "Error searching for obsolete operating systems. "
+                f"Return code: {completed_process.returncode}"
+            )
+            error_message = (
+                completed_process.stderr.strip()
+                if getattr(completed_process, "stderr", "")
+                else getattr(completed_process, "stdout", "").strip()
+            )
+            if error_message:
+                print_error(f"Details: {error_message}")
+            return
+
+        clean_stdout = str(getattr(completed_process, "stdout", "") or "").strip()
+        if clean_stdout:
+            shell.console.print(clean_stdout)
+
+        parsed = parse_netexec_obsolete_output(clean_stdout)
+        hosts = parsed.get("hosts", []) if isinstance(parsed, dict) else []
+        shell.update_report_field(
+            domain,
+            "obsolete_computers",
+            hosts if isinstance(hosts, list) and hosts else False,
+        )
+        _record_obsolete_computers_finding(
+            shell,
+            domain=domain,
+            command_output=clean_stdout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_error("Error executing netexec obsolete operating system audit.")
+        print_exception(show_locals=False, exception=exc)
+
+
+def execute_netexec_ldap_security(
+    shell: LdapShell,
+    *,
+    domain: str,
+    targets: list[dict[str, str]],
+) -> None:
+    """Execute per-DC LDAP signing/channel binding checks and persist posture."""
+    if not targets:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            f"No Domain Controllers were available to audit LDAP posture in {marked_domain}."
+        )
+        return
+
+    results: list[dict[str, object]] = []
+    combined_output_blocks: list[str] = []
+    target_count = len(targets)
+
+    for target in targets:
+        connect_target = str(target.get("connect_target") or "").strip()
+        target_label = str(target.get("display_name") or connect_target).strip()
+        if not connect_target:
+            continue
+
+        command = f"{shell.netexec_path} ldap {connect_target}"
+        try:
+            completed_process = shell._run_netexec(
+                command,
+                domain=domain,
+                timeout=300,
+                operation_kind="ldap_security_posture",
+                service="ldap",
+                target_count=target_count,
+            )
+
+            stdout = str(getattr(completed_process, "stdout", "") or "").strip()
+            stderr = str(getattr(completed_process, "stderr", "") or "").strip()
+            if stdout:
+                combined_output_blocks.append(f"# Target: {target_label}\n{stdout}")
+            elif stderr:
+                combined_output_blocks.append(
+                    f"# Target: {target_label}\n[stderr]\n{stderr}"
+                )
+
+            parsed = parse_netexec_ldap_security_output(stdout)
+            results.append(
+                {
+                    "target_label": target_label,
+                    "command": command,
+                    "returncode": int(getattr(completed_process, "returncode", 0) or 0),
+                    "parsed": parsed,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            combined_output_blocks.append(
+                f"# Target: {target_label}\n[exception]\n{type(exc).__name__}: {exc}"
+            )
+            results.append(
+                {
+                    "target_label": target_label,
+                    "command": command,
+                    "returncode": 1,
+                    "parsed": {},
+                }
+            )
+
+    summary = _summarize_ldap_security_entries(results)
+
+    workspace_cwd = shell._get_workspace_cwd()
+    artifact_path = domain_subpath(
+        workspace_cwd,
+        shell.domains_dir,
+        domain,
+        "ldap",
+        "ldap_security_posture.log",
+    )
+    os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+    with open(artifact_path, "w", encoding="utf-8") as handle:
+        if combined_output_blocks:
+            handle.write("\n\n".join(combined_output_blocks) + "\n")
+
+    risky_targets = summary.get("risky_targets", [])
+    shell.update_report_field(
+        domain,
+        "ldap_security_posture",
+        risky_targets if isinstance(risky_targets, list) and risky_targets else False,
+    )
+    _record_ldap_security_posture_finding(
+        shell,
+        domain=domain,
+        summary=summary,
+    )
+    _render_ldap_security_summary(shell, domain=domain, summary=summary)
+
+
+def run_netexec_obsolete(shell: LdapShell, *, domain: str) -> None:
+    """Run NetExec LDAP obsolete-module against the domain controller."""
+    if not shell.netexec_path:
+        print_error(
+            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
+        )
+        return
+
+    domain_creds = shell.domains_data.get(domain, {})
+    username = domain_creds.get("username")
+    password = domain_creds.get("password")
+    if not username or not password:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"Missing credentials for {marked_domain}. Cannot audit obsolete operating systems."
+        )
+        return
+
+    use_kerberos = False
+    if hasattr(shell, "do_sync_clock_with_pdc"):
+        use_kerberos = bool(shell.do_sync_clock_with_pdc(domain))
+
+    auth = shell.build_auth_nxc(
+        username,
+        password,
+        domain,
+        kerberos=use_kerberos,
+    )
+    pdc_target = shell.domains_data[domain]["pdc"]
+    pdc_hostname = str(shell.domains_data[domain].get("pdc_hostname") or "").strip()
+    if use_kerberos and pdc_hostname:
+        pdc_target = f"{pdc_hostname}.{domain}"
+
+    log_path = domain_relpath(shell.domains_dir, domain, "ldap", "obsolete.log")
+    marked_domain = mark_sensitive(domain, "domain")
+    command = (
+        f"{shell.netexec_path} ldap {pdc_target} {auth} "
+        f"-M obsolete --log {log_path}"
+    )
+    print_info_verbose(
+        f"Auditing obsolete operating systems for domain {marked_domain}"
+    )
+    execute_netexec_obsolete(shell, command=command, domain=domain)
+
+
+def run_netexec_ldap_security(shell: LdapShell, *, domain: str) -> None:
+    """Run LDAP signing/channel binding posture checks against known DCs."""
+    if not shell.netexec_path:
+        print_error(
+            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
+        )
+        return
+
+    targets = _build_ldap_security_targets(shell, domain=domain)
+    marked_domain = mark_sensitive(domain, "domain")
+    print_info_verbose(
+        f"Auditing LDAP signing and channel binding posture for domain {marked_domain}"
+    )
+    execute_netexec_ldap_security(shell, domain=domain, targets=targets)
 
 
 def derive_base_dn(domain: str) -> str:
@@ -1024,7 +1667,13 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
                 ],
             )
         except Exception as exc:  # pragma: no cover
-            telemetry.capture_exception(exc)
+            if not handle_optional_report_service_exception(
+                exc,
+                action="Technical finding sync",
+                debug_printer=print_info_debug,
+                prefix="[ldap-anon]",
+            ):
+                telemetry.capture_exception(exc)
     else:
         print_warning("Anonymous LDAP bind denied.")
         shell.update_report_field(domain, "ldap_anonymous", False)

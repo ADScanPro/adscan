@@ -37,7 +37,11 @@ from adscan_internal.cli.session_preflight import (
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
 from adscan_internal.workspaces.subpaths import domain_relpath
-from adscan_internal.cli.common import build_lab_event_fields
+from adscan_internal.cli.common import (
+    build_lab_event_fields,
+    mark_workspace_start_scan_completed,
+    should_show_workspace_getting_started,
+)
 from adscan_internal.cli.dns import (
     confirm_domain_pdc_mapping,
     finalize_domain_context,
@@ -536,7 +540,7 @@ def _prompt_workspace_cleanup(shell: Any) -> None:
         "[bold cyan]💡 Alternative options:[/bold cyan]\n"
         "• You can clean manually later with: [yellow]clear_all[/yellow]\n"
         "• Or create a new workspace with: [yellow]workspace create[/yellow]\n\n"
-        "[dim]Note: Cleaning preserves variables.json, report.json, and command history[/dim]",
+        "[dim]Note: Cleaning preserves variables.json, technical_report.json, and command history[/dim]",
         title="[bold]🧹 Workspace Preparation[/bold]",
         border_style="yellow",
         padding=(1, 2),
@@ -1148,6 +1152,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
 
         # Skip to enumeration for this domain
         _maybe_apply_domain_inference(shell, known_domain)
+        mark_workspace_start_scan_completed(shell, "start_unauth")
         shell.workspace_save()
         if not shell._is_ctf_domain_pwned(known_domain):
             shell.ask_for_unauth_scan(known_domain)
@@ -2277,9 +2282,8 @@ def run_start_session(*, config: StartSessionConfig, deps: StartSessionDeps) -> 
 
         shell._session_start_time = deps.monotonic()
 
-        if deps.is_first_run():
+        if should_show_workspace_getting_started(shell):
             deps.show_first_run_helper(deps.track_docs_link_shown)
-            deps.mark_first_run_complete()
 
         shell.run()
     except Exception as exc:  # noqa: BLE001 - preserve legacy catch-all behaviour
@@ -2818,6 +2822,12 @@ def _start_auth_with_params(
         force_authenticated_enumeration=True,
         prompt_when_already_authenticated=True,
     )
+    mark_workspace_start_scan_completed(shell, "start_auth")
+    if hasattr(shell, "save_workspace_data"):
+        try:
+            shell.save_workspace_data()
+        except Exception:  # noqa: BLE001 - onboarding persistence is best effort
+            pass
 
 def run_start_auth(shell, args: str | None) -> None:
     """Start authenticated scan using the legacy PentestShell implementation.

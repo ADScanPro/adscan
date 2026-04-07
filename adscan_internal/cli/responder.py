@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 from adscan_internal import telemetry
 from adscan_internal.background_process import launch_background, stop_background
-from adscan_internal.constants import TOOLS_INSTALL_DIR
+from adscan_internal.cli.tools_env import TOOLS_INSTALL_DIR
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_error,
@@ -202,6 +202,7 @@ def start_responder(shell: ResponderShell) -> None:
         env=env,
         needs_root=True,
         label="Responder",
+        watch=True,
     )
 
     if shell.responder_process is None:

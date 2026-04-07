@@ -7,13 +7,13 @@ behaviour stable for the current CLI.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
 import re
 import base64
 import time
 import ipaddress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from datetime import timedelta
 from pathlib import Path
@@ -22,7 +22,6 @@ from typing import Any, Iterable
 from rich.markup import escape as rich_escape
 from rich.prompt import Confirm
 from rich.table import Table
-
 from adscan_internal import (
     print_error,
     print_exception,
@@ -47,6 +46,12 @@ from adscan_internal.cli.scan_outcome_flow import (
     render_no_extracted_findings_preview,
 )
 from adscan_internal.services.pivot_service import orchestrate_ligolo_pivot_tunnel
+from adscan_internal.services.post_pivot_followup_service import (
+    PivotExecutionContext,
+    maybe_offer_post_pivot_owned_followup,
+    refresh_network_inventory_after_pivot,
+    render_post_pivot_reachability_delta,
+)
 from adscan_internal.services.smb_sensitive_file_policy import (
     SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
     SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
@@ -119,6 +124,7 @@ class WinRMPivotTarget:
     prefix_hint: str | None
     ports: list[int]
     selection_reason: str
+
 
 
 def _apply_winrm_phase_candidate_exclusions(
@@ -823,7 +829,7 @@ def check_pivot_reachability_via_winrm(
             )
         if confirmed_reachable:
             upload_helper = getattr(shell, "winrm_upload", None) or winrm_upload
-            orchestrate_ligolo_pivot_tunnel(
+            tunnel_created = orchestrate_ligolo_pivot_tunnel(
                 shell,
                 domain=domain,
                 pivot_host=host,
@@ -835,6 +841,29 @@ def check_pivot_reachability_via_winrm(
                 execute_remote_script=_execute_powershell_via_psrp,
                 remote_agent_os="windows",
             )
+            if tunnel_created:
+                pivot_context = PivotExecutionContext(
+                    domain=domain,
+                    pivot_host=host,
+                    pivot_method="ligolo_winrm_pivot",
+                    pivot_tool="Ligolo",
+                    source_service="winrm",
+                )
+                refresh_result = refresh_network_inventory_after_pivot(
+                    shell,
+                    context=pivot_context,
+                )
+                if refresh_result.refreshed:
+                    render_post_pivot_reachability_delta(
+                        shell,
+                        context=pivot_context,
+                        refresh_result=refresh_result,
+                    )
+                    maybe_offer_post_pivot_owned_followup(
+                        shell,
+                        context=pivot_context,
+                        refresh_result=refresh_result,
+                    )
     except (WinRMPSRPError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
         print_warning(

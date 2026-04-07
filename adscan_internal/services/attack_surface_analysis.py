@@ -413,6 +413,8 @@ def _friendly_rel_label(rel: str) -> str:
         "writeowner": "WriteOwner",
         "forcechangepassword": "ForceChangePassword",
         "addmember": "AddMember",
+        "writelogonscript": "WriteLogonScript",
+        "writesmbpath": "WriteSmbPath",
         "readlapspassword": "ReadLAPSPassword",
         "readgmsapassword": "ReadGMSAPassword",
         "dcsync": "DCSync",

@@ -2707,21 +2707,21 @@ def extract_netbios_name(shell: DNSShell, domain: str) -> str | None:
 
 
 def is_user_dc(shell: DNSShell, domain: str, target_host: str) -> bool:
-    """Check if a user account (machine account) is a Domain Controller.
+    """Return True when the machine account is either a writable DC or an RODC."""
+    return get_user_dc_role(shell, domain, target_host) in {"writable_dc", "rodc"}
 
-    Args:
-        shell: Shell object providing domain data and command execution.
-        domain: Domain name.
-        target_host: Target hostname (must end with '$' for machine account).
 
-    Returns:
-        True if the host is a Domain Controller, False otherwise.
-    """
+def get_user_dc_role(shell: DNSShell, domain: str, target_host: str) -> str:
+    """Classify a machine account as writable DC, RODC, or not a DC."""
     import re
 
     from adscan_internal.rich_output import print_exception
     from adscan_internal.services.attack_graph_service import (
         is_principal_member_of_rid_from_snapshot,
+    )
+    from adscan_internal.services.domain_controller_classifier import (
+        RID_DOMAIN_CONTROLLERS,
+        RID_READ_ONLY_DOMAIN_CONTROLLERS,
     )
     from adscan_internal.principal_utils import normalize_machine_account
 
@@ -2729,21 +2729,34 @@ def is_user_dc(shell: DNSShell, domain: str, target_host: str) -> bool:
         normalized_machine = normalize_machine_account(target_host)
         marked_target_host = mark_sensitive(normalized_machine, "hostname")
 
-        snapshot_result = is_principal_member_of_rid_from_snapshot(
-            shell, domain, normalized_machine, 516
+        rodc_snapshot_result = is_principal_member_of_rid_from_snapshot(
+            shell, domain, normalized_machine, RID_READ_ONLY_DOMAIN_CONTROLLERS
         )
-        if snapshot_result is True:
+        if rodc_snapshot_result is True:
+            print_info_debug(
+                f"[is_user_dc] {marked_target_host} is an RODC (memberships.json RID 521)."
+            )
+            print_success(f"{marked_target_host} is a Read-Only Domain Controller")
+            return "rodc"
+
+        dc_snapshot_result = is_principal_member_of_rid_from_snapshot(
+            shell, domain, normalized_machine, RID_DOMAIN_CONTROLLERS
+        )
+        if dc_snapshot_result is True:
             print_info_debug(
                 f"[is_user_dc] {marked_target_host} is a DC (memberships.json RID 516)."
             )
             print_success(f"{marked_target_host} is a Domain Controller")
-            return True
-        if snapshot_result is False:
+            return "writable_dc"
+
+        if rodc_snapshot_result is False and dc_snapshot_result is False:
             print_info_debug(
-                f"[is_user_dc] {marked_target_host} is not a DC (memberships.json RID 516)."
+                f"[is_user_dc] {marked_target_host} is not a DC "
+                "(memberships.json RID 516/521)."
             )
             print_warning(f"{marked_target_host} is not a Domain Controller")
-            return False
+            return "not_dc"
+
         print_info_debug(
             f"[is_user_dc] memberships.json unavailable or missing SID metadata for {marked_target_host}; "
             "falling back to host heuristics/LDAP."
@@ -2758,54 +2771,55 @@ def is_user_dc(shell: DNSShell, domain: str, target_host: str) -> bool:
                     f"[is_user_dc] {marked_target_host} matches pdc_hostname fallback."
                 )
                 print_success(f"{marked_target_host} is a Domain Controller")
-                return True
+                return "writable_dc"
+
+        def _membership_matches(group_name: str) -> bool:
+            auth_str = shell.build_auth_nxc(
+                shell.domains_data[domain]["username"],
+                shell.domains_data[domain]["password"],
+                shell.domain,
+                kerberos=False,
+            )
+            command = (
+                f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} {auth_str} "
+                f"--log domains/{domain}/ldap/is_dc_{target_host}.log "
+                f"--groups '{group_name}'"
+            )
+
+            print_info(f"Verifying if {marked_target_host} is a Domain Controller")
+            completed_process = shell.run_command(command, timeout=300)
+
+            if completed_process.returncode != 0:
+                marked_host = mark_sensitive(target_host, "hostname")
+                print_error(
+                    f"Error executing {shell.netexec_path} ldap to check if {marked_host} is a DC. "
+                    f"Return code: {completed_process.returncode}"
+                )
+                if completed_process.stderr:
+                    print_error(f"Error details: {completed_process.stderr.strip()}")
+                elif completed_process.stdout:
+                    print_error(
+                        f"Output (possibly error): {completed_process.stdout.strip()}"
+                    )
+                return False
+
+            output_str = completed_process.stdout
+            dc_matches = re.findall(r"GROUP-MEM.*?(\S+\$)", output_str)
+            dc_matches = [match.upper() for match in dc_matches]
+            return normalized_machine.upper() in dc_matches
 
         print_info_debug(
             f"[is_user_dc] Falling back to LDAP group lookup for {marked_target_host}."
         )
-        auth_str = shell.build_auth_nxc(
-            shell.domains_data[domain]["username"],
-            shell.domains_data[domain]["password"],
-            shell.domain,
-            kerberos=False,
-        )
-        command = (
-            f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} {auth_str} "
-            f"--log domains/{domain}/ldap/is_dc_{target_host}.log "
-            f"--groups 'domain controllers'"
-        )
-
-        print_info(f"Verifying if {marked_target_host} is a Domain Controller")
-
-        completed_process = shell.run_command(command, timeout=300)
-
-        if completed_process.returncode != 0:
-            marked_target_host = mark_sensitive(target_host, "hostname")
-            print_error(
-                f"Error executing {shell.netexec_path} ldap to check if {marked_target_host} is a DC. "
-                f"Return code: {completed_process.returncode}"
-            )
-            if completed_process.stderr:
-                print_error(f"Error details: {completed_process.stderr.strip()}")
-            elif completed_process.stdout:
-                # Sometimes errors are on stdout for nxc
-                print_error(
-                    f"Output (possibly error): {completed_process.stdout.strip()}"
-                )
-            return False
-
-        output_str = completed_process.stdout
-
-        # Search for lines containing GROUP-MEM and extract accounts ending with '$'
-        dc_matches = re.findall(r"GROUP-MEM.*?(\S+\$)", output_str)
-        dc_matches = [match.upper() for match in dc_matches]  # Compare in uppercase
-
-        if normalized_machine.upper() in dc_matches:
+        if _membership_matches("read-only domain controllers"):
+            print_success(f"{marked_target_host} is a Read-Only Domain Controller")
+            return "rodc"
+        if _membership_matches("domain controllers"):
             print_success(f"{marked_target_host} is a Domain Controller")
-            return True
+            return "writable_dc"
 
         print_warning(f"{marked_target_host} is not a Domain Controller")
-        return False
+        return "not_dc"
     except Exception as e:
         telemetry.capture_exception(e)
         marked_target_host = mark_sensitive(target_host, "hostname")
@@ -2813,7 +2827,7 @@ def is_user_dc(shell: DNSShell, domain: str, target_host: str) -> bool:
             f"An error occurred while checking if {marked_target_host} is a DC: {e}"
         )
         print_exception(show_locals=False, exception=e)
-        return False
+        return "not_dc"
 
 
 def is_computer_dc(shell: DNSShell, domain: str, target_host: str) -> bool:

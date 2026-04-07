@@ -45,6 +45,11 @@ class BloodHoundClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_stale_enabled_users(self, domain: str, stale_days: int = 180) -> List[Dict]:
+        """Get enabled users that appear stale based on last logon age."""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_user_groups(
         self, domain: str, username: str, recursive: bool = True
     ) -> List[str]:

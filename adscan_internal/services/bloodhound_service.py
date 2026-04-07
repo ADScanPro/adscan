@@ -154,6 +154,9 @@ class BloodHoundService(BaseService):
             f"BloodHoundService initialized with {self.edition} edition",
             extra={"edition": self.edition, "license_mode": license_mode.value},
         )
+        self._principal_node_cache: dict[
+            tuple[str, str, str, str], dict[str, Any] | None
+        ] = {}
 
     def _create_ce_client(
         self,
@@ -584,6 +587,143 @@ class BloodHoundService(BaseService):
             )
         return None
 
+    def get_principal_node(
+        self,
+        domain: str,
+        *,
+        label: str | None = None,
+        object_id: str | None = None,
+        kind_hint: str | None = None,
+        lookup_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the best matching principal node using the most specific lookup.
+
+        Resolution order:
+        1. ``object_id`` when present, optionally constrained by ``kind_hint``.
+        2. A single type-specific lookup when ``kind_hint`` is available.
+        3. Legacy multi-type fallback for ambiguous labels.
+        """
+        domain_clean = (domain or "").strip()
+        label_clean = (label or "").strip()
+        object_id_clean = (object_id or "").strip()
+        lookup_name_clean = (lookup_name or "").strip() or label_clean
+        kind_clean = str(kind_hint or "").strip().lower()
+        if not domain_clean:
+            return None
+
+        cache_key = (
+            domain_clean.lower(),
+            object_id_clean.upper(),
+            kind_clean,
+            (lookup_name_clean or label_clean).lower(),
+        )
+        if cache_key in self._principal_node_cache:
+            return self._principal_node_cache[cache_key]
+
+        result: dict[str, Any] | None = None
+        if object_id_clean:
+            result = self._get_principal_node_by_objectid(
+                domain_clean,
+                object_id_clean,
+                kind_hint=kind_clean or None,
+            )
+        if result is None and kind_clean:
+            result = self._get_principal_node_by_kind(
+                domain_clean,
+                lookup_name_clean or label_clean,
+                kind_clean,
+            )
+        if result is None:
+            result = self._get_principal_node_by_fallbacks(
+                domain_clean,
+                lookup_name_clean or label_clean,
+            )
+
+        self._principal_node_cache[cache_key] = result
+        return result
+
+    def _get_principal_node_by_objectid(
+        self,
+        domain: str,
+        object_id: str,
+        *,
+        kind_hint: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a principal node by objectId/SID using a single query."""
+        domain_clean = (domain or "").strip()
+        object_id_clean = (object_id or "").strip()
+        if not domain_clean or not object_id_clean:
+            return None
+
+        label_predicate = {
+            "user": "n:User",
+            "group": "n:Group",
+            "computer": "n:Computer",
+        }.get(str(kind_hint or "").strip().lower(), "(n:User OR n:Group OR n:Computer)")
+        query = f"""
+        MATCH (n)
+        WHERE {label_predicate}
+          AND toLower(coalesce(n.domain, "")) = toLower("{domain_clean}")
+          AND toUpper(coalesce(n.objectid, n.objectId, "")) = toUpper("{object_id_clean}")
+        RETURN n
+        LIMIT 1
+        """
+        try:
+            rows = self.client.execute_query(query)
+            marked_domain = mark_sensitive(domain_clean, "domain")
+            marked_object_id = mark_sensitive(object_id_clean, "user")
+            print_info_debug(
+                f"[principal_node] objectid lookup completed for {marked_domain}: "
+                f"objectid={marked_object_id} rows={len(rows) if isinstance(rows, list) else 'N/A'}"
+            )
+            if isinstance(rows, list) and rows:
+                node = rows[0]
+                if isinstance(node, dict):
+                    return node
+        except Exception as exc:  # pragma: no cover - best effort
+            telemetry.capture_exception(exc)  # type: ignore[name-defined]
+            marked_domain = mark_sensitive(domain_clean, "domain")
+            marked_object_id = mark_sensitive(object_id_clean, "user")
+            print_info_debug(
+                f"[principal_node] objectid lookup failed for {marked_domain}: "
+                f"objectid={marked_object_id} error={exc}"
+            )
+        return None
+
+    def _get_principal_node_by_kind(
+        self,
+        domain: str,
+        principal_name: str,
+        kind_hint: str,
+    ) -> dict[str, Any] | None:
+        """Return a principal node using one type-specific lookup."""
+        kind_clean = str(kind_hint or "").strip().lower()
+        if kind_clean == "user":
+            normalized = principal_name.split("@", 1)[0].strip()
+            return self.get_user_node_by_samaccountname(domain, normalized)
+        if kind_clean == "group":
+            return self.get_group_node_by_samaccountname(domain, principal_name)
+        if kind_clean == "computer":
+            return self.get_computer_node_by_name(domain, principal_name)
+        return None
+
+    def _get_principal_node_by_fallbacks(
+        self,
+        domain: str,
+        principal_name: str,
+    ) -> dict[str, Any] | None:
+        """Return a principal node using the legacy multi-type fallback chain."""
+        normalized = principal_name.split("@", 1)[0].strip()
+        for resolver in (
+            lambda: self.get_user_node_by_samaccountname(domain, normalized),
+            lambda: self.get_group_node_by_samaccountname(domain, principal_name),
+            lambda: self.get_computer_node_by_name(domain, principal_name),
+        ):
+            node = resolver()
+            if isinstance(node, dict):
+                return node
+        return None
+
     def get_users(
         self,
         domain: str,
@@ -654,6 +794,54 @@ class BloodHoundService(BaseService):
             raise BloodHoundServiceError(
                 "Failed to retrieve users from BloodHound",
                 details={"domain": domain, "error": str(e)},
+            ) from e
+
+    def get_stale_enabled_users(
+        self,
+        domain: str,
+        *,
+        stale_days: int = 180,
+        scan_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get enabled users that appear stale based on last logon age."""
+        self._emit_progress(
+            scan_id=scan_id,
+            phase="bloodhound_user_enumeration",
+            progress=0.0,
+            message=f"Querying BloodHound for stale enabled users in {domain}",
+        )
+
+        try:
+            users = self.client.get_stale_enabled_users(domain, stale_days=stale_days)
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_user_enumeration",
+                progress=1.0,
+                message=f"Retrieved {len(users)} stale enabled users from BloodHound",
+            )
+            self.logger.info(
+                "Retrieved stale enabled users",
+                extra={
+                    "domain": domain,
+                    "stale_days": stale_days,
+                    "count": len(users),
+                },
+            )
+            return users
+        except Exception as e:
+            self.logger.exception(
+                "Failed to get stale enabled users from BloodHound",
+                extra={"domain": domain, "stale_days": stale_days, "error": str(e)},
+            )
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_user_enumeration",
+                progress=1.0,
+                message="Stale enabled user enumeration failed",
+            )
+            raise BloodHoundServiceError(
+                "Failed to retrieve stale enabled users from BloodHound",
+                details={"domain": domain, "stale_days": stale_days, "error": str(e)},
             ) from e
 
     def get_computers(
@@ -844,6 +1032,49 @@ class BloodHoundService(BaseService):
             raise BloodHoundServiceError(
                 "Failed to retrieve users from OU via BloodHound",
                 details={"domain": domain, "error": str(e)},
+            ) from e
+
+    def get_tierzero_objects_in_ou(
+        self,
+        domain: str,
+        ou_distinguished_name: str,
+    ) -> List[Dict[str, Any]]:
+        """Return Tier Zero/high-value Group/User/Computer objects contained in one OU."""
+        try:
+            if not hasattr(self.client, "get_tierzero_objects_in_ou"):
+                raise BloodHoundServiceError(
+                    "Tier Zero OU object filtering is not supported by this BloodHound client",
+                    details={"edition": self.edition},
+                )
+
+            objects = self.client.get_tierzero_objects_in_ou(
+                domain, ou_distinguished_name
+            )
+            self.logger.info(
+                "Retrieved Tier Zero OU objects",
+                extra={
+                    "domain": domain,
+                    "ou_dn": ou_distinguished_name,
+                    "count": len(objects),
+                },
+            )
+            return objects
+        except Exception as e:
+            self.logger.exception(
+                "Failed to get Tier Zero OU objects from BloodHound",
+                extra={
+                    "domain": domain,
+                    "ou_dn": ou_distinguished_name,
+                    "error": str(e),
+                },
+            )
+            raise BloodHoundServiceError(
+                "Failed to retrieve Tier Zero OU objects from BloodHound",
+                details={
+                    "domain": domain,
+                    "ou_dn": ou_distinguished_name,
+                    "error": str(e),
+                },
             ) from e
 
     def get_user_groups(

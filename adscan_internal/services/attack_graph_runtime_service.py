@@ -224,6 +224,10 @@ def set_attack_path_step_context(
     last_executable_idx: int,
     compromise_semantics: str | None = None,
     compromise_effort: str | None = None,
+    effective_target_basis_kind: str | None = None,
+    effective_target_basis_primary: dict[str, object] | None = None,
+    target_terminal_class: str | None = None,
+    target_followup_status: str | None = None,
 ) -> None:
     """Persist lightweight runtime metadata for the current attack-path step."""
     setattr(
@@ -235,6 +239,16 @@ def set_attack_path_step_context(
             "last_executable_idx": int(last_executable_idx),
             "compromise_semantics": str(compromise_semantics or "").strip(),
             "compromise_effort": str(compromise_effort or "").strip(),
+            "effective_target_basis_kind": str(
+                effective_target_basis_kind or ""
+            ).strip(),
+            "effective_target_basis_primary": (
+                dict(effective_target_basis_primary)
+                if isinstance(effective_target_basis_primary, dict)
+                else {}
+            ),
+            "target_terminal_class": str(target_terminal_class or "").strip(),
+            "target_followup_status": str(target_followup_status or "").strip(),
         },
     )
 

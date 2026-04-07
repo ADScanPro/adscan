@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "6.3.0"
+version = "6.4.0"
 description = "ADscan launcher (host-side) that orchestrates Docker to run the ADscan runtime."
 readme = "adscan_pypi_wrapper/README.md"
 authors = [{ name = "ADscan" }]
@@ -23,6 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "impacket==0.13.0",
     "pytest>=8.0,<9.0",
     "ruff>=0.9.0,<1.0",
     "build>=1.2.0,<2.0",
@@ -33,6 +34,7 @@ dev = [
     "jinja2",
 ]
 cli = [
+    "impacket==0.13.0",
     "psutil",
     "python-docx",
     "python-magic>=0.4.27,<0.5; platform_system == 'Linux'",

@@ -17,6 +17,11 @@ from adscan_internal.command_runner import CommandSpec, default_runner
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.core import CredentialFoundEvent
 from adscan_internal.execution_outcomes import output_has_timeout_marker
+from adscan_internal.integrations.impacket.parsers import (
+    extract_kerberoast_candidate_users,
+    parse_asreproast_output,
+    parse_kerberoast_output,
+)
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
@@ -579,9 +584,7 @@ class CredentialService(BaseService):
         # Build command
         command = (
             f"{shlex.quote(getuserspns_path)} -request {auth_string} "
-            f"-target-domain {shlex.quote(domain)} -outputfile {shlex.quote(output_file)} | "
-            f"awk '{{print $2}}' | grep -vE 'Name|v0.|---|CCache|Principal:' | "
-            f"awk '!seen[$0]++' | awk 'NF'"
+            f"-target-domain {shlex.quote(domain)} -outputfile {shlex.quote(output_file)}"
         )
 
         self._emit_progress(
@@ -606,19 +609,17 @@ class CredentialService(BaseService):
             )
 
             # Parse roastable users from stdout
-            roastable_users = []
-            if result.stdout:
-                roastable_users = [
-                    line.strip() for line in result.stdout.splitlines() if line.strip()
-                ]
+            roastable_users = (
+                extract_kerberoast_candidate_users(result.stdout or "")
+                if result.stdout
+                else []
+            )
 
             # Count hashes in output file
             hashes_found = 0
             if os.path.exists(output_file):
-                with open(output_file, "r") as f:
-                    hashes_found = sum(
-                        1 for line in f if line.strip() and "$krb5tgs$" in line
-                    )
+                with open(output_file, "r", encoding="utf-8", errors="ignore") as f:
+                    hashes_found = len(parse_kerberoast_output(f.read()))
 
             self._emit_progress(
                 scan_id=scan_id,
@@ -730,17 +731,14 @@ class CredentialService(BaseService):
             log_part = f" --log {shlex.quote(log_file)}" if log_file else ""
             command = (
                 f"{shlex.quote(netexec_path)} ldap {shlex.quote(pdc)} {auth_string} "
-                f"--kdcHost {shlex.quote(pdc)} --asreproast {shlex.quote(output_file)}{log_part} | "
-                f"grep -P '\\$krb5asrep\\$23\\$([^@]+)@' | "
-                f"sed -E 's/.*\\$krb5asrep\\$23\\$([^@]+)@.*/\\1/'"
+                f"--kdcHost {shlex.quote(pdc)} --asreproast {shlex.quote(output_file)}{log_part}"
             )
         else:
             # Unauthenticated mode with GetNPUsers
             command = (
                 f"{shlex.quote(getnpusers_path)} {shlex.quote(domain + '/')} "
                 f"-usersfile {shlex.quote(users_file)} "
-                f"-format hashcat -outputfile {shlex.quote(output_file)} | "
-                f"grep 'krb5asrep' | tr -t '\\$' ' ' | tr -t '@' ' ' | awk '{{print $3}}'"
+                f"-format hashcat -outputfile {shlex.quote(output_file)}"
             )
 
         self._emit_progress(
@@ -765,19 +763,17 @@ class CredentialService(BaseService):
             )
 
             # Parse roastable users from stdout
-            roastable_users = []
-            if result.stdout:
-                roastable_users = [
-                    line.strip() for line in result.stdout.splitlines() if line.strip()
-                ]
+            roastable_users = (
+                [item.username for item in parse_asreproast_output(result.stdout or "")]
+                if result.stdout
+                else []
+            )
 
             # Count hashes in output file
             hashes_found = 0
             if os.path.exists(output_file):
-                with open(output_file, "r") as f:
-                    hashes_found = sum(
-                        1 for line in f if line.strip() and "$krb5asrep$" in line
-                    )
+                with open(output_file, "r", encoding="utf-8", errors="ignore") as f:
+                    hashes_found = len(parse_asreproast_output(f.read()))
 
             self._emit_progress(
                 scan_id=scan_id,

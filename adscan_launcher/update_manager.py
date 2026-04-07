@@ -109,32 +109,60 @@ def get_local_update_recency_summary(
 ) -> dict[str, object]:
     """Return local update recency metadata derived from persisted state."""
     payload = read_local_update_health(adscan_base_dir)
+    current_time = now or datetime.now(timezone.utc)
     last_success_raw = str(payload.get("last_success_at") or "").strip()
+    last_attempt_raw = str(payload.get("last_attempt_at") or "").strip()
+    last_attempt_ok = payload.get("last_attempt_ok")
     if not last_success_raw:
+        if last_attempt_raw and last_attempt_ok is False:
+            return {
+                "status": "failed_attempt",
+                "has_successful_update": False,
+                "is_stale": True,
+                "age_days": None,
+                "install_initialized_at": str(payload.get("install_initialized_at") or "").strip() or None,
+                "message": f"Previous local update attempt failed: {last_attempt_raw}",
+            }
+        install_initialized_at = str(payload.get("install_initialized_at") or "").strip()
+        if not install_initialized_at:
+            install_initialized_at = current_time.replace(microsecond=0).isoformat()
+            payload["install_initialized_at"] = install_initialized_at
+            try:
+                _write_local_update_health(adscan_base_dir, payload)
+            except OSError:
+                pass
         return {
+            "status": "bootstrap",
             "has_successful_update": False,
-            "is_stale": True,
+            "is_stale": False,
             "age_days": None,
-            "message": "No successful local update recorded yet.",
+            "install_initialized_at": install_initialized_at or None,
+            "message": (
+                "No successful local update recorded yet. "
+                "This is normal on a first install until `adscan update` runs."
+            ),
         }
     try:
         last_success_at = datetime.fromisoformat(last_success_raw)
     except ValueError:
         return {
+            "status": "invalid_success_timestamp",
             "has_successful_update": False,
             "is_stale": True,
             "age_days": None,
+            "install_initialized_at": str(payload.get("install_initialized_at") or "").strip() or None,
             "message": "Last successful local update timestamp is unreadable.",
         }
     if last_success_at.tzinfo is None:
         last_success_at = last_success_at.replace(tzinfo=timezone.utc)
-    current_time = now or datetime.now(timezone.utc)
     age_days = max(0, int((current_time - last_success_at).total_seconds() // 86400))
     is_stale = age_days >= _STALE_UPDATE_WARNING_DAYS
     return {
+        "status": "stale" if is_stale else "fresh",
         "has_successful_update": True,
         "is_stale": is_stale,
         "age_days": age_days,
+        "install_initialized_at": str(payload.get("install_initialized_at") or "").strip() or None,
         "message": (
             f"Last successful local update: {last_success_raw}"
             if not is_stale

@@ -54,6 +54,12 @@ _REQUIRED_JOHN_CONVERTERS = (
     "pfx2john",
     "ansible2john",
 )
+_RUNTIME_PYTHON_DEPENDENCIES = (
+    ("certihound", "CertiHound", "used for ADCS BloodHound collection"),
+    ("gssapi", "gssapi", "required for CertiHound Kerberos authentication"),
+    ("Crypto", "pycryptodome", "required for CertiHound password authentication"),
+    ("pykeepass", "pykeepass", "used for KeePass artifact parsing"),
+)
 
 
 @dataclass(frozen=True)
@@ -133,11 +139,20 @@ def _emit_local_update_recency_guidance(deps: Any) -> None:
         return
     deps.print_info_debug(
         "[check] local update recency: "
+        f"status={recency.get('status')!r}, "
         f"has_successful_update={recency.get('has_successful_update')!r}, "
         f"is_stale={recency.get('is_stale')!r}, "
         f"age_days={recency.get('age_days')!r}, "
+        f"install_initialized_at={recency.get('install_initialized_at')!r}, "
         f"message={recency_message!r}"
     )
+    if recency.get("status") == "bootstrap":
+        initialized_at = str(recency.get("install_initialized_at") or "").strip()
+        if initialized_at:
+            deps.print_info_debug(
+                "[check] bootstrap install detected; "
+                f"install_initialized_at={initialized_at!r}"
+            )
     if not bool(recency.get("is_stale")):
         return
     deps.print_warning("Local update cadence looks stale.")
@@ -1732,6 +1747,86 @@ def check_ligolo_ng_runtime_tooling(*, full_container_runtime: bool, deps: Any) 
     return True
 
 
+def check_runtime_python_dependencies(*, full_container_runtime: bool, deps: Any) -> bool:
+    """Check that runtime-managed Python libraries are importable.
+
+    These dependencies live in the ADscan runtime Python environment rather
+    than in host ``python3`` or isolated per-tool virtual environments, so they
+    need a dedicated runtime check.
+    """
+    if not full_container_runtime:
+        deps.print_info_verbose(
+            "Skipping runtime Python dependency verification outside the ADscan container runtime."
+        )
+        return True
+
+    deps.print_info("Checking runtime Python dependencies...")
+
+    runtime_python_candidates = [
+        "/opt/adscan/venv/bin/python",
+        shutil.which("python3"),
+    ]
+    if os.path.basename(sys.executable).startswith("python"):
+        runtime_python_candidates.append(sys.executable)
+
+    runtime_python = next(
+        (
+            candidate
+            for candidate in runtime_python_candidates
+            if candidate and os.path.exists(candidate)
+        ),
+        None,
+    )
+    if runtime_python is None:
+        deps.print_error(
+            "Could not determine a Python interpreter for runtime dependency verification."
+        )
+        deps.print_instruction("Rebuild or update the ADscan runtime image.")
+        return False
+
+    clean_env = deps.get_clean_env_for_compilation()
+    runtime_python_dir = os.path.dirname(runtime_python)
+    runtime_venv_dir = os.path.dirname(runtime_python_dir)
+    if os.path.basename(runtime_python_dir) == "bin":
+        clean_env["PATH"] = (
+            f"{runtime_python_dir}{os.pathsep}{clean_env.get('PATH', os.environ.get('PATH', ''))}"
+        )
+        clean_env["VIRTUAL_ENV"] = runtime_venv_dir
+
+    all_ok = True
+    for import_name, display_name, usage in _RUNTIME_PYTHON_DEPENDENCIES:
+        import_result = deps.run_command(
+            [runtime_python, "-c", f"import {import_name}"],
+            capture_output=True,
+            check=False,
+            env=clean_env,
+        )
+        if import_result.returncode != 0:
+            deps.print_error(
+                f"Runtime Python dependency '{display_name}' is not importable ({usage})."
+            )
+            deps.print_instruction("Rebuild or update the ADscan runtime image.")
+            stderr = (import_result.stderr or "").strip()
+            stdout = (import_result.stdout or "").strip()
+            if stderr:
+                deps.print_info_verbose(f"{display_name} import stderr: {stderr}")
+            elif stdout:
+                deps.print_info_verbose(f"{display_name} import stdout: {stdout}")
+            all_ok = False
+            continue
+
+        dependency_version = deps.get_python_package_version(
+            runtime_python,
+            import_name,
+            env=clean_env,
+        )
+        version_suffix = f" ({dependency_version})" if dependency_version else ""
+        deps.print_success(
+            f"Runtime Python dependency '{display_name}' is importable{version_suffix}."
+        )
+    return all_ok
+
+
 # ─── DNS/Unbound Resolver Check ──────────────────────────────────────────────
 
 
@@ -2905,6 +3000,14 @@ def run_check(
         deps.print_info_verbose(
             "Skipping external Python tool verification because the main environment is not ready."
         )
+
+    # 3b. Check runtime-managed Python dependencies.
+    runtime_python_deps_ok = check_runtime_python_dependencies(
+        full_container_runtime=full_container_runtime,
+        deps=deps,
+    )
+    if not runtime_python_deps_ok:
+        all_ok = False
 
     # 4. Check System Packages (delegated)
     from adscan_internal.cli.check import (

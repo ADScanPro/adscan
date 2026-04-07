@@ -69,6 +69,11 @@ def _normalize_account(value: str) -> str:
     return name.strip().lower()
 
 
+def _is_audit_mode(shell: Any) -> bool:
+    """Return whether the current shell is running in audit mode."""
+    return str(getattr(shell, "type", "") or "").strip().lower() == "audit"
+
+
 def _sanitize_prompt_account(value: str) -> str:
     """Normalize an account value captured from interactive prompts."""
     return strip_sensitive_markers(str(value or "")).strip()
@@ -635,6 +640,48 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         )
 
     if relation == "forcechangepassword":
+        if _is_audit_mode(shell):
+            marked_from = mark_sensitive(context.exec_username, "user")
+            message = Text()
+            message.append(
+                "ForceChangePassword is disruptive in audit mode.\n",
+                style="bold yellow",
+            )
+            message.append(
+                f"Execution user: {marked_from}\n"
+                f"Target user: {marked_to}\n\n",
+                style="bold",
+            )
+            message.append(
+                "What ADscan will do:\n",
+                style="bold",
+            )
+            message.append(
+                " - Reset the target user's domain password immediately\n"
+                " - Store the new credential in ADscan for follow-up path execution\n\n",
+                style="dim",
+            )
+            message.append(
+                "Risk notes:\n",
+                style="bold",
+            )
+            message.append(
+                " - This invalidates the target user's current password immediately.\n"
+                " - If you do not coordinate with the client, this may interrupt active sessions or service access.\n",
+                style="dim",
+            )
+            print_panel(
+                message,
+                title=Text("Disruptive Operation: ForceChangePassword", style="bold yellow"),
+                border_style="yellow",
+                expand=False,
+            )
+            if not Confirm.ask(
+                "Proceed with ForceChangePassword execution?",
+                default=False,
+            ):
+                print_warning("ForceChangePassword execution cancelled by operator.")
+                return False
         return shell.exploit_force_change_password(
             context.domain,
             context.exec_username,

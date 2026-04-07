@@ -478,7 +478,7 @@ def orchestrate_ligolo_pivot_tunnel(
     upload_agent: Callable[..., bool],
     execute_remote_script: Callable[..., str],
     remote_agent_os: str = "windows",
-) -> None:
+) -> bool:
     """Create one Ligolo tunnel for confirmed pivot subnets and verify the routes."""
 
     workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
@@ -486,14 +486,14 @@ def orchestrate_ligolo_pivot_tunnel(
         print_info_debug(
             "Skipping Ligolo pivot tunnel automation: no active workspace is loaded."
         )
-        return
+        return False
 
     subnet_summaries = summarize_confirmed_pivot_subnets(confirmed_targets)
     if not subnet_summaries:
         print_info_debug(
             "Skipping Ligolo pivot tunnel automation: no subnet summaries were derived from confirmed targets."
         )
-        return
+        return False
 
     _render_subnet_table(shell, subnet_summaries)
     print_info(
@@ -509,7 +509,7 @@ def orchestrate_ligolo_pivot_tunnel(
         default=default_confirm,
     ):
         print_info("Skipping Ligolo tunnel creation by user choice.")
-        return
+        return False
 
     try:
         service = LigoloProxyService(workspace_dir=workspace_dir, current_domain=domain)
@@ -799,6 +799,7 @@ def orchestrate_ligolo_pivot_tunnel(
             print_warning(
                 "Ligolo tunnel started, but the immediate local verification did not observe any expected ports yet."
             )
+        return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_warning(
@@ -810,6 +811,7 @@ def orchestrate_ligolo_pivot_tunnel(
                 "After freeing one default port, retry the tunnel workflow. "
                 "If you must use another port, start the proxy explicitly with: ligolo proxy start 0.0.0.0:<port>"
             )
+        return False
 
 
 __all__ = [

@@ -49,7 +49,13 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.services import CredentialService, EnumerationService
-from adscan_internal.integrations.impacket import ImpacketContext, ImpacketRunner
+from adscan_internal.integrations.impacket import (
+    ImpacketContext,
+    ImpacketRunner,
+    extract_kerberoast_candidate_users,
+    parse_asreproast_output,
+    parse_kerberoast_output,
+)
 from adscan_internal.workspaces import (
     DEFAULT_DOMAIN_LAYOUT,
     domain_relpath,
@@ -403,6 +409,62 @@ def _print_roast_choice_help(
 # ============================================================================
 
 
+def _load_valid_roast_hash_entries(
+    *,
+    roast_type: str,
+    hashes_file_abs: str,
+) -> list[tuple[str, str]]:
+    """Return parsed ``(username, hash)`` pairs from one roast output file."""
+    if not os.path.exists(hashes_file_abs):
+        return []
+
+    try:
+        raw = Path(hashes_file_abs).read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        marked_path = mark_sensitive(hashes_file_abs, "path")
+        print_info_debug(
+            f"[kerberos] Could not read roast hashes file {marked_path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return []
+
+    if roast_type == "kerberoast":
+        parsed = parse_kerberoast_output(raw)
+        return [
+            (item.username.strip(), item.hash_value.strip())
+            for item in parsed
+            if item.username.strip() and item.hash_value.strip()
+        ]
+
+    if roast_type == "asreproast":
+        parsed = parse_asreproast_output(raw)
+        return [
+            (item.username.strip(), item.hash_value.strip())
+            for item in parsed
+            if item.username.strip() and item.hash_value.strip()
+        ]
+
+    return []
+
+
+def _extract_roast_candidate_users_from_stdout(
+    roast_type: str,
+    output: str | None,
+) -> list[str]:
+    """Extract roastable usernames from raw tool stdout without shell pipelines."""
+    if not output:
+        return []
+
+    if roast_type == "kerberoast":
+        return extract_kerberoast_candidate_users(output)
+
+    if roast_type == "asreproast":
+        return [item.username for item in parse_asreproast_output(output) if item.username]
+
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
 def finalize_roast_results(
     shell: KerberosShell,
     *,
@@ -436,16 +498,40 @@ def finalize_roast_results(
     )
 
     hashes_file_exists = os.path.exists(hashes_file_abs)
-    hashes_file_too_small = False
+    hashes_file_size = 0
     if hashes_file_exists:
         try:
-            hashes_file_too_small = os.path.getsize(hashes_file_abs) < 2
+            hashes_file_size = os.path.getsize(hashes_file_abs)
         except (OSError, IOError):
-            hashes_file_too_small = True
+            hashes_file_size = 0
 
-    normalized_users = [u.strip() for u in users if u and u.strip()]
+    parsed_hash_entries = _load_valid_roast_hash_entries(
+        roast_type=roast_type,
+        hashes_file_abs=hashes_file_abs,
+    )
+    normalized_users = []
+    seen_users: set[str] = set()
+    for user in users:
+        stripped = user.strip() if user else ""
+        lowered = stripped.lower()
+        if not stripped or lowered in seen_users:
+            continue
+        normalized_users.append(stripped)
+        seen_users.add(lowered)
 
-    if not normalized_users or not hashes_file_exists or hashes_file_too_small:
+    hash_users = [username for username, _ in parsed_hash_entries]
+    if not normalized_users and hash_users:
+        normalized_users = hash_users
+
+    marked_hashes_file = mark_sensitive(hashes_file_rel, "path")
+    print_info_debug(
+        "[kerberos] Roast result diagnostics: "
+        f"type={roast_type}, file={marked_hashes_file}, "
+        f"file_exists={hashes_file_exists}, file_size={hashes_file_size}, "
+        f"candidate_users={len(normalized_users)}, valid_hashes={len(parsed_hash_entries)}"
+    )
+
+    if not normalized_users:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"No {roast_type}able users found in domain {marked_domain}")
 
@@ -621,26 +707,17 @@ def finalize_roast_results(
     except Exception as e:  # pragma: no cover - best effort
         telemetry.capture_exception(e)
 
-    try:
-        if not os.path.exists(hashes_file_abs):
-            marked_hashes_file = mark_sensitive(hashes_file_rel, "path")
-            print_warning(
-                f"Hashes file not found: {marked_hashes_file}. Skipping hash reading."
-            )
-            hashes: list[str] = []
-        else:
-            with open(hashes_file_abs, "r", encoding="utf-8") as f:
-                hashes = f.readlines()
+    if not parsed_hash_entries:
+        print_warning(
+            f"Roastable users were discovered, but no valid {roast_type} hashes were written to "
+            f"{marked_hashes_file}. Skipping cracking."
+        )
+        return None
 
-        updated_hashes: list[str] = []
-        for index, user in enumerate(all_users):
-            if index < len(hashes):
-                hash_value = hashes[index].strip()
-                updated_hashes.append(f"{user}:{hash_value}")
-            else:
-                marked_user = mark_sensitive(user, "user")
-                print_error(f"Not enough hashes for user {marked_user}")
-                return None
+    try:
+        updated_hashes: list[str] = [
+            f"{username}:{hash_value}" for username, hash_value in parsed_hash_entries
+        ]
 
         with open(hashes_file_abs, "w", encoding="utf-8") as f:
             for entry in updated_hashes:
@@ -1192,8 +1269,7 @@ def execute_roast(
         # Check the process output
         if completed_process and completed_process.returncode == 0:
             output_str = completed_process.stdout or ""
-            # Split the output into lines
-            users = output_str.strip().split("\n") if output_str.strip() else []
+            users = _extract_roast_candidate_users_from_stdout(roast_type, output_str)
 
             return finalize_roast_results(
                 shell,

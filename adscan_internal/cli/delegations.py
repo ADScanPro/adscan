@@ -295,7 +295,7 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
 
                 total_delegations = len(shell.domains_data[domain]["delegations"])
 
-                # Update report.json for delegation-related vulnerabilities
+                # Update the technical report cache for delegation-related findings
                 if total_delegations == 0:
                     # Explicitly record that no delegations were found
                     shell.update_report_field(domain, "unconstrained_delegation", None)

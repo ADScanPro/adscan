@@ -25,6 +25,7 @@ ADSCAN_TAGLINE = "Automate the AD kill chain."
 ADSCAN_COPYRIGHT = "© 2026 Yeray Martín · Macroblond44"
 
 ADSCAN_LINKS = {
+    "docs": "https://www.adscanpro.com/docs",
     "github": "https://github.com/ADscanPro/adscan",
     "discord": "https://discord.gg/fXBR3P8H74",
     "linkedin": "https://linkedin.com/in/yeray-martín-domínguez-324a64223",
@@ -88,7 +89,7 @@ def build_intro_lines(version_tag: str) -> list[tuple[str, str]]:
     Suitable for both Rich ``console.print`` and Textual ``Static`` widgets.
 
     Args:
-        version_tag: e.g. "6.3.0-lite"
+        version_tag: e.g. "6.4.0-lite"
 
     Returns:
         List of (text, style) tuples.
@@ -101,9 +102,14 @@ def build_intro_lines(version_tag: str) -> list[tuple[str, str]]:
         ("", ""),
         (ADSCAN_COPYRIGHT, "dim"),
         (
-            f"[link={ADSCAN_LINKS['discord']}]💬 Discord[/link]"
+            f"[link={ADSCAN_LINKS['docs']}]📚 Docs[/link]"
+            f"  ·  [link={ADSCAN_LINKS['discord']}]💬 Discord[/link]"
             f"  ·  [link={ADSCAN_LINKS['github']}]🔗 GitHub[/link]"
             f"  ·  [link={ADSCAN_LINKS['linkedin']}]💼 LinkedIn[/link]",
+            "dim",
+        ),
+        (
+            "Quick start: [bold]start_unauth[/bold] or [bold]start_auth[/bold]",
             "dim",
         ),
     ]

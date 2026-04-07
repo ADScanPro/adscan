@@ -11,6 +11,7 @@ import time
 import os
 import re
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 import json
 
@@ -53,6 +54,56 @@ def _read_phase_profiling_enabled() -> bool:
 
 
 _ATTACK_PATH_PHASE_PROFILING_ENABLED = _read_phase_profiling_enabled()
+
+
+def _read_debug_sample_limit() -> int:
+    """Return the max number of per-path debug lines to emit per category."""
+    raw = os.getenv("ADSCAN_ATTACK_PATH_DEBUG_SAMPLE_LIMIT", "5").strip()
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 5
+
+
+@dataclass
+class SampledDebugLogger:
+    """Emit only a sample of repetitive debug lines and summarize the rest.
+
+    This keeps attack-path telemetry bounded while preserving representative
+    examples for troubleshooting. Aggregate summary lines should still be
+    logged separately by callers.
+    """
+
+    prefix: str
+    summary_label: str
+    enabled: bool = True
+    limit: int | None = None
+    _emitted: int = 0
+    _suppressed: int = 0
+
+    def __post_init__(self) -> None:
+        """Resolve the effective sample limit after dataclass initialization."""
+        if self.limit is None:
+            self.limit = _read_debug_sample_limit()
+
+    def log(self, message: str) -> None:
+        """Emit one debug line or account for it as suppressed."""
+        if not self.enabled:
+            return
+        if self.limit is not None and self.limit > self._emitted:
+            print_info_debug(message)
+            self._emitted += 1
+            return
+        self._suppressed += 1
+
+    def flush(self) -> None:
+        """Emit a compact suppression summary when lines were skipped."""
+        if not self.enabled or self._suppressed <= 0:
+            return
+        print_info_debug(
+            f"{self.prefix} suppressed {self._suppressed} additional per-path "
+            f"debug line(s) for {self.summary_label}"
+        )
 
 # Per-worker state for principal parallelism.
 _PW_GRAPH: dict[str, Any] = {}
@@ -1347,6 +1398,16 @@ def minimize_display_paths(
         f" → active rules: {', '.join(_active_rules)} | {len(records)} path(s)"
     )
     debug_enabled = _debug_logging_enabled()
+    eliminated_debug = SampledDebugLogger(
+        prefix="[bh-minimize]",
+        summary_label="eliminated (redundant_memberof)",
+        enabled=debug_enabled,
+    )
+    minimized_debug = SampledDebugLogger(
+        prefix="[bh-minimize]",
+        summary_label="minimized path rewrites",
+        enabled=debug_enabled,
+    )
     minimized: list[dict[str, Any]] = []
     for record in records:
         orig_nodes = record.get("nodes") or []
@@ -1359,7 +1420,7 @@ def minimize_display_paths(
         if updated is None:
             if debug_enabled:
                 orig_path = " → ".join(str(n) for n in orig_nodes)
-                print_info_debug(
+                eliminated_debug.log(
                     f"[bh-minimize] eliminated (redundant_memberof): {orig_path!r}"
                 )
             continue
@@ -1371,8 +1432,12 @@ def minimize_display_paths(
             orig_path = " → ".join(str(n) for n in orig_nodes)
             new_path = " → ".join(str(n) for n in (final.get("nodes") or []))
             reason = final.get("meta", {}).get("minimized_reason", "")
-            print_info_debug(f"[bh-minimize] {orig_path!r} → {new_path!r} (reason={reason})")
+            minimized_debug.log(
+                f"[bh-minimize] {orig_path!r} → {new_path!r} (reason={reason})"
+            )
         minimized.append(final)
+    eliminated_debug.flush()
+    minimized_debug.flush()
     return minimized
 
 
