@@ -363,8 +363,28 @@ def _write_acl_object_control_coverage_sidecar(
         coverage_records.append(
             {
                 "source_id": source_id,
+                "source_graph_id": source_id,
+                "source_object_id": str(
+                    nodes[0].get("objectId")
+                    or (
+                        nodes[0].get("properties")
+                        if isinstance(nodes[0].get("properties"), dict)
+                        else {}
+                    ).get("objectid")
+                    or ""
+                ).strip(),
                 "source": _bloodhound_node_display_label(nodes[0]),
                 "target_id": target_id,
+                "target_graph_id": target_id,
+                "target_object_id": str(
+                    nodes[1].get("objectId")
+                    or (
+                        nodes[1].get("properties")
+                        if isinstance(nodes[1].get("properties"), dict)
+                        else {}
+                    ).get("objectid")
+                    or ""
+                ).strip(),
                 "target": _bloodhound_node_display_label(nodes[1]),
                 "relation": relation,
                 "target_kind": target_kind,
@@ -373,7 +393,7 @@ def _write_acl_object_control_coverage_sidecar(
         )
 
     payload = {
-        "schema_version": "acl-object-control-coverage-1.0",
+        "schema_version": "acl-object-control-coverage-1.1",
         "domain": domain,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "coverage": coverage_records,

@@ -9690,6 +9690,7 @@ class PentestShell:
             lab_name (str): Lab name that is not in whitelist
         """
         try:
+            telemetry_enabled = bool(telemetry._is_telemetry_enabled())
             # Path is already imported at module level, no need to reimport
             _migrate_adscan_state_files()
             tracking_file = Path(ADSCAN_STATE_DIR) / "non_whitelisted_labs.json"
@@ -9734,7 +9735,7 @@ class PentestShell:
             )  # noqa: PLC0415
 
             webhook_url = get_labs_webhook_url()
-            if webhook_url:
+            if webhook_url and telemetry_enabled:
                 try:
                     # Get adscan version and distribution info for webhook payload
                     adscan_version = get_version()
@@ -9749,9 +9750,13 @@ class PentestShell:
                         "provider": lab_provider.lower()
                         if lab_provider
                         else None,  # Ensure normalized (fallback if not saved yet)
-                        "lab_name": lab_name.lower()
+                        "lab_name_hash": telemetry._pseudonymize_value(
+                            str(lab_name or "").lower(), "lab"
+                        )
                         if lab_name
-                        else None,  # Ensure normalized (fallback if not saved yet)
+                        else None,
+                        "lab_name_present": bool(lab_name),
+                        "lab_name_whitelisted": False,
                         "adscan_version": adscan_version,
                         "distro": distro_full,
                         "source": "cli",
@@ -9765,7 +9770,7 @@ class PentestShell:
                     )
                     if response.status_code in [200, 201]:
                         print_info_debug(
-                            f"Non-whitelisted lab '{lab_name}' usage tracked and notification sent"
+                            "Non-whitelisted lab usage tracked and notification sent"
                         )
                 except Exception as e:
                     # Don't fail if webhook fails

@@ -3878,6 +3878,30 @@ def _load_acl_object_control_inventory_pairs(
     if not isinstance(coverage, list):
         return set()
 
+    def _record_identity_variants(
+        record: dict[str, Any],
+        *,
+        prefix: str,
+        default_label_field: str,
+    ) -> set[str]:
+        """Return comparable identity keys for one sidecar endpoint."""
+        variants: set[str] = set()
+        for field_name in (
+            f"{prefix}_graph_id",
+            f"{prefix}_id",
+            f"{prefix}_object_id",
+            default_label_field,
+        ):
+            value = str(record.get(field_name) or "").strip()
+            if value:
+                variants.add(value.upper())
+        label_value = str(record.get(default_label_field) or "").strip()
+        if label_value:
+            canonical_label = _canonical_account_identifier(label_value)
+            if canonical_label:
+                variants.add(f"name:{canonical_label}".upper())
+        return variants
+
     indexed_pairs: set[tuple[str, str]] = set()
     for record in coverage:
         if not isinstance(record, dict):
@@ -3888,11 +3912,23 @@ def _load_acl_object_control_inventory_pairs(
         target_kind = str(record.get("target_kind") or "").strip().lower()
         if target_kind and target_kind != "user":
             continue
-        source_id = str(record.get("source_id") or "").strip()
-        target_id = str(record.get("target_id") or "").strip()
-        if not source_id or not target_id:
+        source_variants = _record_identity_variants(
+            record,
+            prefix="source",
+            default_label_field="source",
+        )
+        target_variants = _record_identity_variants(
+            record,
+            prefix="target",
+            default_label_field="target",
+        )
+        if not source_variants or not target_variants:
             continue
-        indexed_pairs.add((source_id.upper(), target_id.upper()))
+        indexed_pairs.update(
+            (source_variant, target_variant)
+            for source_variant in source_variants
+            for target_variant in target_variants
+        )
 
     if indexed_pairs:
         print_info_debug(
@@ -4006,6 +4042,55 @@ def get_writable_user_attribute_paths(
 
     edges: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
+
+    def _candidate_pair_variants(
+        *,
+        source_node: dict[str, Any],
+        target_node: dict[str, Any],
+        target_object_id: str,
+    ) -> set[tuple[str, str]]:
+        """Return comparable source/target identity variants for subsumption checks."""
+        source_variants: set[str] = set()
+        target_variants: set[str] = set()
+
+        source_graph_id = str(_node_id(source_node) or "").strip()
+        source_object_id = str(source_node.get("objectId") or "").strip()
+        source_name = str(source_node.get("name") or "").strip()
+        target_graph_id = str(_node_id(target_node) or "").strip()
+        target_name = str(target_node.get("name") or "").strip()
+
+        for value in (
+            source_graph_id,
+            source_object_id,
+            source_name,
+        ):
+            value_clean = str(value or "").strip()
+            if not value_clean:
+                continue
+            source_variants.add(value_clean.upper())
+            canonical = _canonical_account_identifier(value_clean)
+            if canonical:
+                source_variants.add(f"name:{canonical}".upper())
+
+        for value in (
+            target_graph_id,
+            target_object_id,
+            target_name,
+        ):
+            value_clean = str(value or "").strip()
+            if not value_clean:
+                continue
+            target_variants.add(value_clean.upper())
+            canonical = _canonical_account_identifier(value_clean)
+            if canonical:
+                target_variants.add(f"name:{canonical}".upper())
+
+        return {
+            (source_variant, target_variant)
+            for source_variant in source_variants
+            for target_variant in target_variants
+        }
+
     for row in resolved_rows:
         finding = row["finding"]
         relation = str(finding.get("relation") or "").strip()
@@ -4047,11 +4132,13 @@ def get_writable_user_attribute_paths(
         target_object_id = str(finding.get("target_object_id") or "").strip()
         if (
             relation.lower() == "writelogonscript"
-            and source_object_id
-            and target_object_id
         ):
-            source_target_pair = (source_object_id.upper(), target_object_id.upper())
-            if source_target_pair in inventory_acl_pairs:
+            pair_variants = _candidate_pair_variants(
+                source_node=source_node,
+                target_node=target_node,
+                target_object_id=target_object_id,
+            )
+            if pair_variants.intersection(inventory_acl_pairs):
                 discard_counters["skipped_subsumed_by_acl_inventory"] += 1
                 _sample_drop(
                     "subsumed_by_acl_inventory",
@@ -4061,7 +4148,7 @@ def get_writable_user_attribute_paths(
                     f"target={mark_sensitive(target_label, 'user')}",
                 )
                 continue
-            if source_target_pair in graph_fallback_acl_pairs:
+            if pair_variants.intersection(graph_fallback_acl_pairs):
                 discard_counters["skipped_subsumed_by_graph_fallback"] += 1
                 _sample_drop(
                     "subsumed_by_graph_fallback",

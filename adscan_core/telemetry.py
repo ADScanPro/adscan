@@ -149,13 +149,10 @@ _WELL_KNOWN_PRINCIPALS_PASSTHROUGH: frozenset[str] = frozenset(
 def _preserve_well_known_principals_enabled() -> bool:
     """Return True when well-known AD principals should be preserved verbatim.
 
-    Controlled by ``ADSCAN_TELEMETRY_PRESERVE_WELL_KNOWN_PRINCIPALS``.
-    Defaults to False to keep telemetry maximally privacy-preserving by default.
+    Built-in AD users/groups are always preserved because they are generic and
+    useful for debugging. Domain-qualified forms still sanitize the domain part.
     """
-    raw = str(os.getenv("ADSCAN_TELEMETRY_PRESERVE_WELL_KNOWN_PRINCIPALS", "")).strip()
-    if not raw:
-        return False
-    return raw.lower() in {"1", "true", "yes", "y", "on"}
+    return True
 
 
 def _is_well_known_principal(value: str) -> bool:
@@ -168,10 +165,6 @@ def _is_well_known_principal(value: str) -> bool:
         return False
     raw = str(value).strip()
     if not raw:
-        return False
-    # Do not preserve domain-qualified representations; those parts must be
-    # sanitized independently (domain stays sensitive).
-    if "\\" in raw or "@" in raw:
         return False
     return raw.lower() in _WELL_KNOWN_PRINCIPALS_PASSTHROUGH
 
@@ -315,6 +308,8 @@ class _SentryN8nTransport:
             envelope: Sentry envelope to send
         """
         try:
+            if not _is_telemetry_enabled():
+                return
             token = get_cli_shared_token()
             if not token:
                 print_error_debug(
@@ -323,7 +318,9 @@ class _SentryN8nTransport:
                 return
 
             # Serialize envelope
-            envelope_payload = envelope.serialize().decode("utf-8")
+            envelope_payload = _sanitize_serialized_payload_for_telemetry(
+                envelope.serialize().decode("utf-8")
+            )
 
             # Configure SSL certificates before making request
             _configure_ssl_certificates_for_requests()
@@ -437,6 +434,13 @@ def init_sentry():
         print_error_debug("Sentry proxy URL not configured")
         return
 
+    def _before_send(event, hint):  # type: ignore[no-untyped-def]
+        """Sanitize Sentry events and honor runtime telemetry opt-out."""
+        _ = hint
+        if not _is_telemetry_enabled():
+            return None
+        return _sanitize_telemetry_value(event)
+
     try:
         integrations = []
         if ExcepthookIntegration is not None:
@@ -466,6 +470,10 @@ def init_sentry():
             environment=current_env,  # Tag exceptions with environment
             traces_sample_rate=0.0,
             send_default_pii=False,
+            attach_stacktrace=False,
+            include_local_variables=False,
+            max_breadcrumbs=0,
+            before_send=_before_send,
             # Override transport to use n8n proxy
             transport=lambda options: _SentryN8nTransport(options, n8n_sentry_proxy),
         )
@@ -837,15 +845,15 @@ def _resolve_session_scope() -> str:
 def _should_sanitize_session_recording(
     command_type: Optional[str], session_scope: Optional[str]
 ) -> bool:
-    """Return True only for runtime ``start``/``ci`` session segments.
+    """Return whether uploaded session recordings must be sanitized.
 
-    Sanitization is intentionally restricted to the container runtime execution
-    where most sensitive target data appears. Launcher/preflight segments and
-    host-maintenance commands should keep full context for diagnostics.
+    Session recordings are always sanitized before leaving the host. The
+    ``command_type`` / ``session_scope`` parameters are preserved for backward
+    compatibility and telemetry metadata, but they no longer control privacy
+    policy.
     """
-    command = str(command_type or "").strip().lower()
-    scope = str(session_scope or "").strip().lower()
-    return command in {"start", "ci"} and scope == "runtime"
+    _ = (command_type, session_scope)
+    return True
 
 
 def _resolve_session_trace_id() -> str | None:
@@ -1745,7 +1753,8 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
             except Exception:
                 # Best-effort only; failures here must not break telemetry.
                 pass
-            merged_set = {**default_set, **user_set}
+            merged_set = _sanitize_telemetry_properties({**default_set, **user_set})
+            props = _sanitize_telemetry_properties(props)
             props["$set"] = merged_set
 
             # Send event to n8n proxy (mimics PostHog API format)
@@ -1803,6 +1812,175 @@ def _prepare_rich_content_for_processing(content: str) -> str:
 def _strip_sensitive_markers(content: str) -> str:
     """Remove invisible sensitive markers without redacting the wrapped content."""
     return strip_sensitive_markers(content)
+
+
+_SAFE_TELEMETRY_STRING_FIELDS: frozenset[str] = frozenset(
+    {
+        "adscan_detected_installer",
+        "adscan_version_source",
+        "auth_type",
+        "command_type",
+        "downloaded_source",
+        "environment",
+        "event",
+        "exception_type",
+        "installer",
+        "lab_confirmation_state",
+        "lab_inference_source",
+        "lab_provider",
+        "launcher_version_source",
+        "result",
+        "runtime_version_source",
+        "scan_mode",
+        "service",
+        "session_scope",
+        "session_trace_id",
+        "source",
+        "telemetry_level",
+        "telemetry_source",
+        "target_slug",
+        "target_type",
+        "trace_id",
+        "version_context_mode",
+        "workspace_type",
+    }
+)
+
+_SAFE_TELEMETRY_STRING_RE = re.compile(r"^[A-Za-z0-9._:/@+-]{1,128}$")
+_SENSITIVE_TELEMETRY_FIELD_TYPES: dict[str, str] = {
+    "credential": "password",
+    "credentials": "password",
+    "domain": "domain",
+    "exception_message": "workspace",
+    "fqdn": "hostname",
+    "hash": "hash",
+    "host": "hostname",
+    "hostname": "hostname",
+    "ip": "ip",
+    "ip_address": "ip",
+    "lab_name": "workspace",
+    "message": "workspace",
+    "password": "password",
+    "path": "path",
+    "principal": "user",
+    "pwd": "password",
+    "server": "hostname",
+    "target_host": "hostname",
+    "target_ip": "ip",
+    "user": "user",
+    "username": "user",
+    "workspace": "workspace",
+    "workspace_name": "workspace",
+}
+
+
+def _is_safe_telemetry_string(field_name: str | None, value: str) -> bool:
+    """Return whether one scalar string can bypass heavy sanitization.
+
+    Only tightly-scoped enum-like fields are preserved verbatim. Everything
+    else is sanitized recursively to avoid leaking operator/customer data.
+    """
+    if not field_name:
+        return False
+    normalized_field = str(field_name).strip().lower()
+    if normalized_field not in _SAFE_TELEMETRY_STRING_FIELDS:
+        return False
+    normalized_value = str(value).strip()
+    if not normalized_value:
+        return True
+    return bool(_SAFE_TELEMETRY_STRING_RE.fullmatch(normalized_value))
+
+
+def _sanitize_string_for_telemetry(
+    value: str,
+    *,
+    field_name: str | None = None,
+) -> str:
+    """Return one telemetry-safe string value."""
+    stripped = _strip_sensitive_markers(str(value))
+    normalized_field = str(field_name or "").strip().lower()
+    sensitive_type = _SENSITIVE_TELEMETRY_FIELD_TYPES.get(normalized_field)
+    if sensitive_type == "user" and stripped:
+        if _is_well_known_principal(stripped):
+            return stripped
+        if "@" in stripped:
+            user_part, domain_part = stripped.split("@", 1)
+            if _is_well_known_principal(user_part):
+                return (
+                    f"{user_part}@{_pseudonymize_value(domain_part, 'domain')}"
+                    if domain_part
+                    else user_part
+                )
+        if "\\" in stripped:
+            domain_part, user_part = stripped.rsplit("\\", 1)
+            if _is_well_known_principal(user_part):
+                return (
+                    f"{_pseudonymize_value(domain_part, 'domain')}\\{user_part}"
+                    if domain_part
+                    else user_part
+                )
+    if sensitive_type and stripped:
+        return _pseudonymize_value(stripped, sensitive_type)
+    if _is_safe_telemetry_string(field_name, stripped):
+        return stripped
+    return _sanitize_rich_output(stripped)
+
+
+def _sanitize_telemetry_value(
+    value: Any,
+    *,
+    field_name: str | None = None,
+) -> Any:
+    """Recursively sanitize one telemetry payload value."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _sanitize_string_for_telemetry(value, field_name=field_name)
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, nested_value in value.items():
+            sanitized[str(key)] = _sanitize_telemetry_value(
+                nested_value, field_name=str(key)
+            )
+        return sanitized
+    if isinstance(value, (list, tuple, set)):
+        return [
+            _sanitize_telemetry_value(item, field_name=field_name) for item in value
+        ]
+    return _sanitize_string_for_telemetry(str(value), field_name=field_name)
+
+
+def _sanitize_telemetry_properties(
+    properties: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return sanitized telemetry properties for outbound transport."""
+    return _sanitize_telemetry_value(properties or {}) or {}
+
+
+def _sanitize_serialized_payload_for_telemetry(payload: str) -> str:
+    """Best-effort sanitization for serialized JSON / line-delimited payloads."""
+    text = str(payload)
+    sanitized_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            sanitized_lines.append(line)
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            sanitized_lines.append(_sanitize_string_for_telemetry(line))
+            continue
+
+        sanitized_lines.append(
+            json.dumps(_sanitize_telemetry_value(parsed), separators=(",", ":"))
+        )
+
+    if sanitized_lines:
+        return "\n".join(sanitized_lines)
+    return _sanitize_string_for_telemetry(text)
 
 
 def _get_sanitization_key() -> bytes:
@@ -1997,7 +2175,7 @@ def _record_pseudonym(value: str, data_type: str) -> str:
     """Return a pseudonym and remember it to avoid double-sanitization."""
     if value in _SANITIZED_VALUES:
         return value
-    # Opt-in preservation of well-known built-in AD principals (useful for telemetry debugging).
+    # Preserve generic built-in AD principals (useful for telemetry debugging).
     # We only allow this for "user" tokens because groups are usually treated as users in output.
     if (
         data_type.lower() == "user"
@@ -2701,6 +2879,19 @@ def _sanitize_rich_output(content: str) -> str:
         data_type="domain",
         separator_pattern=r"\s*[│|:=]\s*",  # Only match pipe/colon/equals, not spaces
     )
+    content = _sanitize_keyword_value(
+        content,
+        keywords=[
+            "workspace",
+            "workspace name",
+            "engagement",
+            "engagement name",
+            "lab",
+            "lab name",
+        ],
+        data_type="workspace",
+        separator_pattern=r"\s*[│|:=]\s*",
+    )
 
     # Redact domains in dig SRV queries/results (e.g., _ldap._tcp.dc._msdcs.example.tld)
     content = re.sub(
@@ -3098,6 +3289,37 @@ def _mask_credential_sections(content: str) -> str:
             continue
 
         if mask_mode == "credentials_table":
+            if "│" in line and any(
+                keyword in stripped for keyword in ("user", "username", "credential", "password")
+            ):
+                continue
+            if "│" in line:
+                segments = line.split("│")
+                interior_indices = [
+                    idx_seg
+                    for idx_seg in range(1, len(segments) - 1)
+                    if segments[idx_seg].strip()
+                ]
+                if len(interior_indices) >= 2:
+                    if len(interior_indices) >= 3:
+                        segments[interior_indices[0]] = _replace_table_cell(
+                            segments[interior_indices[0]], "domain"
+                        )
+                        segments[interior_indices[1]] = _replace_table_cell(
+                            segments[interior_indices[1]], "user"
+                        )
+                        segments[interior_indices[2]] = _replace_table_cell(
+                            segments[interior_indices[2]], "password"
+                        )
+                    else:
+                        segments[interior_indices[0]] = _replace_table_cell(
+                            segments[interior_indices[0]], "user"
+                        )
+                        segments[interior_indices[1]] = _replace_table_cell(
+                            segments[interior_indices[1]], "password"
+                        )
+                    lines[idx] = "│".join(segments)
+                    continue
             lines[idx] = _record_pseudonym(line, "redacted")
             continue
 
@@ -3868,7 +4090,9 @@ def _send_session_to_vercel(
             "html": html_content,
         }
         payload.update(_vercel_version_field())
-        payload.update(_vercel_metadata_fields(metadata))
+        payload.update(
+            _sanitize_telemetry_properties(_vercel_metadata_fields(metadata))
+        )
         payload.update(_vercel_timestamp_fields(started_at, finished_at))
 
         # print_info_debug(
@@ -4128,27 +4352,45 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
                     f"Text={len(text_content)} bytes",
                 )
 
-                # Sanitize before sending (unless command is known non-sensitive)
-                sanitized_html = _maybe_sanitize_rich_output(
-                    html_content, sanitize=sanitize_session
-                )
-                sanitized_text = _maybe_sanitize_rich_output(
-                    text_content, sanitize=sanitize_session
-                )
+                try:
+                    # Session recordings are always sanitized before any outbound upload.
+                    sanitized_html = _maybe_sanitize_rich_output(
+                        html_content, sanitize=sanitize_session
+                    )
+                    sanitized_text = _maybe_sanitize_rich_output(
+                        text_content, sanitize=sanitize_session
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print_warning_debug(
+                        f"Failed to sanitize session recording before upload: {exc}"
+                    )
+                    sanitized_html = None
+                    sanitized_text = None
 
-                print_info_debug(
-                    f"Sanitized recording: HTML={len(sanitized_html)} bytes, "
-                    f"Text={len(sanitized_text)} bytes",
-                )
+                if not isinstance(sanitized_html, str) or not isinstance(
+                    sanitized_text, str
+                ):
+                    print_warning_debug(
+                        "Skipping session upload because sanitized recording output "
+                        "was invalid."
+                    )
+                    sanitized_html = None
+                    sanitized_text = None
 
-                # Try Vercel API first (new, preferred)
-                session_url = _send_session_to_vercel(
-                    session_id,
-                    sanitized_html,
-                    metadata=metadata_with_env,
-                    started_at=effective_started_at,
-                    finished_at=finished_at,
-                )
+                if sanitized_html is not None and sanitized_text is not None:
+                    print_info_debug(
+                        f"Sanitized recording: HTML={len(sanitized_html)} bytes, "
+                        f"Text={len(sanitized_text)} bytes",
+                    )
+
+                    # Try Vercel API first (new, preferred)
+                    session_url = _send_session_to_vercel(
+                        session_id,
+                        sanitized_html,
+                        metadata=metadata_with_env,
+                        started_at=effective_started_at,
+                        finished_at=finished_at,
+                    )
 
             except (ValueError, RuntimeError, AttributeError) as e:
                 # Import debug functions (already imported at module level, but keeping for clarity)
@@ -4203,6 +4445,8 @@ def identify_user(properties: dict):
         if value is None or value == "":
             continue
         properties.setdefault(key, value)
+    properties = _sanitize_telemetry_properties(properties)
+
     if _telemetry_client:
         try:
             # Get appropriate proxy URL for current environment
@@ -4345,6 +4589,7 @@ def capture_exception(e: Exception, properties: Optional[dict[str, Any]] = None)
                 capture_props[key] = value
             if properties:
                 capture_props.update(properties)
+            capture_props = _sanitize_telemetry_properties(capture_props)
 
             # Send exception as a special event to PostHog via n8n
             payload = {
