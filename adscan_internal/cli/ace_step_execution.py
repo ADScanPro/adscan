@@ -24,6 +24,7 @@ from adscan_internal.rich_output import (
     print_info_debug,
     print_panel,
     print_info_verbose,
+    print_system_change_warning,
     strip_sensitive_markers,
 )
 from adscan_internal.services.attack_graph_service import (
@@ -647,34 +648,23 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 "ForceChangePassword is disruptive in audit mode.\n",
                 style="bold yellow",
             )
-            message.append(
-                f"Execution user: {marked_from}\n"
-                f"Target user: {marked_to}\n\n",
-                style="bold",
-            )
-            message.append(
-                "What ADscan will do:\n",
-                style="bold",
-            )
-            message.append(
-                " - Reset the target user's domain password immediately\n"
-                " - Store the new credential in ADscan for follow-up path execution\n\n",
-                style="dim",
-            )
-            message.append(
-                "Risk notes:\n",
-                style="bold",
-            )
-            message.append(
-                " - This invalidates the target user's current password immediately.\n"
-                " - If you do not coordinate with the client, this may interrupt active sessions or service access.\n",
-                style="dim",
-            )
-            print_panel(
-                message,
-                title=Text("Disruptive Operation: ForceChangePassword", style="bold yellow"),
-                border_style="yellow",
-                expand=False,
+            print_system_change_warning(
+                title="[bold yellow]Disruptive Operation: ForceChangePassword[/bold yellow]",
+                summary=(
+                    f"Execution user: {marked_from}\n"
+                    f"Target user: {marked_to}"
+                ),
+                planned_changes=[
+                    "Reset the target user's domain password immediately.",
+                    "Store the new credential in ADscan for follow-up path execution.",
+                ],
+                impact_notes=[
+                    "This invalidates the target user's current password immediately.",
+                    "If you do not coordinate with the client, this may interrupt active sessions or service access.",
+                ],
+                authorization_note=(
+                    "Only continue if you are explicitly authorized to reset this credential during the engagement."
+                ),
             )
             if not Confirm.ask(
                 "Proceed with ForceChangePassword execution?",

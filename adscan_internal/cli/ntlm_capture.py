@@ -8,8 +8,10 @@ import shlex
 from typing import Any, Protocol
 
 from adscan_internal import telemetry
+from adscan_internal.interaction import is_non_interactive
 from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import (
+    confirm_operation,
     mark_sensitive,
     print_error,
     print_exception,
@@ -503,6 +505,54 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
             result=None,
             status="skipped",
             reason="ctf_enabled_computer_ip_threshold",
+            reachable_ip_count=reachable_ip_count,
+        )
+        return False
+
+    should_execute = True
+    if bool(getattr(shell, "auto", False)) or is_non_interactive(shell=shell):
+        print_info("Auto mode detected. Proceeding with DC NTLM auth-type check.")
+    else:
+        pdc = (
+            str(shell.domains_data.get(target_domain, {}).get("pdc") or "").strip()
+            or "N/A"
+        )
+        pdc_hostname = (
+            str(
+                shell.domains_data.get(target_domain, {}).get("pdc_hostname") or ""
+            ).strip()
+            or "N/A"
+        )
+        username = (
+            str(shell.domains_data.get(target_domain, {}).get("username") or "").strip()
+            or "N/A"
+        )
+        listener_ip = str(getattr(shell, "myip", "") or "").strip() or "N/A"
+        should_execute = confirm_operation(
+            operation_name="DC NTLM Auth-Type Check",
+            description=(
+                "Coerces the PDC to authenticate back to the current listener to "
+                "classify NTLMv1 vs NTLMv2."
+            ),
+            context={
+                "Domain": target_domain,
+                "PDC": pdc,
+                "PDC Hostname": pdc_hostname,
+                "Username": username,
+                "Listener": listener_ip,
+                "Trigger": "Coercer -> Responder",
+            },
+            default=True,
+            icon="🔐",
+        )
+    if not should_execute:
+        print_info("DC NTLM auth-type check skipped by user.")
+        _persist_ntlm_probe_result(
+            shell,
+            domain=target_domain,
+            result=None,
+            status="skipped",
+            reason="user_declined_prompt",
             reachable_ip_count=reachable_ip_count,
         )
         return False

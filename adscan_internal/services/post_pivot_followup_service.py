@@ -227,7 +227,7 @@ def _run_owned_user_followup_after_pivot(shell: Any, *, domain: str) -> None:
     from adscan_internal.cli.attack_path_execution import (
         offer_attack_paths_with_non_high_value_fallback,
     )
-    from adscan_internal.cli.privileges import run_service_access_sweep
+    from adscan_internal.cli.privileges import run_postauth_service_and_share_followup
     from adscan_internal.services.attack_graph_service import (
         ATTACK_PATHS_MAX_DEPTH_USER,
         get_owned_domain_usernames_for_attack_paths,
@@ -310,12 +310,11 @@ def _run_owned_user_followup_after_pivot(shell: Any, *, domain: str) -> None:
         f"Running post-pivot service/share follow-up for {len(selected_users)} owned user(s)."
     )
     for username, secret in selected_users:
-        run_service_access_sweep(
+        run_postauth_service_and_share_followup(
             shell,
             domain=domain,
             username=username,
             password=secret,
-            services=["smb", "winrm", "rdp", "mssql"],
             hosts=None,
             prompt=False,
             scope_preference="optimized",

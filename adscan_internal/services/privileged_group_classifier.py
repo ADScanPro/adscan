@@ -29,6 +29,12 @@ class PrivilegedFollowupSpec:
 _PRIVILEGED_FOLLOWUP_SPECS: tuple[PrivilegedFollowupSpec, ...] = (
     PrivilegedFollowupSpec("domain_admin", "Domain Admins", 400, "direct"),
     PrivilegedFollowupSpec("Administrators", "Administrators", 300, "direct"),
+    PrivilegedFollowupSpec(
+        "read_only_domain_controllers",
+        "Read-Only Domain Controllers",
+        250,
+        "direct",
+    ),
     PrivilegedFollowupSpec("backup_operators", "Backup Operators", 200, "direct"),
     PrivilegedFollowupSpec(
         "exchange_trusted_subsystem",
@@ -81,6 +87,7 @@ _FOLLOWUP_SPEC_ORDER_BY_KEY: dict[str, int] = {
 
 _BUILTIN_ACCOUNT_OPERATORS_RID = 548
 _BUILTIN_BACKUP_OPERATORS_RID = 551
+_READ_ONLY_DOMAIN_CONTROLLERS_RID = 521
 _BUILTIN_INCOMING_FOREST_TRUST_BUILDERS_RID = 557
 _BUILTIN_PERFORMANCE_LOG_USERS_RID = 559
 _BUILTIN_DISTRIBUTED_COM_USERS_RID = 562
@@ -136,6 +143,7 @@ class PrivilegedGroupMembership:
     domain_admin: bool = False
     administrators: bool = False
     backup_operators: bool = False
+    read_only_domain_controllers: bool = False
     cert_publishers: bool = False
     key_admins: bool = False
     enterprise_key_admins: bool = False
@@ -154,6 +162,7 @@ class PrivilegedGroupMembership:
             "domain_admin": bool(self.domain_admin),
             "Administrators": bool(self.administrators),
             "backup_operators": bool(self.backup_operators),
+            "read_only_domain_controllers": bool(self.read_only_domain_controllers),
             "cert_publishers": bool(self.cert_publishers),
             "key_admins": bool(self.key_admins),
             "enterprise_key_admins": bool(self.enterprise_key_admins),
@@ -191,6 +200,11 @@ def is_exchange_trusted_subsystem_group_name(value: str) -> bool:
 def is_account_operators_group_name(value: str) -> bool:
     """Return True when the input matches the Account Operators group."""
     return normalize_group_name(value) == "account operators"
+
+
+def is_read_only_domain_controllers_group_name(value: str) -> bool:
+    """Return True when the input matches the Read-Only Domain Controllers group."""
+    return normalize_group_name(value) == "read-only domain controllers"
 
 
 def is_cert_publishers_group_name(value: str) -> bool:
@@ -465,6 +479,9 @@ def _coerce_membership_flags(
             membership.get("Administrators") or membership.get("administrators")
         ),
         "backup_operators": bool(membership.get("backup_operators")),
+        "read_only_domain_controllers": bool(
+            membership.get("read_only_domain_controllers")
+        ),
         "cert_publishers": bool(membership.get("cert_publishers")),
         "key_admins": bool(membership.get("key_admins")),
         "enterprise_key_admins": bool(membership.get("enterprise_key_admins")),
@@ -502,6 +519,7 @@ def privileged_followup_order_for_group_name(name: str) -> int | None:
         "domain admins": "domain_admin",
         "administrators": "Administrators",
         "backup operators": "backup_operators",
+        "read-only domain controllers": "read_only_domain_controllers",
         "account operators": "account_operators",
         "cert publishers": "cert_publishers",
         "key admins": "key_admins",
@@ -614,6 +632,7 @@ def classify_privileged_membership_from_group_sids(
     domain_admin = False
     administrators = False
     backup_operators = False
+    read_only_domain_controllers = False
     cert_publishers = False
     key_admins = False
     enterprise_key_admins = False
@@ -638,6 +657,8 @@ def classify_privileged_membership_from_group_sids(
             domain_admin = True
         elif rid == _CERT_PUBLISHERS_RID:
             cert_publishers = True
+        elif rid == _READ_ONLY_DOMAIN_CONTROLLERS_RID:
+            read_only_domain_controllers = True
         elif rid == _KEY_ADMINS_RID:
             key_admins = True
         elif rid == _ENTERPRISE_KEY_ADMINS_RID:
@@ -666,6 +687,7 @@ def classify_privileged_membership_from_group_sids(
             domain_admin
             and administrators
             and backup_operators
+            and read_only_domain_controllers
             and cert_publishers
             and key_admins
             and enterprise_key_admins
@@ -682,6 +704,7 @@ def classify_privileged_membership_from_group_sids(
         domain_admin=domain_admin,
         administrators=administrators,
         backup_operators=backup_operators,
+        read_only_domain_controllers=read_only_domain_controllers,
         cert_publishers=cert_publishers,
         key_admins=key_admins,
         enterprise_key_admins=enterprise_key_admins,
@@ -703,6 +726,7 @@ def classify_privileged_membership(
     """Classify privileged memberships using SIDs first, then normalized group names."""
     base = classify_privileged_membership_from_group_sids(group_sids or [])
     cert_publishers = False
+    read_only_domain_controllers = False
     key_admins = False
     enterprise_key_admins = False
     cryptographic_operators = False
@@ -737,6 +761,11 @@ def classify_privileged_membership(
             or is_account_operators_group_name(str(name or ""))
         ):
             account_operators = True
+        if not read_only_domain_controllers and (
+            sid_rid(str(sid or "")) == _READ_ONLY_DOMAIN_CONTROLLERS_RID
+            or is_read_only_domain_controllers_group_name(str(name or ""))
+        ):
+            read_only_domain_controllers = True
         if not cert_publishers and (
             sid_rid(str(sid or "")) == _CERT_PUBLISHERS_RID
             or is_cert_publishers_group_name(str(name or ""))
@@ -791,6 +820,9 @@ def classify_privileged_membership(
         domain_admin=base.domain_admin,
         administrators=base.administrators,
         backup_operators=base.backup_operators,
+        read_only_domain_controllers=(
+            read_only_domain_controllers or base.read_only_domain_controllers
+        ),
         cert_publishers=cert_publishers or base.cert_publishers,
         key_admins=key_admins or base.key_admins,
         enterprise_key_admins=enterprise_key_admins or base.enterprise_key_admins,

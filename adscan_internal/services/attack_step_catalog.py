@@ -40,6 +40,7 @@ from typing import Any, Literal
 
 
 SupportKind = Literal["supported", "unsupported", "policy_blocked", "context"]
+ExecutionTargetAccessRequirement = Literal["none", "computer_reachable"]
 CompromiseSemantics = Literal[
     "direct_target_compromise",
     "access_capability_only",
@@ -84,6 +85,7 @@ class AttackStepCatalogEntry:
     ] = ()  # Cypher relationship type(s) for BH CE queries
     requires_execution_context: bool = False
     counts_for_execution_readiness: bool = False
+    execution_target_access_requirement: ExecutionTargetAccessRequirement = "none"
 
 
 def _entry(
@@ -106,6 +108,7 @@ def _entry(
     bh_cypher_names: tuple[str, ...] = (),
     requires_execution_context: bool = False,
     counts_for_execution_readiness: bool = False,
+    execution_target_access_requirement: ExecutionTargetAccessRequirement = "none",
 ) -> AttackStepCatalogEntry:
     """Build a normalized catalog entry."""
     return AttackStepCatalogEntry(
@@ -127,6 +130,7 @@ def _entry(
         bh_cypher_names=bh_cypher_names,
         requires_execution_context=requires_execution_context,
         counts_for_execution_readiness=counts_for_execution_readiness,
+        execution_target_access_requirement=execution_target_access_requirement,
     )
 
 
@@ -262,6 +266,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624", "4672"),
         bh_native=True,
         bh_cypher_names=("HasSession",),
+        execution_target_access_requirement="computer_reachable",
     ),
     # ── Network exploitation / CVEs ─────────────────────────────────────────
     _entry(
@@ -513,6 +518,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624", "4648", "4672"),
         bh_native=True,
         bh_cypher_names=("AdminTo",),
+        execution_target_access_requirement="computer_reachable",
     ),
     _entry(
         "sqladmin",
@@ -533,6 +539,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624",),
         bh_native=True,
         bh_cypher_names=("SQLAdmin",),
+        execution_target_access_requirement="computer_reachable",
     ),
     _entry(
         "canrdp",
@@ -553,6 +560,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624", "4778"),
         bh_native=True,
         bh_cypher_names=("CanRDP",),
+        execution_target_access_requirement="computer_reachable",
     ),
     _entry(
         "canpsremote",
@@ -573,6 +581,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624",),
         bh_native=True,
         bh_cypher_names=("CanPSRemote",),
+        execution_target_access_requirement="computer_reachable",
     ),
     _entry(
         "guestsession",
@@ -609,6 +618,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4624", "4688"),
         bh_native=True,
         bh_cypher_names=("ExecuteDCOM",),
+        execution_target_access_requirement="computer_reachable",
     ),
     # ── ADCS / PKI ──────────────────────────────────────────────────────────
     _entry(
@@ -1654,6 +1664,7 @@ _RELATIONS_REQUIRING_EXECUTION_CONTEXT: frozenset[str] = frozenset(
         "sqladmin",
         "canrdp",
         "canpsremote",
+        "hassession",
         "allowedtodelegate",
         "adcsesc1",
         "adcsesc3",
@@ -1757,6 +1768,14 @@ def relation_counts_for_execution_readiness(relation: str) -> bool:
     if entry is None:
         return False
     return bool(entry.counts_for_execution_readiness)
+
+
+def relation_requires_reachable_computer_target(relation: str) -> bool:
+    """Return whether a relation needs the target computer to be reachable now."""
+    entry = get_attack_step_entry(relation)
+    if entry is None:
+        return False
+    return entry.execution_target_access_requirement == "computer_reachable"
 
 
 def get_exploitation_relation_vuln_keys() -> dict[str, str]:

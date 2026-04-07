@@ -3966,6 +3966,7 @@ def get_writable_user_attribute_paths(
         "skipped_privileged_principal": 0,
         "skipped_builtin_or_system_principal": 0,
         "skipped_unresolved_principal": 0,
+        "skipped_target_not_enabled": 0,
         "skipped_subsumed_by_acl_inventory": 0,
         "skipped_subsumed_by_graph_fallback": 0,
         "skipped_target_tier0": 0,
@@ -3973,6 +3974,7 @@ def get_writable_user_attribute_paths(
         "edges_emitted": 0,
     }
     drop_samples: dict[str, int] = {}
+    enabled_users = get_enabled_users_for_domain(shell, domain_key)
     inventory_acl_pairs = _load_acl_object_control_inventory_pairs(shell, domain_key)
     graph_fallback_acl_pairs = _index_existing_user_object_control_relations(graph)
 
@@ -4020,6 +4022,15 @@ def get_writable_user_attribute_paths(
         target_norm = normalize_samaccountname(target_username)
         if not target_norm:
             discard_counters["skipped_invalid_row"] += 1
+            continue
+        if enabled_users is not None and target_norm not in enabled_users:
+            discard_counters["skipped_target_not_enabled"] += 1
+            _sample_drop(
+                "target_not_enabled",
+                "[attack_graph] writable-attrs drop: "
+                "reason=target_not_enabled "
+                f"target={mark_sensitive(target_username, 'user')}",
+            )
             continue
 
         resolved_rows.append(
@@ -6852,11 +6863,22 @@ def update_edge_status_by_labels(
     graph = load_attack_graph(shell, domain)
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     if not isinstance(nodes_map, dict):
+        print_info_debug(
+            "[attack-graph] Edge status update skipped: "
+            f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
+            "reason=missing_nodes_map"
+        )
         return False
 
     from_norm = _normalize_account(from_label)
     to_norm = _normalize_account(to_label)
     if not from_norm or not to_norm:
+        print_info_debug(
+            "[attack-graph] Edge status update skipped: "
+            f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
+            f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')} "
+            "reason=invalid_endpoint_labels"
+        )
         return False
 
     def match(label: str, node_id: str) -> bool:
@@ -6869,6 +6891,13 @@ def update_edge_status_by_labels(
     from_id = next((nid for nid in nodes_map.keys() if match(from_label, nid)), "")
     to_id = next((nid for nid in nodes_map.keys() if match(to_label, nid)), "")
     if not from_id or not to_id:
+        print_info_debug(
+            "[attack-graph] Edge status update skipped: "
+            f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
+            f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')} "
+            f"reason=edge_nodes_not_found from_id={mark_sensitive(from_id or 'N/A', 'detail')} "
+            f"to_id={mark_sensitive(to_id or 'N/A', 'detail')}"
+        )
         return False
 
     upsert_edge(
@@ -6881,6 +6910,11 @@ def update_edge_status_by_labels(
         notes=notes,
     )
     save_attack_graph(shell, domain, graph)
+    print_info_debug(
+        "[attack-graph] Edge status updated: "
+        f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
+        f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')}"
+    )
     return True
 
 

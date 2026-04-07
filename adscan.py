@@ -130,6 +130,12 @@ from adscan_internal.services.service_access_results import (
     render_service_access_results,
     select_confirmed_service_access_followup_targets,
 )
+from adscan_internal.services.service_access_probe_history import (
+    record_service_access_probe_batch,
+)
+from adscan_internal.services.pivot_capability_registry import (
+    is_service_pivot_capable,
+)
 from adscan_internal.version import get_version, get_version_tag
 from adscan_internal.workspaces import (
     DEFAULT_DOMAIN_LAYOUT,
@@ -22050,6 +22056,9 @@ class PentestShell:
         privileged_groups = {
             "domain_admin": bool(membership.get("domain_admin")),
             "backup_operators": bool(membership.get("backup_operators")),
+            "read_only_domain_controllers": bool(
+                membership.get("read_only_domain_controllers")
+            ),
             "Administrators": bool(membership.get("Administrators")),
             "cert_publishers": bool(membership.get("cert_publishers")),
             "key_admins": bool(membership.get("key_admins")),
@@ -22304,6 +22313,25 @@ class PentestShell:
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
                 print_info_debug(f"[backup-ops] escalation helper failed: {exc}")
+
+        if selected_key == "read_only_domain_controllers":
+            print_warning(
+                f"The user {marked_username} is a member of the Read-Only Domain Controllers group"
+            )
+            try:
+                from adscan_internal.cli.rodc_escalation import (
+                    offer_rodc_escalation,
+                )
+
+                offer_rodc_escalation(
+                    self,
+                    domain=domain,
+                    username=username,
+                    password=password,
+                )
+            except Exception as exc:  # pragma: no cover - best effort
+                telemetry.capture_exception(exc)
+                print_info_debug(f"[rodc] escalation helper failed: {exc}")
 
         if selected_key == "account_operators":
             print_warning(
@@ -22576,6 +22604,9 @@ class PentestShell:
             "domain_admin": bool((privileged_groups or {}).get("domain_admin")),
             "Administrators": bool((privileged_groups or {}).get("Administrators")),
             "backup_operators": bool((privileged_groups or {}).get("backup_operators")),
+            "read_only_domain_controllers": bool(
+                (privileged_groups or {}).get("read_only_domain_controllers")
+            ),
             "exchange_trusted_subsystem": bool(
                 (privileged_groups or {}).get("exchange_trusted_subsystem")
             ),
@@ -22648,6 +22679,10 @@ class PentestShell:
             marker in lowered_text
             for marker in ("backup operators", "operadores de copia")
         )
+        read_only_domain_controllers = (
+            any("read-only domain controllers" in g["group"] for g in groups)
+            or "read-only domain controllers" in lowered_text
+        )
 
         account_operators = (
             any("account operators" in g["group"] for g in groups)
@@ -22666,6 +22701,7 @@ class PentestShell:
             "domain_admin": domain_admin,
             "Administrators": administrators,
             "backup_operators": backup_operators,
+            "read_only_domain_controllers": read_only_domain_controllers,
             "exchange_trusted_subsystem": exchange_trusted_subsystem,
             "exchange_windows_permissions": exchange_windows_permissions,
             "account_operators": account_operators,
@@ -24391,6 +24427,46 @@ class PentestShell:
             return 1
         return max(count, 1)
 
+    def _infer_service_command_targets(self, command: str) -> list[str]:
+        """Infer concrete targets one NetExec service command will probe."""
+
+        try:
+            argv = shlex.split(str(command or ""))
+        except ValueError:
+            return []
+
+        services = {
+            "smb",
+            "ldap",
+            "mssql",
+            "rdp",
+            "winrm",
+            "ssh",
+            "vnc",
+            "ftp",
+            "http",
+            "https",
+        }
+        service_index = next(
+            (idx for idx, token in enumerate(argv) if token in services),
+            None,
+        )
+        if service_index is None or service_index + 1 >= len(argv):
+            return []
+
+        target_value = str(argv[service_index + 1]).strip()
+        if not target_value:
+            return []
+        target_path = Path(_expand_effective_user_path(target_value))
+        if not target_path.is_file():
+            return [target_value]
+
+        try:
+            with target_path.open("r", encoding="utf-8", errors="replace") as handle:
+                return [line.strip() for line in handle if line.strip()]
+        except OSError:
+            return [target_value]
+
     def _ensure_service_command_netexec_timeout(
         self,
         *,
@@ -24450,6 +24526,7 @@ class PentestShell:
             service=service,
         )
         target_count = self._infer_service_command_target_count(command)
+        target_entries = self._infer_service_command_targets(command)
         timeout_seconds: int | None = resolve_service_command_timeout_seconds(
             service=service, target_count=target_count, return_boolean=return_boolean
         )
@@ -24588,6 +24665,28 @@ class PentestShell:
                             findings=confirmed_findings,
                             total_targets=target_count,
                         )
+                        try:
+                            record_service_access_probe_batch(
+                                workspace_dir=(
+                                    self._get_workspace_cwd()
+                                    if hasattr(self, "_get_workspace_cwd")
+                                    else getattr(self, "current_workspace_dir", os.getcwd())
+                                ),
+                                domains_dir=getattr(self, "domains_dir", "domains"),
+                                domain=domain,
+                                username=username,
+                                service=service,
+                                targets=target_entries,
+                                confirmed_hosts=[finding.host for finding in confirmed_findings],
+                                source="run_service_command",
+                                backend="netexec",
+                                pivot_capable=is_service_pivot_capable(service),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                            print_info_debug(
+                                f"[service-access] failed to persist probe history: {exc}"
+                            )
                         if prompt:
                             selected_followups, used_selector = (
                                 select_confirmed_service_access_followup_targets(
@@ -24675,6 +24774,28 @@ class PentestShell:
                             username=username,
                             total_targets=target_count,
                         )
+                        try:
+                            record_service_access_probe_batch(
+                                workspace_dir=(
+                                    self._get_workspace_cwd()
+                                    if hasattr(self, "_get_workspace_cwd")
+                                    else getattr(self, "current_workspace_dir", os.getcwd())
+                                ),
+                                domains_dir=getattr(self, "domains_dir", "domains"),
+                                domain=domain,
+                                username=username,
+                                service=service,
+                                targets=target_entries,
+                                confirmed_hosts=[],
+                                source="run_service_command",
+                                backend="netexec",
+                                pivot_capable=is_service_pivot_capable(service),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                            print_info_debug(
+                                f"[service-access] failed to persist probe history: {exc}"
+                            )
                         if return_boolean:
                             return False
                     return found_privileged_hosts

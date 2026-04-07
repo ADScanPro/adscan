@@ -44,6 +44,7 @@ from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
     print_panel,
+    print_system_change_warning,
     print_attack_path_detail,
     print_attack_paths_summary,
 )
@@ -93,9 +94,14 @@ from adscan_internal.services.ldap_transport_service import (
 from adscan_internal.services.attack_step_catalog import (
     relation_counts_for_execution_readiness,
     relation_requires_execution_context,
+    relation_requires_reachable_computer_target,
 )
 from adscan_internal.services.attack_path_target_viability_service import (
     assess_computer_target_viability,
+)
+from adscan_internal.services.pivot_opportunity_service import (
+    ensure_host_bound_workflow_target_viable,
+    maybe_offer_pivot_opportunity_for_host_viability,
 )
 from adscan_internal.services.logon_script_payload_service import (
     build_force_change_password_logon_script,
@@ -221,6 +227,89 @@ def _get_pending_writelogonscript_manual_validations(shell: Any) -> list[dict[st
     pending: list[dict[str, Any]] = []
     setattr(shell, "_pending_writelogonscript_manual_validations", pending)
     return pending
+
+
+def _update_attack_path_step_status_at_index(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    step_index: int,
+    status: str,
+    notes: dict[str, Any] | None = None,
+) -> None:
+    """Update one summary step and its matching graph edge when labels are known."""
+    steps = summary.get("steps")
+    if not isinstance(steps, list):
+        return
+    if step_index < 0 or step_index >= len(steps):
+        return
+    step = steps[step_index]
+    if not isinstance(step, dict):
+        return
+
+    merged_notes: dict[str, Any] = {}
+    existing_details = step.get("details")
+    if isinstance(existing_details, dict):
+        merged_notes.update(existing_details)
+    if isinstance(notes, dict):
+        merged_notes.update(notes)
+
+    step["status"] = status
+    step["details"] = merged_notes
+
+    action = str(step.get("action") or "").strip()
+    from_label = str(merged_notes.get("from") or "").strip()
+    to_label = str(merged_notes.get("to") or "").strip()
+    if not action or not from_label or not to_label:
+        return
+    _update_attack_path_edge_status(
+        shell,
+        domain,
+        from_label=from_label,
+        relation=action,
+        to_label=to_label,
+        status=status,
+        notes=merged_notes,
+    )
+
+
+def _update_attack_path_edge_status(
+    shell: Any,
+    domain: str,
+    *,
+    from_label: str,
+    relation: str,
+    to_label: str,
+    status: str,
+    notes: dict[str, Any] | None = None,
+) -> bool:
+    """Persist one attack-path edge status using the active-step updater when possible."""
+    active = getattr(shell, "_active_attack_graph_step", None)
+    active_domain = str(getattr(active, "domain", "") or "").strip()
+    active_from = str(getattr(active, "from_label", "") or "").strip()
+    active_relation = str(getattr(active, "relation", "") or "").strip()
+    active_to = str(getattr(active, "to_label", "") or "").strip()
+    updater = getattr(shell, "_update_active_attack_graph_step_status", None)
+    if (
+        callable(updater)
+        and active_domain == str(domain or "").strip()
+        and active_from == str(from_label or "").strip()
+        and active_relation == str(relation or "").strip()
+        and active_to == str(to_label or "").strip()
+    ):
+        return bool(updater(domain=domain, status=status, notes=notes))
+    return bool(
+        update_edge_status_by_labels(
+            shell,
+            domain,
+            from_label=from_label,
+            relation=relation,
+            to_label=to_label,
+            status=status,
+            notes=notes,
+        )
+    )
 
 
 def register_writelogonscript_manual_validation(
@@ -825,7 +914,13 @@ def _execution_readiness_meta(
     target_matched_ips: tuple[str, ...] = ()
     target_vantage_mode = ""
     target_execution_advisory = ""
-    if action in ACL_ACE_RELATIONS and to_label:
+    target_access_requirement = (
+        "computer_reachable"
+        if relation_requires_reachable_computer_target(action)
+        else "none"
+    )
+    to_node: dict[str, Any] | None = None
+    if to_label:
         to_node = get_node_by_label(shell, domain, label=to_label)
         if isinstance(to_node, dict):
             kind = to_node.get("kind") or to_node.get("labels") or to_node.get("type")
@@ -862,6 +957,7 @@ def _execution_readiness_meta(
                 target_execution_advisory = str(
                     target_viability.execution_advisory or ""
                 )
+    if action in ACL_ACE_RELATIONS and to_label:
         supported, support_reason = describe_ace_relation_support(action, target_kind)
         if not supported:
             return {
@@ -880,10 +976,67 @@ def _execution_readiness_meta(
                 "execution_target_matched_ips": list(target_matched_ips),
                 "execution_target_vantage_mode": target_vantage_mode,
                 "execution_target_execution_advisory": target_execution_advisory,
+                "execution_target_access_requirement": target_access_requirement,
+                "execution_target_label": to_label,
                 "execution_ready_count": 0,
                 "execution_candidate_count": 0,
                 "execution_candidate_source": "unsupported",
                 "execution_readiness_reason": "unsupported_target_type",
+                "execution_context_action": action,
+            }
+
+    if (
+        target_access_requirement == "computer_reachable"
+        and str(target_kind or "").strip().lower() == "computer"
+    ):
+        blocked_reason = ""
+        support_reason = ""
+        if target_enabled is False:
+            blocked_reason = "target_computer_disabled"
+            support_reason = (
+                "Host-bound execution is blocked because the target computer is disabled."
+            )
+        elif target_viability_status == "resolved_but_unreachable":
+            blocked_reason = "target_computer_unreachable_from_current_vantage"
+            support_reason = (
+                "Host-bound execution is blocked because the target computer is unreachable "
+                "from the current vantage."
+            )
+        elif target_viability_status == "enabled_but_unresolved":
+            blocked_reason = "target_computer_enabled_but_unresolved"
+            support_reason = (
+                "Host-bound execution is blocked because the target computer is enabled in AD "
+                "but has no resolvable current-vantage target."
+            )
+        elif target_viability_status == "not_in_enabled_inventory":
+            blocked_reason = "target_computer_not_in_enabled_inventory"
+            support_reason = (
+                "Host-bound execution is blocked because the target computer is not present in "
+                "the enabled-computer inventory."
+            )
+        if blocked_reason:
+            return {
+                "execution_context_required": True,
+                "execution_support_status": "blocked",
+                "execution_support_reason": support_reason,
+                "execution_support_target_kind": target_kind or "Unknown",
+                "execution_target_enabled": target_enabled,
+                "execution_target_enabled_source": target_enabled_source,
+                "execution_target_viability_status": target_viability_status,
+                "execution_target_viability_summary": target_viability_summary,
+                "execution_target_viability_reason": target_viability_reason,
+                "execution_target_reachable": target_reachable,
+                "execution_target_reachable_source": target_reachable_source,
+                "execution_target_resolved": target_resolved,
+                "execution_target_matched_ips": list(target_matched_ips),
+                "execution_target_vantage_mode": target_vantage_mode,
+                "execution_target_execution_advisory": target_execution_advisory,
+                "execution_target_access_requirement": target_access_requirement,
+                "execution_target_label": to_label,
+                "execution_ready_count": 0,
+                "execution_candidate_count": 0,
+                "execution_candidate_source": "blocked",
+                "execution_readiness_reason": blocked_reason,
                 "execution_context_action": action,
             }
 
@@ -908,6 +1061,8 @@ def _execution_readiness_meta(
             "execution_target_matched_ips": list(target_matched_ips),
             "execution_target_vantage_mode": target_vantage_mode,
             "execution_target_execution_advisory": target_execution_advisory,
+            "execution_target_access_requirement": target_access_requirement,
+            "execution_target_label": to_label,
             "execution_ready_count": 1 if ready else 0,
             "execution_candidate_count": 1,
             "execution_candidate_source": "context_username",
@@ -997,10 +1152,12 @@ def _execution_readiness_meta(
             "execution_target_reachable": target_reachable,
             "execution_target_reachable_source": target_reachable_source,
             "execution_target_resolved": target_resolved,
-            "execution_target_matched_ips": list(target_matched_ips),
-            "execution_target_vantage_mode": target_vantage_mode,
-            "execution_target_execution_advisory": target_execution_advisory,
-            "execution_ready_count": len(ready_users),
+        "execution_target_matched_ips": list(target_matched_ips),
+        "execution_target_vantage_mode": target_vantage_mode,
+        "execution_target_execution_advisory": target_execution_advisory,
+        "execution_target_access_requirement": target_access_requirement,
+        "execution_target_label": to_label,
+        "execution_ready_count": len(ready_users),
             "execution_candidate_count": affected_count or len(affected_users),
             "execution_candidate_source": "affected_users",
             "execution_readiness_reason": (
@@ -1101,11 +1258,14 @@ def _path_has_ready_execution_context(summary: dict[str, Any]) -> bool:
 
 
 def _path_is_supported_for_execution(summary: dict[str, Any]) -> bool:
-    """Return False when the path is pre-identified as unsupported."""
+    """Return False when the path is pre-identified as unsupported or blocked."""
     meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
     if not isinstance(meta, dict):
         return True
-    return str(meta.get("execution_support_status") or "").strip().lower() != "unsupported"
+    return str(meta.get("execution_support_status") or "").strip().lower() not in {
+        "unsupported",
+        "blocked",
+    }
 
 
 def _path_is_actionable_for_execution_prompt(
@@ -1126,6 +1286,21 @@ def _path_is_actionable_for_execution_prompt(
     if not _path_has_ready_execution_context(summary):
         return False
     return True
+
+
+def _execution_block_message(meta: dict[str, Any]) -> tuple[str, str]:
+    """Return user-visible warning and debug reason for one blocked execution summary."""
+    support_reason = str(meta.get("execution_support_reason") or "").strip()
+    readiness_reason = str(meta.get("execution_readiness_reason") or "").strip()
+    viability_summary = str(meta.get("execution_target_viability_summary") or "").strip()
+    if support_reason:
+        return support_reason, readiness_reason or "execution_blocked"
+    if viability_summary:
+        return viability_summary, readiness_reason or "execution_blocked"
+    return (
+        "This path is currently blocked by target viability or execution policy.",
+        readiness_reason or "execution_blocked",
+    )
 
 
 def _summarize_non_actionable_paths(
@@ -1161,6 +1336,15 @@ def _summarize_non_actionable_paths(
             continue
         if status == "unavailable":
             reasons["unavailable"] += 1
+            continue
+        meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+        support_status = (
+            str(meta.get("execution_support_status") or "").strip().lower()
+            if isinstance(meta, dict)
+            else ""
+        )
+        if support_status == "blocked":
+            reasons["blocked"] += 1
             continue
         if not _path_is_supported_for_execution(summary):
             reasons["unsupported"] += 1
@@ -1243,6 +1427,155 @@ def _choose_custom_attack_path_start_step(
     return executable_indices[selection]
 
 
+def _find_next_attack_path_executable_step_index(
+    executable_indices: list[int],
+    current_step_index: int,
+) -> int | None:
+    """Return the next executable step index after one current step index."""
+    for candidate in executable_indices:
+        if candidate > current_step_index:
+            return candidate
+    return None
+
+
+def _resolve_attack_path_step_password(
+    shell: Any,
+    *,
+    domain: str,
+    exec_username: str,
+    context_username: str | None,
+    context_password: str | None,
+) -> str:
+    """Resolve the password ADscan would use for one execution principal."""
+    if not exec_username:
+        return ""
+    if (
+        context_username
+        and _normalize_account(context_username) == _normalize_account(exec_username)
+        and context_password
+    ):
+        return str(context_password)
+    return str(_resolve_domain_password(shell, domain, exec_username) or "")
+
+
+def _attack_path_step_has_executable_context(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    steps: list[dict[str, Any]],
+    step_index: int,
+    context_username: str | None,
+    context_password: str | None,
+) -> bool:
+    """Return whether ADscan could execute one step with the current context."""
+    if step_index < 1 or step_index > len(steps):
+        return False
+    step_item = steps[step_index - 1]
+    if not isinstance(step_item, dict):
+        return False
+
+    step_action = str(step_item.get("action") or "").strip()
+    step_key = step_action.lower()
+    step_details = (
+        step_item.get("details") if isinstance(step_item.get("details"), dict) else {}
+    )
+    from_label = str(step_details.get("from") or "").strip()
+    to_label = str(step_details.get("to") or "").strip()
+    if not step_action:
+        return False
+
+    if step_key in ACL_ACE_RELATIONS:
+        try:
+            exec_context = build_ace_step_context(
+                shell,
+                domain,
+                relation=step_action,
+                summary=summary,
+                from_label=from_label,
+                to_label=to_label,
+                context_username=context_username,
+                context_password=context_password,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            return False
+        return bool(
+            str(getattr(exec_context, "exec_username", "") or "").strip()
+            and str(getattr(exec_context, "exec_password", "") or "").strip()
+        )
+
+    exec_username = _resolve_execution_user(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+    )
+    exec_password = _resolve_attack_path_step_password(
+        shell,
+        domain=domain,
+        exec_username=exec_username or "",
+        context_username=context_username,
+        context_password=context_password,
+    )
+    if not exec_username or not exec_password:
+        return False
+
+    if step_key in {"adminto", "sqladmin", "canrdp", "canpsremote"}:
+        return bool(
+            to_label
+            and resolve_netexec_target_for_node_label(
+                shell,
+                domain,
+                node_label=to_label,
+            )
+        )
+    if step_key == "allowedtodelegate":
+        return bool(from_label and to_label)
+    if step_key == "writelogonscript":
+        domain_data = (
+            getattr(shell, "domains_data", {}).get(domain, {})
+            if isinstance(getattr(shell, "domains_data", None), dict)
+            else {}
+        )
+        return bool(
+            str(step_details.get("host") or "").strip()
+            or _resolve_default_domain_controller(domain_data, domain)
+        )
+    return True
+
+
+def _attack_path_processed_step_is_bypassable(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    steps: list[dict[str, Any]],
+    executable_indices: list[int],
+    step_index: int,
+    step_status: str,
+    context_username: str | None,
+    context_password: str | None,
+) -> bool:
+    """Return whether one processed step can be skipped while continuing the path."""
+    next_step_index = _find_next_attack_path_executable_step_index(
+        executable_indices,
+        step_index,
+    )
+    if next_step_index is None:
+        return str(step_status or "").strip().lower() == "success"
+    return _attack_path_step_has_executable_context(
+        shell,
+        domain=domain,
+        summary=summary,
+        steps=steps,
+        step_index=next_step_index,
+        context_username=context_username,
+        context_password=context_password,
+    )
+
+
 def _resolve_attack_path_start_step(
     shell: Any,
     *,
@@ -1251,6 +1584,9 @@ def _resolve_attack_path_start_step(
     executable_indices: list[int],
     non_executable_actions: set[str],
     dangerous_actions: set[str],
+    summary: dict[str, Any],
+    context_username: str | None = None,
+    context_password: str | None = None,
 ) -> int | None:
     """Return selected start step index for attack path execution."""
     if not executable_indices:
@@ -1265,7 +1601,7 @@ def _resolve_attack_path_start_step(
         return first_executable_idx
 
     first_pending_idx: int | None = None
-    first_non_success_idx: int | None = None
+    first_execution_required_idx: int | None = None
     completed_steps = 0
     for step_idx, step_item in enumerate(steps, start=1):
         if not isinstance(step_item, dict):
@@ -1277,10 +1613,37 @@ def _resolve_attack_path_start_step(
             continue
         step_status = str(step_item.get("status") or "discovered").strip().lower()
         if step_status == "success":
-            completed_steps += 1
-            continue
-        if first_non_success_idx is None:
-            first_non_success_idx = step_idx
+            if _attack_path_processed_step_is_bypassable(
+                shell,
+                domain=domain,
+                summary=summary,
+                steps=steps,
+                executable_indices=executable_indices,
+                step_index=step_idx,
+                step_status=step_status,
+                context_username=context_username,
+                context_password=context_password,
+            ):
+                completed_steps += 1
+                continue
+            first_execution_required_idx = step_idx
+            break
+        if step_status == "attempted":
+            if _attack_path_processed_step_is_bypassable(
+                shell,
+                domain=domain,
+                summary=summary,
+                steps=steps,
+                executable_indices=executable_indices,
+                step_index=step_idx,
+                step_status=step_status,
+                context_username=context_username,
+                context_password=context_password,
+            ):
+                continue
+            first_execution_required_idx = step_idx
+            break
+        first_execution_required_idx = step_idx
         if step_status in {"", "discovered", "theoretical"}:
             first_pending_idx = step_idx
             break
@@ -1292,7 +1655,9 @@ def _resolve_attack_path_start_step(
     )
     domain_pwned = domain_auth == "pwned"
 
-    default_start_idx = first_pending_idx or first_non_success_idx or first_executable_idx
+    default_start_idx = (
+        first_execution_required_idx or first_pending_idx or first_executable_idx
+    )
     non_interactive = is_non_interactive(shell)
 
     if domain_pwned and first_pending_idx is None:
@@ -1311,7 +1676,10 @@ def _resolve_attack_path_start_step(
                 "Use ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS=1 or choose a custom "
                 "start step to force re-execution."
             )
-            return None
+            return first_executable_idx if Confirm.ask(
+                "This path has no fresh executable steps left. Re-run from the first step?",
+                default=False,
+            ) else None
 
         options = [
             "Skip execution (Recommended)",
@@ -1332,12 +1700,12 @@ def _resolve_attack_path_start_step(
                 shell,
                 steps=steps,
                 executable_indices=executable_indices,
-                default_step_idx=first_non_success_idx or first_executable_idx,
+                default_step_idx=first_execution_required_idx or first_executable_idx,
             )
         return None
 
     # If no pending steps, default to not re-execute unless explicitly requested.
-    if first_non_success_idx is None:
+    if first_execution_required_idx is None:
         if non_interactive:
             return None
         if not hasattr(shell, "_questionary_select"):
@@ -1348,7 +1716,10 @@ def _resolve_attack_path_start_step(
                 "Set ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS=1 to force re-execution "
                 "from the first step."
             )
-            return None
+            return first_executable_idx if Confirm.ask(
+                "All executable steps are already successful. Re-run from the first step?",
+                default=False,
+            ) else None
 
         options = [
             "Skip execution (Recommended)",
@@ -1381,7 +1752,7 @@ def _resolve_attack_path_start_step(
     resume_label = (
         "first pending step"
         if first_pending_idx is not None
-        else "first non-success step"
+        else "first required step"
     )
 
     if not hasattr(shell, "_questionary_select"):
@@ -1959,7 +2330,7 @@ def _resolve_writelogonscript_next_step_strategy(
     current_step_index: int,
     current_to_label: str,
 ) -> dict[str, Any] | None:
-    """Return the supported next-step strategy for one WriteLogonScript edge."""
+    """Return the supported chained-step strategy for one WriteLogonScript edge."""
     steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
     if current_step_index < 0 or current_step_index >= len(steps) - 1:
         return None
@@ -1981,6 +2352,10 @@ def _resolve_writelogonscript_next_step_strategy(
         "next_step_index": current_step_index + 1,
         "next_action": str(next_step.get("action") or "").strip(),
         "target_user_label": next_to,
+        "chained_step_index": current_step_index + 1,
+        "chained_step_action": str(next_step.get("action") or "").strip(),
+        "chained_step_from_label": next_from,
+        "chained_step_to_label": next_to,
     }
 
 
@@ -2142,66 +2517,58 @@ def _execute_writelogonscript_force_change_password_strategy(
             f"target={mark_sensitive(to_label, 'user')} "
             f"script_path={mark_sensitive(stale_managed_script_path, 'path')}"
         )
-    if _is_audit_mode(shell) and not non_interactive:
+    if _is_audit_mode(shell):
         marked_target = mark_sensitive(to_label, "user")
         marked_executor = mark_sensitive(exec_username, "user")
         marked_next_target = mark_sensitive(next_target_label or next_target_user, "user")
         marked_share = mark_sensitive(str(precheck_notes.get("share") or "NETLOGON"), "text")
         marked_path = mark_sensitive(str(precheck_notes.get("path") or "\\"), "path")
-        message = Text()
-        message.append(
-            "WriteLogonScript is disruptive in audit mode.\n",
-            style="bold yellow",
-        )
-        message.append(
-            f"Execution user: {marked_executor}\n"
-            f"Logon-script target: {marked_target}\n"
-            f"Follow-up action: reset password for {marked_next_target}\n"
-            f"Staging location: {marked_share} -> {marked_path}\n\n",
-            style="bold",
-        )
-        message.append("What ADscan will do:\n", style="bold")
-        message.append(
-            " - Upload a .bat payload to the selected staging share\n"
-            " - Overwrite scriptPath on the target user\n"
-            " - Wait for the user to log on so the payload runs\n"
-            " - Attempt to restore the original scriptPath and delete the staged file once the downstream credential is confirmed\n\n",
-            style="dim",
-        )
-        message.append("Risk notes:\n", style="bold")
+        cleanup_notes: list[str] = []
         if stale_managed_script_path:
-            message.append(
-                f" - The target currently points to an older ADscan artifact "
-                f"{mark_sensitive(stale_managed_script_path, 'path')}; "
-                "ADscan will replace it and clear the stale restore baseline.\n",
-                style="dim",
+            cleanup_notes.append(
+                f"The target currently points to an older ADscan artifact {mark_sensitive(stale_managed_script_path, 'path')}; ADscan will replace it and clear the stale restore baseline."
             )
         elif previous_script_path_readable and previous_script_path:
-            message.append(
-                f" - The target already has scriptPath set to {mark_sensitive(previous_script_path, 'path')}; "
-                "ADscan will overwrite it temporarily and then restore it.\n",
-                style="dim",
+            cleanup_notes.append(
+                f"The target already has scriptPath set to {mark_sensitive(previous_script_path, 'path')}; ADscan will overwrite it temporarily and then restore it."
             )
         elif previous_script_path_readable:
-            message.append(
-                " - The target currently has no scriptPath set; ADscan will add one temporarily and then clear it.\n",
-                style="dim",
+            cleanup_notes.append(
+                "The target currently has no scriptPath set; ADscan will add one temporarily and then clear it."
             )
         else:
-            message.append(
-                " - ADscan could not read the existing scriptPath value; cleanup will be best-effort only.\n",
-                style="dim",
+            cleanup_notes.append(
+                "ADscan could not read the existing scriptPath value; cleanup will be best-effort only."
             )
-        message.append(
-            " - If cleanup fails, the staged script or scriptPath change may remain until you remove them manually.\n",
-            style="dim",
+        cleanup_notes.append(
+            "If cleanup fails, the staged script or scriptPath change may remain until you remove them manually."
         )
-        print_panel(
-            message,
-            title=Text("Disruptive Operation: WriteLogonScript", style="bold yellow"),
-            border_style="yellow",
-            expand=False,
+        print_system_change_warning(
+            title="[bold yellow]Disruptive Operation: WriteLogonScript[/bold yellow]",
+            summary=(
+                f"WriteLogonScript is disruptive in audit mode.\nExecution user: {marked_executor}\n"
+                f"Logon-script target: {marked_target}\nFollow-up action: reset password for {marked_next_target}\n"
+                f"Staging location: {marked_share} -> {marked_path}"
+            ),
+            planned_changes=[
+                "Upload a .bat payload to the selected staging share.",
+                "Overwrite scriptPath on the target user.",
+                "Wait for the user to log on so the payload runs.",
+                "Attempt to restore the original scriptPath and delete the staged file once the downstream credential is confirmed.",
+            ],
+            impact_notes=[
+                "This changes a user logon script and depends on an interactive logon on the target account.",
+            ],
+            cleanup_notes=cleanup_notes,
+            authorization_note=(
+                "Only continue if you are explicitly authorized to stage a temporary logon script in this environment."
+            ),
         )
+        if non_interactive:
+            print_info_debug(
+                "[writelogonscript] non-interactive audit execution defaulted to 'No' for disruptive staging"
+            )
+            return ("blocked", {"reason": "operator_cancelled_disruptive_writelogonscript"})
         if not Confirm.ask("Proceed with WriteLogonScript staging?", default=False):
             return ("blocked", {"reason": "operator_cancelled_disruptive_writelogonscript"})
 
@@ -2301,8 +2668,19 @@ def _execute_writelogonscript_force_change_password_strategy(
             "stale_managed_script_deleted": stale_managed_script_deleted,
             "stale_managed_script_delete_error": stale_managed_script_delete_error,
             "scriptpath_updated": True,
+            "next_step_index": int(strategy.get("next_step_index") or -1),
             "next_step_action": str(strategy.get("next_action") or "ForceChangePassword"),
             "next_step_target_user": next_target_user,
+            "chained_step_index": int(strategy.get("chained_step_index") or -1),
+            "chained_step_action": str(
+                strategy.get("chained_step_action") or strategy.get("next_action") or ""
+            ),
+            "chained_step_from_label": str(
+                strategy.get("chained_step_from_label") or to_label or ""
+            ),
+            "chained_step_to_label": str(
+                strategy.get("chained_step_to_label") or strategy.get("target_user_label") or ""
+            ),
             "generated_password": selected_password,
             "target_login_required": True,
             "auth_mode": upload_result.auth_mode,
@@ -3649,6 +4027,7 @@ def execute_selected_attack_path(
             return False
 
         execution_started = False
+        implicitly_satisfied_step_indices: set[int] = set()
         if not isinstance(steps, list) or not steps:
             _record_attack_path_execution_event(
                 shell,
@@ -3683,6 +4062,9 @@ def execute_selected_attack_path(
             executable_indices=executable_indices,
             non_executable_actions=non_executable_actions,
             dangerous_actions=dangerous_actions,
+            summary=summary,
+            context_username=context_username,
+            context_password=context_password,
         )
         if resume_from_step_idx is None:
             _record_attack_path_execution_event(
@@ -3816,6 +4198,218 @@ def execute_selected_attack_path(
                 f"context={mark_sensitive(str(followup_context or {}), 'detail')}"
             )
 
+        def _mark_step_implicitly_satisfied(
+            *,
+            step_index: int,
+            status: str,
+            notes: dict[str, Any] | None = None,
+        ) -> None:
+            """Mark one step as satisfied by another action during the same execution."""
+            implicitly_satisfied_step_indices.add(step_index + 1)
+            _update_attack_path_step_status_at_index(
+                shell,
+                domain=domain,
+                summary=summary,
+                step_index=step_index,
+                status=status,
+                notes=notes,
+            )
+
+        def _apply_chained_step_execution_result(
+            *,
+            source_action: str,
+            source_from_label: str,
+            source_to_label: str,
+            execution_result: dict[str, Any],
+        ) -> bool:
+            """Apply one chained-step result produced by the active step.
+
+            Returns ``True`` when the attack path should continue automatically.
+            """
+            chained_step_index = int(execution_result.get("step_index") or -1)
+            chained_status = str(execution_result.get("status") or "").strip().lower()
+            chained_action = str(execution_result.get("action") or "").strip()
+            chained_from_label = str(execution_result.get("from_label") or "").strip()
+            chained_to_label = str(execution_result.get("to_label") or "").strip()
+            chained_notes = (
+                dict(execution_result.get("notes"))
+                if isinstance(execution_result.get("notes"), dict)
+                else {}
+            )
+            if chained_step_index < 0 or not chained_status:
+                return False
+
+            if chained_status == "success":
+                _mark_step_implicitly_satisfied(
+                    step_index=chained_step_index,
+                    status="success",
+                    notes=chained_notes,
+                )
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_succeeded",
+                    message=(
+                        f"{chained_action or 'Chained step'} succeeded against "
+                        f"{chained_to_label or 'the downstream target'} via {source_action}."
+                    ),
+                    step_index=chained_step_index + 1,
+                    total_steps=total_executable_steps,
+                    executable_step_index=chained_step_index + 1,
+                    last_executable_idx=last_executable_idx,
+                    action=chained_action,
+                    from_label=chained_from_label,
+                    to_label=chained_to_label,
+                    step_status="success",
+                    actor=str(execution_result.get("actor") or ""),
+                    reason=str(
+                        execution_result.get("reason")
+                        or f"executed_via_{source_action.lower()}"
+                    ),
+                )
+                follow_on_outcome = execution_result.get("follow_on_outcome")
+                if isinstance(follow_on_outcome, dict):
+                    _apply_execution_outcome_context_handoff(follow_on_outcome)
+                return True
+
+            _update_attack_path_step_status_at_index(
+                shell,
+                domain=domain,
+                summary=summary,
+                step_index=chained_step_index,
+                status=chained_status,
+                notes=chained_notes,
+            )
+            _record_attack_path_execution_event(
+                shell,
+                domain=domain,
+                summary=summary,
+                event_stage="step_failed"
+                if chained_status == "failed"
+                else "step_blocked"
+                if chained_status == "blocked"
+                else "step_started",
+                message=(
+                    f"{chained_action or 'Chained step'} ended with status "
+                    f"{chained_status} after {source_action}."
+                ),
+                step_index=chained_step_index + 1,
+                total_steps=total_executable_steps,
+                executable_step_index=chained_step_index + 1,
+                last_executable_idx=last_executable_idx,
+                action=chained_action,
+                from_label=chained_from_label,
+                to_label=chained_to_label,
+                step_status=chained_status,
+                actor=str(execution_result.get("actor") or ""),
+                reason=str(
+                    execution_result.get("reason")
+                    or f"{chained_status}_via_{source_action.lower()}"
+                ),
+            )
+            return False
+
+        def _confirm_step_rerun(prompt: str, *, default: bool) -> bool:
+            """Return a rerun decision while honoring non-interactive defaults."""
+            if hasattr(shell, "_questionary_confirm"):
+                resolved = shell._questionary_confirm(
+                    prompt,
+                    default=default,
+                    timeout_result=False,
+                    context={
+                        "remote_interaction": True,
+                        "category": "attack_path_execution",
+                        "domain": domain,
+                    },
+                )
+                if isinstance(resolved, bool):
+                    return resolved
+            if is_non_interactive(shell):
+                print_info_debug(
+                    "[attack_paths] step rerun defaulted (non-interactive): "
+                    f"domain={mark_sensitive(domain, 'domain')} "
+                    f"prompt={mark_sensitive(prompt, 'detail')} default={default!r}"
+                )
+                return default
+            return Confirm.ask(prompt, default=default)
+
+        def _decide_existing_step_handling(
+            *,
+            step: dict[str, Any],
+            step_index: int,
+            action: str,
+            from_label: str,
+            to_label: str,
+        ) -> str:
+            """Return `execute`, `skip`, or `cancel` for one previously processed step."""
+            status = str(step.get("status") or "").strip().lower()
+            if status not in {"success", "attempted"}:
+                return "execute"
+            if step_index in implicitly_satisfied_step_indices:
+                print_info_debug(
+                    "[attack_paths] skipping implicitly satisfied step in current execution: "
+                    f"index={step_index} status={mark_sensitive(status, 'detail')} "
+                    f"action={mark_sensitive(action or 'N/A', 'detail')}"
+                )
+                return "skip"
+            if status == "success" and _env_flag_enabled(
+                "ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS"
+            ):
+                print_info_debug(
+                    "[attack_paths] forcing success-step re-execution via env flag: "
+                    f"index={step_index} action={mark_sensitive(action or 'N/A', 'detail')}"
+                )
+                return "execute"
+
+            bypassable = _attack_path_processed_step_is_bypassable(
+                shell,
+                domain=domain,
+                summary=summary,
+                steps=steps,
+                executable_indices=executable_indices,
+                step_index=step_index,
+                step_status=status,
+                context_username=context_username,
+                context_password=context_password,
+            )
+            if bypassable:
+                if status == "success":
+                    prompt = (
+                        f"Step #{step_index} ({action}) is already marked success and "
+                        "ADscan can continue without re-running it. Re-run it anyway?"
+                    )
+                else:
+                    prompt = (
+                        f"Step #{step_index} ({action}) was already attempted, but ADscan "
+                        "can continue without re-running it. Re-run it anyway?"
+                    )
+            elif status == "success":
+                prompt = (
+                    f"Step #{step_index} ({action}) is marked success, but ADscan cannot "
+                    "continue from it with the currently available credentials. Re-run it now?"
+                )
+            else:
+                prompt = (
+                    f"Step #{step_index} ({action}) was already attempted and ADscan cannot "
+                    "continue past it with the currently available credentials. Retry it now?"
+                )
+            rerun = _confirm_step_rerun(prompt, default=False)
+            print_info_debug(
+                "[attack_paths] existing-step rerun decision: "
+                f"index={step_index} status={mark_sensitive(status, 'detail')} "
+                f"action={mark_sensitive(action or 'N/A', 'detail')} "
+                f"from={mark_sensitive(from_label or 'N/A', 'node')} "
+                f"to={mark_sensitive(to_label or 'N/A', 'node')} "
+                f"bypassable={bypassable!r} "
+                f"rerun={rerun!r}"
+            )
+            if rerun:
+                return "execute"
+            if bypassable:
+                return "skip"
+            return "cancel"
+
         for idx, step in enumerate(steps, start=1):
             if not isinstance(step, dict):
                 continue
@@ -3853,6 +4447,29 @@ def execute_selected_attack_path(
             )
             from_label = str(details.get("from") or "")
             to_label = str(details.get("to") or "")
+            existing_step_decision = _decide_existing_step_handling(
+                step=step,
+                step_index=idx,
+                action=action,
+                from_label=from_label,
+                to_label=to_label,
+            )
+            if existing_step_decision == "skip":
+                print_info_debug(
+                    "[attack_paths] skipping previously processed step: "
+                    f"index={idx} status={mark_sensitive(str(step.get('status') or ''), 'detail')} "
+                    f"action={mark_sensitive(action, 'detail')} "
+                    f"from={mark_sensitive(from_label or 'N/A', 'node')} "
+                    f"to={mark_sensitive(to_label or 'N/A', 'node')}"
+                )
+                continue
+            if existing_step_decision == "cancel":
+                print_info_debug(
+                    "[attack_paths] cancelling path execution because a previously processed "
+                    "step cannot be bypassed with the current credentials: "
+                    f"index={idx} action={mark_sensitive(action, 'detail')}"
+                )
+                return execution_started
             executable_step_position = 0
             if executable_indices:
                 try:
@@ -4154,34 +4771,21 @@ def execute_selected_attack_path(
                     context_username=context_username,
                     context_password=context_password,
                 )
-                if hasattr(shell, "_update_active_attack_graph_step_status"):
-                    shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                        domain=domain,
-                        status=(
-                            "attempted"
-                            if probe_state == "precheck_succeeded"
-                            else "failed"
-                            if probe_state == "failed"
-                            else "blocked"
-                        ),
-                        notes=probe_notes,
-                    )
-                else:
-                    update_edge_status_by_labels(
-                        shell,
-                        domain,
-                        from_label=from_label,
-                        relation=action,
-                        to_label=to_label,
-                        status=(
-                            "attempted"
-                            if probe_state == "precheck_succeeded"
-                            else "failed"
-                            if probe_state == "failed"
-                            else "blocked"
-                        ),
-                        notes=probe_notes,
-                    )
+                _update_attack_path_edge_status(
+                    shell,
+                    domain,
+                    from_label=from_label,
+                    relation=action,
+                    to_label=to_label,
+                    status=(
+                        "attempted"
+                        if probe_state == "precheck_succeeded"
+                        else "failed"
+                        if probe_state == "failed"
+                        else "blocked"
+                    ),
+                    notes=probe_notes,
+                )
                 if probe_state == "blocked":
                     _record_attack_path_execution_event(
                         shell,
@@ -4257,26 +4861,20 @@ def execute_selected_attack_path(
                     precheck_notes=probe_notes,
                 )
                 if strategy_state == "payload_staged":
-                    final_notes = dict(probe_notes)
+                    final_notes = dict(details)
+                    final_notes.update(probe_notes)
                     final_notes.update(strategy_notes)
-                    step["status"] = "attempted"
+                    step["status"] = "success"
                     step["details"] = final_notes
-                    if hasattr(shell, "_update_active_attack_graph_step_status"):
-                        shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                            domain=domain,
-                            status="attempted",
-                            notes=final_notes,
-                        )
-                    else:
-                        update_edge_status_by_labels(
-                            shell,
-                            domain,
-                            from_label=from_label,
-                            relation=action,
-                            to_label=to_label,
-                            status="attempted",
-                            notes=final_notes,
-                        )
+                    _update_attack_path_edge_status(
+                        shell,
+                        domain,
+                        from_label=from_label,
+                        relation=action,
+                        to_label=to_label,
+                        status="success",
+                        notes=final_notes,
+                    )
                     print_info(
                         "WriteLogonScript payload staged: the script was uploaded and scriptPath was updated. "
                         f"When {mark_sensitive(to_label, 'user')} logs on, the payload should run and reset "
@@ -4297,24 +4895,17 @@ def execute_selected_attack_path(
                                 "target_login_required": True,
                             }
                         )
-                        step["status"] = "attempted"
+                        step["status"] = "success"
                         step["details"] = final_notes
-                        if hasattr(shell, "_update_active_attack_graph_step_status"):
-                            shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                                domain=domain,
-                                status="attempted",
-                                notes=final_notes,
-                            )
-                        else:
-                            update_edge_status_by_labels(
-                                shell,
-                                domain,
-                                from_label=from_label,
-                                relation=action,
-                                to_label=to_label,
-                                status="attempted",
-                                notes=final_notes,
-                            )
+                        _update_attack_path_edge_status(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="success",
+                            notes=final_notes,
+                        )
                         register_writelogonscript_manual_validation(
                             shell,
                             domain=domain,
@@ -4341,33 +4932,70 @@ def execute_selected_attack_path(
                         target_password=str(strategy_notes.get("generated_password") or ""),
                     )
                     final_notes.update(poll_notes)
-                    step["status"] = (
-                        "success"
-                        if str(poll_notes.get("verification_status") or "") == "confirmed"
-                        else "attempted"
-                    )
+                    step["status"] = "success"
                     step["details"] = final_notes
-                    if hasattr(shell, "_update_active_attack_graph_step_status"):
-                        shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                            domain=domain,
-                            status="success"
-                            if str(poll_notes.get("verification_status") or "") == "confirmed"
-                            else "attempted",
-                            notes=final_notes,
-                        )
-                    else:
-                        update_edge_status_by_labels(
-                            shell,
-                            domain,
-                            from_label=from_label,
-                            relation=action,
-                            to_label=to_label,
-                            status="success"
-                            if str(poll_notes.get("verification_status") or "") == "confirmed"
-                            else "attempted",
-                            notes=final_notes,
-                        )
+                    _update_attack_path_edge_status(
+                        shell,
+                        domain,
+                        from_label=from_label,
+                        relation=action,
+                        to_label=to_label,
+                        status="success",
+                        notes=final_notes,
+                    )
                     if str(poll_notes.get("verification_status") or "") == "confirmed":
+                        chained_step_notes = {
+                            "verification_status": "executed_via_writelogonscript",
+                            "execution_origin_action": action,
+                            "execution_origin_from": from_label,
+                            "execution_origin_to": to_label,
+                            "credential_confirmed_user": str(
+                                strategy_notes.get("next_step_target_user") or ""
+                            ),
+                            "credential_confirmed_at": str(
+                                poll_notes.get("verification_completed_at") or ""
+                            ),
+                            "credential_confirmed_wait_seconds": int(
+                                poll_notes.get("verification_wait_seconds") or 0
+                            ),
+                        }
+                        continue_path = _apply_chained_step_execution_result(
+                            source_action=action,
+                            source_from_label=from_label,
+                            source_to_label=to_label,
+                            execution_result={
+                                "step_index": int(
+                                    strategy_notes.get("chained_step_index") or -1
+                                ),
+                                "action": str(
+                                    strategy_notes.get("chained_step_action")
+                                    or strategy_notes.get("next_step_action")
+                                    or ""
+                                ),
+                                "from_label": str(
+                                    strategy_notes.get("chained_step_from_label")
+                                    or to_label
+                                    or ""
+                                ),
+                                "to_label": str(
+                                    strategy_notes.get("chained_step_to_label")
+                                    or ""
+                                ),
+                                "status": "success",
+                                "notes": chained_step_notes,
+                                "actor": str(strategy_notes.get("user") or ""),
+                                "reason": "executed_via_writelogonscript",
+                                "follow_on_outcome": {
+                                    "key": "user_credential_obtained",
+                                    "compromised_user": str(
+                                        strategy_notes.get("next_step_target_user") or ""
+                                    ),
+                                    "credential": str(
+                                        strategy_notes.get("generated_password") or ""
+                                    ),
+                                },
+                            },
+                        )
                         add_credential_fn = getattr(shell, "add_credential", None)
                         if callable(add_credential_fn):
                             add_credential_fn(
@@ -4381,49 +5009,85 @@ def execute_selected_attack_path(
                             domain=domain,
                             summary=summary,
                         )
+                        if continue_path:
+                            continue
+                    else:
+                        _apply_chained_step_execution_result(
+                            source_action=action,
+                            source_from_label=from_label,
+                            source_to_label=to_label,
+                            execution_result={
+                                "step_index": int(
+                                    strategy_notes.get("chained_step_index") or -1
+                                ),
+                                "action": str(
+                                    strategy_notes.get("chained_step_action")
+                                    or strategy_notes.get("next_step_action")
+                                    or ""
+                                ),
+                                "from_label": str(
+                                    strategy_notes.get("chained_step_from_label")
+                                    or to_label
+                                    or ""
+                                ),
+                                "to_label": str(
+                                    strategy_notes.get("chained_step_to_label")
+                                    or ""
+                                ),
+                                "status": "attempted",
+                                "notes": {
+                                    "verification_status": "pending",
+                                    "execution_origin_action": action,
+                                    "execution_origin_from": from_label,
+                                    "execution_origin_to": to_label,
+                                    "credential_confirmed_user": str(
+                                        strategy_notes.get("next_step_target_user") or ""
+                                    ),
+                                    "verification_wait_seconds": int(
+                                        poll_notes.get("verification_wait_seconds") or 0
+                                    ),
+                                    "verification_attempts": int(
+                                        poll_notes.get("verification_attempts") or 0
+                                    ),
+                                    "target_login_required": bool(
+                                        poll_notes.get("target_login_required")
+                                    ),
+                                },
+                                "actor": str(strategy_notes.get("user") or ""),
+                                "reason": "pending_via_writelogonscript",
+                            },
+                        )
                     return execution_started
                 if strategy_state == "failed":
-                    final_notes = dict(probe_notes)
+                    final_notes = dict(details)
+                    final_notes.update(probe_notes)
                     final_notes.update(strategy_notes)
-                    if hasattr(shell, "_update_active_attack_graph_step_status"):
-                        shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                            domain=domain,
-                            status="failed",
-                            notes=final_notes,
-                        )
-                    else:
-                        update_edge_status_by_labels(
-                            shell,
-                            domain,
-                            from_label=from_label,
-                            relation=action,
-                            to_label=to_label,
-                            status="failed",
-                            notes=final_notes,
-                        )
+                    _update_attack_path_edge_status(
+                        shell,
+                        domain,
+                        from_label=from_label,
+                        relation=action,
+                        to_label=to_label,
+                        status="failed",
+                        notes=final_notes,
+                    )
                     print_warning(
                         "WriteLogonScript staging failed after the write precheck succeeded."
                     )
                     return execution_started
                 if strategy_state == "blocked":
-                    final_notes = dict(probe_notes)
+                    final_notes = dict(details)
+                    final_notes.update(probe_notes)
                     final_notes.update(strategy_notes)
-                    if hasattr(shell, "_update_active_attack_graph_step_status"):
-                        shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                            domain=domain,
-                            status="blocked",
-                            notes=final_notes,
-                        )
-                    else:
-                        update_edge_status_by_labels(
-                            shell,
-                            domain,
-                            from_label=from_label,
-                            relation=action,
-                            to_label=to_label,
-                            status="blocked",
-                            notes=final_notes,
-                        )
+                    _update_attack_path_edge_status(
+                        shell,
+                        domain,
+                        from_label=from_label,
+                        relation=action,
+                        to_label=to_label,
+                        status="blocked",
+                        notes=final_notes,
+                    )
                     print_warning(
                         "WriteLogonScript payload staging was blocked."
                     )
@@ -4619,22 +5283,14 @@ def execute_selected_attack_path(
                     notes={"user": exec_context.exec_username},
                 ):
                     try:
-                        if hasattr(shell, "_update_active_attack_graph_step_status"):
-                            shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                                domain=domain,
-                                status="attempted",
-                                notes={"user": exec_context.exec_username},
-                            )
-                        else:
-                            update_edge_status_by_labels(
-                                shell,
-                                domain,
-                                from_label=from_label,
-                                relation=action,
-                                to_label=to_label,
-                                status="attempted",
-                                notes={"user": exec_context.exec_username},
-                            )
+                        _update_attack_path_step_status_at_index(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                            step_index=idx - 1,
+                            status="attempted",
+                            notes={"user": exec_context.exec_username},
+                        )
 
                         ace_result = execute_ace_step(shell, context=exec_context)
                         last_outcome = get_last_ace_execution_outcome(shell) or {}
@@ -4643,24 +5299,14 @@ def execute_selected_attack_path(
                             idx == last_executable_idx and ace_result is True
                         )
                         if ace_result is True:
-                            if hasattr(
-                                shell, "_update_active_attack_graph_step_status"
-                            ):
-                                shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                                    domain=domain,
-                                    status="success",
-                                    notes={"user": exec_context.exec_username},
-                                )
-                            else:
-                                update_edge_status_by_labels(
-                                    shell,
-                                    domain,
-                                    from_label=from_label,
-                                    relation=action,
-                                    to_label=to_label,
-                                    status="success",
-                                    notes={"user": exec_context.exec_username},
-                                )
+                            _update_attack_path_step_status_at_index(
+                                shell,
+                                domain=domain,
+                                summary=summary,
+                                step_index=idx - 1,
+                                status="success",
+                                notes={"user": exec_context.exec_username},
+                            )
                             _record_attack_path_execution_event(
                                 shell,
                                 domain=domain,
@@ -4678,24 +5324,14 @@ def execute_selected_attack_path(
                                 actor=exec_context.exec_username,
                             )
                         elif ace_result is False:
-                            if hasattr(
-                                shell, "_update_active_attack_graph_step_status"
-                            ):
-                                shell._update_active_attack_graph_step_status(  # type: ignore[attr-defined]
-                                    domain=domain,
-                                    status="failed",
-                                    notes={"user": exec_context.exec_username},
-                                )
-                            else:
-                                update_edge_status_by_labels(
-                                    shell,
-                                    domain,
-                                    from_label=from_label,
-                                    relation=action,
-                                    to_label=to_label,
-                                    status="failed",
-                                    notes={"user": exec_context.exec_username},
-                                )
+                            _update_attack_path_step_status_at_index(
+                                shell,
+                                domain=domain,
+                                summary=summary,
+                                step_index=idx - 1,
+                                status="failed",
+                                notes={"user": exec_context.exec_username},
+                            )
                             _record_attack_path_execution_event(
                                 shell,
                                 domain=domain,
@@ -5794,6 +6430,24 @@ def execute_selected_attack_path(
                         to_label,
                         kind="unavailable",
                         reason="Session user is not resolvable",
+                    )
+                    return execution_started
+
+                if (
+                    ensure_host_bound_workflow_target_viable(
+                        shell,
+                        domain=domain,
+                        target_host=target_host,
+                        workflow_label="HasSession exploitation",
+                    )
+                    is None
+                ):
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="blocked",
+                        reason="Session host is not reachable from the current vantage",
                     )
                     return execution_started
 
@@ -7247,6 +7901,7 @@ def offer_attack_paths_for_execution_summaries(
             candidates: list[dict[str, Any]] = []
             skipped_no_context = 0
             skipped_unsupported = 0
+            skipped_blocked = 0
             for summary in summaries:
                 status = str(summary.get("status") or "theoretical").strip().lower()
                 if not _status_allowed_by_filter(status, desired_statuses_set):
@@ -7254,6 +7909,15 @@ def offer_attack_paths_for_execution_summaries(
                 if not retry_attempted and status == "attempted":
                     continue
                 if status == "exploited":
+                    continue
+                meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+                support_status = (
+                    str(meta.get("execution_support_status") or "").strip().lower()
+                    if isinstance(meta, dict)
+                    else ""
+                )
+                if support_status == "blocked":
+                    skipped_blocked += 1
                     continue
                 if not _path_is_supported_for_execution(summary):
                     skipped_unsupported += 1
@@ -7272,6 +7936,15 @@ def offer_attack_paths_for_execution_summaries(
                     print_info_debug(
                         "[attack_paths] batch: "
                         f"domain={marked_domain} skipped_unsupported={skipped_unsupported}"
+                    )
+                if skipped_blocked > 0:
+                    print_warning(
+                        "No remaining attack paths are executable because their target "
+                        "hosts are currently not viable from this vantage."
+                    )
+                    print_info_debug(
+                        "[attack_paths] batch: "
+                        f"domain={marked_domain} skipped_blocked={skipped_blocked}"
                     )
                 if skipped_no_context > 0:
                     print_warning(
@@ -7297,6 +7970,16 @@ def offer_attack_paths_for_execution_summaries(
                     "[attack_paths] batch support pre-check: "
                     f"domain={marked_domain} eligible={len(candidates)} "
                     f"skipped_unsupported={skipped_unsupported}"
+                )
+            if skipped_blocked > 0:
+                print_info(
+                    f"Skipping {skipped_blocked} attack path(s) whose target hosts are "
+                    "not currently viable from this vantage."
+                )
+                print_info_debug(
+                    "[attack_paths] batch host-viability pre-check: "
+                    f"domain={marked_domain} eligible={len(candidates)} "
+                    f"skipped_blocked={skipped_blocked}"
                 )
             if skipped_no_context > 0:
                 print_info(
@@ -7372,6 +8055,41 @@ def offer_attack_paths_for_execution_summaries(
             if isinstance(selected_meta, dict)
             else ""
         )
+        if execution_support_status == "blocked":
+            warning_message, debug_reason = _execution_block_message(selected_meta)
+            marked_action = mark_sensitive(
+                str(selected_meta.get("execution_context_action") or "step"),
+                "detail",
+            )
+            print_warning(warning_message)
+            print_info_debug(
+                "[attack_paths] execution pre-check blocked: "
+                f"domain={marked_domain} action={marked_action} "
+                f"reason={mark_sensitive(debug_reason, 'detail')}"
+            )
+            blocked_target_label = str(
+                selected_meta.get("execution_target_label")
+                or selected.get("target")
+                or ""
+            ).strip()
+            blocked_viability_status = str(
+                selected_meta.get("execution_target_viability_status") or ""
+            ).strip()
+            if blocked_target_label and blocked_viability_status in {
+                "resolved_but_unreachable",
+                "enabled_but_unresolved",
+                "not_in_enabled_inventory",
+            }:
+                maybe_offer_pivot_opportunity_for_host_viability(
+                    shell,
+                    domain=domain,
+                    blocked_target=blocked_target_label,
+                    viability_status=blocked_viability_status,
+                    operator_summary=None,
+                )
+            if single_pass:
+                return executed
+            continue
         if execution_support_status == "unsupported":
             marked_action = mark_sensitive(
                 str(selected_meta.get("execution_context_action") or "step"),

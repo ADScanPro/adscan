@@ -2748,6 +2748,53 @@ def print_panel(
                 telemetry_console.print()
 
 
+def print_system_change_warning(
+    *,
+    title: str,
+    summary: str,
+    planned_changes: List[str] | tuple[str, ...] = (),
+    impact_notes: List[str] | tuple[str, ...] = (),
+    cleanup_notes: List[str] | tuple[str, ...] = (),
+    authorization_note: Optional[str] = None,
+    border_style: str = "yellow",
+    expand: bool = False,
+) -> None:
+    """Print a standardized warning panel for disruptive system changes.
+
+    The implementation delegates to ``print_panel`` so telemetry and spacing
+    follow the same path as the other high-level Rich output helpers.
+    """
+    content_lines: list[str] = [summary]
+
+    if planned_changes:
+        content_lines.extend(["", "Planned changes:"])
+        content_lines.extend(
+            f"- {item}" for item in planned_changes if str(item).strip()
+        )
+
+    if impact_notes:
+        content_lines.extend(["", "Operational impact:"])
+        content_lines.extend(
+            f"- {item}" for item in impact_notes if str(item).strip()
+        )
+
+    if cleanup_notes:
+        content_lines.extend(["", "Cleanup notes:"])
+        content_lines.extend(
+            f"- {item}" for item in cleanup_notes if str(item).strip()
+        )
+
+    if authorization_note:
+        content_lines.extend(["", authorization_note])
+
+    print_panel(
+        "\n".join(content_lines),
+        title=title,
+        border_style=border_style,
+        expand=expand,
+    )
+
+
 def print_section(
     title: str, content: str, border_style: str = "blue", icon: Optional[str] = None
 ):

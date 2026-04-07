@@ -36,6 +36,15 @@ from adscan_internal.integrations.netexec.timeouts import (
     resolve_service_command_timeout_seconds,
 )
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
+from adscan_internal.services.pivot_capability_registry import (
+    is_service_pivot_capable,
+)
+from adscan_internal.services.pivot_opportunity_service import (
+    ensure_host_bound_workflow_target_viable,
+)
+from adscan_internal.services.service_access_probe_history import (
+    record_service_access_probe_batch,
+)
 from adscan_internal.services.service_access_results import (
     ServiceAccessFinding,
     render_service_access_results,
@@ -43,6 +52,7 @@ from adscan_internal.services.service_access_results import (
     select_confirmed_service_access_followup_targets,
 )
 from adscan_internal.text_utils import strip_ansi_codes
+from adscan_internal.workspaces.computers import load_target_entries
 
 
 def _looks_like_ntlm_hash(value: str) -> bool:
@@ -66,6 +76,17 @@ def ask_for_rdp_access(
         username: RDP username.
         password: Password or NTLM hash.
     """
+    if (
+        ensure_host_bound_workflow_target_viable(
+            shell,
+            domain=domain,
+            target_host=host,
+            workflow_label="RDP access workflow",
+        )
+        is None
+    ):
+        return
+
     marked_host = mark_sensitive(host, "hostname")
     marked_username = mark_sensitive(username, "user")
     answer = Confirm.ask(
@@ -404,6 +425,7 @@ def run_rdp_service_access_sweep_with_medusa(
         if hasattr(shell, "_get_workspace_cwd")
         else getattr(shell, "current_workspace_dir", os.getcwd())
     )
+    domains_dir = getattr(shell, "domains_dir", "domains")
     log_abs_path = os.path.join(
         workspace_cwd,
         "domains",
@@ -530,6 +552,45 @@ def run_rdp_service_access_sweep_with_medusa(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+
+    target_entries = (
+        sorted(load_target_entries(targets))
+        if os.path.isfile(targets)
+        else [str(targets).strip()]
+    )
+    normalized_target_entries = {
+        str(entry).strip().lower() for entry in target_entries if str(entry).strip()
+    }
+    confirmed_targets = [
+        entry
+        for entry in target_entries
+        if str(entry).strip().lower()
+        in {
+            str(finding.host).strip().lower()
+            for finding in success_findings
+            if str(finding.host).strip()
+        }
+    ]
+    if not confirmed_targets and len(normalized_target_entries) == 1 and success_findings:
+        confirmed_targets = list(target_entries)
+    try:
+        record_service_access_probe_batch(
+            workspace_dir=workspace_cwd,
+            domains_dir=domains_dir,
+            domain=domain,
+            username=username,
+            service="rdp",
+            targets=target_entries,
+            confirmed_hosts=confirmed_targets,
+            source="run_rdp_service_access_sweep_with_medusa",
+            backend="medusa",
+            pivot_capable=is_service_pivot_capable("rdp"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[rdp-medusa] failed to persist probe history: {exc}"
+        )
 
     if prompt and success_findings:
         selected_followups, used_selector = select_confirmed_service_access_followup_targets(

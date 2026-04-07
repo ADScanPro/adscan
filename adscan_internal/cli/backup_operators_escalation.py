@@ -15,6 +15,7 @@ from adscan_internal.rich_output import (
     mark_sensitive,
     print_operation_header,
     print_panel,
+    print_system_change_warning,
 )
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal import telemetry
@@ -476,26 +477,29 @@ def offer_backup_operators_escalation(
         if not getattr(shell, "auto", False):
             marked_domain = mark_sensitive(domain, "domain")
             marked_pdc = mark_sensitive(pdc_ip, "ip")
-            print_panel(
-                "\n".join(
-                    [
-                        "⚠️  This escalation will copy sensitive hives to SYSVOL",
-                        f"Domain: {marked_domain}",
-                        f"PDC: {marked_pdc}",
-                        "It will dump SYSTEM/SAM/SECURITY to SYSVOL, download them,",
-                        "and parse for the DC machine account hash.",
-                        "",
-                        "If the exploit fails, the hives may remain in SYSVOL.",
-                        "In production, ensure they are cleaned up immediately.",
-                    ]
-                ),
+            print_system_change_warning(
                 title="[bold yellow]Backup Operators Warning[/bold yellow]",
-                border_style="yellow",
-                expand=False,
+                summary=(
+                    f"This escalation will copy sensitive registry hives to SYSVOL on {marked_pdc} in {marked_domain}."
+                ),
+                planned_changes=[
+                    "Dump SYSTEM, SAM, and SECURITY into SYSVOL.",
+                    "Download the dumped hives and parse them for the DC machine account hash.",
+                ],
+                impact_notes=[
+                    "The operation writes sensitive files to SYSVOL and may be visible to defenders.",
+                ],
+                cleanup_notes=[
+                    "If the exploit fails, the dumped hives may remain in SYSVOL until you remove them manually.",
+                    "In production, ensure SYSVOL artifacts are cleaned up immediately.",
+                ],
+                authorization_note=(
+                    "Only continue if you are explicitly authorized to create temporary dump artifacts on the domain controller."
+                ),
             )
             if not Confirm.ask(
                 "Proceed with Backup Operators escalation?",
-                default=True,
+                default=False,
             ):
                 print_warning("Backup Operators escalation skipped by user.")
                 _update_backup_ops_da_edge(

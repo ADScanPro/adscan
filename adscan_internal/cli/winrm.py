@@ -52,6 +52,9 @@ from adscan_internal.services.post_pivot_followup_service import (
     refresh_network_inventory_after_pivot,
     render_post_pivot_reachability_delta,
 )
+from adscan_internal.services.pivot_opportunity_service import (
+    ensure_host_bound_workflow_target_viable,
+)
 from adscan_internal.services.smb_sensitive_file_policy import (
     SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS,
     SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS,
@@ -876,6 +879,17 @@ def ask_for_winrm_access(
 ) -> None:
     """Ask to enumerate a host via WinRM and run the follow-up checks."""
     from rich.prompt import Confirm
+
+    if (
+        ensure_host_bound_workflow_target_viable(
+            shell,
+            domain=domain,
+            target_host=host,
+            workflow_label="WinRM access workflow",
+        )
+        is None
+    ):
+        return
 
     marked_host = mark_sensitive(host, "hostname")
     marked_username = mark_sensitive(username, "user")

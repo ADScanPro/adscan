@@ -30,6 +30,9 @@ from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.path_utils import get_adscan_home
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.exploitation import ExploitationService
+from adscan_internal.services.pivot_opportunity_service import (
+    ensure_host_bound_workflow_target_viable,
+)
 from adscan_internal.text_utils import strip_ansi_codes
 from rich.prompt import Confirm
 
@@ -266,6 +269,16 @@ def ask_for_mssql_access(
     shell: MssqlShell, *, domain: str, host: str, username: str, password: str
 ) -> None:
     """Ask user if they want to exploit SeImpersonate via MSSQL."""
+    if (
+        ensure_host_bound_workflow_target_viable(
+            shell,
+            domain=domain,
+            target_host=host,
+            workflow_label="MSSQL access workflow",
+        )
+        is None
+    ):
+        return
     ask_for_mssql_impersonate(shell, domain=domain, host=host, username=username, password=password)
 
 

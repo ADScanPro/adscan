@@ -22,6 +22,10 @@ from adscan_internal.integrations.netexec.timeouts import (
     get_recommended_internal_timeout,
 )
 from adscan_internal.cli.rdp import run_rdp_service_access_sweep_with_medusa
+from adscan_internal.services.service_access_probe_history import (
+    load_service_access_probe_history,
+    partition_targets_by_probe_history,
+)
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.workspaces.computers import (
     count_target_file_entries,
@@ -31,6 +35,114 @@ from adscan_internal.workspaces.computers import (
     resolve_domain_service_target_file,
 )
 from rich.prompt import Confirm
+
+
+def _build_service_sweep_target_argument(
+    *,
+    workspace_dir: str,
+    domains_dir: str,
+    domain: str,
+    service: str,
+    username: str,
+    targets: list[str],
+) -> str | None:
+    """Materialize one host list into the argument expected by service backends."""
+    cleaned_targets = [
+        str(target).strip() for target in targets if str(target or "").strip()
+    ]
+    if not cleaned_targets:
+        return None
+    if len(cleaned_targets) == 1:
+        return cleaned_targets[0]
+
+    tmp_dir = domain_subpath(workspace_dir, domains_dir, domain, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    targets_path = os.path.join(
+        tmp_dir,
+        f"hosts.{service}.{username}.filtered.txt",
+    )
+    with open(targets_path, "w", encoding="utf-8") as handle:
+        for entry in cleaned_targets:
+            handle.write(entry + "\n")
+    return targets_path
+
+
+def _select_effective_service_targets(
+    shell: Any,
+    *,
+    workspace_dir: str,
+    domains_dir: str,
+    domain: str,
+    username: str,
+    service: str,
+    current_targets: list[str],
+    include_previously_tested: bool,
+) -> list[str]:
+    """Return the target list that should be probed for one service sweep.
+
+    By default, previously tested targets are skipped. When every target was
+    already checked, the caller may offer a re-check prompt with a default of
+    ``No`` so the operator can intentionally opt back into reprobing.
+    """
+    if include_previously_tested:
+        return list(current_targets)
+
+    history = load_service_access_probe_history(
+        workspace_dir=workspace_dir,
+        domains_dir=domains_dir,
+        domain=domain,
+    )
+    fresh_targets, previous_records = partition_targets_by_probe_history(
+        records=history,
+        username=username,
+        service=service,
+        targets=current_targets,
+    )
+    if fresh_targets:
+        if previous_records:
+            print_info(
+                f"Skipping {len(previous_records)} previously tested "
+                f"{service.upper()} target(s) by default. Checking "
+                f"{len(fresh_targets)} new target(s)."
+            )
+            skipped_hosts = [
+                mark_sensitive(str(record.get("host") or ""), "hostname")
+                for record in previous_records
+                if str(record.get("host") or "").strip()
+            ]
+            if skipped_hosts:
+                print_info_debug(
+                    "[privileges] previously tested targets skipped by default: "
+                    f"service={service} user={mark_sensitive(username, 'user')} "
+                    f"targets={skipped_hosts}"
+                )
+        return fresh_targets
+
+    if not previous_records:
+        return list(current_targets)
+
+    prompt = (
+        f"All current {service.upper()} targets for "
+        f"{mark_sensitive(username, 'user')} were tested before. Re-check them now?"
+    )
+    confirmer = getattr(shell, "_questionary_confirm", None)
+    should_recheck = (
+        bool(confirmer(prompt, default=False))
+        if callable(confirmer)
+        else False
+    )
+    if should_recheck:
+        print_info(
+            f"Re-checking {len(previous_records)} previously tested "
+            f"{service.upper()} target(s) by user choice."
+        )
+        return list(current_targets)
+
+    print_info(
+        f"Skipping {service.upper()} sweep because all {len(previous_records)} "
+        "current target(s) were already tested."
+    )
+    return []
 
 
 def _resolve_next_broader_scope(
@@ -183,6 +295,44 @@ def run_netexec_user_postauth_access(
     )
 
 
+def run_postauth_service_and_share_followup(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    hosts: list[str] | None = None,
+    prompt: bool = False,
+    scope_preference: str = "optimized",
+) -> None:
+    """Run the standard post-auth follow-up for one user.
+
+    This is the shared "minimal valuable" post-auth workflow reused by attack-step
+    follow-ups and post-pivot follow-ups:
+
+    1. Probe service access across SMB/WinRM/RDP/MSSQL.
+    2. Enumerate authenticated SMB shares reachable by that user.
+    """
+    from adscan_internal.cli.smb import run_auth_shares
+
+    run_service_access_sweep(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+        services=["smb", "winrm", "rdp", "mssql"],
+        hosts=hosts,
+        prompt=prompt,
+        scope_preference=scope_preference,
+    )
+    run_auth_shares(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+    )
+
+
 def run_netexec_user_privs(
     shell: Any,
     *,
@@ -211,6 +361,7 @@ def run_service_access_sweep(
     hosts: list[str] | None = None,
     prompt: bool = False,
     scope_preference: str = "optimized",
+    include_previously_tested: bool = False,
 ) -> None:
     """Enumerate access across a set of services for one user."""
     if domain not in shell.domains_data:
@@ -245,22 +396,23 @@ def run_service_access_sweep(
                 )
             while True:
                 targets: str | None = None
+                original_targets_arg: str | None = None
                 current_target_entries: set[str] = set()
                 source = "explicit_hosts"
                 if cleaned_hosts:
-                    if len(cleaned_hosts) == 1:
-                        targets = cleaned_hosts[0]
-                    else:
-                        tmp_dir = domain_subpath(workspace_cwd, domains_dir, domain, "tmp")
-                        os.makedirs(tmp_dir, exist_ok=True)
-                        targets_path = os.path.join(
-                            tmp_dir, f"hosts.{service}.{username}.txt"
-                        )
-                        with open(targets_path, "w", encoding="utf-8") as handle:
-                            for entry in sorted(set(cleaned_hosts), key=str.lower):
-                                handle.write(entry + "\n")
-                        targets = targets_path
-                    current_target_entries = {entry.lower() for entry in cleaned_hosts}
+                    current_target_list = list(dict.fromkeys(cleaned_hosts))
+                    current_target_entries = {
+                        entry.lower() for entry in current_target_list
+                    }
+                    original_targets_arg = _build_service_sweep_target_argument(
+                        workspace_dir=workspace_cwd,
+                        domains_dir=domains_dir,
+                        domain=domain,
+                        service=service,
+                        username=username,
+                        targets=current_target_list,
+                    )
+                    targets = original_targets_arg
                 else:
                     default_hosts_file, source = resolve_domain_service_target_file(
                         workspace_cwd,
@@ -295,6 +447,75 @@ def run_service_access_sweep(
                     if targeting_notice:
                         print_info(targeting_notice)
                     current_target_entries = load_target_entries(default_hosts_file)
+                    current_target_list = sorted(current_target_entries)
+                    original_targets_arg = default_hosts_file
+
+                effective_target_list = _select_effective_service_targets(
+                    shell,
+                    workspace_dir=workspace_cwd,
+                    domains_dir=domains_dir,
+                    domain=domain,
+                    username=username,
+                    service=service,
+                    current_targets=current_target_list,
+                    include_previously_tested=include_previously_tested,
+                )
+                effective_target_entries = {
+                    entry.lower() for entry in effective_target_list
+                }
+                if effective_target_list == current_target_list and original_targets_arg:
+                    targets = original_targets_arg
+                else:
+                    targets = _build_service_sweep_target_argument(
+                        workspace_dir=workspace_cwd,
+                        domains_dir=domains_dir,
+                        domain=domain,
+                        service=service,
+                        username=username,
+                        targets=effective_target_list,
+                    )
+                if not targets:
+                    found_hosts = False
+                    if cleaned_hosts:
+                        break
+                    next_scope_preference = _resolve_next_broader_scope(
+                        service=service,
+                        source=source,
+                        current_scope_preference=current_scope_preference,
+                    )
+                    if not next_scope_preference:
+                        break
+                    next_targets_file, _next_source = resolve_domain_service_target_file(
+                        workspace_cwd,
+                        domains_dir,
+                        domain,
+                        service=service,
+                        domain_data=shell.domains_data.get(domain, {}),
+                        scope_preference=next_scope_preference,
+                    )
+                    next_target_count = count_target_file_entries(next_targets_file)
+                    if not next_targets_file or next_target_count <= 0:
+                        break
+                    next_target_entries = load_target_entries(next_targets_file)
+                    if next_target_entries and next_target_entries.issubset(current_target_entries):
+                        print_info_debug(
+                            "[privileges] skipping broader sweep prompt because "
+                            f"{mark_sensitive(next_scope_preference, 'detail')} does not add "
+                            f"new {service.upper()} targets beyond "
+                            f"{mark_sensitive(source, 'detail')}"
+                        )
+                        break
+                    if not _prompt_broader_postauth_scope_retry(
+                        shell,
+                        service=service,
+                        domain=domain,
+                        current_source=source,
+                        next_scope_preference=next_scope_preference,
+                        next_target_count=next_target_count,
+                    ):
+                        break
+                    current_scope_preference = next_scope_preference
+                    continue
 
                 marked_domain = mark_sensitive(domain, "domain")
                 marked_username = mark_sensitive(username, "user")
@@ -319,7 +540,7 @@ def run_service_access_sweep(
                             target_count=(
                                 len(cleaned_hosts)
                                 if cleaned_hosts
-                                else target_count
+                                else len(effective_target_list)
                             ),
                         )
                     )
@@ -375,7 +596,9 @@ def run_service_access_sweep(
                 if not next_targets_file or next_target_count <= 0:
                     break
                 next_target_entries = load_target_entries(next_targets_file)
-                if next_target_entries and next_target_entries.issubset(current_target_entries):
+                if next_target_entries and next_target_entries.issubset(
+                    effective_target_entries or current_target_entries
+                ):
                     print_info_debug(
                         "[privileges] skipping broader sweep prompt because "
                         f"{mark_sensitive(next_scope_preference, 'detail')} does not add "
