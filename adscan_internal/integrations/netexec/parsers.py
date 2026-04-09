@@ -36,6 +36,46 @@ class ParsedShare:
     permission: str
 
 
+@dataclass(frozen=True)
+class ParsedDelegatedAuthFailure:
+    """Parsed delegated-auth failure line emitted by NetExec."""
+
+    line: str
+    status: str
+    through_s4u: bool
+
+
+def parse_netexec_delegated_auth_failure(
+    output: str,
+) -> ParsedDelegatedAuthFailure | None:
+    """Return delegated-auth failure metadata when NetExec reports it.
+
+    This targets the specific family of lines where NetExec authenticates with
+    delegated Kerberos/S4U and then reports a ``STATUS_*`` failure in stdout or
+    stderr while still potentially returning exit code ``0``.
+    """
+    if not output:
+        return None
+
+    normalized = normalize_cli_output(output)
+    for raw_line in normalized.splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        line_upper = line.upper()
+        if "THROUGH S4U WITH" not in line_upper:
+            continue
+        status_match = re.search(r"\b(STATUS_[A-Z0-9_]+)\b", line_upper)
+        if not status_match:
+            continue
+        return ParsedDelegatedAuthFailure(
+            line=line,
+            status=status_match.group(1),
+            through_s4u=True,
+        )
+    return None
+
+
 def parse_smb_share_map(output: str) -> dict[str, dict[str, str]]:
     """Parse NetExec SMB ``--shares`` output into a host->share->perm map.
 

@@ -1987,10 +1987,16 @@ def confirm_domain_pdc_mapping(
     mode_label: str,
     on_reenter: Callable[[], tuple[str, str] | None] | None = None,
     candidate_open_tcp_ports: set[int] | tuple[int, ...] | list[int] | None = None,
+    skip_initial_candidate: bool = False,
 ) -> tuple[str, str] | None:
     """Confirm/validate a domain ↔ PDC mapping with shared UX."""
     current_domain = domain
     current_ip = candidate_ip
+    if skip_initial_candidate and on_reenter:
+        updated = on_reenter()
+        if not updated:
+            return None
+        current_domain, current_ip = updated
     while True:
         current_port_hints = (
             candidate_open_tcp_ports if current_ip == candidate_ip else None

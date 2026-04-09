@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import time
+from contextlib import contextmanager
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -76,6 +77,7 @@ from adscan_internal.services.adcs_target_filter import (
 )
 from adscan_internal.services.ldap_transport_service import (
     prepare_kerberos_ldap_environment,
+    resolve_ldap_target_endpoints,
 )
 
 
@@ -109,6 +111,50 @@ ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS = os.getenv(
 _CERTIPY_TEMPLATE_CACHE: dict[str, dict[str, Any]] = {}
 _CERTIHOUND_TEMPLATE_CACHE: dict[str, dict[str, Any]] = {}
 _REPORT_SYNC_FN: Callable[[object, str, dict[str, Any]], None] | None | bool = None
+_ATTACK_PATH_DEBUG_SUMMARY_TABLES_ENABLED = True
+
+
+@dataclass(frozen=True, slots=True)
+class AttackPathSummaryFilters:
+    """Optional filters applied to computed attack-path summary records.
+
+    These are post-compute filters over the summary/output layer, intended for
+    follow-up workflows that need to reuse the standard attack-path engine but
+    narrow the result set to a specific target or terminal primitive.
+    """
+
+    target_labels: tuple[str, ...] = ()
+    terminal_relations: tuple[str, ...] = ()
+
+
+@contextmanager
+def _attack_path_debug_summary_tables(enabled: bool):
+    """Temporarily control debug attack-path summary table rendering."""
+    global _ATTACK_PATH_DEBUG_SUMMARY_TABLES_ENABLED  # noqa: PLW0603
+    previous = _ATTACK_PATH_DEBUG_SUMMARY_TABLES_ENABLED
+    _ATTACK_PATH_DEBUG_SUMMARY_TABLES_ENABLED = bool(enabled)
+    try:
+        yield
+    finally:
+        _ATTACK_PATH_DEBUG_SUMMARY_TABLES_ENABLED = previous
+
+
+def _maybe_print_attack_paths_summary_debug(
+    domain: str,
+    paths: list[dict[str, Any]],
+    *,
+    stage_label: str,
+    max_display: int = 30,
+) -> None:
+    """Render the debug attack-path table only when this computation allows it."""
+    if not _ATTACK_PATH_DEBUG_SUMMARY_TABLES_ENABLED:
+        return
+    print_attack_paths_summary_debug(
+        domain,
+        paths,
+        stage_label=stage_label,
+        max_display=max_display,
+    )
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -2389,8 +2435,11 @@ def get_attack_paths_cache_stats(
 
 
 __all__ = [
+    "AttackPathSummaryFilters",
     "get_attack_path_summaries",
+    "get_owned_attack_path_summaries_to_target",
     "get_owned_domain_usernames_for_attack_paths",
+    "get_rodc_prp_control_paths",
     "get_recursive_principal_groups_from_snapshot",
     "is_principal_member_of_rid_from_snapshot",
     "get_users_in_group_rid_from_snapshot",
@@ -2834,6 +2883,21 @@ def _writable_attribute_report_path(
     return os.path.join(acl_dir, "writable_attributes_domain.json")
 
 
+def _rodc_prp_report_path(
+    domain_dir: str,
+) -> str | None:
+    """Return the canonical RODC PRP control cache path for one domain."""
+    if not domain_dir:
+        return None
+    acl_dir = os.path.join(domain_dir, "acl")
+    if not os.path.isdir(acl_dir):
+        try:
+            os.makedirs(acl_dir, exist_ok=True)
+        except OSError:
+            return None
+    return os.path.join(acl_dir, "rodc_prp_writers_domain.json")
+
+
 def _load_writable_attribute_report(
     domain_dir: str,
 ) -> dict[str, Any] | None:
@@ -2855,6 +2919,36 @@ def _persist_writable_attribute_report(
 ) -> None:
     """Persist writable-attribute findings for one domain."""
     report_path = _writable_attribute_report_path(domain_dir)
+    if not report_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        write_json_file(report_path, report)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+
+def _load_rodc_prp_report(
+    domain_dir: str,
+) -> dict[str, Any] | None:
+    """Load cached RODC PRP findings when present."""
+    report_path = _rodc_prp_report_path(domain_dir)
+    if not report_path or not os.path.exists(report_path):
+        return None
+    try:
+        report = read_json_file(report_path)
+        return report if isinstance(report, dict) else None
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return None
+
+
+def _persist_rodc_prp_report(
+    domain_dir: str,
+    report: dict[str, Any],
+) -> None:
+    """Persist RODC PRP findings for one domain."""
+    report_path = _rodc_prp_report_path(domain_dir)
     if not report_path:
         return
     try:
@@ -2941,15 +3035,13 @@ def _resolve_certihound_detection_report(
             domains_data=getattr(shell, "domains_data", {}),
             sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
         )
-    dc_fqdn = domain_data.get("pdc_hostname_fqdn") or domain_data.get("pdc_fqdn")
-    if not dc_fqdn:
-        pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip()
-        if pdc_hostname:
-            dc_fqdn = (
-                pdc_hostname if "." in pdc_hostname else f"{pdc_hostname}.{domain_key}"
-            )
-    dc_ip = str(domain_data.get("pdc") or "").strip()
-    dc_target = dc_fqdn if kerberos_ready and dc_fqdn else dc_ip
+    ldap_targets = resolve_ldap_target_endpoints(
+        target_domain=domain_key,
+        domain_data=domain_data,
+        kerberos_ready=kerberos_ready,
+    )
+    dc_target = ldap_targets.dc_address
+    kerberos_target_hostname = ldap_targets.kerberos_target_hostname
     if not dc_target:
         print_info_debug(
             "[adcs] Missing DC target for CertiHound detection; skipping."
@@ -2957,13 +3049,24 @@ def _resolve_certihound_detection_report(
         return None
 
     service = CertiHoundDetectionService()
-    report = service.build_detection_report(
-        target_domain=domain_key,
+
+    def _run_detection(*, dc_address: str, use_kerberos_auth: bool) -> dict[str, Any] | None:
+        return service.build_detection_report(
+            target_domain=domain_key,
+            dc_address=str(dc_address),
+            username=str(username),
+            password=str(password),
+            use_kerberos=use_kerberos_auth,
+            use_ldaps=True,
+            shell=shell,
+            registry_username=str(username),
+            registry_credential=str(password),
+            kerberos_target_hostname=kerberos_target_hostname,
+        )
+
+    report = _run_detection(
         dc_address=str(dc_target),
-        username=None if kerberos_ready else str(username),
-        password=None if kerberos_ready else str(password),
-        use_kerberos=kerberos_ready,
-        use_ldaps=True,
+        use_kerberos_auth=kerberos_ready,
     )
     if not isinstance(report, dict):
         return None
@@ -3024,15 +3127,13 @@ def _resolve_writable_attribute_report(
             domains_data=getattr(shell, "domains_data", {}),
             sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
         )
-    pdc_ip = str(domain_data.get("pdc") or "").strip()
-    dc_fqdn = domain_data.get("pdc_hostname_fqdn") or domain_data.get("pdc_fqdn")
-    if not dc_fqdn:
-        pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip()
-        if pdc_hostname:
-            dc_fqdn = (
-                pdc_hostname if "." in pdc_hostname else f"{pdc_hostname}.{domain_key}"
-            )
-    dc_target = dc_fqdn if kerberos_ready and dc_fqdn else pdc_ip
+    ldap_targets = resolve_ldap_target_endpoints(
+        target_domain=domain_key,
+        domain_data=domain_data,
+        kerberos_ready=kerberos_ready,
+    )
+    dc_target = ldap_targets.dc_address
+    kerberos_target_hostname = ldap_targets.kerberos_target_hostname
     if not dc_target:
         print_info_debug(
             "[writable-attrs] Missing DC target for writable-attribute discovery; skipping."
@@ -3045,6 +3146,94 @@ def _resolve_writable_attribute_report(
     )
     report = DomainWritableAttributeDetectionService().build_user_attribute_write_report(
         dc_address=str(dc_target),
+        kerberos_target_hostname=kerberos_target_hostname,
+        target_domain=domain_key,
+        username=str(username),
+        password=str(password),
+        use_kerberos=kerberos_ready,
+        use_ldaps=True,
+    )
+    if not isinstance(report, dict):
+        return None
+
+    _persist_writable_attribute_report(domain_dir, report=report)
+    return report
+
+
+def _resolve_rodc_prp_report(
+    shell: object,
+    domain: str,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any] | None:
+    """Load or build domain-scope delegated RODC PRP-write findings."""
+    from adscan_internal.services import CredentialStoreService
+    from adscan_internal.services.domain_rodc_prp_detection_service import (
+        DomainRodcPrpDetectionService,
+    )
+
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return None
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain_key, {})
+    domain_dir = domain_data.get("dir") if isinstance(domain_data, dict) else None
+    if not isinstance(domain_dir, str) or not domain_dir:
+        return None
+
+    creds = CredentialStoreService.resolve_auth_credentials(
+        getattr(shell, "domains_data", {}),
+        target_domain=domain_key,
+        primary_domain=getattr(shell, "domain", None),
+    )
+    if not creds:
+        print_info_debug(
+            "[rodc-prp] No credentials available for delegated RODC PRP discovery; skipping."
+        )
+        return None
+    username, password, auth_domain = creds
+
+    cached_report = None if force_refresh else _load_rodc_prp_report(domain_dir)
+    if isinstance(cached_report, dict):
+        return cached_report
+
+    kerberos_ready = bool(
+        getattr(shell, "domains_data", {}).get(domain_key, {}).get("kerberos_tickets")
+    )
+    if kerberos_ready:
+        kerberos_ready = prepare_kerberos_ldap_environment(
+            operation_name="RODC PRP detection",
+            target_domain=domain_key,
+            workspace_dir=str(
+                getattr(shell, "current_workspace_dir", "")
+                or getattr(shell, "_get_workspace_cwd", lambda: "")()
+                or ""
+            ),
+            username=str(username),
+            user_domain=str(auth_domain or domain_key),
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+        )
+    ldap_targets = resolve_ldap_target_endpoints(
+        target_domain=domain_key,
+        domain_data=domain_data,
+        kerberos_ready=kerberos_ready,
+    )
+    dc_target = ldap_targets.dc_address
+    kerberos_target_hostname = ldap_targets.kerberos_target_hostname
+    if not dc_target:
+        print_info_debug(
+            "[rodc-prp] Missing DC target for delegated RODC PRP discovery; skipping."
+        )
+        return None
+
+    print_info_debug(
+        f"[rodc-prp] attempting delegated RODC PRP discovery for "
+        f"{mark_sensitive(domain_key, 'domain')} via {mark_sensitive(str(dc_target), 'host')}"
+    )
+    report = DomainRodcPrpDetectionService().build_rodc_prp_write_report(
+        dc_address=str(dc_target),
+        kerberos_target_hostname=kerberos_target_hostname,
         target_domain=domain_key,
         username=None if kerberos_ready else str(username),
         password=None if kerberos_ready else str(password),
@@ -3054,7 +3243,7 @@ def _resolve_writable_attribute_report(
     if not isinstance(report, dict):
         return None
 
-    _persist_writable_attribute_report(domain_dir, report=report)
+    _persist_rodc_prp_report(domain_dir, report=report)
     return report
 
 
@@ -4204,6 +4393,135 @@ def get_writable_user_attribute_paths(
     )
     print_info_debug(
         "[attack_graph] writable-attribute summary: "
+        + " ".join(f"{key}={value}" for key, value in discard_counters.items())
+    )
+    return edges
+
+
+def get_rodc_prp_control_paths(
+    shell: object,
+    domain: str,
+    *,
+    graph: dict[str, Any] | None = None,
+    force_refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """Build custom ``ManageRODCPrp`` edges from delegated RODC PRP write findings."""
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return []
+
+    report = _resolve_rodc_prp_report(shell, domain_key, force_refresh=force_refresh)
+    if not isinstance(report, dict):
+        return []
+
+    raw_findings = report.get("findings")
+    if not isinstance(raw_findings, list):
+        return []
+
+    edges: list[dict[str, Any]] = []
+    discard_counters: dict[str, int] = {
+        "findings_collected": len(raw_findings),
+        "skipped_invalid_row": 0,
+        "skipped_privileged_principal": 0,
+        "skipped_builtin_or_system_principal": 0,
+        "skipped_unresolved_principal": 0,
+        "skipped_self_edge": 0,
+        "edges_emitted": 0,
+    }
+    drop_samples: dict[str, int] = {}
+
+    def _sample_drop(reason: str, message: str) -> None:
+        count = drop_samples.get(reason, 0)
+        if count < 3:
+            print_info_debug(message)
+        drop_samples[reason] = count + 1
+
+    for finding in raw_findings:
+        if not isinstance(finding, dict):
+            discard_counters["skipped_invalid_row"] += 1
+            continue
+        relation = str(finding.get("relation") or "").strip()
+        principal_sid = str(finding.get("principal_sid") or "").strip()
+        target_machine = str(finding.get("target_machine") or "").strip()
+        target_object_id = str(finding.get("target_object_id") or "").strip()
+        target_dn = str(finding.get("target_dn") or "").strip()
+        if not relation or not principal_sid or not target_machine or not target_object_id:
+            discard_counters["skipped_invalid_row"] += 1
+            continue
+
+        should_skip, skip_reason, principal_node = _evaluate_lowpriv_source_principal(
+            shell,
+            domain=domain_key,
+            object_id=principal_sid,
+            preferred_kind="group",
+            graph=graph,
+            skip_on_unresolved=True,
+        )
+        if should_skip:
+            if skip_reason == "privileged_principal":
+                discard_counters["skipped_privileged_principal"] += 1
+            elif skip_reason == "builtin_or_system_principal":
+                discard_counters["skipped_builtin_or_system_principal"] += 1
+            else:
+                discard_counters["skipped_unresolved_principal"] += 1
+            _sample_drop(
+                skip_reason or "skipped_source",
+                f"[attack_graph] rodc-prp drop: "
+                f"reason={skip_reason or 'unknown'} "
+                f"principal_sid={mark_sensitive(principal_sid, 'user')} "
+                f"target={mark_sensitive(target_machine, 'user')}",
+            )
+            continue
+
+        target_machine_label = _canonical_membership_label(domain_key, target_machine)
+        source_label = str(
+            (principal_node or {}).get("name")
+            or _resolve_principal_label_from_sid(
+                shell,
+                domain=domain_key,
+                sid=principal_sid,
+                preferred_kind="group",
+            )
+            or ""
+        ).strip()
+        if not source_label or not target_machine_label:
+            discard_counters["skipped_invalid_row"] += 1
+            continue
+        if source_label.casefold() == target_machine_label.casefold():
+            discard_counters["skipped_self_edge"] += 1
+            continue
+
+        target_node = {
+            "name": target_machine_label,
+            "kind": ["Computer"],
+            "objectId": target_object_id,
+            "properties": {
+                "name": target_machine_label,
+                "objectid": target_object_id,
+                "distinguishedname": target_dn,
+                "domain": domain_key.upper(),
+                "samaccountname": target_machine,
+                "msDS-isRODC": True,
+            },
+        }
+        notes = {
+            "source": "ldap_rodc_prp_acl",
+            "detector": "ldap_rodc_prp_acl",
+            "target_dn": target_dn,
+            "required_attributes": list(finding.get("required_attributes") or []),
+            "principal_sid": principal_sid,
+        }
+        edges.append(
+            {
+                "nodes": [principal_node, target_node],
+                "rels": [relation],
+                "notes_by_relation_index": {0: notes},
+            }
+        )
+        discard_counters["edges_emitted"] += 1
+
+    print_info_debug(
+        f"[attack_graph] rodc-prp paths for {mark_sensitive(domain_key, 'domain')}: "
         + " ".join(f"{key}={value}" for key, value in discard_counters.items())
     )
     return edges
@@ -6704,6 +7022,82 @@ def _normalize_account(value: str) -> str:
     if "@" in name:
         name = name.split("@", 1)[0]
     return name.strip().lower()
+
+
+def _normalize_attack_path_filter_label(value: str) -> str:
+    """Return a comparable canonical label for summary target/source matching."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return raw.upper()
+
+
+def _summary_terminal_relation(record: dict[str, Any]) -> str:
+    """Return the last executable relation key for one summary record."""
+    steps = record.get("steps")
+    if isinstance(steps, list):
+        terminal_relation = ""
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            relation = str(step.get("action") or "").strip()
+            if not relation:
+                continue
+            if relation.strip().lower() in _CONTEXT_RELATIONS_LOWER:
+                continue
+            terminal_relation = relation
+        if terminal_relation:
+            return str(terminal_relation or "").strip().lower()
+    relations = record.get("relations")
+    if isinstance(relations, list):
+        for relation in reversed(relations):
+            relation_clean = str(relation or "").strip()
+            if not relation_clean:
+                continue
+            if relation_clean.lower() in _CONTEXT_RELATIONS_LOWER:
+                continue
+            return relation_clean.lower()
+    return ""
+
+
+def _apply_attack_path_summary_filters(
+    records: list[dict[str, Any]],
+    *,
+    filters: AttackPathSummaryFilters | None,
+) -> list[dict[str, Any]]:
+    """Apply optional reusable filters to attack-path summary records."""
+    if not filters:
+        return records
+
+    target_labels = {
+        _normalize_attack_path_filter_label(label)
+        for label in filters.target_labels
+        if _normalize_attack_path_filter_label(label)
+    }
+    terminal_relations = {
+        str(relation or "").strip().lower()
+        for relation in filters.terminal_relations
+        if str(relation or "").strip()
+    }
+    if not target_labels and not terminal_relations:
+        return records
+
+    filtered: list[dict[str, Any]] = []
+    for record in records:
+        target_label = _normalize_attack_path_filter_label(
+            str(record.get("target") or "")
+        )
+        if not target_label:
+            nodes = record.get("nodes")
+            if isinstance(nodes, list) and nodes:
+                target_label = _normalize_attack_path_filter_label(str(nodes[-1] or ""))
+        if target_labels and target_label not in target_labels:
+            continue
+        terminal_relation = _summary_terminal_relation(record)
+        if terminal_relations and terminal_relation not in terminal_relations:
+            continue
+        filtered.append(record)
+    return filtered
 
 
 def paths_involving_user(
@@ -10942,6 +11336,7 @@ def _apply_local_postprocessing_pipeline(
     snapshot: dict[str, Any] | None,
     principal_count: int = 1,
     owned_labels: frozenset[str] | None = None,
+    allow_owned_terminal_target: bool = False,
 ) -> list[dict[str, Any]]:
     """Apply the shared post-processing pipeline to local DFS results.
 
@@ -10993,7 +11388,7 @@ def _apply_local_postprocessing_pipeline(
         f"minimize: [{_minimize_rules}] | scope-filter: [{_scope_filter}] | "
         f"dedup: [exact key safety-net, all scopes]"
     )
-    print_attack_paths_summary_debug(domain, records, stage_label="1/6 · raw local-dfs")
+    _maybe_print_attack_paths_summary_debug(domain, records, stage_label="1/6 · raw local-dfs")
 
     # Stage 2: Non-terminal MemberOf filter — mirrors BH CE _build_non_terminal_memberof_filter.
     #   Runs BEFORE minimize so redundant_memberof cannot strip a trailing MemberOf and hide
@@ -11062,7 +11457,7 @@ def _apply_local_postprocessing_pipeline(
                 f"→ {len(_terminal_mo_kept)} remain"
             )
         records = _terminal_mo_kept
-    print_attack_paths_summary_debug(
+    _maybe_print_attack_paths_summary_debug(
         domain,
         records,
         stage_label=f"2/6 · after terminal-memberof filter [{target!r}]",
@@ -11079,7 +11474,7 @@ def _apply_local_postprocessing_pipeline(
     # are handled by the containment filter (stage 6): the shorter path from that
     # owned node is kept and the longer super-path dropped.
     # Only active for owned/principals multi-principal scopes.
-    if owned_labels and _is_multi:
+    if owned_labels and _is_multi and not allow_owned_terminal_target:
         _owned_removed = 0
         _owned_kept: list[dict[str, Any]] = []
         _owned_removed_debug = attack_paths_core.SampledDebugLogger(
@@ -11119,7 +11514,7 @@ def _apply_local_postprocessing_pipeline(
             f"[local-pipeline] minimize: {n_before_min} → {len(records)}, "
             f"{n_minimized} record(s) modified"
         )
-    print_attack_paths_summary_debug(
+    _maybe_print_attack_paths_summary_debug(
         domain,
         records,
         stage_label=f"3/6 · after minimize (scope={scope}, {n_minimized} record(s) modified)",
@@ -11149,7 +11544,7 @@ def _apply_local_postprocessing_pipeline(
             f"[local-pipeline] dedup: removed {n_dedup_removed} duplicate(s) → {len(deduped)} remain"
         )
     records = deduped
-    print_attack_paths_summary_debug(
+    _maybe_print_attack_paths_summary_debug(
         domain,
         records,
         stage_label=f"4/6 · after dedup [{scope}] ({n_dedup_removed} removed)",
@@ -11157,7 +11552,7 @@ def _apply_local_postprocessing_pipeline(
 
     # Stage 5: affected-user metadata (shell-aware, no BH CE graph required).
     records = _apply_affected_user_metadata(shell, domain, records)
-    print_attack_paths_summary_debug(
+    _maybe_print_attack_paths_summary_debug(
         domain, records, stage_label=f"5/6 · after annotate_affected_users [{scope}]"
     )
 
@@ -11193,7 +11588,7 @@ def _apply_local_postprocessing_pipeline(
                 f"removed {n_contained} path(s) → {len(result)} remain"
             )
         records = result
-        print_attack_paths_summary_debug(
+        _maybe_print_attack_paths_summary_debug(
             domain,
                 records,
                 stage_label=(
@@ -11212,7 +11607,7 @@ def _apply_local_postprocessing_pipeline(
                 f"removed {n_contained} sub-path(s) → {len(result)} remain"
             )
         records = result
-        print_attack_paths_summary_debug(
+        _maybe_print_attack_paths_summary_debug(
             domain,
                 records,
                 stage_label=(
@@ -11261,6 +11656,7 @@ def compute_display_paths_for_user(
     target: str = "highvalue",
     target_mode: str = "tier0",
     no_cache: bool = False,
+    allow_owned_terminal_target: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal dynamic paths from a specific user node.
 
@@ -11418,6 +11814,7 @@ def compute_display_paths_for_user(
         target=target,
         snapshot=snapshot,
         principal_count=1,
+        allow_owned_terminal_target=allow_owned_terminal_target,
     )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
@@ -11446,6 +11843,7 @@ def compute_display_paths_for_domain(
     target: str = "highvalue",
     target_mode: str = "tier0",
     no_cache: bool = False,
+    allow_owned_terminal_target: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain with optional high-value promotion.
 
@@ -11579,6 +11977,7 @@ def compute_display_paths_for_domain(
         target=target,
         snapshot=snapshot,
         principal_count=2,  # domain scope is always treated as multi-principal
+        allow_owned_terminal_target=allow_owned_terminal_target,
     )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
@@ -11812,6 +12211,7 @@ def compute_display_paths_for_owned_users(
     target: str = "highvalue",
     target_mode: str = "tier0",
     no_cache: bool = False,
+    allow_owned_terminal_target: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal dynamic paths for all owned users in a domain.
 
@@ -11839,6 +12239,7 @@ def compute_display_paths_for_owned_users(
         target=target,
         target_mode=target_mode,
         no_cache=no_cache,
+        allow_owned_terminal_target=allow_owned_terminal_target,
     )
 
 
@@ -11919,8 +12320,9 @@ def _is_bh_available(shell: object) -> bool:
 def _ask_or_get_attack_path_engine(shell: object) -> tuple[str, int]:
     """Return the attack-path engine and worker override to use.
 
-    In production (non-dev) always returns ``("local", -1)`` — local DFS is
-    faster and has no dependency on BH CE data being present for the domain.
+    In production (non-dev) always returns ``("local", 0)`` — local DFS is
+    faster and sequential execution currently benchmarks better than the
+    parallel worker mode for the workloads ADscan computes by default.
     In development mode (``ADSCAN_SESSION_ENV=dev``) shows an interactive
     questionary selector so engineers can compare engines:
       - BloodHound CE (only when connected)
@@ -11928,7 +12330,7 @@ def _ask_or_get_attack_path_engine(shell: object) -> tuple[str, int]:
       - rustworkx Rust-backed DFS (dev benchmark)
 
     For Local and rustworkx engines a second sub-selector appears to choose
-    between Sequential (0 workers) and Parallel (auto, -1) so that engineers
+    between Sequential (0 workers, default) and Parallel (auto, -1) so that engineers
     can benchmark both modes back-to-back.
 
     Returns:
@@ -11936,13 +12338,13 @@ def _ask_or_get_attack_path_engine(shell: object) -> tuple[str, int]:
         ``"local"``, or ``"rustworkx"`` and dev_workers is the worker count
         override (-1 = auto, 0 = sequential, used only for this computation).
     """
-    # In production (non-dev) always use local DFS — faster and no BH data dependency.
+    # In production (non-dev) always use local DFS in sequential mode.
     is_dev = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
     if not is_dev:
-        return "local", -1
+        return "local", 0
 
     if not hasattr(shell, "_questionary_select"):
-        return "local", -1
+        return "local", 0
 
     bh_available = _is_bh_available(shell)
     if bh_available:
@@ -11966,7 +12368,7 @@ def _ask_or_get_attack_path_engine(shell: object) -> tuple[str, int]:
             default_idx=default_idx,
         )
     except Exception:  # noqa: BLE001
-        return "local", -1
+        return "local", 0
 
     if bh_available:
         if idx == 0:
@@ -11980,15 +12382,15 @@ def _ask_or_get_attack_path_engine(shell: object) -> tuple[str, int]:
         parallelism_idx = shell._questionary_select(  # type: ignore[attr-defined]
             "Parallelism mode  [dev benchmark]:",
             [
-                "Parallel  (auto workers)",
                 "Sequential  (single process)",
+                "Parallel  (auto workers)",
             ],
             default_idx=0,
         )
     except Exception:  # noqa: BLE001
-        return engine, -1
+        return engine, 0
 
-    dev_workers = 0 if parallelism_idx == 1 else -1
+    dev_workers = 0 if parallelism_idx == 0 else -1
     return engine, dev_workers
 
 
@@ -12111,6 +12513,7 @@ def _compute_bh_attack_paths(
     max_depth: int,
     max_paths: int | None = None,
     target: str = "highvalue",
+    allow_owned_terminal_target: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Compute attack paths using the BloodHound Cypher engine.
 
@@ -12270,7 +12673,7 @@ def _compute_bh_attack_paths(
         # ALL(n IN nodes(p) WHERE single(m IN nodes(p) WHERE id(m) = id(n)))
         # single() avoids the nested list comprehension scoping issue that caused
         # "Variable `x` not defined" with the original predicate on Neo4j 4.4.
-        print_attack_paths_summary_debug(
+        _maybe_print_attack_paths_summary_debug(
             domain,
             display_records,
             stage_label="1/6 · raw BH (acyclic filter in Cypher)",
@@ -12280,7 +12683,12 @@ def _compute_bh_attack_paths(
         # BH CE has no terminal-MemberOf trim stage (handled in Cypher WHERE), so
         # terminals are already final.  Filter here — before minimize — to reduce
         # work for all subsequent stages.
-        if scope_norm in {"owned", "principals"} and _is_multi and principals:
+        if (
+            scope_norm in {"owned", "principals"}
+            and _is_multi
+            and principals
+            and not allow_owned_terminal_target
+        ):
             _bh_owned_labels = frozenset(_normalize_account(p) for p in principals)
             _bh_owned_removed = 0
             _bh_owned_kept: list[dict[str, Any]] = []
@@ -12333,7 +12741,7 @@ def _compute_bh_attack_paths(
             print_info_debug(
                 f"[bh-pipeline] minimize: {n_before_min} → {len(display_records)}, {n_minimized} record(s) modified"
             )
-        print_attack_paths_summary_debug(
+        _maybe_print_attack_paths_summary_debug(
             domain,
             display_records,
             stage_label=f"2/5 · after minimize (scope={scope_norm}, {n_minimized} record(s) modified)",
@@ -12364,7 +12772,7 @@ def _compute_bh_attack_paths(
             print_info_debug(
                 f"[bh-pipeline] dedup: removed {n_dedup_removed} duplicate(s) → {len(deduped)} remain"
             )
-        print_attack_paths_summary_debug(
+        _maybe_print_attack_paths_summary_debug(
             domain,
             deduped,
             stage_label=f"3/5 · after dedup [{scope_norm}] ({n_dedup_removed} removed)",
@@ -12377,7 +12785,7 @@ def _compute_bh_attack_paths(
             snapshot=snapshot,
             filter_empty=True,
         )
-        print_attack_paths_summary_debug(
+        _maybe_print_attack_paths_summary_debug(
             domain,
             annotated,
             stage_label=f"4/5 · after annotate_affected_users [{scope_norm}]",
@@ -12405,7 +12813,7 @@ def _compute_bh_attack_paths(
                 )
             else:
                 result = annotated
-            print_attack_paths_summary_debug(
+            _maybe_print_attack_paths_summary_debug(
                 domain,
                 result,
                 stage_label=f"5/5 · after contained filter [hv-aware, {scope_norm}] ({n_contained if n_contained else 0} removed)",
@@ -12422,7 +12830,7 @@ def _compute_bh_attack_paths(
                 )
             else:
                 result = annotated
-            print_attack_paths_summary_debug(
+            _maybe_print_attack_paths_summary_debug(
                 domain,
                 result,
                 stage_label=f"5/5 · after contained filter [keep_longest, domain] ({n_contained if n_contained else 0} removed)",
@@ -12480,8 +12888,12 @@ def get_attack_path_summaries(
     max_paths: int | None = None,
     target: str = "highvalue",
     target_mode: str = "tier0",
+    summary_filters: AttackPathSummaryFilters | None = None,
     membership_sample_max: int = 3,
     no_cache: bool = False,
+    engine_override: str | None = None,
+    dev_workers_override: int | None = None,
+    render_debug_tables: bool = True,
 ) -> list[dict[str, Any]]:
     """Return user-facing attack-path summaries through the shell-aware layer.
 
@@ -12497,9 +12909,17 @@ def get_attack_path_summaries(
     scope_norm = str(scope or "domain").strip().lower()
 
     # In dev mode an interactive selector lets engineers compare all three engines
-    # and choose sequential vs parallel execution.  In production always returns
-    # ("local", -1) without prompting.
-    _engine, _dev_workers = _ask_or_get_attack_path_engine(shell)
+    # and choose sequential vs parallel execution. Callers that need a silent
+    # internal computation path can bypass prompts with explicit overrides.
+    if engine_override is None:
+        _engine, _dev_workers = _ask_or_get_attack_path_engine(shell)
+    else:
+        _engine = str(engine_override or "local").strip().lower() or "local"
+        _dev_workers = (
+            int(dev_workers_override)
+            if isinstance(dev_workers_override, int)
+            else -1
+        )
 
     # Temporarily override the worker count for this computation when a dev
     # override was selected (dev mode only — in production _dev_workers == -1
@@ -12510,23 +12930,96 @@ def get_attack_path_summaries(
     attack_paths_core._PRINCIPAL_WORKERS = _dev_workers  # noqa: SLF001
 
     try:
-        return _compute_attack_path_summaries_inner(
-            shell,
-            domain,
-            scope_norm=scope_norm,
-            engine=_engine,
-            username=username,
-            principals=principals,
-            max_depth=max_depth,
-            max_paths=max_paths,
-            target=target,
-            target_mode=target_mode,
-            membership_sample_max=membership_sample_max,
-            no_cache=no_cache,
-        )
+        with _attack_path_debug_summary_tables(render_debug_tables):
+            return _compute_attack_path_summaries_inner(
+                shell,
+                domain,
+                scope_norm=scope_norm,
+                engine=_engine,
+                username=username,
+                principals=principals,
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                summary_filters=summary_filters,
+                membership_sample_max=membership_sample_max,
+                no_cache=no_cache,
+            )
     finally:
         attack_graph_core._ATTACK_PATH_WORKERS = _prev_graph_workers  # noqa: SLF001
         attack_paths_core._PRINCIPAL_WORKERS = _prev_principal_workers  # noqa: SLF001
+
+
+def get_owned_attack_path_summaries_to_target(
+    shell: object,
+    domain: str,
+    *,
+    target_label: str,
+    terminal_relations: Iterable[str] | None = None,
+    max_depth: int,
+    max_paths: int | None = None,
+    target_mode: str = "tier0",
+    membership_sample_max: int = 3,
+    no_cache: bool = False,
+    engine_override: str | None = None,
+    dev_workers_override: int | None = None,
+    render_debug_tables: bool = True,
+) -> list[dict[str, Any]]:
+    """Return owned-scope attack-path summaries narrowed to a specific target.
+
+    This helper exists for follow-up workflows that need the standard attack-path
+    computation, but only for one concrete target object and optionally only when
+    the final executable step matches one of a known set of relations.
+
+    Args:
+        shell: Active shell/session object.
+        domain: Domain whose attack graph should be queried.
+        target_label: Concrete summary target label to retain.
+        terminal_relations: Optional final-step relation keys to retain.
+        max_depth: Max graph depth for the underlying computation.
+        max_paths: Optional path cap.
+        target_mode: Existing attack-path target mode.
+        membership_sample_max: Existing sample setting forwarded to summaries.
+        no_cache: When True, bypass cached summary results.
+        engine_override: Optional internal engine override to avoid interactive
+            engine selection for programmatic prerequisite checks.
+        dev_workers_override: Optional worker override paired with
+            ``engine_override``.
+        render_debug_tables: Whether to render debug attack-path tables during
+            the underlying computation.
+
+    Returns:
+        Filtered list of summary dicts matching the requested target and, when
+        provided, one of the requested terminal relations.
+    """
+    relation_filters = tuple(
+        sorted(
+            {
+                str(relation or "").strip().lower()
+                for relation in (terminal_relations or ())
+                if str(relation or "").strip()
+            }
+        )
+    )
+    return get_attack_path_summaries(
+        shell,
+        domain,
+        scope="owned",
+        max_depth=max_depth,
+        max_paths=max_paths,
+        target="all",
+        target_mode=target_mode,
+        summary_filters=AttackPathSummaryFilters(
+            target_labels=(target_label,),
+            terminal_relations=relation_filters,
+        ),
+        membership_sample_max=membership_sample_max,
+        no_cache=no_cache,
+        engine_override=engine_override,
+        dev_workers_override=dev_workers_override,
+        render_debug_tables=render_debug_tables,
+    )
 
 
 def _compute_attack_path_summaries_inner(
@@ -12541,10 +13034,15 @@ def _compute_attack_path_summaries_inner(
     max_paths: int | None,
     target: str,
     target_mode: str,
+    summary_filters: AttackPathSummaryFilters | None,
     membership_sample_max: int,
     no_cache: bool,
 ) -> list[dict[str, Any]]:
     """Inner implementation of compute_attack_path_summaries, engine-dispatched."""
+    allow_owned_terminal_target = bool(
+        isinstance(summary_filters, AttackPathSummaryFilters)
+        and summary_filters.target_labels
+    )
     if engine == "bloodhound":
         bh_result = _compute_bh_attack_paths(
             shell,
@@ -12555,12 +13053,17 @@ def _compute_attack_path_summaries_inner(
             max_depth=max_depth,
             max_paths=max_paths,
             target=target,
+            allow_owned_terminal_target=allow_owned_terminal_target,
         )
         if bh_result is not None:
-            return bh_result
+            return _apply_attack_path_summary_filters(
+                bh_result,
+                filters=summary_filters,
+            )
 
     if engine == "rustworkx":
-        return _compute_rustworkx_display_paths(
+        return _apply_attack_path_summary_filters(
+            _compute_rustworkx_display_paths(
             shell,
             domain,
             scope=scope_norm,
@@ -12571,6 +13074,8 @@ def _compute_attack_path_summaries_inner(
             target=target,
             target_mode=target_mode,
             membership_sample_max=membership_sample_max,
+        ),
+            filters=summary_filters,
         )
 
     _local_t0 = time.perf_counter()
@@ -12584,6 +13089,7 @@ def _compute_attack_path_summaries_inner(
             target=target,
             target_mode=target_mode,
             no_cache=no_cache,
+            allow_owned_terminal_target=allow_owned_terminal_target,
         )
     elif scope_norm == "user":
         if not str(username or "").strip():
@@ -12597,6 +13103,7 @@ def _compute_attack_path_summaries_inner(
             target=target,
             target_mode=target_mode,
             no_cache=no_cache,
+            allow_owned_terminal_target=allow_owned_terminal_target,
         )
     elif scope_norm == "owned":
         local_result = compute_display_paths_for_owned_users(
@@ -12607,6 +13114,7 @@ def _compute_attack_path_summaries_inner(
             target=target,
             target_mode=target_mode,
             no_cache=no_cache,
+            allow_owned_terminal_target=allow_owned_terminal_target,
         )
     elif scope_norm == "principals":
         normalized_principals = [
@@ -12626,13 +13134,17 @@ def _compute_attack_path_summaries_inner(
             membership_sample_max=membership_sample_max,
             target_mode=target_mode,
             no_cache=no_cache,
+            allow_owned_terminal_target=allow_owned_terminal_target,
         )
     else:
         raise ValueError(f"Unsupported attack path summary scope: {scope_norm!r}")
     print_info_debug(
         f"[engine=local-dfs] {len(local_result)} path(s) in {time.perf_counter() - _local_t0:.2f}s"
     )
-    return local_result
+    return _apply_attack_path_summary_filters(
+        local_result,
+        filters=summary_filters,
+    )
 
 
 def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
@@ -12733,6 +13245,7 @@ def compute_display_paths_for_principals(
     membership_sample_max: int = 3,
     target_mode: str = "tier0",
     no_cache: bool = False,
+    allow_owned_terminal_target: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal dynamic paths for a list of user principals.
 
@@ -12938,6 +13451,7 @@ def compute_display_paths_for_principals(
         snapshot=snapshot,
         principal_count=len(unique_principals),
         owned_labels=frozenset(_normalize_account(p) for p in unique_principals),
+        allow_owned_terminal_target=allow_owned_terminal_target,
     )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(

@@ -113,7 +113,14 @@ def domain_has_adcs_for_attack_steps(shell: object, domain: str) -> bool:
     detect_adcs = getattr(shell, "_detect_adcs", None)
     if callable(detect_adcs):
         try:
-            return bool(detect_adcs(domain, silent=True, emit_telemetry=False))
+            return bool(
+                detect_adcs(
+                    domain,
+                    silent=True,
+                    emit_telemetry=False,
+                    source_context="attack_path_filter",
+                )
+            )
         except TypeError:
             return bool(detect_adcs(domain))
         except Exception as exc:  # pragma: no cover

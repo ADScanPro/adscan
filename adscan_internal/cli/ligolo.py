@@ -21,6 +21,15 @@ from adscan_internal.services.ligolo_service import (
     DEFAULT_LIGOLO_PROXY_API_ADDR,
     LigoloProxyService,
 )
+from adscan_internal.services.pivot_runtime_state_service import (
+    reconcile_domain_pivot_runtime_state,
+    reconcile_workspace_pivot_runtime_state,
+)
+from adscan_internal.services.pivot_relaunch_service import (
+    assess_persisted_tunnel_relaunchability,
+    list_relaunch_candidates,
+    relaunch_persisted_pivot,
+)
 
 
 class LigoloShell(Protocol):
@@ -69,9 +78,22 @@ def _print_tunnel_table(shell: LigoloShell, records: list[dict[str, Any]]) -> No
     if not records:
         print_info("No Ligolo tunnels are persisted for this workspace.")
         return
+    ordered_records = []
+    for record in records:
+        relaunch = assess_persisted_tunnel_relaunchability(shell, record=record)
+        ordered_records.append((record, relaunch))
+    relaunch_rank = {"Yes": 0, "Blocked": 1, "No": 2}
+    ordered_records.sort(
+        key=lambda item: (
+            relaunch_rank.get(item[1].status_label, 99),
+            str(item[0].get("domain") or "").strip().lower(),
+            str(item[0].get("pivot_host") or "").strip().lower(),
+            str(item[0].get("tunnel_id") or "").strip().lower(),
+        )
+    )
     console = getattr(shell, "console", None)
     if console is None:
-        for record in records:
+        for record, relaunch in ordered_records:
             print_info(
                 " | ".join(
                     [
@@ -79,6 +101,8 @@ def _print_tunnel_table(shell: LigoloShell, records: list[dict[str, Any]]) -> No
                         f"status={record.get('status')}",
                         f"pivot={record.get('pivot_host')}",
                         f"interface={record.get('interface_name')}",
+                        f"relaunch={relaunch.status_label}",
+                        f"reason={relaunch.reason}",
                     ]
                 )
             )
@@ -90,7 +114,9 @@ def _print_tunnel_table(shell: LigoloShell, records: list[dict[str, Any]]) -> No
     table.add_column("Interface")
     table.add_column("Routes")
     table.add_column("Target Preview")
-    for record in records[:20]:
+    table.add_column("Relaunch")
+    table.add_column("Why")
+    for record, relaunch in ordered_records[:20]:
         targets = record.get("confirmed_targets") or []
         preview_hosts = []
         for target in targets[:3]:
@@ -106,6 +132,8 @@ def _print_tunnel_table(shell: LigoloShell, records: list[dict[str, Any]]) -> No
             mark_sensitive(str(record.get("interface_name") or "unknown"), "text"),
             ", ".join(mark_sensitive(str(route), "text") for route in (record.get("routes") or [])[:3]) or "-",
             ", ".join(mark_sensitive(host, "hostname") for host in preview_hosts) or "-",
+            mark_sensitive(relaunch.status_label, "text"),
+            mark_sensitive(relaunch.reason, "detail"),
         )
     console.print(table)
 
@@ -165,10 +193,17 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                     "Status": record.get("status", "unknown"),
                     "Pivot Host": record.get("pivot_host", "unknown"),
                     "Interface": record.get("interface_name", "unknown"),
+                    "Relaunch": assess_persisted_tunnel_relaunchability(shell, record=record).status_label,
                 },
                 icon="🧭",
             )
             _print_tunnel_table(shell, [record])
+            relaunch = assess_persisted_tunnel_relaunchability(shell, record=record)
+            print_info(
+                "Relaunch viability: "
+                f"{mark_sensitive(relaunch.status_label, 'text')} "
+                f"({mark_sensitive(relaunch.reason, 'detail')})"
+            )
             print_info_debug("[ligolo] Tunnel payload: " + str(mark_sensitive(str(record), "json")))
             return
         if action == "stop":
@@ -187,9 +222,53 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                 "Ligolo tunnel stopped. "
                 f"Tunnel ID={mark_sensitive(str(record.get('tunnel_id') or tunnel_id), 'text')}"
             )
+            current_domain = str(record.get("domain") or getattr(shell, "current_domain", "")).strip()
+            if current_domain:
+                try:
+                    reconcile_domain_pivot_runtime_state(
+                        shell,
+                        workspace_dir=workspace_dir,
+                        domain=current_domain,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_info_debug(
+                        f"[ligolo] Failed to reconcile workspace state after tunnel stop: {exc}"
+                    )
+            return
+        if action == "relaunch":
+            tunnel_id = argv[2] if len(argv) > 2 else ""
+            candidates = list_relaunch_candidates(
+                shell,
+                domain_filter=getattr(shell, "current_domain", None),
+            )
+            if tunnel_id:
+                candidates = [
+                    item for item in candidates if item.tunnel_id == str(tunnel_id).strip()
+                ]
+            if not candidates:
+                print_info("No relaunchable Ligolo pivots are available for this workspace.")
+                return
+            candidate = candidates[0]
+            if len(candidates) > 1 and not tunnel_id and hasattr(shell, "_questionary_select"):
+                labels = [
+                    f"{item.tunnel_id} | {item.domain} | {item.source_service.upper()} | "
+                    f"{item.pivot_username} -> {item.pivot_host}"
+                    for item in candidates
+                ]
+                selected_idx = shell._questionary_select(  # type: ignore[attr-defined]
+                    "Select a previous pivot to relaunch:",
+                    labels,
+                )
+                if selected_idx is None:
+                    print_info("Skipping pivot relaunch by user choice.")
+                    return
+                candidate = candidates[int(selected_idx)]
+            if not relaunch_persisted_pivot(shell, candidate=candidate):
+                print_error("Failed to relaunch the selected previous pivot.")
             return
         print_error(f"Unknown ligolo tunnel action '{action}'.")
-        print_instruction("Use: ligolo tunnel <list|status|stop>")
+        print_instruction("Use: ligolo tunnel <list|status|stop|relaunch>")
         return
 
     if command != "proxy":
@@ -257,6 +336,16 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
             "Ligolo-ng proxy stopped. "
             f"Previous PID={mark_sensitive(str(state.get('pid', 'unknown')), 'pid')}"
         )
+        try:
+            reconcile_workspace_pivot_runtime_state(
+                shell,
+                workspace_dir=workspace_dir,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[ligolo] Failed to reconcile workspace state after proxy stop: {exc}"
+            )
         return
 
     if action == "status":

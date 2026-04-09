@@ -22,6 +22,7 @@ from adscan_internal.rich_output import (
     print_warning,
 )
 from adscan_internal.integrations.coercer import CoercerRunner, looks_like_ntlm_hash
+from adscan_internal.subprocess_env import get_clean_env_for_compilation
 from adscan_internal.services.ntlm_capture_workflow import (
     NtlmCaptureProbeResult,
     ResponderListener,
@@ -30,6 +31,7 @@ from adscan_internal.services.ntlm_capture_workflow import (
 from adscan_internal.services.current_vantage_reachability_service import (
     resolve_targets_from_current_vantage,
 )
+from adscan_internal.reporting_compat import load_optional_report_service_attr
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.workspaces.computers import count_target_file_entries
 
@@ -287,6 +289,162 @@ def _prepare_ntlm_probe(shell: NtlmCaptureShell, domain: str) -> PreparedNtlmPro
     return prepared
 
 
+def _build_coercer_kerberos_env() -> dict[str, str]:
+    """Return a clean external-tool env preserving the current Kerberos context."""
+
+    env = get_clean_env_for_compilation()
+    for variable in (
+        "KRB5_CONFIG",
+        "KRB5CCNAME",
+        "KRB5_CLIENT_KTNAME",
+        "KRB5_TRACE",
+    ):
+        value = os.environ.get(variable)
+        if value:
+            env[variable] = value
+    return env
+
+
+def _should_attempt_smb_fallback(result: NtlmCaptureProbeResult) -> bool:
+    """Return whether a failed Kerberos attempt should retry via SMB."""
+
+    if result.success:
+        return False
+    if result.reason in {
+        "listener_start_failed",
+        "listener_exited_early",
+        "listener_exited_during_capture",
+    }:
+        return False
+    return True
+
+
+def _merge_probe_attempts(
+    primary: NtlmCaptureProbeResult, fallback: NtlmCaptureProbeResult
+) -> NtlmCaptureProbeResult:
+    """Return a final probe result that preserves both attempted auth modes."""
+
+    attempted_modes = primary.attempted_trigger_auth_modes + tuple(
+        mode
+        for mode in fallback.attempted_trigger_auth_modes
+        if mode not in primary.attempted_trigger_auth_modes
+    )
+    return NtlmCaptureProbeResult(
+        success=fallback.success,
+        auth_type=fallback.auth_type,
+        observation=fallback.observation,
+        reason=fallback.reason,
+        trigger_command=fallback.trigger_command,
+        trigger_auth_mode=fallback.trigger_auth_mode,
+        attempted_trigger_auth_modes=attempted_modes,
+        trigger_returncode=fallback.trigger_returncode,
+        trigger_stdout=fallback.trigger_stdout,
+        trigger_stderr=fallback.trigger_stderr,
+        trigger_error_kind=fallback.trigger_error_kind,
+        trigger_error_detail=fallback.trigger_error_detail,
+        listener_returncode=fallback.listener_returncode,
+        listener_expected_stop=fallback.listener_expected_stop,
+    )
+
+
+def _render_failed_ntlm_capture_probe(result: NtlmCaptureProbeResult) -> None:
+    """Render a precise user-facing explanation for a failed NTLM capture probe."""
+
+    attempted_modes = tuple(result.attempted_trigger_auth_modes)
+    attempted_kerberos = "kerberos" in attempted_modes
+    used_smb_fallback = result.trigger_auth_mode == "smb" and attempted_kerberos
+    trigger_output = f"{result.trigger_stdout or ''}\n{result.trigger_stderr or ''}".lower()
+
+    if result.reason == "listener_exited_during_capture":
+        print_warning(
+            "Responder stopped before the capture window completed, so the NTLM probe "
+            "result is inconclusive."
+        )
+        return
+
+    if result.trigger_returncode not in (None, 0):
+        if attempted_kerberos and not used_smb_fallback:
+            print_warning(
+                "The Kerberos-authenticated Coercer trigger failed before the PDC "
+                "could authenticate back to the listener."
+            )
+            print_instruction(
+                "This usually means the local Coercer build rejected the Kerberos path "
+                "or the target would not accept that trigger over Kerberos."
+            )
+            return
+        if used_smb_fallback:
+            print_warning(
+                "Kerberos did not yield a usable callback and the SMB fallback trigger "
+                "also failed before the PDC authenticated back."
+            )
+            if "status_not_supported" in trigger_output:
+                print_instruction(
+                    "The SMB fallback reported STATUS_NOT_SUPPORTED. Treat this as a "
+                    "strong sign that NTLM/SMB auth is disabled or restricted on the target."
+                )
+            return
+
+        print_warning(
+            f"Coercer returned code {result.trigger_returncode} and no capture was observed."
+        )
+        return
+
+    if attempted_kerberos and not used_smb_fallback:
+        print_warning(
+            "The Kerberos-authenticated trigger ran, but no NTLM callback from the PDC "
+            "reached the listener."
+        )
+        print_instruction(
+            "If Responder showed hashes from other hosts during this window, treat those "
+            "as ambient network noise rather than proof of PDC NTLM behavior."
+        )
+        return
+
+    if used_smb_fallback:
+        print_warning(
+            "Kerberos did not produce a usable callback, and the SMB fallback also observed "
+            "no NTLM authentication from the PDC."
+        )
+        print_instruction(
+            "If other hosts authenticated to Responder during this window, do not attribute "
+            "those captures to the PDC unless the captured username matches the PDC computer account."
+        )
+        return
+
+    print_warning("No NTLM authentication capture was observed from the PDC.")
+
+
+def _render_no_capture_next_steps(result: NtlmCaptureProbeResult) -> None:
+    """Render actionable next steps for no-capture outcomes."""
+
+    attempted_kerberos = "kerberos" in result.attempted_trigger_auth_modes
+    used_smb_fallback = result.trigger_auth_mode == "smb" and attempted_kerberos
+    trigger_output = f"{result.trigger_stdout or ''}\n{result.trigger_stderr or ''}".lower()
+
+    if result.reason != "capture_not_observed":
+        return
+
+    if attempted_kerberos and not used_smb_fallback:
+        print_instruction(
+            "Try again after confirming a valid Kerberos ticket is loaded for this user, "
+            "or rerun with a known-working Coercer method via --method=<name>."
+        )
+        return
+
+    if used_smb_fallback and "status_not_supported" in trigger_output:
+        print_instruction(
+            "Kerberos was attempted first, then SMB fallback hit STATUS_NOT_SUPPORTED. "
+            "This environment likely blocks NTLM/SMB auth for the trigger path."
+        )
+        return
+
+    print_instruction(
+        "Try again after confirming LLMNR/NBT-NS/SMB reachability to the listener, or filter "
+        "Coercer to a known-working method with --method=<name>."
+    )
+
+
 def _persist_ntlm_probe_result(
     shell: NtlmCaptureShell,
     *,
@@ -315,6 +473,8 @@ def _persist_ntlm_probe_result(
         "listener_returncode": result.listener_returncode if result else None,
         "listener_expected_stop": result.listener_expected_stop if result else None,
         "trigger_returncode": result.trigger_returncode if result else None,
+        "trigger_auth_mode": result.trigger_auth_mode if result else None,
+        "attempted_trigger_auth_modes": list(result.attempted_trigger_auth_modes) if result else [],
         "trigger_error_kind": result.trigger_error_kind if result else None,
         "trigger_error_detail": result.trigger_error_detail if result else None,
         "reachable_ip_count": reachable_ip_count,
@@ -327,6 +487,47 @@ def _persist_ntlm_probe_result(
 
     domain_state["dc_ntlm_auth_type"] = auth_type
     domain_state["dc_ntlm_auth_probe"] = probe_state
+
+    if auth_type in {"NTLMv1", "NTLMv2"}:
+        record_technical_finding = load_optional_report_service_attr(
+            "record_technical_finding",
+            action="Technical finding sync",
+            debug_printer=print_info_debug,
+            prefix="[ntlm-capture]",
+        )
+        if callable(record_technical_finding):
+            try:
+                finding_details = {
+                    "observed_auth_type": auth_type,
+                    "probe_status": status,
+                    "probe_reason": reason,
+                    "checked_at": checked_at,
+                    "source": "coerced_pdc_capture",
+                    "captured_user": probe_state.get("captured_user"),
+                    "trigger_auth_mode": probe_state.get("trigger_auth_mode"),
+                    "attempted_trigger_auth_modes": ",".join(
+                        probe_state.get("attempted_trigger_auth_modes") or []
+                    ),
+                    "trigger_error_kind": probe_state.get("trigger_error_kind"),
+                    "trigger_error_detail": probe_state.get("trigger_error_detail"),
+                    "trigger_returncode": probe_state.get("trigger_returncode"),
+                    "listener_returncode": probe_state.get("listener_returncode"),
+                    "reachable_ip_count": reachable_ip_count,
+                    "method_filter": method_filter,
+                    "workspace_type": probe_state.get("workspace_type"),
+                }
+                record_technical_finding(
+                    shell,
+                    domain,
+                    key="ntlmv1_enabled",
+                    value=(auth_type == "NTLMv1"),
+                    details=finding_details,
+                )
+            except Exception as exc:  # pragma: no cover - best effort sync
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[ntlm-capture] Failed to persist NTLM auth-type finding: {exc}"
+                )
 
     if hasattr(shell, "save_workspace_data"):
         try:
@@ -380,7 +581,7 @@ def _execute_ntlm_capture_probe(
 
     expected_user = f"{prepared.pdc_hostname}$"
     try:
-        result = run_ntlm_capture_probe(
+        kerberos_result = run_ntlm_capture_probe(
             listener=listener,
             trigger=trigger,
             target=prepared.pdc_ip,
@@ -391,9 +592,33 @@ def _execute_ntlm_capture_probe(
             expected_usernames=[expected_user],
             capture_timeout_seconds=capture_timeout,
             trigger_timeout_seconds=trigger_timeout,
+            trigger_auth_mode="kerberos",
+            trigger_env=_build_coercer_kerberos_env(),
             dc_ip=prepared.pdc_ip,
             method_filter=method_filter,
         )
+        result = kerberos_result
+        if _should_attempt_smb_fallback(kerberos_result):
+            print_info(
+                "Kerberos-authenticated Coercer trigger did not produce a usable capture. "
+                "Retrying with SMB fallback."
+            )
+            smb_result = run_ntlm_capture_probe(
+                listener=listener,
+                trigger=trigger,
+                target=prepared.pdc_ip,
+                listener_ip=shell.myip,
+                username=prepared.username,
+                secret=prepared.secret,
+                domain=domain,
+                expected_usernames=[expected_user],
+                capture_timeout_seconds=capture_timeout,
+                trigger_timeout_seconds=trigger_timeout,
+                trigger_auth_mode="smb",
+                dc_ip=prepared.pdc_ip,
+                method_filter=method_filter,
+            )
+            result = _merge_probe_attempts(kerberos_result, smb_result)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error("Error running NTLM capture probe.")
@@ -432,6 +657,11 @@ def _execute_ntlm_capture_probe(
         print_info_debug(
             "[ntlm-capture] trigger command: " + " ".join(map(str, redacted_command))
         )
+    print_info_debug(
+        "[ntlm-capture] trigger auth mode: "
+        f"{result.trigger_auth_mode or 'unknown'} "
+        f"(attempted={','.join(result.attempted_trigger_auth_modes) or 'none'})"
+    )
     print_info_debug(
         f"[ntlm-capture] coercer returncode: {result.trigger_returncode!r}"
     )
@@ -570,31 +800,19 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
 
     if result.success and result.observation:
         marked_user = mark_sensitive(result.observation.raw_user, "user")
+        success_suffix = ""
+        if result.trigger_auth_mode == "smb" and "kerberos" in result.attempted_trigger_auth_modes:
+            success_suffix = " after SMB fallback"
         print_success(
-            f"Captured {result.auth_type} authentication from {marked_user} via PDC coercion."
+            f"Captured {result.auth_type} authentication from {marked_user} via PDC coercion{success_suffix}."
         )
         print_instruction(
             f"Result: the Domain Controller is authenticating back using {result.auth_type}."
         )
         return True
 
-    if result.reason == "listener_exited_during_capture":
-        print_warning(
-            "Responder stopped before the capture window completed, so the NTLM probe "
-            "result is inconclusive."
-        )
-    elif result.trigger_returncode not in (None, 0):
-        print_warning(
-            f"Coercer returned code {result.trigger_returncode} and no capture was observed."
-        )
-    else:
-        print_warning("No NTLM authentication capture was observed from the PDC.")
-
-    if result.reason == "capture_not_observed":
-        print_instruction(
-            "Try again after confirming LLMNR/NBT-NS/SMB reachability to the listener, or filter "
-            "Coercer to a known-working method with --method=<name>."
-        )
+    _render_failed_ntlm_capture_probe(result)
+    _render_no_capture_next_steps(result)
     return False
 
 
@@ -621,31 +839,19 @@ def run_check_dc_ntlm_auth_type(shell: NtlmCaptureShell, args: str) -> None:
 
     if result.success and result.observation:
         marked_user = mark_sensitive(result.observation.raw_user, "user")
+        success_suffix = ""
+        if result.trigger_auth_mode == "smb" and "kerberos" in result.attempted_trigger_auth_modes:
+            success_suffix = " after SMB fallback"
         print_success(
-            f"Captured {result.auth_type} authentication from {marked_user} via PDC coercion."
+            f"Captured {result.auth_type} authentication from {marked_user} via PDC coercion{success_suffix}."
         )
         print_instruction(
             f"Result: the Domain Controller is authenticating back using {result.auth_type}."
         )
         return
 
-    if result.reason == "listener_exited_during_capture":
-        print_warning(
-            "Responder stopped before the capture window completed, so the NTLM probe "
-            "result is inconclusive."
-        )
-    elif result.trigger_returncode not in (None, 0):
-        print_warning(
-            f"Coercer returned code {result.trigger_returncode} and no capture was observed."
-        )
-    else:
-        print_warning("No NTLM authentication capture was observed from the PDC.")
-
-    if result.reason == "capture_not_observed":
-        print_instruction(
-            "Try again after confirming LLMNR/NBT-NS/SMB reachability to the listener, or filter "
-            "Coercer to a known-working method with --method=<name>."
-        )
+    _render_failed_ntlm_capture_probe(result)
+    _render_no_capture_next_steps(result)
 
 
 __all__ = [

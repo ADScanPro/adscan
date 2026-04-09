@@ -20,6 +20,7 @@ from typing import List, Optional
 _KERBEROAST_HASH_RE = re.compile(r"\$krb5tgs\$23\$\*([^\$]*)\$", re.MULTILINE)
 _ASREP_HASH_RE = re.compile(r"\$krb5asrep\$23\$([^@]+)@", re.MULTILINE)
 _NTLM_HASH_RE = re.compile(r"([a-fA-F0-9]{32})", re.MULTILINE)
+_USERNAME_ONLY_RE = re.compile(r"^[A-Za-z0-9_.\-]+\$?$")
 
 
 @dataclass(frozen=True)
@@ -100,9 +101,16 @@ def parse_kerberoast_output(output: str) -> List[KerberoastHash]:
         for line in lines:
             line = line.strip()
             if line and not line.startswith("#") and line != "Name":
-                # Could be just a username
-                if "$" not in line and "@" not in line:
-                    # This is likely a username-only output
+                # Only accept bare username-style tokens. This prevents Impacket
+                # banners, LDAP/NTLM errors, and other prose from being treated as
+                # roastable users in downstream flows.
+                if (
+                    "$" not in line
+                    and "@" not in line
+                    and ":" not in line
+                    and " " not in line
+                    and _USERNAME_ONLY_RE.match(line)
+                ):
                     hashes.append(
                         KerberoastHash(username=line, hash_value="", spn=None)
                     )

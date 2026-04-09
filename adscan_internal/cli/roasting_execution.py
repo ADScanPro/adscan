@@ -182,6 +182,19 @@ def _ensure_cracking_dir(shell: Any, domain: str) -> tuple[str, str]:
     return rel, abs_path
 
 
+def _resolve_workspace_dir(shell: Any) -> str:
+    """Return the active workspace directory for roasting helpers.
+
+    Some unit-test shells only expose `_get_workspace_cwd()` and do not define
+    `current_workspace_dir`. Runtime shells usually expose both. This helper
+    keeps the Impacket context tolerant to either shape.
+    """
+    workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
+    if workspace_dir:
+        return workspace_dir
+    return str(shell._get_workspace_cwd())
+
+
 def _normalize_hashes_file_for_hashcat(
     *,
     hashes_file_abs: str,
@@ -220,30 +233,66 @@ def _normalize_hashes_file_for_hashcat(
         # with "<user>:$krb5".
         return bool(re.match(r"^[^:]+:\$krb5", line or ""))
 
+    def _extract_hash_payload() -> str | None:
+        """Extract the first roast hash payload from a noisy/raw file.
+
+        The upstream tools can emit any of these forms:
+        - `$krb5...` on its own line
+        - `user:$krb5...` already ready for `hashcat --username`
+        - a wrapped hash split across multiple lines
+        - auxiliary diagnostic/header lines mixed into the file
+        """
+
+        # Find the first logical line that contains a roast marker and then join
+        # from there forward. This preserves split hashes without dragging in
+        # preamble lines written by upstream tools.
+        for index, line in enumerate(lines):
+            if "$krb5" not in line:
+                continue
+
+            candidate = "".join(lines[index:]).strip()
+            if _is_username_prefixed_hash(line):
+                return candidate
+
+            hash_start = candidate.find("$krb5")
+            if hash_start >= 0:
+                return candidate[hash_start:].strip() or None
+
+        return None
+
     # If already in `<user>:$krb5...` form *and* single-line, keep it as-is.
     # Some tools can emit `user:<hash>` but still wrap the hash across multiple
     # lines; in that case we still need to normalize for hashcat.
     first = lines[0]
     if len(lines) == 1 and _is_username_prefixed_hash(first):
+        print_info_debug(
+            "[roasting-exec] hash file already normalized for hashcat: "
+            f"file={mark_sensitive(hashes_file_abs, 'path')}"
+        )
         return hashes_file_abs
 
-    # If the hash is split across multiple lines, join them into one.
-    # We intentionally remove all whitespace/newlines.
-    joined = "".join(lines)
+    extracted = _extract_hash_payload()
+    if not extracted:
+        print_info_debug(
+            "[roasting-exec] unable to find a Kerberos roast hash marker in file: "
+            f"file={mark_sensitive(hashes_file_abs, 'path')} lines={len(lines)}"
+        )
+        return hashes_file_abs
 
-    # If the joined content includes multiple hashes, keep the first one.
-    # This is a best-effort safety net; the per-user flows should produce 1 hash.
-    if joined.count("$krb5") > 1:
-        # Split on next hash marker and keep the first chunk.
-        parts = joined.split("$krb5", 1)
-        joined = parts[0] + "$krb5" + parts[1]
-
-    normalized_line = f"{target_user}:{joined}"
+    normalized_line = (
+        extracted if _is_username_prefixed_hash(extracted) else f"{target_user}:{extracted}"
+    )
     normalized_path = f"{hashes_file_abs}.hashcat"
     try:
         Path(normalized_path).write_text(normalized_line + "\n", encoding="utf-8")
     except OSError:
         return hashes_file_abs
+    print_info_debug(
+        "[roasting-exec] normalized Kerberos roast hash file for hashcat: "
+        f"source={mark_sensitive(hashes_file_abs, 'path')} "
+        f"target={mark_sensitive(normalized_path, 'path')} "
+        f"input_lines={len(lines)} already_prefixed={_is_username_prefixed_hash(extracted)}"
+    )
     return normalized_path
 
 
@@ -299,6 +348,8 @@ def run_kerberoast_for_user(
         impacket_scripts_dir=shell.impacket_scripts_dir,
         validate_script_exists=lambda p: os.path.isfile(p) and os.access(p, os.X_OK),
         get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
+        workspace_dir=_resolve_workspace_dir(shell),
+        domains_data=shell.domains_data,
     )
     impacket_runner = ImpacketRunner(command_runner=shell.command_runner)
     enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())
@@ -330,6 +381,12 @@ def run_kerberoast_for_user(
     hashes_file_for_cracking = _normalize_hashes_file_for_hashcat(
         hashes_file_abs=hashes_file_abs,
         target_user=target_user,
+    )
+    print_info_debug(
+        "[roasting-exec] Kerberoast cracking input prepared: "
+        f"user={mark_sensitive(target_user, 'user')} "
+        f"raw_file={mark_sensitive(hashes_file_abs, 'path')} "
+        f"cracking_file={mark_sensitive(hashes_file_for_cracking, 'path')}"
     )
 
     if not wordlists_dir:
@@ -397,6 +454,8 @@ def run_asreproast_for_user(
         impacket_scripts_dir=shell.impacket_scripts_dir,
         validate_script_exists=lambda p: os.path.isfile(p) and os.access(p, os.X_OK),
         get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
+        workspace_dir=_resolve_workspace_dir(shell),
+        domains_data=shell.domains_data,
     )
     impacket_runner = ImpacketRunner(command_runner=shell.command_runner)
     enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())
@@ -425,6 +484,12 @@ def run_asreproast_for_user(
     hashes_file_for_cracking = _normalize_hashes_file_for_hashcat(
         hashes_file_abs=hashes_file_abs,
         target_user=target_user,
+    )
+    print_info_debug(
+        "[roasting-exec] ASREPRoast cracking input prepared: "
+        f"user={mark_sensitive(target_user, 'user')} "
+        f"raw_file={mark_sensitive(hashes_file_abs, 'path')} "
+        f"cracking_file={mark_sensitive(hashes_file_for_cracking, 'path')}"
     )
 
     if not wordlists_dir:

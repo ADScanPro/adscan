@@ -154,6 +154,7 @@ _AUTH_INIT_RECOMMENDED_COMMANDS = {
     "netexec_gpp_passwords",
     "netexec_smb_descriptions",
     "search_adcs",
+    "show_adcs_cache",
     "secretsdump_registries",
     "show_powershell_history",
 }

@@ -15,6 +15,10 @@ class PivotServiceCapability:
     requires_privileged_access: bool = True
     supports_tunneling: bool = True
     priority: int = 100
+    required_ports: tuple[int, ...] = ()
+    followup_handler_name: str | None = None
+    followup_workflow_intent: str | None = None
+    relaunch_workflow_intent: str | None = None
 
 
 _PIVOT_SERVICE_CAPABILITIES: dict[str, PivotServiceCapability] = {
@@ -23,6 +27,10 @@ _PIVOT_SERVICE_CAPABILITIES: dict[str, PivotServiceCapability] = {
         title="WinRM",
         pivot_tooling_hint="WinRM can bootstrap Ligolo-based pivoting when privileged access is confirmed.",
         priority=10,
+        required_ports=(5985, 5986),
+        followup_handler_name="ask_for_winrm_access",
+        followup_workflow_intent="pivot_search",
+        relaunch_workflow_intent="pivot_relaunch",
     ),
 }
 

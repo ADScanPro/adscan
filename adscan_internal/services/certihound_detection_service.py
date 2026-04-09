@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from adscan_internal import telemetry
+from adscan_internal.rich_output import mark_sensitive, print_info_debug, print_warning_debug
+from adscan_internal.services.altsecurityidentities_service import (
+    AltSecurityIdentityUser,
+    AltSecurityIdentitiesService,
+)
 from adscan_internal.services.base_service import BaseService
+from adscan_internal.services.certificate_mapping_service import CertificateMappingService
 from adscan_internal.services.ldap_transport_service import execute_with_ldap_fallback
 
 
@@ -87,6 +93,10 @@ class CertiHoundDetectionService(BaseService):
         password: str | None = None,
         use_kerberos: bool = False,
         use_ldaps: bool = True,
+        shell: Any | None = None,
+        registry_username: str | None = None,
+        registry_credential: str | None = None,
+        kerberos_target_hostname: str | None = None,
     ) -> dict[str, Any] | None:
         """Collect ADCS data and return a normalized internal detection report."""
         modules = self._load_modules()
@@ -107,6 +117,12 @@ class CertiHoundDetectionService(BaseService):
                     data=data,
                     connection=connection,
                     modules=modules,
+                    shell=shell,
+                    target_domain=target_domain,
+                    dc_address=dc_address,
+                    registry_username=registry_username,
+                    registry_credential=registry_credential,
+                    use_kerberos=use_kerberos,
                 )
                 report["domain"] = data.domain
                 report["domain_sid"] = data.domain_sid
@@ -125,11 +141,17 @@ class CertiHoundDetectionService(BaseService):
                 password=password,
                 use_kerberos=use_kerberos,
                 prefer_ldaps=use_ldaps,
+                kerberos_target_hostname=kerberos_target_hostname,
+                allow_password_fallback_on_kerberos_failure=bool(
+                    str(username or "").strip() and str(password or "").strip()
+                ),
             )
             return report
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            self.logger.exception("CertiHound detection report generation failed")
+            print_warning_debug(
+                f"CertiHound detection report generation failed: {type(exc).__name__}: {exc}"
+            )
             return None
 
     def _process_template_acls(
@@ -168,12 +190,34 @@ class CertiHoundDetectionService(BaseService):
         data: Any,
         connection: Any,
         modules: dict[str, Any],
+        shell: Any | None = None,
+        target_domain: str,
+        dc_address: str,
+        registry_username: str | None = None,
+        registry_credential: str | None = None,
+        use_kerberos: bool = False,
     ) -> dict[str, Any]:
         """Run all supported ESC detections and return normalized edges/metadata."""
         edge_generator = modules["EdgeGenerator"](data.domain_sid)
         issuance_policies = self._safe_enumerate_issuance_policies(
             connection=connection,
             enumerate_issuance_policies=modules["enumerate_issuance_policies"],
+        )
+        weak_altsecid_entries = self._safe_enumerate_weak_altsecurityidentities_users(
+            connection=connection,
+            target_domain=target_domain,
+            shell=shell,
+        )
+        weak_altsecid_users = [entry.samaccountname for entry in weak_altsecid_entries]
+        strong_cert_binding_enforced = (
+            self._safe_resolve_strong_certificate_binding_enforcement(
+                connection=connection,
+                dc_address=dc_address,
+                username=registry_username,
+                credential=registry_credential,
+                target_domain=target_domain,
+                use_kerberos=use_kerberos,
+            )
         )
 
         template_by_cn = {
@@ -486,7 +530,32 @@ class CertiHoundDetectionService(BaseService):
                             },
                         )
 
-                esc14_result = modules["detect_esc14"](template, ca, data.domain_sid)
+                esc14_result = None
+                if (
+                    weak_altsecid_users
+                    and strong_cert_binding_enforced is False
+                ):
+                    esc14_result = modules["detect_esc14"](
+                        template,
+                        ca,
+                        data.domain_sid,
+                        strong_cert_binding_enforced=False,
+                        alt_security_identities_users=weak_altsecid_users,
+                    )
+                elif weak_altsecid_users:
+                    print_info_debug(
+                        "Skipping CertiHound ESC14 for template "
+                        f"{mark_sensitive(template_name, 'template')} on "
+                        f"{mark_sensitive(ca_name, 'ca_name')}: "
+                        "strong certificate binding enforcement state is unknown."
+                    )
+                else:
+                    print_info_debug(
+                        "Skipping CertiHound ESC14 for template "
+                        f"{mark_sensitive(template_name, 'template')} on "
+                        f"{mark_sensitive(ca_name, 'ca_name')}: "
+                        "no weak altSecurityIdentities mappings were found in LDAP."
+                    )
                 if esc14_result:
                     self._append_vulnerability(metadata_entry, "ESC14")
                     for principal_sid in esc14_result.vulnerable_principals:
@@ -598,6 +667,65 @@ class CertiHoundDetectionService(BaseService):
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             return {}
+
+    def _safe_enumerate_weak_altsecurityidentities_users(
+        self,
+        *,
+        connection: Any,
+        target_domain: str,
+        shell: Any | None = None,
+    ) -> list[AltSecurityIdentityUser]:
+        """Return low-privileged enabled users with weak explicit mappings."""
+        try:
+            service = AltSecurityIdentitiesService()
+            return service.find_users_with_weak_altsecurityidentities(
+                connection=connection,
+                domain=target_domain,
+                shell=shell,
+                enabled_only=True,
+                low_privileged_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            return []
+
+    def _safe_resolve_strong_certificate_binding_enforcement(
+        self,
+        *,
+        connection: Any,
+        dc_address: str,
+        username: str | None = None,
+        credential: str | None = None,
+        target_domain: str,
+        use_kerberos: bool = False,
+    ) -> bool | None:
+        """Return binding enforcement state when ADscan has a reliable source.
+
+        LDAP template collection alone does not expose this domain controller
+        setting. Attempt remote registry and return ``None`` when unavailable
+        instead of assuming weak binding by default.
+        """
+        _ = connection
+        if not str(dc_address or "").strip():
+            return None
+        if not str(username or "").strip():
+            return None
+        if not use_kerberos and not str(credential or "").strip():
+            return None
+        try:
+            state = CertificateMappingService().read_dc_binding_state(
+                target_host=str(dc_address).strip(),
+                username=str(username or "").strip(),
+                credential=str(credential or "").strip(),
+                auth_domain=str(target_domain).strip(),
+                use_kerberos=use_kerberos,
+                kdc_host=str(dc_address).strip(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            return None
+        return state.strong_binding_enforced
+
 
     def _detect_esc5_objects(
         self,

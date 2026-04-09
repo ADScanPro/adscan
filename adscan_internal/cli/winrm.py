@@ -129,6 +129,20 @@ class WinRMPivotTarget:
     selection_reason: str
 
 
+def _format_winrm_fetch_path_preview(
+    *,
+    items: list[tuple[str, str]],
+    preview_limit: int = 3,
+) -> str:
+    """Return a compact preview of WinRM fetch paths for warning output."""
+    preview = ", ".join(
+        str(mark_sensitive(path, "path")) for path, _reason in items[:preview_limit]
+    )
+    remaining = len(items) - min(len(items), preview_limit)
+    if remaining > 0:
+        return f"{preview}, +{remaining} more"
+    return preview
+
 
 def _apply_winrm_phase_candidate_exclusions(
     *,
@@ -589,7 +603,13 @@ def _summarize_winrm_pivot_inventory(entries: list[dict[str, Any]], *, route_mod
 
 
 def check_pivot_reachability_via_winrm(
-    shell: Any, *, domain: str, host: str, username: str, password: str
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    offer_post_pivot_owned_followup: bool = True,
 ) -> None:
     """Check whether a compromised WinRM host can reach IPs hidden from the original vantage."""
     reachability_payload = _load_workspace_network_reachability_report(shell, domain=domain)
@@ -862,11 +882,12 @@ def check_pivot_reachability_via_winrm(
                         context=pivot_context,
                         refresh_result=refresh_result,
                     )
-                    maybe_offer_post_pivot_owned_followup(
-                        shell,
-                        context=pivot_context,
-                        refresh_result=refresh_result,
-                    )
+                    if offer_post_pivot_owned_followup:
+                        maybe_offer_post_pivot_owned_followup(
+                            shell,
+                            context=pivot_context,
+                            refresh_result=refresh_result,
+                        )
     except (WinRMPSRPError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
         print_warning(
@@ -875,9 +896,30 @@ def check_pivot_reachability_via_winrm(
 
 
 def ask_for_winrm_access(
-    shell: Any, *, domain: str, host: str, username: str, password: str
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    workflow_intent: str = "default",
 ) -> None:
-    """Ask to enumerate a host via WinRM and run the follow-up checks."""
+    """Ask to enumerate a host via WinRM and run the relevant follow-up checks.
+
+    Args:
+        shell: Interactive ADscan shell instance.
+        domain: Target domain name.
+        host: Target host/FQDN/IP.
+        username: Credential username to use.
+        password: Cleartext password or supported secret.
+        workflow_intent: Entry intent for the WinRM workflow. ``"default"``
+            runs the full post-auth WinRM follow-up chain. ``"pivot_search"``
+            offers only the reachability-and-pivot branch so that pivot-search
+            UX does not unexpectedly expand into unrelated host-enumeration
+            flows such as DPAPI, history, autologon, or transcript checks.
+            ``"pivot_relaunch"`` restores a previous pivot and suppresses the
+            post-pivot owned-user escalation UX during workspace-load relaunch.
+    """
     from rich.prompt import Confirm
 
     if (
@@ -893,60 +935,89 @@ def ask_for_winrm_access(
 
     marked_host = mark_sensitive(host, "hostname")
     marked_username = mark_sensitive(username, "user")
-    answer = Confirm.ask(
-        f"Do you want to enumerate host {marked_host} via WinRM as user {marked_username}?"
-    )
+    normalized_intent = str(workflow_intent or "default").strip().lower()
+    if normalized_intent == "pivot_search":
+        answer = Confirm.ask(
+            "Do you want to test WinRM pivot reachability and try a Ligolo pivot on "
+            f"{marked_host} as user {marked_username}?",
+            default=True,
+        )
+    elif normalized_intent == "pivot_relaunch":
+        answer = Confirm.ask(
+            "Do you want to restore the previous Ligolo pivot via WinRM on "
+            f"{marked_host} as user {marked_username}?",
+            default=True,
+        )
+    else:
+        answer = Confirm.ask(
+            f"Do you want to enumerate host {marked_host} via WinRM as user {marked_username}?"
+        )
     if answer:
-        followup_steps = [
-            (
-                "dpapi",
-                lambda: check_dpapi(
-                    shell,
-                    domain=domain,
-                    host=host,
-                    username=username,
-                    password=password,
+        if normalized_intent in {"pivot_search", "pivot_relaunch"}:
+            followup_steps = [
+                (
+                    "pivot_reachability",
+                    lambda: check_pivot_reachability_via_winrm(
+                        shell,
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
+                        offer_post_pivot_owned_followup=normalized_intent != "pivot_relaunch",
+                    ),
                 ),
-            ),
-            (
-                "pivot_reachability",
-                lambda: check_pivot_reachability_via_winrm(
-                    shell,
-                    domain=domain,
-                    host=host,
-                    username=username,
-                    password=password,
+            ]
+        else:
+            followup_steps = [
+                (
+                    "dpapi",
+                    lambda: check_dpapi(
+                        shell,
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
+                    ),
                 ),
-            ),
-            (
-                "firefox_credentials",
-                lambda: shell.do_check_firefox_credentials(
-                    domain, host, username, password
+                (
+                    "pivot_reachability",
+                    lambda: check_pivot_reachability_via_winrm(
+                        shell,
+                        domain=domain,
+                        host=host,
+                        username=username,
+                        password=password,
+                    ),
                 ),
-            ),
-            (
-                "powershell_history",
-                lambda: shell.do_show_powershell_history(
-                    domain, host, username, password
+                (
+                    "firefox_credentials",
+                    lambda: shell.do_check_firefox_credentials(
+                        domain, host, username, password
+                    ),
                 ),
-            ),
-            (
-                "powershell_transcripts",
-                lambda: shell.do_check_powershell_transcripts(
-                    domain, host, username, password
+                (
+                    "powershell_history",
+                    lambda: shell.do_show_powershell_history(
+                        domain, host, username, password
+                    ),
                 ),
-            ),
-            (
-                "autologon",
-                lambda: shell.do_check_autologon(domain, host, username, password),
-            ),
-            (
-                "sensitive_data_scan",
-                lambda: shell.do_check_winrm_sensitive_data(
-                    domain, host, username, password
+                (
+                    "powershell_transcripts",
+                    lambda: shell.do_check_powershell_transcripts(
+                        domain, host, username, password
+                    ),
                 ),
-            ),
-        ]
+                (
+                    "autologon",
+                    lambda: shell.do_check_autologon(domain, host, username, password),
+                ),
+                (
+                    "sensitive_data_scan",
+                    lambda: shell.do_check_winrm_sensitive_data(
+                        domain, host, username, password
+                    ),
+                ),
+            ]
         for action_label, action in followup_steps:
             if _should_skip_winrm_followup_for_ctf_pwned(
                 shell=shell,
@@ -2561,24 +2632,13 @@ def _fetch_winrm_phase_files(
             )
             if batch_result.skipped_files:
                 skipped_summary = _summarize_winrm_fetch_skip_reasons(batch_result.skipped_files)
-                preview = ", ".join(
-                    mark_sensitive(path, "path")
-                    for path, _reason in batch_result.skipped_files[:3]
-                )
-                remaining = len(batch_result.skipped_files) - min(len(batch_result.skipped_files), 3)
-                remaining_suffix = f", +{remaining} more" if remaining > 0 else ""
                 print_warning(
                     "WinRM PSRP batch fetch skipped inaccessible files but continued: "
                     f"staged={batch_result.staged_file_count} skipped={len(batch_result.skipped_files)} "
                     f"access_denied={skipped_summary['access_denied']} "
                     f"file_in_use={skipped_summary['file_in_use']} "
                     f"other={skipped_summary['other']} "
-                    f"preview=[{rich_escape(preview)}{rich_escape(remaining_suffix)}]"
-                )
-            else:
-                print_info_debug(
-                    "WinRM PSRP batch fetch completed successfully: "
-                    f"staged={batch_result.staged_file_count}"
+                    f"preview=[{rich_escape(_format_winrm_fetch_path_preview(items=list(batch_result.skipped_files)))}]"
                 )
             return WinRMPhaseFetchResult(
                 downloaded_files=batch_result.downloaded_files,
@@ -2602,7 +2662,7 @@ def _fetch_winrm_phase_files(
                 )
             print_warning(
                 "WinRM PSRP batch staging failed; falling back to per-file fetch. "
-                "This does not abort the scan, but individual locked files may still warn separately: "
+                "This does not abort the scan; per-file failures will be summarized once at the end: "
                 f"{exc}"
             )
 
@@ -2629,10 +2689,16 @@ def _fetch_winrm_phase_files(
                     auth_invalid_reason=reason,
                 )
             per_file_failures.append((remote_path, str(exc)))
-            print_warning(
-                "WinRM file fetch failed for "
-                f"{mark_sensitive(remote_path, 'path')}: {exc}"
-            )
+    if per_file_failures:
+        failure_summary = _summarize_winrm_fetch_skip_reasons(per_file_failures)
+        print_warning(
+            "WinRM per-file fetch skipped inaccessible files but continued: "
+            f"downloaded={len(downloaded_files)} failed={len(per_file_failures)} "
+            f"access_denied={failure_summary['access_denied']} "
+            f"file_in_use={failure_summary['file_in_use']} "
+            f"other={failure_summary['other']} "
+            f"preview=[{rich_escape(_format_winrm_fetch_path_preview(items=per_file_failures))}]"
+        )
     return WinRMPhaseFetchResult(
         downloaded_files=downloaded_files,
         batch_used=len(file_targets) >= batch_threshold,

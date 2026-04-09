@@ -22,6 +22,9 @@ from rich.table import Table
 
 from adscan_internal import print_info, print_info_debug, print_success, telemetry
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.pivot_runtime_state_service import (
+    snapshot_direct_vantage_artifacts,
+)
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.workspaces.layout import DEFAULT_DOMAIN_LAYOUT
 
@@ -327,16 +330,21 @@ def maybe_offer_post_pivot_owned_followup(
     context: PivotExecutionContext,
     refresh_result: PostPivotRefreshResult,
 ) -> None:
-    """Offer a high-value owned-user follow-up when the pivot unlocked multiple hosts."""
+    """Offer a high-value owned-user follow-up when the pivot unlocked new hosts."""
     from rich.prompt import Confirm
 
     new_hosts = refresh_result.newly_reachable_hosts or []
-    if len(new_hosts) <= 1:
+    if not new_hosts:
         return
+    host_phrase = (
+        "1 new reachable host"
+        if len(new_hosts) == 1
+        else f"{len(new_hosts)} new reachable hosts"
+    )
 
     prompt = (
         f"The pivot through {mark_sensitive(context.pivot_host, 'hostname')} unlocked "
-        f"{len(new_hosts)} new reachable hosts. Re-check attack paths from owned users "
+        f"{host_phrase}. Re-check attack paths from owned users "
         "and run post-auth service/share follow-up now?"
     )
     confirmer = getattr(shell, "_questionary_confirm", None)
@@ -406,6 +414,18 @@ def refresh_network_inventory_after_pivot(
         f"computers_file={mark_sensitive(computers_file, 'path')} "
         f"nmap_dir={mark_sensitive(nmap_dir, 'path')}"
     )
+    try:
+        snapshot_direct_vantage_artifacts(
+            workspace_dir=workspace_dir,
+            domains_dir=shell.domains_dir,
+            domain=context.domain,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[post-pivot] failed to snapshot direct/current-vantage artifacts before pivot refresh: "
+            f"{mark_sensitive(str(exc), 'detail')}"
+        )
     try:
         refresh_callable(context.domain, computers_file, nmap_dir)
     except Exception as exc:  # noqa: BLE001

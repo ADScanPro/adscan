@@ -18,6 +18,7 @@ from typing import Any
 from uuid import UUID
 
 from adscan_internal import telemetry
+from adscan_internal.rich_output import print_info_debug, print_warning_debug
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.ldap_transport_service import execute_with_ldap_fallback
 
@@ -53,6 +54,7 @@ class DomainWritableAttributeDetectionService(BaseService):
         *,
         target_domain: str,
         dc_address: str,
+        kerberos_target_hostname: str | None = None,
         username: str | None = None,
         password: str | None = None,
         use_kerberos: bool = False,
@@ -115,12 +117,17 @@ class DomainWritableAttributeDetectionService(BaseService):
                 password=password,
                 use_kerberos=use_kerberos,
                 prefer_ldaps=use_ldaps,
+                kerberos_target_hostname=kerberos_target_hostname,
+                allow_password_fallback_on_kerberos_failure=bool(
+                    str(username or "").strip() and str(password or "").strip()
+                ),
             )
             return report
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            self.logger.exception(
-                "Domain writable-attribute detection report generation failed"
+            print_warning_debug(
+                "Domain writable-attribute detection report generation failed: "
+                f"{type(exc).__name__}: {exc}"
             )
             return None
 
@@ -166,7 +173,10 @@ class DomainWritableAttributeDetectionService(BaseService):
             return str(UUID(bytes_le=raw_guid)).lower()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            self.logger.exception("Failed to resolve schema GUID for %s", attribute_name)
+            print_info_debug(
+                f"[writable-attrs] Failed to resolve schema GUID for {attribute_name}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             return None
 
     def _collect_script_path_writers(

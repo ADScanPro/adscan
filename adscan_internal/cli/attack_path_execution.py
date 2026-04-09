@@ -32,6 +32,7 @@ from adscan_internal import (
     print_info_debug,
     print_info_verbose,
     print_warning,
+    print_warning_debug,
     telemetry,
 )
 from adscan_internal.interaction import is_non_interactive
@@ -96,6 +97,13 @@ from adscan_internal.services.attack_step_catalog import (
     relation_requires_execution_context,
     relation_requires_reachable_computer_target,
 )
+from adscan_internal.services.attack_path_cleanup_service import (
+    begin_cleanup_scope,
+    discard_cleanup_scope,
+    execute_cleanup_scope,
+    has_active_cleanup_scope,
+    register_cleanup_from_outcome,
+)
 from adscan_internal.services.attack_path_target_viability_service import (
     assess_computer_target_viability,
 )
@@ -106,6 +114,7 @@ from adscan_internal.services.pivot_opportunity_service import (
 from adscan_internal.services.logon_script_payload_service import (
     build_force_change_password_logon_script,
 )
+from adscan_internal.services.kerberos_ticket_service import KerberosTicketService
 from adscan_internal.workspaces import domain_subpath, write_json_file
 
 
@@ -2155,6 +2164,80 @@ def _resolve_default_domain_controller(domain_data: dict[str, Any], domain: str)
     return pdc_ip or None
 
 
+def _prepare_kerberos_for_smb_execution(
+    shell: Any,
+    *,
+    operation_name: str,
+    domain: str,
+    username: str,
+    credential: str,
+    domain_data: dict[str, Any],
+) -> bool:
+    """Prepare Kerberos env for one SMB-backed step and refresh expired tickets when possible."""
+    if not bool(domain_data.get("kerberos_tickets")):
+        return False
+
+    workspace_dir = str(
+        getattr(shell, "current_workspace_dir", "")
+        or getattr(shell, "_get_workspace_cwd", lambda: "")()
+        or ""
+    )
+    use_kerberos = prepare_kerberos_ldap_environment(
+        operation_name=operation_name,
+        target_domain=domain,
+        workspace_dir=workspace_dir,
+        username=str(username),
+        user_domain=str(domain),
+        domains_data=getattr(shell, "domains_data", {}),
+        sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+    )
+    if not use_kerberos:
+        return False
+
+    ticket_service = KerberosTicketService()
+    ticket_path = ticket_service.get_ticket_for_user(
+        workspace_dir=workspace_dir,
+        domain=domain,
+        username=username,
+        domains_data=getattr(shell, "domains_data", {}),
+    )
+    ticket_state = ticket_service.is_ticket_valid(ticket_path=ticket_path or "")
+    if ticket_state is not False:
+        return True
+
+    dc_ip = str(domain_data.get("pdc") or "").strip() or None
+    print_warning_debug(
+        "[writelogonscript] Kerberos ticket appears expired before SMB operation; "
+        f"refreshing ticket for {mark_sensitive(username, 'user')} in "
+        f"{mark_sensitive(domain, 'domain')}"
+    )
+    auto_generate = getattr(shell, "_auto_generate_kerberos_ticket", None)
+    if not callable(auto_generate):
+        return True
+    try:
+        refreshed = auto_generate(username, credential, domain, dc_ip)
+        if not refreshed:
+            return True
+        return prepare_kerberos_ldap_environment(
+            operation_name=f"{operation_name} (ticket refresh)",
+            target_domain=domain,
+            workspace_dir=workspace_dir,
+            username=str(username),
+            user_domain=str(domain),
+            domains_data=getattr(shell, "domains_data", {}),
+            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            "[writelogonscript] Kerberos ticket refresh failed before SMB operation; "
+            f"user={mark_sensitive(username, 'user')} "
+            f"domain={mark_sensitive(domain, 'domain')} "
+            f"error={mark_sensitive(str(exc), 'text')}"
+        )
+        return True
+
+
 def _execute_writelogonscript_precheck(
     shell: Any,
     *,
@@ -2204,21 +2287,14 @@ def _execute_writelogonscript_precheck(
     if not target_host:
         return ("failed", {"reason": "missing_target_host"})
 
-    use_kerberos = bool(domain_data.get("kerberos_tickets"))
-    if use_kerberos:
-        use_kerberos = prepare_kerberos_ldap_environment(
-            operation_name="WriteLogonScript execution precheck",
-            target_domain=domain,
-            workspace_dir=str(
-                getattr(shell, "current_workspace_dir", "")
-                or getattr(shell, "_get_workspace_cwd", lambda: "")()
-                or ""
-            ),
-            username=str(exec_username),
-            user_domain=str(domain),
-            domains_data=getattr(shell, "domains_data", {}),
-            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
-        )
+    use_kerberos = _prepare_kerberos_for_smb_execution(
+        shell,
+        operation_name="WriteLogonScript execution precheck",
+        domain=domain,
+        username=str(exec_username),
+        credential=password,
+        domain_data=domain_data,
+    )
 
     probe_service = SMBPathAccessService()
     candidate_map = {
@@ -2457,21 +2533,14 @@ def _execute_writelogonscript_force_change_password_strategy(
         if isinstance(getattr(shell, "domains_data", {}), dict)
         else {}
     )
-    use_kerberos = bool(domain_data.get("kerberos_tickets"))
-    if use_kerberos:
-        use_kerberos = prepare_kerberos_ldap_environment(
-            operation_name="WriteLogonScript ForceChangePassword staging",
-            target_domain=domain,
-            workspace_dir=str(
-                getattr(shell, "current_workspace_dir", "")
-                or getattr(shell, "_get_workspace_cwd", lambda: "")()
-                or ""
-            ),
-            username=str(exec_username),
-            user_domain=str(domain),
-            domains_data=getattr(shell, "domains_data", {}),
-            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
-        )
+    use_kerberos = _prepare_kerberos_for_smb_execution(
+        shell,
+        operation_name="WriteLogonScript ForceChangePassword staging",
+        domain=domain,
+        username=str(exec_username),
+        credential=password,
+        domain_data=domain_data,
+    )
 
     bloody_path = str(getattr(shell, "bloodyad_path", "") or "").strip()
     if not bloody_path:
@@ -2941,25 +3010,19 @@ def _attempt_writelogonscript_cleanup_if_ready(
         target_object = str(details.get("scriptpath_target_object") or "").strip()
         previous_script_path = str(details.get("previous_script_path") or "").strip()
         previous_readable = bool(details.get("previous_script_path_readable"))
-        use_kerberos = bool(
-            isinstance(getattr(shell, "domains_data", None), dict)
-            and isinstance(getattr(shell, "domains_data", {}).get(domain), dict)
-            and getattr(shell, "domains_data", {}).get(domain, {}).get("kerberos_tickets")
+        cleanup_domain_data = (
+            getattr(shell, "domains_data", {}).get(domain, {})
+            if isinstance(getattr(shell, "domains_data", {}), dict)
+            else {}
         )
-        if use_kerberos:
-            use_kerberos = prepare_kerberos_ldap_environment(
-                operation_name="WriteLogonScript cleanup",
-                target_domain=domain,
-                workspace_dir=str(
-                    getattr(shell, "current_workspace_dir", "")
-                    or getattr(shell, "_get_workspace_cwd", lambda: "")()
-                    or ""
-                ),
-                username=cleanup_user,
-                user_domain=str(domain),
-                domains_data=getattr(shell, "domains_data", {}),
-                sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
-            )
+        use_kerberos = _prepare_kerberos_for_smb_execution(
+            shell,
+            operation_name="WriteLogonScript cleanup",
+            domain=domain,
+            username=cleanup_user,
+            credential=cleanup_password or "",
+            domain_data=cleanup_domain_data if isinstance(cleanup_domain_data, dict) else {},
+        )
 
         cleanup_notes = dict(details)
         cleanup_notes["cleanup_checked_at"] = datetime.now(UTC).isoformat()
@@ -3749,7 +3812,17 @@ def execute_selected_attack_path(
         True if an execution attempt was started, False otherwise.
     """
     set_attack_path_execution(shell)
+    local_cleanup_scope_id: str | None = None
+    cleanup_scope_owner = False
     try:
+        if not has_active_cleanup_scope(shell):
+            local_cleanup_scope_id = begin_cleanup_scope(
+                shell,
+                label="attack_path_execution",
+                domain=domain,
+            )
+            cleanup_scope_owner = True
+
         is_pivot_search = str(search_mode_label or "").strip().lower() == "pivot search"
 
         non_executable_actions = CONTEXT_ONLY_RELATIONS
@@ -5295,6 +5368,14 @@ def execute_selected_attack_path(
                         ace_result = execute_ace_step(shell, context=exec_context)
                         last_outcome = get_last_ace_execution_outcome(shell) or {}
                         _apply_execution_outcome_context_handoff(last_outcome)
+                        register_cleanup_from_outcome(
+                            shell,
+                            domain=domain,
+                            outcome=last_outcome,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                        )
                         offer_followups = (
                             idx == last_executable_idx and ace_result is True
                         )
@@ -7044,7 +7125,13 @@ def execute_selected_attack_path(
         return execution_started
 
     finally:
-        clear_attack_path_execution(shell)
+        try:
+            if cleanup_scope_owner and local_cleanup_scope_id:
+                execute_cleanup_scope(shell, scope_id=local_cleanup_scope_id)
+        finally:
+            if cleanup_scope_owner and local_cleanup_scope_id:
+                discard_cleanup_scope(shell, scope_id=local_cleanup_scope_id)
+            clear_attack_path_execution(shell)
 
 
 def offer_attack_paths_for_execution(

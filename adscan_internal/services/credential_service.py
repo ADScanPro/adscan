@@ -7,6 +7,7 @@ This module provides services for credential verification, roasting attacks
 from typing import Callable, Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
+import re
 import subprocess
 import os
 import logging
@@ -29,6 +30,11 @@ from adscan_internal.subprocess_env import (
 
 
 logger = logging.getLogger(__name__)
+
+_NETEXEC_NEGATIVE_AUTH_LINE_RE = re.compile(
+    r"\[-\]\s+(?P<principal>[^\s]+(?:\\|/)[^:\s]+):",
+    re.IGNORECASE,
+)
 
 CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str] | None]
 
@@ -484,6 +490,15 @@ class CredentialService(BaseService):
                 error_message="Pre-authentication failed",
             )
 
+        if self._contains_negative_auth_result(output, username, domain):
+            return CredentialVerificationResult(
+                status=CredentialStatus.INVALID,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Incorrect credentials",
+            )
+
         # Check for success
         if "[+]" in output:
             is_admin = "(Pwn3d!)" in output
@@ -503,6 +518,27 @@ class CredentialService(BaseService):
             credential_type=credential_type,
             error_message="Unknown verification result",
         )
+
+    @staticmethod
+    def _contains_negative_auth_result(output: str, username: str, domain: str) -> bool:
+        """Return True when NetExec emitted a generic failed-auth line.
+
+        NetExec often returns ``0`` even when LDAP/SMB auth fails, and for some
+        protocols it emits only a generic ``[-] domain\\user:secret`` line
+        without a more specific status code such as ``STATUS_LOGON_FAILURE``.
+        Treat those lines as invalid credentials when they match the tested
+        principal so the CLI does not downgrade them to an opaque error.
+        """
+
+        expected_principals = {
+            f"{domain}\\{username}".lower(),
+            f"{domain}/{username}".lower(),
+            username.lower(),
+        }
+        for match in _NETEXEC_NEGATIVE_AUTH_LINE_RE.finditer(output):
+            if match.group("principal").lower() in expected_principals:
+                return True
+        return False
 
     def _parse_password_change_output(
         self,

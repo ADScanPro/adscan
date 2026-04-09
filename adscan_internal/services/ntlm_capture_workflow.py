@@ -63,6 +63,8 @@ class NtlmCaptureProbeResult:
     observation: NtlmCaptureObservation | None
     reason: str | None
     trigger_command: list[str]
+    trigger_auth_mode: str | None
+    attempted_trigger_auth_modes: tuple[str, ...]
     trigger_returncode: int | None
     trigger_stdout: str
     trigger_stderr: str
@@ -229,6 +231,8 @@ def run_ntlm_capture_probe(
     capture_timeout_seconds: int,
     trigger_timeout_seconds: int,
     auth_type: str = "smb",
+    trigger_auth_mode: str = "smb",
+    trigger_env: dict[str, str] | None = None,
     dc_ip: str | None = None,
     method_filter: str | None = None,
     listener_ready_delay_seconds: float = 2.0,
@@ -244,6 +248,8 @@ def run_ntlm_capture_probe(
             observation=None,
             reason="listener_start_failed",
             trigger_command=[],
+            trigger_auth_mode=None,
+            attempted_trigger_auth_modes=(),
             trigger_returncode=None,
             trigger_stdout="",
             trigger_stderr="",
@@ -268,6 +274,8 @@ def run_ntlm_capture_probe(
                     observation=None,
                     reason="listener_exited_early",
                     trigger_command=[],
+                    trigger_auth_mode=None,
+                    attempted_trigger_auth_modes=(),
                     trigger_returncode=None,
                     trigger_stdout="",
                     trigger_stderr="",
@@ -284,6 +292,8 @@ def run_ntlm_capture_probe(
             domain=domain,
             timeout_seconds=trigger_timeout_seconds,
             auth_type=auth_type,
+            use_kerberos=trigger_auth_mode == "kerberos",
+            env=trigger_env,
             dc_ip=dc_ip,
             method_filter=method_filter,
         )
@@ -306,6 +316,8 @@ def run_ntlm_capture_probe(
             observation=observation,
             reason=None,
             trigger_command=trigger_command,
+            trigger_auth_mode=trigger_auth_mode,
+            attempted_trigger_auth_modes=(trigger_auth_mode,),
             trigger_returncode=(
                 trigger_result.returncode if trigger_result is not None else None
             ),
@@ -327,6 +339,8 @@ def run_ntlm_capture_probe(
         observation=None,
         reason=reason,
         trigger_command=trigger_command,
+        trigger_auth_mode=trigger_auth_mode,
+        attempted_trigger_auth_modes=(trigger_auth_mode,),
         trigger_returncode=(
             trigger_result.returncode if trigger_result is not None else None
         ),

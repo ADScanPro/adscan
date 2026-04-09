@@ -13,13 +13,16 @@ import subprocess
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Callable
+from types import SimpleNamespace
+from typing import Optional, Callable, Mapping, Any
 
 from adscan_internal import (
     print_error,
     print_error_verbose,
+    print_info,
     print_info_debug,
     print_instruction,
+    print_panel,
     print_warning,
     telemetry,
 )
@@ -33,7 +36,21 @@ from adscan_internal.execution_outcomes import (
     build_no_result_completed_process,
     build_timeout_completed_process,
 )
+from adscan_internal.integrations.auth_policy import (
+    build_impacket_kerberos_command,
+    build_impacket_ntlm_command,
+    impacket_script_supports_kerberos_first,
+    output_indicates_kerberos_auth_failure,
+    output_indicates_kerberos_invalid_credentials,
+    output_indicates_ntlm_disabled,
+    resolve_auth_policy_decision,
+)
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
+from adscan_internal.reporting_compat import load_optional_report_service_attr
+from adscan_internal.services.auth_posture_service import (
+    record_ntlm_disabled_signal,
+    record_ntlm_enabled_signal,
+)
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
@@ -42,6 +59,86 @@ from adscan_internal.text_utils import normalize_cli_output
 
 
 ExecutionResult = subprocess.CompletedProcess[str]
+
+
+def _notify_ntlm_disabled_prioritize_kerberos(
+    *,
+    domain: str | None,
+    protocol: str | None,
+    source: str,
+) -> None:
+    """Render one-time UX notice when NTLM appears disabled for one domain."""
+    marked_domain = mark_sensitive(str(domain or "unknown"), "domain")
+    protocol_label = str(protocol or "domain services").upper()
+    print_panel(
+        (
+            f"ADscan detected that NTLM appears disabled or unsupported for {marked_domain}.\n\n"
+            f"Evidence source: {source}\n"
+            f"Protocol scope: {protocol_label}\n\n"
+            "From this point on, ADscan will prioritize Kerberos for compatible authenticated "
+            "operations in this domain and only fall back when necessary."
+        ),
+        title="Authentication Posture Updated",
+        border_style="cyan",
+        expand=False,
+    )
+    print_info(
+        "Authentication posture updated: "
+        f"{marked_domain} will now prefer Kerberos for compatible authenticated operations."
+    )
+
+
+def _sync_ntlm_control_evidence(
+    ctx: "ImpacketContext",
+    *,
+    domain: str | None,
+    protocol: str | None,
+    status: str,
+    source: str,
+    message: str | None = None,
+) -> None:
+    """Persist positive/neutral NTLM posture evidence to technical_report.json."""
+    domain_name = str(domain or "").strip()
+    workspace_dir = str(ctx.workspace_dir or "").strip()
+    if not domain_name or not workspace_dir:
+        return
+
+    record_control_evidence = load_optional_report_service_attr(
+        "record_control_evidence",
+        action="Control evidence sync",
+        debug_printer=print_info_debug,
+        prefix="[auth-posture]",
+    )
+    if not callable(record_control_evidence):
+        return
+
+    shell_adapter = SimpleNamespace(
+        current_workspace_dir=workspace_dir,
+        technical_report_file="technical_report.json",
+        domains_data=ctx.domains_data if isinstance(ctx.domains_data, dict) else {},
+        domains=[],
+        report_file="",
+        report={},
+        technical_report={},
+    )
+    try:
+        record_control_evidence(
+            shell_adapter,
+            domain_name,
+            key="ntlm_likely_disabled",
+            title="NTLM Likely Disabled or Unsupported",
+            category="Authentication Posture",
+            status=status,
+            details={
+                "confidence": "heuristic",
+                "source": source,
+                "protocol": str(protocol or "").strip().lower() or None,
+                "message": str(message or "").strip()[:500] or None,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - best effort sync
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[auth-posture] Failed to sync NTLM control evidence: {exc}")
 
 
 @dataclass(frozen=True)
@@ -55,6 +152,18 @@ class ImpacketContext:
     impacket_scripts_dir: str | Path
     validate_script_exists: Callable[[str], bool]
     get_domain_pdc: Callable[[str], str | None]
+    workspace_dir: str | Path | None = None
+    domains_data: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ImpacketKerberosRetryContext:
+    """Credential context required to prepare a deterministic Kerberos run."""
+
+    domain: str
+    username: str
+    credential: str
+    dc_ip: str | None = None
 
 
 class ImpacketRunner:
@@ -107,11 +216,10 @@ class ImpacketRunner:
         command_parts = [str(script_path)] + cleaned_args
         command = shlex.join(command_parts)
 
-        # Show full command in debug output (no truncation)
-        print_info_debug(f"[impacket] Running {script_name}: {command}")
-
-        result = self._execute_command(
-            command,
+        result = self._run_with_kerberos_retry(
+            script_name=script_name,
+            command=command,
+            ctx=ctx,
             timeout=timeout,
             capture_output=capture_output,
             **kwargs,
@@ -238,14 +346,23 @@ class ImpacketRunner:
         command_parts = [str(script_path)] + cleaned_args
         command = shlex.join(command_parts)
 
-        print_info_debug(f"[impacket] Running GetUserSPNs.py: {command}")
+        kerberos_retry_context = self._build_retry_context(
+            domain=domain,
+            username=username,
+            password=password,
+            hashes=hashes,
+            dc_ip=clean_pdc,
+        )
 
-        result = self._execute_command(
-            command,
+        result = self._run_with_kerberos_retry(
+            script_name="GetUserSPNs.py",
+            command=command,
+            ctx=ctx,
+            kerberos_retry_context=kerberos_retry_context,
             timeout=timeout,
             capture_output=True,
         )
-        
+
         return result
 
     def run_getnpusers(
@@ -315,11 +432,20 @@ class ImpacketRunner:
         if dc_ip:
             args.extend(["-dc-ip", dc_ip])
 
+        kerberos_retry_context = self._build_retry_context(
+            domain=domain,
+            username=username,
+            password=password,
+            hashes=None,
+            dc_ip=dc_ip,
+        )
+
         return self.run(
             "GetNPUsers.py",
             args,
             ctx=ctx,
             timeout=timeout,
+            kerberos_retry_context=kerberos_retry_context,
         )
 
     def run_secretsdump(
@@ -413,11 +539,20 @@ class ImpacketRunner:
         if outputfile:
             args.extend(["-outputfile", str(outputfile)])
 
+        kerberos_retry_context = self._build_retry_context(
+            domain=domain,
+            username=username,
+            password=password,
+            hashes=hashes,
+            dc_ip=target,
+        )
+
         return self.run(
             "secretsdump.py",
             args,
             ctx=ctx,
             timeout=timeout,
+            kerberos_retry_context=kerberos_retry_context,
         )
 
     def _execute_command(
@@ -493,3 +628,329 @@ class ImpacketRunner:
             telemetry.capture_exception(exc)
             print_error_verbose(f"Error executing Impacket command: {command} - {exc}")
             return None
+
+    def _run_with_kerberos_retry(
+        self,
+        *,
+        script_name: str,
+        command: str,
+        ctx: ImpacketContext,
+        kerberos_retry_context: ImpacketKerberosRetryContext | None = None,
+        timeout: int | None = None,
+        capture_output: bool = True,
+        **kwargs: object,
+    ) -> ExecutionResult | None:
+        """Run an Impacket command and retry with Kerberos when NTLM is disabled.
+
+        Args:
+            script_name: Script being executed.
+            command: Shell-escaped command string.
+            timeout: Optional timeout in seconds.
+            capture_output: Whether to capture stdout/stderr.
+            **kwargs: Additional arguments for command runner.
+
+        Returns:
+            Completed process or None if execution failed.
+        """
+        current_command = command
+        kerberos_first_attempted = False
+        protocol = self._resolve_auth_posture_protocol(script_name)
+        supports_kerberos_first = impacket_script_supports_kerberos_first(script_name)
+        command_already_uses_kerberos = self._command_uses_kerberos(current_command)
+        decision = (
+            resolve_auth_policy_decision(
+                domains_data=ctx.domains_data,
+                domain=kerberos_retry_context.domain,
+                protocol=protocol,
+                default_preference=True,
+            )
+            if kerberos_retry_context is not None
+            else None
+        )
+        auth_posture_status = decision.ntlm_status if decision is not None else "unknown"
+        kerberos_first_selected = (
+            kerberos_retry_context is not None
+            and supports_kerberos_first
+            and not command_already_uses_kerberos
+            and decision is not None
+            and decision.prefer_kerberos
+        )
+
+        if kerberos_retry_context is None:
+            auth_policy_reason = "no_retry_context"
+        elif not supports_kerberos_first:
+            auth_policy_reason = "script_not_supported"
+        elif command_already_uses_kerberos:
+            auth_policy_reason = "command_already_uses_kerberos"
+        else:
+            auth_policy_reason = decision.reason if decision is not None else "policy_declined"
+
+        print_info_debug(
+            "[impacket] Auth policy: "
+            f"script={script_name} "
+            f"domain={mark_sensitive(kerberos_retry_context.domain, 'domain') if kerberos_retry_context is not None else 'unknown'} "
+            f"protocol={protocol or 'unknown'} "
+            f"ntlm_status={auth_posture_status} "
+            f"kerberos_first={kerberos_first_selected!r} "
+            f"reason={auth_policy_reason}"
+        )
+
+        if kerberos_first_selected:
+            kerberos_first_command = build_impacket_kerberos_command(
+                script_name,
+                current_command,
+            )
+            if kerberos_first_command is not None:
+                kerberos_first_attempted = True
+                current_command = kerberos_first_command
+
+        if self._command_uses_kerberos(current_command) and kerberos_retry_context is not None:
+            self._prepare_kerberos_execution(
+                ctx=ctx,
+                retry_context=kerberos_retry_context,
+                purpose=f"{script_name} (initial Kerberos execution)",
+            )
+
+        print_info_debug(f"[impacket] Running {script_name}: {current_command}")
+        result = self._execute_command(
+            current_command,
+            timeout=timeout,
+            capture_output=capture_output,
+            **kwargs,
+        )
+
+        if (
+            result is not None
+            and kerberos_retry_context is not None
+            and not self._command_uses_kerberos(current_command)
+        ):
+            combined_output = normalize_cli_output(
+                "\n".join(part for part in (result.stdout or "", result.stderr or "") if part)
+            )
+            if output_indicates_ntlm_disabled(combined_output):
+                posture_update = record_ntlm_disabled_signal(
+                    ctx.domains_data if isinstance(ctx.domains_data, dict) else None,
+                    domain=kerberos_retry_context.domain,
+                    protocol=protocol,
+                    source="impacket",
+                    signal="ntlm_disabled",
+                    message=combined_output.strip()[:500],
+                )
+                print_info_debug(
+                    "[impacket] Observed NTLM-disabled signal: "
+                    f"script={script_name} "
+                    f"domain={mark_sensitive(kerberos_retry_context.domain, 'domain')} "
+                    f"protocol={protocol or 'unknown'} "
+                    "new_ntlm_status=likely_disabled "
+                    "action=recorded"
+                )
+                if posture_update is not None and posture_update.should_notify_user:
+                    _notify_ntlm_disabled_prioritize_kerberos(
+                        domain=kerberos_retry_context.domain,
+                        protocol=protocol,
+                        source="Impacket",
+                    )
+                if posture_update is not None:
+                    _sync_ntlm_control_evidence(
+                        ctx,
+                        domain=kerberos_retry_context.domain,
+                        protocol=protocol,
+                        status="observed",
+                        source="impacket",
+                        message=combined_output.strip()[:500],
+                    )
+            elif result.returncode == 0 and combined_output.strip():
+                record_ntlm_enabled_signal(
+                    ctx.domains_data if isinstance(ctx.domains_data, dict) else None,
+                    domain=kerberos_retry_context.domain,
+                    protocol=protocol,
+                    source="impacket",
+                    message=combined_output.strip()[:500],
+                )
+                print_info_debug(
+                    "[impacket] Observed NTLM success signal: "
+                    f"script={script_name} "
+                    f"domain={mark_sensitive(kerberos_retry_context.domain, 'domain')} "
+                    f"protocol={protocol or 'unknown'} "
+                    "new_ntlm_status=likely_enabled "
+                    "action=recorded"
+                )
+                _sync_ntlm_control_evidence(
+                    ctx,
+                    domain=kerberos_retry_context.domain,
+                    protocol=protocol,
+                    status="contradicted",
+                    source="impacket",
+                    message=combined_output.strip()[:500],
+                )
+
+        if (
+            kerberos_first_attempted
+            and self._command_uses_kerberos(current_command)
+            and result is not None
+            and not output_indicates_kerberos_invalid_credentials(
+                normalize_cli_output(
+                    "\n".join(part for part in (result.stdout or "", result.stderr or "") if part)
+                )
+            )
+            and output_indicates_kerberos_auth_failure(
+                normalize_cli_output(
+                    "\n".join(part for part in (result.stdout or "", result.stderr or "") if part)
+                )
+            )
+        ):
+            ntlm_command = build_impacket_ntlm_command(current_command)
+            if ntlm_command is not None:
+                print_warning(
+                    "Impacket Kerberos authentication failed. Retrying with NTLM."
+                )
+                print_info_debug(
+                    f"[impacket] Kerberos-first NTLM fallback command for {script_name}: {ntlm_command}"
+                )
+                return self._execute_command(
+                    ntlm_command,
+                    timeout=timeout,
+                    capture_output=capture_output,
+                    **kwargs,
+                )
+
+        if not self._should_retry_with_kerberos(script_name, current_command, result):
+            return result
+
+        retry_command = build_impacket_kerberos_command(script_name, current_command)
+        if retry_command is None:
+            return result
+
+        if kerberos_retry_context is not None:
+            self._prepare_kerberos_execution(
+                ctx=ctx,
+                retry_context=kerberos_retry_context,
+                purpose=f"{script_name} (Kerberos retry after NTLM-disabled signal)",
+            )
+
+        print_warning(
+            "Impacket reported NTLM is disabled or unsupported. Retrying with Kerberos (-k)."
+        )
+        print_info_debug(
+            f"[impacket] NTLM-disabled Kerberos retry command for {script_name}: {retry_command}"
+        )
+        return self._execute_command(
+            retry_command,
+            timeout=timeout,
+            capture_output=capture_output,
+            **kwargs,
+        )
+
+    def _should_retry_with_kerberos(
+        self,
+        script_name: str,
+        command: str,
+        result: ExecutionResult | None,
+    ) -> bool:
+        """Return True when a failed Impacket run should retry with Kerberos."""
+        if result is None:
+            return False
+        if not output_indicates_ntlm_disabled(
+            normalize_cli_output(
+                "\n".join(part for part in (result.stdout or "", result.stderr or "") if part)
+            )
+        ):
+            return False
+        if build_impacket_kerberos_command(script_name, command) is None:
+            return False
+        return True
+
+    @staticmethod
+    def _build_retry_context(
+        *,
+        domain: str | None,
+        username: str | None,
+        password: str | None,
+        hashes: str | None,
+        dc_ip: str | None,
+    ) -> ImpacketKerberosRetryContext | None:
+        """Build Kerberos retry context from available Impacket credentials."""
+        user = str(username or "").strip()
+        realm = str(domain or "").strip()
+        if not user or not realm:
+            return None
+
+        secret = str(password or hashes or "").strip()
+        if not secret:
+            return None
+
+        return ImpacketKerberosRetryContext(
+            domain=realm,
+            username=user,
+            credential=secret.lstrip(":") if hashes and not password else secret,
+            dc_ip=str(dc_ip or "").strip() or None,
+        )
+
+    @staticmethod
+    def _command_uses_kerberos(command: str) -> bool:
+        """Return True when one command explicitly requests Kerberos."""
+        try:
+            return "-k" in shlex.split(command)
+        except ValueError:
+            return " -k " in f" {command} "
+
+    def _prepare_kerberos_execution(
+        self,
+        *,
+        ctx: ImpacketContext,
+        retry_context: ImpacketKerberosRetryContext,
+        purpose: str,
+    ) -> str | None:
+        """Refresh the intended Kerberos ticket and bind the process env to it."""
+        from adscan_internal.services.kerberos_ticket_service import KerberosTicketService
+
+        workspace_dir = str(ctx.workspace_dir or "").strip()
+        if not workspace_dir:
+            print_info_debug(
+                f"[impacket] Kerberos preparation skipped for {purpose}: no workspace_dir in context."
+            )
+            return None
+
+        service = KerberosTicketService()
+        result = service.auto_generate_tgt(
+            username=retry_context.username,
+            credential=retry_context.credential,
+            domain=retry_context.domain,
+            workspace_dir=workspace_dir,
+            dc_ip=retry_context.dc_ip,
+        )
+        if not result.success:
+            print_warning(
+                "Failed to refresh Kerberos ticket before Impacket Kerberos execution."
+            )
+            print_info_debug(
+                "[impacket] Kerberos ticket refresh failed: "
+                f"user={mark_sensitive(retry_context.username, 'user')}@"
+                f"{mark_sensitive(retry_context.domain, 'domain')} "
+                f"error={result.error_message!r}"
+            )
+
+        _conf_set, _ticket_set, krb5_config_path, ticket_path = service.setup_environment_for_domain(
+            workspace_dir=workspace_dir,
+            domain=retry_context.domain,
+            user_domain=retry_context.domain,
+            username=retry_context.username,
+            domains_data=ctx.domains_data,
+        )
+        print_info_debug(
+            "[impacket] Prepared Kerberos environment: "
+            f"purpose={purpose!r} user={mark_sensitive(retry_context.username, 'user')}@"
+            f"{mark_sensitive(retry_context.domain, 'domain')} "
+            f"krb5_config={mark_sensitive(str(krb5_config_path or 'unknown'), 'path')} "
+            f"ccache={mark_sensitive(str(ticket_path or 'unknown'), 'path')}"
+        )
+        return ticket_path
+
+    @staticmethod
+    def _resolve_auth_posture_protocol(script_name: str) -> str | None:
+        """Map Impacket scripts to auth-posture protocol buckets."""
+        if script_name in {"GetUserSPNs.py", "GetNPUsers.py"}:
+            return "ldap"
+        if script_name == "secretsdump.py":
+            return "smb"
+        return None

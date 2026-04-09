@@ -472,6 +472,7 @@ def init_sentry():
             send_default_pii=False,
             attach_stacktrace=False,
             include_local_variables=False,
+            include_source_context=False,
             max_breadcrumbs=0,
             before_send=_before_send,
             # Override transport to use n8n proxy
@@ -1838,7 +1839,6 @@ _SAFE_TELEMETRY_STRING_FIELDS: frozenset[str] = frozenset(
         "source",
         "telemetry_level",
         "telemetry_source",
-        "target_slug",
         "target_type",
         "trace_id",
         "version_context_mode",
@@ -1865,13 +1865,27 @@ _SENSITIVE_TELEMETRY_FIELD_TYPES: dict[str, str] = {
     "principal": "user",
     "pwd": "password",
     "server": "hostname",
+    "sid": "sid",
     "target_host": "hostname",
     "target_ip": "ip",
+    "target_name": "workspace",
+    "target_slug": "workspace",
     "user": "user",
+    "user_sid": "sid",
     "username": "user",
     "workspace": "workspace",
     "workspace_name": "workspace",
 }
+
+
+def _resolve_telemetry_sensitive_field_type(field_name: str | None) -> str | None:
+    """Return the sensitive classification for a telemetry field name."""
+    normalized_field = str(field_name or "").strip().lower()
+    if not normalized_field:
+        return None
+    if "sid" in normalized_field:
+        return "sid"
+    return _SENSITIVE_TELEMETRY_FIELD_TYPES.get(normalized_field)
 
 
 def _is_safe_telemetry_string(field_name: str | None, value: str) -> bool:
@@ -1899,7 +1913,7 @@ def _sanitize_string_for_telemetry(
     """Return one telemetry-safe string value."""
     stripped = _strip_sensitive_markers(str(value))
     normalized_field = str(field_name or "").strip().lower()
-    sensitive_type = _SENSITIVE_TELEMETRY_FIELD_TYPES.get(normalized_field)
+    sensitive_type = _resolve_telemetry_sensitive_field_type(normalized_field)
     if sensitive_type == "user" and stripped:
         if _is_well_known_principal(stripped):
             return stripped
@@ -2094,6 +2108,7 @@ def _pseudonymize_value(value: str, data_type: str) -> str:
     preserve_non_alnum = data_type in {
         "domain",
         "hostname",
+        "sid",
         "user",
         "service",
         "path",
@@ -3965,12 +3980,27 @@ def _vercel_metadata_fields(metadata: Optional[dict[str, Any]]) -> dict[str, Any
         # Keep legacy target_type populated even when no lab provider exists
         # (e.g., audit workspaces), so downstream filters remain explicit.
         updates["target_type"] = workspace_type
-    if lab_name:
-        updates["target_name"] = lab_name.lower()
-    if lab_slug:
-        updates["target_slug"] = lab_slug.lower()
     if lab_name_whitelisted is not None:
         updates["target_whitelisted"] = bool(lab_name_whitelisted)
+    preserve_public_lab_identity = bool(lab_name_whitelisted) is True
+    if lab_name:
+        normalized_lab_name = lab_name.lower()
+        updates["target_name"] = (
+            normalized_lab_name
+            if preserve_public_lab_identity
+            else _sanitize_string_for_telemetry(
+                normalized_lab_name, field_name="target_name"
+            )
+        )
+    if lab_slug:
+        normalized_lab_slug = lab_slug.lower()
+        updates["target_slug"] = (
+            normalized_lab_slug
+            if preserve_public_lab_identity
+            else _sanitize_string_for_telemetry(
+                normalized_lab_slug, field_name="target_slug"
+            )
+        )
     confirmation_state = metadata.get("lab_confirmation_state")
     if confirmation_state:
         updates["target_confirmation_state"] = str(confirmation_state)
@@ -4090,9 +4120,10 @@ def _send_session_to_vercel(
             "html": html_content,
         }
         payload.update(_vercel_version_field())
-        payload.update(
-            _sanitize_telemetry_properties(_vercel_metadata_fields(metadata))
-        )
+        # _vercel_metadata_fields() already applies the privacy policy for
+        # lab/session context. Do not re-sanitize here or we will destroy the
+        # distinction between public whitelisted labs and custom/internal labs.
+        payload.update(_vercel_metadata_fields(metadata))
         payload.update(_vercel_timestamp_fields(started_at, finished_at))
 
         # print_info_debug(
@@ -4193,6 +4224,7 @@ def _build_session_metadata(shell=None) -> Optional[dict]:
         lab_slug = build_lab_slug(
             getattr(shell, "lab_provider", None),
             getattr(shell, "lab_name", None),
+            getattr(shell, "lab_name_whitelisted", None),
         )
     if lab_slug:
         metadata["lab_slug"] = str(lab_slug).lower()

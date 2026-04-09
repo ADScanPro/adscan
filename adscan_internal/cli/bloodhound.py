@@ -52,11 +52,13 @@ from adscan_internal.services.adcs_target_filter import (
     domain_has_adcs_for_attack_steps,
     path_contains_adcs_dependent_node,
 )
+from adscan_internal.services.domain_controller_classifier import node_is_rodc_computer
 from adscan_internal.services.attack_graph_service import (
     ATTACK_PATHS_MAX_DEPTH_DOMAIN,
     ATTACK_PATHS_MAX_DEPTH_USER,
     get_netlogon_write_support_paths,
 )
+from adscan_internal.services.ldap_transport_service import resolve_ldap_target_endpoints
 from adscan_internal.workspaces import domain_relpath, domain_subpath, write_json_file
 
 
@@ -1827,9 +1829,15 @@ def run_bloodhound_collector(
             if is_certihound_library_available():
                 print_info_verbose("Using CertiHound Python library collector.")
                 library_service = CertiHoundLibraryService()
+                ldap_targets = resolve_ldap_target_endpoints(
+                    target_domain=target_domain,
+                    domain_data=shell.domains_data.get(target_domain, {}),
+                    kerberos_ready=kerberos_env_ready_certihound,
+                )
                 collected_zip_path = library_service.collect_adcs_zip(
                     target_domain=target_domain,
-                    dc_address=certihound_dc_target,
+                    dc_address=str(ldap_targets.dc_address or certihound_dc_target),
+                    kerberos_target_hostname=ldap_targets.kerberos_target_hostname,
                     output_dir=bh_dir,
                     zip_filename=certihound_zip,
                     username=None if kerberos_env_ready_certihound else upn,
@@ -2001,6 +2009,28 @@ def _load_writable_user_attribute_discovery(
     return paths
 
 
+def _load_rodc_prp_control_discovery(
+    shell: BloodHoundShell,
+    *,
+    target_domain: str,
+    graph: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Load custom delegated RODC PRP control attack steps discovered via LDAP ACL parsing."""
+    paths: list[dict[str, Any]] = []
+    try:
+        from adscan_internal.services.attack_graph_service import (
+            get_rodc_prp_control_paths,
+        )
+
+        paths = get_rodc_prp_control_paths(shell, target_domain, graph=graph)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[rodc-prp] Delegated RODC PRP discovery load failed: {exc}"
+        )
+    return paths
+
+
 def run_enumerate_user_aces(shell: BloodHoundShell, args: str) -> None:
     """Parse arguments and initiate user ACE enumeration.
 
@@ -2087,6 +2117,7 @@ def run_bloodhound_attack_paths(
     adcs_certipy_paths: list[dict[str, Any]] | None = None
     adcs_certipy_templates: dict[str, Any] | None = None
     writable_user_attribute_paths: list[dict[str, Any]] | None = None
+    rodc_prp_control_paths: list[dict[str, Any]] | None = None
 
     def _ensure_adcs_certihound_loaded() -> None:
         nonlocal adcs_certihound_paths
@@ -2130,9 +2161,23 @@ def run_bloodhound_attack_paths(
             graph=graph,
         )
 
+    def _ensure_rodc_prp_control_loaded() -> None:
+        nonlocal rodc_prp_control_paths
+        if rodc_prp_control_paths is not None:
+            return
+        rodc_prp_control_paths = _load_rodc_prp_control_discovery(
+            shell,
+            target_domain=target_domain,
+            graph=graph,
+        )
+
     def _get_writable_user_attribute_paths() -> list[dict[str, Any]]:
         _ensure_writable_user_attributes_loaded()
         return list(writable_user_attribute_paths or [])
+
+    def _get_rodc_prp_control_paths() -> list[dict[str, Any]]:
+        _ensure_rodc_prp_control_loaded()
+        return list(rodc_prp_control_paths or [])
 
     def _get_netlogon_write_support_paths() -> list[dict[str, Any]]:
         return list(
@@ -2193,6 +2238,11 @@ def run_bloodhound_attack_paths(
             _get_writable_user_attribute_paths,
         ),
         (
+            "RODC PRP Control",
+            "get_rodc_prp_control_paths",
+            _get_rodc_prp_control_paths,
+        ),
+        (
             "NETLOGON Write Access",
             "get_netlogon_write_support_paths",
             _get_netlogon_write_support_paths,
@@ -2216,6 +2266,16 @@ def run_bloodhound_attack_paths(
             isinstance(edge, dict)
             and str(edge.get("relation") or "").strip().lower() == target_relation
             for edge in edges
+        )
+
+    def _graph_has_rodc_computer_target() -> bool:
+        """Return whether the current graph already contains at least one RODC computer."""
+        nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+        if not isinstance(nodes_map, dict):
+            return False
+        return any(
+            isinstance(node, dict) and node_is_rodc_computer(node)
+            for node in nodes_map.values()
         )
 
     # ADCS discovery happens in Phase 1 (Domain Analysis).
@@ -2398,6 +2458,26 @@ def run_bloodhound_attack_paths(
             )
             print_info(
                 f"{title}: skipped; no WriteLogonScript attack steps require prerequisite validation."
+            )
+            continue
+        if (
+            method_name == "get_rodc_prp_control_paths"
+            and not _graph_has_rodc_computer_target()
+        ):
+            marked_domain = mark_sensitive(target_domain, "domain")
+            print_info_debug(
+                "[bloodhound] skipping delegated RODC PRP discovery: "
+                f"reason=no_rodc_targets domain={marked_domain}"
+            )
+            print_step_status(
+                title,
+                status="completed",
+                step_number=step_number,
+                total_steps=total_steps,
+                details="skipped=no RODC computer objects",
+            )
+            print_info(
+                f"{title}: skipped; no RODC computer objects require delegated PRP discovery."
             )
             continue
         raw_paths = None

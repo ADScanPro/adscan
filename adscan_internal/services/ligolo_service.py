@@ -30,6 +30,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import ssl
@@ -318,8 +319,8 @@ class LigoloProxyService:
             json.dump(tunnels, handle, indent=2, sort_keys=False)
             handle.write("\n")
 
-    def append_tunnel_state(self, record: dict[str, Any]) -> None:
-        """Append one tunnel record to the workspace tunnel state."""
+    def append_tunnel_state(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Append one tunnel record to the workspace tunnel state and return it."""
 
         tunnels = self.load_tunnels_state()
         stored_record = dict(record)
@@ -329,6 +330,25 @@ class LigoloProxyService:
         stored_record["updated_at"] = _utc_now_iso()
         tunnels.append(stored_record)
         self.save_tunnels_state(tunnels)
+        return dict(stored_record)
+
+    def update_tunnel_record(self, *, tunnel_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        """Merge updates into one persisted tunnel record and return the result."""
+
+        needle = str(tunnel_id or "").strip()
+        if not needle or not isinstance(updates, dict):
+            return None
+        records = self.load_tunnels_state()
+        for index, record in enumerate(records):
+            if str(record.get("tunnel_id") or "").strip() != needle:
+                continue
+            updated_record = dict(record)
+            updated_record.update(updates)
+            updated_record["updated_at"] = _utc_now_iso()
+            records[index] = updated_record
+            self.save_tunnels_state(records)
+            return dict(updated_record)
+        return None
 
     def get_tunnel_record(self, tunnel_id: str) -> dict[str, Any] | None:
         """Return one persisted tunnel record by identifier."""
@@ -999,6 +1019,148 @@ class LigoloProxyService:
         interface_payload = payload.get(interface_name)
         return interface_payload if isinstance(interface_payload, dict) else None
 
+    def _list_active_route_interfaces(self, route: str) -> list[str]:
+        """Return local interface names currently owning one route in the kernel table."""
+
+        ip_binary = shutil.which("ip")
+        if ip_binary is None or not route:
+            return []
+        try:
+            result = subprocess.run(
+                [ip_binary, "-o", "route", "show", "exact", route],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+        except Exception as exc:
+            print_info_debug(f"[ligolo] Failed to inspect kernel route {route}: {exc}")
+            return []
+        if result.returncode != 0:
+            stderr_text = str(result.stderr or "").strip()
+            if stderr_text:
+                print_info_debug(f"[ligolo] Kernel route lookup for {route} failed: {stderr_text}")
+            return []
+
+        interfaces: list[str] = []
+        for raw_line in str(result.stdout or "").splitlines():
+            match = re.search(r"\bdev\s+(\S+)", raw_line)
+            if not match:
+                continue
+            iface_name = str(match.group(1) or "").strip()
+            if iface_name and iface_name not in interfaces:
+                interfaces.append(iface_name)
+        if interfaces:
+            print_info_debug(f"[ligolo] Kernel route owners for {route}: {interfaces}")
+        return interfaces
+
+    def _delete_kernel_route(self, *, route: str, interface_name: str) -> bool:
+        """Best-effort delete of one local kernel route bound to one interface."""
+
+        ip_binary = shutil.which("ip")
+        if ip_binary is None or not route or not interface_name:
+            return False
+        try:
+            result = subprocess.run(
+                [ip_binary, "route", "del", route, "dev", interface_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+        except Exception as exc:
+            print_info_debug(f"[ligolo] Failed to delete kernel route {route} on {interface_name}: {exc}")
+            return False
+        if result.returncode == 0:
+            print_info_verbose(f"Route {route}: removed stale kernel route on {interface_name!r}.")
+            return True
+        stderr_text = str(result.stderr or "").strip()
+        if stderr_text:
+            print_info_debug(
+                f"[ligolo] Kernel route deletion failed for {route} on {interface_name}: {stderr_text}"
+            )
+        return False
+
+    def _delete_kernel_interface(self, interface_name: str) -> bool:
+        """Best-effort delete of one local kernel TUN interface."""
+
+        ip_binary = shutil.which("ip")
+        if ip_binary is None or not interface_name:
+            return False
+        try:
+            result = subprocess.run(
+                [ip_binary, "link", "delete", interface_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+        except Exception as exc:
+            print_info_debug(f"[ligolo] Failed to delete kernel interface {interface_name}: {exc}")
+            return False
+        if result.returncode == 0:
+            print_info_verbose(f"Interface {interface_name!r}: removed stale kernel TUN device.")
+            return True
+        stderr_text = str(result.stderr or "").strip()
+        if stderr_text:
+            print_info_debug(f"[ligolo] Kernel interface deletion failed for {interface_name}: {stderr_text}")
+        return False
+
+    def _interface_has_active_tunnel(self, interface_name: str) -> bool:
+        """Return whether one Ligolo agent is actively running on the interface."""
+
+        return any(
+            bool(agent.get("running")) and str(agent.get("interface") or "").strip() == interface_name
+            for agent in self.list_agents()
+        )
+
+    def _cleanup_stale_interface(self, interface_name: str) -> None:
+        """Best-effort cleanup for one stale Ligolo interface in API config and kernel."""
+
+        if not interface_name:
+            return
+        if self._interface_has_active_tunnel(interface_name):
+            print_info_debug(f"[ligolo] Refusing stale cleanup for active interface {interface_name!r}.")
+            return
+        try:
+            self._api_request(
+                method="DELETE",
+                path="/api/v1/interfaces",
+                payload={"Interface": interface_name},
+            )
+            print_info_verbose(f"Interface {interface_name!r}: stale conflict removed via Ligolo API.")
+        except RuntimeError as exc:
+            print_info_debug(f"[ligolo] Stale interface API cleanup failed for {interface_name!r}: {exc}")
+        self._delete_kernel_interface(interface_name)
+
+    def _reconcile_route_conflict(self, *, route: str, interface_name: str, conflict_interface: str | None) -> None:
+        """Best-effort cleanup for one route blocked by stale Ligolo state."""
+
+        if conflict_interface and conflict_interface != interface_name:
+            try:
+                self._api_request(
+                    method="DELETE",
+                    path="/api/v1/routes",
+                    payload={"Interface": conflict_interface, "Route": route},
+                )
+                print_info_verbose(f"Route {route}: removed from conflicting interface {conflict_interface!r}.")
+            except RuntimeError as exc:
+                print_info_debug(
+                    f"[ligolo] Conflict route cleanup failed for {route} on {conflict_interface!r}: {exc}"
+                )
+                self._cleanup_stale_interface(conflict_interface)
+
+        for owner_interface in self._list_active_route_interfaces(route):
+            if owner_interface == interface_name:
+                continue
+            if self._interface_has_active_tunnel(owner_interface):
+                print_info_debug(
+                    f"[ligolo] Route {route} still belongs to active interface {owner_interface!r}; skipping kernel cleanup."
+                )
+                continue
+            self._delete_kernel_route(route=route, interface_name=owner_interface)
+            self._cleanup_stale_interface(owner_interface)
+
     def ensure_interface(self, interface_name: str) -> None:
         """Ensure one interface exists in the Ligolo config/runtime.
 
@@ -1009,11 +1171,7 @@ class LigoloProxyService:
         interface_state = self.get_interface_state(interface_name)
         if interface_state is not None:
             # Check whether a tunnel is actively running on this interface.
-            agents = self.list_agents()
-            has_active_tunnel = any(
-                bool(a.get("running")) and str(a.get("interface") or "").strip() == interface_name
-                for a in agents
-            )
+            has_active_tunnel = self._interface_has_active_tunnel(interface_name)
             if has_active_tunnel:
                 print_info_verbose(f"Interface {interface_name!r}: already active, skipping creation.")
                 return  # Interface is live — nothing to do.
@@ -1077,14 +1235,11 @@ class LigoloProxyService:
             conflict = route_to_iface.get(route)
             if conflict and conflict != interface_name:
                 print_info_verbose(f"Route {route}: conflicts with interface {conflict!r} — removing conflict first.")
-                try:
-                    self._api_request(
-                        method="DELETE",
-                        path="/api/v1/routes",
-                        payload={"Interface": conflict, "Route": route},
-                    )
-                except RuntimeError:
-                    pass  # Best-effort; proceed anyway.
+                self._reconcile_route_conflict(
+                    route=route,
+                    interface_name=interface_name,
+                    conflict_interface=conflict,
+                )
 
             # Add the route to our interface.
             try:
@@ -1095,8 +1250,19 @@ class LigoloProxyService:
                 )
             except RuntimeError as exc:
                 if "file exists" in str(exc).lower():
-                    # Route already in the OS routing table — counts as added.
-                    print_info_verbose(f"Route {route}: already in OS routing table, treating as added.")
+                    print_info_verbose(
+                        f"Route {route}: kernel conflict detected during add; reconciling stale state and retrying."
+                    )
+                    self._reconcile_route_conflict(
+                        route=route,
+                        interface_name=interface_name,
+                        conflict_interface=conflict,
+                    )
+                    self._api_request(
+                        method="POST",
+                        path="/api/v1/routes",
+                        payload={"Interface": interface_name, "Route": [route]},
+                    )
                 else:
                     raise
             print_info_verbose(f"Route {route} → {interface_name!r}: added.")

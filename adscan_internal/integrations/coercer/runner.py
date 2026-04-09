@@ -32,6 +32,7 @@ def looks_like_ntlm_hash(value: str) -> bool:
 class CoercerExecution:
     """Outcome of one Coercer execution attempt."""
 
+    auth_mode: str
     command: list[str]
     result: subprocess.CompletedProcess[str]
     error_kind: str | None
@@ -65,6 +66,7 @@ class CoercerRunner:
         auth_type: str = "smb",
         dc_ip: str | None = None,
         method_filter: str | None = None,
+        use_kerberos: bool = False,
     ) -> list[str]:
         """Build the Coercer subprocess command."""
 
@@ -88,6 +90,8 @@ class CoercerRunner:
             command.extend(["--dc-ip", dc_ip])
         if method_filter:
             command.extend(["--filter-method-name", method_filter])
+        if use_kerberos:
+            command.append("-k")
         if looks_like_ntlm_hash(secret):
             command.extend(["--hashes", f":{secret}"])
         else:
@@ -117,6 +121,8 @@ class CoercerRunner:
         auth_type: str = "smb",
         dc_ip: str | None = None,
         method_filter: str | None = None,
+        use_kerberos: bool = False,
+        env: dict[str, str] | None = None,
     ) -> CoercerExecution:
         """Execute Coercer and return a structured result."""
 
@@ -129,6 +135,7 @@ class CoercerRunner:
             auth_type=auth_type,
             dc_ip=dc_ip,
             method_filter=method_filter,
+            use_kerberos=use_kerberos,
         )
         serialized_command = shlex.join(command)
 
@@ -140,6 +147,7 @@ class CoercerRunner:
             text=True,
             check=False,
             ignore_errors=True,
+            env=env,
         )
 
         error_kind: str | None = None
@@ -176,6 +184,7 @@ class CoercerRunner:
         result.stderr = normalize_cli_output(result.stderr or "")
 
         return CoercerExecution(
+            auth_mode="kerberos" if use_kerberos else "smb",
             command=command,
             result=result,
             error_kind=error_kind,

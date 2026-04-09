@@ -17,6 +17,7 @@ from adscan_internal.services.attack_graph_service import (
 )
 from adscan_internal.services.ligolo_service import LigoloProxyService
 from adscan_internal.services.pivot_capability_registry import (
+    get_pivot_service_capability,
     list_pivot_service_capabilities,
 )
 from adscan_internal.services.service_access_probe_history import (
@@ -349,12 +350,23 @@ def maybe_offer_pivot_opportunity_followup(
                 continue
             handler = getattr(shell, f"ask_for_{item.service}_access", None)
             if callable(handler):
+                capability = get_pivot_service_capability(item.service)
                 print_warning(
                     f"Host-bound execution to {mark_sensitive(blocked_target, 'hostname')} is blocked. "
-                    f"Opening {item.service.upper()} follow-up on {mark_sensitive(item.host, 'hostname')} "
-                    "to pursue pivoting."
+                    f"Opening the {item.service.upper()} pivoting workflow on "
+                    f"{mark_sensitive(item.host, 'hostname')} to pursue pivoting. "
+                    "[This will run the pivoting branch only, not the full service-enumeration workflow.]"
                 )
-                handler(domain, item.host, item.username, item.credential)
+                if capability and capability.followup_workflow_intent:
+                    handler(
+                        domain,
+                        item.host,
+                        item.username,
+                        item.credential,
+                        workflow_intent=capability.followup_workflow_intent,
+                    )
+                else:
+                    handler(domain, item.host, item.username, item.credential)
         return
 
     if assessment.has_pending_candidate:
@@ -400,7 +412,7 @@ def maybe_offer_pivot_opportunity_followup(
                 password=item.credential,
                 services=[item.service],
                 hosts=[item.host],
-                prompt=False,
+                prompt=True,
                 scope_preference="optimized",
                 include_previously_tested=False,
             )
@@ -434,7 +446,7 @@ def maybe_offer_pivot_opportunity_followup(
                 password=item.credential,
                 services=[item.service],
                 hosts=[item.host],
-                prompt=False,
+                prompt=True,
                 scope_preference="optimized",
                 include_previously_tested=True,
             )

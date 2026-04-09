@@ -61,6 +61,14 @@ def get_last_ace_execution_outcome(shell: Any) -> dict[str, Any] | None:
     return get_last_execution_outcome(shell)
 
 
+def _consume_group_membership_operation_outcome(shell: Any) -> dict[str, Any]:
+    """Return one temporary add-member outcome emitted by the exploit wrapper."""
+    outcome = get_last_execution_outcome(shell) or {}
+    if str(outcome.get("key") or "").strip().lower() != "group_membership_operation":
+        return {}
+    return outcome
+
+
 def _normalize_account(value: str) -> str:
     name = strip_sensitive_markers(str(value or "")).strip()
     if "\\" in name:
@@ -755,6 +763,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 context.target_domain,
                 enumerate_aces_after=False,
             )
+            membership_outcome = _consume_group_membership_operation_outcome(shell)
             if result is True:
                 _set_last_ace_execution_outcome(
                     shell,
@@ -766,6 +775,12 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                         "added_user": changed_username,
                         "exec_username": context.exec_username,
                         "exec_password": context.exec_password,
+                        "cleanup_required": not bool(
+                            membership_outcome.get("already_member")
+                        ),
+                        "membership_already_present": bool(
+                            membership_outcome.get("already_member")
+                        ),
                     },
                 )
             return result
@@ -785,6 +800,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             context.target_domain,
             enumerate_aces_after=False,
         )
+        membership_outcome = _consume_group_membership_operation_outcome(shell)
         if result is True:
             _set_last_ace_execution_outcome(
                 shell,
@@ -796,6 +812,12 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     "added_user": context.exec_username,
                     "exec_username": context.exec_username,
                     "exec_password": context.exec_password,
+                    "cleanup_required": not bool(
+                        membership_outcome.get("already_member")
+                    ),
+                    "membership_already_present": bool(
+                        membership_outcome.get("already_member")
+                    ),
                 },
             )
         return result
@@ -815,6 +837,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             context.target_domain,
             enumerate_aces_after=False,
         )
+        membership_outcome = _consume_group_membership_operation_outcome(shell)
         if result is True:
             _set_last_ace_execution_outcome(
                 shell,
@@ -826,6 +849,12 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     "added_user": changed_username,
                     "exec_username": context.exec_username,
                     "exec_password": context.exec_password,
+                    "cleanup_required": not bool(
+                        membership_outcome.get("already_member")
+                    ),
+                    "membership_already_present": bool(
+                        membership_outcome.get("already_member")
+                    ),
                 },
             )
         return result

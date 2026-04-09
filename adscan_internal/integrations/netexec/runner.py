@@ -16,6 +16,7 @@ from adscan_internal import (
     print_info,
     print_info_debug,
     print_instruction,
+    print_panel,
     print_warning,
     print_warning_debug,
     print_warning_verbose,
@@ -33,15 +34,32 @@ from adscan_internal.execution_outcomes import (
     output_has_exact_ldap_connection_timeout,
     result_is_timeout,
 )
+from adscan_internal.integrations.auth_policy import (
+    build_netexec_kerberos_command,
+    build_netexec_ntlm_command,
+    netexec_can_use_kerberos,
+    output_indicates_kerberos_auth_failure,
+    output_indicates_kerberos_invalid_credentials,
+    output_indicates_ntlm_disabled,
+    resolve_netexec_auth_policy_decision,
+)
+from adscan_internal.integrations.netexec.parsers import (
+    parse_netexec_delegated_auth_failure,
+)
 from adscan_internal.integrations.netexec.timeouts import (
     resolve_extended_timeout_seconds,
 )
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
+from adscan_internal.reporting_compat import load_optional_report_service_attr
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
 )
 from adscan_internal.text_utils import normalize_cli_output
+from adscan_internal.services.auth_posture_service import (
+    record_ntlm_disabled_signal,
+    record_ntlm_enabled_signal,
+)
 
 ExecutionResult = subprocess.CompletedProcess[str]
 
@@ -63,6 +81,107 @@ def _is_netexec_autoquote_enabled() -> bool:
     """Return whether NetExec path-like argument auto-quoting is enabled."""
     value = os.getenv("ADSCAN_NETEXEC_AUTOQUOTE", "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def _notify_ntlm_disabled_prioritize_kerberos(
+    *,
+    domain: str | None,
+    protocol: str | None,
+    source: str,
+) -> None:
+    """Render one-time UX notice when NTLM appears disabled for one domain."""
+    marked_domain = mark_sensitive(str(domain or "unknown"), "domain")
+    protocol_label = str(protocol or "domain services").upper()
+    print_panel(
+        (
+            f"ADscan detected that NTLM appears disabled or unsupported for {marked_domain}.\n\n"
+            f"Evidence source: {source}\n"
+            f"Protocol scope: {protocol_label}\n\n"
+            "From this point on, ADscan will prioritize Kerberos for compatible authenticated "
+            "operations in this domain and only fall back when necessary."
+        ),
+        title="Authentication Posture Updated",
+        border_style="cyan",
+        expand=False,
+    )
+    print_info(
+        "Authentication posture updated: "
+        f"{marked_domain} will now prefer Kerberos for compatible authenticated operations."
+    )
+
+
+def _log_netexec_attempt_result(proc: subprocess.CompletedProcess[str]) -> None:
+    """Emit concise execution summary and output preview for one attempt.
+
+    This must run before auth-mode fallback breaks so operators can inspect the
+    failed Kerberos or NTLM attempt that triggered the retry.
+    """
+    try:
+        exit_code, stdout_count, stderr_count, duration_text = summarize_execution_result(
+            proc
+        )
+        print_info_debug(
+            "[netexec] Result: "
+            f"exit_code={exit_code}, "
+            f"stdout_lines={stdout_count}, "
+            f"stderr_lines={stderr_count}, "
+            f"duration={duration_text}"
+        )
+        preview_text = build_execution_output_preview(
+            proc,
+            stdout_head=20,
+            stdout_tail=20,
+            stderr_head=20,
+            stderr_tail=20,
+        )
+        if preview_text:
+            print_info_debug("[netexec] Output preview:\n" + preview_text, panel=True)
+    except Exception:
+        # Never let logging failures affect command flow.
+        pass
+
+
+def _sync_ntlm_control_evidence(
+    state_owner: Any,
+    *,
+    domain: str | None,
+    protocol: str | None,
+    status: str,
+    source: str,
+    message: str | None = None,
+) -> None:
+    """Persist positive/neutral NTLM posture evidence to technical_report.json."""
+    domain_name = str(domain or "").strip()
+    if not domain_name:
+        return
+
+    record_control_evidence = load_optional_report_service_attr(
+        "record_control_evidence",
+        action="Control evidence sync",
+        debug_printer=print_info_debug,
+        prefix="[auth-posture]",
+    )
+    if not callable(record_control_evidence):
+        return
+
+    try:
+        record_control_evidence(
+            state_owner,
+            domain_name,
+            key="ntlm_likely_disabled",
+            title="NTLM Likely Disabled or Unsupported",
+            category="Authentication Posture",
+            status=status,
+            details={
+                "confidence": "heuristic",
+                "source": source,
+                "protocol": str(protocol or "").strip().lower() or None,
+                "message": str(message or "").strip()[:500] or None,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - best effort sync
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[auth-posture] Failed to sync NTLM control evidence: {exc}")
 
 
 def _quote_path_like_netexec_args(command: str) -> str:
@@ -164,6 +283,40 @@ class NetExecRunner:
 
     def __init__(self, *, command_runner: CommandRunner) -> None:
         self._command_runner = command_runner
+
+    @staticmethod
+    def _print_delegated_smb_status_more_processing_required_guidance(
+        *,
+        command: str,
+        failure_line: str,
+    ) -> None:
+        """Render operator guidance for delegated SMB STATUS_MORE_PROCESSING_REQUIRED."""
+        print_warning(
+            "NetExec delegated SMB authentication hit "
+            "`STATUS_MORE_PROCESSING_REQUIRED`, which ADscan treats as a known "
+            "NetExec/Impacket client-side failure mode for this path."
+        )
+        print_panel(
+            (
+                "The delegated SMB session did not complete cleanly, so ADscan "
+                "cannot trust this command result.\n\n"
+                f"NetExec output: {failure_line}\n\n"
+                "Current guidance:\n"
+                "- There is no reliable client-side fix in ADscan for this "
+                "specific delegated SMB handshake failure.\n"
+                "- In CTF/lab environments, rebooting or resetting the target "
+                "machine is the only known practical workaround before retrying.\n"
+                "- If reset is not possible, use another follow-up route instead "
+                "of retrying the same delegated SMB path."
+            ),
+            title="Delegated SMB Command Blocked",
+            border_style="yellow",
+            expand=False,
+        )
+        print_info_debug(
+            "[netexec] delegated SMB command degraded to failure due to "
+            f"STATUS_MORE_PROCESSING_REQUIRED: {command}"
+        )
 
     def run(
         self,
@@ -304,8 +457,7 @@ class NetExecRunner:
 
         max_retries = 3
         current_command = command
-        kerberos_fallback_command: str | None = None
-        kerberos_forced = False
+        command_started_with_kerberos = " -k " in f" {command} "
         max_clock_skew_sync_attempts = 3
         clock_skew_sync_attempts = 0
         schema_mismatch_cleanup_attempts = 0
@@ -317,60 +469,6 @@ class NetExecRunner:
             except ValueError:
                 return " ldap " in f" {cmd} "
             return "ldap" in argv
-
-        def _should_force_kerberos(cmd: str) -> bool:
-            try:
-                argv = shlex.split(cmd)
-            except ValueError:
-                return False
-            if "-k" in argv:
-                return False
-            if "--local-auth" in argv or "-no-pass" in argv:
-                return False
-            has_domain = "-d" in argv or "--domain" in argv
-            if not has_domain:
-                return False
-            if "-u" not in argv:
-                return False
-            try:
-                u_idx = argv.index("-u")
-                username = argv[u_idx + 1]
-            except (ValueError, IndexError):
-                return False
-            if username.strip().strip("'\"") == "":
-                return False
-            if "-p" not in argv and "-H" not in argv:
-                return False
-            if "-p" in argv:
-                try:
-                    p_idx = argv.index("-p")
-                    password = argv[p_idx + 1]
-                except (ValueError, IndexError):
-                    return False
-                if password.strip().strip("'\"") == "":
-                    return False
-            if "-H" in argv:
-                try:
-                    h_idx = argv.index("-H")
-                    nt_hash = argv[h_idx + 1]
-                except (ValueError, IndexError):
-                    return False
-                if nt_hash.strip().strip("'\"") == "":
-                    return False
-            return True
-
-        def _has_kerberos_auth_failure(output: str) -> bool:
-            patterns = (
-                "KDC_ERR_PREAUTH_FAILED",
-                "KRB_AP_ERR",
-                "KDC_ERR",
-                "STATUS_LOGON_FAILURE",
-                "STATUS_NOT_SUPPORTED",
-                "STATUS_ACCOUNT_RESTRICTION",
-                "STATUS_PASSWORD_EXPIRED",
-            )
-            upper = output.upper()
-            return any(token in upper for token in patterns)
 
         def _has_connection_reset_by_peer(output: str) -> bool:
             return "CONNECTION RESET BY PEER" in output.upper()
@@ -453,29 +551,97 @@ class NetExecRunner:
 
             return shlex.join(fallback_argv)
 
-        if _should_force_kerberos(current_command):
-            kerberos_forced = True
-            kerberos_fallback_command = current_command
-            print_info_debug(
-                "[netexec] Kerberos-first enabled, but command lacks -k; "
-                "leaving command unchanged to avoid breaking modules/protocols. "
-                "If NTLM is disabled, this command may fail."
-            )
-
         while True:
             needs_retry = False
             schema_mismatch_detected = False
+            netexec_auth_decision = (
+                resolve_netexec_auth_policy_decision(
+                    command=current_command,
+                    domains_data=getattr(ctx.state_owner, "domains_data", None),
+                    domain=effective_domain,
+                    protocol=effective_service,
+                    domain_configured=ctx.is_domain_configured(str(effective_domain))
+                    if effective_domain is not None
+                    else False,
+                    target_count=effective_target_count,
+                )
+                if effective_domain is not None
+                else None
+            )
+
+            print_info_debug(
+                "[netexec] Auth policy: "
+                f"domain={mark_sensitive(str(effective_domain), 'domain') if effective_domain is not None else 'unknown'} "
+                f"protocol={effective_service or 'unknown'} "
+                f"ntlm_status={netexec_auth_decision.ntlm_status if netexec_auth_decision is not None else 'unknown'} "
+                f"kerberos_first={netexec_auth_decision.prefer_kerberos if netexec_auth_decision is not None else False!r} "
+                f"reason={netexec_auth_decision.reason if netexec_auth_decision is not None else 'missing_domain'}"
+            )
+
+            if (
+                not command_started_with_kerberos
+                and "-k" not in f" {current_command} "
+                and effective_domain is not None
+                and netexec_auth_decision is not None
+                and netexec_auth_decision.prefer_kerberos
+                and netexec_can_use_kerberos(current_command)
+                and not getattr(ctx.state_owner, "_netexec_kerberos_first_attempted", False)
+            ):
+                kerberos_first_command = build_netexec_kerberos_command(current_command)
+                if kerberos_first_command and kerberos_first_command != current_command:
+                    setattr(ctx.state_owner, "_netexec_kerberos_first_attempted", True)
+                    print_info_debug(
+                        "[netexec] Kerberos-first initial command selected: "
+                        f"reason={netexec_auth_decision.reason} command={kerberos_first_command}"
+                    )
+                    current_command = kerberos_first_command
 
             for retry_attempt in range(1, max_retries + 1):
                 proc = _execute_command_internal(current_command)
                 if not isinstance(proc, subprocess.CompletedProcess):
                     return proc
+                attempt_result_logged = False
+
+                def _log_attempt_once() -> None:
+                    nonlocal attempt_result_logged
+                    if attempt_result_logged:
+                        return
+                    _log_netexec_attempt_result(proc)
+                    attempt_result_logged = True
 
                 stdout_clean = normalize_cli_output(proc.stdout or "")
                 stderr_clean = normalize_cli_output(proc.stderr or "")
                 proc.stdout = stdout_clean
                 proc.stderr = stderr_clean
                 combined_output = stdout_clean + stderr_clean
+                delegated_auth_failure = parse_netexec_delegated_auth_failure(
+                    combined_output
+                )
+                if (
+                    delegated_auth_failure is not None
+                    and delegated_auth_failure.status
+                    == "STATUS_MORE_PROCESSING_REQUIRED"
+                ):
+                    self._print_delegated_smb_status_more_processing_required_guidance(
+                        command=current_command,
+                        failure_line=delegated_auth_failure.line,
+                    )
+                    synthesized_stderr = (stderr_clean or "").strip()
+                    if synthesized_stderr:
+                        synthesized_stderr += "\n"
+                    synthesized_stderr += (
+                        "[ADSCAN] NETEXEC_DELEGATED_SMB_STATUS_MORE_PROCESSING_REQUIRED\n"
+                        + delegated_auth_failure.line
+                    )
+                    proc = subprocess.CompletedProcess(
+                        args=proc.args,
+                        returncode=1,
+                        stdout=stdout_clean,
+                        stderr=synthesized_stderr,
+                    )
+                    stdout_clean = proc.stdout or ""
+                    stderr_clean = proc.stderr or ""
+                    combined_output = stdout_clean + stderr_clean
                 has_exact_ldap_connection_timeout = _is_ldap_command(
                     current_command
                 ) and output_has_exact_ldap_connection_timeout(combined_output)
@@ -508,6 +674,7 @@ class NetExecRunner:
                     and not has_service_line
                     and retry_attempt < max_retries
                 ):
+                    _log_attempt_once()
                     print_warning_verbose(
                         "NetExec is initializing its workspace (first run detected). "
                         f"Retrying command ({retry_attempt}/{max_retries})..."
@@ -515,25 +682,122 @@ class NetExecRunner:
                     time.sleep(1.0)
                     continue
 
-                if kerberos_forced and kerberos_fallback_command:
-                    if current_command.endswith(" -k") and _has_kerberos_auth_failure(
+                if " -k " not in f" {current_command} ":
+                    if output_indicates_ntlm_disabled(combined_output):
+                        posture_update = record_ntlm_disabled_signal(
+                            getattr(ctx.state_owner, "domains_data", None),
+                            domain=effective_domain,
+                            protocol=effective_service,
+                            source="netexec",
+                            signal="ntlm_disabled",
+                            message=combined_output.strip()[:500],
+                        )
+                        print_info_debug(
+                            "[netexec] Observed NTLM-disabled signal: "
+                            f"domain={mark_sensitive(str(effective_domain), 'domain') if effective_domain is not None else 'unknown'} "
+                            f"protocol={effective_service or 'unknown'} "
+                            "new_ntlm_status=likely_disabled "
+                            "action=recorded"
+                        )
+                        if posture_update is not None and posture_update.should_notify_user:
+                            _notify_ntlm_disabled_prioritize_kerberos(
+                                domain=effective_domain,
+                                protocol=effective_service,
+                                source="NetExec",
+                            )
+                        if posture_update is not None:
+                            _sync_ntlm_control_evidence(
+                                ctx.state_owner,
+                                domain=effective_domain,
+                                protocol=effective_service,
+                                status="observed",
+                                source="netexec",
+                                message=combined_output.strip()[:500],
+                            )
+
+                    kerberos_retry_attempted = getattr(
+                        ctx.state_owner,
+                        "_netexec_ntlm_disabled_kerberos_retry_attempted",
+                        False,
+                    )
+                    if not kerberos_retry_attempted and output_indicates_ntlm_disabled(
                         combined_output
                     ):
-                        fallback_attempted = getattr(
-                            ctx.state_owner,
-                            "_netexec_kerberos_fallback_attempted",
-                            False,
+                        kerberos_retry_command = build_netexec_kerberos_command(
+                            current_command
                         )
-                        if not fallback_attempted:
+                        if kerberos_retry_command and kerberos_retry_command != current_command:
                             setattr(
                                 ctx.state_owner,
-                                "_netexec_kerberos_fallback_attempted",
+                                "_netexec_ntlm_disabled_kerberos_retry_attempted",
                                 True,
                             )
+                            _log_attempt_once()
                             print_warning(
-                                "Kerberos authentication failed. Retrying with NTLM fallback."
+                                "NetExec reported NTLM is disabled or unsupported. Retrying with Kerberos (-k)."
                             )
-                            current_command = kerberos_fallback_command
+                            print_info_debug(
+                                "[netexec] NTLM-disabled Kerberos retry command: "
+                                f"reason=ntlm_disabled_signal command={kerberos_retry_command}"
+                            )
+                            current_command = kerberos_retry_command
+                            needs_retry = True
+                            break
+                    if proc.returncode == 0 and combined_output.strip():
+                        record_ntlm_enabled_signal(
+                            getattr(ctx.state_owner, "domains_data", None),
+                            domain=effective_domain,
+                            protocol=effective_service,
+                            source="netexec",
+                            message=combined_output.strip()[:500],
+                        )
+                        print_info_debug(
+                            "[netexec] Observed NTLM success signal: "
+                            f"domain={mark_sensitive(str(effective_domain), 'domain') if effective_domain is not None else 'unknown'} "
+                            f"protocol={effective_service or 'unknown'} "
+                            "new_ntlm_status=likely_enabled "
+                            "action=recorded"
+                        )
+                        _sync_ntlm_control_evidence(
+                            ctx.state_owner,
+                            domain=effective_domain,
+                            protocol=effective_service,
+                            status="contradicted",
+                            source="netexec",
+                            message=combined_output.strip()[:500],
+                        )
+                else:
+                    has_wrong_realm = "KDC_ERR_WRONG_REALM" in combined_output
+                    has_connection_reset = _has_connection_reset_by_peer(combined_output)
+                    kerberos_ntlm_fallback_attempted = getattr(
+                        ctx.state_owner,
+                        "_netexec_kerberos_first_ntlm_fallback_attempted",
+                        False,
+                    )
+                    if (
+                        not kerberos_ntlm_fallback_attempted
+                        and not has_wrong_realm
+                        and not has_connection_reset
+                        and not output_indicates_kerberos_invalid_credentials(
+                            combined_output
+                        )
+                        and output_indicates_kerberos_auth_failure(combined_output)
+                    ):
+                        ntlm_fallback_command = build_netexec_ntlm_command(current_command)
+                        if ntlm_fallback_command and ntlm_fallback_command != current_command:
+                            setattr(
+                                ctx.state_owner,
+                                "_netexec_kerberos_first_ntlm_fallback_attempted",
+                                True,
+                            )
+                            _log_attempt_once()
+                            print_warning(
+                                "NetExec Kerberos authentication failed. Retrying with NTLM."
+                            )
+                            print_info_debug(
+                                f"[netexec] Kerberos-first NTLM fallback command: {ntlm_fallback_command}"
+                            )
+                            current_command = ntlm_fallback_command
                             needs_retry = True
                             break
 
@@ -550,6 +814,7 @@ class NetExecRunner:
                             else ""
                         )
                         if retry_attempt < max_retries:
+                            _log_attempt_once()
                             print_warning(
                                 "No output received and redirected file "
                                 f"'{marked_redirected_file}' is empty or missing "
@@ -564,6 +829,7 @@ class NetExecRunner:
                         )
 
                 if has_empty_output and retry_attempt < max_retries:
+                    _log_attempt_once()
                     print_warning_verbose(
                         f"No output received from NetExec (attempt {retry_attempt}/{max_retries}). "
                         "Retrying command..."
@@ -584,6 +850,7 @@ class NetExecRunner:
                             "_netexec_no_output_kerberos_fallback_attempted",
                             True,
                         )
+                        _log_attempt_once()
                         print_warning(
                             "Kerberos NetExec command produced no output after repeated retries. "
                             "Retrying once with NTLM fallback."
@@ -627,6 +894,7 @@ class NetExecRunner:
                             print_warning(
                                 "Non-interactive mode detected; timeout recovery will not prompt."
                             )
+                        _log_attempt_once()
                         return proc
 
                     if timeout_recovery_attempts >= max_timeout_recovery_attempts:
@@ -634,6 +902,7 @@ class NetExecRunner:
                             "NetExec timeout recovery has already been attempted multiple times. "
                             "Stopping retries to avoid an infinite loop."
                         )
+                        _log_attempt_once()
                         return proc
 
                     extended_timeout = resolve_extended_timeout_seconds(
@@ -651,6 +920,7 @@ class NetExecRunner:
                         timeout_recovery_attempts += 1
                         current_timeout = extended_timeout
                         needs_retry = True
+                        _log_attempt_once()
                         print_info_debug(
                             "[netexec] Retrying after timeout with extended "
                             f"global_timeout={current_timeout}s"
@@ -664,11 +934,13 @@ class NetExecRunner:
                         timeout_recovery_attempts += 1
                         current_timeout = None
                         needs_retry = True
+                        _log_attempt_once()
                         print_info_debug(
                             "[netexec] Retrying after timeout with global_timeout=disabled"
                         )
                         break
 
+                    _log_attempt_once()
                     return proc
 
                 if has_exact_ldap_connection_timeout:
@@ -682,31 +954,7 @@ class NetExecRunner:
                         "LDAP did not complete successfully. Continue with non-LDAP "
                         "logic or re-run later when LDAP connectivity is stable."
                     )
-                    try:
-                        exit_code, stdout_count, stderr_count, duration_text = (
-                            summarize_execution_result(proc)
-                        )
-                        print_info_debug(
-                            "[netexec] Result: "
-                            f"exit_code={exit_code}, "
-                            f"stdout_lines={stdout_count}, "
-                            f"stderr_lines={stderr_count}, "
-                            f"duration={duration_text}"
-                        )
-                        preview_text = build_execution_output_preview(
-                            proc,
-                            stdout_head=20,
-                            stdout_tail=20,
-                            stderr_head=20,
-                            stderr_tail=20,
-                        )
-                        if preview_text:
-                            print_info_debug(
-                                "[netexec] Output preview:\n" + preview_text,
-                                panel=True,
-                            )
-                    except Exception:
-                        pass
+                    _log_attempt_once()
                     return build_ldap_exact_connection_timeout_completed_process(
                         current_command,
                         stdout=stdout_clean,
@@ -725,20 +973,7 @@ class NetExecRunner:
                 )
 
                 if has_netbios_timeout and retry_attempt < max_retries:
-                    try:
-                        stdout_lines = [
-                            line for line in stdout_clean.splitlines() if line.strip()
-                        ]
-                        stderr_lines = [
-                            line for line in stderr_clean.splitlines() if line.strip()
-                        ]
-                        print_info_debug(
-                            "[netexec] NETBIOS timeout output preview:\n"
-                            + "\n".join((stdout_lines + stderr_lines)[:30]),
-                            panel=True,
-                        )
-                    except Exception:
-                        pass
+                    _log_attempt_once()
                     print_warning_debug(
                         f"NETBIOS connection timeout detected (attempt {retry_attempt}/{max_retries}). "
                         "Retrying command..."
@@ -786,6 +1021,7 @@ class NetExecRunner:
                         "\n".join(preview_lines[-30:]) if preview_lines else ""
                     )
                     if preview_tail:
+                        _log_attempt_once()
                         print_info_debug(
                             "[netexec] NETBIOS timeout output preview (tail):\n"
                             + preview_tail,
@@ -808,6 +1044,7 @@ class NetExecRunner:
                                 ctx.state_owner, "_netexec_slow_retry_attempted", True
                             )
                             needs_retry = True
+                            _log_attempt_once()
                             current_command = _force_slow_netexec_settings(
                                 current_command
                             )
@@ -819,6 +1056,7 @@ class NetExecRunner:
                             False,
                         )
                         if skip_check:
+                            _log_attempt_once()
                             return subprocess.CompletedProcess(
                                 args=current_command,
                                 returncode=0,
@@ -859,6 +1097,7 @@ class NetExecRunner:
                             "💡 Try: `adscan check --fix` (repairs NetExec state/permissions) or manually run "
                             f"`sudo rm -rf {ctx.get_workspaces_dir()}` and re-run the command."
                         )
+                        _log_attempt_once()
                         return proc
                     print_warning(
                         "Schema mismatch detected in NetExec output. Cleaning NetExec workspaces and retrying."
@@ -872,9 +1111,11 @@ class NetExecRunner:
                             "💡 Try: `adscan check --fix` (repairs NetExec state/permissions) or manually run "
                             f"`sudo rm -rf {ctx.get_workspaces_dir()}` and re-run the command."
                         )
+                        _log_attempt_once()
                         return proc
                     needs_retry = True
                     schema_mismatch_detected = True
+                    _log_attempt_once()
                     break
 
                 if (
@@ -896,6 +1137,7 @@ class NetExecRunner:
                                 "_netexec_connection_reset_ntlm_fallback_attempted",
                                 True,
                             )
+                            _log_attempt_once()
                             print_warning(
                                 "Kerberos NetExec command hit 'Connection reset by peer'. "
                                 "Retrying once with NTLM fallback."
@@ -914,34 +1156,7 @@ class NetExecRunner:
                     and not has_wrong_realm
                     and not needs_retry
                 ):
-                    # Log a concise summary and truncated preview of the NetExec output.
-                    try:
-                        exit_code, stdout_count, stderr_count, duration_text = (
-                            summarize_execution_result(proc)
-                        )
-                        print_info_debug(
-                            "[netexec] Result: "
-                            f"exit_code={exit_code}, "
-                            f"stdout_lines={stdout_count}, "
-                            f"stderr_lines={stderr_count}, "
-                            f"duration={duration_text}"
-                        )
-
-                        preview_text = build_execution_output_preview(
-                            proc,
-                            stdout_head=20,
-                            stdout_tail=20,
-                            stderr_head=20,
-                            stderr_tail=20,
-                        )
-                        if preview_text:
-                            print_info_debug(
-                                "[netexec] Output preview:\n" + preview_text,
-                                panel=True,
-                            )
-                    except Exception:
-                        # Never let logging failures affect command flow
-                        pass
+                    _log_attempt_once()
 
                     return proc
 
@@ -965,6 +1180,7 @@ class NetExecRunner:
                             "KDC_ERR_WRONG_REALM persists after removing -k. "
                             "Not retrying further to avoid a loop."
                         )
+                        _log_attempt_once()
                     else:
                         try:
                             argv = shlex.split(retry_command)
@@ -979,6 +1195,7 @@ class NetExecRunner:
                                 "_netexec_wrong_realm_retry_attempted",
                                 True,
                             )
+                            _log_attempt_once()
                             print_warning(
                                 "KDC_ERR_WRONG_REALM detected. Retrying NetExec without "
                                 "Kerberos (-k) using NTLM."
@@ -989,11 +1206,13 @@ class NetExecRunner:
                                 "KDC_ERR_WRONG_REALM detected but command does not "
                                 "include -k. Cannot retry with NTLM fallback."
                             )
+                            _log_attempt_once()
                 if has_sched_error:
                     if "--exec-method atexec" in retry_command:
                         retry_command = retry_command.replace(
                             "--exec-method atexec", "--exec-method wmiexec"
                         )
+                        _log_attempt_once()
                         print_warning(
                             "atexec method failed. Changing to wmiexec and retrying."
                         )
@@ -1003,9 +1222,11 @@ class NetExecRunner:
                             "SCHED_S_TASK_HAS_NOT_RUN detected but command does not use "
                             "--exec-method atexec. Cannot automatically fix."
                         )
+                        _log_attempt_once()
 
                 if has_clock_skew:
                     if not effective_domain:
+                        _log_attempt_once()
                         print_warning(
                             "KRB_AP_ERR_SKEW detected in NetExec output but no domain is available "
                             "to synchronize the clock with the PDC."
@@ -1013,6 +1234,7 @@ class NetExecRunner:
                     else:
                         marked_domain = mark_sensitive(str(effective_domain), "domain")
                         if clock_skew_sync_attempts >= max_clock_skew_sync_attempts:
+                            _log_attempt_once()
                             print_warning(
                                 "KRB_AP_ERR_SKEW persists after multiple clock synchronization attempts. "
                                 "Stopping retries to avoid an infinite loop."
@@ -1024,6 +1246,7 @@ class NetExecRunner:
                             )
                         else:
                             clock_skew_sync_attempts += 1
+                            _log_attempt_once()
                             print_warning(
                                 "KRB_AP_ERR_SKEW detected when running NetExec. Attempting to synchronize "
                                 "the local clock with the PDC of domain "
@@ -1033,6 +1256,7 @@ class NetExecRunner:
                             if ctx.sync_clock_with_pdc(str(effective_domain)):
                                 needs_retry = True
                             else:
+                                _log_attempt_once()
                                 print_error(
                                     "Clock synchronization with the PDC of domain "
                                     f"'{marked_domain}' failed. NetExec command will not be retried for clock skew."
@@ -1044,6 +1268,7 @@ class NetExecRunner:
                         current_command = retry_command
                     break
 
+                _log_attempt_once()
                 return proc
 
             if not needs_retry:

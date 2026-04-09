@@ -51,14 +51,24 @@ def normalize_lab_name(value: str | None) -> str | None:
     return normalized
 
 
-def build_lab_slug(lab_provider: str | None, lab_name: str | None) -> str | None:
-    """Build canonical lab slug `provider/lab_name` for telemetry."""
+def build_lab_slug(
+    lab_provider: str | None,
+    lab_name: str | None,
+    lab_name_whitelisted: bool | None = None,
+) -> str | None:
+    """Build canonical lab slug `provider/lab_name` for telemetry.
+
+    When the provider is known but the machine is unknown or intentionally not
+    accepted into the public catalog, return `provider/unknown`.
+    """
     provider_norm = normalize_lab_provider(lab_provider)
     lab_name_norm = normalize_lab_name(lab_name)
-    if not provider_norm or not lab_name_norm:
+    if not provider_norm:
         return None
 
     provider_slug = _PROVIDER_SLUG_MAP.get(provider_norm, provider_norm)
+    if not lab_name_norm or lab_name_whitelisted is not True:
+        return f"{provider_slug}/unknown"
     lab_slug = re.sub(r"\s+", "_", lab_name_norm)
     return f"{provider_slug}/{lab_slug}"
 
@@ -76,6 +86,8 @@ def build_lab_telemetry_fields(
     Privacy policy:
     - `lab_name` is included only when explicitly whitelisted.
     - `lab_name_whitelisted` is included only when a lab name exists.
+    - `lab_slug` is emitted only from catalog-safe values. Unknown/custom labs
+      are normalized to `provider/unknown`.
     """
     fields: dict[str, Any] = {}
 
@@ -96,9 +108,13 @@ def build_lab_telemetry_fields(
         fields["lab_name_whitelisted"] = whitelisted_flag
 
     if include_slug:
-        slug_value = normalize_lab_name(lab_slug) if lab_slug else None
-        if not slug_value:
-            slug_value = build_lab_slug(provider_norm, name_norm)
+        slug_value = None
+        if whitelisted_flag is True:
+            slug_value = normalize_lab_name(lab_slug) if lab_slug else None
+            if not slug_value:
+                slug_value = build_lab_slug(provider_norm, name_norm, True)
+        elif provider_norm:
+            slug_value = build_lab_slug(provider_norm, None, False)
         if slug_value:
             fields["lab_slug"] = slug_value
 

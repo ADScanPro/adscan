@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,97 @@ from adscan_internal.rich_output import mark_sensitive, print_info_debug, print_
 
 class LDAPTransportValidationError(RuntimeError):
     """Raised when an LDAP connection opens but is not usable for queries."""
+
+
+@dataclass(frozen=True)
+class LDAPTargetEndpoints:
+    """Resolved LDAP transport and Kerberos target endpoints for one domain."""
+
+    dc_address: str | None
+    kerberos_target_hostname: str | None
+    dc_ip: str | None
+    dc_fqdn: str | None
+
+
+def _build_kerberos_aware_config_class(base_cls: type[Any]) -> type[Any]:
+    """Return a config class that carries an explicit Kerberos target host."""
+
+    class _KerberosAwareLDAPConfig(base_cls):  # type: ignore[misc,valid-type]
+        kerberos_target_hostname: str | None = None
+
+        def __init__(self, **kwargs: Any) -> None:
+            kerberos_target_hostname = kwargs.pop("kerberos_target_hostname", None)
+            super().__init__(**kwargs)
+            self.kerberos_target_hostname = kerberos_target_hostname
+
+    return _KerberosAwareLDAPConfig
+
+
+def _build_kerberos_aware_connection_class(base_cls: type[Any]) -> type[Any]:
+    """Return a connection class that forces the GSSAPI target hostname."""
+
+    class _KerberosAwareLDAPConnection(base_cls):  # type: ignore[misc,valid-type]
+        def _connect_kerberos(self) -> Any:
+            from ldap3 import Connection, SASL  # type: ignore
+
+            target_host = str(
+                getattr(self.config, "kerberos_target_hostname", None)
+                or self.config.server_address
+            ).strip()
+            return Connection(
+                self._server,
+                authentication=SASL,
+                sasl_mechanism="GSSAPI",
+                sasl_credentials=(target_host,),
+                auto_bind=False,
+            )
+
+    return _KerberosAwareLDAPConnection
+
+
+def resolve_ldap_target_endpoints(
+    *,
+    target_domain: str,
+    domain_data: Mapping[str, Any] | None,
+    kerberos_ready: bool,
+) -> LDAPTargetEndpoints:
+    """Resolve transport and Kerberos target endpoints for one domain.
+
+    Args:
+        target_domain: DNS domain name.
+        domain_data: Domain metadata loaded in the shell workspace.
+        kerberos_ready: Whether the caller intends to authenticate with Kerberos.
+
+    Returns:
+        Resolved transport target plus the FQDN that Kerberos should use for the
+        service principal name.
+    """
+
+    dc_fqdn = None
+    if isinstance(domain_data, Mapping):
+        dc_fqdn = domain_data.get("pdc_hostname_fqdn") or domain_data.get("pdc_fqdn")
+        if not dc_fqdn:
+            pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip()
+            if pdc_hostname:
+                dc_fqdn = (
+                    pdc_hostname
+                    if "." in pdc_hostname
+                    else f"{pdc_hostname}.{target_domain}"
+                )
+    dc_ip = (
+        str(domain_data.get("pdc") or "").strip()
+        if isinstance(domain_data, Mapping)
+        else ""
+    )
+    kerberos_target_hostname = str(dc_fqdn or "").strip() or None
+    _ = kerberos_ready
+    dc_address = dc_ip or str(dc_fqdn or "").strip() or None
+    return LDAPTargetEndpoints(
+        dc_address=dc_address,
+        kerberos_target_hostname=kerberos_target_hostname,
+        dc_ip=dc_ip or None,
+        dc_fqdn=str(dc_fqdn or "").strip() or None,
+    )
 
 
 def prepare_kerberos_ldap_environment(
@@ -146,6 +238,30 @@ def is_ldaps_transport_failure(exc: BaseException) -> bool:
     return False
 
 
+def is_kerberos_auth_failure(exc: BaseException) -> bool:
+    """Return whether one exception looks like a Kerberos/GSSAPI auth failure."""
+
+    indicators = (
+        "server not found in kerberos database",
+        "ticket expired",
+        "krb_ap_err",
+        "kerberos",
+        "gssapi",
+        "gsserror",
+        "preauthentication failed",
+        "no credentials were supplied",
+        "cannot find kdc",
+        "client not found in kerberos database",
+    )
+    for candidate in _walk_exception_chain(exc):
+        class_name = type(candidate).__name__.strip().lower()
+        message = str(candidate or "").strip().lower()
+        haystacks = (class_name, message)
+        if any(indicator in haystack for haystack in haystacks for indicator in indicators):
+            return True
+    return False
+
+
 def _validate_rootdse_query(connection: Any) -> None:
     """Ensure one LDAP connection can execute a minimal rootDSE query."""
     attempts = (
@@ -195,6 +311,9 @@ def execute_with_ldap_fallback(
     use_kerberos: bool = False,
     prefer_ldaps: bool = True,
     validate_connection: Callable[[Any], None] | None = None,
+    config_overrides: Mapping[str, Any] | None = None,
+    kerberos_target_hostname: str | None = None,
+    allow_password_fallback_on_kerberos_failure: bool = False,
 ) -> tuple[Any, bool]:
     """Execute one LDAP-backed callback with centralized LDAPS->LDAP fallback.
 
@@ -208,53 +327,96 @@ def execute_with_ldap_fallback(
     if prefer_ldaps:
         attempts.append(False)
 
+    marked_operation = mark_sensitive(operation_name, "path")
+    marked_domain = mark_sensitive(target_domain, "domain")
+    marked_dc = mark_sensitive(dc_address, "host")
     last_exc: Exception | None = None
-    final_result: Any | None = None
-    final_used_ldaps: bool | None = None
-    for use_ldaps in attempts:
-        transport = "LDAPS" if use_ldaps else "LDAP"
-        marked_operation = mark_sensitive(operation_name, "path")
-        marked_domain = mark_sensitive(target_domain, "domain")
-        marked_dc = mark_sensitive(dc_address, "host")
-        print_info_debug(
-            f"[ldap] Attempting {marked_operation} over {transport} for "
-            f"{marked_domain} via {marked_dc}"
-        )
-        config_kwargs: dict[str, Any] = {
-            "domain": target_domain,
-            "dc_ip": dc_address,
-            "use_ldaps": use_ldaps,
-            "use_kerberos": use_kerberos,
-        }
-        if not use_kerberos:
-            if not username or not password:
-                raise ValueError(
-                    f"{operation_name} with password auth requires username and password."
-                )
-            config_kwargs["username"] = username
-            config_kwargs["password"] = password
 
-        try:
-            config = config_cls(**config_kwargs)
-            with connection_cls(config) as connection:
-                validator = validate_connection or _validate_rootdse_query
-                validator(connection)
-                final_result = callback(connection)
-                final_used_ldaps = use_ldaps
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if use_ldaps and prefer_ldaps and is_ldaps_transport_failure(exc):
-                print_warning_debug(
-                    f"[ldap] {marked_operation} failed over LDAPS for {marked_domain}; "
-                    "retrying over LDAP"
-                )
-                continue
-            raise
-        if not use_ldaps:
+    auth_attempts: list[bool] = [use_kerberos]
+    can_retry_with_password = (
+        use_kerberos
+        and allow_password_fallback_on_kerberos_failure
+        and bool(str(username or "").strip())
+        and bool(str(password or "").strip())
+    )
+    if can_retry_with_password:
+        auth_attempts.append(False)
+
+    for use_kerberos_auth in auth_attempts:
+        effective_config_cls = config_cls
+        effective_connection_cls = connection_cls
+        if use_kerberos_auth and str(kerberos_target_hostname or "").strip():
+            effective_config_cls = _build_kerberos_aware_config_class(config_cls)
+            effective_connection_cls = _build_kerberos_aware_connection_class(connection_cls)
+
+        retry_with_password = False
+        for use_ldaps in attempts:
+            transport = "LDAPS" if use_ldaps else "LDAP"
+            auth_mode = "Kerberos" if use_kerberos_auth else "password"
             print_info_debug(
-                f"[ldap] LDAP fallback succeeded for {marked_operation} on {marked_domain}"
+                f"[ldap] Attempting {marked_operation} over {transport} for "
+                f"{marked_domain} via {marked_dc} using {auth_mode} auth"
             )
-        return final_result, bool(final_used_ldaps)
+            config_kwargs: dict[str, Any] = {
+                "domain": target_domain,
+                "dc_ip": dc_address,
+                "use_ldaps": use_ldaps,
+                "use_kerberos": use_kerberos_auth,
+            }
+            if isinstance(config_overrides, Mapping):
+                config_kwargs.update(dict(config_overrides))
+            if use_kerberos_auth and str(kerberos_target_hostname or "").strip():
+                config_kwargs["kerberos_target_hostname"] = str(
+                    kerberos_target_hostname
+                ).strip()
+            if not use_kerberos_auth:
+                if not username or not password:
+                    raise ValueError(
+                        f"{operation_name} with password auth requires username and password."
+                    )
+                config_kwargs["username"] = username
+                config_kwargs["password"] = password
+
+            try:
+                config = effective_config_cls(**config_kwargs)
+                with effective_connection_cls(config) as connection:
+                    validator = validate_connection or _validate_rootdse_query
+                    validator(connection)
+                    result = callback(connection)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if use_ldaps and prefer_ldaps and is_ldaps_transport_failure(exc):
+                    print_warning_debug(
+                        f"[ldap] {marked_operation} failed over LDAPS for {marked_domain}; "
+                        "retrying over LDAP"
+                    )
+                    continue
+                if (
+                    use_kerberos_auth
+                    and can_retry_with_password
+                    and is_kerberos_auth_failure(exc)
+                ):
+                    print_warning_debug(
+                        f"[ldap] {marked_operation} Kerberos auth failed for {marked_domain} "
+                        f"via {marked_dc}; retrying with password bind"
+                    )
+                    retry_with_password = True
+                    break
+                raise
+
+            if not use_ldaps:
+                print_info_debug(
+                    f"[ldap] LDAP fallback succeeded for {marked_operation} on {marked_domain}"
+                )
+            if not use_kerberos_auth and use_kerberos:
+                print_info_debug(
+                    f"[ldap] Password bind fallback succeeded for {marked_operation} on "
+                    f"{marked_domain}"
+                )
+            return result, bool(use_ldaps)
+
+        if retry_with_password:
+            continue
 
     if last_exc is not None:
         raise last_exc

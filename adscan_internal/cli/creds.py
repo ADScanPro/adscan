@@ -378,6 +378,14 @@ def select_cred(shell: Any, domain: str) -> None:
     print_success_verbose(
         f"Credentials for '[bold]{selected_user}[/bold]' verified successfully for domain [bold]{marked_domain}[/bold]."
     )
+    _ensure_verified_domain_credential_ticket(
+        shell,
+        domain=domain,
+        user=selected_user,
+        credential=cred_value,
+        ui_silent=False,
+        ensure_fresh_kerberos_ticket=True,
+    )
 
     handle_auth_and_optional_privs(
         shell,
@@ -385,6 +393,96 @@ def select_cred(shell: Any, domain: str) -> None:
         [(selected_user, cred_value)],
         prompt_for_user_privs_after=True,
     )
+
+
+def _ensure_verified_domain_credential_ticket(
+    shell: Any,
+    *,
+    domain: str,
+    user: str,
+    credential: str,
+    ui_silent: bool,
+    ensure_fresh_kerberos_ticket: bool,
+) -> None:
+    """Refresh or create the Kerberos ticket for one verified domain credential."""
+    from adscan_internal.services.credential_store_service import (
+        CredentialStoreService,
+    )
+
+    store_service = CredentialStoreService()
+    is_explicit_blank_password = credential == ""
+    try:
+        existing_ticket = store_service.get_kerberos_ticket(
+            domains_data=shell.domains_data,
+            domain=domain,
+            username=user,
+        )
+        if is_explicit_blank_password:
+            marked_user = mark_sensitive(user, "user")
+            marked_domain = mark_sensitive(domain, "domain")
+            print_info_debug(
+                "[kerberos] Skipping Kerberos ticket generation for "
+                f"{marked_user}@{marked_domain} because the credential is a blank password."
+            )
+            return
+        if existing_ticket and not ensure_fresh_kerberos_ticket:
+            marked_user = mark_sensitive(user, "user")
+            marked_domain = mark_sensitive(domain, "domain")
+            marked_ticket = mark_sensitive(existing_ticket, "path")
+            print_info_verbose(
+                f"Kerberos ticket already registered for {marked_user}@{marked_domain}; "
+                f"skipping auto-generation (ticket={marked_ticket})."
+            )
+            return
+        if existing_ticket and ensure_fresh_kerberos_ticket:
+            marked_user = mark_sensitive(user, "user")
+            marked_domain = mark_sensitive(domain, "domain")
+            marked_ticket = mark_sensitive(existing_ticket, "path")
+            print_info_verbose(
+                f"Refreshing Kerberos ticket for {marked_user}@{marked_domain} "
+                f"(existing_ticket={marked_ticket})."
+            )
+
+        dc_ip = None
+        if "dc_ip" in shell.domains_data.get(domain, {}):
+            dc_ip = shell.domains_data[domain]["dc_ip"]
+        ccache_file = shell._auto_generate_kerberos_ticket(
+            user, credential, domain, dc_ip
+        )
+        marked_user = mark_sensitive(user, "user")
+        marked_domain = mark_sensitive(domain, "domain")
+        if ccache_file:
+            store_service.store_kerberos_ticket(
+                domains_data=shell.domains_data,
+                domain=domain,
+                username=user,
+                ticket_path=ccache_file,
+            )
+            if not ui_silent:
+                print_info(
+                    f"Kerberos ticket generated for {marked_user}@{marked_domain}"
+                )
+            else:
+                print_info_verbose(
+                    f"[ui_silent] Kerberos ticket generated for {marked_user}@{marked_domain}"
+                )
+        else:
+            if not ui_silent:
+                print_warning(
+                    f"Could not generate Kerberos ticket for {marked_user}@{marked_domain}"
+                )
+            else:
+                print_info_verbose(
+                    f"[ui_silent] Could not generate Kerberos ticket for {marked_user}@{marked_domain}"
+                )
+    except Exception as e:  # noqa: BLE001
+        telemetry.capture_exception(e)
+        marked_user = mark_sensitive(user, "user")
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            f"[kerberos] Error while handling Kerberos ticket for "
+            f"{marked_user}@{marked_domain}: {e}"
+        )
 
 
 def handle_auth_and_optional_privs(
@@ -1686,87 +1784,14 @@ def add_credential(
                     f"{mark_sensitive(user, 'user')}@{mark_sensitive(domain, 'domain')}: {_bh_exc}"
                 )
 
-            try:
-                existing_ticket = store_service.get_kerberos_ticket(
-                    domains_data=shell.domains_data,
-                    domain=domain,
-                    username=user,
-                )
-                if is_explicit_blank_password:
-                    marked_user = mark_sensitive(user, "user")
-                    marked_domain = mark_sensitive(domain, "domain")
-                    print_info_debug(
-                        "[add_credential] Skipping Kerberos ticket generation for "
-                        f"{marked_user}@{marked_domain} because the credential is a blank password."
-                    )
-                elif existing_ticket and not ensure_fresh_kerberos_ticket:
-                    marked_user = mark_sensitive(user, "user")
-                    marked_domain = mark_sensitive(domain, "domain")
-                    marked_ticket = mark_sensitive(existing_ticket, "path")
-                    print_info_verbose(
-                        f"Kerberos ticket already registered for {marked_user}@{marked_domain}; "
-                        f"skipping auto-generation (ticket={marked_ticket})."
-                    )
-                else:
-                    if existing_ticket and ensure_fresh_kerberos_ticket:
-                        marked_user = mark_sensitive(user, "user")
-                        marked_domain = mark_sensitive(domain, "domain")
-                        marked_ticket = mark_sensitive(existing_ticket, "path")
-                        print_info_verbose(
-                            f"Refreshing Kerberos ticket for {marked_user}@{marked_domain} "
-                            f"(existing_ticket={marked_ticket})."
-                        )
-
-                    # Try to get DC IP from domain data if available
-                    dc_ip = None
-                    if "dc_ip" in shell.domains_data.get(domain, {}):
-                        dc_ip = shell.domains_data[domain]["dc_ip"]
-
-                    ccache_file = shell._auto_generate_kerberos_ticket(
-                        user, cred, domain, dc_ip
-                    )
-                    if ccache_file:
-                        # Store ccache file path using the service
-                        store_service.store_kerberos_ticket(
-                            domains_data=shell.domains_data,
-                            domain=domain,
-                            username=user,
-                            ticket_path=ccache_file,
-                        )
-
-                        marked_user = mark_sensitive(user, "user")
-                        marked_domain = mark_sensitive(domain, "domain")
-                        if not ui_silent:
-                            print_info(
-                                f"Kerberos ticket generated for {marked_user}@{marked_domain}"
-                            )
-                        else:
-                            print_info_verbose(
-                                f"[ui_silent] Kerberos ticket generated for {marked_user}@{marked_domain}"
-                            )
-                    else:
-                        marked_user = mark_sensitive(user, "user")
-                        marked_domain = mark_sensitive(domain, "domain")
-                        if not ui_silent:
-                            print_warning(
-                                f"Could not generate Kerberos ticket for {marked_user}@{marked_domain}"
-                            )
-                        else:
-                            print_info_verbose(
-                                f"[ui_silent] Could not generate Kerberos ticket for {marked_user}@{marked_domain}"
-                            )
-            except Exception as e:
-                telemetry.capture_exception(e)
-                marked_user = mark_sensitive(user, "user")
-                marked_domain = mark_sensitive(domain, "domain")
-                if not ui_silent:
-                    print_error(
-                        f"Kerberos ticket generation skipped for {marked_user}@{marked_domain}: {e}"
-                    )
-                else:
-                    print_info_verbose(
-                        f"[ui_silent] Kerberos ticket generation skipped for {marked_user}@{marked_domain}: {e}"
-                    )
+            _ensure_verified_domain_credential_ticket(
+                shell,
+                domain=domain,
+                user=user,
+                credential=cred,
+                ui_silent=ui_silent,
+                ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
+            )
 
             # Set shell.domain and proceed with enumeration if applicable.
             if hasattr(shell, "domain"):

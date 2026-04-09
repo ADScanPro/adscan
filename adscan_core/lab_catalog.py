@@ -17,8 +17,6 @@ CTF_LAB_PROVIDER_OPTIONS: tuple[str, ...] = (
     "VulnHub",
     "GOAD",
     "Proving Grounds",
-    "Other lab environment",
-    "Local practice only",
 )
 
 
@@ -30,8 +28,6 @@ _PROVIDER_DISPLAY_TO_CANONICAL: dict[str, str] = {
     "VulnHub": "vulnhub",
     "GOAD": "goad",
     "Proving Grounds": "proving_grounds",
-    "Other lab environment": "other",
-    "Local practice only": "local_test",
 }
 
 _PROVIDER_DISPLAY_LOOKUP: dict[str, str] = {

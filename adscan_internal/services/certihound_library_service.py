@@ -8,14 +8,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-import logging
 
 from adscan_internal import print_warning, print_warning_debug, telemetry
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.ldap_transport_service import execute_with_ldap_fallback
-
-
-logger = logging.getLogger(__name__)
 
 
 def _load_certihound_library() -> tuple[Any, Any, Any, Any]:
@@ -54,6 +50,7 @@ class CertiHoundLibraryService(BaseService):
         *,
         target_domain: str,
         dc_address: str,
+        kerberos_target_hostname: str | None = None,
         output_dir: str,
         zip_filename: str,
         username: str | None = None,
@@ -110,6 +107,10 @@ class CertiHoundLibraryService(BaseService):
                 password=password,
                 use_kerberos=use_kerberos,
                 prefer_ldaps=use_ldaps,
+                kerberos_target_hostname=kerberos_target_hostname,
+                allow_password_fallback_on_kerberos_failure=bool(
+                    str(username or "").strip() and str(password or "").strip()
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -117,7 +118,6 @@ class CertiHoundLibraryService(BaseService):
             print_warning_debug(
                 f"CertiHound library collection failure: {type(exc).__name__}: {exc}"
             )
-            logger.exception("CertiHound library collection failure")
             return None
 
         return str(output_path)

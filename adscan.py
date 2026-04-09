@@ -9860,7 +9860,11 @@ class PentestShell:
         """
         from adscan_core.lab_context import build_lab_slug
 
-        return build_lab_slug(self.lab_provider, self.lab_name)
+        return build_lab_slug(
+            self.lab_provider,
+            self.lab_name,
+            getattr(self, "lab_name_whitelisted", None),
+        )
 
     def _get_workspace_cwd(self) -> str:
         """Return the workspace directory to use for filesystem operations."""
@@ -9913,7 +9917,7 @@ class PentestShell:
         Args:
             prompt_text (str): Prompt message to display
             lab_options (list): List of lab names to choose from
-            allow_custom (bool): If True, allows user to type a custom name
+            allow_custom (bool): Deprecated. Custom names are no longer accepted.
 
         Returns:
             str | None: Selected lab name or None if cancelled
@@ -9982,26 +9986,15 @@ class PentestShell:
             if selected in lab_options:
                 return selected
 
-            # If allow_custom and not found, confirm custom entry with option to go back
-            if allow_custom:
-                # Confirm is already imported at module level
-                print_info(f"'{selected}' not in list.")
-                use_custom = Confirm.ask("Use as custom lab name?", default=True)
-                if use_custom:
-                    return selected
-                # If user says no, go directly back to search without asking
-                # Recursively call self to allow user to try again
-                return self._fuzzy_select_lab(prompt_text, lab_options, allow_custom)
-            if not allow_custom:
-                # Suggest closest match
-                from difflib import get_close_matches
+            # Only catalog-backed labs are accepted. Suggest a close match or abort.
+            from difflib import get_close_matches
 
-                matches = get_close_matches(selected, lab_options, n=1, cutoff=0.6)
-                if matches:
-                    if Confirm.ask(f"Did you mean '{matches[0]}'?", default=True):
-                        return matches[0]
-                print_warning(f"'{selected}' not found in lab list")
-                return None
+            matches = get_close_matches(selected, lab_options, n=1, cutoff=0.6)
+            if matches:
+                if Confirm.ask(f"Did you mean '{matches[0]}'?", default=True):
+                    return matches[0]
+            print_warning(f"'{selected}' not found in lab list")
+            return None
 
         except ImportError:
             # Fallback to simple prompt if prompt_toolkit prompt not available
@@ -14997,9 +14990,15 @@ class PentestShell:
             return True
 
         if status == CredentialStatus.INVALID:
+            should_offer_spraying = False
+            spraying_failure_detail = "incorrect credentials"
+
             # Distinguish generic invalid creds from pre-auth failure to keep the
-            # spraying UX aligned with the legacy behaviour.
+            # user-facing explanation precise while still exposing the same
+            # spraying shortcut for password-based secrets.
             if result.error_message == "Pre-authentication failed":
+                should_offer_spraying = True
+                spraying_failure_detail = "pre-authentication failed"
                 marked_cred_value = mark_sensitive(cred_value, "password")
                 if not ui_silent:
                     print_error(
@@ -15048,6 +15047,36 @@ class PentestShell:
                 print_info_verbose(
                     f"[ui_silent] Logon failure for user {marked_user} on domain {marked_domain_name}."
                 )
+
+            should_offer_spraying = True
+            from adscan_internal.services.credential_store_service import (
+                CredentialStoreService,
+            )
+
+            if (
+                should_offer_spraying
+                and not CredentialStoreService._looks_like_ntlm_hash(cred_value)
+            ):
+                if not ui_silent:
+                    respuesta = Confirm.ask(
+                        "Would you like to perform a password spraying with this password?",
+                        default=True,
+                    )
+                    if respuesta:
+                        self.spraying_with_password(
+                            domain_name,
+                            cred_value,
+                            source_context={
+                                "auth_username": user,
+                                "origin": "credential_validation",
+                                "verification_failure": spraying_failure_detail,
+                            },
+                            source_steps=source_steps,
+                        )
+                else:
+                    print_info_verbose(
+                        "[ui_silent] Password spraying prompt suppressed."
+                    )
             return False
 
         if status == CredentialStatus.ACCOUNT_LOCKED:
@@ -15349,7 +15378,15 @@ class PentestShell:
 
         return _ask_for_search_adcs(self, domain)
 
-    def _detect_adcs(self, domain, *, silent=False, emit_telemetry=True, force=False):
+    def _detect_adcs(
+        self,
+        domain,
+        *,
+        silent=False,
+        emit_telemetry=True,
+        force=False,
+        source_context=None,
+    ):
         """Detects whether ADCS is implemented in the given domain."""
         from adscan_internal.cli.adcs import detect_adcs
 
@@ -15359,10 +15396,17 @@ class PentestShell:
             silent=silent,
             emit_telemetry=emit_telemetry,
             force=force,
+            source_context=source_context,
         )
 
     def _detect_adcs_metadata(
-        self, domain, *, silent=False, emit_telemetry=True, force=False
+        self,
+        domain,
+        *,
+        silent=False,
+        emit_telemetry=True,
+        force=False,
+        source_context=None,
     ):
         """Resolve ADCS metadata using BloodHound with LDAP fallback."""
         from adscan_internal.cli.adcs import ensure_adcs_metadata
@@ -15374,6 +15418,7 @@ class PentestShell:
             emit_telemetry=emit_telemetry,
             force=force,
             allow_ldap_fallback=True,
+            source_context=source_context,
         )
 
     def do_search_adcs(self, domain):
@@ -15381,6 +15426,14 @@ class PentestShell:
         from adscan_internal.cli.adcs import do_search_adcs as _do_search_adcs
 
         return _do_search_adcs(self, domain)
+
+    def do_show_adcs_cache(self, domain):
+        """Thin wrapper → adscan_internal.cli.adcs.do_show_adcs_cache"""
+        from adscan_internal.cli.adcs import (
+            do_show_adcs_cache as _do_show_adcs_cache,
+        )
+
+        return _do_show_adcs_cache(self, domain)
 
     def ask_for_enum_domain_auth(self, domain):
         """Thin wrapper → adscan_internal.cli.enum.ask_for_enum_domain_auth"""
@@ -15584,7 +15637,11 @@ class PentestShell:
 
             if _run_step(
                 "ADCS Discovery",
-                lambda: self._detect_adcs_metadata(domain),
+                lambda: self._detect_adcs_metadata(
+                    domain,
+                    force=True,
+                    source_context="authenticated_enum_phase1",
+                ),
                 step_number=3,
                 total_steps=3,
             ):
@@ -16766,6 +16823,59 @@ class PentestShell:
 
         return run_ligolo_command(self, args)
 
+    def refresh_current_vantage_inventory(self, domain: str, *, reason: str = "manual") -> bool:
+        """Refresh only the current-vantage reachability/service inventory for one domain."""
+        from adscan_internal.services.current_vantage_inventory_refresh_service import (
+            refresh_current_vantage_inventory,
+        )
+
+        return refresh_current_vantage_inventory(
+            self,
+            domain=domain,
+            reason=reason,
+        )
+
+    def do_refresh_inventory(self, args):
+        """Refresh current-vantage reachability/service inventory without rerunning full Phase 1."""
+        raw_arg = str(args or "").strip()
+        if raw_arg:
+            selected = raw_arg
+        else:
+            selected = str(self.current_domain or "").strip()
+
+        if not selected:
+            print_error("Usage: refresh_inventory <domain|all>")
+            return
+
+        domains_to_refresh: list[str] = []
+        if selected.lower() == "all":
+            if isinstance(self.domains_data, dict):
+                domains_to_refresh = [
+                    str(domain).strip() for domain in self.domains_data.keys() if str(domain).strip()
+                ]
+            if not domains_to_refresh and self.current_domain:
+                domains_to_refresh = [str(self.current_domain).strip()]
+        else:
+            domains_to_refresh = [selected]
+
+        if not domains_to_refresh:
+            print_error("No domains are available to refresh in the current workspace.")
+            return
+
+        refreshed = 0
+        for domain_name in sorted(set(domains_to_refresh), key=str.lower):
+            if self.refresh_current_vantage_inventory(
+                domain_name,
+                reason="manual_command",
+            ):
+                refreshed += 1
+        if refreshed:
+            print_success(
+                f"Refreshed current-vantage inventory for {refreshed}/{len(set(domains_to_refresh))} domain(s)."
+            )
+        else:
+            print_warning("No current-vantage inventory refresh completed successfully.")
+
     def gpp_passwords(self, domain, username, password, share):
         from adscan_internal.rich_output import mark_sensitive
 
@@ -17220,7 +17330,15 @@ class PentestShell:
             password=password,
         )
 
-    def ask_for_winrm_access(self, domain, host, username, password):
+    def ask_for_winrm_access(
+        self,
+        domain,
+        host,
+        username,
+        password,
+        *,
+        workflow_intent: str = "default",
+    ):
         from adscan_internal.cli.winrm import ask_for_winrm_access
 
         ask_for_winrm_access(
@@ -17229,6 +17347,7 @@ class PentestShell:
             host=host,
             username=username,
             password=password,
+            workflow_intent=workflow_intent,
         )
 
     def do_check_autologon(self, domain, host, username, password):
@@ -21893,6 +22012,7 @@ class PentestShell:
         """
         from adscan_internal.rich_output import mark_sensitive
         from adscan_internal.cli.ldap import peek_exact_ldap_connection_timeout_state
+        from adscan_internal.principal_utils import is_machine_account
 
         try:
             marked_username = mark_sensitive(username, "user")
@@ -22008,6 +22128,19 @@ class PentestShell:
                 )
                 return {}
 
+            if is_machine_account(username):
+                dc_role = self.get_user_dc_role(domain, username)
+                if (
+                    dc_role == "rodc"
+                    and not bool(privileged_groups.get("read_only_domain_controllers"))
+                ):
+                    privileged_groups = dict(privileged_groups)
+                    privileged_groups["read_only_domain_controllers"] = True
+                    print_info_debug(
+                        "[priv-groups] overlaying Read-Only Domain Controllers "
+                        f"membership from machine-account DC role for {marked_username}@{marked_domain}."
+                    )
+
             structured_groups = privileged_groups.get("groups")
             if isinstance(structured_groups, list):
                 resolved_group_names = [
@@ -22095,6 +22228,18 @@ class PentestShell:
             actionable = [option for option in options if option.actionable]
             if not actionable:
                 return None
+            domain_admin_option = next(
+                (option for option in actionable if option.key == "domain_admin"),
+                None,
+            )
+            if domain_admin_option is not None:
+                return domain_admin_option
+            administrators_option = next(
+                (option for option in actionable if option.key == "Administrators"),
+                None,
+            )
+            if administrators_option is not None:
+                return administrators_option
             if len(actionable) == 1 or _should_disable_interactive_prompts(self):
                 return actionable[0]
 
@@ -28462,6 +28607,15 @@ class PentestShell:
             print_warning("Shutdown already in progress. Please wait...")
             return exit_requested
         self._shutdown_in_progress = True
+        try:
+            from adscan_internal.services.ligolo_artifact_cleanup_service import (
+                cleanup_workspace_ligolo_artifacts,
+            )
+
+            cleanup_workspace_ligolo_artifacts(self, reason="adscan_exit")
+        except Exception as exc:  # pragma: no cover - best-effort shutdown
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[ligolo-cleanup] shutdown cleanup failed: {exc}")
         # Use telemetry console for session recording export. This console
         # records a superset of what the user sees in the terminal and is
         # only used for sanitized session uploads.
@@ -28616,7 +28770,7 @@ class PentestShell:
                 "sync_clock_with_pdc",
             ],
             "Trusts": ["enum_trusts", "raise_child", "enum_cross_domain_acl"],
-            "ADCS": ["search_adcs", "enum_adcs_privs"],
+            "ADCS": ["search_adcs", "show_adcs_cache", "enum_adcs_privs"],
             "Delegations": ["enum_delegations"],
             "CVE": [
                 "enum_cve_dcs",

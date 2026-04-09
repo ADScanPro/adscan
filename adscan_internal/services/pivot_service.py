@@ -19,7 +19,7 @@ import time
 from typing import Any, Callable
 
 from rich.markup import escape as rich_escape
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 
 from adscan_core.port_diagnostics import (
@@ -38,7 +38,14 @@ from adscan_internal import (
 )
 from adscan_internal.ligolo_manager import get_ligolo_agent_local_path
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.ligolo_artifact_cleanup_service import (
+    cleanup_remote_ligolo_artifact,
+    confirm_ligolo_artifact_deployment,
+)
 from adscan_internal.services.ligolo_service import LigoloProxyService
+from adscan_internal.services.pivot_runtime_state_service import (
+    reconcile_domain_pivot_runtime_state,
+)
 
 
 @dataclass(slots=True)
@@ -466,6 +473,28 @@ def _resolve_ligolo_listen_addr_with_recovery(
                 return custom_addr
 
 
+def _keepalive_exit_was_operator_requested(
+    service: LigoloProxyService,
+    *,
+    tunnel_id: str | None,
+) -> bool:
+    """Return whether the keepalive exit belongs to an intentional shutdown path."""
+
+    if not tunnel_id:
+        return False
+    try:
+        record = service.get_tunnel_record(tunnel_id)
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"[ligolo-cleanup] failed to inspect tunnel shutdown state: {exc}")
+        return False
+    if not isinstance(record, dict):
+        return False
+    if bool(record.get("shutdown_requested")):
+        return True
+    cleanup_reason = str(record.get("remote_artifact_cleanup_reason") or "").strip().lower()
+    return cleanup_reason == "adscan_exit"
+
+
 def orchestrate_ligolo_pivot_tunnel(
     shell: Any,
     *,
@@ -501,18 +530,19 @@ def orchestrate_ligolo_pivot_tunnel(
         "This will route the selected prefixes through the pivot so existing ADscan tooling can reach those hosts directly."
     )
     default_confirm = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
-    if not Confirm.ask(
-        (
-            f"Do you want to create a Ligolo tunnel via {mark_sensitive(pivot_host, 'hostname')} "
-            f"for {len(subnet_summaries)} reachable subnet(s)?"
-        ),
-        default=default_confirm,
-    ):
-        print_info("Skipping Ligolo tunnel creation by user choice.")
-        return False
 
     try:
         service = LigoloProxyService(workspace_dir=workspace_dir, current_domain=domain)
+        remote_agent_path = ""
+        remote_agent_pid: int | None = None
+        persisted_tunnel_id: str | None = None
+
+        def _persist_artifact_cleanup_update(updates: dict[str, Any]) -> None:
+            updater = getattr(service, "update_tunnel_record", None)
+            if not persisted_tunnel_id or not callable(updater):
+                return
+            updater(tunnel_id=persisted_tunnel_id, updates=updates)
+
         proxy_state = service.get_status()
         if not bool(proxy_state.get("alive")):
             listen_addr = _resolve_ligolo_listen_addr_with_recovery(
@@ -581,6 +611,13 @@ def orchestrate_ligolo_pivot_tunnel(
             if str(remote_agent_os).lower() == "windows"
             else f"/tmp/{remote_agent_name}"
         )
+        if not confirm_ligolo_artifact_deployment(
+            pivot_host=pivot_host,
+            remote_agent_path=remote_agent_path,
+            default=default_confirm,
+        ):
+            print_info("Skipping Ligolo tunnel creation by user choice.")
+            return False
         if not upload_agent(
             domain=domain,
             host=pivot_host,
@@ -685,6 +722,8 @@ def orchestrate_ligolo_pivot_tunnel(
             f"Agent launch method: {launch_payload.get('launch_method', 'unknown')} | "
             f"PID: {launch_payload.get('pid')}"
         )
+        if isinstance(launch_payload.get("pid"), int):
+            remote_agent_pid = int(launch_payload.get("pid"))
         print_info_verbose(
             f"Agent process alive on target (PID {launch_payload.get('pid')}). "
             f"Keepalive WinRM session is holding the Job Object open. "
@@ -708,14 +747,53 @@ def orchestrate_ligolo_pivot_tunnel(
             agent_id=int(agent["id"]), interface_name=interface_name
         )
 
+        verification_results = probe_ligolo_routed_targets(confirmed_targets)
+        verified_targets = [
+            entry for entry in verification_results if entry.get("observed_ports")
+        ]
+        tunnel_record = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "domain": domain,
+            "pivot_host": pivot_host,
+            "pivot_username": username,
+            "source_service": "winrm",
+            "pivot_method": "ligolo_winrm_pivot",
+            "pivot_tool": "Ligolo",
+            "proxy_listen_addr": proxy_state.get("listen_addr"),
+            "proxy_api_laddr": proxy_state.get("api_laddr"),
+            "connect_target": connect_target,
+            "fingerprint": fingerprint,
+            "remote_agent_path": remote_agent_path,
+            "remote_agent_pid": launch_payload.get("pid"),
+            "agent": agent,
+            "interface_name": interface_name,
+            "routes": routes,
+            "new_routes": added_routes,
+            "confirmed_targets": confirmed_targets,
+            "verification": verification_results,
+        }
+        stored_tunnel_record = service.append_tunnel_state(tunnel_record) or tunnel_record
+        persisted_tunnel_id = str(stored_tunnel_record.get("tunnel_id") or "").strip() or None
+
         # Monitor thread: waits for the keepalive thread to exit and notifies
         # the user immediately, since a dead keepalive means the WinRM Job Object
         # closed and the agent process was killed (tunnel will drop).
         _monitor_iface = interface_name
         _monitor_host = pivot_host
+        _monitor_agent_path = remote_agent_path
+        _monitor_agent_pid = remote_agent_pid
+        _monitor_tunnel_id = persisted_tunnel_id
 
         def _monitor_keepalive() -> None:
             keepalive_thread.join()
+            if _keepalive_exit_was_operator_requested(
+                service,
+                tunnel_id=_monitor_tunnel_id,
+            ):
+                print_info_debug(
+                    f"[ligolo-cleanup] keepalive exit for {_monitor_host} suppressed because shutdown was requested."
+                )
+                return
             if keepalive_errors:
                 print_warning(
                     f"Ligolo keepalive WinRM session for "
@@ -734,6 +812,64 @@ def orchestrate_ligolo_pivot_tunnel(
                     f"Tunnel on {mark_sensitive(_monitor_iface, 'text')} may be down.",
                     spacing="before",
                 )
+            try:
+                cleanup_result = cleanup_remote_ligolo_artifact(
+                    domain=domain,
+                    pivot_host=_monitor_host,
+                    username=username,
+                    password=password,
+                    remote_agent_path=_monitor_agent_path,
+                    remote_agent_pid=_monitor_agent_pid,
+                    execute_remote_script=execute_remote_script,
+                    tunnel_id=_monitor_tunnel_id,
+                    reason="keepalive_exit",
+                )
+                if cleanup_result.cleanup_succeeded:
+                    _persist_artifact_cleanup_update(
+                        {
+                            "remote_artifact_cleanup_at": datetime.now(timezone.utc).isoformat(),
+                            "remote_artifact_cleanup_reason": "keepalive_exit",
+                            "remote_artifact_cleanup_status": "deleted",
+                            "remote_artifact_cleanup_message": cleanup_result.message,
+                            "remote_artifact_deleted": cleanup_result.file_deleted,
+                        }
+                    )
+                else:
+                    _persist_artifact_cleanup_update(
+                        {
+                            "remote_artifact_cleanup_at": datetime.now(timezone.utc).isoformat(),
+                            "remote_artifact_cleanup_reason": "keepalive_exit",
+                            "remote_artifact_cleanup_status": "operator_action_required",
+                            "remote_artifact_cleanup_message": cleanup_result.message,
+                            "remote_artifact_deleted": cleanup_result.file_deleted,
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(f"[ligolo-cleanup] keepalive cleanup failed: {exc}")
+            try:
+                reconciliation = reconcile_domain_pivot_runtime_state(
+                    shell,
+                    workspace_dir=workspace_dir,
+                    domain=domain,
+                )
+                if reconciliation and reconciliation.restored_direct_vantage:
+                    from adscan_internal.services.pivot_relaunch_service import (
+                        maybe_offer_previous_pivot_relaunch,
+                    )
+
+                    maybe_offer_previous_pivot_relaunch(
+                        shell,
+                        domain=domain,
+                        interactive=False,
+                        trigger="keepalive_drop",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    "[pivot-runtime] failed to reconcile stale pivot after keepalive drop: "
+                    f"{mark_sensitive(str(exc), 'detail')}"
+                )
 
         threading.Thread(
             target=_monitor_keepalive, daemon=True, name="ligolo-keepalive-monitor"
@@ -743,33 +879,12 @@ def orchestrate_ligolo_pivot_tunnel(
             f"for {mark_sensitive(pivot_host, 'hostname')} drops."
         )
 
-        verification_results = probe_ligolo_routed_targets(confirmed_targets)
-        verified_targets = [
-            entry for entry in verification_results if entry.get("observed_ports")
-        ]
-        tunnel_record = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "domain": domain,
-            "pivot_host": pivot_host,
-            "pivot_username": username,
-            "proxy_listen_addr": proxy_state.get("listen_addr"),
-            "proxy_api_laddr": proxy_state.get("api_laddr"),
-            "connect_target": connect_target,
-            "fingerprint": fingerprint,
-            "remote_agent_path": remote_agent_path,
-            "remote_agent_pid": launch_payload.get("pid"),
-            "agent": agent,
-            "interface_name": interface_name,
-            "routes": routes,
-            "new_routes": added_routes,
-            "confirmed_targets": confirmed_targets,
-            "verification": verification_results,
-        }
-        service.append_tunnel_state(tunnel_record)
-
         print_success(
             f"Ligolo tunnel created through {mark_sensitive(pivot_host, 'hostname')} on "
             f"{mark_sensitive(interface_name, 'text')} for {len(routes)} route(s)."
+        )
+        print_info(
+            "Exit ADscan cleanly when you are done with this pivot so the staged Ligolo agent can be removed from the target."
         )
         if getattr(shell, "console", None):
             verification_table = Table(title="Ligolo Route Verification", box=None)
@@ -802,6 +917,45 @@ def orchestrate_ligolo_pivot_tunnel(
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+        if remote_agent_path:
+            print_info("Attempting to remove the staged Ligolo agent from the pivot host…")
+            cleanup_result = cleanup_remote_ligolo_artifact(
+                domain=domain,
+                pivot_host=pivot_host,
+                username=username,
+                password=password,
+                remote_agent_path=remote_agent_path,
+                remote_agent_pid=remote_agent_pid,
+                execute_remote_script=execute_remote_script,
+                tunnel_id=persisted_tunnel_id,
+                reason="tunnel_creation_failed",
+            )
+            _persist_artifact_cleanup_update(
+                {
+                    "remote_artifact_cleanup_at": datetime.now(timezone.utc).isoformat(),
+                    "remote_artifact_cleanup_reason": "tunnel_creation_failed",
+                    "remote_artifact_cleanup_status": (
+                        "deleted" if cleanup_result.cleanup_succeeded else "operator_action_required"
+                    ),
+                    "remote_artifact_cleanup_message": cleanup_result.message,
+                    "remote_artifact_deleted": cleanup_result.file_deleted,
+                }
+            )
+            if cleanup_result.cleanup_succeeded:
+                print_info(
+                    f"Removed the staged Ligolo agent from {mark_sensitive(pivot_host, 'hostname')} "
+                    f"after the failed tunnel attempt."
+                )
+            else:
+                print_warning(
+                    f"ADscan could not confirm cleanup of the staged Ligolo agent on "
+                    f"{mark_sensitive(pivot_host, 'hostname')}.",
+                    items=[
+                        f"Verify manually: {mark_sensitive(remote_agent_path, 'path')}",
+                        cleanup_result.message,
+                    ],
+                    panel=True,
+                )
         print_warning(
             f"Ligolo pivot tunnel creation failed for {mark_sensitive(pivot_host, 'hostname')}: {rich_escape(str(exc))}"
         )

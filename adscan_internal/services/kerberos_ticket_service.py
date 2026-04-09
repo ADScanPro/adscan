@@ -470,12 +470,14 @@ class KerberosTicketService(BaseService):
     def is_ticket_valid(self, *, ticket_path: str) -> bool | None:
         """Return True if the provided ccache appears valid (best-effort).
 
-        We rely on `klist -c <ticket>` to validate the cache. This avoids
-        expensive/interactive network checks and keeps the logic localized.
+        We rely on ``klist -s -c <ticket>`` as the primary validation path
+        because ``klist -c`` may still return success while listing expired
+        tickets. The ``-s`` mode is intended for scripting and reports whether
+        the cache is currently usable.
 
         Returns:
-            - True: klist succeeded (ticket cache readable and not expired)
-            - False: klist failed (missing/unreadable/expired)
+            - True: the cache appears readable and currently usable
+            - False: the cache is missing, unreadable, or expired
             - None: unable to validate (klist not available or unexpected error)
         """
         path = str(ticket_path or "").strip()
@@ -490,13 +492,25 @@ class KerberosTicketService(BaseService):
 
         try:
             clean_env = get_clean_env_for_compilation()
-            proc = self._run_command_logged(
+            silent_proc = self._run_command_logged(
+                label="klist -s -c",
+                command=["klist", "-s", "-c", path],
+                env=clean_env,
+                shell=False,
+            )
+            if silent_proc.returncode == 0:
+                return True
+            fallback_proc = self._run_command_logged(
                 label="klist -c",
                 command=["klist", "-c", path],
                 env=clean_env,
                 shell=False,
             )
-            return proc.returncode == 0
+            if fallback_proc.returncode == 0:
+                stderr_text = str(fallback_proc.stderr or "").strip().lower()
+                if "unknown option" in stderr_text or "usage:" in stderr_text:
+                    return None
+            return False
         except FileNotFoundError:
             return None
         except Exception:

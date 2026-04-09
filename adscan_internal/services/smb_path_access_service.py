@@ -62,6 +62,24 @@ def _extract_status_code(exc: Exception) -> str | None:
     return None
 
 
+def _looks_like_kerberos_auth_failure(
+    *,
+    status_code: str | None,
+    error_message: str | None,
+) -> bool:
+    """Return whether one SMB error looks like a Kerberos authentication failure."""
+    combined = f"{str(status_code or '').strip()} {str(error_message or '').strip()}".upper()
+    if not combined.strip():
+        return False
+    kerberos_markers = (
+        "KRB_AP_ERR_TKT_EXPIRED",
+        "KRB_AP_ERR",
+        "KERBEROS SESSIONERROR",
+        "TICKET EXPIRED",
+    )
+    return any(marker in combined for marker in kerberos_markers)
+
+
 def _normalize_directory_path(directory_path: str | None) -> str:
     """Normalize one SMB directory path for Impacket operations."""
     normalized = str(directory_path or "").strip().replace("/", "\\")
@@ -346,6 +364,24 @@ class SMBPathAccessService(BaseService):
             user=username,
             password=credential,
             domain=auth_domain,
+        )
+
+    def _should_retry_with_ntlm(
+        self,
+        *,
+        use_kerberos: bool,
+        credential: str,
+        status_code: str | None,
+        error_message: str | None,
+    ) -> bool:
+        """Return whether one failed Kerberos SMB operation should retry with NTLM."""
+        if not use_kerberos:
+            return False
+        if not str(credential or "").strip():
+            return False
+        return _looks_like_kerberos_auth_failure(
+            status_code=status_code,
+            error_message=error_message,
         )
 
     def _get_share_security_descriptor(
@@ -971,115 +1007,152 @@ class SMBPathAccessService(BaseService):
             f"auth_mode={mark_sensitive(auth_mode, 'text')}"
         )
 
-        connection = None
-        can_list_directory = False
-        uploaded_path = ""
-        deleted_after_successfully = False
-        try:
-            connection = self._build_connection(
-                target_host=host_clean,
-                timeout_seconds=timeout_seconds,
-            )
-            self._authenticate_connection(
-                connection=connection,
-                username=username_clean,
-                credential=credential,
-                auth_domain=domain_clean,
-                auth_mode=auth_mode,
-                kdc_host=kdc_host,
-            )
-            list_pattern = f"{directory_clean}\\*" if directory_clean else "*"
+        def _attempt_upload(attempt_auth_mode: str, attempt_use_kerberos: bool) -> tuple[SMBFileUploadResult, Exception | None]:
+            connection = None
+            can_list_directory = False
+            uploaded_path = ""
+            deleted_after_successfully = False
             try:
-                connection.listPath(share_clean, list_pattern)  # type: ignore[attr-defined]
-                can_list_directory = True
-                print_info_verbose(
-                    "[smb-path] directory listing succeeded before upload probe: "
-                    f"host={marked_host} share={marked_share} path={marked_directory}"
+                connection = self._build_connection(
+                    target_host=host_clean,
+                    timeout_seconds=timeout_seconds,
                 )
-            except SessionError:
-                print_warning_debug(
-                    "[smb-path] directory listing was denied before file upload; "
-                    f"upload will continue: host={marked_host} share={marked_share} "
-                    f"path={marked_directory}"
+                self._authenticate_connection(
+                    connection=connection,
+                    username=username_clean,
+                    credential=credential,
+                    auth_domain=domain_clean,
+                    auth_mode=attempt_auth_mode,
+                    kdc_host=kdc_host if attempt_use_kerberos else None,
                 )
-
-            uploaded_path = (
-                f"{directory_clean}\\{remote_name_clean}"
-                if directory_clean
-                else remote_name_clean
-            )
-            tree_id = connection.connectTree(share_clean)  # type: ignore[attr-defined]
-            file_id = connection.createFile(  # type: ignore[attr-defined]
-                tree_id,
-                uploaded_path,
-                desiredAccess=GENERIC_WRITE,
-                shareMode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                creationOption=FILE_NON_DIRECTORY_FILE,
-                creationDisposition=FILE_CREATE,
-            )
-            try:
-                connection.writeFile(tree_id, file_id, file_contents)  # type: ignore[attr-defined]
-            finally:
-                connection.closeFile(tree_id, file_id)  # type: ignore[attr-defined]
-            if delete_after:
+                list_pattern = f"{directory_clean}\\*" if directory_clean else "*"
                 try:
-                    connection.deleteFile(share_clean, uploaded_path)  # type: ignore[attr-defined]
-                    deleted_after_successfully = True
-                except Exception as exc:  # noqa: BLE001
-                    print_warning_debug(
-                        "[smb-path] uploaded file but cleanup failed: "
-                        f"host={marked_host} share={marked_share} "
-                        f"path={mark_sensitive(uploaded_path, 'path')} "
-                        f"error={mark_sensitive(str(exc), 'text')}"
+                    connection.listPath(share_clean, list_pattern)  # type: ignore[attr-defined]
+                    can_list_directory = True
+                    print_info_verbose(
+                        "[smb-path] directory listing succeeded before upload probe: "
+                        f"host={marked_host} share={marked_share} path={marked_directory}"
                     )
-            print_success_debug(
-                "[smb-path] file upload succeeded: "
-                f"host={marked_host} share={marked_share} "
-                f"path={mark_sensitive(uploaded_path, 'path')} "
-                f"delete_after={mark_sensitive(str(delete_after).lower(), 'text')}"
-            )
-            return SMBFileUploadResult(
-                success=True,
-                target_host=host_clean,
-                share_name=share_clean,
-                directory_path=directory_clean,
-                can_list_directory=can_list_directory,
-                auth_mode=auth_mode,
-                uploaded_file_path=uploaded_path,
-                deleted_after=deleted_after_successfully,
-                bytes_written=len(file_contents),
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-        except Exception as exc:  # noqa: BLE001
+                except SessionError:
+                    print_warning_debug(
+                        "[smb-path] directory listing was denied before file upload; "
+                        f"upload will continue: host={marked_host} share={marked_share} "
+                        f"path={marked_directory}"
+                    )
+                uploaded_path = (
+                    f"{directory_clean}\\{remote_name_clean}" if directory_clean else remote_name_clean
+                )
+                tree_id = connection.connectTree(share_clean)  # type: ignore[attr-defined]
+                file_id = connection.createFile(  # type: ignore[attr-defined]
+                    tree_id,
+                    uploaded_path,
+                    desiredAccess=GENERIC_WRITE,
+                    shareMode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    creationOption=FILE_NON_DIRECTORY_FILE,
+                    creationDisposition=FILE_CREATE,
+                )
+                try:
+                    connection.writeFile(tree_id, file_id, file_contents)  # type: ignore[attr-defined]
+                finally:
+                    connection.closeFile(tree_id, file_id)  # type: ignore[attr-defined]
+                if delete_after:
+                    try:
+                        connection.deleteFile(share_clean, uploaded_path)  # type: ignore[attr-defined]
+                        deleted_after_successfully = True
+                    except Exception as exc:  # noqa: BLE001
+                        print_warning_debug(
+                            "[smb-path] uploaded file but cleanup failed: "
+                            f"host={marked_host} share={marked_share} "
+                            f"path={mark_sensitive(uploaded_path, 'path')} "
+                            f"error={mark_sensitive(str(exc), 'text')}"
+                        )
+                print_success_debug(
+                    "[smb-path] file upload succeeded: "
+                    f"host={marked_host} share={marked_share} "
+                    f"path={mark_sensitive(uploaded_path, 'path')} "
+                    f"delete_after={mark_sensitive(str(delete_after).lower(), 'text')} "
+                    f"auth_mode={mark_sensitive(attempt_auth_mode, 'text')}"
+                )
+                return (
+                    SMBFileUploadResult(
+                        success=True,
+                        target_host=host_clean,
+                        share_name=share_clean,
+                        directory_path=directory_clean,
+                        can_list_directory=can_list_directory,
+                        auth_mode=attempt_auth_mode,
+                        uploaded_file_path=uploaded_path,
+                        deleted_after=deleted_after_successfully,
+                        bytes_written=len(file_contents),
+                        auth_username=username_clean,
+                        auth_domain=domain_clean,
+                    ),
+                    None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return (
+                    SMBFileUploadResult(
+                        success=False,
+                        target_host=host_clean,
+                        share_name=share_clean,
+                        directory_path=directory_clean,
+                        can_list_directory=can_list_directory,
+                        auth_mode=attempt_auth_mode,
+                        uploaded_file_path=uploaded_path,
+                        error_message=str(exc),
+                        status_code=_extract_status_code(exc),
+                        auth_username=username_clean,
+                        auth_domain=domain_clean,
+                    ),
+                    exc,
+                )
+            finally:
+                if connection is not None:
+                    try:
+                        connection.logoff()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        result, exc = _attempt_upload(auth_mode, use_kerberos)
+        if result.success:
+            return result
+        if exc is not None:
             telemetry.capture_exception(exc)
+        print_warning_debug(
+            "[smb-path] file upload failed: "
+            f"host={marked_host} share={marked_share} path={marked_directory} "
+            f"user={marked_username} domain={marked_domain} "
+            f"auth_mode={mark_sensitive(result.auth_mode, 'text')} "
+            f"status={mark_sensitive(result.status_code or '<unknown>', 'text')} "
+            f"error={mark_sensitive(result.error_message or '', 'text')}"
+        )
+        if self._should_retry_with_ntlm(
+            use_kerberos=use_kerberos,
+            credential=credential,
+            status_code=result.status_code,
+            error_message=result.error_message,
+        ):
+            retry_auth_mode = "hash" if is_hash else "password"
             print_warning_debug(
-                "[smb-path] file upload failed: "
+                "[smb-path] retrying file upload with NTLM after Kerberos failure: "
+                f"host={marked_host} share={marked_share} path={marked_directory} "
+                f"user={marked_username} domain={marked_domain}"
+            )
+            retry_result, retry_exc = _attempt_upload(retry_auth_mode, False)
+            if retry_result.success:
+                return retry_result
+            if retry_exc is not None:
+                telemetry.capture_exception(retry_exc)
+            print_warning_debug(
+                "[smb-path] NTLM fallback upload failed: "
                 f"host={marked_host} share={marked_share} path={marked_directory} "
                 f"user={marked_username} domain={marked_domain} "
-                f"auth_mode={mark_sensitive(auth_mode, 'text')} "
-                f"status={mark_sensitive(_extract_status_code(exc) or '<unknown>', 'text')} "
-                f"error={mark_sensitive(str(exc), 'text')}"
+                f"auth_mode={mark_sensitive(retry_result.auth_mode, 'text')} "
+                f"status={mark_sensitive(retry_result.status_code or '<unknown>', 'text')} "
+                f"error={mark_sensitive(retry_result.error_message or '', 'text')}"
             )
-            return SMBFileUploadResult(
-                success=False,
-                target_host=host_clean,
-                share_name=share_clean,
-                directory_path=directory_clean,
-                can_list_directory=can_list_directory,
-                auth_mode=auth_mode,
-                uploaded_file_path=uploaded_path,
-                error_message=str(exc),
-                status_code=_extract_status_code(exc),
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-        finally:
-            if connection is not None:
-                try:
-                    connection.logoff()
-                except Exception:  # noqa: BLE001
-                    pass
+            return retry_result
+        return result
 
     def delete_file(
         self,
@@ -1113,7 +1186,7 @@ class SMBPathAccessService(BaseService):
             )
 
         try:
-            from impacket.smbconnection import SessionError  # type: ignore
+            from impacket.smbconnection import SMBConnection  # type: ignore  # noqa: F401
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             return SMBFileDeleteResult(
@@ -1142,71 +1215,101 @@ class SMBPathAccessService(BaseService):
             f"auth_mode={mark_sensitive(auth_mode, 'text')}"
         )
 
-        connection = None
-        try:
-            connection = self._build_connection(
-                target_host=host_clean,
-                timeout_seconds=timeout_seconds,
-            )
-            self._authenticate_connection(
-                connection=connection,
-                username=username_clean,
-                credential=credential,
-                auth_domain=domain_clean,
-                auth_mode=auth_mode,
-                kdc_host=kdc_host,
-            )
-            connection.deleteFile(share_clean, file_path_clean)  # type: ignore[attr-defined]
-            print_success_debug(
-                "[smb-path] file delete succeeded: "
-                f"host={marked_host} share={marked_share} file={marked_file_path}"
-            )
-            return SMBFileDeleteResult(
-                success=True,
-                target_host=host_clean,
-                share_name=share_clean,
-                file_path=file_path_clean,
-                auth_mode=auth_mode,
-                auth_username=username_clean,
-                auth_domain=domain_clean,
-            )
-        except Exception as exc:  # noqa: BLE001
+        def _attempt_delete(attempt_auth_mode: str, attempt_use_kerberos: bool) -> tuple[SMBFileDeleteResult, Exception | None]:
+            connection = None
+            try:
+                connection = self._build_connection(
+                    target_host=host_clean,
+                    timeout_seconds=timeout_seconds,
+                )
+                self._authenticate_connection(
+                    connection=connection,
+                    username=username_clean,
+                    credential=credential,
+                    auth_domain=domain_clean,
+                    auth_mode=attempt_auth_mode,
+                    kdc_host=kdc_host if attempt_use_kerberos else None,
+                )
+                connection.deleteFile(share_clean, file_path_clean)  # type: ignore[attr-defined]
+                print_success_debug(
+                    "[smb-path] file delete succeeded: "
+                    f"host={marked_host} share={marked_share} file={marked_file_path} "
+                    f"auth_mode={mark_sensitive(attempt_auth_mode, 'text')}"
+                )
+                return (
+                    SMBFileDeleteResult(
+                        success=True,
+                        target_host=host_clean,
+                        share_name=share_clean,
+                        file_path=file_path_clean,
+                        auth_mode=attempt_auth_mode,
+                        auth_username=username_clean,
+                        auth_domain=domain_clean,
+                    ),
+                    None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return (
+                    SMBFileDeleteResult(
+                        success=False,
+                        target_host=host_clean,
+                        share_name=share_clean,
+                        file_path=file_path_clean,
+                        auth_mode=attempt_auth_mode,
+                        error_message=str(exc),
+                        status_code=_extract_status_code(exc),
+                        auth_username=username_clean,
+                        auth_domain=domain_clean,
+                    ),
+                    exc,
+                )
+            finally:
+                if connection is not None:
+                    try:
+                        connection.logoff()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        result, exc = _attempt_delete(auth_mode, use_kerberos)
+        if result.success:
+            return result
+        if exc is not None:
             telemetry.capture_exception(exc)
-            status_code = _extract_status_code(exc)
-            if isinstance(exc, SessionError):
-                print_warning_debug(
-                    "[smb-path] file delete failed: "
-                    f"host={marked_host} share={marked_share} file={marked_file_path} "
-                    f"user={marked_username} domain={marked_domain} "
-                    f"auth_mode={mark_sensitive(auth_mode, 'text')} "
-                    f"status={mark_sensitive(status_code or '<unknown>', 'text')} "
-                    f"error={mark_sensitive(str(exc), 'text')}"
-                )
-            else:
-                print_warning_debug(
-                    "[smb-path] file delete failed: "
-                    f"host={marked_host} share={marked_share} file={marked_file_path} "
-                    f"user={marked_username} domain={marked_domain} "
-                    f"auth_mode={mark_sensitive(auth_mode, 'text')} "
-                    f"error={mark_sensitive(str(exc), 'text')}"
-                )
-            return SMBFileDeleteResult(
-                success=False,
-                target_host=host_clean,
-                share_name=share_clean,
-                file_path=file_path_clean,
-                auth_mode=auth_mode,
-                error_message=str(exc),
-                status_code=status_code,
-                auth_username=username_clean,
-                auth_domain=domain_clean,
+        print_warning_debug(
+            "[smb-path] file delete failed: "
+            f"host={marked_host} share={marked_share} file={marked_file_path} "
+            f"user={marked_username} domain={marked_domain} "
+            f"auth_mode={mark_sensitive(result.auth_mode, 'text')} "
+            f"status={mark_sensitive(result.status_code or '<unknown>', 'text')} "
+            f"error={mark_sensitive(result.error_message or '', 'text')}"
+        )
+        if self._should_retry_with_ntlm(
+            use_kerberos=use_kerberos,
+            credential=credential,
+            status_code=result.status_code,
+            error_message=result.error_message,
+        ):
+            retry_auth_mode = "hash" if is_hash else "password"
+            print_warning_debug(
+                "[smb-path] retrying file delete with NTLM after Kerberos failure: "
+                f"host={marked_host} share={marked_share} file={marked_file_path} "
+                f"user={marked_username} domain={marked_domain}"
             )
-        finally:
-            if connection is not None:
-                try:
-                    connection.logoff()
-                except Exception:  # noqa: BLE001
-                    pass
+            retry_result, retry_exc = _attempt_delete(retry_auth_mode, False)
+            if retry_result.success:
+                return retry_result
+            if retry_exc is not None:
+                telemetry.capture_exception(retry_exc)
+            print_warning_debug(
+                "[smb-path] NTLM fallback delete failed: "
+                f"host={marked_host} share={marked_share} file={marked_file_path} "
+                f"user={marked_username} domain={marked_domain} "
+                f"auth_mode={mark_sensitive(retry_result.auth_mode, 'text')} "
+                f"status={mark_sensitive(retry_result.status_code or '<unknown>', 'text')} "
+                f"error={mark_sensitive(retry_result.error_message or '', 'text')}"
+            )
+            return retry_result
+        return result
 
     def probe_file_upload(
         self,

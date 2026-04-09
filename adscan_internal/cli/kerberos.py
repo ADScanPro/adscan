@@ -496,6 +496,8 @@ def finalize_roast_results(
     hashes_file_rel = domain_relpath(
         shell.domains_dir, domain, shell.cracking_dir, f"hashes.{roast_type}"
     )
+    cracking_hashes_file_abs = hashes_file_abs
+    cracking_hashes_file_rel = hashes_file_rel
 
     hashes_file_exists = os.path.exists(hashes_file_abs)
     hashes_file_size = 0
@@ -530,6 +532,30 @@ def finalize_roast_results(
         f"file_exists={hashes_file_exists}, file_size={hashes_file_size}, "
         f"candidate_users={len(normalized_users)}, valid_hashes={len(parsed_hash_entries)}"
     )
+
+    if hashes_file_exists and parsed_hash_entries:
+        from adscan_internal.cli.roasting_execution import (
+            _normalize_hashes_file_for_hashcat,
+        )
+
+        normalization_target_user = next(
+            (username for username, _ in parsed_hash_entries if username.strip()),
+            normalized_users[0] if normalized_users else "",
+        )
+        if normalization_target_user:
+            cracking_hashes_file_abs = _normalize_hashes_file_for_hashcat(
+                hashes_file_abs=hashes_file_abs,
+                target_user=normalization_target_user,
+            )
+            cracking_hashes_file_rel = os.path.relpath(
+                cracking_hashes_file_abs,
+                workspace_cwd,
+            )
+            print_info_debug(
+                "[kerberos] Roast cracking file prepared: "
+                f"type={roast_type}, raw_file={mark_sensitive(hashes_file_rel, 'path')} "
+                f"cracking_file={mark_sensitive(cracking_hashes_file_rel, 'path')}"
+            )
 
     if not normalized_users:
         marked_domain = mark_sensitive(domain, "domain")
@@ -810,7 +836,7 @@ def finalize_roast_results(
                 return subset_rel
 
             if choice == "none":
-                return hashes_file_rel
+                return cracking_hashes_file_rel
             if choice == "recommended":
                 subset_file = _write_subset_file("recommended", priority_list)
                 if subset_file:
@@ -819,12 +845,12 @@ def finalize_roast_results(
                     )
                 else:
                     shell.ask_for_cracking(
-                        roast_type, domain, hashes_file_rel, confirm=False
+                        roast_type, domain, cracking_hashes_file_rel, confirm=False
                     )
             elif choice == "specific":
                 if shell.auto:
                     shell.ask_for_cracking(
-                        roast_type, domain, hashes_file_rel, confirm=False
+                        roast_type, domain, cracking_hashes_file_rel, confirm=False
                     )
                 else:
                     selection = Prompt.ask(
@@ -839,13 +865,13 @@ def finalize_roast_results(
                         )
                     else:
                         shell.ask_for_cracking(
-                            roast_type, domain, hashes_file_rel, confirm=False
+                            roast_type, domain, cracking_hashes_file_rel, confirm=False
                         )
             else:
                 shell.ask_for_cracking(
-                    roast_type, domain, hashes_file_rel, confirm=False
+                    roast_type, domain, cracking_hashes_file_rel, confirm=False
                 )
-        return hashes_file_rel
+        return cracking_hashes_file_rel
     except FileNotFoundError as e:
         telemetry.capture_exception(e)
         marked_domain = mark_sensitive(domain, "domain")
@@ -935,6 +961,8 @@ def run_kerberoast(
         impacket_scripts_dir=shell.impacket_scripts_dir,
         validate_script_exists=lambda p: os.path.isfile(p) and os.access(p, os.X_OK),
         get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
+        workspace_dir=shell.current_workspace_dir or shell._get_workspace_cwd(),
+        domains_data=shell.domains_data,
     )
     impacket_runner = ImpacketRunner(command_runner=shell.command_runner)
 
@@ -1094,6 +1122,8 @@ def run_asreproast(
             validate_script_exists=lambda p: os.path.isfile(p)
             and os.access(p, os.X_OK),
             get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
+            workspace_dir=shell.current_workspace_dir or shell._get_workspace_cwd(),
+            domains_data=shell.domains_data,
         )
         impacket_runner = ImpacketRunner(command_runner=shell.command_runner)
         enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())

@@ -83,6 +83,7 @@ class Domain:
     kerberos_tickets: Dict[str, str] = field(
         default_factory=dict
     )  # {username: ticket_path}
+    auth_posture: Dict[str, Any] = field(default_factory=dict)
 
     # Discovered entities
     trusts: List[Dict[str, Any]] = field(default_factory=list)
@@ -118,6 +119,7 @@ class Domain:
             "credentials": self.credentials,
             "local_credentials": self.local_credentials,
             "kerberos_tickets": self.kerberos_tickets,
+            "auth_posture": self.auth_posture,
             "trusts": self.trusts,
             "users": self.users,
             "computers": self.computers,
@@ -159,6 +161,7 @@ class Domain:
             credentials=data.get("credentials", {}),
             local_credentials=data.get("local_credentials", {}),
             kerberos_tickets=data.get("kerberos_tickets", {}),
+            auth_posture=data.get("auth_posture", {}),
             trusts=data.get("trusts", []),
             users=data.get("users", []),
             computers=data.get("computers", []),

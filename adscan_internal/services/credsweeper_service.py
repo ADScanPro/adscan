@@ -1175,11 +1175,6 @@ class CredSweeperService(BaseService):
                 cmd_parts.append("--no-filters")
             command = " ".join(cmd_parts)
 
-            print_info_verbose(
-                f"Analyzing file for credentials with CredSweeper ({label} rules)..."
-            )
-            print_info_debug(f"[credsweeper] Command ({label}): {command}")
-
             ruleset_started_at = time.perf_counter()
             completed_process = self._command_executor(
                 command, timeout=timeout, use_clean_env=True
@@ -1208,9 +1203,6 @@ class CredSweeperService(BaseService):
                 continue
 
             if not os.path.exists(json_output):
-                print_info_verbose(
-                    f"[credsweeper] No JSON output generated for file ({label} rules)."
-                )
                 continue
 
             try:
@@ -1240,14 +1232,7 @@ class CredSweeperService(BaseService):
                 ) and ml_probability is None:
                     continue
                 all_results.append(result)
-            print_info_debug(
-                "[credsweeper] Ruleset completed: "
-                    f"label={label} path={analysis_target} duration_seconds={ruleset_duration_seconds:.2f} "
-                f"raw_results={len(results)} accumulated_results={len(all_results)}"
-            )
-
         if not all_results:
-            print_info_verbose("No credentials detected by CredSweeper.")
             return findings
 
         seen_credentials: set[Tuple[str, str, int]] = set()
@@ -1383,6 +1368,7 @@ class CredSweeperService(BaseService):
 
         all_results: List[Dict[str, Any]] = []
         analysis_started_at = time.perf_counter()
+        target_is_directory = os.path.isdir(path_to_scan)
 
         for label, rules in rulesets:
             json_output = self._resolve_json_output_path(
@@ -1421,15 +1407,16 @@ class CredSweeperService(BaseService):
                 cmd_parts.extend(["--jobs", str(int(jobs))])
             command = " ".join(cmd_parts)
 
-            print_info_verbose(
-                "Analyzing path for credentials with CredSweeper "
-                f"({label} rules): {path_to_scan}"
-            )
-            print_info_debug(f"[credsweeper] Command ({label}): {command}")
-            print_info_debug(
-                "[credsweeper] Execution budget: "
-                f"label={label} doc={doc} depth={depth} timeout_seconds={int(timeout)}"
-            )
+            if target_is_directory:
+                print_info_verbose(
+                    "Analyzing path for credentials with CredSweeper "
+                    f"({label} rules): {path_to_scan}"
+                )
+                print_info_debug(f"[credsweeper] Command ({label}): {command}")
+                print_info_debug(
+                    "[credsweeper] Execution budget: "
+                    f"label={label} doc={doc} depth={depth} timeout_seconds={int(timeout)}"
+                )
 
             ruleset_started_at = time.perf_counter()
             completed_process = self._command_executor(
@@ -1459,9 +1446,10 @@ class CredSweeperService(BaseService):
                 continue
 
             if not os.path.exists(json_output):
-                print_info_verbose(
-                    f"[credsweeper] No JSON output generated for path ({label} rules)."
-                )
+                if target_is_directory:
+                    print_info_verbose(
+                        f"[credsweeper] No JSON output generated for path ({label} rules)."
+                    )
                 continue
 
             try:
@@ -1491,11 +1479,12 @@ class CredSweeperService(BaseService):
                 ) and ml_probability is None:
                     continue
                 all_results.append(result)
-            print_info_debug(
-                "[credsweeper] Ruleset completed: "
-                f"label={label} path={path_to_scan} duration_seconds={ruleset_duration_seconds:.2f} "
-                f"raw_results={len(results)} accumulated_results={len(all_results)}"
-            )
+            if target_is_directory:
+                print_info_debug(
+                    "[credsweeper] Ruleset completed: "
+                    f"label={label} path={path_to_scan} duration_seconds={ruleset_duration_seconds:.2f} "
+                    f"raw_results={len(results)} accumulated_results={len(all_results)}"
+                )
 
         if all_results:
             seen_credentials: set[Tuple[str, str, int]] = set()
@@ -1558,14 +1547,16 @@ class CredSweeperService(BaseService):
             findings = self._merge_grouped_findings(findings, supplemental_findings)
 
         if not findings:
-            print_info_verbose("No credentials detected by CredSweeper.")
+            if target_is_directory:
+                print_info_verbose("No credentials detected by CredSweeper.")
             return findings
 
-        print_info_debug(
-            "[credsweeper] Analysis summary: "
-            f"target={path_to_scan} duration_seconds={time.perf_counter() - analysis_started_at:.2f} "
-            f"grouped_rules={len(findings)} total_findings={self._count_total_grouped_findings(findings)}"
-        )
+        if target_is_directory:
+            print_info_debug(
+                "[credsweeper] Analysis summary: "
+                f"target={path_to_scan} duration_seconds={time.perf_counter() - analysis_started_at:.2f} "
+                f"grouped_rules={len(findings)} total_findings={self._count_total_grouped_findings(findings)}"
+            )
         return findings
 
 

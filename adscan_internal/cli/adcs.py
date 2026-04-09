@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from typing import Any
+from datetime import UTC, datetime
 
 from adscan_internal import (
     print_error,
     print_exception,
+    print_instruction,
     print_info_debug,
     print_info_verbose,
     print_operation_header,
@@ -15,9 +17,44 @@ from adscan_internal import (
 )
 from adscan_internal.integrations.netexec.parsers import parse_adcs_detection_output
 from adscan_internal.cli.common import build_lab_event_fields
-from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.rich_output import mark_sensitive, print_panel
 from adscan_internal.services import CredentialStoreService
 from adscan_internal.workspaces import domain_relpath
+
+
+def _set_adcs_detection_state(
+    shell: Any,
+    *,
+    domain: str,
+    detected: bool | None,
+    via: str,
+    reason: str,
+    source_context: str | None = None,
+) -> None:
+    """Persist ADCS detection state with basic traceability fields."""
+    domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+    if not isinstance(domain_data, dict):
+        domain_data = {}
+    if detected is None:
+        domain_data.pop("adcs_detected", None)
+    else:
+        domain_data["adcs_detected"] = detected
+    domain_data["adcs_detected_via"] = via
+    domain_data["adcs_detected_reason"] = reason
+    domain_data["adcs_detected_checked_at"] = datetime.now(UTC).isoformat()
+    if source_context:
+        domain_data["adcs_detected_source_context"] = source_context
+    shell.domains_data[domain] = domain_data
+
+
+def _is_inconclusive_adcs_reason(reason: str) -> bool:
+    """Return True when the detection outcome should not be cached as negative."""
+    normalized = str(reason or "").strip().lower()
+    if normalized == "missing_credentials":
+        return True
+    if normalized.startswith("auth_"):
+        return True
+    return False
 
 
 def _resolve_adcs_credentials(
@@ -66,6 +103,7 @@ def detect_adcs(
     silent: bool = False,
     emit_telemetry: bool = True,
     force: bool = False,
+    source_context: str | None = None,
 ) -> bool:
     """Detect whether ADCS is implemented in the given domain.
 
@@ -105,8 +143,17 @@ def detect_adcs(
                     "No credentials found for ADCS detection. "
                     f"Configure credentials for domain {marked_domain} or for the primary domain."
                 )
-            domain_data["adcs_detected"] = False
-            shell.domains_data[domain] = domain_data
+            missing_credentials_reason = "missing_credentials"
+            _set_adcs_detection_state(
+                shell,
+                domain=domain,
+                detected=None
+                if _is_inconclusive_adcs_reason(missing_credentials_reason)
+                else False,
+                via="ldap",
+                reason=missing_credentials_reason,
+                source_context=source_context,
+            )
             return False
 
         username, password, auth_domain = creds
@@ -162,8 +209,14 @@ def detect_adcs(
         if completed_process is None:
             if emit_telemetry:
                 _capture_adcs_not_discovered(shell, domain_data, error=True)
-            domain_data["adcs_detected"] = False
-            shell.domains_data[domain] = domain_data
+            _set_adcs_detection_state(
+                shell,
+                domain=domain,
+                detected=False,
+                via="ldap",
+                reason="runner_returned_none",
+                source_context=source_context,
+            )
             return False
 
         output = completed_process.stdout or ""
@@ -177,8 +230,14 @@ def detect_adcs(
                     print_error(errors.strip())
             if emit_telemetry:
                 _capture_adcs_not_discovered(shell, domain_data, error=True)
-            domain_data["adcs_detected"] = False
-            shell.domains_data[domain] = domain_data
+            _set_adcs_detection_state(
+                shell,
+                domain=domain,
+                detected=False,
+                via="ldap",
+                reason=f"netexec_nonzero:{completed_process.returncode}",
+                source_context=source_context,
+            )
             return False
 
         enrollment_server, ca_name = parse_adcs_detection_output(output)
@@ -206,8 +265,21 @@ def detect_adcs(
             if emit_telemetry:
                 _capture_adcs_not_discovered(shell, domain_data, error=False)
 
-        domain_data["adcs_detected"] = adcs_found
-        shell.domains_data[domain] = domain_data
+        _set_adcs_detection_state(
+            shell,
+            domain=domain,
+            detected=adcs_found,
+            via="ldap",
+            reason="enrollment_server_or_ca_found" if adcs_found else "ldap_detection_empty",
+            source_context=source_context,
+        )
+        domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
+        if isinstance(domain_data, dict):
+            if enrollment_server:
+                domain_data["adcs"] = enrollment_server
+            if ca_name:
+                domain_data["ca"] = ca_name
+            shell.domains_data[domain] = domain_data
         return adcs_found
     except Exception as exc:
         if emit_telemetry:
@@ -218,7 +290,14 @@ def detect_adcs(
                 f"Error executing ADCS detection for domain {marked_domain}: {exc}"
             )
         if domain in shell.domains_data:
-            shell.domains_data[domain]["adcs_detected"] = False
+            _set_adcs_detection_state(
+                shell,
+                domain=domain,
+                detected=False,
+                via="ldap",
+                reason=f"exception:{type(exc).__name__}",
+                source_context=source_context,
+            )
         return False
 
 
@@ -514,6 +593,7 @@ def ensure_adcs_metadata(
     emit_telemetry: bool = True,
     force: bool = False,
     allow_ldap_fallback: bool = True,
+    source_context: str | None = None,
 ) -> bool:
     """Ensure ADCS metadata (adcs + ca) is populated using BH → LDAP fallback."""
     domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
@@ -533,8 +613,16 @@ def ensure_adcs_metadata(
     if not force and domain_data.get("adcs_detected") is False:
         if not silent:
             marked_domain = mark_sensitive(domain, "domain")
+            cached_reason = str(domain_data.get("adcs_detected_reason") or "unknown").strip() or "unknown"
+            cached_checked_at = str(domain_data.get("adcs_detected_checked_at") or "").strip() or "unknown"
+            cached_via = str(domain_data.get("adcs_detected_via") or "unknown").strip() or "unknown"
+            cached_source_context = (
+                str(domain_data.get("adcs_detected_source_context") or "").strip() or "unknown"
+            )
             print_info_debug(
-                f"[adcs] Cached negative ADCS detection for {marked_domain}; skipping lookup."
+                f"[adcs] Cached negative ADCS detection for {marked_domain}; skipping lookup. "
+                f"via={cached_via!r} reason={cached_reason!r} "
+                f"source_context={cached_source_context!r} checked_at={cached_checked_at!r}"
             )
         return False
 
@@ -547,9 +635,15 @@ def ensure_adcs_metadata(
         domain_data["ca"] = ca_name
 
     if domain_data.get("adcs") and domain_data.get("ca"):
-        domain_data["adcs_detected"] = True
-        domain_data["adcs_detected_via"] = "bloodhound"
-        shell.domains_data[domain] = domain_data
+        _set_adcs_detection_state(
+            shell,
+            domain=domain,
+            detected=True,
+            via="bloodhound",
+            reason="bloodhound_metadata_resolved",
+            source_context=source_context,
+        )
+        domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
         if not silent:
             marked_domain = mark_sensitive(domain, "domain")
             print_success(
@@ -576,11 +670,14 @@ def ensure_adcs_metadata(
             silent=silent,
             emit_telemetry=emit_telemetry,
             force=True,
+            source_context=source_context,
         )
         if found:
             domain_data = shell.domains_data.get(domain, {}) if hasattr(shell, "domains_data") else {}
             if isinstance(domain_data, dict):
                 domain_data["adcs_detected_via"] = "ldap"
+                if source_context:
+                    domain_data["adcs_detected_source_context"] = source_context
                 shell.domains_data[domain] = domain_data
             if not silent:
                 marked_domain = mark_sensitive(domain, "domain")
@@ -589,8 +686,14 @@ def ensure_adcs_metadata(
                 )
         return found
 
-    domain_data["adcs_detected"] = False
-    shell.domains_data[domain] = domain_data
+    _set_adcs_detection_state(
+        shell,
+        domain=domain,
+        detected=False,
+        via="bloodhound",
+        reason="bloodhound_and_ldap_not_found" if allow_ldap_fallback else "bloodhound_not_found",
+        source_context=source_context,
+    )
     return False
 
 def _capture_adcs_discovered(
@@ -648,7 +751,59 @@ def do_search_adcs(shell: Any, domain: str) -> None:
     If an error occurs while executing the command, an error message is displayed and
     it continues with the next domain.
     """
-    detect_adcs(shell, domain=domain, silent=False, emit_telemetry=True, force=True)
+    detect_adcs(
+        shell,
+        domain=domain,
+        silent=False,
+        emit_telemetry=True,
+        force=True,
+        source_context="manual_search_adcs",
+    )
+
+
+def do_show_adcs_cache(shell: Any, domain: str) -> None:
+    """Show the cached ADCS detection state for a domain.
+
+    Usage:
+        show_adcs_cache [domain]
+
+    When ``domain`` is omitted, the current shell domain is used.
+    """
+    requested_domain = str(domain or "").strip()
+    target_domain = requested_domain or str(getattr(shell, "domain", "") or "").strip()
+    if not target_domain:
+        print_instruction("Usage: show_adcs_cache <domain>")
+        return
+
+    domain_data = shell.domains_data.get(target_domain, {}) if hasattr(shell, "domains_data") else {}
+    if not isinstance(domain_data, dict) or not domain_data:
+        marked_domain = mark_sensitive(target_domain, "domain")
+        print_error(f"Domain {marked_domain} is not initialized.")
+        return
+
+    marked_domain = mark_sensitive(target_domain, "domain")
+    panel_lines = [
+        f"[bold]Domain:[/bold] {marked_domain}",
+        f"[bold]ADCS Host:[/bold] {mark_sensitive(str(domain_data.get('adcs') or 'unknown'), 'hostname')}",
+        f"[bold]CA:[/bold] {mark_sensitive(str(domain_data.get('ca') or 'unknown'), 'text')}",
+        f"[bold]Detected:[/bold] {domain_data.get('adcs_detected')!r}",
+        f"[bold]Via:[/bold] {str(domain_data.get('adcs_detected_via') or 'unknown')}",
+        f"[bold]Reason:[/bold] {str(domain_data.get('adcs_detected_reason') or 'unknown')}",
+        (
+            "[bold]Source Context:[/bold] "
+            f"{str(domain_data.get('adcs_detected_source_context') or 'unknown')}"
+        ),
+        (
+            "[bold]Checked At:[/bold] "
+            f"{str(domain_data.get('adcs_detected_checked_at') or 'unknown')}"
+        ),
+    ]
+    print_panel(
+        "\n".join(panel_lines),
+        title="[bold]ADCS Cache[/bold]",
+        border_style="cyan",
+        padding=(1, 2),
+    )
 
 
 def ask_for_adcs_esc(

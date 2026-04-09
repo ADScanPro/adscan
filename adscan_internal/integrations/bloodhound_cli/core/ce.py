@@ -4,7 +4,10 @@ BloodHound CE implementation using HTTP API
 
 # pylint: skip-file
 import configparser
+import email.utils
 import os
+import random
+import threading
 from json import JSONDecodeError
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
@@ -29,6 +32,7 @@ from adscan_internal.rich_output import (
     print_warning,
     print_exception
 )
+from adscan_internal.services.attack_step_catalog import get_bh_native_acl_cypher_names
 
 
 def _safe_truncate(value: str, limit: int = 1200) -> str:
@@ -49,6 +53,15 @@ def _get_default_admin_password() -> str:
 
 
 _bh_complexity_warning_shown = False
+_BH_CE_DEFAULT_MAX_RPS = 25.0
+_BH_CE_LOGIN_MAX_RPS = 0.8
+_BH_CE_RATELIMITER_HEADROOM = 0.8
+_BH_CE_DEFAULT_429_WAIT_SECONDS = 1.25
+_BH_CE_MAX_SERVER_WAIT_SECONDS = 15.0
+_BH_CE_STUCK_RATE_LIMIT_THRESHOLD_SECONDS = 60.0
+_BH_CE_MAX_429_RETRIES = 5
+_BH_CE_RATE_LIMITERS: dict[tuple[str, str], "_BloodHoundApiRateLimiter"] = {}
+_BH_CE_RATE_LIMITERS_LOCK = threading.Lock()
 
 
 def _warn_bh_complexity_limit() -> None:
@@ -68,6 +81,195 @@ def _warn_bh_complexity_limit() -> None:
         title="Action required",
         border_style="yellow",
     )
+
+
+def _build_cypher_relationship_union(relationships: set[str]) -> str:
+    """Return a deterministic ``:TypeA|TypeB|...`` union for Cypher path patterns."""
+    ordered = sorted({str(value or "").strip() for value in relationships if str(value or "").strip()})
+    return ":" + "|".join(ordered) if ordered else ""
+
+
+def _parse_retry_after_seconds(raw_value: Optional[str]) -> float | None:
+    """Return the wait time in seconds from a Retry-After style header."""
+    if not raw_value:
+        return None
+
+    text = str(raw_value).strip()
+    if not text:
+        return None
+
+    try:
+        wait_seconds = max(0.0, float(text))
+        if wait_seconds > _BH_CE_MAX_SERVER_WAIT_SECONDS:
+            return None
+        return wait_seconds
+    except ValueError:
+        pass
+
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed is None:
+        return None
+
+    if parsed.tzinfo is None:
+        now_epoch = time.time()
+        wait_seconds = max(0.0, parsed.timestamp() - now_epoch)
+        if wait_seconds > _BH_CE_MAX_SERVER_WAIT_SECONDS:
+            return None
+        return wait_seconds
+
+    now_epoch = time.time()
+    wait_seconds = max(0.0, parsed.timestamp() - now_epoch)
+    if wait_seconds > _BH_CE_MAX_SERVER_WAIT_SECONDS:
+        return None
+    return wait_seconds
+
+
+def _parse_http_date_epoch(raw_value: Optional[str]) -> float | None:
+    """Parse an HTTP date header and return its epoch timestamp."""
+    if not raw_value:
+        return None
+
+    try:
+        parsed = email.utils.parsedate_to_datetime(str(raw_value).strip())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed is None:
+        return None
+    return parsed.timestamp()
+
+
+def _get_rate_limit_reset_delay_seconds(
+    raw_value: Optional[str],
+    *,
+    server_date_header: Optional[str] = None,
+) -> float | None:
+    """Return the raw reset delay without applying BloodHound-specific sanity limits."""
+    if not raw_value:
+        return None
+
+    try:
+        value = float(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return None
+
+    if value < 0:
+        return None
+
+    reference_epoch = _parse_http_date_epoch(server_date_header) or time.time()
+    if value >= 1_000_000_000:
+        return max(0.0, value - reference_epoch)
+    return value
+
+
+def _parse_rate_limit_reset_seconds(
+    raw_value: Optional[str],
+    *,
+    server_date_header: Optional[str] = None,
+) -> float | None:
+    """Return the reset delay in seconds from BloodHound-style rate-limit headers."""
+    wait_seconds = _get_rate_limit_reset_delay_seconds(
+        raw_value,
+        server_date_header=server_date_header,
+    )
+    if wait_seconds is None:
+        return None
+    if wait_seconds > _BH_CE_MAX_SERVER_WAIT_SECONDS:
+        return None
+    return wait_seconds
+
+
+class _BloodHoundApiRateLimiter:
+    """Coordinate request pacing and server-directed pauses for one CE bucket."""
+
+    def __init__(self, configured_max_rps: float) -> None:
+        self._configured_max_rps = max(0.2, float(configured_max_rps))
+        self._lock = threading.Lock()
+        self._next_request_at = 0.0
+        self._pause_until = 0.0
+        self._awaiting_recovery_notice = False
+        self._server_limit_per_second: float | None = None
+
+    def _effective_max_rps(self) -> float:
+        """Return the active request budget after considering server hints."""
+        effective_max_rps = self._configured_max_rps
+        if self._server_limit_per_second:
+            effective_max_rps = min(
+                effective_max_rps,
+                max(0.2, self._server_limit_per_second * _BH_CE_RATELIMITER_HEADROOM),
+            )
+        return max(0.2, effective_max_rps)
+
+    def reserve_delay(self) -> float:
+        """Reserve the next request slot and return how long the caller should wait."""
+        with self._lock:
+            now = time.monotonic()
+            if self._pause_until and now >= self._pause_until:
+                self._pause_until = 0.0
+
+            interval_seconds = 1.0 / self._effective_max_rps()
+            scheduled_at = max(now, self._next_request_at, self._pause_until)
+            delay_seconds = max(0.0, scheduled_at - now)
+            self._next_request_at = scheduled_at + interval_seconds
+            return delay_seconds
+
+    def note_response(self, headers: requests.structures.CaseInsensitiveDict) -> float | None:
+        """Update limiter state from response headers and return any proactive pause."""
+        limit_header = headers.get("X-Ratelimit-Limit") or headers.get("X-RateLimit-Limit")
+        remaining_header = headers.get("X-Ratelimit-Remaining") or headers.get("X-RateLimit-Remaining")
+        reset_header = headers.get("X-Ratelimit-Reset") or headers.get("X-RateLimit-Reset")
+        server_date_header = headers.get("Date")
+
+        if limit_header:
+            try:
+                self._server_limit_per_second = max(0.2, float(str(limit_header).strip()))
+            except (TypeError, ValueError):
+                pass
+
+        proactive_pause = None
+        if remaining_header is not None:
+            try:
+                remaining_budget = float(str(remaining_header).strip())
+            except (TypeError, ValueError):
+                remaining_budget = None
+            if remaining_budget is not None and remaining_budget <= 0:
+                proactive_pause = _parse_rate_limit_reset_seconds(
+                    reset_header,
+                    server_date_header=server_date_header,
+                )
+                if proactive_pause and proactive_pause > 0:
+                    with self._lock:
+                        self._pause_until = max(self._pause_until, time.monotonic() + proactive_pause)
+                        self._awaiting_recovery_notice = True
+        return proactive_pause
+
+    def note_rate_limited(self, headers: requests.structures.CaseInsensitiveDict) -> float:
+        """Register a 429 response and return the pause duration to honor."""
+        retry_after_seconds = _parse_retry_after_seconds(headers.get("Retry-After"))
+        reset_seconds = _parse_rate_limit_reset_seconds(
+            headers.get("X-Ratelimit-Reset") or headers.get("X-RateLimit-Reset"),
+            server_date_header=headers.get("Date"),
+        )
+        pause_seconds = retry_after_seconds or reset_seconds or _BH_CE_DEFAULT_429_WAIT_SECONDS
+        pause_seconds = max(_BH_CE_DEFAULT_429_WAIT_SECONDS, pause_seconds)
+
+        with self._lock:
+            self._pause_until = max(self._pause_until, time.monotonic() + pause_seconds)
+            self._awaiting_recovery_notice = True
+        return pause_seconds
+
+    def consume_recovery_notice(self) -> bool:
+        """Return True once after a server-directed pause has elapsed."""
+        with self._lock:
+            if not self._awaiting_recovery_notice:
+                return False
+            if self._pause_until and time.monotonic() < self._pause_until:
+                return False
+            self._awaiting_recovery_notice = False
+            self._pause_until = 0.0
+            return True
 
 
 class BloodHoundCEClient(BloodHoundClient):
@@ -109,6 +311,266 @@ class BloodHoundCEClient(BloodHoundClient):
         self._stored_username = None
         self._stored_password = None
         self._last_error: str | None = None
+        self._rate_limit_notice_active = False
+        self._rate_limit_notice_kind: str | None = None
+        self._stuck_rate_limit_notice_shown = False
+
+    def _get_rate_limiter(self, bucket: str) -> _BloodHoundApiRateLimiter:
+        """Return the shared rate limiter for this BloodHound CE base URL and bucket."""
+        key = (self.base_url, bucket)
+        with _BH_CE_RATE_LIMITERS_LOCK:
+            limiter = _BH_CE_RATE_LIMITERS.get(key)
+            if limiter is not None:
+                return limiter
+
+            configured_rps = (
+                _BH_CE_LOGIN_MAX_RPS
+                if bucket == "login"
+                else float(os.getenv("ADSCAN_BH_API_MAX_RPS", str(_BH_CE_DEFAULT_MAX_RPS)))
+            )
+            limiter = _BloodHoundApiRateLimiter(configured_max_rps=configured_rps)
+            _BH_CE_RATE_LIMITERS[key] = limiter
+            return limiter
+
+    def _resolve_request_url(self, url_or_path: str) -> str:
+        """Return an absolute BloodHound CE URL for the given path or URL."""
+        if str(url_or_path).startswith("http://") or str(url_or_path).startswith("https://"):
+            return str(url_or_path)
+        return f"{self.base_url}{url_or_path}"
+
+    def _resolve_rate_limit_bucket(self, url_or_path: str, bucket: Optional[str] = None) -> str:
+        """Resolve the rate-limit bucket for a request."""
+        if bucket:
+            return bucket
+        if str(url_or_path).endswith("/api/v2/login"):
+            return "login"
+        return "default"
+
+    def _emit_rate_limit_pause(self, *, pause_seconds: float, proactive: bool) -> None:
+        """Emit one user-facing pause message plus detailed debug context."""
+        pause_seconds = max(0.0, pause_seconds)
+        rounded_pause = round(pause_seconds, 2)
+        if proactive:
+            if not self._rate_limit_notice_active:
+                print_info(
+                    "BloodHound CE API budget is exhausted for the current window. "
+                    f"ADscan is pacing requests for about {rounded_pause}s to avoid 429 responses."
+                )
+                self._rate_limit_notice_active = True
+                self._rate_limit_notice_kind = "proactive"
+            self._debug("proactive BloodHound CE pacing pause", wait_seconds=rounded_pause)
+            return
+
+        if not self._rate_limit_notice_active or self._rate_limit_notice_kind != "reactive":
+            print_warning(
+                "BloodHound CE API rate limit reached. "
+                f"ADscan is pausing for about {rounded_pause}s and will resume automatically."
+            )
+            self._rate_limit_notice_active = True
+            self._rate_limit_notice_kind = "reactive"
+        self._debug("BloodHound CE rate-limit pause", wait_seconds=rounded_pause)
+
+    def _emit_rate_limit_recovered(self) -> None:
+        """Emit a one-time recovery message after a server-directed pause."""
+        if not self._rate_limit_notice_active:
+            return
+        print_success("BloodHound CE API budget recovered. ADscan resumed automatically.")
+        self._rate_limit_notice_active = False
+        self._rate_limit_notice_kind = None
+        self._stuck_rate_limit_notice_shown = False
+
+    def _emit_stuck_rate_limit_warning(
+        self,
+        *,
+        wait_seconds: float,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """Warn when BloodHound CE reports a reset horizon far beyond its normal 1s window."""
+        if self._stuck_rate_limit_notice_shown:
+            return
+        rounded_wait = round(wait_seconds, 2)
+        request_hint = f" (request_id={request_id})" if request_id else ""
+        print_warning(
+            "BloodHound CE returned a rate-limit reset far in the future "
+            f"({rounded_wait}s){request_hint}. "
+            "This usually indicates the CE rate limiter is stuck or the host/container clock changed. "
+            "ADscan will stop retrying this request. Check the BloodHound CE container time and restart it if needed."
+        )
+        diagnostics = self._collect_rate_limit_time_diagnostics()
+        if diagnostics:
+            self._debug(
+                "BloodHound CE stuck rate-limit clock diagnostics",
+                diagnostics=diagnostics,
+            )
+        self._stuck_rate_limit_notice_shown = True
+
+    def _collect_rate_limit_time_diagnostics(self) -> str:
+        """Return best-effort host/container time diagnostics for stuck BH rate limits."""
+        host_epoch = time.time()
+        host_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(host_epoch))
+        diagnostics: list[str] = [
+            f"host_utc={host_utc}",
+            f"host_epoch={round(host_epoch, 3)}",
+        ]
+
+        try:
+            from adscan_launcher.bloodhound_ce_compose import (
+                _compose_container_name,
+                docker_available,
+                run_docker,
+            )
+        except Exception as exc:
+            diagnostics.append(f"compose_import_error={_safe_truncate(exc)}")
+            return " | ".join(diagnostics)
+
+        try:
+            if not docker_available():
+                diagnostics.append("docker_unavailable")
+                return " | ".join(diagnostics)
+
+            container_name = _compose_container_name("bloodhound")
+            diagnostics.append(f"container_name={container_name}")
+
+            proc = run_docker(
+                [
+                    "docker",
+                    "exec",
+                    container_name,
+                    "date",
+                    "-u",
+                    "+%Y-%m-%dT%H:%M:%SZ (%s)",
+                ],
+                check=False,
+                capture_output=True,
+                timeout=15,
+            )
+            diagnostics.append(f"container_date_rc={getattr(proc, 'returncode', 'unknown')}")
+            stdout = (getattr(proc, "stdout", "") or "").strip()
+            stderr = (getattr(proc, "stderr", "") or "").strip()
+            if stdout:
+                diagnostics.append(f"container_utc={stdout}")
+            if stderr:
+                diagnostics.append(f"container_date_err={_safe_truncate(stderr)}")
+            return " | ".join(diagnostics)
+        except Exception as exc:
+            diagnostics.append(f"container_date_error={_safe_truncate(exc)}")
+            return " | ".join(diagnostics)
+
+    def _debug_rate_limit_diagnostics(
+        self,
+        headers: requests.structures.CaseInsensitiveDict,
+        *,
+        bucket: str,
+        status_code: int,
+        raw_reset_wait: Optional[float] = None,
+    ) -> None:
+        """Emit detailed rate-limit diagnostics for CI/root-cause analysis."""
+        raw_reset = headers.get("X-Ratelimit-Reset") or headers.get("X-RateLimit-Reset")
+        retry_after = headers.get("Retry-After")
+        server_date = headers.get("Date")
+        request_id = headers.get("Requestid") or headers.get("RequestId")
+        remaining = headers.get("X-Ratelimit-Remaining") or headers.get("X-RateLimit-Remaining")
+        limit = headers.get("X-Ratelimit-Limit") or headers.get("X-RateLimit-Limit")
+        server_epoch = _parse_http_date_epoch(server_date)
+        local_epoch = time.time()
+        clock_skew_seconds = None
+        if server_epoch is not None:
+            clock_skew_seconds = round(server_epoch - local_epoch, 3)
+
+        self._debug(
+            "BloodHound CE rate-limit diagnostics",
+            bucket=bucket,
+            status=status_code,
+            limit=limit,
+            remaining=remaining,
+            retry_after=retry_after,
+            reset_raw=raw_reset,
+            reset_wait_seconds=(
+                None if raw_reset_wait is None else round(float(raw_reset_wait), 3)
+            ),
+            server_date=server_date,
+            server_epoch=None if server_epoch is None else round(server_epoch, 3),
+            local_epoch=round(local_epoch, 3),
+            clock_skew_seconds=clock_skew_seconds,
+            request_id=request_id,
+            base_url=self.base_url,
+        )
+
+    def _request(
+        self,
+        method: str,
+        url_or_path: str,
+        *,
+        bucket: Optional[str] = None,
+        allow_auth_retry: bool = True,
+        allow_rate_limit_retry: bool = True,
+        max_rate_limit_retries: int = _BH_CE_MAX_429_RETRIES,
+        **kwargs,
+    ) -> requests.Response:
+        """Execute a CE HTTP request with centralized pacing, auth renewal, and 429 recovery."""
+        resolved_bucket = self._resolve_rate_limit_bucket(url_or_path, bucket=bucket)
+        rate_limiter = self._get_rate_limiter(resolved_bucket)
+        request_callable = getattr(self.session, method.lower())
+        url = self._resolve_request_url(url_or_path)
+
+        auth_retried = False
+        rate_limit_retries = 0
+
+        while True:
+            delay_seconds = rate_limiter.reserve_delay()
+            if delay_seconds > 0:
+                if delay_seconds >= 0.25:
+                    self._debug(
+                        "BloodHound CE client-side pacing",
+                        bucket=resolved_bucket,
+                        wait_seconds=round(delay_seconds, 3),
+                    )
+                time.sleep(delay_seconds)
+
+            response = request_callable(url, verify=self.verify, **kwargs)
+            proactive_pause = rate_limiter.note_response(response.headers)
+            if proactive_pause and proactive_pause >= 0.25:
+                self._emit_rate_limit_pause(pause_seconds=proactive_pause, proactive=True)
+
+            if response.status_code == 401 and allow_auth_retry and not auth_retried:
+                self._debug("authentication failed, attempting token renewal", bucket=resolved_bucket)
+                if self.ensure_authenticated_robust():
+                    auth_retried = True
+                    continue
+
+            if response.status_code == 429 and allow_rate_limit_retry:
+                raw_reset_wait = _get_rate_limit_reset_delay_seconds(
+                    response.headers.get("X-Ratelimit-Reset") or response.headers.get("X-RateLimit-Reset"),
+                    server_date_header=response.headers.get("Date"),
+                )
+                self._debug_rate_limit_diagnostics(
+                    response.headers,
+                    bucket=resolved_bucket,
+                    status_code=response.status_code,
+                    raw_reset_wait=raw_reset_wait,
+                )
+                if (
+                    raw_reset_wait is not None
+                    and raw_reset_wait > _BH_CE_STUCK_RATE_LIMIT_THRESHOLD_SECONDS
+                ):
+                    self._emit_stuck_rate_limit_warning(
+                        wait_seconds=raw_reset_wait,
+                        request_id=response.headers.get("Requestid") or response.headers.get("RequestId"),
+                    )
+                    return response
+                pause_seconds = rate_limiter.note_rate_limited(response.headers)
+                self._emit_rate_limit_pause(pause_seconds=pause_seconds, proactive=False)
+                if rate_limit_retries >= max_rate_limit_retries:
+                    return response
+                rate_limit_retries += 1
+                # Add a small jitter to avoid synchronized retries when multiple workers share the same budget.
+                time.sleep(max(0.0, random.uniform(0.05, 0.2)))
+                continue
+
+            if response.status_code != 429 and rate_limiter.consume_recovery_notice():
+                self._emit_rate_limit_recovered()
+
+            return response
 
     @staticmethod
     def _normalize_base_url(raw_url: Optional[str]) -> str:
@@ -161,7 +623,6 @@ class BloodHoundCEClient(BloodHoundClient):
         self, username: str, password: str, login_path: str = "/api/v2/login"
     ) -> Optional[str]:
         """Authenticate against CE and return token"""
-        url = f"{self.base_url}{login_path}"
         try:
             payload = {
                 "login_method": "secret",
@@ -170,8 +631,13 @@ class BloodHoundCEClient(BloodHoundClient):
             }
             # Remove stale token headers before logging in
             self.session.headers.pop("Authorization", None)
-            response = self.session.post(
-                url, json=payload, verify=self.verify, timeout=60
+            response = self._request(
+                "post",
+                login_path,
+                json=payload,
+                timeout=60,
+                bucket="login",
+                allow_auth_retry=False,
             )
 
             if response.status_code == 200:
@@ -191,8 +657,6 @@ class BloodHoundCEClient(BloodHoundClient):
     def execute_query(self, query: str, **params) -> List[Dict]:
         """Execute a Cypher query using BloodHound CE API"""
         try:
-            url = f"{self.base_url}/api/v2/graphs/cypher"
-
             # Clean up query: normalize whitespace but preserve structure
             # Using split() + join() preserves all non-whitespace characters
             cleaned_query = " ".join(query.split())
@@ -200,29 +664,12 @@ class BloodHoundCEClient(BloodHoundClient):
 
             payload = {"query": cleaned_query, "include_properties": True}
 
-            response = self.session.post(
-                url, json=payload, verify=self.verify, timeout=60
+            response = self._request(
+                "post",
+                "/api/v2/graphs/cypher",
+                json=payload,
+                timeout=60,
             )
-
-            # Handle authentication errors by attempting token renewal
-            if response.status_code == 401:
-                self._debug("authentication failed, attempting token renewal")
-                if self.ensure_authenticated_robust():
-                    # Retry the request with renewed token
-                    response = self.session.post(
-                        url, json=payload, verify=self.verify, timeout=60
-                    )
-                    self._debug(
-                        "cypher query retry response",
-                        status=response.status_code,
-                    )
-                else:
-                    self._debug(
-                        "token renewal failed",
-                        status=response.status_code,
-                        response_text=response.text,
-                    )
-                    return []
 
             if response.status_code == 200:
                 data = response.json()
@@ -347,15 +794,13 @@ class BloodHoundCEClient(BloodHoundClient):
             cleaned_query = " ".join(query.split())
             print_cypher_query(cleaned_query)
 
-            url = f"{self.base_url}/api/v2/graphs/cypher"
             payload = {"query": cleaned_query, "include_properties": True}
-            response = self.session.post(url, json=payload, verify=self.verify, timeout=60)
-
-            if response.status_code == 401:
-                if self.ensure_authenticated_robust():
-                    response = self.session.post(url, json=payload, verify=self.verify, timeout=60)
-                else:
-                    return []
+            response = self._request(
+                "post",
+                "/api/v2/graphs/cypher",
+                json=payload,
+                timeout=60,
+            )
 
             self._debug(
                 "path query response",
@@ -407,8 +852,6 @@ class BloodHoundCEClient(BloodHoundClient):
     def execute_query_with_relationships(self, query: str) -> Dict:
         """Execute a Cypher query and include relationships in the response"""
         try:
-            url = f"{self.base_url}/api/v2/graphs/cypher"
-
             cleaned_query = " ".join(query.split())
             print_cypher_query(cleaned_query)
             payload = {
@@ -417,8 +860,11 @@ class BloodHoundCEClient(BloodHoundClient):
                 "include_relationships": True,
             }
 
-            response = self.session.post(
-                url, json=payload, verify=self.verify, timeout=60
+            response = self._request(
+                "post",
+                "/api/v2/graphs/cypher",
+                json=payload,
+                timeout=60,
             )
 
             self._debug(
@@ -426,26 +872,6 @@ class BloodHoundCEClient(BloodHoundClient):
                 status=response.status_code,
                 headers=dict(response.headers),
             )
-
-            # Handle authentication errors by attempting token renewal
-            if response.status_code == 401:
-                self._debug("authentication failed, attempting token renewal")
-                if self.ensure_authenticated_robust():
-                    # Retry the request with renewed token
-                    response = self.session.post(
-                        url, json=payload, verify=self.verify, timeout=60
-                    )
-                    self._debug(
-                        "relationship query retry response",
-                        status=response.status_code,
-                    )
-                else:
-                    self._debug(
-                        "token renewal failed",
-                        status=response.status_code,
-                        response=response.text,
-                    )
-                    return {}
 
             if response.status_code == 200:
                 data = response.json()
@@ -1811,9 +2237,11 @@ class BloodHoundCEClient(BloodHoundClient):
         acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
         depth = max(1, int(max_depth))
         limit_value = max(1, min(int(max_results), 5000))
+        acl_pattern = _build_cypher_relationship_union(
+            self._get_low_priv_acl_allowed_relations()
+        )
         return (
-            "MATCH p=(s:Group)-[:GenericAll|GenericWrite|WriteOwner|WriteDacl|"
-            f"AddMember|ForceChangePassword|DCSync*1..{depth}]->(t) "
+            f"MATCH p=(s:Group)-[{acl_pattern}*1..{depth}]->(t) "
             f"WHERE toLower(coalesce(s.name,'')) = toLower('{group_name}') "
             "AND s<>t "
             f"AND {terminal_target_filter} "
@@ -2103,19 +2531,7 @@ class BloodHoundCEClient(BloodHoundClient):
 
     def _get_low_priv_acl_allowed_relations(self) -> set[str]:
         """Return the ACL relationship types used in Phase 2 low-priv collection."""
-        return {
-            "GenericAll",
-            "GenericWrite",
-            "ForceChangePassword",
-            "AddSelf",
-            "AddMember",
-            "ReadGMSAPassword",
-            "ReadLAPSPassword",
-            "WriteDacl",
-            "WriteOwner",
-            "DCSync",
-            "WriteSPN",
-        }
+        return set(get_bh_native_acl_cypher_names())
 
     def _build_objectid_exclusion_filter(
         self, *, alias: str, objectids: List[str] | None
@@ -3113,8 +3529,9 @@ class BloodHoundCEClient(BloodHoundClient):
 
     def _create_file_upload_job_id(self) -> int | None:
         """Create a file upload job and return its ID."""
-        create_response = self.session.post(
-            f"{self.base_url}/api/v2/file-upload/start",
+        create_response = self._request(
+            "post",
+            "/api/v2/file-upload/start",
             headers=self._get_headers(),
             json={"collection_method": "manual"},
         )
@@ -3166,8 +3583,9 @@ class BloodHoundCEClient(BloodHoundClient):
 
         with open(file_path, "rb") as f:
             body = f.read()
-            upload_response = self.session.post(
-                f"{self.base_url}/api/v2/file-upload/{job_id}",
+            upload_response = self._request(
+                "post",
+                f"/api/v2/file-upload/{job_id}",
                 data=body,
                 headers=headers,
             )
@@ -3185,8 +3603,9 @@ class BloodHoundCEClient(BloodHoundClient):
 
     def _end_file_upload_job(self, job_id: int) -> bool:
         """End a file upload job."""
-        end_response = self.session.post(
-            f"{self.base_url}/api/v2/file-upload/{job_id}/end",
+        end_response = self._request(
+            "post",
+            f"/api/v2/file-upload/{job_id}/end",
             headers=self._get_headers(),
         )
         if end_response.status_code >= 400:
@@ -3500,15 +3919,13 @@ class BloodHoundCEClient(BloodHoundClient):
             cleaned_query = " ".join(query.split())
             print_cypher_query(cleaned_query)
 
-            url = f"{self.base_url}/api/v2/graphs/cypher"
             payload = {"query": cleaned_query, "include_properties": False}
-            response = self.session.post(url, json=payload, verify=self.verify, timeout=30)
-
-            if response.status_code == 401:
-                if self.ensure_authenticated_robust():
-                    response = self.session.post(url, json=payload, verify=self.verify, timeout=30)
-                else:
-                    return False
+            response = self._request(
+                "post",
+                "/api/v2/graphs/cypher",
+                json=payload,
+                timeout=30,
+            )
 
             if response.status_code == 200:
                 self._debug("opengraph cypher upsert accepted", kind=kind)
@@ -3529,8 +3946,10 @@ class BloodHoundCEClient(BloodHoundClient):
     def list_upload_jobs(self) -> List[Dict]:
         """List file upload jobs"""
         try:
-            response = self.session.get(
-                f"{self.base_url}/api/v2/file-upload", headers=self._get_headers()
+            response = self._request(
+                "get",
+                "/api/v2/file-upload",
+                headers=self._get_headers(),
             )
             response.raise_for_status()
             data = response.json()
@@ -3548,8 +3967,9 @@ class BloodHoundCEClient(BloodHoundClient):
     def get_accepted_upload_types(self) -> List[str]:
         """Get accepted file upload types"""
         try:
-            response = self.session.get(
-                f"{self.base_url}/api/v2/file-upload/accepted-types",
+            response = self._request(
+                "get",
+                "/api/v2/file-upload/accepted-types",
                 headers=self._get_headers(),
             )
             response.raise_for_status()
@@ -3562,8 +3982,10 @@ class BloodHoundCEClient(BloodHoundClient):
         """Get specific file upload job details"""
         try:
             # Use the list endpoint and filter by job_id
-            response = self.session.get(
-                f"{self.base_url}/api/v2/file-upload", headers=self._get_headers()
+            response = self._request(
+                "get",
+                "/api/v2/file-upload",
+                headers=self._get_headers(),
             )
             response.raise_for_status()
             data = response.json()
@@ -3614,8 +4036,11 @@ class BloodHoundCEClient(BloodHoundClient):
         """Verify if the current token is valid by making a test request"""
         try:
             # Try to make a simple API call to verify the token
-            response = self.session.get(
-                f"{self.base_url}/api/v2/file-upload", headers=self._get_headers()
+            response = self._request(
+                "get",
+                "/api/v2/file-upload",
+                headers=self._get_headers(),
+                allow_auth_retry=False,
             )
             return response.status_code == 200
         except Exception:
@@ -3626,28 +4051,11 @@ class BloodHoundCEClient(BloodHoundClient):
         try:
             # First try to use credentials stored in memory (from authenticate())
             if self._stored_username and self._stored_password:
-                login_url = f"{self.base_url}/api/v2/login"
-                payload = {
-                    "login_method": "secret",
-                    "username": self._stored_username,
-                    "secret": self._stored_password,
-                }
-
-                # Remove stale token headers before logging in
-                self.session.headers.pop("Authorization", None)
-                response = self.session.post(
-                    login_url, json=payload, verify=self.verify, timeout=60
-                )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    token = data.get("data", {}).get("session_token")
-                    if token:
-                        self.api_token = token
-                        self.session.headers.update(
-                            {"Authorization": f"Bearer {token}"}
-                        )
-                        return True
+                token = self.authenticate(self._stored_username, self._stored_password)
+                if token:
+                    self.api_token = token
+                    self.session.headers.update({"Authorization": f"Bearer {token}"})
+                    return True
                 return False
 
             # Fallback: Load config to get stored credentials
@@ -3670,58 +4078,28 @@ class BloodHoundCEClient(BloodHoundClient):
             if not password:
                 return False
 
-            # Create a new session for authentication (without the expired token)
-            import requests
-
-            temp_session = requests.Session()
-            temp_session.verify = self.session.verify
-
-            # Authenticate with stored credentials using the temp session
-            login_url = f"{base_url}/api/v2/login"
-            payload = {
-                "login_method": "secret",
-                "username": username,
-                "secret": password,
-            }
-
-            response = temp_session.post(login_url, json=payload, timeout=60)
-            if response.status_code >= 400:
-                return False
-
+            previous_base_url = self.base_url
             try:
-                data = response.json()
-            except JSONDecodeError as exc:
-                # Non‑JSON response (e.g., HTML or empty body) – treat as failure.
-                print_info_debug(
-                    f"[bloodhound-ce] token auto-renew json decode error: {exc} "
-                    f"(status={response.status_code})"
+                self.base_url = base_url
+                token = self.authenticate(username, password)
+                if not token:
+                    return False
+
+                # Update the stored token, normalized base_url, and our session.
+                write_ce_config(
+                    base_url=base_url,
+                    api_token=token,
+                    username=username,
+                    password=password,
+                    verify=self.verify,
                 )
-                return False
-            token = None
-            if isinstance(data, dict):
-                data_field = data.get("data")
-                if isinstance(data_field, dict):
-                    token = data_field.get("session_token")
-            if not token:
-                token = data.get("token") or data.get("access_token") or data.get("jwt")
 
-            if not token:
-                return False
-
-            # Update the stored token, normalized base_url, and our session
-            write_ce_config(
-                base_url=base_url,
-                api_token=token,
-                username=username,
-                password=password,
-                verify=self.verify,
-            )
-
-            # Update our session with the new token
-            self.api_token = token
-            self.session.headers.update({"Authorization": f"Bearer {token}"})
-
-            return True
+                self.api_token = token
+                self.session.headers.update({"Authorization": f"Bearer {token}"})
+                return True
+            finally:
+                if not self.api_token:
+                    self.base_url = previous_base_url
 
         except Exception as e:
             print_info_debug(f"[bloodhound-ce] token auto-renew error: {e}")

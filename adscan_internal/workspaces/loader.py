@@ -120,6 +120,7 @@ class WorkspaceLoaderShell(Protocol):
     def _clean_netexec_workspaces(self, *, use_sudo_if_needed: bool = True) -> bool: ...
     def do_cd(self, path: str) -> None: ...
     def do_update_resolv_conf(self, domain_pdc: str) -> bool: ...
+    def convert_hostnames_to_ips_and_scan(self, domain: str, computers_file: str, nmap_dir: str) -> Any: ...
     def add_to_hosts(self, domain: str) -> None: ...
     def _clean_domain_entries(self, domain: str) -> None: ...
     def _get_dns_discovery_service(self) -> Any: ...
@@ -384,6 +385,69 @@ def _prompt_updated_dc_ip_for_workspace_domain(domain: str) -> str | None:
             )
 
 
+def _build_workspace_dns_repair_network_context(shell: WorkspaceLoaderShell) -> str:
+    """Build a compact network-context block for the DNS repair panel.
+
+    Args:
+        shell: Workspace-aware shell with interface and myip attributes.
+
+    Returns:
+        Rich-formatted text summarizing the local interface and IP context.
+    """
+    interface = str(getattr(shell, "interface", "") or "").strip()
+    stored_myip = str(getattr(shell, "myip", "") or "").strip()
+    marked_interface = (
+        f"[bold cyan]{interface}[/bold cyan]" if interface else "[dim]unset[/dim]"
+    )
+    lines = [
+        "[bold]Workspace network context[/bold]",
+        f"Interface: {marked_interface}",
+    ]
+
+    if not interface:
+        lines.append(
+            "Current interface IP: [dim]unknown[/dim] (set an interface to validate routing)"
+        )
+        return "\n".join(lines)
+
+    try:
+        from adscan_internal.services.myip_staleness import detect_myip_staleness
+
+        staleness = detect_myip_staleness(interface=interface, stored_ip=stored_myip or None)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[workspace_dns_repair] network context check failed: {exc}")
+        lines.append("Current interface IP: [dim]unknown[/dim] (probe failed)")
+        return "\n".join(lines)
+
+    current_ip = str(staleness.get("current_ip") or "").strip()
+    if current_ip:
+        marked_current_ip = mark_sensitive(current_ip, "ip")
+        if stored_myip and current_ip != stored_myip:
+            marked_stored_myip = mark_sensitive(stored_myip, "ip")
+            lines.append(f"Stored myip: {marked_stored_myip}")
+            lines.append(
+                f"Current interface IP: [bold green]{marked_current_ip}[/bold green] "
+                "[dim](changed since the workspace was saved)[/dim]"
+            )
+        else:
+            lines.append(f"Current interface IP: {marked_current_ip}")
+    elif staleness.get("no_ip_on_interface"):
+        if stored_myip:
+            marked_stored_myip = mark_sensitive(stored_myip, "ip")
+            lines.append(f"Stored myip: {marked_stored_myip}")
+        lines.append(
+            "Current interface IP: [dim]none[/dim] (VPN/tunnel may be disconnected)"
+        )
+    else:
+        if stored_myip:
+            marked_stored_myip = mark_sensitive(stored_myip, "ip")
+            lines.append(f"Stored myip: {marked_stored_myip}")
+        lines.append("Current interface IP: [dim]unknown[/dim]")
+
+    return "\n".join(lines)
+
+
 def _attempt_workspace_dns_repair_interactive(
     shell: WorkspaceLoaderShell,
     *,
@@ -418,10 +482,14 @@ def _attempt_workspace_dns_repair_interactive(
         )
         return False
 
+    network_context = _build_workspace_dns_repair_network_context(shell)
     print_panel(
         "[bold yellow]Workspace DNS mapping appears stale.[/bold yellow]\n\n"
         f"Domain: {marked_domain}\n"
         f"Saved DC/DNS IP: {marked_saved_pdc}\n\n"
+        "ADscan already retried the saved mapping during workspace load and it failed.\n"
+        "The next step is to provide a new DC/DNS IP if the lab/domain rotated.\n\n"
+        f"{network_context}\n\n"
         "This is common in CTF labs where DC IPs rotate between sessions.\n"
         "You can repair it now or skip (offline mode).\n",
         title="[bold]🧭 Workspace DNS Repair[/bold]",
@@ -461,6 +529,7 @@ def _attempt_workspace_dns_repair_interactive(
             interactive=True,
             mode_label="workspace_load",
             on_reenter=_on_reenter,
+            skip_initial_candidate=True,
         )
         if not mapping:
             print_warning(
@@ -699,6 +768,22 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
             shell.variables = variables  # Store all loaded variables
             print_info(f"Variables loaded from {variables_file}")
 
+            try:
+                from adscan_internal.services.pivot_runtime_state_service import (
+                    reconcile_workspace_pivot_runtime_state,
+                )
+
+                reconciliation_results = reconcile_workspace_pivot_runtime_state(
+                    shell,
+                    workspace_dir=workspace_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[workspace_load] pivot runtime reconciliation failed: {exc}"
+                )
+                reconciliation_results = []
+
             # Refresh attack-graph step support classification for this ADscan version.
             try:
                 from adscan_internal.services.attack_graph_service import (
@@ -805,6 +890,42 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
                 check_and_refresh_myip(shell, context="workspace load")
             except Exception as _myip_exc:
                 print_info_debug(f"[workspace_load] myip staleness check failed: {_myip_exc}")
+
+            try:
+                from adscan_internal.services.pivot_relaunch_service import (
+                    maybe_offer_previous_pivot_relaunch,
+                )
+
+                interactive_relaunch = not bool(getattr(shell, "auto", False))
+                for result in reconciliation_results:
+                    if not result.restored_direct_vantage:
+                        continue
+                    maybe_offer_previous_pivot_relaunch(
+                        shell,
+                        domain=result.domain,
+                        interactive=interactive_relaunch,
+                        trigger="workspace_load",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[workspace_load] pivot relaunch offer failed: {exc}"
+                )
+
+            try:
+                from adscan_internal.services.current_vantage_inventory_refresh_service import (
+                    maybe_offer_workspace_current_vantage_refresh,
+                )
+
+                maybe_offer_workspace_current_vantage_refresh(
+                    shell,
+                    trigger="workspace_load",
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[workspace_load] current-vantage refresh offer failed: {exc}"
+                )
 
         else:
             print_warning(

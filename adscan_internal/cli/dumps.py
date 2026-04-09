@@ -42,6 +42,9 @@ from adscan_internal import (
     print_operation_header,
     telemetry,
 )
+from adscan_internal.integrations.netexec.parsers import (
+    parse_netexec_delegated_auth_failure,
+)
 from adscan_internal.rich_output import (
     ScanProgressTracker,
     confirm_operation,
@@ -2432,6 +2435,15 @@ def execute_dump_lsa(
         errors_output = completed_process.stderr
 
         if completed_process.returncode == 0:
+            auth_failure = parse_netexec_delegated_auth_failure(
+                output
+            ) or parse_netexec_delegated_auth_failure(errors_output)
+            if auth_failure:
+                print_error(
+                    "Error executing LSA dump: "
+                    f"{auth_failure.line}"
+                )
+                return
             bulk_mode = _is_bulk_dump_target(host)
             bulk_summary: dict[str, dict[str, Any]] = {}
             bulk_credentials: dict[tuple[str, str, bool], dict[str, Any]] = {}

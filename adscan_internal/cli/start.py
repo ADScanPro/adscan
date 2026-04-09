@@ -402,8 +402,9 @@ def maybe_offer_post_scan_lab_confirmation(shell: Any) -> None:
 
     Policy:
     - Strong inference (>= 0.90): accepted silently.
-    - Weak inference (< 0.90): prompt once to accept/change/skip.
-    - Unknown lab/provider: prompt once for optional manual entry.
+    - Weak inference (< 0.90): prompt once to accept or skip.
+    - Unknown lab/provider: no free-text prompt; keep provider context and use
+      `provider/unknown` downstream when applicable.
     """
     if getattr(shell, "type", None) != "ctf":
         return
@@ -439,7 +440,7 @@ def maybe_offer_post_scan_lab_confirmation(shell: Any) -> None:
             f"Lab: {marked_lab}\n"
             f"Source: {inference_source}\n"
             f"Confidence: {percent}%\n\n"
-            "[dim]Accept to keep it, reject to enter a different machine, or press Enter later to skip.[/dim]",
+            "[dim]Accept to keep it, or reject to leave the machine as unknown.[/dim]",
             title="[bold]Lab Confirmation[/bold]",
             border_style="cyan",
             padding=(1, 2),
@@ -458,49 +459,16 @@ def maybe_offer_post_scan_lab_confirmation(shell: Any) -> None:
 
         # Explicit rejection means we should not keep the weak inferred value.
         _clear_inferred_lab_context(shell)
-
-    try:
-        user_input = Prompt.ask(
-            "[dim]Which machine were you testing? (optional, Enter to skip)[/dim]",
-            default="",
-            console=shell.console,
-        )
-    except (EOFError, KeyboardInterrupt):
-        return
-
-    if not user_input or not user_input.strip():
-        return
-
-    try:
-        from adscan_core.domain_inference import resolve_lab_from_text  # noqa: PLC0415
-
-        resolved = resolve_lab_from_text(user_input.strip())
-    except Exception:  # noqa: BLE001
-        resolved = None
-
-    if not resolved:
         print_info_debug(
-            "[domain_inference] post-scan confirmation: no catalog match for manual input"
+            "[domain_inference] post-scan confirmation: free-text lab entry disabled; "
+            "falling back to provider/unknown when provider context exists"
         )
-        return
-
-    resolved_provider, resolved_lab, resolved_whitelisted = resolved
-    _set_user_selected_lab_context(
-        shell,
-        provider=resolved_provider,
-        lab_name=resolved_lab,
-        whitelisted=resolved_whitelisted,
-    )
-    print_info_debug(
-        f"[domain_inference] post-scan confirmation resolved: "
-        f"provider={resolved_provider} lab={resolved_lab} "
-        f"whitelisted={resolved_whitelisted}"
-    )
-    if hasattr(shell, "save_workspace_data"):
-        try:
-            shell.save_workspace_data()
-        except Exception:  # noqa: BLE001
-            pass
+        if hasattr(shell, "save_workspace_data"):
+            try:
+                shell.save_workspace_data()
+            except Exception:  # noqa: BLE001
+                pass
+    return
 
 
 def _workspace_has_domain_data(shell: Any) -> bool:

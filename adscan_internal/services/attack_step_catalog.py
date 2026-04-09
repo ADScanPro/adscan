@@ -83,6 +83,7 @@ class AttackStepCatalogEntry:
     bh_cypher_names: tuple[
         str, ...
     ] = ()  # Cypher relationship type(s) for BH CE queries
+    is_acl_edge: bool = False  # True = ACL/ACE-derived object-control or extended-right edge
     requires_execution_context: bool = False
     counts_for_execution_readiness: bool = False
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none"
@@ -106,6 +107,7 @@ def _entry(
     detection_event_ids: tuple[str, ...] = (),
     bh_native: bool = False,
     bh_cypher_names: tuple[str, ...] = (),
+    is_acl_edge: bool = False,
     requires_execution_context: bool = False,
     counts_for_execution_readiness: bool = False,
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none",
@@ -128,6 +130,7 @@ def _entry(
         detection_event_ids=detection_event_ids,
         bh_native=bh_native,
         bh_cypher_names=bh_cypher_names,
+        is_acl_edge=is_acl_edge,
         requires_execution_context=requires_execution_context,
         counts_for_execution_readiness=counts_for_execution_readiness,
         execution_target_access_requirement=execution_target_access_requirement,
@@ -1022,6 +1025,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("5136", "4662"),
         bh_native=True,
         bh_cypher_names=("GenericAll",),
+        is_acl_edge=True,
     ),
     _entry(
         "genericwrite",
@@ -1042,6 +1046,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("5136",),
         bh_native=True,
         bh_cypher_names=("GenericWrite",),
+        is_acl_edge=True,
     ),
     _entry(
         "owns",
@@ -1060,6 +1065,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4662",),
         bh_native=True,
         bh_cypher_names=("Owns",),
+        is_acl_edge=True,
     ),
     _entry(
         "forcechangepassword",
@@ -1081,6 +1087,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4723", "4724"),
         bh_native=True,
         bh_cypher_names=("ForceChangePassword",),
+        is_acl_edge=True,
     ),
     _entry(
         "addself",
@@ -1100,6 +1107,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4728", "4732", "4756"),
         bh_native=True,
         bh_cypher_names=("AddSelf",),
+        is_acl_edge=True,
     ),
     _entry(
         "addmember",
@@ -1120,6 +1128,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4728", "4732", "4756"),
         bh_native=True,
         bh_cypher_names=("AddMember",),
+        is_acl_edge=True,
     ),
     _entry(
         "readgmsapassword",
@@ -1141,6 +1150,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4662",),
         bh_native=True,
         bh_cypher_names=("ReadGMSAPassword",),
+        is_acl_edge=True,
     ),
     _entry(
         "readlapspassword",
@@ -1162,6 +1172,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4662",),
         bh_native=True,
         bh_cypher_names=("ReadLAPSPassword",),
+        is_acl_edge=True,
     ),
     _entry(
         "synclapspassword",
@@ -1180,6 +1191,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4662",),
         bh_native=True,
         bh_cypher_names=("SyncLAPSPassword",),
+        is_acl_edge=True,
     ),
     _entry(
         "writedacl",
@@ -1199,7 +1211,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_name="Windows File and Directory Permissions Modification",
         detection_event_ids=("5136",),
         bh_native=True,
-        bh_cypher_names=("WriteDACL",),
+        bh_cypher_names=("WriteDacl",),
+        is_acl_edge=True,
     ),
     _entry(
         "writeowner",
@@ -1220,6 +1233,31 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("5136",),
         bh_native=True,
         bh_cypher_names=("WriteOwner",),
+        is_acl_edge=True,
+    ),
+    _entry(
+        "writeaccountrestrictions",
+        support_kind="unsupported",
+        support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
+        category="acl_ace",
+        description=(
+            "Modify account-restriction property sets on the target user/computer object"
+        ),
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Remove WriteAccountRestrictions from non-privileged principals on the "
+            "target object. Restrict delegated property-set writes on privileged "
+            "user and computer objects."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1098",
+        mitre_technique_name="Account Manipulation",
+        detection_event_ids=("5136", "4662"),
+        bh_native=True,
+        bh_cypher_names=("WriteAccountRestrictions",),
+        is_acl_edge=True,
     ),
     _entry(
         "writespn",
@@ -1240,6 +1278,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("5136",),
         bh_native=True,
         bh_cypher_names=("WriteSPN",),
+        is_acl_edge=True,
     ),
     _entry(
         "writelogonscript",
@@ -1262,6 +1301,30 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         mitre_technique_id="T1098",
         mitre_technique_name="Account Manipulation",
         detection_event_ids=("5136",),
+        is_acl_edge=True,
+    ),
+    _entry(
+        "managerodcprp",
+        support_kind="context",
+        support_reason=(
+            "Contextual delegated RODC PRP-control edge discovered via LDAP ACL analysis; "
+            "not executed directly"
+        ),
+        compromise_semantics="context_only",
+        compromise_effort="none",
+        category="acl_ace",
+        description="Modify the RODC password-replication policy on the RODC computer object",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Remove delegated write access to msDS-RevealOnDemandGroup and "
+            "msDS-NeverRevealGroup from non-privileged principals. Review RODC "
+            "delegation groups for unnecessary membership."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1098",
+        mitre_technique_name="Account Manipulation",
+        detection_event_ids=("5136", "4662"),
+        is_acl_edge=True,
     ),
     _entry(
         "writesmbpath",
@@ -1298,6 +1361,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("5136",),
         bh_native=True,
         bh_cypher_names=("AddKeyCredentialLink",),
+        is_acl_edge=True,
     ),
     _entry(
         "allextendedrights",
@@ -1317,6 +1381,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4662",),
         bh_native=True,
         bh_cypher_names=("AllExtendedRights",),
+        is_acl_edge=True,
     ),
     # ── Credential access ───────────────────────────────────────────────────
     _entry(
@@ -1338,6 +1403,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4662",),
         bh_native=True,
         bh_cypher_names=("DCSync",),
+        is_acl_edge=True,
     ),
     _entry(
         "getchanges",
@@ -1355,6 +1421,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4662",),
         bh_native=True,
         bh_cypher_names=("GetChanges",),
+        is_acl_edge=True,
     ),
     _entry(
         "getchangesall",
@@ -1372,6 +1439,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4662",),
         bh_native=True,
         bh_cypher_names=("GetChangesAll",),
+        is_acl_edge=True,
     ),
     _entry(
         "dumplsa",
@@ -1714,6 +1782,9 @@ _RELATION_ALIASES_BY_KEY: dict[str, str] = {
     # KeyCredentialLink typo variants (BloodHound uses various spellings).
     "addkeycreatentiallink": "addkeycredentiallink",
     "addkeycredentiallinks": "addkeycredentiallink",
+    # Account restriction property-set variants.
+    "writeaccountrestriction": "writeaccountrestrictions",
+    "writeaccountrestrictions": "writeaccountrestrictions",
     # MS17-010 alias.
     "ms17010": "ms17-010",
 }
@@ -1799,6 +1870,21 @@ def get_bh_native_relations() -> frozenset[str]:
     return frozenset(
         rel for rel, entry in ATTACK_STEP_CATALOG.items() if entry.bh_native
     )
+
+
+def get_bh_native_acl_cypher_names() -> frozenset[str]:
+    """Return BH-native Cypher type names for ACL/ACE-derived edges.
+
+    The catalog marks ACL semantics explicitly via ``is_acl_edge`` so Phase 2
+    BloodHound queries and similar collection logic stay synchronized when new
+    ACL-backed attack steps are added.
+    """
+    result: set[str] = set()
+    for entry in ATTACK_STEP_CATALOG.values():
+        if not entry.bh_native or not entry.is_acl_edge:
+            continue
+        result.update(entry.bh_cypher_names)
+    return frozenset(result)
 
 
 def get_bh_cypher_relation_types() -> tuple[str, ...]:
