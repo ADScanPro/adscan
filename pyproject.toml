@@ -5,13 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "adscan"
 version = "6.5.0"
-description = "ADscan launcher (host-side) that orchestrates Docker to run the ADscan runtime."
+description = "Active Directory pentesting CLI for AD enumeration, BloodHound collection, Kerberoasting, ADCS checks, attack paths, and CTF labs."
 readme = "adscan_pypi_wrapper/README.md"
 authors = [{ name = "ADscan" }]
 requires-python = ">=3.9"
+keywords = [
+    "active-directory",
+    "pentesting",
+    "penetration-testing",
+    "bloodhound",
+    "kerberoasting",
+    "adcs",
+    "red-team",
+    "ctf",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
 ]
 dependencies = [
     "rich>=13.0,<14.0",
@@ -54,6 +68,10 @@ cli = [
 
 [project.urls]
 homepage = "https://github.com/ADscanPro/adscan"
+documentation = "https://adscanpro.com/docs"
+repository = "https://github.com/ADscanPro/adscan"
+issues = "https://github.com/ADscanPro/adscan/issues"
+changelog = "https://github.com/ADscanPro/adscan/releases"
 
 [project.scripts]
 adscan = "adscan_launcher.cli:main"

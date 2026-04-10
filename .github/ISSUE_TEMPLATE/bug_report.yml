@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible ADscan issue
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue. Remove secrets, hashes, customer names, internal domains, public IPs, and screenshots with sensitive data.
+  - type: input
+    id: version
+    attributes:
+      label: ADscan version
+      placeholder: "adscan version"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Host OS
+      placeholder: "Kali 2026.1, Ubuntu 24.04, Debian 12"
+    validations:
+      required: true
+  - type: input
+    id: docker
+    attributes:
+      label: Docker version
+      placeholder: "docker --version && docker compose version"
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and sanitized output
+      description: Include the command, error, and relevant logs with secrets removed.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Lab or environment context
+      description: HTB/VulnLab machine, AD lab, or real audit context if safe to share.
