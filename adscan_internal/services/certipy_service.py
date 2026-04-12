@@ -37,6 +37,28 @@ from adscan_internal.subprocess_env import (
 )
 
 
+_CERTIPY_LAB_PADATA_NOSUPP_TOKENS: tuple[str, ...] = (
+    "kdc_err_padata_type_nosupp",
+    "kdc has no support for padata type",
+)
+
+
+def _certipy_output_indicates_lab_padata_nosupp(output: str) -> bool:
+    """Return True when Certipy hit the known lab/CA PKINIT failure."""
+    lowered = output.lower()
+    return any(token in lowered for token in _CERTIPY_LAB_PADATA_NOSUPP_TOKENS)
+
+
+def _build_certipy_lab_padata_nosupp_message() -> str:
+    """Return a user-facing explanation for the PKINIT padata lab failure."""
+    return (
+        "Certipy Pass-the-Certificate hit KDC_ERR_PADATA_TYPE_NOSUPP. "
+        "This usually indicates a broken lab/CA PKINIT state rather than an issue "
+        "with the certificate itself. Restart the lab or the affected CA/KDC services "
+        "and retry."
+    )
+
+
 @dataclass
 class PassTheCertificateResult:
     """Result of a Certipy Pass-the-Certificate operation.
@@ -256,6 +278,23 @@ class CertipyService(BaseService):
                 raw_output=output,
                 success=False,
                 error_message=timeout_error,
+            )
+
+        if _certipy_output_indicates_lab_padata_nosupp(output):
+            lab_error = _build_certipy_lab_padata_nosupp_message()
+            print_error(lab_error)
+            print_instruction(
+                "Restart the lab or the affected CA/KDC services, then retry the Pass-the-Certificate step."
+            )
+            return PassTheCertificateResult(
+                domain=domain,
+                principal=None,
+                username=None,
+                resolved_domain=None,
+                nt_hash=None,
+                raw_output=output,
+                success=False,
+                error_message=lab_error,
             )
 
         # Parse NT hash using the same pattern as the legacy implementation.

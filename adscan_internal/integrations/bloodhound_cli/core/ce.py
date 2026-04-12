@@ -33,6 +33,10 @@ from adscan_internal.rich_output import (
     print_exception
 )
 from adscan_internal.services.attack_step_catalog import get_bh_native_acl_cypher_names
+from adscan_internal.services.host_docker_service import (
+    get_managed_bloodhound_ce_service_time,
+    restart_bloodhound_ce_and_wait,
+)
 
 
 def _safe_truncate(value: str, limit: int = 1200) -> str:
@@ -314,6 +318,7 @@ class BloodHoundCEClient(BloodHoundClient):
         self._rate_limit_notice_active = False
         self._rate_limit_notice_kind: str | None = None
         self._stuck_rate_limit_notice_shown = False
+        self._stuck_rate_limit_recovery_attempted = False
 
     def _get_rate_limiter(self, bucket: str) -> _BloodHoundApiRateLimiter:
         """Return the shared rate limiter for this BloodHound CE base URL and bucket."""
@@ -412,49 +417,58 @@ class BloodHoundCEClient(BloodHoundClient):
             f"host_utc={host_utc}",
             f"host_epoch={round(host_epoch, 3)}",
         ]
-
         try:
-            from adscan_launcher.bloodhound_ce_compose import (
-                _compose_container_name,
-                docker_available,
-                run_docker,
-            )
-        except Exception as exc:
-            diagnostics.append(f"compose_import_error={_safe_truncate(exc)}")
-            return " | ".join(diagnostics)
-
-        try:
-            if not docker_available():
-                diagnostics.append("docker_unavailable")
-                return " | ".join(diagnostics)
-
-            container_name = _compose_container_name("bloodhound")
-            diagnostics.append(f"container_name={container_name}")
-
-            proc = run_docker(
-                [
-                    "docker",
-                    "exec",
-                    container_name,
-                    "date",
-                    "-u",
-                    "+%Y-%m-%dT%H:%M:%SZ (%s)",
-                ],
-                check=False,
-                capture_output=True,
-                timeout=15,
-            )
-            diagnostics.append(f"container_date_rc={getattr(proc, 'returncode', 'unknown')}")
-            stdout = (getattr(proc, "stdout", "") or "").strip()
-            stderr = (getattr(proc, "stderr", "") or "").strip()
-            if stdout:
-                diagnostics.append(f"container_utc={stdout}")
-            if stderr:
-                diagnostics.append(f"container_date_err={_safe_truncate(stderr)}")
+            diagnostics.append("service=bloodhound")
+            container_time = get_managed_bloodhound_ce_service_time("bloodhound")
+            if container_time.ok:
+                if container_time.stdout:
+                    diagnostics.append(
+                        f"container_utc={_safe_truncate(container_time.stdout.strip())}"
+                    )
+            else:
+                if container_time.message:
+                    diagnostics.append(container_time.message)
+                if container_time.stderr:
+                    diagnostics.append(
+                        f"container_date_err={_safe_truncate(container_time.stderr)}"
+                    )
             return " | ".join(diagnostics)
         except Exception as exc:
             diagnostics.append(f"container_date_error={_safe_truncate(exc)}")
             return " | ".join(diagnostics)
+
+    def _attempt_recover_from_stuck_rate_limit(self) -> bool:
+        """Best-effort recovery for a BloodHound CE rate limiter stuck far in the future."""
+        if self._stuck_rate_limit_recovery_attempted:
+            return False
+        self._stuck_rate_limit_recovery_attempted = True
+        print_warning(
+            "Attempting automatic BloodHound CE web-container restart to recover from a stuck API rate limiter."
+        )
+
+        recovery = restart_bloodhound_ce_and_wait(
+            base_url=self.base_url,
+            service_name="bloodhound",
+            timeout_seconds=60,
+            interval_seconds=2,
+        )
+        if not recovery.ok:
+            self._debug(
+                "stuck rate-limit recovery skipped",
+                method=recovery.method,
+                reason=recovery.message or "unknown",
+                stderr=_safe_truncate(recovery.stderr or ""),
+                stdout=_safe_truncate(recovery.stdout or ""),
+            )
+            return False
+
+        print_success(
+            "BloodHound CE API responded after automatic restart. Retrying the request once."
+        )
+        self._stuck_rate_limit_notice_shown = False
+        self._rate_limit_notice_active = False
+        self._rate_limit_notice_kind = None
+        return True
 
     def _debug_rate_limit_diagnostics(
         self,
@@ -557,6 +571,10 @@ class BloodHoundCEClient(BloodHoundClient):
                         wait_seconds=raw_reset_wait,
                         request_id=response.headers.get("Requestid") or response.headers.get("RequestId"),
                     )
+                    if self._attempt_recover_from_stuck_rate_limit():
+                        rate_limit_retries += 1
+                        auth_retried = False
+                        continue
                     return response
                 pause_seconds = rate_limiter.note_rate_limited(response.headers)
                 self._emit_rate_limit_pause(pause_seconds=pause_seconds, proactive=False)

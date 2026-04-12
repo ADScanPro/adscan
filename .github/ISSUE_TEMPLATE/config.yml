@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ADscan documentation
+    url: https://adscanpro.com/docs
+    about: Installation, quickstart, labs, and troubleshooting live in the docs.
+  - name: ADscan Discord
+    url: https://discord.com/invite/fXBR3P8H74
+    about: Ask usage questions, share lab results, or discuss workflows with other pentesters.

@@ -55,6 +55,7 @@ _SAFE_SHARE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9$._ -]{0,127}$")
 _SAFE_WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$")
 
 _CONTAINER_WORKSPACES_DIR = "/opt/adscan/workspaces"
+_MANAGED_BLOODHOUND_SERVICES = frozenset({"bloodhound", "neo4j", "postgres"})
 
 
 class HostHelperError(RuntimeError):
@@ -582,6 +583,20 @@ def _run_cmd(
     )
 
 
+def _resolve_managed_bloodhound_container_name(service_name: str) -> str:
+    """Resolve the managed BloodHound CE container name for a known service."""
+    normalized = str(service_name or "").strip().lower()
+    if normalized not in _MANAGED_BLOODHOUND_SERVICES:
+        allowed = ", ".join(sorted(_MANAGED_BLOODHOUND_SERVICES))
+        raise HostHelperError(
+            f"Invalid BloodHound CE service: {service_name!r}. Allowed: {allowed}"
+        )
+
+    from adscan_launcher.bloodhound_ce_compose import _compose_container_name
+
+    return _compose_container_name(normalized)
+
+
 def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
     op = str(req.get("op") or "").strip()
     if not op:
@@ -673,6 +688,40 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
             )
         except Exception as exc:
             return HostHelperResponse(False, 1, None, None, f"exception: {exc}")
+
+    if op == "bloodhound_ce_restart_service":
+        service = req.get("service")
+        if not isinstance(service, str):
+            return HostHelperResponse(False, None, None, None, "Invalid service")
+        if not shutil_which("docker"):
+            return HostHelperResponse(False, 127, None, None, "docker not found")
+        try:
+            container_name = _resolve_managed_bloodhound_container_name(service)
+        except HostHelperError as exc:
+            return HostHelperResponse(False, None, None, None, str(exc))
+        return _run_cmd(["docker", "restart", container_name], timeout=60)
+
+    if op == "bloodhound_ce_service_utc":
+        service = req.get("service")
+        if not isinstance(service, str):
+            return HostHelperResponse(False, None, None, None, "Invalid service")
+        if not shutil_which("docker"):
+            return HostHelperResponse(False, 127, None, None, "docker not found")
+        try:
+            container_name = _resolve_managed_bloodhound_container_name(service)
+        except HostHelperError as exc:
+            return HostHelperResponse(False, None, None, None, str(exc))
+        return _run_cmd(
+            [
+                "docker",
+                "exec",
+                container_name,
+                "date",
+                "-u",
+                "+%Y-%m-%dT%H:%M:%SZ (%s)",
+            ],
+            timeout=20,
+        )
 
     if op == "rdp_launch":
         host = req.get("host")

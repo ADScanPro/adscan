@@ -1825,16 +1825,20 @@ def _extract_cert_template_name_from_label(
 
 def _extract_cert_templates_from_step_details(
     details: dict[str, Any],
+    *,
+    template_field: str = "template",
+    list_field: str = "templates",
+    summary_field: str = "templates_summary",
 ) -> list[str]:
     """Extract certificate template names from attack-step details."""
 
     templates: list[str] = []
 
-    template_name = details.get("template")
+    template_name = details.get(template_field)
     if isinstance(template_name, str) and template_name.strip():
         templates.append(template_name.strip())
 
-    raw_templates = details.get("templates")
+    raw_templates = details.get(list_field)
     if isinstance(raw_templates, list):
         for entry in raw_templates:
             name = None
@@ -1845,7 +1849,7 @@ def _extract_cert_templates_from_step_details(
             if isinstance(name, str) and name.strip():
                 templates.append(name.strip())
 
-    summary = details.get("templates_summary")
+    summary = details.get(summary_field)
     if isinstance(summary, str) and summary.strip() and not raw_templates:
         for item in summary.split(","):
             candidate = item.strip()
@@ -1865,6 +1869,23 @@ def _extract_cert_templates_from_step_details(
     return unique
 
 
+def _extract_cert_templates_by_role(
+    details: dict[str, Any],
+    *,
+    role: str,
+) -> list[str]:
+    """Extract role-specific certificate templates from attack-step details."""
+    role_key = str(role or "").strip().lower()
+    if role_key not in {"agent", "target"}:
+        return []
+    return _extract_cert_templates_from_step_details(
+        details,
+        template_field=f"{role_key}_template",
+        list_field=f"{role_key}_templates",
+        summary_field=f"{role_key}_templates_summary",
+    )
+
+
 def _status_allowed_by_filter(status: str, desired_statuses: set[str] | None) -> bool:
     """Return True when status passes the optional execution filter."""
     if desired_statuses is None:
@@ -1878,6 +1899,7 @@ def _select_adcs_template(
     esc_number: str,
     templates: list[str],
     default_idx: int = 0,
+    prompt_label: str = "template",
 ) -> str | None:
     """Select a certificate template from candidates (prompt if needed)."""
 
@@ -1888,7 +1910,7 @@ def _select_adcs_template(
     if len(templates) > 1 and hasattr(shell, "_questionary_select"):
         options = list(templates) + ["Cancel"]
         idx = shell._questionary_select(
-            f"Select an ESC{esc_number} template to use:",
+            f"Select an ESC{esc_number} {prompt_label} to use:",
             options,
             default_idx=default_idx,
         )
@@ -4187,14 +4209,18 @@ def execute_selected_attack_path(
                 if isinstance(last_outcome, dict)
                 else (get_last_ace_execution_outcome(shell) or {})
             )
+            outcome_key = str(effective_outcome.get("key") or "").strip().lower()
             marked_outcome_domain = mark_sensitive(domain, "domain")
             print_info_debug(
                 "[attack_paths] outcome follow-up evaluation: "
                 f"domain={marked_outcome_domain} pivot={is_pivot_search!r} "
-                f"outcome_key={mark_sensitive(str(effective_outcome.get('key') or 'none'), 'detail')}"
+                f"outcome_key={mark_sensitive(str(outcome_key or 'none'), 'detail')}"
             )
-            if is_pivot_search:
-                outcome_key = str(effective_outcome.get("key") or "").strip().lower()
+            should_evaluate_outcome_followups = is_pivot_search or outcome_key in {
+                "rbcd_prepared",
+                "rodc_host_access_prepared",
+            }
+            if should_evaluate_outcome_followups:
                 if outcome_key != "user_credential_obtained":
                     outcome_followups = build_followups_for_execution_outcome(
                         shell,
@@ -6083,22 +6109,36 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
-                esc3_templates = _resolve_adcs_template_candidates(
-                    shell,
-                    domain=domain,
-                    exec_username=exec_username,
-                    password=password,
-                    esc_number="3",
-                    details=details,
-                    to_label=to_label,
-                    domain_data=domain_data,
+                esc3_agent_templates = _extract_cert_templates_by_role(
+                    details,
+                    role="agent",
                 )
-                if not esc3_templates:
+                if esc3_agent_templates:
+                    marked = ", ".join(
+                        mark_sensitive(template_name, "service")
+                        for template_name in esc3_agent_templates
+                    )
+                    print_info_debug(
+                        "[adcsesc3] Using agent template(s) from attack step details: "
+                        f"{marked}"
+                    )
+                else:
+                    esc3_agent_templates = _resolve_adcs_template_candidates(
+                        shell,
+                        domain=domain,
+                        exec_username=exec_username,
+                        password=password,
+                        esc_number="3",
+                        details=details,
+                        to_label=to_label,
+                        domain_data=domain_data,
+                    )
+                if not esc3_agent_templates:
                     manual_template = _prompt_for_manual_adcs_template(esc_number="3")
                     if manual_template:
-                        esc3_templates = [manual_template]
+                        esc3_agent_templates = [manual_template]
                         print_info_debug(
-                            "[adcsesc3] Using operator-specified template: "
+                            "[adcsesc3] Using operator-specified agent template: "
                             f"{mark_sensitive(manual_template, 'service')}"
                         )
                     else:
@@ -6106,18 +6146,42 @@ def execute_selected_attack_path(
                             "No ESC3 vulnerable certificate templates found for this user."
                         )
                         return execution_started
-                if not esc3_templates:
+                if not esc3_agent_templates:
                     print_warning(
                         "No ESC3 vulnerable certificate templates found for this user."
                     )
                     return execution_started
 
-                template = _select_adcs_template(
+                agent_template = _select_adcs_template(
                     shell,
                     esc_number="3",
-                    templates=esc3_templates,
+                    templates=esc3_agent_templates,
+                    prompt_label="agent template",
                 )
-                if not template:
+                if not agent_template:
+                    print_warning("ESC3 execution cancelled.")
+                    return execution_started
+
+                esc3_target_templates = _extract_cert_templates_by_role(
+                    details,
+                    role="target",
+                )
+                if not esc3_target_templates:
+                    esc3_target_templates = ["User"]
+                default_target_idx = 0
+                for idx, template_name in enumerate(esc3_target_templates):
+                    if str(template_name).strip().lower() == "user":
+                        default_target_idx = idx
+                        break
+
+                client_auth_template = _select_adcs_template(
+                    shell,
+                    esc_number="3",
+                    templates=esc3_target_templates,
+                    default_idx=default_target_idx,
+                    prompt_label="target template",
+                )
+                if not client_auth_template:
                     print_warning("ESC3 execution cancelled.")
                     return execution_started
 
@@ -6126,7 +6190,11 @@ def execute_selected_attack_path(
                     action="ADCSESC3",
                     from_label=from_label,
                     to_label=to_label,
-                    notes={"username": exec_username, "template": template},
+                    notes={
+                        "username": exec_username,
+                        "template": agent_template,
+                        "client_auth_template": client_auth_template,
+                    },
                 ):
                     try:
                         update_edge_status_by_labels(
@@ -6136,14 +6204,22 @@ def execute_selected_attack_path(
                             relation="ADCSESC3",
                             to_label=to_label,
                             status="attempted",
-                            notes={"username": exec_username, "template": template},
+                            notes={
+                                "username": exec_username,
+                                "template": agent_template,
+                                "client_auth_template": client_auth_template,
+                            },
                         )
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
                     if hasattr(shell, "adcs_esc3"):
                         shell.adcs_esc3(  # type: ignore[attr-defined]
-                            domain, exec_username, password, template
+                            domain,
+                            exec_username,
+                            password,
+                            agent_template,
+                            client_auth_template=client_auth_template,
                         )
                     else:
                         from adscan_internal.cli.adcs_exploitation import adcs_esc3
@@ -6153,7 +6229,8 @@ def execute_selected_attack_path(
                             domain=domain,
                             username=exec_username,
                             password=password,
-                            template=template,
+                            template=agent_template,
+                            client_auth_template=client_auth_template,
                         )
                 continue
 

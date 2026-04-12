@@ -1097,6 +1097,18 @@ class BloodHoundShell(Protocol):
         prompt_for_method_choice: bool = True,
     ) -> bool: ...
 
+    def exploit_control_computer_object(
+        self,
+        domain: str,
+        username: str,
+        password: str,
+        target_computer: str,
+        target_domain: str,
+        *,
+        prompt_for_user_privs_after: bool = True,
+        prompt_for_method_choice: bool = True,
+    ) -> bool: ...
+
     def exploit_write_spn(
         self,
         domain: str,
@@ -1964,6 +1976,140 @@ def _load_certipy_adcs_discovery(
     return paths, templates
 
 
+def _certipy_relation_template_tag(relation: str) -> str:
+    """Normalize a BH ESC relation to the base Certipy vulnerability tag."""
+    rel_upper = str(relation or "").strip().upper()
+    if not rel_upper.startswith("ADCSESC"):
+        return ""
+    esc_tag = rel_upper.replace("ADCS", "", 1)
+    if re.fullmatch(r"ESC\d+[A-Z]", esc_tag):
+        return esc_tag[:-1]
+    return esc_tag
+
+
+def _has_certipy_display_notes(note: object) -> bool:
+    """Return True when a relation note already carries template or CA display data."""
+    if not isinstance(note, dict):
+        return False
+    return bool(
+        note.get("enterpriseca_name")
+        or note.get("enterpriseca")
+        or note.get("template")
+        or note.get("templates")
+        or note.get("templates_summary")
+    )
+
+
+def _summarize_adcs_detector_path_signatures(
+    paths: list[dict[str, Any]],
+) -> set[str]:
+    """Collapse ADCS path output into stable detector-parity signatures."""
+    signatures: set[str] = set()
+    for entry in paths:
+        if not isinstance(entry, dict):
+            continue
+        nodes = entry.get("nodes") if isinstance(entry.get("nodes"), list) else []
+        rels = entry.get("rels") if isinstance(entry.get("rels"), list) else []
+        notes_by_relation_index = (
+            entry.get("notes_by_relation_index")
+            if isinstance(entry.get("notes_by_relation_index"), dict)
+            else {}
+        )
+        if len(nodes) < 2 or not rels:
+            continue
+        relation_names = []
+        for rel in rels:
+            if isinstance(rel, dict):
+                relation_names.append(
+                    str(
+                        rel.get("type")
+                        or rel.get("label")
+                        or rel.get("kind")
+                        or rel.get("name")
+                        or ""
+                    )
+                )
+            else:
+                relation_names.append(str(rel))
+        for rel_idx, rel in enumerate(relation_names):
+            if rel_idx + 1 >= len(nodes):
+                break
+            rel_upper = str(rel or "").strip().upper()
+            if not rel_upper.startswith("ADCSESC"):
+                continue
+            left = _bloodhound_node_display_label(nodes[rel_idx])
+            right = _bloodhound_node_display_label(nodes[rel_idx + 1])
+            note = notes_by_relation_index.get(rel_idx)
+            note_dict = note if isinstance(note, dict) else None
+            display_right = _canonicalize_adcs_detector_parity_target(
+                relation=rel_upper,
+                note=note_dict,
+                fallback_target=right,
+            )
+            signatures.add(f"{left} -> {rel_upper} -> {display_right}")
+    return signatures
+
+
+def _canonicalize_adcs_detector_parity_target(
+    *,
+    relation: str,
+    note: dict[str, Any] | None,
+    fallback_target: str,
+) -> str:
+    """Normalize ADCS display targets so parity compares semantics, not summaries."""
+    relation_upper = str(relation or "").strip().upper()
+    if relation_upper in {"ADCSESC8", "ADCSESC11", "ADCSESC6A", "ADCSESC7"}:
+        ca_name = str(
+            (note or {}).get("enterpriseca_name")
+            or (note or {}).get("enterpriseca")
+            or ""
+        ).strip()
+        if ca_name:
+            return ca_name
+
+    if relation_upper == "ADCSESC3":
+        return "ESC3_TEMPLATE_SCOPE"
+
+    return resolve_adcs_display_target(
+        relation_upper,
+        note,
+        fallback_target=fallback_target,
+    )
+
+
+def _log_adcs_detector_parity_debug(
+    *,
+    target_domain: str,
+    certihound_paths: list[dict[str, Any]],
+    certipy_paths: list[dict[str, Any]],
+) -> None:
+    """Log one compact parity summary for CertiHound vs Certipy ADCS output."""
+    certihound_signatures = _summarize_adcs_detector_path_signatures(certihound_paths)
+    certipy_signatures = _summarize_adcs_detector_path_signatures(certipy_paths)
+    only_certihound = sorted(certihound_signatures - certipy_signatures)
+    only_certipy = sorted(certipy_signatures - certihound_signatures)
+    overlap = len(certihound_signatures & certipy_signatures)
+    print_info_debug(
+        "[bloodhound] ADCS detector parity for "
+        f"{mark_sensitive(target_domain, 'domain')}: "
+        f"certihound={len(certihound_signatures)} "
+        f"certipy={len(certipy_signatures)} "
+        f"overlap={overlap} "
+        f"only_certihound={len(only_certihound)} "
+        f"only_certipy={len(only_certipy)}"
+    )
+    if only_certihound:
+        print_info_debug(
+            "[bloodhound] ADCS detector parity only_certihound="
+            + "; ".join(only_certihound[:5])
+        )
+    if only_certipy:
+        print_info_debug(
+            "[bloodhound] ADCS detector parity only_certipy="
+            + "; ".join(only_certipy[:5])
+        )
+
+
 def _load_certihound_adcs_discovery(
     shell: BloodHoundShell,
     *,
@@ -2116,8 +2262,22 @@ def run_bloodhound_attack_paths(
     adcs_certihound_templates: dict[str, Any] | None = None
     adcs_certipy_paths: list[dict[str, Any]] | None = None
     adcs_certipy_templates: dict[str, Any] | None = None
+    adcs_detector_parity_logged = False
     writable_user_attribute_paths: list[dict[str, Any]] | None = None
     rodc_prp_control_paths: list[dict[str, Any]] | None = None
+
+    def _maybe_log_adcs_detector_parity() -> None:
+        nonlocal adcs_detector_parity_logged
+        if adcs_detector_parity_logged:
+            return
+        if adcs_certihound_paths is None or adcs_certipy_paths is None:
+            return
+        _log_adcs_detector_parity_debug(
+            target_domain=target_domain,
+            certihound_paths=list(adcs_certihound_paths or []),
+            certipy_paths=list(adcs_certipy_paths or []),
+        )
+        adcs_detector_parity_logged = True
 
     def _ensure_adcs_certihound_loaded() -> None:
         nonlocal adcs_certihound_paths
@@ -2131,6 +2291,7 @@ def run_bloodhound_attack_paths(
                 graph=graph,
             )
         )
+        _maybe_log_adcs_detector_parity()
 
     def _ensure_adcs_certipy_loaded() -> None:
         nonlocal adcs_certipy_paths
@@ -2142,6 +2303,7 @@ def run_bloodhound_attack_paths(
             target_domain=target_domain,
             graph=graph,
         )
+        _maybe_log_adcs_detector_parity()
 
     def _get_adcs_certihound_paths() -> list[dict[str, Any]]:
         _ensure_adcs_certihound_loaded()
@@ -2191,14 +2353,14 @@ def run_bloodhound_attack_paths(
 
     steps: list[tuple[str, str, callable]] = [
         (
-            "ADCS Escalation (CertiHound)",
-            "get_certihound_adcs_paths",
-            _get_adcs_certihound_paths,
-        ),
-        (
             "ADCS Escalation (Certipy)",
             "get_certipy_adcs_paths",
             _get_adcs_certipy_paths,
+        ),
+        (
+            "ADCS Escalation (CertiHound)",
+            "get_certihound_adcs_paths",
+            _get_adcs_certihound_paths,
         ),
         (
             "Roastable Users",
@@ -2573,6 +2735,11 @@ def run_bloodhound_attack_paths(
                 continue
 
             relation_names = [_relation_name(rel) for rel in rels]
+            entry_notes = (
+                entry.get("notes_by_relation_index")
+                if isinstance(entry.get("notes_by_relation_index"), dict)
+                else {}
+            )
             notes_by_relation_index: dict[int, dict[str, Any]] = {}
             for rel_idx, rel in enumerate(relation_names):
                 if not isinstance(rel, str):
@@ -2580,7 +2747,7 @@ def run_bloodhound_attack_paths(
                 rel_upper = rel.upper()
                 if not rel_upper.startswith("ADCSESC"):
                     continue
-                esc_tag = rel_upper.replace("ADCS", "")
+                esc_tag = _certipy_relation_template_tag(rel_upper)
                 templates: list[dict[str, Any]] = []
                 for tpl_name, meta in certipy_templates.items():
                     if not isinstance(meta, dict):
@@ -2611,18 +2778,17 @@ def run_bloodhound_attack_paths(
                         "templates": templates,
                         "templates_summary": ", ".join(summary_items),
                     }
-                elif certipy_templates and rel_upper not in warned_relation_mismatches:
+                elif (
+                    certipy_templates
+                    and rel_upper not in warned_relation_mismatches
+                    and not _has_certipy_display_notes(entry_notes.get(rel_idx))
+                ):
                     marked_domain = mark_sensitive(target_domain, "domain")
                     print_info_debug(
                         f"[bloodhound] no certipy templates matched {rel_upper} "
                         f"for {marked_domain}; JSON may be stale or scoped differently."
                     )
                     warned_relation_mismatches.add(rel_upper)
-            entry_notes = (
-                entry.get("notes_by_relation_index")
-                if isinstance(entry.get("notes_by_relation_index"), dict)
-                else {}
-            )
             if entry_notes:
                 for note_idx, note_value in entry_notes.items():
                     if not isinstance(note_idx, int) or not isinstance(note_value, dict):
@@ -5450,80 +5616,116 @@ def execute_bloodhound_dc_access(
 # ============================================================================
 
 
+def _parse_bloodhound_epoch(value: object) -> datetime | None:
+    """Convert BloodHound epoch-like values to an aware UTC datetime."""
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(parsed, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _resolve_krbtgt_last_change(
+    records: list[dict[str, object]],
+) -> tuple[datetime | None, dict[str, object] | None]:
+    """Return the best ``krbtgt`` password-last-change record from BloodHound data."""
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        username = str(record.get("samaccountname") or "").strip().lower()
+        if username != "krbtgt":
+            continue
+        last_change = _parse_bloodhound_epoch(record.get("pwdlastset"))
+        if last_change is not None:
+            return last_change, record
+    return None, None
+
+
 def run_bloodhound_krbtgt(shell: BloodHoundShell, domain: str) -> None:
-    """Check the last password change of the 'krbtgt' user in the given domain using BloodHound.
+    """Check the ``krbtgt`` password age using the active BloodHound service.
 
     Args:
         shell: Shell instance implementing BloodHoundShell protocol
         domain: Domain name to check
     """
     marked_domain = mark_sensitive(domain, "domain")
-    bh_cli = shell._get_bloodhound_cli_path()
-    if not bh_cli:
-        return
-    command = f"{bh_cli} user --password-last-change -d {marked_domain} -u krbtgt"
-    print_info(f"Checking kbrtgt's last password change on domain {marked_domain}")
-    execute_bloodhound_krbtgt(shell, command, domain)
+    print_info(f"Checking krbtgt's last password change on domain {marked_domain}")
+    try:
+        records = shell._get_bloodhound_service().get_password_last_change(
+            domain=domain,
+            user="krbtgt",
+        )
+        execute_bloodhound_krbtgt(shell, None, domain, records=records)
+    except Exception as e:
+        telemetry.capture_exception(e)
+        print_error(
+            f"Failed to query BloodHound for krbtgt password age in domain {marked_domain}"
+        )
+        print_exception(show_locals=False, exception=e)
 
 
 def execute_bloodhound_krbtgt(
-    shell: BloodHoundShell, command: str, domain: str
+    shell: BloodHoundShell,
+    command: str | None,
+    domain: str,
+    *,
+    records: list[dict[str, object]] | None = None,
 ) -> None:
-    """Execute the bloodhound-cli command, parse the output, extract the last password change date.
+    """Persist ``krbtgt`` password age from BloodHound query data.
 
     Args:
         shell: Shell instance implementing BloodHoundShell protocol
-        command: Command to execute
+        command: Legacy compatibility argument, unused when records are provided
         domain: Domain name
+        records: Structured BloodHound password-last-change records
     """
     try:
-        # Execute the command and capture its output without freezing the interactive shell
-        completed_process = shell.run_command(command, timeout=60)
-        output = completed_process.stdout
+        if records is None:
+            print_info_debug(
+                "[krbtgt] Legacy execute path invoked without structured records; querying BloodHound service."
+            )
+            records = shell._get_bloodhound_service().get_password_last_change(
+                domain=domain,
+                user="krbtgt",
+            )
     except Exception as e:
         telemetry.capture_exception(e)
-        # If the command execution fails, log error and exit the function
-        print_error(f"Error executing bloodhound-cli command: {e}")
+        print_error(f"Error retrieving krbtgt password age data: {e}")
         return
 
-    # Check that the expected string is present in the command output
-    if "User: krbtgt | Password Last Change:" in output:
-        # Use regex to extract the date string after the indicator text
-        match = re.search(r"User: krbtgt \| Password Last Change:\s*(.*)", output)
-        if match:
-            date_str = match.group(1).strip()
-            # Remove the "UTC" suffix if it exists for proper parsing
-            date_str = date_str.replace("UTC", "").strip()
-            try:
-                # Parse the date. The expected format is "Friday, 2011-03-18 09:15:38"
-                last_change = datetime.strptime(date_str, "%A, %Y-%m-%d %H:%M:%S")
-                # Make the parsed datetime timezone-aware by assigning UTC
-                last_change = last_change.replace(tzinfo=timezone.utc)
-                # Get the current time in UTC as a timezone-aware datetime.
-                # This intentionally uses wall-clock time because we care
-                # about calendar age, not monotonic duration.
-                now = datetime.now(timezone.utc)
-                diff = now - last_change
-                # Determine if the difference is one year (365 days) or more
-                flag = diff.days >= 365
-                shell.update_report_field(domain, "krbtgt_pass", flag)
-                marked_domain = mark_sensitive(domain, "domain")
-                print_success(
-                    f"krbtgt password was changed last time in {date_str} in domain {marked_domain}"
-                )
-            except ValueError as e:
-                telemetry.capture_exception(e)
-                # If parsing the date fails, log an error message
-                marked_domain = mark_sensitive(domain, "domain")
-                print_error(
-                    f"Unable to parse the date for krbtgt in domain {marked_domain}"
-                )
-    else:
-        # If the expected string is missing in the output, log an error message
+    last_change, record = _resolve_krbtgt_last_change(records or [])
+    if last_change is None:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(
-            f"Unable to find the expected string for krbtgt in domain {marked_domain}"
+            f"Unable to resolve krbtgt password last change from BloodHound data in domain {marked_domain}"
         )
+        return
+
+    now = datetime.now(timezone.utc)
+    diff = now - last_change
+    flag = diff.days >= 365
+    shell.update_report_field(domain, "krbtgt_pass", flag)
+
+    marked_domain = mark_sensitive(domain, "domain")
+    date_str = last_change.strftime("%Y-%m-%d %H:%M:%S %Z")
+    posture = "stale" if flag else "recent"
+    print_success(
+        f"krbtgt password was last changed on {date_str} in domain {marked_domain}"
+    )
+    print_info_debug(
+        "[krbtgt] password age assessment: "
+        f"domain={marked_domain} "
+        f"days_since_change={diff.days} "
+        f"posture={posture} "
+        f"record={record}"
+    )
 
 
 # ============================================================================

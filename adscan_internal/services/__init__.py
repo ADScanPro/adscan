@@ -37,6 +37,7 @@ if _STATIC_ANALYSIS:
     from .credential_store_service import (
         CredentialStoreService,
         DomainCredentialUpdateResult,
+        KerberosKeyMaterial,
         LocalCredentialUpdateResult,
     )
     from .credsweeper_library_service import (
@@ -194,6 +195,7 @@ _EXPORT_MODULES: dict[str, str] = {
     "SpideringService": ".spidering_service",
     "CredentialStoreService": ".credential_store_service",
     "DomainCredentialUpdateResult": ".credential_store_service",
+    "KerberosKeyMaterial": ".credential_store_service",
     "LocalCredentialUpdateResult": ".credential_store_service",
     "ShareMappingService": ".share_mapping_service",
     "CIFSShareMappingService": ".cifs_share_mapping_service",

@@ -69,6 +69,8 @@ def normalize_creds_subcommand(subcommand: str) -> tuple[str, bool]:
     normalized = str(subcommand or "").strip().lower()
     aliases = {
         "add": "save",
+        "remove": "delete",
+        "del": "delete",
     }
     target = aliases.get(normalized, normalized)
     return target, target != normalized
@@ -262,12 +264,20 @@ def clear_creds(shell: Any, domain: str) -> None:
     print_info(f"All credentials for domain {marked_domain} have been cleared.")
 
 
-def select_cred(shell: Any, domain: str) -> None:
-    """Select a credential for a domain and proceed with enumeration.
+def _get_selectable_domain_users(
+    shell: Any,
+    *,
+    domain: str,
+) -> list[str] | None:
+    """Return stored domain users that can be selected for a domain action.
 
     Args:
-        shell: The PentestShell instance with domains_data and related methods.
-        domain: The domain name to select credentials for.
+        shell: The PentestShell instance with domains_data.
+        domain: Domain whose stored credentials should be inspected.
+
+    Returns:
+        The selectable username list when present, otherwise ``None`` after
+        showing the corresponding user-facing error.
     """
     if (
         domain not in shell.domains_data
@@ -276,18 +286,37 @@ def select_cred(shell: Any, domain: str) -> None:
     ):
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"No credentials stored for domain [bold]{marked_domain}[/bold].")
-        return
+        return None
 
     credentials = shell.domains_data[domain]["credentials"]
     user_list = list(credentials.keys())
-
     if not user_list:
         marked_domain = mark_sensitive(domain, "domain")
         print_warning(
             f"No users with credentials found for domain [bold]{marked_domain}[/bold], though credentials entry exists."
         )
-        return
+        return None
 
+    return user_list
+
+
+def _prompt_for_domain_user_selection(
+    shell: Any,
+    *,
+    domain: str,
+    user_list: list[str],
+    prompt_label: str = "Select a user",
+) -> str | None:
+    """Display stored users for ``domain`` and return the selected username.
+
+    Args:
+        domain: The domain name whose users are being presented.
+        user_list: Stored usernames for the domain.
+        prompt_label: Interactive prompt shown to the operator.
+
+    Returns:
+        The selected username, or ``None`` when selection is cancelled/invalid.
+    """
     print_panel(
         Text.from_markup(
             f"[bold {BRAND_COLORS['info']}]{domain}[/bold {BRAND_COLORS['info']}]",
@@ -313,13 +342,37 @@ def select_cred(shell: Any, domain: str) -> None:
 
     print_table(table)
 
+    selector = getattr(shell, "_questionary_select", None)
+    if callable(selector):
+        try:
+            selected_user_idx = selector(
+                f"{prompt_label}:",
+                user_list,
+                default_idx=0,
+            )
+        except KeyboardInterrupt as e:
+            telemetry.capture_exception(e)
+            print_warning("Credential selection cancelled.")
+            return None
+        except Exception as e:  # noqa: BLE001
+            telemetry.capture_exception(e)
+            print_warning(f"Questionary credential selection failed: {e}")
+        else:
+            if selected_user_idx is None:
+                print_warning("Credential selection cancelled.")
+                return None
+            if 0 <= selected_user_idx < len(user_list):
+                return user_list[selected_user_idx]
+            print_error("Invalid selection. Index out of range.")
+            return None
+
     try:
         num_users = len(user_list)
         if num_users == 0:
-            return  # Should have been caught by earlier checks
+            return None
 
         selected_user_num = IntPrompt.ask(
-            f"Select a user by ID (1-{num_users})",
+            f"{prompt_label} (1-{num_users})",
             choices=[str(i + 1) for i in range(num_users)],
             show_default=False,
             show_choices=False,
@@ -329,15 +382,38 @@ def select_cred(shell: Any, domain: str) -> None:
     except KeyboardInterrupt as e:
         telemetry.capture_exception(e)
         print_warning("Credential selection cancelled.")
-        return
+        return None
 
     # IntPrompt handles non-integer input and choice validation.
     # This check is mostly for safety, IntPrompt with choices should ensure validity.
     if not (0 <= selected_user_idx < len(user_list)):
         print_error("Invalid selection. Index out of range.")
+        return None
+
+    return user_list[selected_user_idx]
+
+
+def select_cred(shell: Any, domain: str) -> None:
+    """Select a credential for a domain and proceed with enumeration.
+
+    Args:
+        shell: The PentestShell instance with domains_data and related methods.
+        domain: The domain name to select credentials for.
+    """
+    user_list = _get_selectable_domain_users(shell, domain=domain)
+    if not user_list:
         return
 
-    selected_user = user_list[selected_user_idx]
+    credentials = shell.domains_data[domain]["credentials"]
+    selected_user = _prompt_for_domain_user_selection(
+        shell,
+        domain=domain,
+        user_list=user_list,
+        prompt_label="Select a user",
+    )
+    if not selected_user:
+        return
+
     print_info_verbose(f"Selected user: [bold green]{selected_user}[/bold green]")
 
     cred_value = credentials[selected_user]
@@ -393,6 +469,107 @@ def select_cred(shell: Any, domain: str) -> None:
         [(selected_user, cred_value)],
         prompt_for_user_privs_after=True,
     )
+
+
+def delete_cred(shell: Any, domain: str) -> None:
+    """Interactively delete one stored domain credential from a workspace.
+
+    Args:
+        shell: The PentestShell instance with domains_data.
+        domain: The domain name to delete a credential from.
+    """
+    from adscan_internal.services.credential_store_service import (
+        CredentialStoreService,
+    )
+
+    user_list = _get_selectable_domain_users(shell, domain=domain)
+    if not user_list:
+        return
+
+    checkbox = getattr(shell, "_questionary_checkbox", None)
+    if callable(checkbox):
+        try:
+            selected_users = checkbox(
+                "Select credential(s) to delete:",
+                user_list,
+                default_values=None,
+            )
+        except KeyboardInterrupt as e:
+            telemetry.capture_exception(e)
+            print_warning("Credential deletion cancelled.")
+            return
+        except Exception as e:  # noqa: BLE001
+            telemetry.capture_exception(e)
+            print_warning(f"Questionary credential deletion selection failed: {e}")
+            selected_users = None
+    else:
+        selected_user = _prompt_for_domain_user_selection(
+            shell,
+            domain=domain,
+            user_list=user_list,
+            prompt_label="Select a credential to delete",
+        )
+        selected_users = [selected_user] if selected_user else None
+
+    if not selected_users:
+        print_warning("Credential deletion cancelled.")
+        return
+
+    store_service = CredentialStoreService()
+    marked_domain = mark_sensitive(domain, "domain")
+    deleted_users: list[str] = []
+    deleted_ticket_users: list[str] = []
+    missing_users: list[str] = []
+
+    for selected_user in selected_users:
+        credential_deleted = store_service.delete_domain_credential(
+            domains_data=shell.domains_data,
+            domain=domain,
+            username=selected_user,
+        )
+        ticket_deleted = store_service.delete_kerberos_ticket(
+            domains_data=shell.domains_data,
+            domain=domain,
+            username=selected_user,
+        )
+        if credential_deleted:
+            deleted_users.append(selected_user)
+            if ticket_deleted:
+                deleted_ticket_users.append(selected_user)
+        else:
+            missing_users.append(selected_user)
+
+    if missing_users:
+        marked_missing_users = ", ".join(
+            mark_sensitive(user, "user") for user in missing_users
+        )
+        print_error(
+            f"Credential(s) for {marked_missing_users} were not found in domain [bold]{marked_domain}[/bold]."
+        )
+
+    if not deleted_users:
+        return
+
+    marked_deleted_users = ", ".join(
+        f"[bold]{mark_sensitive(user, 'user')}[/bold]" for user in deleted_users
+    )
+    print_info(
+        f"Deleted credential(s) for {marked_deleted_users} in domain [bold]{marked_domain}[/bold]."
+    )
+    if deleted_ticket_users:
+        marked_ticket_users = ", ".join(
+            f"[bold]{mark_sensitive(user, 'user')}[/bold]"
+            for user in deleted_ticket_users
+        )
+        print_info_verbose(
+            f"Removed stored Kerberos ticket(s) for {marked_ticket_users} in domain [bold]{marked_domain}[/bold]."
+        )
+
+    if shell.current_workspace_dir:
+        if shell.save_workspace_data():
+            print_info("Workspace data saved after removing credential.")
+        else:
+            print_error("Failed to save workspace data after removing credential.")
 
 
 def _ensure_verified_domain_credential_ticket(
@@ -754,10 +931,23 @@ def handle_auth_and_optional_privs(
         return is_terminal_pivot
 
     def _resolve_active_step_target_principal() -> str | None:
-        """Return the normalized principal represented by the step target node."""
+        """Return the normalized principal represented by the step target.
+
+        For some attack steps, especially ADCS paths like ``ADCSESC1``, the
+        graph target is the Domain node while the execution target is a user
+        chosen at runtime (for example ``administrator``). Prefer the explicit
+        execution target from the active-step notes when it exists.
+        """
         active = getattr(shell, "_active_attack_graph_step", None)
         if not isinstance(active, ActiveAttackGraphStep):
             return None
+        notes = active.notes if isinstance(active.notes, dict) else {}
+        for key in ("target_user", "expected_user", "compromised_user", "principal"):
+            value = notes.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized = normalize_samaccountname(value)
+                if normalized:
+                    return normalized
         target_label = str(getattr(active, "to_label", "") or "").strip()
         if not target_label:
             return None
@@ -991,6 +1181,48 @@ def handle_auth_and_optional_privs(
         )
         return True
 
+    def _should_force_direct_target_compromise_user_privs(
+        user: str,
+        *,
+        target_principal: str | None,
+    ) -> bool:
+        """Promote direct-compromise steps to full user follow-up when justified.
+
+        This covers steps whose graph target is broader than the principal
+        actually compromised at runtime, such as ``ADCSESC1`` paths modeled
+        against the Domain node while the operator chose a concrete Domain Admin
+        target for certificate impersonation.
+        """
+        if not is_attack_path_execution_active(shell):
+            return False
+
+        compromise_semantics, compromise_effort = (
+            _resolve_active_step_compromise_metadata()
+        )
+        if compromise_semantics != "direct_target_compromise":
+            return False
+
+        normalized_user = normalize_samaccountname(user)
+        if not normalized_user or not target_principal:
+            return False
+        if normalized_user != target_principal:
+            return False
+
+        active_step_user = _resolve_active_step_execution_user()
+        if active_step_user and normalized_user == active_step_user:
+            return False
+
+        print_info_debug(
+            "[creds] attack-context direct-compromise flow: enabling full "
+            "ask_for_user_privs for effective target principal "
+            f"user={mark_sensitive(normalized_user, 'user')} "
+            f"target_principal={mark_sensitive(target_principal, 'user')} "
+            f"active_step_user={mark_sensitive(active_step_user or 'N/A', 'user')} "
+            f"compromise_semantics={mark_sensitive(compromise_semantics, 'detail')} "
+            f"compromise_effort={mark_sensitive(compromise_effort, 'detail')}"
+        )
+        return True
+
     standard_user_privs_covered_by_full_scan = full_scan_started and (
         enumeration_action == "full_scan"
     )
@@ -1073,6 +1305,12 @@ def handle_auth_and_optional_privs(
             force_full_user_privs_from_attack_context = (
                 _should_force_full_user_privs_from_attack_context(user)
             )
+            if not force_full_user_privs_from_attack_context:
+                force_full_user_privs_from_attack_context = (
+                    _should_force_direct_target_compromise_user_privs(
+                        user, target_principal=target_principal
+                    )
+                )
             should_force_high_value_terminal_user_privs = False
             if (
                 is_attack_path_execution_active(shell)
@@ -1827,6 +2065,74 @@ def add_credential(
             print_info_verbose(
                 f"[ui_silent] Empty or invalid credential for '{marked_user}' in domain {marked_domain}"
             )
+
+
+def store_kerberos_principal_material(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    nt_hash: str | None = None,
+    aes256: str | None = None,
+    aes128: str | None = None,
+    source: str = "",
+    target_host: str = "",
+    rid: str = "",
+) -> Any:
+    """Persist typed Kerberos key material without invoking ``add_credential``.
+
+    This path is for principals whose recovered secret is primarily useful as
+    Kerberos key material, not as a normal interactive AD credential. It stores
+    RC4/NT, AES128 and AES256 under ``domains_data[domain]["kerberos_keys"]``
+    and intentionally skips the generic credential pipeline:
+
+    - no cracking attempts
+    - no live credential verification
+    - no auto-generated Kerberos TGT
+    - no BloodHound "owned" tag
+    - no follow-up privilege enumeration prompts
+
+    Args:
+        shell: Active shell instance with ``domains_data``.
+        domain: Owning AD domain.
+        username: Principal name whose material was recovered.
+        nt_hash: Optional RC4/NT material.
+        aes256: Optional AES256 material.
+        aes128: Optional AES128 material.
+        source: Short provenance label for the recovered material.
+        target_host: Host/source context this material belongs to.
+        rid: Optional RID suffix for per-RODC ``krbtgt_<RID>`` accounts.
+
+    Returns:
+        The normalized :class:`KerberosKeyMaterial` written to the workspace.
+    """
+    from adscan_internal.services.credential_store_service import CredentialStoreService
+
+    normalized_domain = str(domain or "").strip().rstrip(".").lower()
+    if not normalized_domain:
+        raise ValueError("Kerberos principal material requires a valid domain.")
+
+    material = CredentialStoreService().store_kerberos_key_material(
+        domains_data=shell.domains_data,
+        domain=normalized_domain,
+        username=username,
+        nt_hash=nt_hash,
+        aes256=aes256,
+        aes128=aes128,
+        source=source,
+        target_host=target_host,
+        rid=rid,
+    )
+
+    print_info_debug(
+        "[creds] stored Kerberos principal material: "
+        f"user={mark_sensitive(material.username, 'user')} "
+        f"domain={mark_sensitive(normalized_domain, 'domain')} "
+        f"nt_hash={bool(material.nt_hash)} aes256={bool(material.aes256)} "
+        f"aes128={bool(material.aes128)} "
+        f"target_host={mark_sensitive(material.target_host, 'hostname')}"
+    )
+    return material
 
 
 def add_credentials_batch(

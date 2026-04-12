@@ -1,0 +1,613 @@
+{
+  "NtAllocateVirtualMemory": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",  "type": "HANDLE",      "annotation": "IN" },
+      { "name": "BaseAddress",    "type": "PVOID*",      "annotation": "IN OUT" },
+      { "name": "ZeroBits",       "type": "ULONG_PTR",   "annotation": "IN" },
+      { "name": "RegionSize",     "type": "PSIZE_T",     "annotation": "IN OUT" },
+      { "name": "AllocationType", "type": "ULONG",       "annotation": "IN" },
+      { "name": "Protect",        "type": "ULONG",       "annotation": "IN" }
+    ]
+  },
+  "NtAllocateVirtualMemoryEx": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",          "type": "HANDLE",    "annotation": "IN" },
+      { "name": "BaseAddress",            "type": "PVOID*",    "annotation": "IN OUT" },
+      { "name": "RegionSize",             "type": "PSIZE_T",   "annotation": "IN OUT" },
+      { "name": "AllocationType",         "type": "ULONG",     "annotation": "IN" },
+      { "name": "PageProtection",         "type": "ULONG",     "annotation": "IN" },
+      { "name": "ExtendedParameters",     "type": "PVOID",     "annotation": "IN OUT OPTIONAL" },
+      { "name": "ExtendedParameterCount", "type": "ULONG",     "annotation": "IN" }
+    ]
+  },
+  "NtFreeVirtualMemory": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle", "type": "HANDLE",   "annotation": "IN" },
+      { "name": "BaseAddress",   "type": "PVOID*",   "annotation": "IN OUT" },
+      { "name": "RegionSize",    "type": "PSIZE_T",  "annotation": "IN OUT" },
+      { "name": "FreeType",      "type": "ULONG",    "annotation": "IN" }
+    ]
+  },
+  "NtWriteVirtualMemory": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",          "type": "HANDLE",    "annotation": "IN" },
+      { "name": "BaseAddress",            "type": "PVOID",     "annotation": "IN" },
+      { "name": "Buffer",                 "type": "PVOID",     "annotation": "IN" },
+      { "name": "NumberOfBytesToWrite",   "type": "SIZE_T",    "annotation": "IN" },
+      { "name": "NumberOfBytesWritten",   "type": "PSIZE_T",   "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtReadVirtualMemory": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",        "type": "HANDLE",    "annotation": "IN" },
+      { "name": "BaseAddress",          "type": "PVOID",     "annotation": "IN OPTIONAL" },
+      { "name": "Buffer",               "type": "PVOID",     "annotation": "OUT" },
+      { "name": "NumberOfBytesToRead",  "type": "SIZE_T",    "annotation": "IN" },
+      { "name": "NumberOfBytesRead",    "type": "PSIZE_T",   "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtProtectVirtualMemory": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle", "type": "HANDLE",    "annotation": "IN" },
+      { "name": "BaseAddress",   "type": "PVOID*",    "annotation": "IN OUT" },
+      { "name": "RegionSize",    "type": "PSIZE_T",   "annotation": "IN OUT" },
+      { "name": "NewProtect",    "type": "ULONG",     "annotation": "IN" },
+      { "name": "OldProtect",    "type": "PULONG",    "annotation": "OUT" }
+    ]
+  },
+  "NtQueryVirtualMemory": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",             "type": "HANDLE",                      "annotation": "IN" },
+      { "name": "BaseAddress",               "type": "PVOID",                       "annotation": "IN OPTIONAL" },
+      { "name": "MemoryInformationClass",    "type": "MEMORY_INFORMATION_CLASS",    "annotation": "IN" },
+      { "name": "MemoryInformation",         "type": "PVOID",                       "annotation": "OUT" },
+      { "name": "MemoryInformationLength",   "type": "SIZE_T",                      "annotation": "IN" },
+      { "name": "ReturnLength",              "type": "PSIZE_T",                     "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtCreateThreadEx": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",      "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",     "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes",  "type": "POBJECT_ATTRIBUTES", "annotation": "IN OPTIONAL" },
+      { "name": "ProcessHandle",     "type": "HANDLE",             "annotation": "IN" },
+      { "name": "StartRoutine",      "type": "PVOID",              "annotation": "IN" },
+      { "name": "Argument",          "type": "PVOID",              "annotation": "IN OPTIONAL" },
+      { "name": "CreateFlags",       "type": "ULONG",              "annotation": "IN" },
+      { "name": "ZeroBits",          "type": "SIZE_T",             "annotation": "IN" },
+      { "name": "StackSize",         "type": "SIZE_T",             "annotation": "IN" },
+      { "name": "MaximumStackSize",  "type": "SIZE_T",             "annotation": "IN" },
+      { "name": "AttributeList",     "type": "PPS_ATTRIBUTE_LIST", "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtOpenProcess": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",    "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",    "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes", "type": "POBJECT_ATTRIBUTES", "annotation": "IN" },
+      { "name": "ClientId",         "type": "PCLIENT_ID",         "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtOpenThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",     "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",    "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes", "type": "POBJECT_ATTRIBUTES", "annotation": "IN" },
+      { "name": "ClientId",         "type": "PCLIENT_ID",         "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtSuspendThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",          "type": "HANDLE",    "annotation": "IN" },
+      { "name": "PreviousSuspendCount",  "type": "PULONG",    "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtResumeThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",      "type": "HANDLE",    "annotation": "IN" },
+      { "name": "SuspendCount",      "type": "PULONG",    "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtSuspendProcess": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle", "type": "HANDLE", "annotation": "IN" }
+    ]
+  },
+  "NtResumeProcess": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle", "type": "HANDLE", "annotation": "IN" }
+    ]
+  },
+  "NtGetContextThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",   "type": "HANDLE",    "annotation": "IN" },
+      { "name": "ThreadContext",  "type": "PCONTEXT",  "annotation": "IN OUT" }
+    ]
+  },
+  "NtSetContextThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",   "type": "HANDLE",    "annotation": "IN" },
+      { "name": "ThreadContext",  "type": "PCONTEXT",  "annotation": "IN" }
+    ]
+  },
+  "NtTerminateProcess": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle", "type": "HANDLE",    "annotation": "IN OPTIONAL" },
+      { "name": "ExitStatus",    "type": "NTSTATUS",  "annotation": "IN" }
+    ]
+  },
+  "NtTerminateThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle", "type": "HANDLE",    "annotation": "IN OPTIONAL" },
+      { "name": "ExitStatus",   "type": "NTSTATUS",  "annotation": "IN" }
+    ]
+  },
+  "NtClose": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "Handle", "type": "HANDLE", "annotation": "IN" }
+    ]
+  },
+  "NtDuplicateObject": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "SourceProcessHandle", "type": "HANDLE",      "annotation": "IN" },
+      { "name": "SourceHandle",        "type": "HANDLE",      "annotation": "IN" },
+      { "name": "TargetProcessHandle", "type": "HANDLE",      "annotation": "IN OPTIONAL" },
+      { "name": "TargetHandle",        "type": "PHANDLE",     "annotation": "OUT OPTIONAL" },
+      { "name": "DesiredAccess",       "type": "ACCESS_MASK", "annotation": "IN" },
+      { "name": "HandleAttributes",    "type": "ULONG",       "annotation": "IN" },
+      { "name": "Options",             "type": "ULONG",       "annotation": "IN" }
+    ]
+  },
+  "NtWaitForSingleObject": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "Handle",    "type": "HANDLE",          "annotation": "IN" },
+      { "name": "Alertable", "type": "BOOLEAN",         "annotation": "IN" },
+      { "name": "Timeout",   "type": "PLARGE_INTEGER",  "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtWaitForMultipleObjects": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "Count",     "type": "ULONG",           "annotation": "IN" },
+      { "name": "Handles",   "type": "PHANDLE",         "annotation": "IN" },
+      { "name": "WaitType",  "type": "WAIT_TYPE",       "annotation": "IN" },
+      { "name": "Alertable", "type": "BOOLEAN",         "annotation": "IN" },
+      { "name": "Timeout",   "type": "PLARGE_INTEGER",  "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtSignalAndWaitForSingleObject": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "SignalHandle", "type": "HANDLE",          "annotation": "IN" },
+      { "name": "WaitHandle",   "type": "HANDLE",          "annotation": "IN" },
+      { "name": "Alertable",    "type": "BOOLEAN",         "annotation": "IN" },
+      { "name": "Timeout",      "type": "PLARGE_INTEGER",  "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtUnmapViewOfSection": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle", "type": "HANDLE", "annotation": "IN" },
+      { "name": "BaseAddress",   "type": "PVOID",  "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtMapViewOfSection": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "SectionHandle",       "type": "HANDLE",           "annotation": "IN" },
+      { "name": "ProcessHandle",       "type": "HANDLE",           "annotation": "IN" },
+      { "name": "BaseAddress",         "type": "PVOID*",           "annotation": "IN OUT" },
+      { "name": "ZeroBits",            "type": "ULONG_PTR",        "annotation": "IN" },
+      { "name": "CommitSize",          "type": "SIZE_T",           "annotation": "IN" },
+      { "name": "SectionOffset",       "type": "PLARGE_INTEGER",   "annotation": "IN OUT OPTIONAL" },
+      { "name": "ViewSize",            "type": "PSIZE_T",          "annotation": "IN OUT" },
+      { "name": "InheritDisposition",  "type": "SECTION_INHERIT",  "annotation": "IN" },
+      { "name": "AllocationType",      "type": "ULONG",            "annotation": "IN" },
+      { "name": "Win32Protect",        "type": "ULONG",            "annotation": "IN" }
+    ]
+  },
+  "NtCreateSection": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "SectionHandle",         "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",         "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes",      "type": "POBJECT_ATTRIBUTES", "annotation": "IN OPTIONAL" },
+      { "name": "MaximumSize",           "type": "PLARGE_INTEGER",     "annotation": "IN OPTIONAL" },
+      { "name": "SectionPageProtection","type": "ULONG",              "annotation": "IN" },
+      { "name": "AllocationAttributes", "type": "ULONG",              "annotation": "IN" },
+      { "name": "FileHandle",           "type": "HANDLE",             "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtOpenSection": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "SectionHandle",    "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",    "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes", "type": "POBJECT_ATTRIBUTES", "annotation": "IN" }
+    ]
+  },
+  "NtQueryInformationProcess": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",            "type": "HANDLE",               "annotation": "IN" },
+      { "name": "ProcessInformationClass",  "type": "PROCESSINFOCLASS",     "annotation": "IN" },
+      { "name": "ProcessInformation",       "type": "PVOID",                "annotation": "OUT" },
+      { "name": "ProcessInformationLength", "type": "ULONG",                "annotation": "IN" },
+      { "name": "ReturnLength",             "type": "PULONG",               "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtSetInformationProcess": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",            "type": "HANDLE",           "annotation": "IN" },
+      { "name": "ProcessInformationClass",  "type": "PROCESSINFOCLASS", "annotation": "IN" },
+      { "name": "ProcessInformation",       "type": "PVOID",            "annotation": "IN" },
+      { "name": "ProcessInformationLength", "type": "ULONG",            "annotation": "IN" }
+    ]
+  },
+  "NtQueryInformationThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",             "type": "HANDLE",             "annotation": "IN" },
+      { "name": "ThreadInformationClass",   "type": "THREADINFOCLASS",    "annotation": "IN" },
+      { "name": "ThreadInformation",        "type": "PVOID",              "annotation": "OUT" },
+      { "name": "ThreadInformationLength",  "type": "ULONG",              "annotation": "IN" },
+      { "name": "ReturnLength",             "type": "PULONG",             "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtSetInformationThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",             "type": "HANDLE",           "annotation": "IN" },
+      { "name": "ThreadInformationClass",   "type": "THREADINFOCLASS",  "annotation": "IN" },
+      { "name": "ThreadInformation",        "type": "PVOID",            "annotation": "IN" },
+      { "name": "ThreadInformationLength",  "type": "ULONG",            "annotation": "IN" }
+    ]
+  },
+  "NtQuerySystemInformation": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "SystemInformationClass",   "type": "SYSTEM_INFORMATION_CLASS", "annotation": "IN" },
+      { "name": "SystemInformation",        "type": "PVOID",                    "annotation": "OUT" },
+      { "name": "SystemInformationLength",  "type": "ULONG",                    "annotation": "IN" },
+      { "name": "ReturnLength",             "type": "PULONG",                   "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtDelayExecution": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "Alertable",     "type": "BOOLEAN",        "annotation": "IN" },
+      { "name": "DelayInterval", "type": "PLARGE_INTEGER", "annotation": "IN" }
+    ]
+  },
+  "NtQueueApcThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",  "type": "HANDLE",           "annotation": "IN" },
+      { "name": "ApcRoutine",    "type": "PPS_APC_ROUTINE",  "annotation": "IN" },
+      { "name": "ApcArgument1",  "type": "PVOID",            "annotation": "IN OPTIONAL" },
+      { "name": "ApcArgument2",  "type": "PVOID",            "annotation": "IN OPTIONAL" },
+      { "name": "ApcArgument3",  "type": "PVOID",            "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtQueueApcThreadEx": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",  "type": "HANDLE",           "annotation": "IN" },
+      { "name": "ReserveHandle", "type": "HANDLE",           "annotation": "IN OPTIONAL" },
+      { "name": "ApcRoutine",    "type": "PPS_APC_ROUTINE",  "annotation": "IN" },
+      { "name": "ApcArgument1",  "type": "PVOID",            "annotation": "IN OPTIONAL" },
+      { "name": "ApcArgument2",  "type": "PVOID",            "annotation": "IN OPTIONAL" },
+      { "name": "ApcArgument3",  "type": "PVOID",            "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtCreateFile": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "FileHandle",        "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",     "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes",  "type": "POBJECT_ATTRIBUTES", "annotation": "IN" },
+      { "name": "IoStatusBlock",     "type": "PIO_STATUS_BLOCK",   "annotation": "OUT" },
+      { "name": "AllocationSize",    "type": "PLARGE_INTEGER",     "annotation": "IN OPTIONAL" },
+      { "name": "FileAttributes",    "type": "ULONG",              "annotation": "IN" },
+      { "name": "ShareAccess",       "type": "ULONG",              "annotation": "IN" },
+      { "name": "CreateDisposition", "type": "ULONG",              "annotation": "IN" },
+      { "name": "CreateOptions",     "type": "ULONG",              "annotation": "IN" },
+      { "name": "EaBuffer",          "type": "PVOID",              "annotation": "IN OPTIONAL" },
+      { "name": "EaLength",          "type": "ULONG",              "annotation": "IN" }
+    ]
+  },
+  "NtOpenFile": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "FileHandle",       "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",    "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes", "type": "POBJECT_ATTRIBUTES", "annotation": "IN" },
+      { "name": "IoStatusBlock",    "type": "PIO_STATUS_BLOCK",   "annotation": "OUT" },
+      { "name": "ShareAccess",      "type": "ULONG",              "annotation": "IN" },
+      { "name": "OpenOptions",      "type": "ULONG",              "annotation": "IN" }
+    ]
+  },
+  "NtCreateProcess": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",       "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",       "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes",    "type": "POBJECT_ATTRIBUTES", "annotation": "IN OPTIONAL" },
+      { "name": "ParentProcess",       "type": "HANDLE",             "annotation": "IN" },
+      { "name": "InheritObjectTable",  "type": "BOOLEAN",            "annotation": "IN" },
+      { "name": "SectionHandle",       "type": "HANDLE",             "annotation": "IN OPTIONAL" },
+      { "name": "DebugPort",           "type": "HANDLE",             "annotation": "IN OPTIONAL" },
+      { "name": "TokenHandle",         "type": "HANDLE",             "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtCreateProcessEx": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",    "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",    "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes", "type": "POBJECT_ATTRIBUTES", "annotation": "IN OPTIONAL" },
+      { "name": "ParentProcess",    "type": "HANDLE",             "annotation": "IN" },
+      { "name": "Flags",            "type": "ULONG",              "annotation": "IN" },
+      { "name": "SectionHandle",    "type": "HANDLE",             "annotation": "IN OPTIONAL" },
+      { "name": "DebugPort",        "type": "HANDLE",             "annotation": "IN OPTIONAL" },
+      { "name": "TokenHandle",      "type": "HANDLE",             "annotation": "IN OPTIONAL" },
+      { "name": "Reserved",         "type": "ULONG",              "annotation": "IN" }
+    ]
+  },
+  "NtCreateUserProcess": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",            "type": "PHANDLE",              "annotation": "OUT" },
+      { "name": "ThreadHandle",             "type": "PHANDLE",              "annotation": "OUT" },
+      { "name": "ProcessDesiredAccess",     "type": "ACCESS_MASK",          "annotation": "IN" },
+      { "name": "ThreadDesiredAccess",      "type": "ACCESS_MASK",          "annotation": "IN" },
+      { "name": "ProcessObjectAttributes",  "type": "POBJECT_ATTRIBUTES",   "annotation": "IN OPTIONAL" },
+      { "name": "ThreadObjectAttributes",   "type": "POBJECT_ATTRIBUTES",   "annotation": "IN OPTIONAL" },
+      { "name": "ProcessFlags",             "type": "ULONG",                "annotation": "IN" },
+      { "name": "ThreadFlags",              "type": "ULONG",                "annotation": "IN" },
+      { "name": "ProcessParameters",        "type": "PVOID",                "annotation": "IN OPTIONAL" },
+      { "name": "CreateInfo",               "type": "PPS_CREATE_INFO",      "annotation": "IN OUT" },
+      { "name": "AttributeList",            "type": "PPS_ATTRIBUTE_LIST",   "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtOpenProcessToken": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",  "type": "HANDLE",      "annotation": "IN" },
+      { "name": "DesiredAccess",  "type": "ACCESS_MASK", "annotation": "IN" },
+      { "name": "TokenHandle",    "type": "PHANDLE",     "annotation": "OUT" }
+    ]
+  },
+  "NtOpenThreadToken": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",  "type": "HANDLE",      "annotation": "IN" },
+      { "name": "DesiredAccess", "type": "ACCESS_MASK", "annotation": "IN" },
+      { "name": "OpenAsSelf",    "type": "BOOLEAN",     "annotation": "IN" },
+      { "name": "TokenHandle",   "type": "PHANDLE",     "annotation": "OUT" }
+    ]
+  },
+  "NtQueryInformationToken": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "TokenHandle",              "type": "HANDLE",                   "annotation": "IN" },
+      { "name": "TokenInformationClass",    "type": "TOKEN_INFORMATION_CLASS",  "annotation": "IN" },
+      { "name": "TokenInformation",         "type": "PVOID",                    "annotation": "OUT" },
+      { "name": "TokenInformationLength",   "type": "ULONG",                    "annotation": "IN" },
+      { "name": "ReturnLength",             "type": "PULONG",                   "annotation": "OUT" }
+    ]
+  },
+  "NtAdjustPrivilegesToken": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "TokenHandle",          "type": "HANDLE",            "annotation": "IN" },
+      { "name": "DisableAllPrivileges", "type": "BOOLEAN",           "annotation": "IN" },
+      { "name": "NewState",             "type": "PTOKEN_PRIVILEGES", "annotation": "IN OPTIONAL" },
+      { "name": "BufferLength",         "type": "ULONG",             "annotation": "IN" },
+      { "name": "PreviousState",        "type": "PTOKEN_PRIVILEGES", "annotation": "OUT OPTIONAL" },
+      { "name": "ReturnLength",         "type": "PULONG",            "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtDuplicateToken": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ExistingTokenHandle",  "type": "HANDLE",             "annotation": "IN" },
+      { "name": "DesiredAccess",        "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes",     "type": "POBJECT_ATTRIBUTES", "annotation": "IN OPTIONAL" },
+      { "name": "EffectiveOnly",        "type": "BOOLEAN",            "annotation": "IN" },
+      { "name": "TokenType",            "type": "TOKEN_TYPE",         "annotation": "IN" },
+      { "name": "NewTokenHandle",       "type": "PHANDLE",            "annotation": "OUT" }
+    ]
+  },
+  "NtImpersonateThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ServerThreadHandle",   "type": "HANDLE",             "annotation": "IN" },
+      { "name": "ClientThreadHandle",   "type": "HANDLE",             "annotation": "IN" },
+      { "name": "SecurityQos",          "type": "PSECURITY_QUALITY_OF_SERVICE", "annotation": "IN" }
+    ]
+  },
+  "NtContinue": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadContext",  "type": "PCONTEXT",  "annotation": "IN" },
+      { "name": "RaiseAlert",     "type": "BOOLEAN",   "annotation": "IN" }
+    ]
+  },
+  "NtFlushInstructionCache": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle", "type": "HANDLE",  "annotation": "IN" },
+      { "name": "BaseAddress",   "type": "PVOID",   "annotation": "IN OPTIONAL" },
+      { "name": "Length",        "type": "SIZE_T",  "annotation": "IN" }
+    ]
+  },
+  "NtQueryObject": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "Handle",                  "type": "HANDLE",                     "annotation": "IN OPTIONAL" },
+      { "name": "ObjectInformationClass",  "type": "OBJECT_INFORMATION_CLASS",   "annotation": "IN" },
+      { "name": "ObjectInformation",       "type": "PVOID",                      "annotation": "OUT OPTIONAL" },
+      { "name": "ObjectInformationLength", "type": "ULONG",                      "annotation": "IN" },
+      { "name": "ReturnLength",            "type": "PULONG",                     "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtCreateTransaction": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "TransactionHandle", "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",     "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes",  "type": "POBJECT_ATTRIBUTES", "annotation": "IN OPTIONAL" },
+      { "name": "Uow",              "type": "PVOID",               "annotation": "IN OPTIONAL" },
+      { "name": "TmHandle",         "type": "HANDLE",              "annotation": "IN OPTIONAL" },
+      { "name": "CreateOptions",    "type": "ULONG",               "annotation": "IN OPTIONAL" },
+      { "name": "IsolationLevel",   "type": "ULONG",               "annotation": "IN OPTIONAL" },
+      { "name": "IsolationFlags",   "type": "ULONG",               "annotation": "IN OPTIONAL" },
+      { "name": "Timeout",          "type": "PLARGE_INTEGER",      "annotation": "IN OPTIONAL" },
+      { "name": "Description",      "type": "PUNICODE_STRING",     "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtRollbackTransaction": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "TransactionHandle", "type": "HANDLE",  "annotation": "IN" },
+      { "name": "Wait",              "type": "BOOLEAN", "annotation": "IN" }
+    ]
+  },
+  "NtCommitTransaction": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "TransactionHandle", "type": "HANDLE",  "annotation": "IN" },
+      { "name": "Wait",              "type": "BOOLEAN", "annotation": "IN" }
+    ]
+  },
+  "NtSetInformationVirtualMemory": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ProcessHandle",             "type": "HANDLE",     "annotation": "IN" },
+      { "name": "VmInformationClass",        "type": "ULONG",      "annotation": "IN" },
+      { "name": "NumberOfEntries",           "type": "ULONG_PTR",  "annotation": "IN" },
+      { "name": "VirtualAddresses",          "type": "PVOID",      "annotation": "IN" },
+      { "name": "VmInformation",             "type": "PVOID",      "annotation": "IN" },
+      { "name": "VmInformationLength",       "type": "ULONG",      "annotation": "IN" }
+    ]
+  },
+  "NtCreateEvent": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "EventHandle",      "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",    "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes", "type": "POBJECT_ATTRIBUTES", "annotation": "IN OPTIONAL" },
+      { "name": "EventType",        "type": "ULONG",              "annotation": "IN" },
+      { "name": "InitialState",     "type": "BOOLEAN",            "annotation": "IN" }
+    ]
+  },
+  "NtSetEvent": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "EventHandle",    "type": "HANDLE",  "annotation": "IN" },
+      { "name": "PreviousState",  "type": "PLONG",   "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtResetEvent": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "EventHandle",    "type": "HANDLE",  "annotation": "IN" },
+      { "name": "PreviousState",  "type": "PLONG",   "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtCreateTimer": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "TimerHandle",      "type": "PHANDLE",            "annotation": "OUT" },
+      { "name": "DesiredAccess",    "type": "ACCESS_MASK",        "annotation": "IN" },
+      { "name": "ObjectAttributes", "type": "POBJECT_ATTRIBUTES", "annotation": "IN OPTIONAL" },
+      { "name": "TimerType",        "type": "TIMER_TYPE",         "annotation": "IN" }
+    ]
+  },
+  "NtSetTimer": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "TimerHandle",      "type": "HANDLE",          "annotation": "IN" },
+      { "name": "DueTime",          "type": "PLARGE_INTEGER",  "annotation": "IN" },
+      { "name": "TimerApcRoutine",  "type": "PVOID",           "annotation": "IN OPTIONAL" },
+      { "name": "TimerContext",     "type": "PVOID",           "annotation": "IN OPTIONAL" },
+      { "name": "ResumeTimer",      "type": "BOOLEAN",         "annotation": "IN" },
+      { "name": "Period",           "type": "LONG",            "annotation": "IN OPTIONAL" },
+      { "name": "PreviousState",    "type": "PBOOLEAN",        "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtTestAlert": {
+    "return_type": "NTSTATUS",
+    "params": []
+  },
+  "NtAlertResumeThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle",         "type": "HANDLE",  "annotation": "IN" },
+      { "name": "PreviousSuspendCount", "type": "PULONG",  "annotation": "OUT OPTIONAL" }
+    ]
+  },
+  "NtAlertThread": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ThreadHandle", "type": "HANDLE", "annotation": "IN" }
+    ]
+  },
+  "NtWriteFile": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "FileHandle",    "type": "HANDLE",           "annotation": "IN" },
+      { "name": "Event",         "type": "HANDLE",           "annotation": "IN OPTIONAL" },
+      { "name": "ApcRoutine",    "type": "PVOID",            "annotation": "IN OPTIONAL" },
+      { "name": "ApcContext",    "type": "PVOID",            "annotation": "IN OPTIONAL" },
+      { "name": "IoStatusBlock", "type": "PIO_STATUS_BLOCK", "annotation": "OUT" },
+      { "name": "Buffer",        "type": "PVOID",            "annotation": "IN" },
+      { "name": "Length",        "type": "ULONG",            "annotation": "IN" },
+      { "name": "ByteOffset",    "type": "PLARGE_INTEGER",   "annotation": "IN OPTIONAL" },
+      { "name": "Key",           "type": "PULONG",           "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtReadFile": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "FileHandle",    "type": "HANDLE",           "annotation": "IN" },
+      { "name": "Event",         "type": "HANDLE",           "annotation": "IN OPTIONAL" },
+      { "name": "ApcRoutine",    "type": "PVOID",            "annotation": "IN OPTIONAL" },
+      { "name": "ApcContext",    "type": "PVOID",            "annotation": "IN OPTIONAL" },
+      { "name": "IoStatusBlock", "type": "PIO_STATUS_BLOCK", "annotation": "OUT" },
+      { "name": "Buffer",        "type": "PVOID",            "annotation": "OUT" },
+      { "name": "Length",        "type": "ULONG",            "annotation": "IN" },
+      { "name": "ByteOffset",    "type": "PLARGE_INTEGER",   "annotation": "IN OPTIONAL" },
+      { "name": "Key",           "type": "PULONG",           "annotation": "IN OPTIONAL" }
+    ]
+  },
+  "NtDeleteFile": {
+    "return_type": "NTSTATUS",
+    "params": [
+      { "name": "ObjectAttributes", "type": "POBJECT_ATTRIBUTES", "annotation": "IN" }
+    ]
+  }
+}

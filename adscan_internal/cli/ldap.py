@@ -3867,7 +3867,7 @@ def check_maq(shell: LdapShell, domain: str, username: str, password: str) -> in
         auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
         log_path = domain_relpath(shell.domains_dir, domain, shell.ldap_dir, "maq.log")
         command = (
-            f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} {auth} "
+            f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} {auth} -k "
             f"--log {log_path} -M maq"
         )
         print_success("Checking MachineAccountQuota")

@@ -24,7 +24,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import rich.box
 from rich.panel import Panel
@@ -61,6 +61,57 @@ from adscan_internal.workspaces import (
     domain_relpath,
     domain_subpath,
 )
+
+
+def _resolve_dcsync_target_user(shell: Any, *, domain: str) -> str | None:
+    """Resolve the target user for interactive DCSync execution.
+
+    Keeps ``All`` as a first-class option while still guiding the operator with
+    known privileged accounts when available.
+    """
+    admins = shell.get_domain_admins(domain)
+    default_user = "All" if shell.domains_data[domain]["auth"] in ["pwned"] else (
+        admins[0] if admins else "Administrator"
+    )
+    selector = getattr(shell, "_questionary_select", None)
+    if callable(selector):
+        options = ["All"]
+        for admin in admins:
+            candidate = str(admin or "").strip()
+            if not candidate or candidate in options:
+                continue
+            options.append(candidate)
+        options.extend(["Enter manually", "Cancel"])
+        try:
+            selected_idx = selector(
+                f"Select the user to extract NTLM hashes from in {mark_sensitive(domain, 'domain')}:",
+                options,
+                default_idx=0 if default_user == "All" else max(options.index(default_user), 0)
+                if default_user in options
+                else 0,
+            )
+        except TypeError:
+            selected_idx = selector(
+                f"Select the user to extract NTLM hashes from in {mark_sensitive(domain, 'domain')}:",
+                options,
+            )
+        if selected_idx is None:
+            return None
+        choice = options[selected_idx]
+        if choice == "Cancel":
+            return None
+        if choice == "Enter manually":
+            target_user_raw = Prompt.ask(
+                "Specify the user to extract NTLM hashes from (type 'All' for all users)",
+                default=default_user,
+            )
+            return target_user_raw
+        return choice
+
+    return Prompt.ask(
+        "Specify the user to extract NTLM hashes from (type 'All' for all users)",
+        default=default_user,
+    )
 
 
 class KerberosShell(Protocol):
@@ -402,6 +453,48 @@ def _print_roast_choice_help(
         )
     lines.append(f"[dim]Default: {default_choice}[/dim]")
     print_panel("\n".join(lines), title="Cracking Options", expand=False)
+
+
+def _should_crack_single_roast_user(
+    shell: KerberosShell,
+    *,
+    roast_type: str,
+    username: str,
+) -> bool:
+    """Return whether to crack immediately when only one user was discovered."""
+    if shell.auto:
+        print_info_verbose(
+            f"Auto-selected cracking option: crack single discovered {roast_type} user {username}"
+        )
+        return True
+
+    if hasattr(shell, "_questionary_select"):
+        options = [
+            f"crack — Crack {username} now",
+            "none — Skip cracking for now",
+        ]
+        selected_idx = shell._questionary_select(
+            "Crack discovered user?",
+            options,
+            default_idx=0,
+        )
+        return selected_idx in (None, 0)
+
+    print_panel(
+        (
+            "[bold]Single roastable user discovered[/bold]\n"
+            f"[cyan]{username}[/cyan]\n"
+            f"[dim]Attack type: {roast_type}[/dim]"
+        ),
+        title="Cracking Options",
+        expand=False,
+    )
+    choice = Prompt.ask(
+        "Crack discovered user?",
+        choices=["crack", "none"],
+        default="crack",
+    )
+    return choice == "crack"
 
 
 # ============================================================================
@@ -750,6 +843,21 @@ def finalize_roast_results(
                 f.write(f"{entry}\n")
 
         if auto_crack:
+            if len(all_users) == 1:
+                selected_user = all_users[0]
+                if _should_crack_single_roast_user(
+                    shell,
+                    roast_type=roast_type,
+                    username=selected_user,
+                ):
+                    shell.ask_for_cracking(
+                        roast_type,
+                        domain,
+                        cracking_hashes_file_rel,
+                        confirm=False,
+                    )
+                return cracking_hashes_file_rel
+
             priority_users = {
                 user.lower()
                 for user in (admin_users + privileged_users + non_admin_users)
@@ -1398,9 +1506,10 @@ def sync_clock_with_pdc(
                     op="timedatectl_set_ntp",
                     payload={"value": False},
                 )
-                print_info_debug(
-                    "[DEBUG] Host helper timedatectl_set_ntp(false): "
-                    f"ok={ntp_off_resp.ok}, rc={ntp_off_resp.returncode}, msg={ntp_off_resp.message!r}"
+                _log_host_helper_clock_sync_response(
+                    operation="timedatectl_set_ntp(false)",
+                    host=pdc_ip,
+                    response=ntp_off_resp,
                 )
                 if not ntp_off_resp.ok:
                     print_warning_verbose(
@@ -1411,11 +1520,20 @@ def sync_clock_with_pdc(
             ntp_resp = host_helper_client_request(
                 sock_path, op="ntpdate", payload={"host": pdc_ip}
             )
+            _log_host_helper_clock_sync_response(
+                operation="ntpdate",
+                host=pdc_ip,
+                response=ntp_resp,
+            )
 
             if ntp_resp.ok:
                 marked_pdc_ip = mark_sensitive(pdc_ip, "ip")
                 print_success_verbose(
                     f"Clock synchronized successfully with PDC {marked_pdc_ip}"
+                )
+                print_info_debug(
+                    "[kerberos] Host-helper clock sync reported success. "
+                    "Kerberos retry will be used as the effective post-sync validation."
                 )
                 return True
 
@@ -1592,6 +1710,39 @@ def _is_tcp_port_open(
         return False
 
 
+def _sanitize_clock_sync_preview(value: str | None, *, host: str) -> str:
+    """Return a single-line preview for clock-sync helper output."""
+    if not value:
+        return "-"
+    preview = " ".join(str(value).split())
+    if len(preview) > 220:
+        preview = f"{preview[:217]}..."
+    try:
+        marked_host = mark_sensitive(host, "ip")
+        preview = preview.replace(host, str(marked_host))
+    except Exception:  # noqa: BLE001
+        pass
+    return preview
+
+
+def _log_host_helper_clock_sync_response(
+    *, operation: str, host: str, response: object
+) -> None:
+    """Emit debug diagnostics for host-helper clock sync operations."""
+    returncode = getattr(response, "returncode", None)
+    message = getattr(response, "message", None)
+    stdout = getattr(response, "stdout", None)
+    stderr = getattr(response, "stderr", None)
+    ok = bool(getattr(response, "ok", False))
+    marked_host = mark_sensitive(host, "ip")
+    print_info_debug(
+        "[kerberos] Host helper clock sync response: "
+        f"op={operation} host={marked_host} ok={ok} rc={returncode} "
+        f"msg={message!r} stdout={_sanitize_clock_sync_preview(stdout, host=host)!r} "
+        f"stderr={_sanitize_clock_sync_preview(stderr, host=host)!r}"
+    )
+
+
 def _sync_clock_via_net_time(
     shell: KerberosShell, host: str, *, domain: str | None = None
 ) -> bool:
@@ -1616,6 +1767,11 @@ def _sync_clock_via_net_time(
 
             resp = host_helper_client_request(
                 sock_path, op="net_time_set", payload={"host": host}
+            )
+            _log_host_helper_clock_sync_response(
+                operation="net_time_set",
+                host=host,
+                response=resp,
             )
             return bool(resp.ok)
         except (HostHelperError, OSError):
@@ -1699,7 +1855,6 @@ def run_dcsync(shell: KerberosShell, domain: str, username: str, password: str) 
     """
     from adscan_internal.rich_output import print_operation_header
     from adscan_internal.workspaces import domain_subpath
-    from rich.prompt import Prompt
     from adscan import _resolve_domain_key, _normalize_interactive_text
     import shlex
 
@@ -1712,18 +1867,7 @@ def run_dcsync(shell: KerberosShell, domain: str, username: str, password: str) 
         return
     domain = resolved_domain
 
-    admins = shell.get_domain_admins(domain)
-    if shell.domains_data[domain]["auth"] in ["pwned"]:
-        default_user = "All"
-    else:
-        if admins:
-            default_user = admins[0]
-        else:
-            default_user = "Administrator"
-    target_user_raw = Prompt.ask(
-        "Specify the user to extract NTLM hashes from (type 'All' for all users)",
-        default=default_user,
-    )
+    target_user_raw = _resolve_dcsync_target_user(shell, domain=domain)
     target_user = _normalize_interactive_text(target_user_raw)
     if not target_user:
         print_warning("No target user specified. Aborting DCSync.")

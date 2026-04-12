@@ -36,6 +36,7 @@ def run_netexec_remote_command(
     exec_method: str | None = None,
     timeout: int = 300,
     attempts: int = 1,
+    env: dict[str, str] | None = None,
 ) -> NetexecRemoteExecResult:
     """Execute a remote command via NetExec (-x), optionally forcing exec method.
 
@@ -60,9 +61,7 @@ def run_netexec_remote_command(
     status = NetexecExecStatus(executed=False, method=None, not_found=[])
 
     for attempt in range(1, max_attempts + 1):
-        command = (
-            f'{shell.netexec_path} {service_clean} {host} {auth} -t 1 --timeout 60 -x "{remote_command}"'
-        )
+        command = f'{shell.netexec_path} {service_clean} {host} {auth} -t 1 --timeout 60 -x "{remote_command}"'
         if service_clean == "smb":
             command = f"{command} --smb-timeout 30"
         if current_method:
@@ -74,6 +73,7 @@ def run_netexec_remote_command(
             operation_kind=f"netexec_remote_exec:{service_clean}",
             service=service_clean,
             target_count=1,
+            env=env,
         )
         output = ""
         if proc:

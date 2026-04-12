@@ -75,6 +75,7 @@ _NETEXEC_SERVICE_TOKENS = {
     "http",
     "https",
 }
+_NETEXEC_CLOCK_SKEW_NTLM_FALLBACK_PROTOCOLS = frozenset({"smb", "ldap"})
 
 
 def _is_netexec_autoquote_enabled() -> bool:
@@ -276,6 +277,7 @@ class NetExecContext:
     clean_workspaces: Callable[[bool], bool]
     get_workspaces_dir: Callable[[], str | Path]
     confirm_ask: Callable[[str, bool], bool]
+    refresh_delegated_ticket: Callable[[str | None], str | None] | None = None
 
 
 class NetExecRunner:
@@ -283,6 +285,111 @@ class NetExecRunner:
 
     def __init__(self, *, command_runner: CommandRunner) -> None:
         self._command_runner = command_runner
+
+    @staticmethod
+    def _extract_kerberos_ccache_path(
+        command: str,
+        *,
+        env: dict[str, str] | None,
+    ) -> str | None:
+        """Return the Kerberos ccache path used by one NetExec invocation."""
+        env_path = ""
+        if isinstance(env, dict):
+            env_path = str(env.get("KRB5CCNAME") or "").strip()
+        if env_path:
+            return env_path
+
+        match = re.match(
+            r"^\s*KRB5CCNAME=(?P<value>(?:\"[^\"]*\"|'[^']*'|[^\s]+))\s+",
+            str(command or ""),
+        )
+        if not match:
+            return None
+
+        raw_value = str(match.group("value") or "").strip()
+        if not raw_value:
+            return None
+        try:
+            parsed = shlex.split(raw_value)
+        except ValueError:
+            parsed = []
+        if parsed:
+            return parsed[0]
+        return raw_value.strip("'\"")
+
+    @staticmethod
+    def _replace_kerberos_ccache_prefix(command: str, ticket_path: str) -> str:
+        """Replace an inline ``KRB5CCNAME=...`` prefix with a refreshed path."""
+        prefix_pattern = re.compile(
+            r"^(?P<prefix>\s*KRB5CCNAME=(?:\"[^\"]*\"|'[^']*'|[^\s]+)\s+)"
+        )
+        replacement = f"KRB5CCNAME={shlex.quote(ticket_path)} "
+        if prefix_pattern.match(str(command or "")):
+            return prefix_pattern.sub(replacement, str(command or ""), count=1)
+        return str(command or "")
+
+    @classmethod
+    def _attempt_delegated_ticket_refresh(
+        cls,
+        *,
+        current_command: str,
+        env: dict[str, str] | None,
+        ctx: NetExecContext,
+    ) -> tuple[bool, str, dict[str, str] | None]:
+        """Offer delegated ticket recreation for stale ``--use-kcache`` flows."""
+        if "--use-kcache" not in str(current_command or ""):
+            return False, current_command, env
+        if not callable(ctx.refresh_delegated_ticket):
+            return False, current_command, env
+
+        current_ticket_path = cls._extract_kerberos_ccache_path(
+            current_command,
+            env=env,
+        )
+        marked_ticket = mark_sensitive(current_ticket_path or "unknown", "path")
+        print_panel(
+            (
+                "This delegated SMB failure is often caused by a stale or invalid "
+                "Kerberos cache rather than a real permission problem.\n\n"
+                f"Current ticket: {marked_ticket}\n\n"
+                "ADscan can recreate the delegated ticket and retry this exact "
+                "NetExec command once."
+            ),
+            title="Delegated Ticket Recovery Available",
+            border_style="yellow",
+            expand=False,
+        )
+        if not ctx.confirm_ask(
+            "Refresh the delegated Kerberos ticket and retry this command?",
+            True,
+        ):
+            return False, current_command, env
+
+        refreshed_ticket_path = str(
+            ctx.refresh_delegated_ticket(current_ticket_path) or ""
+        ).strip()
+        if not refreshed_ticket_path:
+            print_warning(
+                "Delegated ticket refresh did not produce a new Kerberos cache. "
+                "ADscan will keep the original failure."
+            )
+            return False, current_command, env
+
+        updated_command = cls._replace_kerberos_ccache_prefix(
+            current_command,
+            refreshed_ticket_path,
+        )
+        updated_env = dict(env or {})
+        updated_env["KRB5CCNAME"] = refreshed_ticket_path
+        print_info(
+            "Delegated Kerberos ticket refreshed successfully. Retrying the NetExec command."
+        )
+        print_info_debug(
+            "[netexec] delegated ticket refreshed: "
+            f"old_ticket={marked_ticket} "
+            f"new_ticket={mark_sensitive(refreshed_ticket_path, 'path')}"
+        )
+        return True, updated_command, updated_env
 
     @staticmethod
     def _print_delegated_smb_status_more_processing_required_guidance(
@@ -551,6 +658,8 @@ class NetExecRunner:
 
             return shlex.join(fallback_argv)
 
+        delegated_ticket_refresh_attempted = False
+
         while True:
             needs_retry = False
             schema_mismatch_detected = False
@@ -622,6 +731,27 @@ class NetExecRunner:
                     and delegated_auth_failure.status
                     == "STATUS_MORE_PROCESSING_REQUIRED"
                 ):
+                    if not delegated_ticket_refresh_attempted:
+                        current_env = kwargs.get("env")
+                        normalized_env = (
+                            dict(current_env)
+                            if isinstance(current_env, dict)
+                            else None
+                        )
+                        refreshed, refreshed_command, refreshed_env = (
+                            self._attempt_delegated_ticket_refresh(
+                                current_command=current_command,
+                                env=normalized_env,
+                                ctx=ctx,
+                            )
+                        )
+                        if refreshed:
+                            delegated_ticket_refresh_attempted = True
+                            current_command = refreshed_command
+                            kwargs["env"] = refreshed_env
+                            _log_attempt_once()
+                            needs_retry = True
+                            break
                     self._print_delegated_smb_status_more_processing_required_guidance(
                         command=current_command,
                         failure_line=delegated_auth_failure.line,
@@ -767,6 +897,7 @@ class NetExecRunner:
                             message=combined_output.strip()[:500],
                         )
                 else:
+                    has_clock_skew = "KRB_AP_ERR_SKEW" in combined_output
                     has_wrong_realm = "KDC_ERR_WRONG_REALM" in combined_output
                     has_connection_reset = _has_connection_reset_by_peer(combined_output)
                     kerberos_ntlm_fallback_attempted = getattr(
@@ -776,6 +907,7 @@ class NetExecRunner:
                     )
                     if (
                         not kerberos_ntlm_fallback_attempted
+                        and not has_clock_skew
                         and not has_wrong_realm
                         and not has_connection_reset
                         and not output_indicates_kerberos_invalid_credentials(
@@ -1235,15 +1367,56 @@ class NetExecRunner:
                         marked_domain = mark_sensitive(str(effective_domain), "domain")
                         if clock_skew_sync_attempts >= max_clock_skew_sync_attempts:
                             _log_attempt_once()
-                            print_warning(
-                                "KRB_AP_ERR_SKEW persists after multiple clock synchronization attempts. "
-                                "Stopping retries to avoid an infinite loop."
+                            clock_skew_ntlm_fallback_attempted = getattr(
+                                ctx.state_owner,
+                                "_netexec_clock_skew_ntlm_fallback_attempted",
+                                False,
                             )
-                            print_info_debug(
-                                "[DEBUG] Clock-skew retries exhausted for "
-                                f"domain={marked_domain}: attempts={clock_skew_sync_attempts}/"
-                                f"{max_clock_skew_sync_attempts}"
+                            protocol_supports_ntlm_fallback = (
+                                effective_service
+                                in _NETEXEC_CLOCK_SKEW_NTLM_FALLBACK_PROTOCOLS
                             )
+                            ntlm_fallback_command = (
+                                build_netexec_ntlm_command(retry_command)
+                                if protocol_supports_ntlm_fallback
+                                else None
+                            )
+                            if (
+                                not clock_skew_ntlm_fallback_attempted
+                                and ntlm_fallback_command
+                                and ntlm_fallback_command != retry_command
+                            ):
+                                setattr(
+                                    ctx.state_owner,
+                                    "_netexec_clock_skew_ntlm_fallback_attempted",
+                                    True,
+                                )
+                                print_warning(
+                                    "KRB_AP_ERR_SKEW persists after multiple clock synchronization attempts. "
+                                    "Kerberos validation is unreliable in the current environment. "
+                                    "Retrying once with NTLM fallback to verify whether access is valid "
+                                    "outside the Kerberos time-skew condition."
+                                )
+                                print_info_debug(
+                                    "[netexec] Clock-skew NTLM fallback command: "
+                                    f"domain={marked_domain} protocol={effective_service or 'unknown'} "
+                                    f"command={ntlm_fallback_command}"
+                                )
+                                retry_command = ntlm_fallback_command
+                                needs_retry = True
+                            else:
+                                print_warning(
+                                    "KRB_AP_ERR_SKEW persists after multiple clock synchronization attempts. "
+                                    "Stopping retries to avoid an infinite loop."
+                                )
+                                print_info_debug(
+                                    "[DEBUG] Clock-skew retries exhausted for "
+                                    f"domain={marked_domain}: attempts={clock_skew_sync_attempts}/"
+                                    f"{max_clock_skew_sync_attempts} "
+                                    f"ntlm_fallback_attempted={clock_skew_ntlm_fallback_attempted!r} "
+                                    f"protocol={effective_service or 'unknown'} "
+                                    f"protocol_supports_ntlm_fallback={protocol_supports_ntlm_fallback!r}"
+                                )
                         else:
                             clock_skew_sync_attempts += 1
                             _log_attempt_once()

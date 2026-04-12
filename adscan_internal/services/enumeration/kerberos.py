@@ -21,6 +21,7 @@ import re
 
 from adscan_internal.core import AuthMode, requires_auth
 from adscan_internal.command_runner import CommandSpec, default_runner
+from adscan_internal.rich_output import mark_sensitive, print_info_debug
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
@@ -28,6 +29,7 @@ from adscan_internal.subprocess_env import (
 from adscan_internal.integrations.impacket import (
     ImpacketRunner,
     ImpacketContext,
+    extract_kerberoast_candidate_users,
     parse_kerberoast_output,
     parse_asreproast_output,
     KerberoastHash,
@@ -451,7 +453,7 @@ class KerberosEnumerationMixin:
             timeout=timeout,
         )
 
-        if not result or not result.stdout:
+        if not result:
             self.logger.warning("Kerberoasting returned no output")
             self.parent._emit_progress(
                 scan_id=scan_id,
@@ -461,8 +463,55 @@ class KerberosEnumerationMixin:
             )
             return []
 
-        # Parse output
-        hashes_list = parse_kerberoast_output(result.stdout)
+        stdout_output = result.stdout or ""
+        hashes_list = parse_kerberoast_output(stdout_output)
+        stdout_candidate_users = extract_kerberoast_candidate_users(stdout_output)
+        file_hashes_count = 0
+        file_candidate_users: list[str] = []
+        hashes_source = "stdout"
+
+        if not hashes_list and output_file and output_file.exists():
+            try:
+                file_output = output_file.read_text(encoding="utf-8", errors="ignore")
+            except OSError as exc:
+                self.logger.warning(
+                    "Kerberoast output file could not be read",
+                    extra={"domain": domain, "output_file": str(output_file)},
+                    exc_info=exc,
+                )
+            else:
+                file_hashes = parse_kerberoast_output(file_output)
+                file_hashes_count = len(file_hashes)
+                file_candidate_users = [item.username for item in file_hashes if item.username]
+                hashes_list = file_hashes
+                if file_hashes:
+                    hashes_source = "output_file"
+
+        if not hashes_list and stdout_output:
+            hashes_list = [
+                KerberoastHash(username=user, hash_value="")
+                for user in stdout_candidate_users
+                if user.strip()
+            ]
+            if hashes_list:
+                hashes_source = "stdout_candidates"
+
+        print_info_debug(
+            "[kerberoast] Parsed discovery: "
+            f"domain={mark_sensitive(domain, 'domain')} "
+            f"stdout_candidates={len(stdout_candidate_users)} "
+            f"output_file_hashes={file_hashes_count} "
+            f"final_entries={len(hashes_list)} "
+            f"source={hashes_source}"
+        )
+        if output_file:
+            print_info_debug(
+                "[kerberoast] Output artifacts: "
+                f"file={mark_sensitive(str(output_file), 'path')} "
+                f"exists={output_file.exists()} "
+                f"stdout_users={stdout_candidate_users!r} "
+                f"file_users={file_candidate_users!r}"
+            )
 
         self.logger.info(
             f"Kerberoasting completed: {len(hashes_list)} hash(es) extracted",

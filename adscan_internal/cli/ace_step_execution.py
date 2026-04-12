@@ -214,6 +214,17 @@ def _resolve_execution_user_with_source(
     max_options: int = 20,
 ) -> tuple[str | None, str]:
     """Resolve an execution user and indicate which source was used."""
+    def _preview_users(users: list[str], *, max_items: int = 5) -> str:
+        """Return a compact debug preview of candidate usernames."""
+        cleaned = [str(user).strip() for user in users if str(user).strip()]
+        if not cleaned:
+            return "[]"
+        preview = cleaned[:max_items]
+        rendered = ", ".join(mark_sensitive(user, "user") for user in preview)
+        if len(cleaned) > max_items:
+            rendered = f"{rendered}, +{len(cleaned) - max_items} more"
+        return f"[{rendered}]"
+
     exec_username = _normalize_account(context_username or "")
     if exec_username:
         print_info_debug(
@@ -250,9 +261,15 @@ def _resolve_execution_user_with_source(
         affected_users_len = (
             len(affected_users) if isinstance(affected_users, list) else None
         )
+        affected_preview = (
+            _preview_users([str(user) for user in affected_users if isinstance(user, str)])
+            if isinstance(affected_users, list)
+            else "[]"
+        )
         print_info_debug(
             "[exec-user] meta.affected_users summary: "
-            f"count={affected_count!r}, list_len={affected_users_len!r}"
+            f"count={affected_count!r}, list_len={affected_users_len!r}, "
+            f"users={affected_preview}"
         )
     else:
         print_info_debug("[exec-user] No meta object available on path summary.")
@@ -281,8 +298,16 @@ def _resolve_execution_user_with_source(
 
     if candidate_users:
         candidate_users = list(dict.fromkeys(candidate_users))
+        stored_credential_preview = (
+            _preview_users([str(stored_user) for stored_user in creds.keys()])
+            if isinstance(creds, dict)
+            else "[]"
+        )
         print_info_debug(
-            f"[exec-user] Found {len(candidate_users)} candidate user(s) with stored credentials."
+            "[exec-user] Found "
+            f"{len(candidate_users)} candidate user(s) with stored credentials. "
+            f"candidates={_preview_users(candidate_users)} "
+            f"stored_credentials={stored_credential_preview}"
         )
         marked_domain = mark_sensitive(domain, "domain")
         print_panel(
@@ -422,6 +447,7 @@ class AceStepContext:
 ACL_ACE_RELATIONS: set[str] = {
     "genericall",
     "genericwrite",
+    "writeaccountrestrictions",
     "forcechangepassword",
     "addself",
     "addmember",
@@ -461,6 +487,14 @@ def describe_ace_relation_support(
         return (
             False,
             f"GenericAll/GenericWrite exploitation is not implemented for target type {target_kind}.",
+        )
+
+    if relation == "writeaccountrestrictions":
+        if target_kind_norm == "computer":
+            return True, None
+        return (
+            False,
+            f"WriteAccountRestrictions exploitation is only implemented for Computer targets (got {target_kind}).",
         )
 
     if relation == "writeowner":
@@ -689,7 +723,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             prompt_for_user_privs_after=False,
         )
 
-    if relation in {"genericall", "genericwrite"}:
+    if relation in {"genericall", "genericwrite", "writeaccountrestrictions"}:
         if target_kind in {"user", "computer"}:
             if context.target_enabled is False and target_kind == "user":
                 print_warning(f"Target {marked_to} is disabled.")
@@ -727,6 +761,36 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                         f"Skipping exploitation for disabled target {marked_to}."
                     )
                     return False
+            if target_kind == "computer":
+                computer_helper = getattr(shell, "exploit_control_computer_object", None)
+                if callable(computer_helper):
+                    return computer_helper(
+                        context.domain,
+                        context.exec_username,
+                        context.exec_password,
+                        context.target_sam_or_label,
+                        context.target_domain,
+                        prompt_for_user_privs_after=False,
+                        prompt_for_method_choice=True,
+                    )
+                if relation in {"genericall", "genericwrite"}:
+                    # Backwards compatibility for older shell stubs while the
+                    # dedicated computer-object helper rolls out.
+                    return shell.exploit_generic_all_user(
+                        context.domain,
+                        context.exec_username,
+                        context.exec_password,
+                        context.target_sam_or_label,
+                        context.target_domain,
+                        prompt_for_password_fallback=False,
+                        prompt_for_user_privs_after=False,
+                        prompt_for_method_choice=True,
+                    )
+                print_warning(
+                    "Computer-object control exploitation helper is unavailable in this shell context."
+                )
+                return False
+
             return shell.exploit_generic_all_user(
                 context.domain,
                 context.exec_username,

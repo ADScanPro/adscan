@@ -18,6 +18,7 @@ from typing import Iterable
 from adscan_internal.services.attack_step_catalog import (
     get_attack_step_entry,
     get_relation_notes_by_support_kind,
+    normalize_execution_relation,
 )
 
 
@@ -81,7 +82,7 @@ def classify_relation_support(relation: str) -> RelationSupport:
         - supported
         - unsupported
     """
-    key = _norm(relation)
+    key = normalize_execution_relation(relation)
     if not key:
         return RelationSupport(kind="unsupported", reason="Missing relation")
     entry = get_attack_step_entry(key)

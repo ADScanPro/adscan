@@ -1912,7 +1912,11 @@ def run_auth_shares(
         )
         return
 
-    auth = shell.build_auth_nxc(username, password, domain)
+    use_ccache = password.lower().endswith(".ccache")
+    auth = shell.build_auth_nxc(username, password, domain, kerberos=use_ccache)
+    kerberos_ticket_prefix = (
+        f"KRB5CCNAME={shlex.quote(password)} " if use_ccache else ""
+    )
     marked_username = mark_sensitive(username, "user")
     log_path = domain_relpath(
         shell.domains_dir, domain, "smb", f"smb_{username}_shares.log"
@@ -1942,7 +1946,7 @@ def run_auth_shares(
         )
         return
     command = (
-        f"{shell.netexec_path} smb {shlex.quote(targets_file)} {auth} "
+        f"{kerberos_ticket_prefix}{shell.netexec_path} smb {shlex.quote(targets_file)} {auth} "
         f"-t 10 --timeout 60 --smb-timeout 30 --shares --log "
         f"{log_path} "
     )

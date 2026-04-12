@@ -3,7 +3,7 @@
 This module encapsulates the logic required to:
 
 * Generate Kerberos TGTs and ``ccache`` files from domain credentials
-  (password or NTLM hash).
+  (password, NTLM hash, or typed Kerberos AES key material).
 * Prepare a minimal Kerberos environment (``KRB5_CONFIG`` and
   ``KRB5CCNAME``) suitable for external tools that rely on the system
   Kerberos stack.
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 import ipaddress
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -41,6 +42,10 @@ from adscan_internal.rich_output import (
     print_error_debug,
     print_info_debug,
     print_warning_debug,
+)
+from adscan_internal.services.credential_store_service import (
+    CredentialStoreService,
+    KerberosKeyMaterial,
 )
 
 
@@ -83,6 +88,7 @@ class KerberosServiceTicketResult:
     success: bool
     error_message: Optional[str] = None
     command: Optional[str] = None
+    ticket_path: Optional[str] = None
 
 
 @dataclass
@@ -300,6 +306,48 @@ class KerberosTicketService(BaseService):
                 success=False,
                 error_message=str(exc),
             )
+
+    def create_tgt_from_kerberos_key_material(
+        self,
+        *,
+        material: KerberosKeyMaterial,
+        domain: str,
+        workspace_dir: str,
+        dc_ip: Optional[str] = None,
+    ) -> KerberosTGTResult:
+        """Generate a TGT from typed Kerberos key material.
+
+        AES256 is preferred over AES128, with NT/RC4 as fallback. This keeps
+        modern Kerberos key material out of the legacy password/NTLM credential
+        map while still making it usable by ticket-dependent workflows.
+        """
+        selected = CredentialStoreService.select_best_kerberos_key(material)
+        if selected is None:
+            return KerberosTGTResult(
+                username=material.username,
+                domain=domain,
+                ticket_path=None,
+                method="kerberos_key",
+                success=False,
+                error_message="No reusable Kerberos key material available",
+            )
+        key_kind, key_value = selected
+        if key_kind == "nt_hash":
+            return self._create_tgt_from_ntlm(
+                username=material.username,
+                ntlm_hash=key_value,
+                domain=domain,
+                workspace_dir=workspace_dir,
+                dc_ip=dc_ip,
+            )
+        return self._create_tgt_from_aes_key(
+            username=material.username,
+            aes_key=key_value,
+            key_kind=key_kind,
+            domain=domain,
+            workspace_dir=workspace_dir,
+            dc_ip=dc_ip,
+        )
 
     def setup_environment_for_domain(
         self,
@@ -989,6 +1037,142 @@ class KerberosTicketService(BaseService):
                     )
 
     # ------------------------------------------------------------------ #
+    # TGT from Kerberos AES key
+    # ------------------------------------------------------------------ #
+
+    def _create_tgt_from_aes_key(
+        self,
+        *,
+        username: str,
+        aes_key: str,
+        key_kind: str,
+        domain: str,
+        workspace_dir: str,
+        dc_ip: Optional[str],
+    ) -> KerberosTGTResult:
+        """Create a Kerberos TGT using AES key material and Impacket getTGT.py."""
+        self._setup_domain_krb5_config(workspace_dir=workspace_dir, domain=domain)
+
+        final_ccache_path, temp_ccache_path = self._build_ccache_paths(
+            workspace_dir=workspace_dir,
+            domain=domain,
+            username=username,
+        )
+
+        expected_len = 64 if key_kind == "aes256" else 32
+        clean_aes_key = str(aes_key or "").strip().lower()
+        if len(clean_aes_key) != expected_len or not re.fullmatch(
+            r"[0-9a-f]+", clean_aes_key
+        ):
+            return KerberosTGTResult(
+                username=username,
+                domain=domain,
+                ticket_path=None,
+                method=f"impacket_{key_kind}",
+                success=False,
+                error_message=f"Invalid {key_kind} key format",
+            )
+
+        adscan_home = get_adscan_home()
+        impacket_venv_path = adscan_home / "tool_venvs" / "impacket" / "venv"
+        get_tgt_script = impacket_venv_path / "bin" / "getTGT.py"
+        if not get_tgt_script.exists():
+            return KerberosTGTResult(
+                username=username,
+                domain=domain,
+                ticket_path=None,
+                method=f"impacket_{key_kind}",
+                success=False,
+                error_message="getTGT.py not found for AES authentication",
+            )
+
+        env = get_clean_env_for_compilation()
+        env["KRB5CCNAME"] = str(temp_ccache_path)
+
+        identity = f"{domain}/{username}"
+        cmd = [str(impacket_venv_path / "bin" / "python"), str(get_tgt_script)]
+        cmd.extend(["-aesKey", clean_aes_key])
+        if dc_ip:
+            cmd.extend(["-dc-ip", dc_ip])
+        cmd.append(identity)
+
+        try:
+            get_tgt_result = self._run_command_logged(
+                label=f"getTGT.py {key_kind}",
+                command=cmd,
+                env=env,
+                shell=False,
+            )
+        except Exception as exc:  # pragma: no cover - unexpected runtime error
+            self.logger.exception(
+                "Error running getTGT.py for AES key %s@%s",
+                username,
+                domain,
+                exc_info=True,
+            )
+            return KerberosTGTResult(
+                username=username,
+                domain=domain,
+                ticket_path=None,
+                method=f"impacket_{key_kind}",
+                success=False,
+                error_message=str(exc),
+            )
+
+        if get_tgt_result.returncode != 0:
+            stderr_text = (get_tgt_result.stderr or "").strip()
+            return KerberosTGTResult(
+                username=username,
+                domain=domain,
+                ticket_path=None,
+                method=f"impacket_{key_kind}",
+                success=False,
+                error_message=stderr_text or "getTGT.py failed",
+            )
+
+        default_ccache = Path.cwd() / f"{username}.ccache"
+        if default_ccache.exists():
+            try:
+                default_ccache.rename(temp_ccache_path)
+            except Exception:
+                self.logger.debug(
+                    "Failed to move default ccache from cwd to temp path",
+                    exc_info=True,
+                )
+
+        if not self._finalize_ticket_file(
+            temp_path=temp_ccache_path, final_path=final_ccache_path
+        ):
+            self._log_ticket_paths_state(
+                temp_path=temp_ccache_path,
+                final_path=final_ccache_path,
+                default_path=default_ccache,
+            )
+            return KerberosTGTResult(
+                username=username,
+                domain=domain,
+                ticket_path=None,
+                method=f"impacket_{key_kind}",
+                success=False,
+                error_message="Ticket file was not created as expected",
+            )
+
+        self._log_ticket_paths_state(
+            temp_path=temp_ccache_path,
+            final_path=final_ccache_path,
+            default_path=default_ccache,
+        )
+        os.environ["KRB5CCNAME"] = str(final_ccache_path)
+
+        return KerberosTGTResult(
+            username=username,
+            domain=domain,
+            ticket_path=str(final_ccache_path),
+            method=f"impacket_{key_kind}",
+            success=True,
+        )
+
+    # ------------------------------------------------------------------ #
     # TGT from NTLM hash
     # ------------------------------------------------------------------ #
 
@@ -1279,6 +1463,35 @@ class KerberosTicketService(BaseService):
                 command=command_str,
             )
 
+        output_text = f"{completed.stdout or ''}\n{completed.stderr or ''}".strip()
+        ticket_match = re.search(r"Saving ticket in (\S+)", output_text)
+        ticket_path = ticket_match.group(1) if ticket_match else None
+        lowered_output = output_text.lower()
+        if (
+            "kdc_err_" in lowered_output
+            or "kerberos sessionerror" in lowered_output
+            or "doesn't exist" in lowered_output
+            or not ticket_path
+        ):
+            msg = (
+                output_text
+                or "getST.py did not report a saved ticket path"
+            )
+            self.logger.warning(
+                "getST.py returned an unusable result for %s@%s: %s",
+                target_user,
+                spn,
+                msg,
+            )
+            return KerberosServiceTicketResult(
+                target_user=target_user,
+                spn=spn,
+                success=False,
+                error_message=msg,
+                command=command_str,
+                ticket_path=ticket_path,
+            )
+
         self.logger.info(
             "Forwardable ticket created successfully via getST.py",
             extra={"target_user": target_user, "spn": spn},
@@ -1288,6 +1501,7 @@ class KerberosTicketService(BaseService):
             spn=spn,
             success=True,
             command=command_str,
+            ticket_path=ticket_path,
         )
 
     def sync_clock_with_pdc(

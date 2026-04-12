@@ -2235,6 +2235,15 @@ EXTERNAL_TOOLS_CONFIG = {
         "req_file": "requirements.txt",
         "check_path": "coercer/Coercer.py",
     },
+    "syswhispers4": {
+        # SysWhispers4 – generates direct-syscall stubs for evasion-compiled binaries.
+        # The Python script is used by the binary_ops preparer (Tier 2).
+        # mingw-w64 cross-compiler must be installed separately via apt.
+        "url": "https://github.com/JoasASantos/SysWhispers4.git",
+        "type": "git",
+        "req_file": "requirements.txt",
+        "check_path": "syswhispers4/syswhispers.py",
+    },
     "massdns": {
         "url": "https://github.com/blechschmidt/massdns.git",
         "type": "git_make",
@@ -2504,8 +2513,16 @@ def _setup_external_tool(
                     return False
 
                 clean_env = _get_clean_env_for_compilation()
+                venv_args = [pyenv_python, "-m", "venv"]
+                if tool_name == "LSA-Reaper":
+                    # LSA-Reaper imports python-apt and also shells out to
+                    # ``sudo python3 -m pypykatz`` internally. A normal isolated
+                    # venv cannot see distro-provided python3-apt, so it must be
+                    # created with system site-packages enabled.
+                    venv_args.append("--system-site-packages")
+                venv_args.append(tool_specific_venv_path)
                 result = run_command(
-                    [pyenv_python, "-m", "venv", tool_specific_venv_path],
+                    venv_args,
                     check=False,
                     env=clean_env,
                 )
@@ -2592,15 +2609,20 @@ def _setup_external_tool(
             pip_env.pop("PYTHONHOME", None)
             pip_env.pop("PYTHONPATH", None)
             _configure_ssl_certificates(pip_env)
+            pip_install_command = [
+                tool_specific_python,
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                os.path.join(tool_path, req_file_path),
+            ]
+            if tool_name == "LSA-Reaper":
+                # LSA-Reaper depends on Impacket explicitly at runtime even
+                # though its upstream requirements.txt omits it.
+                pip_install_command.append("impacket")
             run_command(
-                [
-                    tool_specific_python,
-                    "-m",
-                    "pip",
-                    "install",
-                    "-r",
-                    os.path.join(tool_path, req_file_path),
-                ],
+                pip_install_command,
                 env=pip_env,
                 use_clean_env=False,
             )
@@ -3143,6 +3165,12 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         "check_target": "pypykatz",
         "check_type": "executable",
         "exe_name": "pypykatz",
+    },
+    "lsassy": {
+        "spec": "lsassy==3.1.16",
+        "check_target": "lsassy",
+        "check_type": "executable",
+        "exe_name": "lsassy",
     },
 }
 
@@ -10362,6 +10390,7 @@ class PentestShell:
         self.manspider_path = get_tool_executable_path("manspider")
         self.credsweeper_path = get_tool_executable_path("credsweeper")
         self.pypykatz_path = get_tool_executable_path("pypykatz")
+        self.lsassy_path = get_tool_executable_path("lsassy")
         self.kerbrute_path = get_external_tool_executable("kerbrute")
         self.medusa_path = shutil.which("medusa")
         self.bloodhound_gui_path = os.path.join(
@@ -10964,6 +10993,9 @@ class PentestShell:
             get_workspaces_dir=self._get_nxc_workspaces_dir,
             confirm_ask=lambda question, default: Confirm.ask(
                 question, default=default
+            ),
+            refresh_delegated_ticket=lambda ticket_path: self.refresh_last_delegated_service_ticket(
+                ticket_path
             ),
         )
 
@@ -14337,6 +14369,8 @@ class PentestShell:
 
             clear <domain>: Clears all credentials for the specified domain in the current workspace.
 
+            delete <domain>: Deletes one selected credential for the specified domain in the current workspace.
+
             select <domain>: Run the enumeration of the user of the selected credential.
 
             save <domain> <username> <credential> [host] [service]: Saves a credential for the specified domain in the current workspace.
@@ -14346,6 +14380,7 @@ class PentestShell:
         from adscan_internal.cli.creds import (
             add_credential,
             clear_creds,
+            delete_cred,
             ensure_domain_ready_for_manual_credential_save,
             normalize_creds_subcommand,
             select_cred,
@@ -14361,7 +14396,7 @@ class PentestShell:
         command_parts = args.split()
         if not command_parts:
             print_instruction(
-                "Please provide a subcommand for 'creds'. Usage: creds <show|clear|select|save> [options]"
+                "Please provide a subcommand for 'creds'. Usage: creds <show|clear|delete|select|save> [options]"
             )
             self.do_help("creds")
             return
@@ -14379,6 +14414,11 @@ class PentestShell:
                 clear_creds(self, command_parts[1])
             else:
                 print_instruction("Usage: creds clear <domain_name>")
+        elif command == "delete":
+            if len(command_parts) == 2:
+                delete_cred(self, command_parts[1])
+            else:
+                print_instruction("Usage: creds delete <domain_name>")
         elif command == "select":
             if len(command_parts) == 2:
                 select_cred(self, command_parts[1])
@@ -15307,6 +15347,34 @@ class PentestShell:
         from adscan_internal.cli.dumps import run_do_dump_host
 
         return run_do_dump_host(self, args)
+
+    def do_binary_ops(self, args):
+        """Interactive wizard to deploy a Windows binary to a remote host.
+
+        Guides the user through domain, target host, binary selection,
+        authentication, preparation tier (prebuilt / SysWhispers4 / Donut),
+        and execution arguments, then runs upload → execute → cleanup.
+
+        Usage:
+            binary_ops [domain]
+        """
+        from adscan_internal.cli.binary_ops import do_binary_ops
+
+        return do_binary_ops(self, args)
+
+    def do_deploy_binary(self, args):
+        """Non-interactive binary deploy for use in follow-up flows.
+
+        Usage:
+            deploy_binary <binary> <host> <domain> <user> <secret> [args]
+
+        Example:
+            deploy_binary mimikatz rodc01.garfield.htb garfield.htb Administrator S3cr3t! \\
+                "privilege::debug sekurlsa::logonpasswords exit"
+        """
+        from adscan_internal.cli.binary_ops import do_deploy_binary
+
+        return do_deploy_binary(self, args)
 
     def ask_for_smb_gpp(self, domain):
         """Prompt user to search for Group Policy Preferences files."""
@@ -21825,12 +21893,20 @@ class PentestShell:
 
         Args:
             username (str): The username
-            password (str): The password or NT hash
+            password (str): The password, NT hash, or .ccache file path
             domain (str, optional): The domain if needed
 
         Returns:
             str: The authentication string formatted for netexec
         """
+        if password.lower().endswith(".ccache"):
+            auth = f"-u '{username}' --use-kcache"
+            if domain:
+                auth += f" -d {domain} -k"
+            else:
+                auth += " --local-auth"
+            return auth
+
         # Check if it is an NT hash (32 hexadecimal characters)
         is_hash = len(password) == 32 and all(
             c in "0123456789abcdef" for c in password.lower()
@@ -23283,21 +23359,18 @@ class PentestShell:
         Returns: str username or None if none is found
         """
         try:
-            # Get all lists
-            admins = self.get_domain_admins(domain)
-            dcs = self.get_domain_controllers(domain)
-            not_delegated = self.get_not_delegated_users(domain)
+            from adscan_internal.cli.privileged_target_selection import (
+                resolve_privileged_target_user,
+            )
 
-            # Combine admins and DCs for a complete list of privileged users
-            privileged_users = set(admins + dcs)
-
-            # Find privileged users that are not in the non-delegated list
-            delegatable_users = privileged_users - set(not_delegated)
-
-            if delegatable_users:
-                return next(iter(delegatable_users))
-
-            return None
+            return resolve_privileged_target_user(
+                self,
+                domain=domain,
+                purpose="Kerberos delegation impersonation",
+                require_domain_admin=True,
+                exclude_not_delegated=True,
+                exclude_protected_users=True,
+            )
 
         except Exception as e:
             telemetry.capture_exception(e)
@@ -23333,8 +23406,28 @@ class PentestShell:
     ):
         """Adds a new computer to the domain."""
         try:
+            if domain not in self.domains:
+                marked_target_domain = mark_sensitive(domain, "domain")
+                print_error(
+                    f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
+                )
+                return None
+
+            if not self.impacket_scripts_dir:
+                print_error(
+                    "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
+                )
+                return None
+            getaddcomputer_py_path = os.path.join(self.impacket_scripts_dir, "addcomputer.py")
+            if not os.path.isfile(getaddcomputer_py_path) or not os.access(
+                getaddcomputer_py_path, os.X_OK
+            ):
+                print_error(
+                    f"addcomputer.py not found or not executable in {self.impacket_scripts_dir}. Please check Impacket installation."
+                )
+                return None
             auth = self.build_auth_impacket_no_host(username, password, domain)
-            command = f"addcomputer.py -computer-name '{computer_name}$' -computer-pass '{computer_pass}' "
+            command = f"{getaddcomputer_py_path} -computer-name '{computer_name}$' -computer-pass '{computer_pass}' "
             command += f"-dc-host {self.domains_data[domain]['pdc']} "
             command += f"{auth}"
 
@@ -23371,11 +23464,58 @@ class PentestShell:
             self, domain, s4u_account, username, s4u_password
         )
 
-    def launch_s4proxy(self, domain, target, username, password):
-        """Launches the S4Proxy attack with the forwardable ticket."""
+    def launch_s4proxy(
+        self,
+        domain,
+        target,
+        username,
+        password,
+        *,
+        prompt_for_dcsync_followup=True,
+    ):
+        """Launch the S4Proxy attack with the forwardable ticket."""
         from adscan_internal.cli.delegations import launch_s4proxy
 
-        return launch_s4proxy(self, domain, target, username, password)
+        return launch_s4proxy(
+            self,
+            domain,
+            target,
+            username,
+            password,
+            prompt_for_dcsync_followup=prompt_for_dcsync_followup,
+        )
+
+    def request_delegated_service_ticket(
+        self,
+        domain,
+        target_spn,
+        username,
+        password,
+        *,
+        force_forwardable=True,
+    ):
+        """Request a direct delegated service ticket via getST.py."""
+        from adscan_internal.cli.delegations import request_delegated_service_ticket
+
+        return request_delegated_service_ticket(
+            self,
+            domain,
+            target_spn,
+            username,
+            password,
+            force_forwardable=force_forwardable,
+        )
+
+    def refresh_last_delegated_service_ticket(self, current_ticket_path=None):
+        """Recreate the most recent delegated ticket and return the new ccache path."""
+        from adscan_internal.cli.delegations import (
+            refresh_last_delegated_service_ticket,
+        )
+
+        return refresh_last_delegated_service_ticket(
+            self,
+            current_ticket_path=current_ticket_path,
+        )
 
     def ask_for_enumerate_user_aces(
         self, domain, username, password, group=None, cross_domain=None
@@ -23754,7 +23894,14 @@ class PentestShell:
 
         _adcs_esc7(shell=self, domain=domain, username=username, password=password)
 
-    def adcs_esc3(self, domain, username, password, template):
+    def adcs_esc3(
+        self,
+        domain,
+        username,
+        password,
+        template,
+        client_auth_template="User",
+    ):
         """Wrapper for ADCS ESC3 exploitation."""
         from adscan_internal.cli.adcs_exploitation import adcs_esc3 as _adcs_esc3
 
@@ -23764,6 +23911,7 @@ class PentestShell:
             username=username,
             password=password,
             template=template,
+            client_auth_template=client_auth_template,
         )
 
     def adcs_golden_cert(self, domain, username, password, ca_target_host=None):
@@ -24044,6 +24192,31 @@ class PentestShell:
             target_user=target_user,
             target_domain=target_domain,
             prompt_for_password_fallback=prompt_for_password_fallback,
+            prompt_for_user_privs_after=prompt_for_user_privs_after,
+            prompt_for_method_choice=prompt_for_method_choice,
+        )
+
+    def exploit_control_computer_object(
+        self,
+        domain,
+        username,
+        password,
+        target_computer,
+        target_domain,
+        *,
+        prompt_for_user_privs_after: bool = True,
+        prompt_for_method_choice: bool = True,
+    ) -> bool:
+        """Exploit a computer object through Shadow Credentials or RBCD."""
+        from adscan_internal.cli.exploits import run_exploit_control_computer_object
+
+        return run_exploit_control_computer_object(
+            self,
+            domain=domain,
+            username=username,
+            password=password,
+            target_computer=target_computer,
+            target_domain=target_domain,
             prompt_for_user_privs_after=prompt_for_user_privs_after,
             prompt_for_method_choice=prompt_for_method_choice,
         )
@@ -24349,6 +24522,31 @@ class PentestShell:
                 print_warning(
                     "Pass-the-Certificate succeeded but returned a different principal "
                     f"than expected ({marked_expected})."
+                )
+
+            active_step = getattr(self, "_active_attack_graph_step", None)
+            active_notes = (
+                dict(active_step.notes)
+                if hasattr(active_step, "notes") and isinstance(active_step.notes, dict)
+                else {}
+            )
+            if hasattr(self, "_set_active_attack_graph_step") and all(
+                isinstance(getattr(active_step, field, None), str)
+                and str(getattr(active_step, field, "")).strip()
+                for field in ("domain", "from_label", "relation", "to_label")
+            ):
+                refreshed_notes = dict(active_notes)
+                if expected_user:
+                    refreshed_notes["target_user"] = expected_user
+                    refreshed_notes["expected_user"] = expected_user
+                refreshed_notes["compromised_user"] = result.username
+                refreshed_notes["principal"] = result.principal
+                self._set_active_attack_graph_step(  # type: ignore[attr-defined]
+                    domain=str(active_step.domain),
+                    from_label=str(active_step.from_label),
+                    relation=str(active_step.relation),
+                    to_label=str(active_step.to_label),
+                    notes=refreshed_notes,
                 )
 
             # Persist credential in domains_data

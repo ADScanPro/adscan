@@ -43,6 +43,7 @@ class Domain:
         credentials: Dictionary of discovered credentials {username: password/hash}
         local_credentials: Nested dict of local credentials {host: {service: {user: password}}}
         kerberos_tickets: Dictionary of Kerberos tickets {username: ticket_path}
+        kerberos_keys: Typed Kerberos keys {username: {aes256/aes128/nt_hash/...}}
         trusts: List of discovered domain trusts
         users: List of discovered user accounts
         computers: List of discovered computer accounts
@@ -83,6 +84,7 @@ class Domain:
     kerberos_tickets: Dict[str, str] = field(
         default_factory=dict
     )  # {username: ticket_path}
+    kerberos_keys: Dict[str, Dict[str, str]] = field(default_factory=dict)
     auth_posture: Dict[str, Any] = field(default_factory=dict)
 
     # Discovered entities
@@ -119,6 +121,7 @@ class Domain:
             "credentials": self.credentials,
             "local_credentials": self.local_credentials,
             "kerberos_tickets": self.kerberos_tickets,
+            "kerberos_keys": self.kerberos_keys,
             "auth_posture": self.auth_posture,
             "trusts": self.trusts,
             "users": self.users,
@@ -161,6 +164,7 @@ class Domain:
             credentials=data.get("credentials", {}),
             local_credentials=data.get("local_credentials", {}),
             kerberos_tickets=data.get("kerberos_tickets", {}),
+            kerberos_keys=data.get("kerberos_keys", {}),
             auth_posture=data.get("auth_posture", {}),
             trusts=data.get("trusts", []),
             users=data.get("users", []),

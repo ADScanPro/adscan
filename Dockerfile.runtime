@@ -276,6 +276,10 @@ RUN set -eux; \
   pip_retry /opt/adscan/tool_venvs/pypykatz/venv/bin/python -U pip; \
   pip_retry /opt/adscan/tool_venvs/pypykatz/venv/bin/python "pypykatz==0.6.13"; \
   \
+  python3 -m venv /opt/adscan/tool_venvs/lsassy/venv; \
+  pip_retry /opt/adscan/tool_venvs/lsassy/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/lsassy/venv/bin/python "lsassy==3.1.16"; \
+  \
   chmod -R 0777 /opt/adscan/tool_venvs
 
 # External tools (git/curl)
@@ -297,9 +301,9 @@ RUN set -eux; \
   /opt/adscan/tool_venvs/firepwd/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/firepwd/requirements.txt; \
   \
   git clone --depth 1 https://github.com/spextat0r/LSA-Reaper.git /opt/adscan/tools/LSA-Reaper; \
-  python3 -m venv /opt/adscan/tool_venvs/LSA-Reaper/venv; \
+  python3 -m venv --system-site-packages /opt/adscan/tool_venvs/LSA-Reaper/venv; \
   /opt/adscan/tool_venvs/LSA-Reaper/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/LSA-Reaper/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/LSA-Reaper/requirements.txt; \
+  /opt/adscan/tool_venvs/LSA-Reaper/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/LSA-Reaper/requirements.txt impacket; \
   \
   mkdir -p /opt/adscan/tools/PKINITtools; \
   curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/gettgtpkinit.py -o /opt/adscan/tools/PKINITtools/gettgtpkinit.py; \
@@ -391,6 +395,126 @@ RUN set -eux; \
   ln -sf /opt/adscan/tools/massdns/bin/massdns /opt/adscan/bin/massdns; \
   \
   chmod -R 0777 /opt/adscan/tools /opt/adscan/tool_venvs
+
+# SysWhispers4 – direct-syscall stub generator for evasion-compiled Windows binaries.
+# mingw-w64 (already installed above) provides the x86_64-w64-mingw32-g++ cross-compiler
+# required by the binary_ops Tier-2 pipeline.
+RUN set -eux; \
+  git clone --depth 1 https://github.com/JoasASantos/SysWhispers4.git /opt/adscan/tools/syswhispers4; \
+  python3 -m venv /opt/adscan/tool_venvs/syswhispers4/venv; \
+  /opt/adscan/tool_venvs/syswhispers4/venv/bin/python -m pip install --no-cache-dir -U pip; \
+  if [ -f /opt/adscan/tools/syswhispers4/requirements.txt ]; then \
+    /opt/adscan/tool_venvs/syswhispers4/venv/bin/python -m pip install --no-cache-dir \
+      -r /opt/adscan/tools/syswhispers4/requirements.txt; \
+  fi; \
+  python3 /opt/adscan/tools/syswhispers4/syswhispers.py --help >/dev/null 2>&1 || true; \
+  chmod -R 0777 /opt/adscan/tools/syswhispers4 /opt/adscan/tool_venvs/syswhispers4
+
+# Donut – PE-to-shellcode converter for the Tier-3 in-memory loader pipeline.
+# Installed to /opt/adscan/bin/ which is on PATH (see ENV above).
+# CFLAGS=-w suppresses deprecation warnings that would fail on GCC 13+ with -Werror.
+RUN set -eux; \
+  git clone --depth 1 https://github.com/TheWover/donut.git /tmp/donut_build; \
+  make -C /tmp/donut_build CFLAGS="-w -O2"; \
+  cp /tmp/donut_build/donut /opt/adscan/bin/donut; \
+  chmod 0755 /opt/adscan/bin/donut; \
+  rm -rf /tmp/donut_build
+
+# Windows attack binaries (binary_ops catalog – Tier 1 prebuilt cache).
+# Stored at /opt/adscan/tools/windows-tools/<name>/<filename> to match
+# get_adscan_home() / "tools" / "windows-tools" with ADSCAN_HOME=/opt/adscan.
+ARG MIMIKATZ_VERSION=2.2.0-20220919
+ARG RUBEUS_COMMIT=e37fa53
+ARG WHISKER_COMMIT=9a236c063e37f2d59c1637bdefcae6b4371bf466
+ARG SHARPHOUND_VERSION=v2.10.0
+ARG KRBRELAYUP_URL=https://kb.offsec.nl/tools/techniques/krbrelayup/files/KrbRelayUp.exe
+ARG RUNASCS_VERSION=1.5
+RUN set -eux; \
+  mkdir -p \
+    /opt/adscan/tools/windows-tools/mimikatz \
+    /opt/adscan/tools/windows-tools/rubeus \
+    /opt/adscan/tools/windows-tools/certify \
+    /opt/adscan/tools/windows-tools/whisker \
+    /opt/adscan/tools/windows-tools/seatbelt \
+    /opt/adscan/tools/windows-tools/sharphound \
+    /opt/adscan/tools/windows-tools/krbrelayup \
+    /opt/adscan/tools/windows-tools/runascs; \
+  \
+  # mimikatz – credential extraction (official gentilkiwi release ZIP)
+  curl -fsSL \
+    "https://github.com/gentilkiwi/mimikatz/releases/download/${MIMIKATZ_VERSION}/mimikatz_trunk.zip" \
+    -o /tmp/mimikatz.zip; \
+  unzip -p /tmp/mimikatz.zip x64/mimikatz.exe \
+    > /opt/adscan/tools/windows-tools/mimikatz/mimikatz.exe; \
+  rm /tmp/mimikatz.zip; \
+  \
+  # Rubeus – Kerberos attacks (Ghostpack compiled binaries mirror)
+  curl -fsSL \
+    "https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Rubeus.exe" \
+    -o /opt/adscan/tools/windows-tools/rubeus/Rubeus.exe; \
+  \
+  # Certify – ADCS exploitation (Ghostpack compiled binaries mirror)
+  curl -fsSL \
+    "https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Certify.exe" \
+    -o /opt/adscan/tools/windows-tools/certify/Certify.exe; \
+  \
+  # Whisker – Shadow credentials.
+  # The old Ghostpack-CompiledBinaries mirror stopped shipping Whisker.exe,
+  # so build it from the official source to keep the image reproducible.
+  git clone --depth 1 https://github.com/eladshamir/Whisker.git /tmp/Whisker; \
+  git -C /tmp/Whisker checkout "${WHISKER_COMMIT}"; \
+  perl -0pi -e 's#<Reference Include="System.DirectoryServices" />#<Reference Include="System.DirectoryServices" />\n    <Reference Include="System.Numerics" />#' \
+    /tmp/Whisker/Whisker/Whisker.csproj; \
+  build_tool=""; \
+  if command -v msbuild >/dev/null 2>&1; then \
+    build_tool="msbuild"; \
+  elif command -v xbuild >/dev/null 2>&1; then \
+    build_tool="xbuild"; \
+  else \
+    echo "Neither msbuild nor xbuild is available for Whisker build" >&2; \
+    exit 1; \
+  fi; \
+  "${build_tool}" /tmp/Whisker/Whisker.sln /p:Configuration=Release /verbosity:minimal; \
+  test -f /tmp/Whisker/Whisker/bin/Release/Whisker.exe; \
+  cp /tmp/Whisker/Whisker/bin/Release/Whisker.exe /opt/adscan/tools/windows-tools/whisker/Whisker.exe; \
+  rm -rf /tmp/Whisker; \
+  \
+  # Seatbelt – host security enumeration (Ghostpack compiled binaries mirror)
+  curl -fsSL \
+    "https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Seatbelt.exe" \
+    -o /opt/adscan/tools/windows-tools/seatbelt/Seatbelt.exe; \
+  \
+  # SharpHound – BloodHound collection from inside the target.
+  # Keep this aligned with the managed BloodHound CE version. For BH CE v8.7.0,
+  # upstream pins SHARPHOUND_VERSION=v2.10.0 in their Dockerfiles.
+  curl -fsSL \
+    "https://github.com/SpecterOps/SharpHound/releases/download/${SHARPHOUND_VERSION}/SharpHound_${SHARPHOUND_VERSION}_windows_x86.zip" \
+    -o /tmp/sharphound.zip; \
+  unzip -p /tmp/sharphound.zip SharpHound.exe \
+    > /opt/adscan/tools/windows-tools/sharphound/SharpHound.exe; \
+  rm -f /tmp/sharphound.zip; \
+  \
+  # KrbRelayUp – local privilege escalation via Kerberos relay.
+  # The historical GitHub release URL now returns 404 and the source tree
+  # requires a larger Mono/xbuild compatibility patch set than we want inside
+  # the runtime image, so use the maintained OffSec knowledge-base binary.
+  curl -fsSL "${KRBRELAYUP_URL}" \
+    -o /opt/adscan/tools/windows-tools/krbrelayup/KrbRelayUp.exe; \
+  \
+  # RunasCs – run as different user (official GitHub release ZIP)
+  # Also symlinked to the legacy path so runascs_manager.py finds it.
+  curl -fsSL \
+    "https://github.com/antonioCoco/RunasCs/releases/download/v${RUNASCS_VERSION}/RunasCs.zip" \
+    -o /tmp/runascs.zip; \
+  unzip -p /tmp/runascs.zip RunasCs.exe \
+    > /opt/adscan/tools/windows-tools/runascs/RunasCs.exe; \
+  rm /tmp/runascs.zip; \
+  mkdir -p /opt/adscan/tools/runascs/windows-amd64; \
+  ln -sf \
+    /opt/adscan/tools/windows-tools/runascs/RunasCs.exe \
+    /opt/adscan/tools/runascs/windows-amd64/RunasCs.exe; \
+  \
+  chmod -R 0777 /opt/adscan/tools/windows-tools
 
 # Wordlists
 RUN set -eux; \

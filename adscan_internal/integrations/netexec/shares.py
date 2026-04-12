@@ -39,13 +39,11 @@ def list_share_directory(
     share_arg = str(share).strip()
     cmd = f"{shell.netexec_path} smb {host} {auth} --share {share_arg}"
     if directory is None:
-        cmd = f"{cmd} --dir \"\""
+        cmd = f'{cmd} --dir ""'
     elif directory:
-        cmd = f"{cmd} --dir \"{directory}\""
+        cmd = f'{cmd} --dir "{directory}"'
 
-    print_info_debug(
-        f"[netexec] Share list command: {cmd}"
-    )
+    print_info_debug(f"[netexec] Share list command: {cmd}")
     proc = shell._run_netexec(
         cmd,
         domain=domain,
@@ -71,6 +69,7 @@ def download_share_files(
     files: list[str],
     output_dir: str,
     timeout: int = 300,
+    env: dict[str, str] | None = None,
 ) -> list[str]:
     """Download multiple files from a SMB share using NetExec."""
     if not getattr(shell, "netexec_path", None):
@@ -88,7 +87,7 @@ def download_share_files(
         local_path = os.path.join(output_dir, local_name)
         cmd = (
             f"{shell.netexec_path} smb {host} {auth} --share {share} "
-            f"--get-file \"{remote_clean}\" \"{local_path}\""
+            f'--get-file "{remote_clean}" "{local_path}"'
         )
         print_info_debug(f"[netexec] Share download command: {cmd}")
         proc = shell._run_netexec(
@@ -98,6 +97,7 @@ def download_share_files(
             operation_kind="share_download",
             service="smb",
             target_count=1,
+            env=env,
         )
         if not proc or proc.returncode != 0:
             marked_file = mark_sensitive(remote_clean, "path")
@@ -106,3 +106,49 @@ def download_share_files(
         if os.path.exists(local_path):
             downloaded.append(local_path)
     return downloaded
+
+
+def upload_share_file(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    auth: str,
+    share: str,
+    local_path: str,
+    remote_path: str,
+    timeout: int = 300,
+    env: dict[str, str] | None = None,
+) -> bool:
+    """Upload one local file to a SMB share using NetExec."""
+    if not getattr(shell, "netexec_path", None):
+        return False
+    if not os.path.isfile(local_path):
+        marked_file = mark_sensitive(local_path, "path")
+        print_warning(f"Local upload source does not exist: {marked_file}.")
+        return False
+
+    local_clean = str(local_path).strip()
+    remote_clean = str(remote_path).strip()
+    if not local_clean or not remote_clean:
+        return False
+
+    cmd = (
+        f"{shell.netexec_path} smb {host} {auth} --share {share} "
+        f'--put-file "{local_clean}" "{remote_clean}"'
+    )
+    print_info_debug(f"[netexec] Share upload command: {cmd}")
+    proc = shell._run_netexec(
+        cmd,
+        domain=domain,
+        timeout=timeout,
+        operation_kind="share_upload",
+        service="smb",
+        target_count=1,
+        env=env,
+    )
+    if not proc or proc.returncode != 0:
+        marked_file = mark_sensitive(local_clean, "path")
+        print_warning(f"Failed to upload {marked_file} to share {share}.")
+        return False
+    return True

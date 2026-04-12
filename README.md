@@ -10,9 +10,11 @@
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://github.com/ADscanPro/adscan)
 [![Discord](https://img.shields.io/discord/1355089867096199300?color=7289da&label=Discord&logo=discord&logoColor=white)](https://discord.com/invite/fXBR3P8H74)
 
-**Automate Active Directory pentesting. From DNS to Domain Admin.**
+**Free Active Directory pentesting CLI for AD enumeration, BloodHound, Kerberoasting, ADCS, and attack paths.**
 
-ADscan is a free Active Directory pentesting CLI for pentesters, red teamers, and CTF players who need fast AD enumeration, BloodHound collection, Kerberoasting, AS-REP Roasting, ADCS checks, password spraying, credential dumping, attack-path execution, and evidence export from one Linux terminal.
+ADscan is a free Linux CLI for pentesters, red teamers, and security consultants who need one workflow for Active Directory enumeration, BloodHound collection, Kerberoasting, AS-REP roasting, ADCS checks, password spraying, DCSync, credential dumping, and evidence export.
+
+It is built for real internal Active Directory assessments and labs, so you can go from unauthenticated recon to privilege escalation from one terminal instead of juggling isolated scripts, cheatsheets, and wrappers.
 
 **[Docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=docs_cta)** | [Discord](https://discord.com/invite/fXBR3P8H74) | [Website](https://adscanpro.com)
 
@@ -38,7 +40,14 @@ adscan start
 
 > **Full installation guide & docs** at [adscanpro.com/docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=install_cta)
 
-## ⚡ Common Pentest Workflows
+## 🎯 Why Pentesters Use ADscan
+
+- **Active Directory enumeration from one CLI:** DNS, LDAP, SMB, Kerberos, trust, ADCS, and BloodHound-ready collection in one workflow.
+- **Attack execution without tool-hopping:** Kerberoasting, AS-REP roasting, password spraying, GPP, DCSync, and credential workflows stay inside the same workspace.
+- **Built for real pentest cadence:** use it in internal AD audits, red team operations, HTB/VulnLab labs, and repeatable attack-path validation.
+- **Evidence-first output:** keep domain-scoped workspaces and export TXT/JSON artifacts for reports, retesting, or client handoff.
+
+## ⚡ Common Active Directory Pentest Workflows
 
 Use ADscan when you need to move quickly through internal Active Directory assessments:
 
@@ -81,7 +90,7 @@ uv run python -m build
 
 ---
 
-## ✨ Features
+## ✨ Active Directory Attack Coverage
 
 <table>
 <tr>

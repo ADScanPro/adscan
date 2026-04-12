@@ -42,6 +42,7 @@ _KERBEROS_INVALID_CREDENTIAL_MARKERS = (
 )
 
 _NETEXEC_UNAUTH_USERNAMES = {"", "guest", "anonymous", "null"}
+_NETEXEC_KERBEROS_SUPPORTED_PROTOCOLS = {"smb", "ldap"}
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,14 @@ def resolve_netexec_auth_policy_decision(
             reason="unauth_probe",
         )
 
+    protocol_key = str(protocol or "").strip().lower()
+    if protocol_key not in _NETEXEC_KERBEROS_SUPPORTED_PROTOCOLS:
+        return AuthPolicyDecision(
+            prefer_kerberos=False,
+            ntlm_status="unknown",
+            reason="protocol_kerberos_unsupported",
+        )
+
     base_decision = resolve_auth_policy_decision(
         domains_data=domains_data,
         domain=domain,
@@ -207,7 +216,6 @@ def resolve_netexec_auth_policy_decision(
             reason="known_dc_target",
         )
 
-    protocol_key = str(protocol or "").strip().lower()
     if protocol_key == "ldap" and _looks_like_domain_hostname(target, domain):
         return AuthPolicyDecision(
             prefer_kerberos=True,
@@ -226,6 +234,9 @@ def netexec_can_use_kerberos(command: str) -> bool:
     try:
         argv = shlex.split(command)
     except ValueError:
+        return False
+    service = _extract_netexec_service_from_argv(argv)
+    if service not in _NETEXEC_KERBEROS_SUPPORTED_PROTOCOLS:
         return False
     if _is_netexec_unauth_probe(command):
         return False
@@ -432,11 +443,24 @@ def _extract_netexec_target(command: str) -> str | None:
         argv = shlex.split(command)
     except ValueError:
         return None
-    services = {"smb", "ldap", "mssql", "rdp", "winrm", "ssh", "vnc", "ftp", "http", "https"}
-    service_index = next((idx for idx, token in enumerate(argv) if token in services), None)
+    service_index = _find_netexec_service_index(argv)
     if service_index is None or service_index + 1 >= len(argv):
         return None
     return str(argv[service_index + 1]).strip() or None
+
+
+def _find_netexec_service_index(argv: list[str]) -> int | None:
+    """Return the index of the NetExec service token in one argv list."""
+    services = {"smb", "ldap", "mssql", "rdp", "winrm", "ssh", "vnc", "ftp", "http", "https"}
+    return next((idx for idx, token in enumerate(argv) if token in services), None)
+
+
+def _extract_netexec_service_from_argv(argv: list[str]) -> str | None:
+    """Extract the NetExec service token from one argv list."""
+    service_index = _find_netexec_service_index(argv)
+    if service_index is None:
+        return None
+    return str(argv[service_index]).strip().lower() or None
 
 
 def _is_ip_address(value: str) -> bool:

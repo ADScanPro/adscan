@@ -84,6 +84,7 @@ class AttackStepCatalogEntry:
         str, ...
     ] = ()  # Cypher relationship type(s) for BH CE queries
     is_acl_edge: bool = False  # True = ACL/ACE-derived object-control or extended-right edge
+    execution_relation_alias: str | None = None  # canonical execution-family relation
     requires_execution_context: bool = False
     counts_for_execution_readiness: bool = False
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none"
@@ -108,6 +109,7 @@ def _entry(
     bh_native: bool = False,
     bh_cypher_names: tuple[str, ...] = (),
     is_acl_edge: bool = False,
+    execution_relation_alias: str | None = None,
     requires_execution_context: bool = False,
     counts_for_execution_readiness: bool = False,
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none",
@@ -131,6 +133,9 @@ def _entry(
         bh_native=bh_native,
         bh_cypher_names=bh_cypher_names,
         is_acl_edge=is_acl_edge,
+        execution_relation_alias=(
+            str(execution_relation_alias or "").strip().lower() or None
+        ),
         requires_execution_context=requires_execution_context,
         counts_for_execution_readiness=counts_for_execution_readiness,
         execution_target_access_requirement=execution_target_access_requirement,
@@ -792,6 +797,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4886", "4887"),
         bh_native=False,
         bh_cypher_names=("ADCSESC8",),
+        execution_relation_alias="coerceandrelayntlmtoadcs",
     ),
     _entry(
         "adcsesc9",
@@ -966,6 +972,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "coerceandrelayntlmtoadcs",
         support_kind="unsupported",
         support_reason="Not implemented yet in ADscan",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
         category="adcs",
         description="Coerce NTLM authentication and relay it to ADCS endpoints",
         remediation_complexity="high",
@@ -1237,7 +1245,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "writeaccountrestrictions",
-        support_kind="unsupported",
+        support_kind="supported",
         support_reason="Not implemented yet in ADscan",
         compromise_semantics="direct_target_compromise",
         compromise_effort="low",
@@ -1811,6 +1819,14 @@ def get_attack_step_entry(relation: str) -> AttackStepCatalogEntry | None:
     return ATTACK_STEP_CATALOG.get(normalize_relation(relation))
 
 
+def normalize_execution_relation(relation: str) -> str:
+    """Return the canonical execution-family relation for one relation."""
+    entry = get_attack_step_entry(relation)
+    if entry and entry.execution_relation_alias:
+        return entry.execution_relation_alias
+    return normalize_relation(relation)
+
+
 def list_attack_step_entries() -> list[AttackStepCatalogEntry]:
     """Return all catalog entries sorted by relation."""
     return [ATTACK_STEP_CATALOG[key] for key in sorted(ATTACK_STEP_CATALOG.keys())]
@@ -1827,7 +1843,7 @@ def get_relation_notes_by_support_kind(support_kind: SupportKind) -> dict[str, s
 
 def relation_requires_execution_context(relation: str) -> bool:
     """Return whether a relation needs an execution credential context."""
-    entry = get_attack_step_entry(relation)
+    entry = get_attack_step_entry(normalize_execution_relation(relation))
     if entry is None:
         return False
     return bool(entry.requires_execution_context)
@@ -1835,7 +1851,7 @@ def relation_requires_execution_context(relation: str) -> bool:
 
 def relation_counts_for_execution_readiness(relation: str) -> bool:
     """Return whether a relation should gate attack-path readiness checks."""
-    entry = get_attack_step_entry(relation)
+    entry = get_attack_step_entry(normalize_execution_relation(relation))
     if entry is None:
         return False
     return bool(entry.counts_for_execution_readiness)
@@ -1843,7 +1859,7 @@ def relation_counts_for_execution_readiness(relation: str) -> bool:
 
 def relation_requires_reachable_computer_target(relation: str) -> bool:
     """Return whether a relation needs the target computer to be reachable now."""
-    entry = get_attack_step_entry(relation)
+    entry = get_attack_step_entry(normalize_execution_relation(relation))
     if entry is None:
         return False
     return entry.execution_target_access_requirement == "computer_reachable"

@@ -13,6 +13,9 @@ from rich.prompt import Confirm, Prompt
 
 from adscan_internal import print_error, print_info_debug, print_warning, telemetry
 from adscan_internal.cli.ldap import derive_base_dn
+from adscan_internal.cli.privileged_target_selection import (
+    resolve_privileged_target_user,
+)
 from adscan_internal.principal_utils import normalize_machine_account
 from adscan_internal.rich_output import (
     mark_sensitive,
@@ -1079,8 +1082,9 @@ def offer_rodc_escalation(
     domain: str,
     username: str,
     password: str,
+    rodc_machine: str | None = None,
 ) -> bool:
-    """Prepare password replication abuse on a compromised RODC machine account."""
+    """Prepare password replication abuse for one RODC using a host-access actor."""
     cleanup_required = False
     cleanup_completed = False
     cleanup_scope_id = begin_cleanup_scope(
@@ -1093,7 +1097,7 @@ def offer_rodc_escalation(
     service: ExploitationService | None = None
     pdc_host = ""
     bloody_path = ""
-    normalized_machine = normalize_machine_account(username)
+    normalized_machine = normalize_machine_account(rodc_machine or username)
     policy_username = username
     policy_password = password
     policy_actor_label = username
@@ -1237,11 +1241,21 @@ def offer_rodc_escalation(
                 print_info("Skipping RODC follow-up by user choice.")
                 return False
 
-        target_user = Prompt.ask(
-            "Privileged user to allow on the RODC",
-            default=default_target_user,
-        )
-        target_user = strip_sensitive_markers(target_user).strip() or default_target_user
+        if getattr(shell, "auto", False):
+            target_user = default_target_user
+        else:
+            selected_target_user = resolve_privileged_target_user(
+                shell,
+                domain=domain,
+                purpose="RODC credential caching",
+                require_domain_admin=True,
+                exclude_not_delegated=False,
+                exclude_protected_users=False,
+            )
+            if not selected_target_user:
+                print_info("Skipping RODC follow-up by user choice.")
+                return False
+            target_user = selected_target_user
         preferred_host = _first_hostname_candidate(
             assessment,
             fallback_host=normalized_machine.rstrip("$"),

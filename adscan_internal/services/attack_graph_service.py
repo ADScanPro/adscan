@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import re
 import time
@@ -33,6 +34,7 @@ from adscan_internal.services.privileged_group_classifier import (
     is_graph_extension_group,
     normalize_group_name,
     normalize_sid,
+    sid_rid,
     privileged_followup_order_for_group_name,
     resolve_privileged_followup_decision,
 )
@@ -48,10 +50,12 @@ from adscan_internal.services.attack_paths_materialized_cache import (
 )
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
+    RelationSupport,
     classify_relation_support,
 )
 from adscan_internal.services.attack_step_catalog import (
     get_exploitation_relation_vuln_keys,
+    normalize_execution_relation,
 )
 from adscan_internal.services.membership_snapshot import (
     load_membership_snapshot as _load_membership_snapshot_impl,
@@ -112,6 +116,10 @@ _CERTIPY_TEMPLATE_CACHE: dict[str, dict[str, Any]] = {}
 _CERTIHOUND_TEMPLATE_CACHE: dict[str, dict[str, Any]] = {}
 _REPORT_SYNC_FN: Callable[[object, str, dict[str, Any]], None] | None | bool = None
 _ATTACK_PATH_DEBUG_SUMMARY_TABLES_ENABLED = True
+_EVERYONE_SID = "S-1-1-0"
+_AUTHENTICATED_USERS_SID = "S-1-5-11"
+_BUILTIN_USERS_SID = "S-1-5-32-545"
+_DOMAIN_USERS_RID = 513
 
 
 @dataclass(frozen=True, slots=True)
@@ -2513,6 +2521,67 @@ def _apply_affected_user_metadata(
     if not records:
         return []
 
+    def _filter_low_priv_affected_users(
+        users: list[str],
+        *,
+        scope_name: str,
+        source_name: str,
+        affected_source: str,
+    ) -> list[str]:
+        """Return broad-group affected users with Tier-0 users removed."""
+        normalized_users = sorted(
+            {
+                normalize_samaccountname(str(user))
+                for user in users
+                if normalize_samaccountname(str(user))
+            },
+            key=str.lower,
+        )
+        if not normalized_users:
+            return []
+
+        risk_flags = classify_users_tier0_high_value(
+            shell,
+            domain=domain,
+            usernames=normalized_users,
+        )
+        low_priv_users = [
+            user
+            for user in normalized_users
+            if not bool(getattr(risk_flags.get(user), "is_tier0", False))
+        ]
+        excluded_tier0 = sorted(
+            [
+                user
+                for user in normalized_users
+                if bool(getattr(risk_flags.get(user), "is_tier0", False))
+            ],
+            key=str.lower,
+        )
+        print_info_debug(
+            "[attack_paths] broad-group low-priv filter: "
+            f"domain={mark_sensitive(domain, 'domain')} "
+            f"source={mark_sensitive(source_name or 'N/A', 'group')} "
+            f"scope={mark_sensitive(scope_name, 'group')} "
+            f"resolver={affected_source or 'N/A'} "
+            f"raw_count={len(normalized_users)} "
+            f"lowpriv_count={len(low_priv_users)} "
+            f"excluded_tier0={len(excluded_tier0)}"
+        )
+        if excluded_tier0:
+            preview = ", ".join(
+                mark_sensitive(user, "user") for user in excluded_tier0[:5]
+            )
+            if len(excluded_tier0) > 5:
+                preview += f", +{len(excluded_tier0) - 5} more"
+            print_info_debug(
+                "[attack_paths] broad-group Tier-0 principals excluded from affected scope: "
+                f"domain={mark_sensitive(domain, 'domain')} "
+                f"scope={mark_sensitive(scope_name, 'group')} "
+                f"users={preview}"
+            )
+        return low_priv_users
+
     snapshot = _load_membership_snapshot(shell, domain)
     base_graph = load_attack_graph(shell, domain)
     annotated = attack_paths_core.apply_affected_user_metadata(
@@ -2529,6 +2598,7 @@ def _apply_affected_user_metadata(
         base_graph.get("nodes") if isinstance(base_graph.get("nodes"), dict) else {}
     )
     label_kind_map: dict[str, str] = {}
+    label_sid_map: dict[str, str] = {}
     if isinstance(nodes_map, dict):
         for node in nodes_map.values():
             if not isinstance(node, dict):
@@ -2536,18 +2606,35 @@ def _apply_affected_user_metadata(
             canonical = _canonical_membership_label(domain, _canonical_node_label(node))
             if canonical:
                 label_kind_map[canonical] = _node_kind(node)
+                props = (
+                    node.get("properties")
+                    if isinstance(node.get("properties"), dict)
+                    else {}
+                )
+                object_id = str(
+                    node.get("objectId")
+                    or props.get("objectid")
+                    or props.get("objectId")
+                    or ""
+                ).strip()
+                sid = attack_paths_core._extract_sid(object_id)  # noqa: SLF001
+                if sid:
+                    label_sid_map[canonical] = sid
+    if isinstance(snapshot, dict):
+        snapshot_label_to_sid = snapshot.get("label_to_sid")
+        if isinstance(snapshot_label_to_sid, dict):
+            for label, sid in snapshot_label_to_sid.items():
+                canonical = _canonical_membership_label(domain, str(label or ""))
+                normalized_sid = normalize_sid(str(sid or ""))
+                if canonical and normalized_sid:
+                    label_sid_map.setdefault(canonical, normalized_sid)
 
     group_members, _computer_group_members, has_users = (
         attack_paths_core.build_group_member_index(
             snapshot, domain, exclude_tier0=True, include_computers=False
         )
     )
-    broad_group_names = {
-        "DOMAIN USERS",
-        "AUTHENTICATED USERS",
-        "EVERYONE",
-        "USERS",
-    }
+    broad_group_resolution_cache: dict[str, tuple[list[str], str]] = {}
 
     fallback_domain_users_source = ""
     enabled_users = get_enabled_users_for_domain(shell, domain)
@@ -2600,6 +2687,32 @@ def _apply_affected_user_metadata(
 
         scope_name = _membership_label_to_name(scope_label).upper()
         source_name = scope_name
+        kind = label_kind_map.get(scope_label, "")
+        broad_group_scope = _classify_broad_group_scope(
+            domain,
+            scope_label,
+            label_sid_map=label_sid_map,
+        )
+        is_broad_group_scope = kind == "Group" and broad_group_scope is not None
+        existing_users = [
+            str(user).strip()
+            for user in meta.get("affected_users", [])
+            if isinstance(user, str) and str(user).strip()
+        ]
+        existing_users_normalized = sorted(
+            {user.lower() for user in existing_users},
+            key=str.lower,
+        )
+        existing_user_count = (
+            int(meta.get("affected_user_count", 0))
+            if isinstance(meta.get("affected_user_count"), int)
+            else len(existing_users_normalized)
+        )
+        existing_computer_count = (
+            int(meta.get("affected_computer_count", 0))
+            if isinstance(meta.get("affected_computer_count"), int)
+            else 0
+        )
 
         should_override = (
             not isinstance(meta.get("affected_principal_count"), int)
@@ -2608,47 +2721,103 @@ def _apply_affected_user_metadata(
             not isinstance(meta.get("affected_user_count"), int)
             or int(meta.get("affected_user_count", 0)) <= 0
         )
-        if not should_override:
+        if not should_override and not is_broad_group_scope:
             enriched.append(current)
             continue
 
         affected_users: list[str] = []
         affected_count = 0
         affected_source = ""
-        kind = label_kind_map.get(scope_label, "")
         if kind == "Group":
-            resolved_members = resolve_group_user_members(
-                shell,
-                domain,
-                scope_label,
-                enabled_only=True,
-                max_results=100_000,
-            )
-            if resolved_members is not None:
-                affected_users = list(resolved_members)
+            if is_broad_group_scope and scope_label in broad_group_resolution_cache:
+                affected_users, affected_source = broad_group_resolution_cache[
+                    scope_label
+                ]
                 affected_count = len(affected_users)
-                affected_source = "group_resolver"
-            elif scope_name in broad_group_names and fallback_domain_users:
-                affected_users = list(fallback_domain_users)
-                affected_count = len(affected_users)
-                affected_source = fallback_domain_users_source
-            elif has_users:
-                affected_users = sorted(
-                    group_members.get(scope_label, set()), key=str.lower
+            else:
+                resolved_members = resolve_group_user_members(
+                    shell,
+                    domain,
+                    scope_label,
+                    enabled_only=True,
+                    max_results=100_000,
                 )
-                affected_count = len(affected_users)
-                if affected_count > 0:
-                    affected_source = "snapshot_group_members"
+                if resolved_members is not None:
+                    affected_users = list(resolved_members)
+                    affected_count = len(affected_users)
+                    affected_source = "group_resolver"
+                elif is_broad_group_scope and fallback_domain_users:
+                    affected_users = list(fallback_domain_users)
+                    affected_count = len(affected_users)
+                    affected_source = fallback_domain_users_source
+                elif has_users:
+                    affected_users = sorted(
+                        group_members.get(scope_label, set()), key=str.lower
+                    )
+                    affected_count = len(affected_users)
+                    if affected_count > 0:
+                        affected_source = "snapshot_group_members"
+                if is_broad_group_scope and affected_users:
+                    affected_users = _filter_low_priv_affected_users(
+                        affected_users,
+                        scope_name=scope_name,
+                        source_name=source_name,
+                        affected_source=affected_source,
+                    )
+                    affected_count = len(affected_users)
+                if is_broad_group_scope:
+                    broad_group_resolution_cache[scope_label] = (
+                        list(affected_users),
+                        affected_source,
+                    )
         elif scope_label:
             affected_users = [_membership_label_to_name(scope_label)]
             affected_count = 1
             affected_source = "principal"
 
-        if affected_count > 0:
+        should_apply_resolution = should_override
+        resolution_reason = "fill_missing_metadata"
+        if is_broad_group_scope and affected_count > 0:
+            resolved_users_normalized = sorted(
+                {user.lower() for user in affected_users},
+                key=str.lower,
+            )
+            should_apply_resolution = (
+                resolved_users_normalized != existing_users_normalized
+                or affected_count != existing_user_count
+            )
+            resolution_reason = "refresh_broad_group_metadata"
+            print_info_debug(
+                    "[attack_paths] broad-group affected user evaluation: "
+                    f"domain={mark_sensitive(domain, 'domain')} "
+                    f"source={mark_sensitive(source_name or 'N/A', 'group')} "
+                    f"scope={mark_sensitive(scope_name, 'group')} "
+                    f"classification={broad_group_scope or 'N/A'} "
+                    f"existing_count={existing_user_count} "
+                    f"resolved_count={affected_count} "
+                    f"existing_source={meta.get('affected_users_source') or 'N/A'} "
+                f"resolved_source={affected_source or 'N/A'} "
+                f"replace={should_apply_resolution}"
+            )
+
+        if affected_count > 0 and should_apply_resolution:
+            affected_principal_count = affected_count + max(0, existing_computer_count)
             meta["affected_user_count"] = affected_count
             meta["affected_users"] = affected_users
+            meta["affected_principal_count"] = affected_principal_count
             if affected_source:
                 meta["affected_users_source"] = affected_source
+            print_info_debug(
+                "[attack_paths] affected users metadata updated: "
+                f"domain={mark_sensitive(domain, 'domain')} "
+                f"source={mark_sensitive(source_name or 'N/A', 'group')} "
+                f"scope={mark_sensitive(scope_name, 'group')} "
+                f"classification={broad_group_scope or 'N/A'} "
+                f"reason={resolution_reason} "
+                f"count={affected_count} "
+                f"principal_count={affected_principal_count} "
+                f"resolver={affected_source or 'N/A'}"
+            )
             if affected_source == "group_resolver":
                 print_info_debug(
                     "[attack_paths] affected users resolved through centralized group membership resolver: "
@@ -2657,7 +2826,7 @@ def _apply_affected_user_metadata(
                     f"scope={scope_name} "
                     f"count={affected_count}"
                 )
-            elif scope_name in broad_group_names and fallback_domain_users_source:
+            elif is_broad_group_scope and fallback_domain_users_source:
                 print_info_debug(
                     "[attack_paths] affected users derived from broad group scope: "
                     f"domain={mark_sensitive(domain, 'domain')} "
@@ -2666,10 +2835,54 @@ def _apply_affected_user_metadata(
                     f"count={affected_count} "
                     f"fallback={fallback_domain_users_source}"
                 )
+        elif is_broad_group_scope:
+            print_info_debug(
+                "[attack_paths] broad-group affected users metadata preserved: "
+                f"domain={mark_sensitive(domain, 'domain')} "
+                f"source={mark_sensitive(source_name or 'N/A', 'group')} "
+                f"scope={mark_sensitive(scope_name, 'group')} "
+                f"classification={broad_group_scope or 'N/A'} "
+                f"existing_count={existing_user_count} "
+                f"resolver={affected_source or 'N/A'}"
+            )
 
         enriched.append(current)
 
     return enriched
+
+
+def _classify_broad_group_scope(
+    domain: str,
+    scope_label: str,
+    *,
+    label_sid_map: dict[str, str],
+) -> str | None:
+    """Return the canonical broad-group classification for a scope label."""
+    canonical_scope = _canonical_membership_label(domain, scope_label)
+    if not canonical_scope:
+        return None
+
+    sid = normalize_sid(label_sid_map.get(canonical_scope, ""))
+    rid = sid_rid(sid or "")
+    if sid == _EVERYONE_SID:
+        return "EVERYONE"
+    if sid == _AUTHENTICATED_USERS_SID:
+        return "AUTHENTICATED_USERS"
+    if sid == _BUILTIN_USERS_SID:
+        return "USERS"
+    if rid == _DOMAIN_USERS_RID and sid and sid.startswith("S-1-5-21-"):
+        return "DOMAIN_USERS"
+
+    scope_name = _membership_label_to_name(canonical_scope).upper()
+    if scope_name == "EVERYONE":
+        return "EVERYONE"
+    if scope_name == "AUTHENTICATED USERS":
+        return "AUTHENTICATED_USERS"
+    if scope_name == "USERS":
+        return "USERS"
+    if scope_name == "DOMAIN USERS":
+        return "DOMAIN_USERS"
+    return None
 
 
 def _derive_execution_scope_metadata(
@@ -2807,6 +3020,72 @@ def _extract_certipy_principals(entry: dict[str, Any]) -> list[str]:
             return [str(item) for item in value if str(item).strip()]
         if isinstance(value, dict):
             return [str(item) for item in value.keys() if str(item).strip()]
+    return []
+
+
+def _extract_certipy_ca_access_principals(entry: dict[str, Any]) -> list[str]:
+    """Extract CA access-right principals from a Certipy CA entry."""
+    permissions = entry.get("Permissions")
+    if not isinstance(permissions, dict):
+        return []
+    access_rights = permissions.get("Access Rights")
+    if not isinstance(access_rights, dict):
+        return []
+
+    preferred_values = access_rights.get("512")
+    if isinstance(preferred_values, list):
+        principals = [str(value or "").strip() for value in preferred_values]
+        return [principal for principal in principals if principal]
+
+    principals: list[str] = []
+    for values in access_rights.values():
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            candidate = str(value or "").strip()
+            if candidate:
+                principals.append(candidate)
+    return principals
+
+
+def _load_certipy_ca_access_principals(
+    shell: object,
+    *,
+    domain: str,
+    ca_name: str,
+) -> list[str]:
+    """Load low-priv CA access principals for one CA from the Certipy inventory."""
+    domain_key = str(domain or "").strip()
+    ca_name_clean = str(ca_name or "").strip().upper()
+    if not domain_key or not ca_name_clean:
+        return []
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    domain_dir = domain_data.get("dir") if isinstance(domain_data, dict) else None
+    if not isinstance(domain_dir, str) or not domain_dir:
+        return []
+
+    json_path = _load_latest_certipy_json(domain_dir)
+    if not json_path:
+        return []
+
+    try:
+        data = read_json_file(json_path)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return []
+
+    certificate_authorities = data.get("Certificate Authorities")
+    if not isinstance(certificate_authorities, dict):
+        return []
+
+    for entry in certificate_authorities.values():
+        if not isinstance(entry, dict):
+            continue
+        entry_ca_name = str(entry.get("CA Name") or entry.get("DNS Name") or "").strip().upper()
+        if entry_ca_name != ca_name_clean:
+            continue
+        return _extract_certipy_ca_access_principals(entry)
     return []
 
 
@@ -2965,10 +3244,21 @@ def _load_certihound_detection_report(domain_dir: str) -> dict[str, Any] | None:
         return None
     try:
         report = read_json_file(report_path)
-        return report if isinstance(report, dict) else None
+        if not isinstance(report, dict):
+            return None
+        return report if _is_compatible_certihound_detection_report(report) else None
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         return None
+
+
+def _is_compatible_certihound_detection_report(report: dict[str, Any]) -> bool:
+    """Return whether one cached CertiHound report is compatible with current runtime needs."""
+    schema_version = str(report.get("schema_version") or "").strip()
+    if schema_version != "certihound-detections-1.1":
+        return False
+    enrichment = report.get("enrichment")
+    return isinstance(enrichment, dict)
 
 
 def _persist_certihound_detection_report(domain_dir: str, report: dict[str, Any]) -> None:
@@ -3712,6 +4002,41 @@ def get_certihound_adcs_paths(
         if not relation or not start_object_id:
             continue
 
+        if (
+            not start_object_id.upper().startswith("S-1-")
+            and relation.upper() in {"ADCSESC8", "ADCSESC11"}
+        ):
+            principal_refs: list[str] = []
+            ca_principal_sids = details.get("ca_enrollment_principals")
+            if isinstance(ca_principal_sids, list):
+                principal_refs.extend(
+                    str(item).strip() for item in ca_principal_sids if str(item).strip()
+                )
+            if not principal_refs:
+                certipy_principals = _load_certipy_ca_access_principals(
+                    shell,
+                    domain=domain_key,
+                    ca_name=str(details.get("enterpriseca_name") or ""),
+                )
+                if certipy_principals:
+                    principal_refs.extend(certipy_principals)
+                    details = dict(details)
+                    details["ca_enrollment_principals"] = certipy_principals
+                    details["ca_enrollment_principals_source"] = "certipy_json"
+            if principal_refs:
+                expanded = _expand_certihound_ca_attack_step_paths(
+                    shell,
+                    domain=domain_key,
+                    relation=relation,
+                    principal_refs=principal_refs,
+                    details=details,
+                    domain_node=domain_node,
+                    graph=loaded_graph,
+                )
+                if expanded:
+                    edges.extend(expanded)
+                    continue
+
         start_node: dict[str, Any] | None = None
         if start_object_id.upper().startswith("S-1-"):
             principal_label = _resolve_group_label_for_sid(
@@ -3758,6 +4083,95 @@ def get_certihound_adcs_paths(
         f"[attack_graph] certihound-derived ADCS paths for {mark_sensitive(domain_key, 'domain')}: "
         f"count={len(edges)}"
     )
+    return edges
+
+
+def _expand_certihound_ca_attack_step_paths(
+    shell: object,
+    *,
+    domain: str,
+    relation: str,
+    principal_refs: list[str],
+    details: dict[str, Any],
+    domain_node: dict[str, Any],
+    graph: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Project CA-level CertiHound findings to exploitable low-priv principals."""
+    edges: list[dict[str, Any]] = []
+    seen_source_ids: set[str] = set()
+    for principal_ref in principal_refs:
+        ref_clean = str(principal_ref or "").strip()
+        if not ref_clean:
+            continue
+        sid_clean = normalize_sid(ref_clean)
+        principal_node: dict[str, Any] | None = None
+        if sid_clean:
+            if sid_clean in seen_source_ids:
+                continue
+            should_skip, _, principal_node = _evaluate_lowpriv_source_principal(
+                shell,
+                domain=domain,
+                object_id=sid_clean,
+                preferred_kind="group",
+                graph=graph,
+                skip_on_unresolved=False,
+            )
+        else:
+            principal_domain, principal_name = _normalize_certipy_principal(
+                domain=domain,
+                principal=ref_clean,
+            )
+            principal_label = _canonical_group_label(
+                domain=principal_domain,
+                group_name=principal_name,
+            )
+            should_skip, _, principal_node = _evaluate_lowpriv_source_principal(
+                shell,
+                domain=principal_domain,
+                label=principal_label,
+                principal_name=principal_name,
+                preferred_kind="group",
+                graph=graph,
+                skip_on_unresolved=False,
+            )
+            sid_clean = str(
+                (principal_node or {}).get("objectId")
+                or ((principal_node or {}).get("properties") or {}).get("objectid")
+                or principal_label
+            ).strip()
+        if should_skip:
+            continue
+        if not isinstance(principal_node, dict):
+            principal_label = (
+                _resolve_principal_label_from_sid(
+                    shell,
+                    domain=domain,
+                    sid=sid_clean,
+                    preferred_kind="group",
+                )
+                if normalize_sid(ref_clean)
+                else _canonical_group_label(
+                    domain=_normalize_certipy_principal(domain=domain, principal=ref_clean)[0],
+                    group_name=_normalize_certipy_principal(domain=domain, principal=ref_clean)[1],
+                )
+            )
+            principal_node = _build_synthetic_principal_node_from_sid(
+                domain=domain,
+                sid=sid_clean,
+                label=principal_label,
+            )
+        seen_source_ids.add(sid_clean)
+        notes = dict(details) if isinstance(details, dict) else {}
+        notes.setdefault("source", "certihound")
+        notes.setdefault("detector", "certihound")
+        notes["source_principal_sid"] = sid_clean
+        edges.append(
+            {
+                "nodes": [principal_node, domain_node],
+                "rels": [relation],
+                "notes_by_relation_index": {0: notes},
+            }
+        )
     return edges
 
 
@@ -4596,9 +5010,12 @@ def get_certipy_adcs_paths(
         return "User"
 
     edges: list[dict[str, Any]] = []
+    template_vuln_candidates: dict[tuple[str, str, str], set[str]] = {}
+    esc4_candidates: dict[tuple[str, str, str, str], set[str]] = {}
     for entry in templates.values():
         if not isinstance(entry, dict):
             continue
+        template_name = str(entry.get("Template Name") or "").strip()
         vulnerabilities = entry.get("[!] Vulnerabilities") or {}
         if isinstance(vulnerabilities, dict) and vulnerabilities:
             principals = _extract_certipy_principals(entry)
@@ -4633,22 +5050,16 @@ def get_certipy_adcs_paths(
                         )
                         if should_skip:
                             continue
-                        group_node = {
-                            "name": group_label,
-                            "kind": ["Group"],
-                            "properties": {
-                                "name": group_label,
-                                "domain": str(principal_domain or domain_key)
-                                .strip()
-                                .upper(),
-                            },
-                        }
-                        edges.append(
-                            {
-                                "nodes": [group_node, domain_node],
-                                "rels": [relation],
-                            }
+                        template_vuln_key = (
+                            group_label,
+                            str(principal_domain or domain_key).strip().upper(),
+                            relation,
                         )
+                        template_set = template_vuln_candidates.setdefault(
+                            template_vuln_key, set()
+                        )
+                        if template_name:
+                            template_set.add(template_name)
 
         # ESC4 (template object control) can apply to principals other than the
         # user that executed certipy. Infer it from template ACL lists.
@@ -4687,23 +5098,158 @@ def get_certipy_adcs_paths(
                 )
                 if should_skip:
                     continue
-                principal_node = {
-                    "name": principal_label,
-                    "kind": [kind],
-                    "properties": {
-                        "name": principal_label,
-                        "domain": str(principal_domain or domain_key).strip().upper(),
-                        "samaccountname": principal_name,
-                    },
-                }
-                edges.append(
-                    {
-                        "nodes": [principal_node, domain_node],
-                        "rels": ["ADCSESC4"],
-                    }
+                esc4_key = (
+                    principal_label,
+                    str(principal_domain or domain_key).strip().upper(),
+                    kind,
+                    principal_name,
                 )
+                template_set = esc4_candidates.setdefault(esc4_key, set())
+                if template_name:
+                    template_set.add(template_name)
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+
+    for (
+        principal_label,
+        principal_domain,
+        relation,
+    ), template_names in template_vuln_candidates.items():
+        group_node = _resolve_attack_step_group_node(
+            shell,
+            domain=principal_domain,
+            group_name=_membership_label_to_name(principal_label) or principal_label,
+            graph=loaded_graph,
+            source="certipy_template_vuln",
+        )
+        notes: dict[str, Any] = {
+            "source": "certipy_json",
+            "detector": "certipy",
+        }
+        if template_names:
+            sorted_templates = sorted(template_names, key=str.lower)
+            notes["templates"] = [{"name": template_name} for template_name in sorted_templates]
+            if len(sorted_templates) == 1:
+                notes["template"] = sorted_templates[0]
+        edges.append(
+            {
+                "nodes": [group_node, domain_node],
+                "rels": [relation],
+                "notes_by_relation_index": {0: notes},
+            }
+        )
+
+    for (
+        principal_label,
+        principal_domain,
+        kind,
+        principal_name,
+    ), template_names in esc4_candidates.items():
+        if kind == "Group":
+            principal_node = _resolve_attack_step_group_node(
+                shell,
+                domain=principal_domain,
+                group_name=principal_name,
+                graph=loaded_graph,
+                source="certipy_esc4",
+            )
+        else:
+            principal_node = {
+                "name": principal_label,
+                "kind": [kind],
+                "properties": {
+                    "name": principal_label,
+                    "domain": principal_domain,
+                    "samaccountname": principal_name,
+                },
+            }
+        notes: dict[str, Any] = {
+            "source": "certipy_json",
+            "detector": "certipy",
+        }
+        if template_names:
+            sorted_templates = sorted(template_names, key=str.lower)
+            notes["templates"] = [{"name": template_name} for template_name in sorted_templates]
+            if len(sorted_templates) == 1:
+                notes["template"] = sorted_templates[0]
+        edges.append(
+            {
+                "nodes": [principal_node, domain_node],
+                "rels": ["ADCSESC4"],
+                "notes_by_relation_index": {0: notes},
+            }
+        )
+
+    certificate_authorities = data.get("Certificate Authorities")
+    if isinstance(certificate_authorities, dict):
+        for entry in certificate_authorities.values():
+            if not isinstance(entry, dict):
+                continue
+            vulnerabilities = entry.get("[!] Vulnerabilities") or {}
+            if not isinstance(vulnerabilities, dict) or not vulnerabilities:
+                continue
+            principals = _extract_certipy_ca_access_principals(entry)
+            if not principals:
+                continue
+
+            ca_name = str(entry.get("CA Name") or entry.get("DNS Name") or "").strip()
+            ca_dns_name = str(entry.get("DNS Name") or "").strip()
+            ca_subject = str(entry.get("Certificate Subject") or "").strip()
+
+            for vuln in vulnerabilities.keys():
+                from adscan_internal.services.attack_step_catalog import (
+                    get_bh_canonical_cypher_name,
+                )
+
+                relation = get_bh_canonical_cypher_name(
+                    f"ADCS{str(vuln).strip().upper()}"
+                )
+                for principal in principals:
+                    principal_domain, principal_name = _normalize_certipy_principal(
+                        domain=domain_key, principal=principal
+                    )
+                    if not principal_name:
+                        continue
+                    principal_label = _canonical_group_label(
+                        domain=principal_domain, group_name=principal_name
+                    )
+                    if not principal_label:
+                        continue
+                    should_skip, _, _ = _evaluate_lowpriv_source_principal(
+                        shell,
+                        domain=principal_domain,
+                        label=principal_label,
+                        principal_name=principal_name,
+                        preferred_kind="group",
+                        graph=loaded_graph,
+                        skip_on_unresolved=False,
+                    )
+                    if should_skip:
+                        continue
+                    start_node = _resolve_attack_step_group_node(
+                        shell,
+                        domain=principal_domain,
+                        group_name=principal_name,
+                        graph=loaded_graph,
+                        source="certipy_ca_vuln",
+                    )
+                    notes = {
+                        "source": "certipy_json",
+                        "detector": "certipy",
+                    }
+                    if ca_name:
+                        notes["enterpriseca_name"] = ca_name
+                    if ca_dns_name:
+                        notes["enterpriseca_dns"] = ca_dns_name
+                    if ca_subject:
+                        notes["enterpriseca"] = ca_subject
+                    edges.append(
+                        {
+                            "nodes": [start_node, domain_node],
+                            "rels": [relation],
+                            "notes_by_relation_index": {0: notes},
+                        }
+                    )
     print_info_debug(
         f"[attack_graph] certipy-derived ADCS paths for {mark_sensitive(domain_key, 'domain')}: "
         f"count={len(edges)}"
@@ -5374,6 +5920,190 @@ def _canonical_group_label(*, domain: str, group_name: str) -> str:
         if left and right:
             return f"{left.strip().upper()}@{right.strip().upper()}"
     return f"{group_clean.strip().upper()}@{domain_clean.strip().upper()}"
+
+
+def _resolve_attack_step_group_node(
+    shell: object,
+    *,
+    domain: str,
+    group_name: str,
+    graph: dict[str, Any] | None = None,
+    source: str,
+) -> dict[str, Any]:
+    """Resolve one group principal for attack-step creation into a canonical node.
+
+    Prefer stable identifiers (well-known SID/RID or BloodHound-backed objectId)
+    over plain labels so attack steps do not fork the same group into multiple
+    node IDs.
+    """
+    domain_clean = str(domain or "").strip()
+    domain_lookup = domain_clean.lower()
+    group_clean = str(group_name or "").strip()
+    canonical_label = _canonical_group_label(domain=domain_clean, group_name=group_clean)
+    if not domain_lookup or not group_clean or not canonical_label:
+        node_record = {
+            "name": canonical_label or group_clean or "UNKNOWN",
+            "kind": ["Group"],
+            "properties": {
+                "name": canonical_label or group_clean or "UNKNOWN",
+                "domain": domain_clean.upper(),
+            },
+        }
+        _mark_synthetic_node_record(
+            node_record,
+            domain=domain_clean,
+            source=f"{source}_invalid_group_fallback",
+        )
+        return node_record
+
+    marked_domain = mark_sensitive(domain_clean, "domain")
+    marked_group = mark_sensitive(group_clean, "group")
+    lowered = group_clean.casefold()
+    well_known_sid = {
+        "authenticated users": "S-1-5-11",
+        "everyone": "S-1-1-0",
+        "anonymous logon": "S-1-5-7",
+        "guests": "S-1-5-32-546",
+    }.get(lowered)
+    domain_rid = {
+        "domain admins": 512,
+        "domain users": 513,
+        "cert publishers": 517,
+        "schema admins": 518,
+        "enterprise admins": 519,
+        "domain computers": 515,
+    }.get(lowered)
+
+    def _log_resolved(path: str, node: dict[str, Any]) -> None:
+        object_id = _extract_node_object_id(node) or ""
+        name = str(node.get("name") or canonical_label or group_clean).strip()
+        print_info_debug(
+            f"[attack_graph] {source} group resolved for {marked_domain}: "
+            f"group={marked_group} path={path} "
+            f"name={mark_sensitive(name, 'group')} "
+            f"objectid={mark_sensitive(object_id, 'user')}"
+        )
+
+    def _finalize(node: dict[str, Any]) -> dict[str, Any]:
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        canonical_name = str(
+            node.get("name")
+            or props.get("name")
+            or node.get("label")
+            or canonical_label
+        ).strip() or canonical_label
+        object_id = (
+            node.get("objectId")
+            or node.get("objectid")
+            or props.get("objectId")
+            or props.get("objectid")
+        )
+        finalized = dict(node)
+        finalized["name"] = canonical_name
+        finalized["kind"] = ["Group"]
+        if object_id:
+            finalized["objectId"] = object_id
+        finalized["properties"] = props or {
+            "name": canonical_name,
+            "domain": domain_clean.upper(),
+        }
+        return finalized
+
+    if well_known_sid:
+        node = _resolve_principal_node_from_sid(
+            shell,
+            domain=domain_lookup,
+            sid=well_known_sid,
+            preferred_kind="group",
+        )
+        if isinstance(node, dict):
+            node = _finalize(node)
+            _log_resolved("well_known_sid", node)
+            return node
+        label_from_sid = _resolve_principal_label_from_sid(
+            shell,
+            domain=domain_lookup,
+            sid=well_known_sid,
+            preferred_kind="group",
+        )
+        node = _build_synthetic_principal_node_from_sid(
+            domain=domain_clean,
+            sid=well_known_sid,
+            label=label_from_sid or canonical_label,
+        )
+        _mark_synthetic_node_record(
+            node, domain=domain_clean, source=f"{source}_well_known_sid_fallback"
+        )
+        node = _finalize(node)
+        _log_resolved("well_known_sid_fallback", node)
+        return node
+
+    if domain_rid is not None:
+        snapshot = _load_membership_snapshot(shell, domain_lookup)
+        domain_sid = _load_domain_sid_from_domains_data(shell, domain_lookup)
+        if not domain_sid and isinstance(snapshot, dict):
+            domain_sid = _resolve_domain_sid(shell, domain_lookup, snapshot)
+        if domain_sid:
+            target_sid = f"{domain_sid.upper()}-{domain_rid}"
+            node = _resolve_principal_node_from_sid(
+                shell,
+                domain=domain_lookup,
+                sid=target_sid,
+                preferred_kind="group",
+            )
+            if isinstance(node, dict):
+                node = _finalize(node)
+                _log_resolved(f"domain_rid:{domain_rid}", node)
+                return node
+            label_from_sid = _resolve_principal_label_from_sid(
+                shell,
+                domain=domain_lookup,
+                sid=target_sid,
+                preferred_kind="group",
+            )
+            node = _build_synthetic_principal_node_from_sid(
+                domain=domain_clean,
+                sid=target_sid,
+                label=label_from_sid or canonical_label,
+            )
+            _mark_synthetic_node_record(
+                node, domain=domain_clean, source=f"{source}_domain_rid_fallback"
+            )
+            node = _finalize(node)
+            _log_resolved(f"domain_rid_fallback:{domain_rid}", node)
+            return node
+        print_info_debug(
+            f"[attack_graph] {source} group RID unresolved for {marked_domain}: "
+            f"group={marked_group} rid={domain_rid}"
+        )
+
+    node = _resolve_bloodhound_principal_node(
+        shell,
+        domain_lookup,
+        canonical_label,
+        entry_kind="group",
+        graph=graph,
+        lookup_name=group_clean,
+    )
+    if isinstance(node, dict):
+        node = _finalize(node)
+        _log_resolved("bloodhound_lookup", node)
+        return node
+
+    node = {
+        "name": canonical_label,
+        "kind": ["Group"],
+        "properties": {
+            "name": canonical_label,
+            "domain": domain_clean.upper(),
+        },
+    }
+    _mark_synthetic_node_record(
+        node, domain=domain_clean, source=f"{source}_synthetic_group_fallback"
+    )
+    node = _finalize(node)
+    _log_resolved("synthetic_fallback", node)
+    return node
 
 
 def _ensure_group_node_for_domain(
@@ -6071,6 +6801,80 @@ def _compact_local_reuse_edge_notes(graph: dict[str, Any]) -> int:
     return changed
 
 
+def _is_tierzero_machine_forcechangepassword_target(
+    graph: dict[str, Any],
+    *,
+    relation: str,
+    to_id: str,
+) -> bool:
+    """Return True when ForceChangePassword targets a Tier Zero computer object.
+
+    Resetting machine-account passwords for Tier Zero assets such as DCs or
+    RODCs is intentionally blocked by policy because it is operationally
+    disruptive and can break domain services.
+    """
+    if normalize_execution_relation(relation) != "forcechangepassword":
+        return False
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, dict):
+        return False
+    target_node = nodes.get(str(to_id or "").strip())
+    if not isinstance(target_node, dict):
+        return False
+    target_kind = str(target_node.get("kind") or "").strip().lower()
+    if target_kind != "computer":
+        return False
+    return attack_graph_core._node_target_priority_class(target_node) == "tierzero"  # noqa: SLF001
+
+
+def _classify_edge_execution_support(
+    graph: dict[str, Any],
+    *,
+    relation: str,
+    to_id: str,
+) -> RelationSupport:
+    """Return support classification for one persisted graph edge.
+
+    Most relations are classified purely by relation name. Some disruptive ACL
+    actions need graph-aware target policy checks so that dangerous paths are
+    blocked before execution.
+    """
+    base_support = classify_relation_support(relation)
+    nodes = graph.get("nodes")
+    target_node = nodes.get(str(to_id or "").strip()) if isinstance(nodes, dict) else None
+    target_kind = (
+        str(target_node.get("kind") or "").strip().lower()
+        if isinstance(target_node, dict)
+        else ""
+    )
+    if (
+        normalize_execution_relation(relation) == "writeaccountrestrictions"
+        and target_kind == "computer"
+    ):
+        return RelationSupport(
+            kind="supported",
+            reason="ACL/ACE abuse (WriteAccountRestrictions -> RBCD on computer)",
+            compromise_semantics=base_support.compromise_semantics,
+            compromise_effort=base_support.compromise_effort,
+        )
+    if _is_tierzero_machine_forcechangepassword_target(
+        graph,
+        relation=relation,
+        to_id=to_id,
+    ):
+        return RelationSupport(
+            kind="policy_blocked",
+            reason=(
+                "ForceChangePassword against Tier Zero machine accounts is "
+                "blocked by policy because changing DC/RODC passwords is "
+                "disruptive and can break domain services"
+            ),
+            compromise_semantics=base_support.compromise_semantics,
+            compromise_effort=base_support.compromise_effort,
+        )
+    return base_support
+
+
 def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None:
     """Persist the attack graph to disk with stable formatting."""
     graph["schema_version"] = ATTACK_GRAPH_SCHEMA_VERSION
@@ -6183,7 +6987,11 @@ def refresh_attack_graph_execution_support(
         if current_status in {"success", "attempted", "failed", "error", "unavailable"}:
             continue
 
-        support = classify_relation_support(relation)
+        support = _classify_edge_execution_support(
+            graph,
+            relation=relation,
+            to_id=str(edge.get("to") or ""),
+        )
         desired_status = "discovered"
         desired_notes: dict[str, Any] = {
             "exec_support": support.kind,
@@ -6279,7 +7087,11 @@ def reset_attack_graph_execution_statuses(
             changed += 1
             metadata_updated += 1
 
-        support = classify_relation_support(relation)
+        support = _classify_edge_execution_support(
+            graph,
+            relation=relation,
+            to_id=str(edge.get("to") or ""),
+        )
         desired_status = "discovered"
         desired_notes: dict[str, Any] = {
             "exec_support": support.kind,
@@ -6359,6 +7171,19 @@ def upsert_nodes(
         kind = _node_kind(node)
         nid = _node_id(node)
         computed[_node_display_name(node)] = nid
+        existing_best_id = _find_node_id_by_label(graph, _node_display_name(node))
+        if existing_best_id and existing_best_id != nid:
+            existing_best = node_map.get(existing_best_id)
+            existing_object_id = _extract_node_object_id(existing_best) or ""
+            new_object_id = _extract_node_object_id(node) or ""
+            print_info_debug(
+                "[attack_graph] duplicate-label node upsert detected: "
+                f"label={mark_sensitive(_node_display_name(node), 'user')} "
+                f"existing_id={mark_sensitive(existing_best_id, 'user')} "
+                f"new_id={mark_sensitive(nid, 'user')} "
+                f"existing_objectid={mark_sensitive(existing_object_id, 'user')} "
+                f"new_objectid={mark_sensitive(new_object_id, 'user')}"
+            )
         existing = node_map.get(nid)
         merged = existing if isinstance(existing, dict) else {}
         node_properties = (
@@ -6436,7 +7261,11 @@ def upsert_edge(
 
     # Classify execution support for this relation (version-sensitive).
     edge_category, edge_vuln_key = _classify_edge_relation(relation_norm)
-    support = classify_relation_support(relation_norm)
+    support = _classify_edge_execution_support(
+        graph,
+        relation=relation_norm,
+        to_id=to_id,
+    )
     desired_status = (status or "discovered").strip().lower()
     desired_notes: dict[str, Any] = {}
     # Avoid filesystem I/O during graph creation/migration: telemetry.VERSION is in-memory.
@@ -6487,19 +7316,17 @@ def upsert_edge(
             if status_changed:
                 edge["status"] = desired_status
             edge.setdefault("edge_type", edge_type)
-            merged_notes: dict[str, Any] = {}
-            if notes:
-                existing_notes = edge.get("notes")
-                if not isinstance(existing_notes, dict):
-                    existing_notes = {}
-                merged_notes.update(existing_notes)
-                merged_notes.update(notes)
-            if desired_notes:
-                existing_notes = edge.get("notes")
-                if not isinstance(existing_notes, dict):
-                    existing_notes = {}
-                merged_notes.update(existing_notes)
-                merged_notes.update(desired_notes)
+            existing_notes = edge.get("notes")
+            if not isinstance(existing_notes, dict):
+                existing_notes = {}
+            merged_notes = _merge_attack_step_notes(
+                existing=existing_notes,
+                incoming=notes or {},
+            )
+            merged_notes = _merge_attack_step_notes(
+                existing=merged_notes,
+                incoming=desired_notes,
+            )
             if merged_notes:
                 edge["notes"] = merged_notes
             # Sync to BH CE when force_opengraph is set (always re-upload) or when
@@ -6588,6 +7415,118 @@ def upsert_edge(
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
     return entry
+
+
+def _merge_attack_step_notes(
+    *,
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge attack-step notes while preserving detector/source provenance."""
+    merged: dict[str, Any] = dict(existing or {})
+    if not incoming:
+        return merged
+
+    merged.update(incoming)
+
+    for key in (
+        "templates",
+        "template_dns",
+        "agent_templates",
+        "target_templates",
+        "reasons",
+        "enterprisecas",
+        "enterpriseca_dns",
+    ):
+        merged_values = _merge_note_list_values(existing.get(key), incoming.get(key))
+        if merged_values:
+            merged[key] = merged_values
+
+    if "template" not in merged:
+        template_values = merged.get("templates")
+        if isinstance(template_values, list) and len(template_values) == 1:
+            single_template = template_values[0]
+            if isinstance(single_template, dict):
+                template_name = str(single_template.get("name") or "").strip()
+                if template_name:
+                    merged["template"] = template_name
+            elif str(single_template).strip():
+                merged["template"] = str(single_template).strip()
+
+    source_values = _merge_note_scalar_provenance(
+        existing=existing,
+        incoming=incoming,
+        field="source",
+        list_field="sources",
+    )
+    detector_values = _merge_note_scalar_provenance(
+        existing=existing,
+        incoming=incoming,
+        field="detector",
+        list_field="detectors",
+    )
+    if source_values:
+        merged["sources"] = source_values
+        merged["source"] = source_values[0]
+    if detector_values:
+        merged["detectors"] = detector_values
+        merged["detector"] = detector_values[0]
+
+    return merged
+
+
+def _merge_note_scalar_provenance(
+    *,
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+    field: str,
+    list_field: str,
+) -> list[str]:
+    """Merge one provenance scalar plus its plural list form into one unique list."""
+    values: list[str] = []
+    for candidate in (
+        existing.get(field),
+        incoming.get(field),
+    ):
+        value = str(candidate or "").strip()
+        if value and value not in values:
+            values.append(value)
+    for collection in (existing.get(list_field), incoming.get(list_field)):
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            value = str(item or "").strip()
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def _merge_note_list_values(
+    existing: Any,
+    incoming: Any,
+) -> list[Any]:
+    """Merge two note list values while preserving order and complex items."""
+    merged: list[Any] = []
+    seen_keys: set[str] = set()
+    for collection in (existing, incoming):
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            item_key = _note_list_item_key(item)
+            if item_key in seen_keys:
+                continue
+            seen_keys.add(item_key)
+            merged.append(item)
+    return merged
+
+
+def _note_list_item_key(value: Any) -> str:
+    """Return a stable deduplication key for one note list item."""
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, default=str)
+    if isinstance(value, list):
+        return json.dumps(value, default=str)
+    return str(value)
 
 
 def _build_opengraph_ref(

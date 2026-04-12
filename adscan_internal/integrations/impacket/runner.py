@@ -45,6 +45,9 @@ from adscan_internal.integrations.auth_policy import (
     output_indicates_ntlm_disabled,
     resolve_auth_policy_decision,
 )
+from adscan_internal.integrations.impacket.helpers import (
+    resolve_impacket_ldaps_fallback_command,
+)
 from adscan_internal.rich_output import mark_sensitive, strip_sensitive_markers
 from adscan_internal.reporting_compat import load_optional_report_service_attr
 from adscan_internal.services.auth_posture_service import (
@@ -177,6 +180,30 @@ class ImpacketRunner:
         """
         self._command_runner = command_runner
 
+    @staticmethod
+    def _log_result(script_name: str, result: ExecutionResult | None) -> None:
+        """Emit a concise summary and output preview for one Impacket result."""
+        if not isinstance(result, subprocess.CompletedProcess):
+            return
+        exit_code, stdout_count, stderr_count, duration_text = (
+            summarize_execution_result(result)
+        )
+
+        print_info_debug(
+            f"[impacket] Result for {script_name}: "
+            f"exit_code={exit_code}, "
+            f"stdout_lines={stdout_count}, "
+            f"stderr_lines={stderr_count}, "
+            f"duration={duration_text}"
+        )
+
+        preview_text = build_execution_output_preview(result)
+        if preview_text:
+            print_info_debug(
+                f"[impacket] Output preview for {script_name}:\n{preview_text}",
+                panel=True,
+            )
+
     def run(
         self,
         script_name: str,
@@ -225,26 +252,7 @@ class ImpacketRunner:
             **kwargs,
         )
 
-        # Always log a concise summary of the result for debugging.
-        if isinstance(result, subprocess.CompletedProcess):
-            exit_code, stdout_count, stderr_count, duration_text = (
-                summarize_execution_result(result)
-            )
-
-            print_info_debug(
-                f"[impacket] Result for {script_name}: "
-                f"exit_code={exit_code}, "
-                f"stdout_lines={stdout_count}, "
-                f"stderr_lines={stderr_count}, "
-                f"duration={duration_text}"
-            )
-
-            preview_text = build_execution_output_preview(result)
-            if preview_text:
-                print_info_debug(
-                    f"[impacket] Output preview for {script_name}:\n{preview_text}",
-                    panel=True,
-                )
+        self._log_result(script_name, result)
 
         return result
 
@@ -281,7 +289,9 @@ class ImpacketRunner:
         """
         pdc = ctx.get_domain_pdc(domain)
         if not pdc:
-            print_error(f"Cannot determine PDC for domain {mark_sensitive(domain, 'domain')}")
+            print_error(
+                f"Cannot determine PDC for domain {mark_sensitive(domain, 'domain')}"
+            )
             return None
 
         args = []
@@ -397,7 +407,9 @@ class ImpacketRunner:
         if not dc_ip:
             dc_ip = ctx.get_domain_pdc(domain)
             if not dc_ip:
-                print_error(f"Cannot determine PDC for domain {mark_sensitive(domain, 'domain')}")
+                print_error(
+                    f"Cannot determine PDC for domain {mark_sensitive(domain, 'domain')}"
+                )
                 return None
 
         args = []
@@ -613,6 +625,20 @@ class ImpacketRunner:
                 if result.stderr:
                     result.stderr = normalize_cli_output(result.stderr)
 
+                fallback_command = resolve_impacket_ldaps_fallback_command(
+                    command,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
+                if fallback_command is not None:
+                    print_warning("LDAPS connection failed. Retrying with LDAP...")
+                    return self._execute_command(
+                        fallback_command,
+                        timeout=timeout,
+                        capture_output=capture_output,
+                        **kwargs,
+                    )
+
             return result
 
         except subprocess.TimeoutExpired as exc:
@@ -621,7 +647,9 @@ class ImpacketRunner:
                 f"Impacket command timed out after {timeout if timeout is not None else 'unknown'}s: "
                 f"{command}"
             )
-            print_instruction("Verify VPN/network connectivity to the target and retry.")
+            print_instruction(
+                "Verify VPN/network connectivity to the target and retry."
+            )
             return build_timeout_completed_process(command, tool_name="impacket")
 
         except Exception as exc:
@@ -667,7 +695,9 @@ class ImpacketRunner:
             if kerberos_retry_context is not None
             else None
         )
-        auth_posture_status = decision.ntlm_status if decision is not None else "unknown"
+        auth_posture_status = (
+            decision.ntlm_status if decision is not None else "unknown"
+        )
         kerberos_first_selected = (
             kerberos_retry_context is not None
             and supports_kerberos_first
@@ -683,7 +713,9 @@ class ImpacketRunner:
         elif command_already_uses_kerberos:
             auth_policy_reason = "command_already_uses_kerberos"
         else:
-            auth_policy_reason = decision.reason if decision is not None else "policy_declined"
+            auth_policy_reason = (
+                decision.reason if decision is not None else "policy_declined"
+            )
 
         print_info_debug(
             "[impacket] Auth policy: "
@@ -704,7 +736,10 @@ class ImpacketRunner:
                 kerberos_first_attempted = True
                 current_command = kerberos_first_command
 
-        if self._command_uses_kerberos(current_command) and kerberos_retry_context is not None:
+        if (
+            self._command_uses_kerberos(current_command)
+            and kerberos_retry_context is not None
+        ):
             self._prepare_kerberos_execution(
                 ctx=ctx,
                 retry_context=kerberos_retry_context,
@@ -725,7 +760,9 @@ class ImpacketRunner:
             and not self._command_uses_kerberos(current_command)
         ):
             combined_output = normalize_cli_output(
-                "\n".join(part for part in (result.stdout or "", result.stderr or "") if part)
+                "\n".join(
+                    part for part in (result.stdout or "", result.stderr or "") if part
+                )
             )
             if output_indicates_ntlm_disabled(combined_output):
                 posture_update = record_ntlm_disabled_signal(
@@ -790,35 +827,48 @@ class ImpacketRunner:
             and result is not None
             and not output_indicates_kerberos_invalid_credentials(
                 normalize_cli_output(
-                    "\n".join(part for part in (result.stdout or "", result.stderr or "") if part)
+                    "\n".join(
+                        part
+                        for part in (result.stdout or "", result.stderr or "")
+                        if part
+                    )
                 )
             )
             and output_indicates_kerberos_auth_failure(
                 normalize_cli_output(
-                    "\n".join(part for part in (result.stdout or "", result.stderr or "") if part)
+                    "\n".join(
+                        part
+                        for part in (result.stdout or "", result.stderr or "")
+                        if part
+                    )
                 )
             )
         ):
             ntlm_command = build_impacket_ntlm_command(current_command)
             if ntlm_command is not None:
+                self._log_result(script_name, result)
                 print_warning(
                     "Impacket Kerberos authentication failed. Retrying with NTLM."
                 )
                 print_info_debug(
                     f"[impacket] Kerberos-first NTLM fallback command for {script_name}: {ntlm_command}"
                 )
-                return self._execute_command(
+                retry_result = self._execute_command(
                     ntlm_command,
                     timeout=timeout,
                     capture_output=capture_output,
                     **kwargs,
                 )
+                self._log_result(script_name, retry_result)
+                return retry_result
 
         if not self._should_retry_with_kerberos(script_name, current_command, result):
+            self._log_result(script_name, result)
             return result
 
         retry_command = build_impacket_kerberos_command(script_name, current_command)
         if retry_command is None:
+            self._log_result(script_name, result)
             return result
 
         if kerberos_retry_context is not None:
@@ -834,12 +884,15 @@ class ImpacketRunner:
         print_info_debug(
             f"[impacket] NTLM-disabled Kerberos retry command for {script_name}: {retry_command}"
         )
-        return self._execute_command(
+        self._log_result(script_name, result)
+        retry_result = self._execute_command(
             retry_command,
             timeout=timeout,
             capture_output=capture_output,
             **kwargs,
         )
+        self._log_result(script_name, retry_result)
+        return retry_result
 
     def _should_retry_with_kerberos(
         self,
@@ -852,7 +905,9 @@ class ImpacketRunner:
             return False
         if not output_indicates_ntlm_disabled(
             normalize_cli_output(
-                "\n".join(part for part in (result.stdout or "", result.stderr or "") if part)
+                "\n".join(
+                    part for part in (result.stdout or "", result.stderr or "") if part
+                )
             )
         ):
             return False
@@ -902,7 +957,9 @@ class ImpacketRunner:
         purpose: str,
     ) -> str | None:
         """Refresh the intended Kerberos ticket and bind the process env to it."""
-        from adscan_internal.services.kerberos_ticket_service import KerberosTicketService
+        from adscan_internal.services.kerberos_ticket_service import (
+            KerberosTicketService,
+        )
 
         workspace_dir = str(ctx.workspace_dir or "").strip()
         if not workspace_dir:
@@ -930,12 +987,14 @@ class ImpacketRunner:
                 f"error={result.error_message!r}"
             )
 
-        _conf_set, _ticket_set, krb5_config_path, ticket_path = service.setup_environment_for_domain(
-            workspace_dir=workspace_dir,
-            domain=retry_context.domain,
-            user_domain=retry_context.domain,
-            username=retry_context.username,
-            domains_data=ctx.domains_data,
+        _conf_set, _ticket_set, krb5_config_path, ticket_path = (
+            service.setup_environment_for_domain(
+                workspace_dir=workspace_dir,
+                domain=retry_context.domain,
+                user_domain=retry_context.domain,
+                username=retry_context.username,
+                domains_data=ctx.domains_data,
+            )
         )
         print_info_debug(
             "[impacket] Prepared Kerberos environment: "

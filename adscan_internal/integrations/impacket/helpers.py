@@ -215,3 +215,31 @@ def build_auth_impacket_no_host(
     if kerberos:
         auth += " -k"
     return auth
+
+
+def resolve_impacket_ldaps_fallback_command(
+    command: str,
+    *,
+    stdout: str | None,
+    stderr: str | None,
+) -> str | None:
+    """Return the command line without ``-use-ldaps`` when LDAPS should be retried as LDAP.
+
+    Impacket tools sometimes report ``Connection reset by peer`` during SSL
+    wrapping while plain LDAP to the same DC still works.
+
+    Args:
+        command: Effective command line passed to the shell (masked as needed).
+        stdout: Process stdout.
+        stderr: Process stderr.
+
+    Returns:
+        Command without ``-use-ldaps`` when that flag was present and combined
+        output contains ``Connection reset by peer``; otherwise ``None``.
+    """
+    if "-use-ldaps" not in command:
+        return None
+    combined = f"{stdout or ''}\n{stderr or ''}"
+    if "Connection reset by peer" not in combined:
+        return None
+    return command.replace("-use-ldaps", "").strip()

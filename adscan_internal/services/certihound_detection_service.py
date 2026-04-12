@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import datetime, timezone
+import os
 from typing import Any
 
 from adscan_internal import telemetry
@@ -21,6 +22,10 @@ from adscan_internal.services.altsecurityidentities_service import (
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.certificate_mapping_service import CertificateMappingService
 from adscan_internal.services.ldap_transport_service import execute_with_ldap_fallback
+from adscan_internal.workspaces import read_json_file
+
+
+CERTIHOUND_DETECTION_SCHEMA_VERSION = "certihound-detections-1.1"
 
 
 class CertiHoundDetectionService(BaseService):
@@ -113,6 +118,15 @@ class CertiHoundDetectionService(BaseService):
                     enterprise_cas=data.enterprise_cas,
                     security_descriptor_parser_cls=modules["SecurityDescriptorParser"],
                 )
+                enrichment_debug = self._enrich_enterprise_cas_for_detection(
+                    data=data,
+                    shell=shell,
+                    target_domain=target_domain,
+                    username=registry_username,
+                    credential=registry_credential,
+                    use_kerberos=use_kerberos,
+                    kdc_host=kerberos_target_hostname or dc_address,
+                )
                 report = self._run_all_detections(
                     data=data,
                     connection=connection,
@@ -127,7 +141,8 @@ class CertiHoundDetectionService(BaseService):
                 report["domain"] = data.domain
                 report["domain_sid"] = data.domain_sid
                 report["generated_at"] = datetime.now(timezone.utc).isoformat()
-                report["schema_version"] = "certihound-detections-1.0"
+                report["schema_version"] = CERTIHOUND_DETECTION_SCHEMA_VERSION
+                report["enrichment"] = enrichment_debug
                 return report
 
             report, _used_ldaps = execute_with_ldap_fallback(
@@ -153,6 +168,35 @@ class CertiHoundDetectionService(BaseService):
                 f"CertiHound detection report generation failed: {type(exc).__name__}: {exc}"
             )
             return None
+
+    def _enrich_enterprise_cas_for_detection(
+        self,
+        *,
+        data: Any,
+        shell: Any | None,
+        target_domain: str,
+        username: str | None,
+        credential: str | None,
+        use_kerberos: bool,
+        kdc_host: str | None,
+    ) -> dict[str, Any]:
+        """Best-effort enrich CA objects with non-LDAP context before detection."""
+        debug = {
+            "registry": self._safe_apply_registry_flags_by_host(
+                data=data,
+                username=username,
+                credential=credential,
+                auth_domain=target_domain,
+                use_kerberos=use_kerberos,
+                kdc_host=kdc_host,
+            ),
+            "certipy": self._safe_apply_certipy_ca_hints(
+                data=data,
+                shell=shell,
+                target_domain=target_domain,
+            ),
+        }
+        return debug
 
     def _process_template_acls(
         self,
@@ -328,6 +372,9 @@ class CertiHoundDetectionService(BaseService):
                     reasons=list(esc8_result.reasons),
                     extra_details={
                         "webenrollmenturl": esc8_result.web_enrollment_url,
+                        "ca_enrollment_principals": list(
+                            getattr(ca, "enrollment_principals", []) or []
+                        ),
                     },
                 )
 
@@ -338,6 +385,11 @@ class CertiHoundDetectionService(BaseService):
                     ca_name=ca_name,
                     ca_dn=ca_dn,
                     reasons=list(esc11_result.reasons),
+                    extra_details={
+                        "ca_enrollment_principals": list(
+                            getattr(ca, "enrollment_principals", []) or []
+                        ),
+                    },
                 )
 
             golden_edge = edge_generator.generate_goldencert_edge(ca)
@@ -652,6 +704,323 @@ class CertiHoundDetectionService(BaseService):
                 ca_by_dn=ca_by_dn,
             ),
             "templates": template_metadata,
+        }
+
+    def _safe_apply_registry_flags_by_host(
+        self,
+        *,
+        data: Any,
+        username: str | None,
+        credential: str | None,
+        auth_domain: str,
+        use_kerberos: bool,
+        kdc_host: str | None,
+    ) -> dict[str, Any]:
+        """Enrich Enterprise CAs with registry-backed flags host by host."""
+        enterprise_cas = list(getattr(data, "enterprise_cas", []) or [])
+        if not enterprise_cas:
+            return {"eligible_cas": 0, "hosts_attempted": 0, "cas_enriched": 0}
+        if not str(username or "").strip():
+            return {
+                "eligible_cas": len(enterprise_cas),
+                "hosts_attempted": 0,
+                "cas_enriched": 0,
+                "reason": "missing_username",
+            }
+        if not use_kerberos and not str(credential or "").strip():
+            return {
+                "eligible_cas": len(enterprise_cas),
+                "hosts_attempted": 0,
+                "cas_enriched": 0,
+                "reason": "missing_credential",
+            }
+
+        grouped_by_host: OrderedDict[str, list[Any]] = OrderedDict()
+        for ca in enterprise_cas:
+            host = str(getattr(ca, "dns_hostname", "") or "").strip()
+            if not host:
+                continue
+            grouped_by_host.setdefault(host.lower(), []).append(ca)
+
+        if not grouped_by_host:
+            return {
+                "eligible_cas": len(enterprise_cas),
+                "hosts_attempted": 0,
+                "cas_enriched": 0,
+                "reason": "missing_ca_hostnames",
+            }
+
+        hosts_attempted = 0
+        cas_enriched = 0
+        host_errors: list[str] = []
+        for grouped_cas in grouped_by_host.values():
+            host = str(getattr(grouped_cas[0], "dns_hostname", "") or "").strip()
+            if not host:
+                continue
+            hosts_attempted += 1
+            try:
+                cas_enriched += self._apply_registry_flags_for_ca_host(
+                    enterprise_cas=grouped_cas,
+                    target_host=host,
+                    username=str(username or "").strip(),
+                    credential=str(credential or "").strip(),
+                    auth_domain=str(auth_domain or "").strip(),
+                    use_kerberos=use_kerberos,
+                    kdc_host=str(kdc_host or "").strip() or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                host_errors.append(f"{host}: {type(exc).__name__}: {exc}")
+                print_info_debug(
+                    "[certihound] CA registry enrichment failed for "
+                    f"{mark_sensitive(host, 'host')}: {type(exc).__name__}: {exc}"
+                )
+
+        result: dict[str, Any] = {
+            "eligible_cas": len(enterprise_cas),
+            "hosts_attempted": hosts_attempted,
+            "cas_enriched": cas_enriched,
+        }
+        if host_errors:
+            result["host_errors"] = host_errors
+        return result
+
+    def _apply_registry_flags_for_ca_host(
+        self,
+        *,
+        enterprise_cas: list[Any],
+        target_host: str,
+        username: str,
+        credential: str,
+        auth_domain: str,
+        use_kerberos: bool,
+        kdc_host: str | None,
+    ) -> int:
+        """Apply registry-backed CA flags for all Enterprise CAs hosted on one server."""
+        from certihound.rpc.ca_registry import CARegistryReader  # type: ignore  # pylint: disable=import-error
+        from impacket.smbconnection import SMBConnection  # type: ignore
+
+        connection = None
+        enriched = 0
+        try:
+            connection = SMBConnection(
+                remoteName=target_host,
+                remoteHost=target_host,
+                sess_port=445,
+                timeout=10,
+            )
+            CertificateMappingService._authenticate_connection(  # type: ignore[attr-defined]
+                connection=connection,
+                username=username,
+                credential=credential,
+                auth_domain=auth_domain,
+                auth_mode="kerberos" if use_kerberos else "password",
+                kdc_host=kdc_host,
+            )
+            with CARegistryReader(connection) as reader:
+                for ca in enterprise_cas:
+                    ca_name = str(getattr(ca, "cn", "") or "").strip()
+                    if not ca_name:
+                        continue
+                    flags = reader.read_ca_flags(
+                        ca_name,
+                        str(getattr(ca, "dns_hostname", "") or "").strip(),
+                    )
+                    if not flags.success:
+                        continue
+                    ca.is_user_specifies_san_enabled = flags.san_flag_enabled
+                    ca.is_security_extension_disabled = (
+                        flags.security_extension_disabled
+                    )
+                    base_flags = ca.flags if getattr(ca, "flags", None) is not None else 0
+                    ca.flags = (base_flags & ~0x200) | (flags.interface_flags & 0x200)
+                    enriched += 1
+        finally:
+            if connection is not None:
+                try:
+                    connection.logoff()
+                except Exception:  # noqa: BLE001
+                    pass
+        return enriched
+
+    def _safe_apply_certipy_ca_hints(
+        self,
+        *,
+        data: Any,
+        shell: Any | None,
+        target_domain: str,
+    ) -> dict[str, Any]:
+        """Supplement CA objects with Certipy-derived non-LDAP context when available."""
+        hints_by_key = self._load_certipy_ca_hints(shell=shell, target_domain=target_domain)
+        if not hints_by_key:
+            return {"eligible_cas": len(list(getattr(data, "enterprise_cas", []) or [])), "cas_enriched": 0}
+
+        cas_enriched = 0
+        for ca in list(getattr(data, "enterprise_cas", []) or []):
+            matched_hint = self._match_certipy_ca_hint(ca=ca, hints_by_key=hints_by_key)
+            if not matched_hint:
+                continue
+            changed = False
+            if matched_hint.get("web_enrollment_enabled") and not bool(
+                getattr(ca, "web_enrollment_enabled", False)
+            ):
+                ca.web_enrollment_enabled = True
+                changed = True
+            certipy_endpoints = list(matched_hint.get("enrollment_endpoints") or [])
+            if certipy_endpoints:
+                existing_endpoints = list(getattr(ca, "enrollment_endpoints", []) or [])
+                merged = list(dict.fromkeys(existing_endpoints + certipy_endpoints))
+                if merged != existing_endpoints:
+                    ca.enrollment_endpoints = merged
+                    changed = True
+            if matched_hint.get("is_user_specifies_san_enabled") and not bool(
+                getattr(ca, "is_user_specifies_san_enabled", False)
+            ):
+                ca.is_user_specifies_san_enabled = True
+                changed = True
+            enforce_encrypt_rpc = matched_hint.get("enforce_encrypt_rpc")
+            if enforce_encrypt_rpc is not None:
+                base_flags = getattr(ca, "flags", None)
+                updated_flags = (base_flags or 0) & ~0x200
+                if enforce_encrypt_rpc:
+                    updated_flags |= 0x200
+                if base_flags != updated_flags:
+                    ca.flags = updated_flags
+                    changed = True
+            if changed:
+                cas_enriched += 1
+
+        return {
+            "eligible_cas": len(list(getattr(data, "enterprise_cas", []) or [])),
+            "cas_enriched": cas_enriched,
+            "hints_loaded": len(hints_by_key),
+        }
+
+    def _match_certipy_ca_hint(
+        self,
+        *,
+        ca: Any,
+        hints_by_key: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Match one Enterprise CA to one Certipy CA hint entry."""
+        candidate_keys = [
+            str(getattr(ca, "cn", "") or "").strip().lower(),
+            str(getattr(ca, "dns_hostname", "") or "").strip().lower(),
+        ]
+        for key in candidate_keys:
+            if key and key in hints_by_key:
+                return hints_by_key[key]
+        return None
+
+    def _load_certipy_ca_hints(
+        self,
+        *,
+        shell: Any | None,
+        target_domain: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Load compact CA hints from the latest Certipy inventory JSON."""
+        json_path = self._find_certipy_json_path(shell=shell, target_domain=target_domain)
+        if not json_path:
+            return {}
+        try:
+            data = read_json_file(json_path)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            return {}
+
+        certificate_authorities = data.get("Certificate Authorities")
+        if not isinstance(certificate_authorities, dict):
+            return {}
+
+        hints: dict[str, dict[str, Any]] = {}
+        for entry in certificate_authorities.values():
+            if not isinstance(entry, dict):
+                continue
+            hint = self._build_certipy_ca_hint(entry)
+            if not hint:
+                continue
+            for key in (
+                str(entry.get("CA Name") or "").strip().lower(),
+                str(entry.get("DNS Name") or "").strip().lower(),
+            ):
+                if key:
+                    hints[key] = hint
+        return hints
+
+    def _find_certipy_json_path(
+        self,
+        *,
+        shell: Any | None,
+        target_domain: str,
+    ) -> str | None:
+        """Resolve the stable Certipy inventory JSON for one domain."""
+        domain_data = getattr(shell, "domains_data", {}).get(target_domain, {})
+        domain_dir = domain_data.get("dir") if isinstance(domain_data, dict) else None
+        if not isinstance(domain_dir, str) or not domain_dir:
+            return None
+        adcs_dir = os.path.join(domain_dir, "adcs")
+        if not os.path.isdir(adcs_dir):
+            return None
+        preferred = os.path.join(adcs_dir, "certipy_find_Certipy.json")
+        if os.path.exists(preferred):
+            return preferred
+        candidates: list[tuple[float, str]] = []
+        for name in os.listdir(adcs_dir):
+            if not name.endswith("_Certipy.json"):
+                continue
+            path = os.path.join(adcs_dir, name)
+            try:
+                candidates.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
+    def _build_certipy_ca_hint(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        """Extract CA-level detector hints from one Certipy CA inventory entry."""
+        dns_name = str(entry.get("DNS Name") or "").strip()
+        web_enrollment = entry.get("Web Enrollment")
+        web_enabled = False
+        endpoints: list[str] = []
+        if isinstance(web_enrollment, dict):
+            http_state = web_enrollment.get("http")
+            if isinstance(http_state, dict) and http_state.get("enabled") is True:
+                web_enabled = True
+                if dns_name:
+                    endpoints.append(f"http://{dns_name}/certsrv/")
+            https_state = web_enrollment.get("https")
+            if isinstance(https_state, dict) and https_state.get("enabled") is True:
+                web_enabled = True
+                if dns_name:
+                    endpoints.append(f"https://{dns_name}/certsrv/")
+
+        san_state = str(entry.get("User Specified SAN") or "").strip().lower()
+        request_disposition = str(entry.get("Enforce Encryption for Requests") or "").strip().lower()
+        vulnerabilities = entry.get("[!] Vulnerabilities") or {}
+        if isinstance(vulnerabilities, dict) and "ESC8" in vulnerabilities:
+            web_enabled = True
+            if dns_name and not endpoints:
+                endpoints.append(f"http://{dns_name}/certsrv/")
+
+        if not any(
+            (
+                web_enabled,
+                san_state == "enabled",
+                request_disposition in {"enabled", "disabled"},
+            )
+        ):
+            return None
+
+        return {
+            "web_enrollment_enabled": web_enabled,
+            "enrollment_endpoints": endpoints,
+            "is_user_specifies_san_enabled": san_state == "enabled",
+            "enforce_encrypt_rpc": (
+                True if request_disposition == "enabled"
+                else False if request_disposition == "disabled"
+                else None
+            ),
         }
 
     def _safe_enumerate_issuance_policies(

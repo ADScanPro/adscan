@@ -13,10 +13,16 @@ capabilities for:
 """
 
 from typing import List, Dict, Optional, Any
-import logging
+import sys
+import traceback
 
 from adscan_internal import telemetry
-from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_internal.rich_output import (
+    mark_sensitive,
+    print_error_debug,
+    print_info_debug,
+    print_warning_debug,
+)
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.core import (
     EventBus,
@@ -25,11 +31,56 @@ from adscan_internal.core import (
 )
 
 
-logger = logging.getLogger(__name__)
-
-
 class BloodHoundServiceError(ADScanException):
     """BloodHound service-specific exceptions."""
+
+
+class _RichOutputServiceLogger:
+    """Small logger adapter that routes service logs through rich_output helpers."""
+
+    def __init__(self, component: str):
+        """Initialize the adapter.
+
+        Args:
+            component: Human-readable component name for log prefixes.
+        """
+        self.component = component
+
+    def _render(self, message: str, **kwargs) -> str:
+        """Render a structured message with any extra diagnostic context."""
+        extra = kwargs.get("extra")
+        if not extra:
+            return f"[{self.component}] {message}"
+        context = ", ".join(f"{key}={value}" for key, value in extra.items())
+        return f"[{self.component}] {message} ({context})"
+
+    def debug(self, message: str, *args, **kwargs) -> None:
+        """Log a debug message through the centralized debug channel."""
+        print_info_debug(self._render(message, **kwargs))
+
+    def info(self, message: str, *args, **kwargs) -> None:
+        """Log an info message through the centralized debug channel."""
+        print_info_debug(self._render(message, **kwargs))
+
+    def warning(self, message: str, *args, **kwargs) -> None:
+        """Log a warning message through the centralized debug channel."""
+        print_warning_debug(self._render(message, **kwargs))
+
+    def exception(self, message: str, *args, **kwargs) -> None:
+        """Log an exception with traceback through the centralized debug channel."""
+        rendered_message = self._render(message, **kwargs)
+        exc = kwargs.get("exception")
+        if exc is None:
+            current_exc = sys.exc_info()[1]
+            if isinstance(current_exc, BaseException):
+                exc = current_exc
+        if exc is not None:
+            traceback_lines = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ).strip()
+            rendered_message = f"{rendered_message}\n{traceback_lines}"
+            telemetry.capture_exception(exc)
+        print_error_debug(rendered_message)
 
 
 class BloodHoundService(BaseService):
@@ -107,6 +158,7 @@ class BloodHoundService(BaseService):
             ValueError: If invalid edition specified
         """
         super().__init__(event_bus=event_bus, license_mode=license_mode)
+        self.logger = _RichOutputServiceLogger(self.__class__.__name__)
 
         self.edition = edition.lower()
         self.debug = debug
@@ -842,6 +894,54 @@ class BloodHoundService(BaseService):
             raise BloodHoundServiceError(
                 "Failed to retrieve stale enabled users from BloodHound",
                 details={"domain": domain, "stale_days": stale_days, "error": str(e)},
+            ) from e
+
+    def get_password_last_change(
+        self,
+        domain: str,
+        *,
+        user: Optional[str] = None,
+        scan_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get password last change data for one user or the full domain."""
+        self._emit_progress(
+            scan_id=scan_id,
+            phase="bloodhound_user_enumeration",
+            progress=0.0,
+            message=f"Querying BloodHound for password last change data in {domain}",
+        )
+
+        try:
+            records = self.client.get_password_last_change(domain, user=user)
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_user_enumeration",
+                progress=1.0,
+                message=f"Retrieved {len(records)} password last change records from BloodHound",
+            )
+            self.logger.info(
+                "Retrieved password last change data",
+                extra={
+                    "domain": domain,
+                    "user": user,
+                    "count": len(records),
+                },
+            )
+            return records
+        except Exception as e:
+            self.logger.exception(
+                "Failed to get password last change data from BloodHound",
+                extra={"domain": domain, "user": user, "error": str(e)},
+            )
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="bloodhound_user_enumeration",
+                progress=1.0,
+                message="Password last change query failed",
+            )
+            raise BloodHoundServiceError(
+                "Failed to retrieve password last change data from BloodHound",
+                details={"domain": domain, "user": user, "error": str(e)},
             ) from e
 
     def get_computers(

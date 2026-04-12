@@ -5,17 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "adscan"
 version = "6.5.0"
-description = "Active Directory pentesting CLI for AD enumeration, BloodHound collection, Kerberoasting, ADCS checks, attack paths, and CTF labs."
-readme = "adscan_pypi_wrapper/README.md"
+description = "Free Active Directory pentesting CLI for AD enumeration, BloodHound, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
+readme = "README.md"
 authors = [{ name = "ADscan" }]
 requires-python = ">=3.9"
 keywords = [
     "active-directory",
+    "activedirectory",
     "pentesting",
     "penetration-testing",
+    "enumeration",
     "bloodhound",
     "kerberoasting",
+    "as-rep-roasting",
     "adcs",
+    "dcsync",
+    "password-spraying",
     "red-team",
     "ctf",
 ]

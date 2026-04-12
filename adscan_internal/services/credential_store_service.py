@@ -65,6 +65,23 @@ class LocalCredentialUpdateResult:
     credential_changed: bool
 
 
+@dataclass(frozen=True)
+class KerberosKeyMaterial:
+    """Typed Kerberos key material for one domain principal.
+
+    This intentionally lives outside the legacy ``credentials`` mapping because
+    that mapping is consumed as password/NTLM by many authentication paths.
+    """
+
+    username: str
+    nt_hash: str | None = None
+    aes256: str | None = None
+    aes128: str | None = None
+    source: str = ""
+    target_host: str = ""
+    rid: str = ""
+
+
 class CredentialStoreService(BaseService):
     """Service responsible for mutating the ``domains_data`` structure.
 
@@ -366,8 +383,136 @@ class CredentialStoreService(BaseService):
         tickets.pop(username, None)
         return True
 
+    # ------------------------------------------------------------------ #
+    # Kerberos key material
+    # ------------------------------------------------------------------ #
+
+    def store_kerberos_key_material(
+        self,
+        *,
+        domains_data: MutableMapping[str, Any],
+        domain: str,
+        username: str,
+        nt_hash: str | None = None,
+        aes256: str | None = None,
+        aes128: str | None = None,
+        source: str = "",
+        target_host: str = "",
+        rid: str = "",
+    ) -> KerberosKeyMaterial | None:
+        """Store typed Kerberos key material for a principal.
+
+        Args:
+            domains_data: Shared workspace domain mapping.
+            domain: Domain that owns the principal.
+            username: Principal name, e.g. ``krbtgt_8245``.
+            nt_hash: Optional RC4/NT hash.
+            aes256: Optional AES256 Kerberos key.
+            aes128: Optional AES128 Kerberos key.
+            source: Optional source identifier for provenance.
+            target_host: Optional host that yielded the material.
+            rid: Optional RID suffix for per-RODC ``krbtgt_<RID>`` accounts.
+
+        Returns:
+            Stored normalized material, or ``None`` when no reusable key was
+            provided.
+        """
+        normalized_username = str(username or "").strip()
+        normalized_nt_hash = _normalize_hex_secret(nt_hash, expected_len=32)
+        normalized_aes256 = _normalize_hex_secret(aes256, expected_len=64)
+        normalized_aes128 = _normalize_hex_secret(aes128, expected_len=32)
+        if (
+            not normalized_username
+            or (
+                not normalized_nt_hash
+                and not normalized_aes256
+                and not normalized_aes128
+            )
+        ):
+            return None
+
+        domain_data = self.ensure_domain_entry(domains_data, domain)
+        kerberos_keys = domain_data.setdefault("kerberos_keys", {})
+        current = kerberos_keys.get(normalized_username)
+        current_data = current if isinstance(current, dict) else {}
+
+        material = {
+            "nt_hash": normalized_nt_hash or str(current_data.get("nt_hash") or ""),
+            "aes256": normalized_aes256 or str(current_data.get("aes256") or ""),
+            "aes128": normalized_aes128 or str(current_data.get("aes128") or ""),
+            "source": str(source or current_data.get("source") or "").strip(),
+            "target_host": str(
+                target_host or current_data.get("target_host") or ""
+            ).strip(),
+            "rid": str(rid or current_data.get("rid") or "").strip(),
+        }
+        kerberos_keys[normalized_username] = {
+            key: value for key, value in material.items() if value
+        }
+
+        return KerberosKeyMaterial(
+            username=normalized_username,
+            nt_hash=material["nt_hash"] or None,
+            aes256=material["aes256"] or None,
+            aes128=material["aes128"] or None,
+            source=material["source"],
+            target_host=material["target_host"],
+            rid=material["rid"],
+        )
+
+    def get_kerberos_key_material(
+        self,
+        *,
+        domains_data: MutableMapping[str, Any],
+        domain: str,
+        username: str,
+    ) -> KerberosKeyMaterial | None:
+        """Return stored Kerberos key material for ``username`` if present."""
+        domain_data = domains_data.get(domain, {})
+        kerberos_keys = domain_data.get("kerberos_keys", {})
+        if not isinstance(kerberos_keys, dict):
+            return None
+        data = kerberos_keys.get(username)
+        if not isinstance(data, dict):
+            return None
+        return KerberosKeyMaterial(
+            username=username,
+            nt_hash=str(data.get("nt_hash") or "") or None,
+            aes256=str(data.get("aes256") or "") or None,
+            aes128=str(data.get("aes128") or "") or None,
+            source=str(data.get("source") or ""),
+            target_host=str(data.get("target_host") or ""),
+            rid=str(data.get("rid") or ""),
+        )
+
+    @staticmethod
+    def select_best_kerberos_key(material: KerberosKeyMaterial) -> tuple[str, str] | None:
+        """Return the preferred reusable key as ``(kind, value)``.
+
+        AES256 is preferred over AES128, with NT/RC4 as the compatibility
+        fallback for older or less hardened domains.
+        """
+        if material.aes256:
+            return "aes256", material.aes256
+        if material.aes128:
+            return "aes128", material.aes128
+        if material.nt_hash:
+            return "nt_hash", material.nt_hash
+        return None
+
+
+def _normalize_hex_secret(value: str | None, *, expected_len: int) -> str:
+    """Return a lowercase hex secret only when it has the expected length."""
+    candidate = str(value or "").strip().lower()
+    if len(candidate) != expected_len:
+        return ""
+    if not re.fullmatch(r"[0-9a-f]+", candidate):
+        return ""
+    return candidate
+
 __all__ = [
     "CredentialStoreService",
     "DomainCredentialUpdateResult",
+    "KerberosKeyMaterial",
     "LocalCredentialUpdateResult",
 ]

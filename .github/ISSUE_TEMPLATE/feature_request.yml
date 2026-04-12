@@ -1,0 +1,51 @@
+name: Feature request
+description: Suggest an ADscan workflow, capability, or pentest quality-of-life improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the pentest problem first, then the feature. This helps us prioritize changes that improve real Active Directory workflows.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Enumeration
+        - BloodHound
+        - ADCS
+        - Kerberos / roasting
+        - Credentials / dumping
+        - Attack paths
+        - Reporting / exports
+        - Install / packaging
+        - Docs / walkthroughs
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Pentest problem to solve
+      description: Explain the workflow friction, missing capability, or repeated manual step.
+      placeholder: "During AD enumeration I still need to switch to X tool because..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the command, automation, UX, or output you want to see.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Lab or real-world context
+      description: HTB/VulnLab machine, GOAD, internal AD audit, or another authorized environment.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround
+      description: What are you doing today without this feature?
