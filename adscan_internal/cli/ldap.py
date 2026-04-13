@@ -88,6 +88,11 @@ from adscan_internal.services.attack_graph_service import (
     resolve_group_members_by_rid,
 )
 from adscan_internal.integrations.impacket.parsers import parse_secretsdump_output
+from adscan_internal.integrations.impacket.runner import (
+    ImpacketContext,
+    ImpacketKerberosRetryContext,
+    run_raw_impacket_command,
+)
 from adscan_internal.workspaces import domain_relpath, domain_subpath
 
 
@@ -1818,12 +1823,49 @@ def run_enum_delegations(shell: LdapShell, domain: str) -> None:
     )
     print_info_debug(f"Command: {command}")
 
+    def _executor(command_to_run: str, timeout: int) -> subprocess.CompletedProcess[str]:
+        kerberos_command = (
+            command_to_run
+            if " -k" in f" {command_to_run}"
+            else f"{command_to_run} -k"
+        )
+        result = run_raw_impacket_command(
+            command_to_run,
+            script_name="findDelegation.py",
+            timeout=timeout,
+            ctx=ImpacketContext(
+                impacket_scripts_dir=str(shell.impacket_scripts_dir or ""),
+                validate_script_exists=lambda path: os.path.isfile(path)
+                and os.access(path, os.X_OK),
+                get_domain_pdc=lambda realm: str(
+                    (shell.domains_data.get(realm) or {}).get("pdc") or ""
+                )
+                or None,
+                sync_clock_with_pdc=lambda realm: bool(
+                    shell.do_sync_clock_with_pdc(realm, verbose=True)
+                ),
+                workspace_dir=shell.current_workspace_dir,
+                domains_data=shell.domains_data,
+            ),
+            kerberos_retry_context=ImpacketKerberosRetryContext(
+                domain=auth_domain,
+                username=auth_username,
+                credential=auth_password,
+                dc_ip=str((shell.domains_data.get(auth_domain) or {}).get("pdc") or "")
+                or None,
+            ),
+            auth_policy_protocol="ldap",
+            kerberos_command=kerberos_command,
+        )
+        if result is None:
+            return subprocess.CompletedProcess(command_to_run, 1, "", "Impacket command failed")
+        return result
+
     enum_service = EnumerationService()
-    executor = shell._get_service_executor()
     delegations, delegation_type_counts = enum_service.delegation.enumerate_delegations(
         domain=domain,
         command=command,
-        executor=executor,
+        executor=_executor,
         timeout=300,
         scan_id=None,
     )
@@ -3142,6 +3184,8 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
 
     if not users:
         print_warning("No Kerberos users were discovered.")
+        _show_kerberos_enum_shortcut_hint(shell, domain, had_results=False)
+        shell.ask_for_kerberos_user_enum(domain, relaunch=True)
         return
 
     unique_users = sorted(set(users))
@@ -3165,7 +3209,7 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         domain,
         source="kerberos_user_enum",
     )
-    _show_kerberos_enum_shortcut_hint(shell, domain)
+    _show_kerberos_enum_shortcut_hint(shell, domain, had_results=True)
 
 
 def _compute_file_sha256(path: Path) -> str | None:
@@ -3581,8 +3625,127 @@ def _prompt_validated_linkedin_company_slug(shell: LdapShell) -> str | None:
             return None
 
 
-def _build_targeted_kerberos_wordlist(shell: LdapShell, domain: str) -> str | None:
-    """Build a focused Kerberos username wordlist based on workspace type and known format."""
+def _infer_kerberos_username_pattern_via_runtime_probe(
+    shell: LdapShell,
+    domain: str,
+) -> tuple[str, str | None]:
+    """Run a compact Kerberos probe to infer the dominant username format."""
+    wordlist_service = KerberosUsernameWordlistService()
+    inference_wordlist = wordlist_service.get_format_inference_wordlist_path()
+    metadata_path = wordlist_service.get_format_inference_metadata_path()
+    marked_domain = mark_sensitive(domain, "domain")
+    if inference_wordlist is None or metadata_path is None:
+        print_warning(
+            "The Kerberos username-format inference assets are not available in this runtime."
+        )
+        return "general", None
+
+    kerbrute_path = os.path.join(TOOLS_INSTALL_DIR, "kerbrute", "kerbrute")
+    if not os.path.isfile(kerbrute_path) or not os.access(kerbrute_path, os.X_OK):
+        print_warning("Kerbrute is not available, so username-format inference cannot run.")
+        return "general", None
+
+    kerberos_dir = domain_subpath(
+        shell._get_workspace_cwd(),
+        shell.domains_dir,
+        domain,
+        shell.kerberos_dir,
+    )
+    os.makedirs(kerberos_dir, exist_ok=True)
+    output_file = Path(os.path.join(kerberos_dir, "enum_users_format_inference.log"))
+
+    print_operation_header(
+        "Kerberos Username Format Inference",
+        details={
+            "Domain": domain,
+            "PDC": shell.domains_data[domain]["pdc"],
+            "Wordlist": inference_wordlist.name,
+            "Protocol": "Kerberos Pre-Authentication",
+        },
+        icon="🧠",
+    )
+
+    users = EnumerationService().kerberos.enumerate_users_kerberos(
+        domain=domain,
+        pdc=shell.domains_data[domain]["pdc"],
+        wordlist=str(inference_wordlist),
+        kerbrute_path=kerbrute_path,
+        output_file=output_file,
+        executor=shell._get_service_executor(),
+        scan_id=None,
+        timeout=180,
+    )
+    ranked_patterns = wordlist_service.rank_inferred_patterns_from_candidates(users)
+    if not ranked_patterns:
+        if users:
+            print_warning(
+                "Kerberos username format inference found valid usernames, but could not "
+                "identify a dominant pattern confidently."
+            )
+        else:
+            print_warning(
+                f"Could not infer a username format for {marked_domain}: no valid usernames "
+                "were discovered with the compact inference list."
+            )
+        fallback_options = [
+            "Use the built-in general common username wordlist (Recommended)",
+            "Use my own username wordlist",
+            "Choose a username format manually",
+        ]
+        fallback_idx = shell._questionary_select(
+            "Username format inference did not produce a clear result. How do you want to continue?",
+            fallback_options,
+            default_idx=0,
+        )
+        if fallback_idx == 1:
+            return "custom", None
+        if fallback_idx == 2:
+            return "pattern", _prompt_kerberos_username_pattern(shell, domain)
+        return "general", None
+
+    preview_lines = [f"Validated usernames from inference probe: {len(sorted(set(users)))}"]
+    preview_lines.append("Likely formats:")
+    sample_name = "John Smith"
+    for pattern_key, score in ranked_patterns[:5]:
+        preview_lines.append(
+            f"- {format_supported_pattern_label(pattern_key, sample_value=sample_name)}: "
+            f"{score} hit(s)"
+        )
+    print_panel(
+        "\n".join(preview_lines),
+        title=f"🧠 Kerberos Username Format Detected for {marked_domain}",
+        border_style=BRAND_COLORS["info"],
+        expand=False,
+    )
+
+    detected_pattern = ranked_patterns[0][0]
+    options = [
+        f"Use detected format: {format_supported_pattern_label(detected_pattern, sample_value=sample_name)} (Recommended)",
+        "Choose another format manually",
+        "Use the built-in general common username wordlist",
+        "Use my own username wordlist",
+    ]
+    choice_idx = shell._questionary_select(
+        f"Select how to continue for {marked_domain} after the inference probe",
+        options,
+        default_idx=0,
+    )
+    if choice_idx == 1:
+        return "pattern", _prompt_kerberos_username_pattern(shell, domain)
+    if choice_idx == 2:
+        return "general", None
+    if choice_idx == 3:
+        return "custom", None
+    return "pattern", detected_pattern
+
+
+def _build_focused_kerberos_wordlist_for_pattern(
+    shell: LdapShell,
+    domain: str,
+    *,
+    pattern_key: str,
+) -> str | None:
+    """Build a focused Kerberos username wordlist for one selected format."""
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     marked_domain = mark_sensitive(domain, "domain")
     wordlist_service = KerberosUsernameWordlistService()
@@ -3594,31 +3757,6 @@ def _build_targeted_kerberos_wordlist(shell: LdapShell, domain: str) -> str | No
             shell.kerberos_dir,
         )
     )
-
-    knows_format = Confirm.ask(
-        f"Do you know the username format used in {marked_domain}?",
-        default=(workspace_type == "audit"),
-    )
-    if not knows_format:
-        fallback_options = [
-            "Use the built-in general common username wordlist (Recommended)",
-            "Use my own username wordlist",
-        ]
-        fallback_idx = shell._questionary_select(
-            "Username format unknown. How do you want to continue?",
-            fallback_options,
-            default_idx=0,
-        )
-        if fallback_idx is None:
-            print_error("Selection cancelled.")
-            return None
-        if fallback_idx == 0:
-            return _resolve_general_kerberos_username_wordlist(domain)
-        return _prompt_custom_kerberos_username_wordlist(shell, domain)
-
-    pattern_key = _prompt_kerberos_username_pattern(shell, domain)
-    if not pattern_key:
-        return None
 
     if workspace_type == "audit":
         source_options = [
@@ -3703,10 +3841,7 @@ def _build_targeted_kerberos_wordlist(shell: LdapShell, domain: str) -> str | No
                         wait_for_user_ready=lambda: _prompt_linkedin_ready(shell),
                         geoblast=True,
                     )
-                    raw_name_lines = []
-                    for employee in employees:
-                        raw_name_lines.append(employee.full_name)
-
+                    raw_name_lines = [employee.full_name for employee in employees]
                     if raw_name_lines:
                         generated_candidates = wordlist_service.generate_candidates_from_linkedin_names(
                             raw_name_lines,
@@ -3761,7 +3896,57 @@ def _build_targeted_kerberos_wordlist(shell: LdapShell, domain: str) -> str | No
     return str(output_path)
 
 
-def _show_kerberos_enum_shortcut_hint(shell: LdapShell, domain: str) -> None:
+def _build_targeted_kerberos_wordlist(shell: LdapShell, domain: str) -> str | None:
+    """Build a focused Kerberos username wordlist based on workspace type and known format."""
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    marked_domain = mark_sensitive(domain, "domain")
+
+    knows_format = Confirm.ask(
+        f"Do you know the username format used in {marked_domain}?",
+        default=(workspace_type == "audit"),
+    )
+    if not knows_format:
+        fallback_options = [
+            "Try to infer the username format first (Recommended)",
+            "Use the built-in general common username wordlist",
+            "Use my own username wordlist",
+        ]
+        fallback_idx = shell._questionary_select(
+            "Username format unknown. How do you want to continue?",
+            fallback_options,
+            default_idx=0,
+        )
+        if fallback_idx is None:
+            print_error("Selection cancelled.")
+            return None
+        if fallback_idx == 0:
+            strategy, value = _infer_kerberos_username_pattern_via_runtime_probe(
+                shell, domain
+            )
+            if strategy == "pattern" and value:
+                return _build_focused_kerberos_wordlist_for_pattern(
+                    shell,
+                    domain,
+                    pattern_key=value,
+                )
+            return _resolve_general_kerberos_username_wordlist(domain)
+        if fallback_idx == 1:
+            return _resolve_general_kerberos_username_wordlist(domain)
+        return _prompt_custom_kerberos_username_wordlist(shell, domain)
+
+    pattern_key = _prompt_kerberos_username_pattern(shell, domain)
+    if not pattern_key:
+        return None
+    return _build_focused_kerberos_wordlist_for_pattern(
+        shell,
+        domain,
+        pattern_key=pattern_key,
+    )
+
+
+def _show_kerberos_enum_shortcut_hint(
+    shell: LdapShell, domain: str, *, had_results: bool = True
+) -> None:
     """Render a reusable reminder for rerunning Kerberos user enumeration only."""
 
     marked_domain = mark_sensitive(domain, "domain")
@@ -3770,11 +3955,21 @@ def _show_kerberos_enum_shortcut_hint(shell: LdapShell, domain: str) -> None:
     users_rel = os.path.join("domains", domain, "users.txt")
     has_users_file = os.path.exists(users_file) and os.path.getsize(users_file) > 0
 
-    lines = [
-        "If you want to keep enumerating users via Kerberos later, you do not need to rerun the full scan.",
-        "",
-        f"Use this shortcut instead: kerberos_enum_users {marked_domain}",
-    ]
+    lines: list[str]
+    if had_results:
+        lines = [
+            "If you want to keep enumerating users via Kerberos later, you do not need to rerun the full scan.",
+            "",
+            f"Use this shortcut instead: kerberos_enum_users {marked_domain}",
+        ]
+    else:
+        lines = [
+            "No users were validated with the last Kerberos enumeration run.",
+            "",
+            "You can retry this step directly later with a different strategy or wordlist.",
+            "",
+            f"Use this shortcut instead: kerberos_enum_users {marked_domain}",
+        ]
     if has_users_file:
         lines.append(f"Current users file: {mark_sensitive(users_rel, 'path')}")
     else:

@@ -45,6 +45,10 @@ from adscan_internal import (
 from adscan_internal.integrations.netexec.parsers import (
     parse_netexec_delegated_auth_failure,
 )
+from adscan_internal.integrations.impacket.runner import (
+    RunCommandAdapter,
+    run_raw_impacket_command,
+)
 from adscan_internal.services.exploitation.lsass import (
     DelegatedLsassDumpRequest,
     LsaReaperCommandRequest,
@@ -2585,7 +2589,15 @@ def run_dump_dpapi(
 def execute_dump_registries(shell: Any, command: str, domain: str) -> None:
     """Execute registry dump command and trigger secretsdump on success."""
     try:
-        completed_process = shell.run_command(command, timeout=300)
+        completed_process = run_raw_impacket_command(
+            command,
+            script_name="reg.py",
+            timeout=300,
+            command_runner=RunCommandAdapter(shell.run_command),
+        )
+        if completed_process is None:
+            print_error("Error dumping registries: command did not return output.")
+            return
 
         if completed_process.returncode == 0:
             marked_domain = mark_sensitive(domain, "domain")

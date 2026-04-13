@@ -16,6 +16,7 @@ Notes:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
@@ -1680,9 +1681,11 @@ def _node_is_tier0(node: dict[str, Any]) -> bool:
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     if bool(props.get("isTierZero")):
         return True
+    if node_is_rodc_computer(node):
+        return True
     tags = node.get("system_tags") or props.get("system_tags") or []
     if isinstance(tags, str):
-        tags = [tags]
+        tags = [tag.strip() for tag in re.split(r"[, ]+", tags) if tag.strip()]
     if any(str(tag).lower() == "admin_tier_0" for tag in tags):
         return True
     if is_adcs_tier_zero_group(node):

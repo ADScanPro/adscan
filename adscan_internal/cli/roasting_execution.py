@@ -348,6 +348,7 @@ def run_kerberoast_for_user(
         impacket_scripts_dir=shell.impacket_scripts_dir,
         validate_script_exists=lambda p: os.path.isfile(p) and os.access(p, os.X_OK),
         get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
+        sync_clock_with_pdc=lambda d: bool(shell.do_sync_clock_with_pdc(d, verbose=True)),
         workspace_dir=_resolve_workspace_dir(shell),
         domains_data=shell.domains_data,
     )
@@ -454,6 +455,7 @@ def run_asreproast_for_user(
         impacket_scripts_dir=shell.impacket_scripts_dir,
         validate_script_exists=lambda p: os.path.isfile(p) and os.access(p, os.X_OK),
         get_domain_pdc=lambda d: shell.domains_data.get(d, {}).get("pdc"),
+        sync_clock_with_pdc=lambda d: bool(shell.do_sync_clock_with_pdc(d, verbose=True)),
         workspace_dir=_resolve_workspace_dir(shell),
         domains_data=shell.domains_data,
     )

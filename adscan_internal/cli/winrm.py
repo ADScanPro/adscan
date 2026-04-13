@@ -917,6 +917,10 @@ def ask_for_winrm_access(
             offers only the reachability-and-pivot branch so that pivot-search
             UX does not unexpectedly expand into unrelated host-enumeration
             flows such as DPAPI, history, autologon, or transcript checks.
+            ``"pivot_host_bound_resume"`` uses the same pivot-only branch but
+            suppresses post-pivot owned-user follow-ups so the blocked
+            host-bound workflow can resume immediately after reachability is
+            restored.
             ``"pivot_relaunch"`` restores a previous pivot and suppresses the
             post-pivot owned-user escalation UX during workspace-load relaunch.
     """
@@ -942,6 +946,12 @@ def ask_for_winrm_access(
             f"{marked_host} as user {marked_username}?",
             default=True,
         )
+    elif normalized_intent == "pivot_host_bound_resume":
+        answer = Confirm.ask(
+            "Do you want to test WinRM pivot reachability and try a Ligolo pivot on "
+            f"{marked_host} as user {marked_username} to continue the blocked host-bound workflow?",
+            default=True,
+        )
     elif normalized_intent == "pivot_relaunch":
         answer = Confirm.ask(
             "Do you want to restore the previous Ligolo pivot via WinRM on "
@@ -953,7 +963,7 @@ def ask_for_winrm_access(
             f"Do you want to enumerate host {marked_host} via WinRM as user {marked_username}?"
         )
     if answer:
-        if normalized_intent in {"pivot_search", "pivot_relaunch"}:
+        if normalized_intent in {"pivot_search", "pivot_host_bound_resume", "pivot_relaunch"}:
             followup_steps = [
                 (
                     "pivot_reachability",
@@ -963,7 +973,7 @@ def ask_for_winrm_access(
                         host=host,
                         username=username,
                         password=password,
-                        offer_post_pivot_owned_followup=normalized_intent != "pivot_relaunch",
+                        offer_post_pivot_owned_followup=normalized_intent == "pivot_search",
                     ),
                 ),
             ]

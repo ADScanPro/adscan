@@ -9,6 +9,7 @@ from typing import Any
 _PROVIDER_SLUG_MAP: dict[str, str] = {
     "hackthebox": "htb",
     "tryhackme": "thm",
+    "training_labs": "training",
     "dockerlabs": "dockerlabs",
     "vulnhub": "vulnhub",
     "goad": "goad",

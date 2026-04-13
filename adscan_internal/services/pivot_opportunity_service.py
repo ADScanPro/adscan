@@ -75,6 +75,7 @@ def maybe_offer_pivot_opportunity_for_host_viability(
     blocked_target: str,
     viability_status: str,
     operator_summary: str | None = None,
+    workflow_intent_override: str | None = None,
 ) -> bool:
     """Offer pivot diagnostics when a host is blocked by current-vantage viability.
 
@@ -91,6 +92,7 @@ def maybe_offer_pivot_opportunity_for_host_viability(
         shell,
         domain=domain,
         blocked_target=blocked_target,
+        workflow_intent_override=workflow_intent_override,
     )
     return True
 
@@ -101,6 +103,7 @@ def ensure_host_bound_workflow_target_viable(
     domain: str,
     target_host: str,
     workflow_label: str,
+    resume_after_pivot: bool = False,
 ) -> ComputerTargetViability | None:
     """Return target viability for one host-bound workflow or block with pivot UX.
 
@@ -124,13 +127,33 @@ def ensure_host_bound_workflow_target_viable(
         f"{marked_workflow} is blocked because ADscan cannot currently reach "
         f"{marked_target} from the active vantage."
     )
+    if resume_after_pivot:
+        print_info(
+            "ADscan will use pivoting only to restore reachability for this host-bound workflow, "
+            "then return to the blocked action."
+        )
     maybe_offer_pivot_opportunity_for_host_viability(
         shell,
         domain=domain,
         blocked_target=target_host,
         viability_status=viability.status,
         operator_summary=viability.operator_summary,
+        workflow_intent_override="pivot_host_bound_resume" if resume_after_pivot else None,
     )
+    if not resume_after_pivot:
+        return None
+
+    refreshed_viability = assess_computer_target_viability(
+        shell,
+        domain=domain,
+        principal_name=target_host,
+    )
+    if refreshed_viability.status not in UNREACHABLE_HOST_VIABILITY_STATUSES:
+        print_info(
+            f"{mark_sensitive(workflow_label, 'detail')} can continue: "
+            f"{mark_sensitive(target_host, 'hostname')} is now reachable from the active vantage."
+        )
+        return refreshed_viability
     return None
 
 
@@ -311,6 +334,7 @@ def maybe_offer_pivot_opportunity_followup(
     *,
     domain: str,
     blocked_target: str,
+    workflow_intent_override: str | None = None,
 ) -> None:
     """Offer pivot-capable access probes or follow-ups for one blocked target host."""
 
@@ -358,12 +382,13 @@ def maybe_offer_pivot_opportunity_followup(
                     "[This will run the pivoting branch only, not the full service-enumeration workflow.]"
                 )
                 if capability and capability.followup_workflow_intent:
+                    workflow_intent = workflow_intent_override or capability.followup_workflow_intent
                     handler(
                         domain,
                         item.host,
                         item.username,
                         item.credential,
-                        workflow_intent=capability.followup_workflow_intent,
+                        workflow_intent=workflow_intent,
                     )
                 else:
                     handler(domain, item.host, item.username, item.credential)
@@ -400,6 +425,10 @@ def maybe_offer_pivot_opportunity_followup(
         for item, label in zip(candidates, options, strict=False):
             if label not in selected:
                 continue
+            capability = get_pivot_service_capability(item.service)
+            workflow_intent = workflow_intent_override or (
+                capability.followup_workflow_intent if capability else None
+            )
             print_info(
                 f"Checking {mark_sensitive(item.service.upper(), 'detail')} access for "
                 f"{mark_sensitive(item.username, 'user')} on {mark_sensitive(item.host, 'hostname')} "
@@ -415,6 +444,7 @@ def maybe_offer_pivot_opportunity_followup(
                 prompt=True,
                 scope_preference="optimized",
                 include_previously_tested=False,
+                workflow_intent=workflow_intent,
             )
         return
 
@@ -439,6 +469,10 @@ def maybe_offer_pivot_opportunity_followup(
         from adscan_internal.cli.privileges import run_service_access_sweep
 
         for item in candidates:
+            capability = get_pivot_service_capability(item.service)
+            workflow_intent = workflow_intent_override or (
+                capability.followup_workflow_intent if capability else None
+            )
             run_service_access_sweep(
                 shell,
                 domain=domain,
@@ -449,6 +483,7 @@ def maybe_offer_pivot_opportunity_followup(
                 prompt=True,
                 scope_preference="optimized",
                 include_previously_tested=True,
+                workflow_intent=workflow_intent,
             )
         return
 

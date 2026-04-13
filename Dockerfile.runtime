@@ -533,6 +533,9 @@ RUN set -eux; \
   rm -f /opt/adscan/wordlists/kaonashi14M.txt.7z; \
   chmod -R 0777 /opt/adscan/wordlists /usr/share/wordlists/statistically-likely-usernames
 
+COPY adscan_internal/assets/wordlists/kerberos-format-inference.txt /opt/adscan/wordlists/kerberos-format-inference.txt
+COPY adscan_internal/assets/wordlists/kerberos-format-inference.json /opt/adscan/wordlists/kerberos-format-inference.json
+
 # RustHound-CE (Kerberos-capable build)
 COPY --from=rusthound_builder /usr/local/cargo/bin/rusthound-ce /usr/local/bin/rusthound-ce
 RUN rusthound-ce --version

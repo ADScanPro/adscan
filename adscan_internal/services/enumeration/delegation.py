@@ -18,11 +18,7 @@ import logging
 import re
 
 from adscan_internal.core import AuthMode, requires_auth
-from adscan_internal.command_runner import CommandSpec, default_runner
-from adscan_internal.subprocess_env import (
-    command_string_needs_clean_env,
-    get_clean_env_for_compilation,
-)
+from adscan_internal.integrations.impacket.runner import run_raw_impacket_command
 
 
 logger = logging.getLogger(__name__)
@@ -40,19 +36,10 @@ def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess
     Returns:
         Completed process result.
     """
-    use_clean_env = command_string_needs_clean_env(command)
-    cmd_env = get_clean_env_for_compilation() if use_clean_env else None
-    return default_runner.run(
-        CommandSpec(
-            command=command,
-            timeout=timeout,
-            shell=True,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=cmd_env,
-        )
-    )
+    result = run_raw_impacket_command(command, timeout=timeout)
+    if result is None:
+        return subprocess.CompletedProcess(command, 1, "", "Impacket command failed")
+    return result
 
 
 @dataclass

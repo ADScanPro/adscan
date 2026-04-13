@@ -82,6 +82,7 @@ def ask_for_rdp_access(
             domain=domain,
             target_host=host,
             workflow_label="RDP access workflow",
+            resume_after_pivot=True,
         )
         is None
     ):

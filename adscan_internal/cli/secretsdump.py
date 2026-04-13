@@ -32,6 +32,10 @@ from adscan_internal import (
     print_warning_debug,
     telemetry,
 )
+from adscan_internal.integrations.impacket.runner import (
+    RunCommandAdapter,
+    run_raw_impacket_command,
+)
 from adscan_internal.rich_output import mark_sensitive, print_panel
 from rich.prompt import Confirm
 
@@ -222,7 +226,15 @@ def execute_secretsdump_with_domain(shell: Any, command: str, domain: str) -> No
         domain: Target domain name for credential filtering.
     """
     try:
-        completed_process = shell.run_command(command, timeout=300)
+        completed_process = run_raw_impacket_command(
+            command,
+            script_name="secretsdump.py",
+            timeout=300,
+            command_runner=RunCommandAdapter(shell.run_command),
+        )
+        if completed_process is None:
+            print_error("Error executing secretsdump: command did not return output.")
+            return
 
         if completed_process.returncode == 0:
             output_decoded = completed_process.stdout
@@ -332,7 +344,15 @@ def execute_secretsdump(shell: Any, command: str, domain: str) -> None:
         # ------------------------------------------------------------------ #
         # 1. Launch secretsdump and capture its complete stdout / stderr
         # ------------------------------------------------------------------ #
-        completed_process = shell.run_command(command, timeout=300)
+        completed_process = run_raw_impacket_command(
+            command,
+            script_name="secretsdump.py",
+            timeout=300,
+            command_runner=RunCommandAdapter(shell.run_command),
+        )
+        if completed_process is None:
+            print_error("Error executing credential extraction: command did not return output.")
+            return
 
         if completed_process.returncode != 0:
             error_message = (

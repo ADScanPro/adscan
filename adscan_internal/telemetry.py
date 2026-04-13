@@ -23,6 +23,7 @@ from adscan_core.telemetry import (  # noqa: F401,E402
     _get_known_netbios,
     _get_known_passwords,
     _get_known_users,
+    _get_known_workspaces,
     _is_telemetry_enabled,
     _maybe_sanitize_rich_output,
     _telemetry_client,

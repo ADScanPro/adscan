@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import subprocess
 import shlex
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +32,7 @@ from adscan_internal.command_runner import (
     CommandRunner,
     CommandSpec,
     build_execution_output_preview,
+    default_runner,
     summarize_execution_result,
 )
 from adscan_internal.execution_outcomes import (
@@ -62,6 +65,87 @@ from adscan_internal.text_utils import normalize_cli_output
 
 
 ExecutionResult = subprocess.CompletedProcess[str]
+_IMPACKET_EMPTY_CCACHE_PATH = str(
+    Path(tempfile.gettempdir()) / "adscan-impacket-empty.ccache"
+)
+_EMPTY_MIT_CCACHE_BYTES = (
+    b"\x05\x04"  # ccache version 4
+    b"\x00\x00"  # no header records
+    b"\x00\x00\x00\x00"  # principal name type
+    b"\x00\x00\x00\x00"  # principal component count
+    b"\x00\x00\x00\x00"  # empty realm
+)
+
+
+def _resolve_raw_script_name(command: str, fallback: str = "impacket") -> str:
+    """Return the executable basename for one shell command."""
+    try:
+        argv = shlex.split(strip_sensitive_markers(command))
+    except ValueError:
+        argv = command.split()
+    if not argv:
+        return fallback
+    return Path(argv[0]).name or fallback
+
+
+def run_raw_impacket_command(
+    command: str,
+    *,
+    script_name: str | None = None,
+    timeout: int | None = 300,
+    command_runner: CommandRunner | None = None,
+    capture_output: bool = True,
+    **kwargs: object,
+) -> ExecutionResult | None:
+    """Run a pre-built Impacket command through the central runner.
+
+    Use this for legacy/orchestration modules that already construct a complete
+    Impacket command and only need the common environment isolation, logging,
+    LDAPS fallback and optional Kerberos policy behavior.
+    """
+    runner = ImpacketRunner(command_runner=command_runner or default_runner)
+    return runner.run_raw_command(
+        script_name=script_name or _resolve_raw_script_name(command),
+        command=command,
+        timeout=timeout,
+        capture_output=capture_output,
+        **kwargs,
+    )
+
+
+class RunCommandAdapter(CommandRunner):
+    """Adapt legacy ``shell.run_command`` callbacks to ``CommandRunner``."""
+
+    def __init__(self, run_command: Callable[..., ExecutionResult | None]) -> None:
+        self._run_command = run_command
+
+    def run(self, spec: CommandSpec) -> ExecutionResult:
+        """Run through the legacy callback while preserving runner-provided env."""
+        kwargs: dict[str, object] = {}
+        if spec.timeout is not None:
+            kwargs["timeout"] = spec.timeout
+        if spec.env is not None:
+            kwargs["env"] = dict(spec.env)
+            kwargs["use_clean_env"] = False
+        if spec.cwd is not None:
+            kwargs["cwd"] = spec.cwd
+        if spec.extra:
+            kwargs.update(spec.extra)
+
+        try:
+            result = self._run_command(spec.command, **kwargs)
+        except TypeError:
+            fallback_kwargs = {
+                "timeout": spec.timeout,
+            }
+            result = self._run_command(spec.command, **fallback_kwargs)
+
+        if result is None:
+            return build_no_result_completed_process(
+                str(spec.command),
+                tool_name="impacket",
+            )
+        return result
 
 
 def _notify_ntlm_disabled_prioritize_kerberos(
@@ -155,6 +239,7 @@ class ImpacketContext:
     impacket_scripts_dir: str | Path
     validate_script_exists: Callable[[str], bool]
     get_domain_pdc: Callable[[str], str | None]
+    sync_clock_with_pdc: Callable[[str], bool] | None = None
     workspace_dir: str | Path | None = None
     domains_data: Mapping[str, Any] | None = None
 
@@ -254,6 +339,114 @@ class ImpacketRunner:
 
         self._log_result(script_name, result)
 
+        return result
+
+    def run_raw_command(
+        self,
+        *,
+        script_name: str,
+        command: str,
+        ctx: ImpacketContext | None = None,
+        kerberos_retry_context: ImpacketKerberosRetryContext | None = None,
+        auth_policy_protocol: str | None = None,
+        kerberos_command: str | None = None,
+        default_kerberos_first: bool = False,
+        timeout: int | None = None,
+        capture_output: bool = True,
+        **kwargs: object,
+    ) -> ExecutionResult | None:
+        """Run a pre-built Impacket command through the central runner.
+
+        Raw commands are used by higher-level exploitation flows that already
+        build the exact Impacket CLI.  By default they keep NTLM semantics but
+        are isolated from inherited ccaches.  When callers provide policy
+        context and a Kerberos variant, known NTLM-disabled domains can still
+        get deterministic Kerberos-first behavior with a freshly prepared
+        ticket for the intended principal.
+        """
+        current_command = command
+        kerberos_first_selected = False
+
+        if ctx is not None and kerberos_retry_context is not None:
+            protocol = auth_policy_protocol or self._resolve_auth_posture_protocol(
+                script_name
+            )
+            command_already_uses_kerberos = self._command_uses_kerberos(
+                current_command
+            )
+            decision = resolve_auth_policy_decision(
+                domains_data=ctx.domains_data,
+                domain=kerberos_retry_context.domain,
+                protocol=protocol,
+                default_preference=default_kerberos_first,
+            )
+            kerberos_first_selected = (
+                decision.prefer_kerberos
+                and not command_already_uses_kerberos
+                and bool(kerberos_command)
+            )
+            print_info_debug(
+                "[impacket] Raw auth policy: "
+                f"script={script_name} "
+                f"domain={mark_sensitive(kerberos_retry_context.domain, 'domain')} "
+                f"protocol={protocol or 'unknown'} "
+                f"ntlm_status={decision.ntlm_status} "
+                f"kerberos_first={kerberos_first_selected!r} "
+                f"reason={decision.reason if kerberos_command else 'missing_kerberos_command'}"
+            )
+            if kerberos_first_selected and kerberos_command is not None:
+                current_command = kerberos_command
+
+        kerberos_env = None
+        if (
+            ctx is not None
+            and kerberos_retry_context is not None
+            and self._command_uses_kerberos(current_command)
+        ):
+            ticket_path = self._prepare_kerberos_execution(
+                ctx=ctx,
+                retry_context=kerberos_retry_context,
+                purpose=f"{script_name} (raw Kerberos execution)",
+            )
+            kerberos_env = self._build_kerberos_command_env(
+                command=current_command,
+                ticket_path=ticket_path,
+            )
+
+        execute_kwargs = dict(kwargs)
+        if kerberos_env is not None and "env" not in execute_kwargs:
+            execute_kwargs["env"] = kerberos_env
+        result, current_command = self._execute_with_clock_skew_retry(
+            script_name=script_name,
+            command=current_command,
+            ctx=ctx,
+            domain=(
+                kerberos_retry_context.domain
+                if kerberos_retry_context is not None
+                else None
+            ),
+            timeout=timeout,
+            capture_output=capture_output,
+            **execute_kwargs,
+        )
+        if kerberos_first_selected:
+            combined_output = normalize_cli_output(
+                "\n".join(
+                    part for part in (result.stdout or "", result.stderr or "") if part
+                )
+                if result is not None
+                else ""
+            )
+            if (
+                result is not None
+                and output_indicates_kerberos_auth_failure(combined_output)
+                and not output_indicates_kerberos_invalid_credentials(combined_output)
+            ):
+                print_warning(
+                    "Impacket Kerberos authentication failed for a raw command. "
+                    "No NTLM fallback was attempted because the stored posture prefers Kerberos."
+                )
+        self._log_result(script_name, result)
         return result
 
     def run_getuserspns(
@@ -596,6 +789,7 @@ class ImpacketRunner:
         cmd_env = local_kwargs.pop("env", None)
         if use_clean_env and cmd_env is None:
             cmd_env = get_clean_env_for_compilation()
+        cmd_env = self._build_command_env(command=command, env=cmd_env)
 
         try:
             spec = CommandSpec(
@@ -656,6 +850,67 @@ class ImpacketRunner:
             telemetry.capture_exception(exc)
             print_error_verbose(f"Error executing Impacket command: {command} - {exc}")
             return None
+
+    @classmethod
+    def _build_command_env(
+        cls, *, command: str, env: Mapping[str, str] | None
+    ) -> Mapping[str, str] | None:
+        """Return an env that prevents unintended ccache use for non-Kerberos runs."""
+        if cls._command_uses_kerberos(command) or cls._command_sets_krb5ccname(command):
+            return env
+
+        prepared_env = dict(env) if env is not None else dict(os.environ)
+        inherited_ccache = prepared_env.get("KRB5CCNAME")
+        cls._ensure_empty_ccache_file()
+        prepared_env["KRB5CCNAME"] = _IMPACKET_EMPTY_CCACHE_PATH
+        if inherited_ccache:
+            print_info_debug(
+                "[impacket] Isolated non-Kerberos command from inherited Kerberos cache: "
+                f"previous_ccache={mark_sensitive(inherited_ccache, 'path')} "
+                f"empty_ccache={mark_sensitive(_IMPACKET_EMPTY_CCACHE_PATH, 'path')}"
+            )
+        return prepared_env
+
+    @staticmethod
+    def _ensure_empty_ccache_file() -> None:
+        """Create a valid empty MIT ccache file for non-Kerberos isolation."""
+        path = Path(_IMPACKET_EMPTY_CCACHE_PATH)
+        try:
+            if path.exists() and path.read_bytes() == _EMPTY_MIT_CCACHE_BYTES:
+                return
+            path.write_bytes(_EMPTY_MIT_CCACHE_BYTES)
+            path.chmod(0o600)
+        except OSError as exc:
+            print_info_debug(
+                "[impacket] Could not prepare empty Kerberos cache isolation file: "
+                f"path={mark_sensitive(str(path), 'path')} error={exc}"
+            )
+
+    @staticmethod
+    def _command_sets_krb5ccname(command: str) -> bool:
+        """Return True when the shell command explicitly sets ``KRB5CCNAME``."""
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return "KRB5CCNAME=" in command
+        return any(part.startswith("KRB5CCNAME=") for part in argv)
+
+    @staticmethod
+    def _build_kerberos_command_env(
+        *, command: str, ticket_path: str | None
+    ) -> Mapping[str, str] | None:
+        """Build an env that preserves clean-env safety and binds the ccache."""
+        if not ticket_path:
+            return None
+        env = (
+            get_clean_env_for_compilation()
+            if command_string_needs_clean_env(command)
+            else dict(os.environ)
+        )
+        env["KRB5CCNAME"] = ticket_path
+        if os.environ.get("KRB5_CONFIG"):
+            env["KRB5_CONFIG"] = str(os.environ["KRB5_CONFIG"])
+        return env
 
     def _run_with_kerberos_retry(
         self,
@@ -740,18 +995,27 @@ class ImpacketRunner:
             self._command_uses_kerberos(current_command)
             and kerberos_retry_context is not None
         ):
-            self._prepare_kerberos_execution(
+            ticket_path = self._prepare_kerberos_execution(
                 ctx=ctx,
                 retry_context=kerberos_retry_context,
                 purpose=f"{script_name} (initial Kerberos execution)",
             )
+            kerberos_env = self._build_kerberos_command_env(
+                command=current_command,
+                ticket_path=ticket_path,
+            )
+        else:
+            kerberos_env = None
 
         print_info_debug(f"[impacket] Running {script_name}: {current_command}")
+        execute_kwargs = dict(kwargs)
+        if kerberos_env is not None and "env" not in execute_kwargs:
+            execute_kwargs["env"] = kerberos_env
         result = self._execute_command(
             current_command,
             timeout=timeout,
             capture_output=capture_output,
-            **kwargs,
+            **execute_kwargs,
         )
 
         if (
@@ -872,11 +1136,17 @@ class ImpacketRunner:
             return result
 
         if kerberos_retry_context is not None:
-            self._prepare_kerberos_execution(
+            ticket_path = self._prepare_kerberos_execution(
                 ctx=ctx,
                 retry_context=kerberos_retry_context,
                 purpose=f"{script_name} (Kerberos retry after NTLM-disabled signal)",
             )
+            retry_env = self._build_kerberos_command_env(
+                command=retry_command,
+                ticket_path=ticket_path,
+            )
+        else:
+            retry_env = None
 
         print_warning(
             "Impacket reported NTLM is disabled or unsupported. Retrying with Kerberos (-k)."
@@ -885,11 +1155,21 @@ class ImpacketRunner:
             f"[impacket] NTLM-disabled Kerberos retry command for {script_name}: {retry_command}"
         )
         self._log_result(script_name, result)
-        retry_result = self._execute_command(
-            retry_command,
+        retry_kwargs = dict(kwargs)
+        if retry_env is not None and "env" not in retry_kwargs:
+            retry_kwargs["env"] = retry_env
+        retry_result, _retry_command_used = self._execute_with_clock_skew_retry(
+            script_name=script_name,
+            command=retry_command,
+            ctx=ctx,
+            domain=(
+                kerberos_retry_context.domain
+                if kerberos_retry_context is not None
+                else None
+            ),
             timeout=timeout,
             capture_output=capture_output,
-            **kwargs,
+            **retry_kwargs,
         )
         self._log_result(script_name, retry_result)
         return retry_result
@@ -914,6 +1194,114 @@ class ImpacketRunner:
         if build_impacket_kerberos_command(script_name, command) is None:
             return False
         return True
+
+    def _execute_with_clock_skew_retry(
+        self,
+        *,
+        script_name: str,
+        command: str,
+        ctx: ImpacketContext | None,
+        domain: str | None,
+        timeout: int | None,
+        capture_output: bool,
+        max_clock_skew_sync_attempts: int = 3,
+        **kwargs: object,
+    ) -> tuple[ExecutionResult | None, str]:
+        """Execute one Impacket command and retry on Kerberos time skew."""
+        current_command = command
+        clock_skew_sync_attempts = 0
+
+        while True:
+            print_info_debug(f"[impacket] Running {script_name}: {current_command}")
+            result = self._execute_command(
+                current_command,
+                timeout=timeout,
+                capture_output=capture_output,
+                **kwargs,
+            )
+            if not self._output_has_clock_skew(result):
+                return result, current_command
+
+            self._log_result(script_name, result)
+
+            if not domain:
+                print_warning(
+                    "KRB_AP_ERR_SKEW detected in Impacket output but no domain is available "
+                    "to synchronize the clock with the PDC."
+                )
+                return result, current_command
+
+            marked_domain = mark_sensitive(str(domain), "domain")
+            sync_clock_with_pdc = getattr(ctx, "sync_clock_with_pdc", None)
+            if not callable(sync_clock_with_pdc):
+                print_warning(
+                    "KRB_AP_ERR_SKEW detected in Impacket output but no centralized clock "
+                    "synchronization callback is available for this context."
+                )
+                print_info_debug(
+                    "[impacket] Clock-skew retry skipped: "
+                    f"script={script_name} domain={marked_domain} "
+                    "reason=missing_sync_callback"
+                )
+                return result, current_command
+
+            if clock_skew_sync_attempts >= max_clock_skew_sync_attempts:
+                print_warning(
+                    "KRB_AP_ERR_SKEW persists after multiple clock synchronization attempts. "
+                    "Stopping retries to avoid an infinite loop."
+                )
+                print_info_debug(
+                    "[impacket] Clock-skew retries exhausted: "
+                    f"script={script_name} domain={marked_domain} "
+                    f"attempts={clock_skew_sync_attempts}/{max_clock_skew_sync_attempts}"
+                )
+                return result, current_command
+
+            clock_skew_sync_attempts += 1
+            print_warning(
+                "KRB_AP_ERR_SKEW detected when running Impacket. Attempting to synchronize "
+                "the local clock with the PDC of domain "
+                f"'{marked_domain}' and retrying "
+                f"({clock_skew_sync_attempts}/{max_clock_skew_sync_attempts})."
+            )
+            if not sync_clock_with_pdc(str(domain)):
+                print_error(
+                    "Clock synchronization with the PDC of domain "
+                    f"'{marked_domain}' failed. Impacket command will not be retried for clock skew."
+                )
+                print_info_debug(
+                    "[impacket] Clock-skew retry aborted: "
+                    f"script={script_name} domain={marked_domain} "
+                    f"attempt={clock_skew_sync_attempts}/{max_clock_skew_sync_attempts} "
+                    "reason=clock_sync_failed"
+                )
+                return result, current_command
+
+            print_info_debug(
+                "[impacket] Clock-skew retry scheduled: "
+                f"script={script_name} domain={marked_domain} "
+                f"attempt={clock_skew_sync_attempts}/{max_clock_skew_sync_attempts}"
+            )
+
+    @staticmethod
+    def _output_has_clock_skew(result: ExecutionResult | None) -> bool:
+        """Return True when the output indicates Kerberos clock skew."""
+        if not isinstance(result, subprocess.CompletedProcess):
+            return False
+        combined = normalize_cli_output(
+            "\n".join(
+                part for part in (result.stdout or "", result.stderr or "") if part
+            )
+        ).lower()
+        return any(
+            pattern in combined
+            for pattern in (
+                "clock skew too great",
+                "ticket not yet valid",
+                "krb_ap_err_skew",
+                "krb_ap_err_tkt_nyv",
+            )
+        )
 
     @staticmethod
     def _build_retry_context(

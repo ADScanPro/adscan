@@ -28,8 +28,9 @@ def _coerce_boolish(value: object) -> bool:
 
 def node_is_rodc_computer(node: dict[str, Any]) -> bool:
     """Return True when an attack-graph node represents an RODC computer."""
-    kind = str(node.get("kind") or "")
-    if kind != "Computer":
+    kind = node.get("kind") or ""
+    kind_values = kind if isinstance(kind, list) else [kind]
+    if not any(str(value or "").strip() == "Computer" for value in kind_values):
         return False
 
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}

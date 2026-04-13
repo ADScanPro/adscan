@@ -16,6 +16,7 @@ import re
 import subprocess
 from typing import Protocol
 
+from adscan_internal.principal_utils import normalize_machine_account
 from adscan_internal import (
     print_error,
     print_info,
@@ -26,11 +27,22 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.cli.common import build_lab_event_fields
+from adscan_internal.command_runner import default_runner
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_exception,
 )
 from rich.prompt import Confirm
+
+from adscan_internal.integrations.impacket.runner import (
+    ImpacketContext,
+    ImpacketKerberosRetryContext,
+    ImpacketRunner,
+)
+from adscan_internal.services.machine_account_quota_state_service import (
+    clear_machine_account_quota_exhausted,
+    mark_machine_account_quota_exhausted,
+)
 
 
 class DelegationShell(Protocol):
@@ -75,6 +87,95 @@ class DelegationShell(Protocol):
 
     def dcsync(self, domain: str, username: str, ticket: str) -> None: ...
 
+    def add_credential(
+        self,
+        domain: str,
+        user: str,
+        cred: str,
+        host: str | None = None,
+        service: str | None = None,
+        skip_hash_cracking: bool = False,
+        pdc_ip: str | None = None,
+        source_steps: list[object] | None = None,
+        prompt_for_user_privs_after: bool = True,
+        skip_user_privs_enumeration: bool = False,
+        verify_credential: bool = True,
+        verify_local_credential: bool = True,
+        prompt_local_reuse_after: bool = True,
+        ui_silent: bool = False,
+        ensure_fresh_kerberos_ticket: bool = True,
+        force_authenticated_enumeration: bool = False,
+        prompt_when_already_authenticated: bool = False,
+        allow_empty_credential: bool = False,
+        trusted_manual_validation: bool = False,
+    ) -> None: ...
+
+
+def _build_impacket_context(shell: DelegationShell) -> ImpacketContext:
+    """Build central Impacket runner context from the interactive shell."""
+    return ImpacketContext(
+        impacket_scripts_dir=str(shell.impacket_scripts_dir or ""),
+        validate_script_exists=lambda path: os.path.isfile(path)
+        and os.access(path, os.X_OK),
+        get_domain_pdc=lambda domain: str(
+            (shell.domains_data.get(domain) or {}).get("pdc") or ""
+        )
+        or None,
+        sync_clock_with_pdc=lambda domain: bool(
+            shell.do_sync_clock_with_pdc(domain, verbose=True)
+        ),
+        workspace_dir=shell.current_workspace_dir,
+        domains_data=shell.domains_data,
+    )
+
+
+def _build_impacket_kerberos_retry_context(
+    shell: DelegationShell,
+    *,
+    domain: str,
+    username: str,
+    credential: str,
+) -> ImpacketKerberosRetryContext:
+    """Build deterministic Kerberos context for an Impacket auth principal."""
+    domain_info = shell.domains_data.get(domain) or {}
+    dc_ip = str(domain_info.get("pdc") or "").strip() or None
+    return ImpacketKerberosRetryContext(
+        domain=domain,
+        username=username,
+        credential=credential,
+        dc_ip=dc_ip,
+    )
+
+
+def _run_find_delegation_command(
+    shell: DelegationShell,
+    *,
+    command: str,
+    domain: str,
+    username: str,
+    password: str,
+    kerberos: bool = False,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run ``findDelegation.py`` through the central Impacket runner."""
+    runner = ImpacketRunner(command_runner=default_runner)
+    kerberos_command = command if " -k" in f" {command}" else f"{command} -k"
+    selected_command = kerberos_command if kerberos else command
+    return runner.run_raw_command(
+        script_name="findDelegation.py",
+        command=selected_command,
+        ctx=_build_impacket_context(shell),
+        kerberos_retry_context=_build_impacket_kerberos_retry_context(
+            shell,
+            domain=domain,
+            username=username,
+            credential=password,
+        ),
+        auth_policy_protocol="ldap",
+        kerberos_command=kerberos_command,
+        timeout=300,
+        capture_output=True,
+    )
+
 
 def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
     """
@@ -104,9 +205,11 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
                 f"findDelegation.py not found or not executable in {shell.impacket_scripts_dir}. Please check Impacket installation."
             )
             return
+        auth_username = shell.domains_data[shell.domain]["username"]
+        auth_password = shell.domains_data[shell.domain]["password"]
         auth = shell.build_auth_impacket_no_host(
-            shell.domains_data[shell.domain]["username"],
-            shell.domains_data[shell.domain]["password"],
+            auth_username,
+            auth_password,
             shell.domain,
         )
         marked_domain = mark_sensitive(domain, "domain")
@@ -116,7 +219,16 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
         print_info_debug(f"Command: {command}")
 
         # First execution without -k
-        completed_process = shell.run_command(command, timeout=300)
+        completed_process = _run_find_delegation_command(
+            shell,
+            command=command,
+            domain=domain,
+            username=auth_username,
+            password=auth_password,
+        )
+        if completed_process is None:
+            print_error("Error enumerating delegations.")
+            return
 
         output = completed_process.stdout
         # stderr is available in completed_process.stderr if needed
@@ -128,7 +240,17 @@ def do_enum_delegations(shell: DelegationShell, domain: str) -> None:
             command += " -k"
             print_info("Retrying with -k")
             # Overwrite completed_process with the result of the retry
-            completed_process = shell.run_command(command, timeout=300)
+            completed_process = _run_find_delegation_command(
+                shell,
+                command=command,
+                domain=domain,
+                username=auth_username,
+                password=auth_password,
+                kerberos=True,
+            )
+            if completed_process is None:
+                print_error("Error enumerating delegations.")
+                return
             output = completed_process.stdout
         if completed_process.returncode == 0:
             # Initialize the domain dictionary if it does not exist
@@ -413,14 +535,33 @@ def enum_delegations_user(
         print_info_verbose(f"Enumerating delegation details for user {marked_username}")
 
         # First execution without -k
-        completed_process = shell.run_command(command, timeout=300)
+        completed_process = _run_find_delegation_command(
+            shell,
+            command=command,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+        if completed_process is None:
+            print_error("Error enumerating user delegations.")
+            return
         output = completed_process.stdout
         error = completed_process.stderr
         # If there is a credentials error, try with -k
         if "invalidCredentials" in output or "AcceptSecurityContext error" in output:
             command += " -k"
             print_success("Retrying with -k")
-            completed_process = shell.run_command(command, timeout=300)
+            completed_process = _run_find_delegation_command(
+                shell,
+                command=command,
+                domain=domain,
+                username=username,
+                password=password,
+                kerberos=True,
+            )
+            if completed_process is None:
+                print_error("Error enumerating user delegations.")
+                return
             output = completed_process.stdout
             error = completed_process.stderr
         if completed_process.returncode == 0:
@@ -534,7 +675,15 @@ def exploit_delegation_constrained(
             telemetry.capture_exception(e)
 
         # Execute the command using the existing execute_dump_lsa function
-        execute_constrained(shell, command, domain, target_host, target_user)
+        execute_constrained(
+            shell,
+            command,
+            domain,
+            target_host,
+            target_user,
+            username=username,
+            password=password,
+        )
 
     except Exception as e:
         telemetry.capture_exception(e)
@@ -548,15 +697,38 @@ def execute_constrained(
     domain: str,
     target_host: str,
     target_user: str,
+    *,
+    username: str = "",
+    password: str = "",
 ) -> None:
     from adscan_internal.rich_output import mark_sensitive
     from adscan_internal.services.exploitation import ExploitationService
 
     try:
         service = ExploitationService()
+        impacket_context = (
+            _build_impacket_context(shell) if username and password else None
+        )
+        kerberos_retry_context = (
+            _build_impacket_kerberos_retry_context(
+                shell,
+                domain=domain,
+                username=username,
+                credential=password,
+            )
+            if username and password
+            else None
+        )
+        runner_kwargs = {}
+        if impacket_context is not None and kerberos_retry_context is not None:
+            runner_kwargs = {
+                "impacket_context": impacket_context,
+                "kerberos_retry_context": kerberos_retry_context,
+            }
         result = service.delegation.run_s4proxy_command(
             command=command,
             timeout=300,
+            **runner_kwargs,
         )
         output_str = (result.stdout or "") + (result.stderr or "")
 
@@ -797,6 +969,8 @@ def add_computer_to_domain(
     password: str,
 ) -> bool:
     """Adds a new computer to the domain."""
+    from adscan_internal.services.exploitation import ExploitationService
+
     try:
         if domain not in shell.domains:
             marked_target_domain = mark_sensitive(domain, "domain")
@@ -827,12 +1001,61 @@ def add_computer_to_domain(
         command += f"{auth}"
 
         print_success("Adding computer to the domain")
-        proc = shell.run_command(command, timeout=300)
+        service = ExploitationService()
+        outcome = service.delegation.run_addcomputer_command(
+            command=command,
+            timeout=300,
+            impacket_context=_build_impacket_context(shell),
+            kerberos_retry_context=_build_impacket_kerberos_retry_context(
+                shell,
+                domain=domain,
+                username=username,
+                credential=password,
+            ),
+        )
 
-        if proc.returncode == 0:
+        if outcome.success:
+            clear_machine_account_quota_exhausted(
+                shell,
+                domain=domain,
+                username=username,
+            )
             print_success(f"Computer {computer_name}$ added successfully")
+            machine_account = normalize_machine_account(computer_name)
+            try:
+                shell.add_credential(
+                    domain,
+                    machine_account,
+                    computer_pass,
+                    prompt_for_user_privs_after=False,
+                    skip_user_privs_enumeration=True,
+                    ui_silent=True,
+                    ensure_fresh_kerberos_ticket=True,
+                    force_authenticated_enumeration=False,
+                    prompt_when_already_authenticated=False,
+                )
+            except Exception as exc:
+                telemetry.capture_exception(exc)
+                marked_machine = mark_sensitive(machine_account, "user")
+                print_warning(
+                    "The computer was created successfully, but ADscan could not "
+                    f"persist the machine credential bootstrap for {marked_machine}."
+                )
             return True
-        print_error(f"Error adding computer: {proc.stderr}")
+        if outcome.quota_exceeded:
+            mark_machine_account_quota_exhausted(
+                shell,
+                domain=domain,
+                username=username,
+                reason=outcome.output or "MachineAccountQuota exceeded for actor.",
+            )
+            marked_user = mark_sensitive(username, "user")
+            marked_domain = mark_sensitive(domain, "domain")
+            print_warning(
+                "MachineAccountQuota exhausted for the current actor: "
+                f"{marked_user} can no longer create additional machine accounts in {marked_domain}."
+            )
+        print_error(f"Error adding computer: {outcome.output or 'unknown error'}")
         return False
 
     except Exception as e:
@@ -873,6 +1096,13 @@ def set_rbcd_delegation(
         outcome = service.delegation.run_rbcd_command(
             command=build_result.command,
             timeout=300,
+            impacket_context=_build_impacket_context(shell),
+            kerberos_retry_context=_build_impacket_kerberos_retry_context(
+                shell,
+                domain=domain,
+                username=username,
+                credential=password,
+            ),
         )
 
         if outcome.success:
@@ -1021,6 +1251,13 @@ def launch_s4proxy(
         result = service.delegation.run_service_ticket_command(
             command=build_result.command,
             timeout=300,
+            impacket_context=_build_impacket_context(shell),
+            kerberos_retry_context=_build_impacket_kerberos_retry_context(
+                shell,
+                domain=domain,
+                username=username,
+                credential=password,
+            ),
         )
 
         if result.success:
@@ -1161,6 +1398,13 @@ def request_delegated_service_ticket(
         result = service.delegation.run_service_ticket_command(
             command=build_result.command,
             timeout=300,
+            impacket_context=_build_impacket_context(shell),
+            kerberos_retry_context=_build_impacket_kerberos_retry_context(
+                shell,
+                domain=domain,
+                username=username,
+                credential=password,
+            ),
         )
         setattr(
             shell,

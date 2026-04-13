@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -31,22 +32,97 @@ _ADS_RIGHT_DS_WRITE_PROP = 0x20
 _SD_FLAGS_DACL = 0x04
 
 
+@dataclass
+class _NativeLDAPConfig:
+    """Minimal LDAP connection config compatible with ADscan's fallback helper."""
+
+    domain: str
+    dc_ip: str
+    use_ldaps: bool
+    use_kerberos: bool
+    username: str | None = None
+    password: str | None = None
+    kerberos_target_hostname: str | None = None
+
+
+class _NativeLDAPConnection:
+    """Small ldap3-backed context manager exposing the CertiHound-like API used here."""
+
+    def __init__(self, config: _NativeLDAPConfig) -> None:
+        self.config = config
+        self.connection: Any | None = None
+        self._server: Any | None = None
+
+    def __enter__(self) -> "_NativeLDAPConnection":
+        from ldap3 import Server
+
+        self._server = Server(
+            self.config.dc_ip,
+            use_ssl=bool(self.config.use_ldaps),
+            connect_timeout=10,
+        )
+        self.connection = (
+            self._connect_kerberos()
+            if bool(self.config.use_kerberos)
+            else self._connect_password()
+        )
+        if not bool(getattr(self.connection, "bound", False)):
+            self.connection.bind()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        if self.connection is not None:
+            self.connection.unbind()
+
+    def _connect_kerberos(self) -> Any:
+        from ldap3 import Connection, SASL
+
+        target_host = str(
+            self.config.kerberos_target_hostname or self.config.dc_ip
+        ).strip()
+        return Connection(
+            self._server,
+            authentication=SASL,
+            sasl_mechanism="GSSAPI",
+            sasl_credentials=(target_host,),
+            auto_bind=False,
+            receive_timeout=30,
+        )
+
+    def _connect_password(self) -> Any:
+        from ldap3 import Connection, NTLM
+
+        username = str(self.config.username or "").strip()
+        if "\\" not in username and "@" not in username:
+            username = f"{self.config.domain}\\{username}"
+        return Connection(
+            self._server,
+            user=username,
+            password=str(self.config.password or ""),
+            authentication=NTLM,
+            auto_bind=False,
+            receive_timeout=30,
+        )
+
+    def search(self, *args: Any, **kwargs: Any) -> Any:
+        """Proxy ldap3 search calls while preserving ``connection.entries``."""
+        if self.connection is None:
+            raise RuntimeError("LDAP connection is not open")
+        return self.connection.search(*args, **kwargs)
+
+
 class DomainRodcPrpDetectionService(BaseService):
     """Collect domain-wide delegated RODC PRP-write findings from LDAP DACLs."""
 
     def _load_modules(self) -> dict[str, Any]:
         """Load LDAP and ACL parsing modules lazily."""
         from impacket.ldap.ldaptypes import SR_SECURITY_DESCRIPTOR
-        from certihound.ldap.connection import (  # type: ignore  # pylint: disable=import-error
-            LDAPConfig,
-            LDAPConnection,
-        )
         from ldap3 import SUBTREE
         from ldap3.protocol.microsoft import security_descriptor_control
 
         return {
-            "LDAPConfig": LDAPConfig,
-            "LDAPConnection": LDAPConnection,
+            "LDAPConfig": _NativeLDAPConfig,
+            "LDAPConnection": _NativeLDAPConnection,
             "SR_SECURITY_DESCRIPTOR": SR_SECURITY_DESCRIPTOR,
             "SUBTREE": SUBTREE,
             "security_descriptor_control": security_descriptor_control,

@@ -362,6 +362,7 @@ def run_service_access_sweep(
     prompt: bool = False,
     scope_preference: str = "optimized",
     include_previously_tested: bool = False,
+    workflow_intent: str | None = None,
 ) -> None:
     """Enumerate access across a set of services for one user."""
     if domain not in shell.domains_data:
@@ -572,6 +573,7 @@ def run_service_access_sweep(
                             username,
                             password,
                             prompt=prompt,
+                            workflow_intent=workflow_intent,
                         )
                     )
                 if found_hosts or cleaned_hosts:

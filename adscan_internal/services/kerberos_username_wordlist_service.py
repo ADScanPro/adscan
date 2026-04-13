@@ -2,6 +2,7 @@
 
 This module centralizes the logic for:
 - loading built-in statistically-likely username lists
+- loading the compact ADscan username-format inference wordlist
 - generating username candidates from known names and a chosen corporate format
 - persisting merged wordlists and source metadata for Kerberos enumeration
 """
@@ -30,6 +31,18 @@ STATISTICALLY_LIKELY_BASE_DIR_CANDIDATES: tuple[Path, ...] = (
 GENERAL_COMMON_USERNAME_WORDLIST_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/share/wordlists/statistically-likely-usernames/top-formats.txt"),
     Path("/opt/adscan/wordlists/statistically-likely-usernames/top-formats.txt"),
+)
+
+_REPO_WORDLIST_ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "wordlists"
+
+KERBEROS_FORMAT_INFERENCE_WORDLIST_CANDIDATES: tuple[Path, ...] = (
+    Path("/opt/adscan/wordlists/kerberos-format-inference.txt"),
+    _REPO_WORDLIST_ASSET_DIR / "kerberos-format-inference.txt",
+)
+
+KERBEROS_FORMAT_INFERENCE_METADATA_CANDIDATES: tuple[Path, ...] = (
+    Path("/opt/adscan/wordlists/kerberos-format-inference.json"),
+    _REPO_WORDLIST_ASSET_DIR / "kerberos-format-inference.json",
 )
 
 SUPPORTED_KERBEROS_PATTERN_KEYS: tuple[str, ...] = (
@@ -74,12 +87,100 @@ class KerberosWordlistSourceMetadata:
 class KerberosUsernameWordlistService:
     """Build focused Kerberos username candidate wordlists."""
 
+    def __init__(self) -> None:
+        self._inference_metadata_cache: dict[str, tuple[str, ...]] | None = None
+
     def get_general_common_wordlist_path(self) -> Path | None:
         """Return the built-in generic Kerberos username wordlist if present."""
         for candidate in GENERAL_COMMON_USERNAME_WORDLIST_CANDIDATES:
             if candidate.exists() and candidate.is_file():
                 return candidate
         return None
+
+    def get_format_inference_wordlist_path(self) -> Path | None:
+        """Return the compact runtime wordlist used to infer username formats."""
+        for candidate in KERBEROS_FORMAT_INFERENCE_WORDLIST_CANDIDATES:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
+
+    def get_format_inference_metadata_path(self) -> Path | None:
+        """Return the metadata mapping inference candidates back to format keys."""
+        for candidate in KERBEROS_FORMAT_INFERENCE_METADATA_CANDIDATES:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
+
+    def load_format_inference_metadata(self) -> dict[str, tuple[str, ...]]:
+        """Load and cache ``candidate -> pattern_keys`` mappings for inference."""
+        if self._inference_metadata_cache is not None:
+            return self._inference_metadata_cache
+
+        metadata_path = self.get_format_inference_metadata_path()
+        if metadata_path is None:
+            self._inference_metadata_cache = {}
+            return self._inference_metadata_cache
+
+        try:
+            raw_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self._inference_metadata_cache = {}
+            return self._inference_metadata_cache
+
+        candidate_patterns = raw_payload.get("candidate_patterns")
+        if not isinstance(candidate_patterns, dict):
+            self._inference_metadata_cache = {}
+            return self._inference_metadata_cache
+
+        normalized: dict[str, tuple[str, ...]] = {}
+        for candidate, raw_patterns in candidate_patterns.items():
+            normalized_candidate = normalize_username_candidate(str(candidate or ""))
+            if not normalized_candidate:
+                continue
+            if not isinstance(raw_patterns, list):
+                continue
+            filtered_patterns = tuple(
+                pattern
+                for pattern in raw_patterns
+                if isinstance(pattern, str) and pattern in SUPPORTED_KERBEROS_PATTERN_KEYS
+            )
+            if filtered_patterns:
+                normalized[normalized_candidate] = filtered_patterns
+
+        self._inference_metadata_cache = normalized
+        return normalized
+
+    def rank_inferred_patterns_from_candidates(
+        self, candidates: list[str] | set[str] | tuple[str, ...]
+    ) -> list[tuple[str, int]]:
+        """Rank likely username patterns from observed valid usernames.
+
+        The compact inference wordlist stores a reverse mapping from candidate
+        username to the pattern(s) that generated it. We score patterns by how
+        many validated usernames map back to each pattern.
+        """
+        metadata = self.load_format_inference_metadata()
+        if not metadata:
+            return []
+
+        scores: dict[str, int] = {key: 0 for key in SUPPORTED_KERBEROS_PATTERN_KEYS}
+        for raw_candidate in candidates:
+            candidate = normalize_username_candidate(str(raw_candidate or ""))
+            if not candidate:
+                continue
+            for pattern_key in metadata.get(candidate, ()):
+                scores[pattern_key] = scores.get(pattern_key, 0) + 1
+
+        order = {key: idx for idx, key in enumerate(SUPPORTED_KERBEROS_PATTERN_KEYS)}
+        ranked = sorted(
+            (
+                (pattern_key, score)
+                for pattern_key, score in scores.items()
+                if score > 0
+            ),
+            key=lambda item: (-item[1], order.get(item[0], 999), item[0]),
+        )
+        return ranked
 
     def get_statistically_likely_wordlist_path(self, pattern_key: str) -> Path | None:
         """Resolve the statistically-likely wordlist for a supported pattern."""

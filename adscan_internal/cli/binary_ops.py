@@ -19,7 +19,6 @@ Commands
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -29,7 +28,6 @@ from adscan_internal import (
     print_error,
     print_exception,
     print_info,
-    print_info_debug,
     print_info_verbose,
     print_operation_header,
     print_success,
@@ -42,7 +40,6 @@ from adscan_internal.services.exploitation.binary_ops import (
     WINDOWS_BINARY_CATALOG,
     WindowsBinary,
     donut_available,
-    ensure_binary,
     is_cached,
     list_binaries,
     syswhispers4_available,
@@ -442,7 +439,7 @@ def _select_exec_args(shell: Any, binary: WindowsBinary) -> str:
 
 def _select_remote_dir(binary: WindowsBinary) -> str:
     default = binary.default_remote_dir
-    answer = Prompt.ask(f"Remote destination directory", default=default)
+    answer = Prompt.ask("Remote destination directory", default=default)
     return answer.strip() or default
 
 
@@ -462,7 +459,6 @@ def _execute_deploy(
 ) -> None:
     """Run the full prepare → upload → execute → cleanup pipeline."""
     masked_host = mark_sensitive(auth.host, "hostname")
-    masked_user = mark_sensitive(auth.username, "user")
 
     print_operation_header(
         "Binary Deployment",
@@ -492,8 +488,8 @@ def _execute_deploy(
     # --- render result ---
     if not result.prepared:
         print_error(
-            f"Binary preparation failed. "
-            f"{'Place the binary at ' + str(result.local_path) if result.local_path else ''}"
+            "Binary preparation failed. "
+            + (f"Place the binary at {result.local_path}" if result.local_path else "")
         )
         return
 

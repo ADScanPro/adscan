@@ -44,6 +44,7 @@ class Domain:
         local_credentials: Nested dict of local credentials {host: {service: {user: password}}}
         kerberos_tickets: Dictionary of Kerberos tickets {username: ticket_path}
         kerberos_keys: Typed Kerberos keys {username: {aes256/aes128/nt_hash/...}}
+        rodc_followup_state: Persisted RODC follow-up milestones keyed by target host
         trusts: List of discovered domain trusts
         users: List of discovered user accounts
         computers: List of discovered computer accounts
@@ -85,6 +86,7 @@ class Domain:
         default_factory=dict
     )  # {username: ticket_path}
     kerberos_keys: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    rodc_followup_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     auth_posture: Dict[str, Any] = field(default_factory=dict)
 
     # Discovered entities
@@ -122,6 +124,7 @@ class Domain:
             "local_credentials": self.local_credentials,
             "kerberos_tickets": self.kerberos_tickets,
             "kerberos_keys": self.kerberos_keys,
+            "rodc_followup_state": self.rodc_followup_state,
             "auth_posture": self.auth_posture,
             "trusts": self.trusts,
             "users": self.users,
@@ -165,6 +168,7 @@ class Domain:
             local_credentials=data.get("local_credentials", {}),
             kerberos_tickets=data.get("kerberos_tickets", {}),
             kerberos_keys=data.get("kerberos_keys", {}),
+            rodc_followup_state=data.get("rodc_followup_state", {}),
             auth_posture=data.get("auth_posture", {}),
             trusts=data.get("trusts", []),
             users=data.get("users", []),

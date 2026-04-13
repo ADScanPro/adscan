@@ -57,6 +57,7 @@ from adscan_internal.services.attack_step_catalog import (
     get_exploitation_relation_vuln_keys,
     normalize_execution_relation,
 )
+from adscan_internal.services.domain_controller_classifier import node_is_rodc_computer
 from adscan_internal.services.membership_snapshot import (
     load_membership_snapshot as _load_membership_snapshot_impl,
     membership_snapshot_path as _membership_snapshot_path,
@@ -3521,12 +3522,17 @@ def _resolve_rodc_prp_report(
         f"[rodc-prp] attempting delegated RODC PRP discovery for "
         f"{mark_sensitive(domain_key, 'domain')} via {mark_sensitive(str(dc_target), 'host')}"
     )
+    password_fallback_secret = (
+        ""
+        if CredentialStoreService._looks_like_ntlm_hash(password)
+        else str(password)
+    )
     report = DomainRodcPrpDetectionService().build_rodc_prp_write_report(
         dc_address=str(dc_target),
         kerberos_target_hostname=kerberos_target_hostname,
         target_domain=domain_key,
-        username=None if kerberos_ready else str(username),
-        password=None if kerberos_ready else str(password),
+        username=str(username),
+        password=password_fallback_secret,
         use_kerberos=kerberos_ready,
         use_ldaps=True,
     )
@@ -5595,9 +5601,11 @@ def _node_is_tier0(node: dict[str, Any]) -> bool:
         return True
     if bool(props.get("isTierZero")):
         return True
+    if node_is_rodc_computer(node):
+        return True
     tags = node.get("system_tags") or props.get("system_tags") or []
     if isinstance(tags, str):
-        tags = [tags]
+        tags = [tag.strip() for tag in re.split(r"[, ]+", tags) if tag.strip()]
     return any(str(tag).lower() == "admin_tier_0" for tag in tags)
 
 
@@ -7186,9 +7194,14 @@ def upsert_nodes(
             )
         existing = node_map.get(nid)
         merged = existing if isinstance(existing, dict) else {}
-        node_properties = (
+        existing_properties = (
+            merged.get("properties") if isinstance(merged.get("properties"), dict) else {}
+        )
+        incoming_properties = (
             node.get("properties") if isinstance(node.get("properties"), dict) else {}
         )
+        node_properties = dict(existing_properties)
+        node_properties.update(incoming_properties)
         if kind in {"User", "Computer"} and domain_upper:
             sam = str(
                 node_properties.get("samaccountname")
@@ -7205,30 +7218,62 @@ def upsert_nodes(
                 node_name = str(node.get("name") or "").strip()
                 if node_name and "@" not in node_name:
                     node["name"] = str(node_properties.get("name") or node_name)
-        system_tags = (
-            node.get("system_tags") or node_properties.get("system_tags") or []
+
+        def _normalize_system_tags(value: object) -> list[str]:
+            """Return normalized BloodHound system tags from one node field."""
+            if isinstance(value, str):
+                return [tag.strip() for tag in re.split(r"[, ]+", value) if tag.strip()]
+            if isinstance(value, list):
+                return [str(tag).strip() for tag in value if str(tag).strip()]
+            return []
+
+        system_tags = sorted(
+            {
+                *[tag.lower() for tag in _normalize_system_tags(merged.get("system_tags"))],
+                *[
+                    tag.lower()
+                    for tag in _normalize_system_tags(existing_properties.get("system_tags"))
+                ],
+                *[tag.lower() for tag in _normalize_system_tags(node.get("system_tags"))],
+                *[tag.lower() for tag in _normalize_system_tags(node_properties.get("system_tags"))],
+            }
         )
-        if isinstance(system_tags, str):
-            system_tags = [system_tags]
+        is_tier_zero = bool(
+            merged.get("isTierZero")
+            or existing_properties.get("isTierZero")
+            or node.get("isTierZero")
+            or node_properties.get("isTierZero")
+            or "admin_tier_0" in system_tags
+        )
+        is_high_value = bool(
+            is_tier_zero
+            or merged.get("highvalue")
+            or existing_properties.get("highvalue")
+            or node.get("highvalue")
+            or node_properties.get("highvalue")
+        )
+        node_properties["isTierZero"] = is_tier_zero
+        node_properties["highvalue"] = is_high_value
+        if system_tags:
+            node_properties["system_tags"] = ",".join(system_tags)
         merged.update(
             {
                 "id": nid,
                 "label": _node_display_name(node),
                 "kind": _node_kind(node),
-                "objectId": node.get("objectId") or node.get("objectid"),
+                "objectId": (
+                    node.get("objectId")
+                    or node.get("objectid")
+                    or merged.get("objectId")
+                    or merged.get("objectid")
+                ),
                 # Persist common BloodHound metadata at the top-level so
                 # attack-path filtering and tests can rely on it without
                 # requiring a full `properties` payload.
-                "isTierZero": bool(
-                    node.get("isTierZero") or node_properties.get("isTierZero")
-                ),
-                "highvalue": bool(
-                    node.get("highvalue") or node_properties.get("highvalue")
-                ),
-                "system_tags": list(system_tags)
-                if isinstance(system_tags, list)
-                else [],
-                "is_high_value": _node_is_effectively_high_value(node),
+                "isTierZero": is_tier_zero,
+                "highvalue": is_high_value,
+                "system_tags": system_tags,
+                "is_high_value": is_high_value,
                 "properties": node_properties,
             }
         )

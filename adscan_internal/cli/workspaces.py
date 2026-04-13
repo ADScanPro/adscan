@@ -71,7 +71,10 @@ def do_workspace(shell: WorkspaceShell, args: str) -> None:
     if not args:
         print_instruction("Usage: workspace <create|delete|select|show|save|list>")
         if shell.current_workspace:
-            print_success(f"Current workspace: {shell.current_workspace_dir}")
+            marked_current_workspace_dir = mark_sensitive(
+                shell.current_workspace_dir or "", "path"
+            )
+            print_success(f"Current workspace: {marked_current_workspace_dir}")
         else:
             print_warning("No workspace selected.")
         workspace_list(shell)
@@ -136,12 +139,14 @@ def workspace_list(shell: WorkspaceShell) -> None:
     )
     for ws_name in sorted_workspaces:
         ws_path = os.path.join(shell.workspaces_dir, ws_name)
+        marked_workspace_name = mark_sensitive(ws_name, "workspace")
+        marked_workspace_path = mark_sensitive(ws_path, "path")
         status = (
             "[bold green]Active[/bold green]"
             if ws_name == shell.current_workspace
             else "Inactive"
         )
-        table.add_row(ws_name, status, ws_path)
+        table.add_row(marked_workspace_name, status, marked_workspace_path)
 
     print_table(table)
 
@@ -373,9 +378,11 @@ def workspace_show(shell: WorkspaceShell) -> None:
         )
     )
     content.append("\nName: ", style=f"bold {BRAND_COLORS['info']}")
-    content.append(f"{shell.current_workspace}\n", style="white")
+    marked_current_workspace = mark_sensitive(shell.current_workspace, "workspace")
+    content.append(f"{marked_current_workspace}\n", style="white")
     content.append("Path: ", style=f"bold {BRAND_COLORS['info']}")
-    content.append(f"{shell.current_workspace_dir}\n", style="white")
+    marked_current_workspace_dir = mark_sensitive(shell.current_workspace_dir, "path")
+    content.append(f"{marked_current_workspace_dir}\n", style="white")
 
     content.append(
         "\nAssociated Data (from variables.json):\n",
@@ -420,7 +427,7 @@ def workspace_show(shell: WorkspaceShell) -> None:
 
     print_panel(
         content,
-        title=f"[bold green]Workspace: {shell.current_workspace}[/bold green]",
+        title=f"[bold green]Workspace: {marked_current_workspace}[/bold green]",
         border_style=BRAND_COLORS["info"],
         expand=False,
     )

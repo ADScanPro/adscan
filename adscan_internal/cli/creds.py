@@ -42,6 +42,9 @@ from adscan_internal.cli.cracking import (
     handle_hash_cracking,
     handle_hash_cracking_batch,
 )
+from adscan_internal.services.session_compromise_state_service import (
+    mark_session_user_compromised,
+)
 
 NON_SPRAYABLE_CREDSWEEPER_RULES = {"uuid"}
 UUID_VALUE_RE = re.compile(
@@ -668,6 +671,7 @@ def handle_auth_and_optional_privs(
     users_with_creds: list[tuple[str, str]],
     *,
     prompt_for_user_privs_after: bool = True,
+    skip_user_privs_enumeration: bool = False,
     force_authenticated_enumeration: bool = False,
     prompt_when_already_authenticated: bool = False,
     allow_empty_credentials: bool = False,
@@ -679,6 +683,8 @@ def handle_auth_and_optional_privs(
         domain: Domain to operate on.
         users_with_creds: List of (username, credential) tuples.
         prompt_for_user_privs_after: When True, prompt for user privilege checks.
+        skip_user_privs_enumeration: When True, skip every privilege-enumeration
+            prompt and follow-up regardless of attack-path overrides.
         force_authenticated_enumeration: When True, rerun authenticated
             enumeration even if the domain is already in ``auth`` state.
         prompt_when_already_authenticated: When True, and the domain is already
@@ -694,6 +700,7 @@ def handle_auth_and_optional_privs(
         f"[creds] handle_auth_and_optional_privs start: domain={marked_domain} "
         f"auth={current_auth_status!r} users={len(users_with_creds)} "
         f"prompt_privs={prompt_for_user_privs_after} "
+        f"skip_user_privs={skip_user_privs_enumeration} "
         f"force_enum={force_authenticated_enumeration!r} "
         f"prompt_existing_auth={prompt_when_already_authenticated!r}"
     )
@@ -1246,11 +1253,18 @@ def handle_auth_and_optional_privs(
                 "[creds] standard ask_for_user_privs disabled because the "
                 "full authenticated scan already includes User Privilege Assessment"
             )
+    if skip_user_privs_enumeration:
+        print_info_debug(
+            "[creds] skipping all ask_for_user_privs flows due to hard disable "
+            f"(auth={updated_auth_status!r})"
+        )
 
     for user, cred in users_with_creds:
         if not user or (cred is None) or (cred == "" and not allow_empty_credentials):
             continue
         try:
+            if skip_user_privs_enumeration:
+                continue
             if updated_auth_status == "pwned":
                 print_info_debug(
                     "[creds] skipping attack-path privilege UX because domain is pwned"
@@ -1468,6 +1482,7 @@ def add_credential(
     pdc_ip: str | None = None,
     source_steps: list[object] | None = None,
     prompt_for_user_privs_after: bool = True,
+    skip_user_privs_enumeration: bool = False,
     verify_credential: bool = True,
     verify_local_credential: bool = True,
     prompt_local_reuse_after: bool = True,
@@ -1477,6 +1492,7 @@ def add_credential(
     prompt_when_already_authenticated: bool = False,
     allow_empty_credential: bool = False,
     trusted_manual_validation: bool = False,
+    mark_user_compromised: bool = True,
 ) -> None:
     """Add a credential to the workspace.
 
@@ -1502,6 +1518,8 @@ def add_credential(
             search attack paths for the user after verifying the credential. This
             should be disabled when credentials are obtained as part of an active
             attack path execution to avoid double-executing downstream steps.
+        skip_user_privs_enumeration: When True, never invoke privilege-enumeration
+            prompts or attack-path privilege follow-ups for this credential.
         verify_credential: When True (default), verify domain credentials before
             storing them. Set to False for trusted bulk-import flows (for example
             DCSync dumps) where per-credential verification would be too costly.
@@ -1527,6 +1545,10 @@ def add_credential(
             reserved for controlled flows such as manual confirmation of one
             staged WriteLogonScript password where another automatic LDAP check
             would risk locking the account.
+        mark_user_compromised: When True (default), record that this credential
+            should count as a compromised-user milestone for the current
+            session. Manual/import flows such as ``creds save`` must override
+            this to False.
     """
     from adscan_internal import print_operation_header
     from adscan_internal.services.credential_store_service import (
@@ -1701,6 +1723,9 @@ def add_credential(
                 )
             except Exception as exc:  # pragma: no cover - best effort eventing
                 telemetry.capture_exception(exc)
+
+            if mark_user_compromised:
+                mark_session_user_compromised(shell, user)
 
             if source_steps and credential_source_verified:
                 try:
@@ -1975,6 +2000,9 @@ def add_credential(
             except Exception as exc:  # pragma: no cover - best effort eventing
                 telemetry.capture_exception(exc)
 
+            if mark_user_compromised:
+                mark_session_user_compromised(shell, user)
+
         if source_steps and (credential_verified or credential_source_verified):
             try:
                 from adscan_internal.services.attack_graph_service import (
@@ -2047,6 +2075,7 @@ def add_credential(
                 domain,
                 [(user, cred)],
                 prompt_for_user_privs_after=prompt_for_user_privs_after,
+                skip_user_privs_enumeration=skip_user_privs_enumeration,
                 force_authenticated_enumeration=force_authenticated_enumeration,
                 prompt_when_already_authenticated=prompt_when_already_authenticated,
                 allow_empty_credentials=allow_empty_credential,
@@ -2144,6 +2173,7 @@ def add_credentials_batch(
     pdc_ip: str | None = None,
     source_steps: list[object] | None = None,
     prompt_for_user_privs_after: bool = True,
+    skip_user_privs_enumeration: bool = False,
     verify_credential: bool = True,
     ui_silent: bool = False,
     ensure_fresh_kerberos_ticket: bool = True,
@@ -2158,6 +2188,7 @@ def add_credentials_batch(
         pdc_ip: Optional PDC IP used when creating domain sub-workspace.
         source_steps: Optional provenance steps to attach to each credential.
         prompt_for_user_privs_after: Forwarded to add_credential.
+        skip_user_privs_enumeration: Forwarded to add_credential.
         verify_credential: Forwarded to add_credential.
         ui_silent: Forwarded to add_credential.
         ensure_fresh_kerberos_ticket: Forwarded to add_credential.
@@ -2185,6 +2216,7 @@ def add_credentials_batch(
             pdc_ip=pdc_ip,
             source_steps=source_steps,
             prompt_for_user_privs_after=prompt_for_user_privs_after,
+            skip_user_privs_enumeration=skip_user_privs_enumeration,
             verify_credential=verify_credential,
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,

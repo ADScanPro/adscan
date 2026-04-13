@@ -19,6 +19,10 @@ from adscan_internal.services.rodc_host_access import (
     RodcHostAccessContext,
     parse_rodc_host_access_outcome,
 )
+from adscan_internal.services.rodc_followup_state_service import (
+    RodcFollowupState,
+    RodcFollowupStateService,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,9 +42,12 @@ class RodcFollowupPlan:
     delegated_user: str
     ticket_path: str
     action_keys: tuple[str, ...]
+    primary_action_key: str
+    optional_action_keys: tuple[str, ...]
     can_extract_krbtgt: bool
     can_prepare_credential_caching: bool
     krbtgt_key_plan: "RodcKrbtgtKeyPlan | None" = None
+    state: "RodcFollowupState | None" = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +80,8 @@ def resolve_rodc_followup_plan(
     target_spn: str = "",
     delegated_user: str = "",
     ticket_path: str = "",
+    has_host_access: bool | None = None,
+    can_prepare_prp: bool | None = None,
 ) -> RodcFollowupPlan | None:
     """Return the RODC follow-up plan for one host-access context."""
     effective_domain = str(domain or "").strip()
@@ -87,12 +96,20 @@ def resolve_rodc_followup_plan(
     effective_delegated_user = str(delegated_user or "").strip()
     effective_ticket_path = str(ticket_path or "").strip()
 
-    if (
-        not effective_target_domain
-        or not effective_target_computer
-        or not effective_auth_username
-        or not effective_auth_secret
-    ):
+    if not effective_target_domain or not effective_target_computer:
+        return None
+
+    effective_has_host_access = (
+        bool(has_host_access)
+        if has_host_access is not None
+        else bool(effective_auth_username and effective_auth_secret)
+    )
+    effective_can_prepare_prp = (
+        bool(can_prepare_prp)
+        if can_prepare_prp is not None
+        else bool(effective_auth_username and effective_auth_secret)
+    )
+    if not effective_has_host_access and not effective_can_prepare_prp:
         return None
 
     is_rodc_target = classify_rodc_target(
@@ -108,12 +125,17 @@ def resolve_rodc_followup_plan(
         domain=effective_target_domain,
         target_computer=effective_target_computer,
     )
-    action_keys = _resolve_action_keys(
+    state = RodcFollowupStateService().resolve_state(
+        shell,
+        domain=effective_target_domain,
+        target_computer=effective_target_computer,
         access_source=effective_access_source,
-        attacker_machine=effective_attacker_machine,
-        target_spn=effective_target_spn,
-        has_krbtgt_key_plan=krbtgt_key_plan is not None,
+        has_host_access=effective_has_host_access,
+        has_prepare_prp_option=effective_can_prepare_prp,
+        krbtgt_key_plan=krbtgt_key_plan,
+        default_target_user="Administrator",
     )
+    action_keys = state.action_keys
 
     return RodcFollowupPlan(
         is_rodc_target=True,
@@ -129,9 +151,12 @@ def resolve_rodc_followup_plan(
         delegated_user=effective_delegated_user,
         ticket_path=effective_ticket_path,
         action_keys=action_keys,
-        can_extract_krbtgt=True,
-        can_prepare_credential_caching=krbtgt_key_plan is not None,
+        primary_action_key=state.primary_action_key,
+        optional_action_keys=state.optional_action_keys,
+        can_extract_krbtgt=effective_has_host_access,
+        can_prepare_credential_caching=effective_can_prepare_prp,
         krbtgt_key_plan=krbtgt_key_plan,
+        state=state,
     )
 
 
@@ -166,6 +191,8 @@ def resolve_rodc_followup_plan_from_context(
         target_spn=context.target_spn,
         delegated_user=context.delegated_user,
         ticket_path=context.ticket_path,
+        has_host_access=True,
+        can_prepare_prp=True,
     )
 
 
@@ -222,7 +249,9 @@ def resolve_rodc_krbtgt_key_plan(
             aes128=str(raw_data.get("aes128") or "") or None,
             source=str(raw_data.get("source") or ""),
             target_host=str(raw_data.get("target_host") or ""),
-            rid=str(raw_data.get("rid") or _extract_rodc_krbtgt_rid(str(username)) or ""),
+            rid=str(
+                raw_data.get("rid") or _extract_rodc_krbtgt_rid(str(username)) or ""
+            ),
         )
         if store.select_best_kerberos_key(material) is None:
             continue
@@ -243,26 +272,6 @@ def resolve_rodc_krbtgt_key_plan(
             material=candidates[0],
         )
     return None
-
-
-def _resolve_action_keys(
-    *,
-    access_source: str,
-    attacker_machine: str,
-    target_spn: str,
-    has_krbtgt_key_plan: bool,
-) -> tuple[str, ...]:
-    """Return ordered follow-up action keys for one RODC access source."""
-    keys: list[str] = []
-    if access_source == "rbcd" and attacker_machine and target_spn:
-        keys.append("review_rbcd_ticket")
-    if has_krbtgt_key_plan:
-        keys.append("review_rodc_krbtgt_material")
-        keys.append("review_rodc_final_validation_plan")
-    keys.append("extract_rodc_krbtgt_secret")
-    if has_krbtgt_key_plan:
-        keys.append("prepare_rodc_credential_caching")
-    return tuple(keys)
 
 
 def _build_key_plan(

@@ -13,6 +13,7 @@ CTF_LAB_PROVIDER_OPTIONS: tuple[str, ...] = (
     "HackTheBox",
     "TryHackMe",
     "Certifications",
+    "Training Labs",
     "DockerLabs",
     "VulnHub",
     "GOAD",
@@ -24,6 +25,7 @@ _PROVIDER_DISPLAY_TO_CANONICAL: dict[str, str] = {
     "HackTheBox": "hackthebox",
     "TryHackMe": "tryhackme",
     "Certifications": "certifications",
+    "Training Labs": "training_labs",
     "DockerLabs": "dockerlabs",
     "VulnHub": "vulnhub",
     "GOAD": "goad",
@@ -161,6 +163,11 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
         "CAPE",
         "CAPE_Exam",
     ),
+    # Shared/community course labs are intentionally separate from vendor CTFs
+    # and certifications because many are cloned homelabs with stable domains.
+    "training_labs": (
+        "Marvel",
+    ),
     # DockerLabs currently exposes a large public catalog, but its official API
     # and public writeups did not provide enough reliable AD-specific machine
     # fingerprints to justify whitelisting generic host labels.  Keeping
@@ -238,6 +245,10 @@ _MACHINE_DOMAIN_FINGERPRINTS: dict[str, tuple[str, str]] = {
     # Parent "moneycorp.local" covers both direct input and subdomain-stripped input.
     # SLD "moneycorp" doesn't match catalog entry "crtp".
     "moneycorp.local": ("certifications", "crtp"),
+    # TCM Security / PEH AD lab — domain: marvel.local
+    # Intentionally fingerprinted even though it is heavily cloned, similar to GOAD:
+    # the goal is to classify the training-lab family, not a unique deployment.
+    "marvel.local": ("training_labs", "marvel"),
     # CRTP_Exam (Altered Security) — exam: garrison.castle.local (child), castle.local (parent)
     # Subdomain stripping on garrison.castle.local resolves to castle.local → fingerprint fires.
     # SLD "castle" doesn't match catalog entry "crtp_exam".

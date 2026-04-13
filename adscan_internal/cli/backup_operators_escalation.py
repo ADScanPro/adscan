@@ -530,7 +530,7 @@ def offer_backup_operators_escalation(
             notes={"action": "backup_operator"},
         )
 
-        auth = shell.build_auth_nxc(username, password, domain, kerberos=True)
+        auth = shell.build_auth_nxc(username, password, domain, kerberos=False)
         auth_log = re.sub(r"(\\s-p\\s+)'[^']*'", r"\\1'[REDACTED]'", auth)
         auth_log = re.sub(r"(\\s-H\\s+)\\S+", r"\\1[REDACTED]", auth_log)
         command = f"{shell.netexec_path} smb {pdc_ip} {auth} --smb-timeout 30 -t 1 -M backup_operator"

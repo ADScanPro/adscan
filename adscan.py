@@ -136,6 +136,11 @@ from adscan_internal.services.service_access_probe_history import (
 from adscan_internal.services.pivot_capability_registry import (
     is_service_pivot_capable,
 )
+from adscan_internal.services.session_compromise_state_service import (
+    SESSION_COMPROMISE_STATUS_UNKNOWN,
+    build_session_compromise_metadata,
+    mark_session_domain_compromised,
+)
 from adscan_internal.version import get_version, get_version_tag
 from adscan_internal.workspaces import (
     DEFAULT_DOMAIN_LAYOUT,
@@ -10467,6 +10472,8 @@ class PentestShell:
         self._session_attack_paths_count: int = 0  # Total attack paths found
         self._session_credentials_count: int = 0  # Total credentials obtained
         self._session_hashes_count: int = 0  # Total hashes extracted
+        self._session_compromise_status: str = SESSION_COMPROMISE_STATUS_UNKNOWN
+        self._session_compromised_users: set[str] = set()
 
         # Scan-level metrics for case studies (reset per scan, not per session)
         # Note: Attack path metrics are computed from attack_graph.json at scan completion
@@ -14469,6 +14476,7 @@ class PentestShell:
                 host,
                 service,
                 trusted_manual_validation=trusted_manual_validation,
+                mark_user_compromised=False,
             )
             if trusted_manual_validation and isinstance(pending_manual_validation, dict):
                 _attempt_writelogonscript_cleanup_if_ready(
@@ -14763,6 +14771,7 @@ class PentestShell:
         source_steps=None,
         *,
         prompt_for_user_privs_after: bool = True,
+        skip_user_privs_enumeration: bool = False,
         verify_credential: bool = True,
         verify_local_credential: bool = True,
         prompt_local_reuse_after: bool = True,
@@ -14772,6 +14781,7 @@ class PentestShell:
         prompt_when_already_authenticated: bool = False,
         allow_empty_credential: bool = False,
         trusted_manual_validation: bool = False,
+        mark_user_compromised: bool = True,
     ):
         """Add a credential (domain or local) delegating to the CLI helper for reuse."""
         from adscan_internal.cli.creds import add_credential
@@ -14787,6 +14797,7 @@ class PentestShell:
             pdc_ip=pdc_ip,
             source_steps=source_steps,
             prompt_for_user_privs_after=prompt_for_user_privs_after,
+            skip_user_privs_enumeration=skip_user_privs_enumeration,
             verify_credential=verify_credential,
             verify_local_credential=verify_local_credential,
             prompt_local_reuse_after=prompt_local_reuse_after,
@@ -14796,6 +14807,7 @@ class PentestShell:
             prompt_when_already_authenticated=prompt_when_already_authenticated,
             allow_empty_credential=allow_empty_credential,
             trusted_manual_validation=trusted_manual_validation,
+            mark_user_compromised=mark_user_compromised,
         )
 
     def add_credentials_batch(
@@ -14807,6 +14819,7 @@ class PentestShell:
         pdc_ip=None,
         source_steps=None,
         prompt_for_user_privs_after: bool = True,
+        skip_user_privs_enumeration: bool = False,
         verify_credential: bool = True,
         ui_silent: bool = False,
         ensure_fresh_kerberos_ticket: bool = True,
@@ -14822,6 +14835,7 @@ class PentestShell:
             pdc_ip=pdc_ip,
             source_steps=source_steps,
             prompt_for_user_privs_after=prompt_for_user_privs_after,
+            skip_user_privs_enumeration=skip_user_privs_enumeration,
             verify_credential=verify_credential,
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
@@ -16945,93 +16959,15 @@ class PentestShell:
             print_warning("No current-vantage inventory refresh completed successfully.")
 
     def gpp_passwords(self, domain, username, password, share):
-        from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.cli.smb import run_gpp_passwords_share
 
-        if username == "null":
-            auth = self.build_auth_impacket("", "", domain)
-        else:
-            auth = self.build_auth_impacket(username, password, domain)
-        if not self.impacket_scripts_dir:
-            print_error(
-                "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-            )
-            return
-        gpp_path = os.path.join(self.impacket_scripts_dir, "Get-GPPPassword.py")
-        if not os.path.isfile(gpp_path) or not os.access(gpp_path, os.X_OK):
-            print_error(
-                f"Get-GPPPassword.py not found or not executable in {self.impacket_scripts_dir}. Please check Impacket installation."
-            )
-            return
-        marked_share = mark_sensitive(share, "service")
-        command = f"{shlex.quote(gpp_path)} {auth} -share {shlex.quote(str(share))}"
-        # Run the Get-GPPPassword command and capture output
-        marked_domain = mark_sensitive(domain, "domain")
-        print_info(
-            f"Searching for Groups XML files in share {marked_share} of domain {marked_domain}"
+        return run_gpp_passwords_share(
+            self,
+            domain=domain,
+            username=username,
+            password=password,
+            share=share,
         )
-        completed_process = self.run_command(command, timeout=300)
-        output = completed_process.stdout or ""
-        lines = output.splitlines()
-
-        # Parse GPP credential entries
-        entries = []
-        for idx, line in enumerate(lines):
-            if "found a groups xml file" in line.lower():
-                entry = {}
-                # Parse subsequent lines for key: value
-                for subline in lines[idx + 1 :]:
-                    if ":" not in subline:
-                        break
-                    # Remove any leading log prefix "[*]" and whitespace
-                    cleaned = re.sub(r"^\[\*\]\s*", "", subline).strip()
-                    key, val = cleaned.split(":", 1)
-                    entry[key.strip()] = val.strip()
-                if "userName" in entry and "password" in entry:
-                    entries.append(entry)
-
-        if not entries:
-            marked_share = mark_sensitive(share, "service")
-            marked_domain = mark_sensitive(domain, "domain")
-            print_info(
-                f"No Groups XML files found in share {marked_share} of domain {marked_domain}"
-            )
-        else:
-            # Display found credentials in a Rich table
-            table = Table(
-                title=f"[bold cyan]GPP Credentials found in {share} share[/bold cyan]",
-                header_style="bold magenta",
-                box=rich.box.SIMPLE,
-            )
-            table.add_column("Domain", style="cyan")
-            table.add_column("User", style="magenta")
-            table.add_column("Password", style="green")
-            for entry in entries:
-                full_user = entry["userName"]
-                # Split domain and username from userName
-                parts = full_user.rsplit("\\", 1)
-                if len(parts) == 2:
-                    dom, usr = parts
-                else:
-                    dom = domain
-                    usr = full_user
-                pwd = entry.get("password", "")
-                marked_dom = mark_sensitive(dom, "domain")
-                marked_usr = mark_sensitive(usr, "user")
-                marked_pwd = mark_sensitive(pwd, "password")
-                table.add_row(marked_dom, marked_usr, marked_pwd)
-                # Store credential
-                from adscan_internal.rich_output import (
-                    BRAND_COLORS,
-                    print_panel_with_table,
-                )
-
-                print_panel_with_table(table, border_style=BRAND_COLORS["info"])
-                self.add_credential(dom, usr, pwd)
-
-        if completed_process.returncode != 0:
-            print_error(
-                f"Error executing Get-GPPPassword.py: {completed_process.stderr.strip() if completed_process.stderr else 'Details not available'}"
-            )
 
     def ask_for_smb_shares_write(self, domain, shares, username, password, hosts):
         """Prompt user to upload NTLM capture files to writable shares."""
@@ -19876,6 +19812,10 @@ class PentestShell:
         return execute_secretsdump(self, command, domain)
 
     def execute_dcsync_zerologon(self, command, domain):
+        from adscan_internal.integrations.impacket.runner import (
+            RunCommandAdapter,
+            run_raw_impacket_command,
+        )
         from adscan_internal.rich_output import mark_sensitive
 
         try:
@@ -19883,7 +19823,17 @@ class PentestShell:
             print_info(
                 f"Executing DCSync (Zerologon) command for domain {marked_domain}: {command}"
             )
-            completed_process = self.run_command(command, timeout=300)
+            completed_process = run_raw_impacket_command(
+                command,
+                script_name="secretsdump.py",
+                timeout=300,
+                command_runner=RunCommandAdapter(self.run_command),
+            )
+            if completed_process is None:
+                print_error(
+                    f"Error executing DCSync (Zerologon) for domain {marked_domain}: command did not return output."
+                )
+                return
 
             if completed_process.returncode == 0:
                 output_decoded = completed_process.stdout
@@ -22416,6 +22366,7 @@ class PentestShell:
                     and self._scan_compromise_time is None
                 ):
                     self._scan_compromise_time = time.monotonic()
+                mark_session_domain_compromised(self)
 
                 # Track victory for session summary (Hormozi: Give:Ask ratio)
                 if hasattr(self, "_session_victories"):
@@ -23405,46 +23356,16 @@ class PentestShell:
         self, domain, computer_name, computer_pass, username, password
     ):
         """Adds a new computer to the domain."""
-        try:
-            if domain not in self.domains:
-                marked_target_domain = mark_sensitive(domain, "domain")
-                print_error(
-                    f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
-                )
-                return None
+        from adscan_internal.cli.delegations import add_computer_to_domain
 
-            if not self.impacket_scripts_dir:
-                print_error(
-                    "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
-                )
-                return None
-            getaddcomputer_py_path = os.path.join(self.impacket_scripts_dir, "addcomputer.py")
-            if not os.path.isfile(getaddcomputer_py_path) or not os.access(
-                getaddcomputer_py_path, os.X_OK
-            ):
-                print_error(
-                    f"addcomputer.py not found or not executable in {self.impacket_scripts_dir}. Please check Impacket installation."
-                )
-                return None
-            auth = self.build_auth_impacket_no_host(username, password, domain)
-            command = f"{getaddcomputer_py_path} -computer-name '{computer_name}$' -computer-pass '{computer_pass}' "
-            command += f"-dc-host {self.domains_data[domain]['pdc']} "
-            command += f"{auth}"
-
-            print_success("Adding computer to the domain")
-            proc = self.run_command(command, timeout=300)
-
-            if proc.returncode == 0:
-                print_success(f"Computer {computer_name}$ added successfully")
-                return True
-            print_error(f"Error adding computer: {proc.stderr}")
-            return False
-
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_error("Error adding computer.")
-            print_exception(show_locals=False, exception=e)
-            return False
+        return add_computer_to_domain(
+            self,
+            domain,
+            computer_name,
+            computer_pass,
+            username,
+            password,
+        )
 
     def set_rbcd_delegation(
         self, domain, computer_name, target, computer_pass, username, password
@@ -24859,6 +24780,7 @@ class PentestShell:
         password,
         return_boolean=False,
         prompt=True,
+        workflow_intent=None,
     ):
         from adscan_internal.rich_output import mark_sensitive
 
@@ -25078,6 +25000,11 @@ class PentestShell:
                                             finding.host,
                                             finding.username,
                                             password,
+                                            **(
+                                                {"workflow_intent": workflow_intent}
+                                                if service == "winrm" and workflow_intent
+                                                else {}
+                                            ),
                                         )
                             else:
                                 func = getattr(self, f"ask_for_{service}_access")
@@ -25097,6 +25024,11 @@ class PentestShell:
                                         finding.host,
                                         finding.username,
                                         password,
+                                        **(
+                                            {"workflow_intent": workflow_intent}
+                                            if service == "winrm" and workflow_intent
+                                            else {}
+                                        ),
                                     )
                         else:
                             for finding in confirmed_findings:
@@ -28881,6 +28813,7 @@ class PentestShell:
                 "workspace_credentials_count": _count_workspace_credentials(self),
                 "hashes_count": getattr(self, "_session_hashes_count", 0),
             }
+            session_summary.update(build_session_compromise_metadata(self))
             telemetry.capture("session_end", session_summary)
 
         _SESSION_CAPTURE_FINALIZED = True

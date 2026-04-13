@@ -48,6 +48,10 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
+from adscan_internal.integrations.impacket.runner import (
+    RunCommandAdapter,
+    run_raw_impacket_command,
+)
 from adscan_internal.integrations.netexec.parsers import (
     parse_smb_share_map,
     parse_smb_usernames,
@@ -1913,7 +1917,10 @@ def run_auth_shares(
         return
 
     use_ccache = password.lower().endswith(".ccache")
-    auth = shell.build_auth_nxc(username, password, domain, kerberos=use_ccache)
+    try:
+        auth = shell.build_auth_nxc(username, password, domain, kerberos=use_ccache)
+    except TypeError:
+        auth = shell.build_auth_nxc(username, password, domain)
     kerberos_ticket_prefix = (
         f"KRB5CCNAME={shlex.quote(password)} " if use_ccache else ""
     )
@@ -3385,7 +3392,15 @@ def run_gpp_passwords_share(
     )
 
     try:
-        completed_process = shell.run_command(command, timeout=300)
+        completed_process = run_raw_impacket_command(
+            command,
+            script_name="Get-GPPPassword.py",
+            timeout=300,
+            command_runner=RunCommandAdapter(shell.run_command),
+        )
+        if completed_process is None:
+            print_error("Error executing Get-GPPPassword.py.")
+            return
     except Exception as e:  # pylint: disable=broad-except
         telemetry.capture_exception(e)
         print_error("Error executing Get-GPPPassword.py.")

@@ -59,6 +59,51 @@ from adscan_core.version_context import (
     resolve_installed_version_info,
 )
 
+try:
+    from adscan_internal.services.session_compromise_state_service import (
+        build_session_compromise_metadata,
+        normalize_session_compromise_status,
+    )
+except ImportError:
+    _SESSION_COMPROMISE_STATUS_UNKNOWN = "unknown"
+    _SESSION_COMPROMISE_STATUS_NONE = "none"
+    _SESSION_COMPROMISE_STATUS_USER = "user"
+    _SESSION_COMPROMISE_STATUS_DOMAIN = "domain"
+    _SESSION_COMPROMISE_STATUS_VALUES = frozenset(
+        {
+            _SESSION_COMPROMISE_STATUS_UNKNOWN,
+            _SESSION_COMPROMISE_STATUS_NONE,
+            _SESSION_COMPROMISE_STATUS_USER,
+            _SESSION_COMPROMISE_STATUS_DOMAIN,
+        }
+    )
+
+    def normalize_session_compromise_status(value: Any) -> str:
+        """Return a valid session compromise status label."""
+        normalized = str(value or "").strip().lower()
+        if normalized in _SESSION_COMPROMISE_STATUS_VALUES:
+            return normalized
+        return _SESSION_COMPROMISE_STATUS_UNKNOWN
+
+    def build_session_compromise_metadata(shell: Any) -> dict[str, Any]:
+        """Return telemetry-safe compromise metadata for one shell session."""
+        status = normalize_session_compromise_status(
+            getattr(shell, "_session_compromise_status", None)
+        )
+        compromised_users = getattr(shell, "_session_compromised_users", set())
+        if not isinstance(compromised_users, set):
+            compromised_users = set()
+
+        return {
+            "compromise_status": status,
+            "user_compromised": status in {
+                _SESSION_COMPROMISE_STATUS_USER,
+                _SESSION_COMPROMISE_STATUS_DOMAIN,
+            },
+            "domain_compromised": status == _SESSION_COMPROMISE_STATUS_DOMAIN,
+            "compromised_users_count": len(compromised_users),
+        }
+
 if TYPE_CHECKING:
     from rich.text import Text
 else:
@@ -775,6 +820,10 @@ _SESSION_TRACE_ID_ENV = "ADSCAN_SESSION_TRACE_ID"
 _SESSION_WORKSPACE_CONTEXT_FIELDS = frozenset(
     {
         "workspace_type",
+        "compromise_status",
+        "user_compromised",
+        "domain_compromised",
+        "compromised_users_count",
         "lab_provider",
         "lab_name",
         "lab_slug",
@@ -1154,6 +1203,8 @@ _KNOWN_BASE_DNS: list[str] = []
 _KNOWN_BASE_DNS_LOADED: bool = False
 _KNOWN_NETBIOS: list[str] = []
 _KNOWN_NETBIOS_LOADED: bool = False
+_KNOWN_WORKSPACES: list[str] = []
+_KNOWN_WORKSPACES_LOADED: bool = False
 
 
 def set_workspace_domains(
@@ -1335,6 +1386,35 @@ def set_workspace_netbios(
     _KNOWN_NETBIOS_LOADED = True
 
 
+def set_workspace_names(
+    workspace_names: Optional[list[str]] | tuple[str, ...] | set[str] | None,
+) -> None:
+    """Set known workspace names for targeted sanitization."""
+    global _KNOWN_WORKSPACES, _KNOWN_WORKSPACES_LOADED
+    if not workspace_names:
+        _KNOWN_WORKSPACES = []
+        _KNOWN_WORKSPACES_LOADED = True
+        return
+    normalized: list[str] = []
+    for workspace_name in workspace_names:
+        if not isinstance(workspace_name, str):
+            continue
+        cleaned = workspace_name.strip()
+        if not cleaned:
+            continue
+        normalized.append(cleaned)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for workspace_name in normalized:
+        key = workspace_name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(workspace_name)
+    _KNOWN_WORKSPACES = deduped
+    _KNOWN_WORKSPACES_LOADED = True
+
+
 def _load_workspace_domains_from_dir(workspace_dir: Path) -> list[str]:
     domains: list[str] = []
     variables_path = workspace_dir / "variables.json"
@@ -1486,9 +1566,40 @@ def _load_workspace_netbios_from_dir(workspace_dir: Path) -> list[str]:
     return netbios_names
 
 
+def _looks_like_workspace_root(workspace_dir: Path) -> bool:
+    """Return True when a directory looks like an ADscan workspace root."""
+    return (workspace_dir / "variables.json").is_file()
+
+
+def _load_workspace_names_from_dir(workspace_dir: Path) -> list[str]:
+    """Load current and sibling workspace names for telemetry sanitization."""
+    workspace_names: list[str] = []
+    if not _looks_like_workspace_root(workspace_dir):
+        return workspace_names
+
+    workspace_names.append(workspace_dir.name)
+    parent_dir = workspace_dir.parent
+    try:
+        for entry in parent_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            if entry.name.startswith("."):
+                continue
+            if not _looks_like_workspace_root(entry):
+                continue
+            workspace_names.append(entry.name)
+    except Exception:
+        pass
+    return workspace_names
+
+
 def _refresh_workspace_cache_if_needed() -> None:
     """Refresh known domains/users/hosts/passwords from workspace files."""
     workspace_dir = Path.cwd()
+    workspace_names = _load_workspace_names_from_dir(workspace_dir)
+    if workspace_names:
+        set_workspace_names(workspace_names)
+
     domains = _load_workspace_domains_from_dir(workspace_dir)
     if domains:
         set_workspace_domains(domains)
@@ -1617,6 +1728,25 @@ def _get_known_netbios() -> list[str]:
     except Exception:
         pass
     return _KNOWN_NETBIOS
+
+
+def _get_known_workspaces() -> list[str]:
+    global _KNOWN_WORKSPACES_LOADED
+    if _KNOWN_WORKSPACES:
+        return _KNOWN_WORKSPACES
+    _refresh_workspace_cache_if_needed()
+    if _KNOWN_WORKSPACES:
+        return _KNOWN_WORKSPACES
+    if _KNOWN_WORKSPACES_LOADED:
+        return []
+    _KNOWN_WORKSPACES_LOADED = True
+    try:
+        cwd_workspaces = _load_workspace_names_from_dir(Path.cwd())
+        if cwd_workspaces:
+            set_workspace_names(cwd_workspaces)
+    except Exception:
+        pass
+    return _KNOWN_WORKSPACES
 
 
 def _configure_ssl_certificates_for_requests():
@@ -3045,6 +3175,21 @@ def _sanitize_rich_output(content: str) -> str:
                 content,
             )
 
+    # Redact known workspace names (current workspace and sibling workspaces).
+    known_workspaces = _get_known_workspaces()
+    if known_workspaces:
+        for workspace_name in known_workspaces:
+            workspace_clean = workspace_name.strip()
+            if not workspace_clean:
+                continue
+            workspace_pattern = re.compile(
+                rf"(?i)(?<![A-Za-z0-9._-])({re.escape(workspace_clean)})(?![A-Za-z0-9._-])"
+            )
+            content = workspace_pattern.sub(
+                lambda m: _record_pseudonym(m.group(1), "workspace"),
+                content,
+            )
+
     # Apply structured redaction for credential tables and lists
     content = _mask_credential_sections(content)
     content = _sanitize_domain_property_tables(content)
@@ -4010,6 +4155,29 @@ def _vercel_metadata_fields(metadata: Optional[dict[str, Any]]) -> dict[str, Any
         updates["target_inference_source"] = str(inference_source)
     if inference_confidence is not None:
         updates["target_inference_confidence"] = float(inference_confidence)
+    compromise_status = normalize_session_compromise_status(
+        metadata.get("compromise_status")
+    )
+    if compromise_status:
+        updates["compromise_status"] = compromise_status
+        updates["user_compromised"] = bool(
+            metadata.get("user_compromised")
+            if metadata.get("user_compromised") is not None
+            else compromise_status in {"user", "domain"}
+        )
+        updates["domain_compromised"] = bool(
+            metadata.get("domain_compromised")
+            if metadata.get("domain_compromised") is not None
+            else compromise_status == "domain"
+        )
+    compromised_users_count = metadata.get("compromised_users_count")
+    if compromised_users_count is not None:
+        try:
+            updates["compromised_users_count"] = max(
+                0, int(compromised_users_count)
+            )
+        except (TypeError, ValueError):
+            pass
     return updates
 
 
@@ -4068,6 +4236,10 @@ def _summarize_vercel_payload_context(payload: dict[str, Any]) -> str:
         "session_trace_id",
         "trace_id",
         "workspace_type",
+        "compromise_status",
+        "user_compromised",
+        "domain_compromised",
+        "compromised_users_count",
         "target_type",
         "target_name",
         "target_slug",
@@ -4239,6 +4411,7 @@ def _build_session_metadata(shell=None) -> Optional[dict]:
     confirmation_state = getattr(shell, "lab_confirmation_state", None)
     if confirmation_state:
         metadata["lab_confirmation_state"] = str(confirmation_state)
+    metadata.update(build_session_compromise_metadata(shell))
 
     # Note: workspace_name is intentionally NOT included to avoid revealing internal information
     return metadata or None
@@ -4447,6 +4620,28 @@ def capture_session_end(console=None, metadata: Optional[dict] = None):
             if session_trace_id:
                 properties["session_trace_id"] = str(session_trace_id)
                 properties["trace_id"] = str(session_trace_id)
+            compromise_status = normalize_session_compromise_status(
+                metadata_with_env.get("compromise_status")
+            )
+            properties["compromise_status"] = compromise_status
+            properties["user_compromised"] = bool(
+                metadata_with_env.get("user_compromised")
+                if metadata_with_env.get("user_compromised") is not None
+                else compromise_status in {"user", "domain"}
+            )
+            properties["domain_compromised"] = bool(
+                metadata_with_env.get("domain_compromised")
+                if metadata_with_env.get("domain_compromised") is not None
+                else compromise_status == "domain"
+            )
+            compromised_users_count = metadata_with_env.get("compromised_users_count")
+            if compromised_users_count is not None:
+                try:
+                    properties["compromised_users_count"] = max(
+                        0, int(compromised_users_count)
+                    )
+                except (TypeError, ValueError):
+                    pass
             if session_url:
                 properties["session_url"] = session_url
                 # Keep legacy key for backward compatibility

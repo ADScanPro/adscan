@@ -6597,6 +6597,7 @@ def execute_selected_attack_path(
                         domain=domain,
                         target_host=target_host,
                         workflow_label="HasSession exploitation",
+                        resume_after_pivot=True,
                     )
                     is None
                 ):

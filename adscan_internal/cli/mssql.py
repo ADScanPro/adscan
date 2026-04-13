@@ -275,6 +275,7 @@ def ask_for_mssql_access(
             domain=domain,
             target_host=host,
             workflow_label="MSSQL access workflow",
+            resume_after_pivot=True,
         )
         is None
     ):

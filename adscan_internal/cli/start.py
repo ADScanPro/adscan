@@ -56,6 +56,9 @@ from adscan_internal.services.network_preflight_service import (
     assess_target_reachability,
     get_interface_ipv4_addresses,
 )
+from adscan_internal.services.session_compromise_state_service import (
+    mark_session_compromise_evaluable,
+)
 
 
 @dataclass(frozen=True)
@@ -1088,6 +1091,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
     # Note: Attack path metrics are computed from attack_graph.json at scan completion
     shell._scan_first_credential_time = None
     shell._scan_compromise_time = None
+    mark_session_compromise_evaluable(shell)
 
     # If domain is known, skip service discovery and proceed directly
     if skip_domain_discovery and known_domain:
@@ -2749,6 +2753,7 @@ def _start_auth_with_params(
     # Note: Attack path metrics are computed from attack_graph.json at scan completion
     shell._scan_first_credential_time = None
     shell._scan_compromise_time = None
+    mark_session_compromise_evaluable(shell)
 
     properties = {
         "type": shell.type,
