@@ -87,6 +87,9 @@ from adscan_internal.services.attack_graph_service import (
     CredentialSourceStep,
     resolve_group_members_by_rid,
 )
+from adscan_internal.services.attack_path_target_viability_service import (
+    assess_computer_target_viability,
+)
 from adscan_internal.integrations.impacket.parsers import parse_secretsdump_output
 from adscan_internal.integrations.impacket.runner import (
     ImpacketContext,
@@ -218,6 +221,14 @@ _OBSOLETE_OS_PATTERN = re.compile(
     r"(?i)\b(windows(?:\s+server)?\s+[0-9a-z][0-9a-z .\-]*?(?:r2)?)(?=\s+is\s+obsolete\b|\s*$)"
 )
 _NETEXEC_LDAP_FIELD_PATTERN = re.compile(r"\(([^:()]+):([^)]+)\)")
+_NETEXEC_OBSOLETE_HOST_LINE_PATTERN = re.compile(
+    r"(?i)\bobsolete\b.*?\b(?P<host>[a-z0-9][a-z0-9_.-]*)\s+\((?P<ip>[^)]+)\)\s*:\s*(?P<operating_system>windows[^\r\n]+?)\s*$"
+)
+
+
+def _normalize_obsolete_host_key(value: object) -> str:
+    """Return a stable case-insensitive key for obsolete-host deduplication."""
+    return str(value or "").strip().rstrip(".").lower()
 
 
 def parse_netexec_obsolete_output(output: str) -> dict[str, object]:
@@ -235,6 +246,7 @@ def parse_netexec_obsolete_output(output: str) -> dict[str, object]:
     entries: list[dict[str, str]] = []
     seen_hosts: set[str] = set()
     hosts: list[str] = []
+    operating_system_counts: dict[str, int] = {}
 
     for raw_line in normalized.splitlines():
         line = raw_line.strip()
@@ -242,34 +254,51 @@ def parse_netexec_obsolete_output(output: str) -> dict[str, object]:
             continue
 
         entry: dict[str, str] = {"raw_line": line}
-        tokens = line.split()
-
         host: str | None = None
-        if len(tokens) >= 4 and tokens[0].upper() in {"LDAP", "SMB"}:
-            if _IP_TOKEN_PATTERN.match(tokens[1]) and tokens[2].isdigit():
-                host = tokens[3]
+        operating_system: str | None = None
 
-        if not host:
-            host_match = re.search(
-                r"(?i)\b([a-z0-9][a-z0-9_.-]*\.[a-z0-9.-]+|[a-z0-9][a-z0-9_-]{1,63})\b",
-                line,
-            )
-            if host_match:
-                candidate = host_match.group(1)
-                if candidate.lower() not in {"ldap", "smb", "obsolete", "module"}:
-                    host = candidate
-
-        if host:
+        detailed_match = _NETEXEC_OBSOLETE_HOST_LINE_PATTERN.search(line)
+        if detailed_match:
+            host = detailed_match.group("host").strip()
+            operating_system = detailed_match.group("operating_system").strip()
             entry["host"] = host
-            host_key = host.lower()
-            if host_key not in seen_hosts:
-                seen_hosts.add(host_key)
-                hosts.append(host)
+            entry["ip"] = detailed_match.group("ip").strip()
+            entry["operating_system"] = operating_system
+        else:
+            tokens = line.split()
+            if len(tokens) >= 4 and tokens[0].upper() in {"LDAP", "SMB"}:
+                if _IP_TOKEN_PATTERN.match(tokens[1]) and tokens[2].isdigit():
+                    host = tokens[3]
 
-        os_match = _OBSOLETE_OS_PATTERN.search(line)
-        if os_match:
-            entry["operating_system"] = os_match.group(1).strip()
+            if not host:
+                host_match = re.search(
+                    r"(?i)\b([a-z0-9][a-z0-9_.-]*\.[a-z0-9.-]+|[a-z0-9][a-z0-9_-]{1,63})\b",
+                    line,
+                )
+                if host_match:
+                    candidate = host_match.group(1)
+                    if candidate.lower() not in {"ldap", "smb", "obsolete", "module"}:
+                        host = candidate
 
+            if host:
+                entry["host"] = host
+
+            os_match = _OBSOLETE_OS_PATTERN.search(line)
+            if os_match:
+                operating_system = os_match.group(1).strip()
+                entry["operating_system"] = operating_system
+
+        if not host or not operating_system:
+            continue
+
+        host_key = _normalize_obsolete_host_key(host)
+        if host_key in seen_hosts:
+            continue
+        seen_hosts.add(host_key)
+        hosts.append(host)
+        operating_system_counts[operating_system] = (
+            int(operating_system_counts.get(operating_system) or 0) + 1
+        )
         entries.append(entry)
 
     return {
@@ -277,7 +306,251 @@ def parse_netexec_obsolete_output(output: str) -> dict[str, object]:
         "count": len(hosts),
         "hosts": hosts,
         "entries": entries,
+        "operating_system_counts": operating_system_counts,
     }
+
+
+def _enrich_obsolete_entries_with_current_vantage(
+    shell: LdapShell,
+    *,
+    domain: str,
+    parsed: dict[str, object],
+) -> dict[str, object]:
+    """Attach current-vantage viability context to parsed obsolete-host evidence."""
+    entries = parsed.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return parsed
+
+    enriched_entries: list[dict[str, object]] = []
+    status_counts = {
+        "reachable_from_current_vantage": 0,
+        "resolved_but_unreachable": 0,
+        "enabled_but_unresolved": 0,
+        "enabled_inventory_only": 0,
+        "not_in_enabled_inventory": 0,
+        "unknown": 0,
+    }
+
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = dict(raw_entry)
+        host = str(entry.get("host") or "").strip()
+        if not host:
+            continue
+
+        viability = assess_computer_target_viability(
+            shell,
+            domain=domain,
+            principal_name=host,
+            node={"properties": {"name": host}},
+        )
+        entry["current_vantage_status"] = viability.status
+        entry["current_vantage_summary"] = viability.operator_summary
+        entry["matched_ips"] = list(viability.matched_ips)
+        entry["matched_hostnames"] = list(viability.matched_hostnames)
+        entry["reachable_from_current_vantage"] = viability.reachable_from_current_vantage
+        entry["resolved_in_current_vantage_inventory"] = (
+            viability.resolved_in_current_vantage_inventory
+        )
+
+        if viability.status in status_counts:
+            status_counts[viability.status] += 1
+        else:
+            status_counts["unknown"] += 1
+        enriched_entries.append(entry)
+
+    parsed["entries"] = enriched_entries
+    parsed["current_vantage_summary"] = {
+        "report_available": any(
+            entry.get("resolved_in_current_vantage_inventory") is not None
+            for entry in enriched_entries
+        ),
+        "reachable_count": status_counts["reachable_from_current_vantage"],
+        "resolved_but_unreachable_count": status_counts["resolved_but_unreachable"],
+        "enabled_but_unresolved_count": status_counts["enabled_but_unresolved"],
+        "enabled_inventory_only_count": status_counts["enabled_inventory_only"],
+        "not_in_enabled_inventory_count": status_counts["not_in_enabled_inventory"],
+        "unknown_count": status_counts["unknown"],
+    }
+    return parsed
+
+
+def _status_label_for_obsolete_entry(status: str) -> str:
+    """Return a concise operator-facing label for one obsolete-host viability status."""
+    normalized = str(status or "").strip()
+    status_map = {
+        "reachable_from_current_vantage": "Reachable now",
+        "resolved_but_unreachable": "Resolved, not reachable",
+        "enabled_but_unresolved": "Enabled, no IP now",
+        "enabled_inventory_only": "Enabled, no vantage report",
+        "not_in_enabled_inventory": "Inventory drift",
+        "unknown": "Unknown",
+    }
+    return status_map.get(normalized, "Unknown")
+
+
+def _build_obsolete_inventory_drift_candidates(
+    entries: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return obsolete hosts that likely represent stale AD/DNS inventory drift."""
+    drift_statuses = {"enabled_but_unresolved", "not_in_enabled_inventory"}
+    return [
+        entry
+        for entry in entries
+        if str(entry.get("current_vantage_status") or "").strip() in drift_statuses
+    ]
+
+
+def _render_obsolete_computers_summary(
+    shell: LdapShell,
+    *,
+    domain: str,
+    parsed: dict[str, object],
+) -> None:
+    """Render a premium obsolete-host summary instead of raw NetExec output."""
+    entries = parsed.get("entries")
+    if not isinstance(entries, list) or not entries:
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info(f"No obsolete operating systems were identified in {marked_domain}.")
+        return
+
+    current_vantage_summary = (
+        parsed.get("current_vantage_summary")
+        if isinstance(parsed.get("current_vantage_summary"), dict)
+        else {}
+    )
+    operating_system_counts = (
+        parsed.get("operating_system_counts")
+        if isinstance(parsed.get("operating_system_counts"), dict)
+        else {}
+    )
+    total_hosts = int(parsed.get("count") or len(entries))
+    marked_domain = mark_sensitive(domain, "domain")
+    report_available = bool(current_vantage_summary.get("report_available"))
+
+    summary_parts = [f"{total_hosts} enabled AD host(s) flagged as obsolete in {marked_domain}."]
+    if operating_system_counts:
+        top_os = sorted(
+            (
+                (str(name), int(count))
+                for name, count in operating_system_counts.items()
+                if str(name).strip()
+            ),
+            key=lambda item: (-item[1], item[0].lower()),
+        )
+        summary_parts.append(
+            "OS mix: "
+            + ", ".join(f"{count}x {name}" for name, count in top_os[:3])
+            + "."
+        )
+    if report_available:
+        summary_parts.append(
+            "Current-vantage triage: "
+            f"{int(current_vantage_summary.get('reachable_count') or 0)} reachable now, "
+            f"{int(current_vantage_summary.get('resolved_but_unreachable_count') or 0)} resolved but not reachable, "
+            f"{int(current_vantage_summary.get('enabled_but_unresolved_count') or 0)} enabled without IP resolution."
+        )
+    else:
+        summary_parts.append(
+            "No current-vantage reachability report is available yet, so ADscan cannot distinguish live exposure from stale directory entries."
+        )
+    print_info(" ".join(summary_parts))
+
+    table = Table(
+        title="Obsolete Operating Systems",
+        show_header=True,
+        header_style=f"bold {BRAND_COLORS['warning']}",
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("Host", style="cyan", no_wrap=False, max_width=34)
+    table.add_column("OS", style="white", no_wrap=False, max_width=30)
+    table.add_column("Current Vantage", style="yellow", no_wrap=False, max_width=26)
+    table.add_column("IP Context", style="magenta", no_wrap=False, max_width=28)
+
+    shown_entries = entries[:12]
+    for idx, item in enumerate(shown_entries, 1):
+        if not isinstance(item, dict):
+            continue
+        host = mark_sensitive(str(item.get("host") or "unknown"), "hostname")
+        operating_system = str(item.get("operating_system") or "Unknown").strip()
+        status_label = _status_label_for_obsolete_entry(
+            str(item.get("current_vantage_status") or "")
+        )
+        matched_ips = [
+            mark_sensitive(str(ip), "ip")
+            for ip in item.get("matched_ips", [])
+            if str(ip).strip()
+        ]
+        raw_ip = str(item.get("ip") or "").strip()
+        ip_context = ", ".join(matched_ips[:2])
+        if not ip_context and raw_ip and raw_ip.upper() != "N/A":
+            ip_context = mark_sensitive(raw_ip, "ip")
+        if not ip_context:
+            ip_context = "N/A"
+        table.add_row(
+            str(idx),
+            host,
+            operating_system,
+            status_label,
+            ip_context,
+        )
+
+    remaining = max(0, total_hosts - len(shown_entries))
+    if remaining:
+        table.caption = (
+            f"Showing first {len(shown_entries)} obsolete hosts. "
+            f"{remaining} additional host(s) remain in the artifact and technical report."
+        )
+
+    subtitle = None
+    if not report_available:
+        subtitle = "Run `refresh_inventory <domain>` to separate reachable legacy systems from likely stale AD/DNS entries."
+
+    print_panel_with_table(
+        table,
+        title="[bold]Obsolete Operating Systems[/bold]",
+        border_style=BRAND_COLORS["warning"],
+    )
+    if subtitle:
+        print_info(subtitle)
+
+    drift_candidates = _build_obsolete_inventory_drift_candidates(
+        [item for item in entries if isinstance(item, dict)]
+    )
+    if drift_candidates:
+        shown_drift = drift_candidates[:8]
+        drift_lines = [
+            "These obsolete computer objects are enabled or still present in directory-linked evidence, "
+            "but ADscan could not resolve them into usable current-vantage network targets."
+        ]
+        drift_lines.append(
+            "This usually means stale AD/DNS inventory, decommissioned endpoints that were never cleaned up, "
+            "or naming records that no longer map to live systems."
+        )
+        drift_lines.append("")
+        drift_lines.append("Likely stale entries:")
+        for item in shown_drift:
+            host = mark_sensitive(str(item.get("host") or "unknown"), "hostname")
+            operating_system = str(item.get("operating_system") or "Unknown").strip()
+            status_label = _status_label_for_obsolete_entry(
+                str(item.get("current_vantage_status") or "")
+            )
+            drift_lines.append(f"- {host} ({operating_system}) [{status_label}]")
+        if len(drift_candidates) > len(shown_drift):
+            drift_lines.append(
+                f"- ... and {len(drift_candidates) - len(shown_drift)} additional stale-looking entry(s)"
+            )
+        drift_lines.append("")
+        drift_lines.append(
+            "Recommended action: validate decommission status, remove stale DNS records, "
+            "disable orphaned computer objects, and refresh the current-vantage inventory after cleanup."
+        )
+        print_panel(
+            "\n".join(drift_lines),
+            title="[bold]Likely Stale AD/DNS Entries[/bold]",
+            border_style=BRAND_COLORS["warning"],
+        )
 
 
 def _is_ldap_signing_hardened(value: str | None) -> bool:
@@ -609,11 +882,14 @@ def _record_obsolete_computers_finding(
     shell: LdapShell,
     *,
     domain: str,
-    command_output: str,
+    command_output: str | None = None,
+    parsed: dict[str, object] | None = None,
 ) -> None:
     """Persist obsolete-computer evidence into the technical report."""
-    parsed = parse_netexec_obsolete_output(command_output)
-    if not parsed:
+    parsed_payload = parsed or parse_netexec_obsolete_output(command_output or "")
+    if parsed and not isinstance(parsed_payload.get("entries"), list):
+        parsed_payload = parse_netexec_obsolete_output(command_output or "")
+    if not parsed_payload:
         return
 
     try:
@@ -627,8 +903,8 @@ def _record_obsolete_computers_finding(
             shell,
             domain,
             key="obsolete_computers",
-            value=bool(parsed.get("hosts")),
-            details=parsed,
+            value=bool(parsed_payload.get("hosts")),
+            details=parsed_payload,
             evidence=[
                 {
                     "type": "artifact",
@@ -677,20 +953,28 @@ def execute_netexec_obsolete(shell: LdapShell, *, command: str, domain: str) -> 
             return
 
         clean_stdout = str(getattr(completed_process, "stdout", "") or "").strip()
-        if clean_stdout:
-            shell.console.print(clean_stdout)
-
         parsed = parse_netexec_obsolete_output(clean_stdout)
+        parsed = _enrich_obsolete_entries_with_current_vantage(
+            shell,
+            domain=domain,
+            parsed=parsed,
+        )
         hosts = parsed.get("hosts", []) if isinstance(parsed, dict) else []
         shell.update_report_field(
             domain,
             "obsolete_computers",
             hosts if isinstance(hosts, list) and hosts else False,
         )
+        _render_obsolete_computers_summary(
+            shell,
+            domain=domain,
+            parsed=parsed,
+        )
         _record_obsolete_computers_finding(
             shell,
             domain=domain,
             command_output=clean_stdout,
+            parsed=parsed if isinstance(parsed, dict) else None,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)

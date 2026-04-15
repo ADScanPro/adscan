@@ -431,6 +431,7 @@ def _friendly_rel_label(rel: str) -> str:
         "printerbug": "PrinterBug",
         "mseven": "MS17-010",
         "ms17-010": "MS17-010",
+        "sqlaccess": "SQLAccess",
         "sqladmin": "SQLAdmin",
         "allowedtodelegate": "ConstrainedDelegation",
         "coercetotgt": "UnconstrainedDelegation",

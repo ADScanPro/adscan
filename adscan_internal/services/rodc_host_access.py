@@ -28,6 +28,7 @@ class RodcHostAccessContext:
     target_spn: str = ""
     delegated_user: str = ""
     ticket_path: str = ""
+    http_ticket_path: str = ""  # http/ SPN ccache for WinRM execution (RBCD dual-ticket)
 
 
 def build_rodc_host_access_outcome(
@@ -43,6 +44,7 @@ def build_rodc_host_access_outcome(
     target_spn: str = "",
     delegated_user: str = "",
     ticket_path: str = "",
+    http_ticket_path: str = "",
 ) -> dict[str, str]:
     """Build one normalized ``rodc_host_access_prepared`` outcome payload."""
     return {
@@ -58,6 +60,7 @@ def build_rodc_host_access_outcome(
         "target_spn": str(target_spn or "").strip(),
         "delegated_user": str(delegated_user or "").strip(),
         "ticket_path": str(ticket_path or "").strip(),
+        "http_ticket_path": str(http_ticket_path or "").strip(),
     }
 
 
@@ -93,6 +96,7 @@ def parse_rodc_host_access_outcome(
         target_spn=_clean(outcome.get("target_spn")),
         delegated_user=_clean(outcome.get("delegated_user")),
         ticket_path=_clean(outcome.get("ticket_path")),
+        http_ticket_path=_clean(outcome.get("http_ticket_path")),
     )
 
 

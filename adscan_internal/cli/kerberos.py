@@ -282,7 +282,7 @@ def ask_for_kerberos_user_enum(
             "Method": "AS-REQ pre-auth testing",
             "Mode": "Additional users" if relaunch else "Initial enumeration",
         },
-        default=True,
+        default=not relaunch,
         icon="👤",
     ):
         workspace_cwd = shell.current_workspace_dir or shell._get_workspace_cwd()
@@ -1484,11 +1484,12 @@ def sync_clock_with_pdc(
         # Docker runtime: perform host clock sync via the host helper socket
         sock_path = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
         if not sock_path:
-            disabled_reasons = getattr(shell, "_clock_sync_disabled_reasons", None)
-            if not isinstance(disabled_reasons, dict):
-                disabled_reasons = {}
-            disabled_reasons[domain] = "host_helper_missing"
-            setattr(shell, "_clock_sync_disabled_reasons", disabled_reasons)
+            _set_clock_sync_disabled_reason(
+                shell,
+                key=domain,
+                reason="host_helper_missing",
+                detail="ADSCAN_HOST_HELPER_SOCK is unset or empty",
+            )
             if verbose:
                 marked_domain = mark_sensitive(domain, "domain")
                 print_warning_verbose(
@@ -1577,13 +1578,17 @@ def sync_clock_with_pdc(
             return False
         except (HostHelperError, OSError) as exc:
             telemetry.capture_exception(exc)
-            disabled_reasons = getattr(shell, "_clock_sync_disabled_reasons", None)
-            if not isinstance(disabled_reasons, dict):
-                disabled_reasons = {}
-            disabled_reasons[domain] = "host_helper_error"
-            setattr(shell, "_clock_sync_disabled_reasons", disabled_reasons)
+            stored_reason = _set_clock_sync_disabled_reason(
+                shell,
+                key=domain,
+                reason="host_helper_error",
+                detail=exc,
+            )
+            marked_domain = mark_sensitive(domain, "domain")
+            print_warning_debug(
+                f"[kerberos] Clock sync host helper failed for {marked_domain}: {stored_reason}"
+            )
             if verbose:
-                marked_domain = mark_sensitive(domain, "domain")
                 print_warning_verbose(
                     f"Clock sync host helper failed for {marked_domain}: {exc}"
                 )
@@ -1591,11 +1596,11 @@ def sync_clock_with_pdc(
 
     needs_sudo = os.geteuid() != 0
     if needs_sudo and not _sudo_validate():
-        disabled_reasons = getattr(shell, "_clock_sync_disabled_reasons", None)
-        if not isinstance(disabled_reasons, dict):
-            disabled_reasons = {}
-        disabled_reasons[domain] = "sudo_unavailable"
-        setattr(shell, "_clock_sync_disabled_reasons", disabled_reasons)
+        _set_clock_sync_disabled_reason(
+            shell,
+            key=domain,
+            reason="sudo_unavailable",
+        )
         if verbose:
             marked_domain = mark_sensitive(domain, "domain")
             print_warning_verbose(
@@ -1729,6 +1734,25 @@ def _sanitize_clock_sync_preview(value: str | None, *, host: str) -> str:
     return preview
 
 
+def _set_clock_sync_disabled_reason(
+    shell: KerberosShell,
+    *,
+    key: str,
+    reason: str,
+    detail: object | None = None,
+) -> str:
+    """Persist a memoized clock-sync disable reason with optional diagnostic detail."""
+    disabled_reasons = getattr(shell, "_clock_sync_disabled_reasons", None)
+    if not isinstance(disabled_reasons, dict):
+        disabled_reasons = {}
+
+    detail_text = str(detail or "").strip()
+    stored_reason = reason if not detail_text else f"{reason}: {detail_text}"
+    disabled_reasons[key] = stored_reason
+    setattr(shell, "_clock_sync_disabled_reasons", disabled_reasons)
+    return stored_reason
+
+
 def _log_host_helper_clock_sync_response(
     *, operation: str, host: str, response: object
 ) -> None:
@@ -1757,11 +1781,12 @@ def _sync_clock_via_net_time(
         sock_path = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
         disable_key = domain or host
         if not sock_path:
-            disabled_reasons = getattr(shell, "_clock_sync_disabled_reasons", None)
-            if not isinstance(disabled_reasons, dict):
-                disabled_reasons = {}
-            disabled_reasons[disable_key] = "host_helper_missing"
-            setattr(shell, "_clock_sync_disabled_reasons", disabled_reasons)
+            _set_clock_sync_disabled_reason(
+                shell,
+                key=disable_key,
+                reason="host_helper_missing",
+                detail="ADSCAN_HOST_HELPER_SOCK is unset or empty",
+            )
             return False
         try:
             from adscan_internal.host_privileged_helper import (
@@ -1809,10 +1834,11 @@ def _sync_clock_via_net_time(
             command = f"sudo -n net time set -S {marked_host}"
         else:
             # We cannot elevate, so this will consistently fail; disable further attempts.
-            if not isinstance(disabled_reasons, dict):
-                disabled_reasons = {}
-            disabled_reasons[disable_key] = "sudo_unavailable"
-            setattr(shell, "_clock_sync_disabled_reasons", disabled_reasons)
+            _set_clock_sync_disabled_reason(
+                shell,
+                key=disable_key,
+                reason="sudo_unavailable",
+            )
             print_warning(
                 f"'net time' synchronization requires elevated privileges and could not use sudo. "
                 f"Disabling clock sync attempts for {mark_sensitive(disable_key, 'domain' if domain else sensitive_kind)}."
@@ -1838,10 +1864,12 @@ def _sync_clock_via_net_time(
         # This is typically a privilege/capability issue (e.g., running without root,
         # sudo not available, or restricted environments). Avoid repeating this for
         # every Kerberos command by disabling further sync attempts.
-        if not isinstance(disabled_reasons, dict):
-            disabled_reasons = {}
-        disabled_reasons[disable_key] = "operation_not_permitted"
-        setattr(shell, "_clock_sync_disabled_reasons", disabled_reasons)
+        _set_clock_sync_disabled_reason(
+            shell,
+            key=disable_key,
+            reason="operation_not_permitted",
+            detail=error_output or None,
+        )
     print_warning(
         f"'net time' synchronization failed against {marked_host}: {error_output or 'unknown error'}"
     )

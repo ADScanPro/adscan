@@ -1531,7 +1531,7 @@ def _attack_path_step_has_executable_context(
     if not exec_username or not exec_password:
         return False
 
-    if step_key in {"adminto", "sqladmin", "canrdp", "canpsremote"}:
+    if step_key in {"adminto", "sqlaccess", "sqladmin", "canrdp", "canpsremote"}:
         return bool(
             to_label
             and resolve_netexec_target_for_node_label(
@@ -3364,6 +3364,7 @@ def _collect_previous_host_access_candidates(
         return []
     relation_priority = {
         "adminto": 0,
+        "sqlaccess": 1,
         "sqladmin": 1,
         "canpsremote": 2,
         "canrdp": 3,
@@ -4576,7 +4577,7 @@ def execute_selected_attack_path(
                 except ValueError:
                     executable_step_position = 0
 
-            if key in {"adminto", "sqladmin", "canrdp", "canpsremote"}:
+            if key in {"adminto", "sqlaccess", "sqladmin", "canrdp", "canpsremote"}:
                 if not to_label:
                     _record_attack_path_execution_event(
                         shell,
@@ -4677,6 +4678,7 @@ def execute_selected_attack_path(
 
                 service_map: dict[str, str] = {
                     "adminto": "smb",
+                    "sqlaccess": "mssql",
                     "sqladmin": "mssql",
                     "canrdp": "rdp",
                     "canpsremote": "winrm",

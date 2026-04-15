@@ -1334,6 +1334,17 @@ def request_delegated_service_ticket(
     """
     from adscan_internal.services.exploitation import ExploitationService
 
+    previous_result = getattr(shell, "_last_delegation_launch_result", None)
+    aggregated_ticket_paths: dict[str, str] = {}
+    if isinstance(previous_result, dict):
+        raw_previous_paths = previous_result.get("ticket_paths")
+        if isinstance(raw_previous_paths, dict):
+            aggregated_ticket_paths = {
+                str(key).strip(): str(value).strip()
+                for key, value in raw_previous_paths.items()
+                if str(key).strip() and str(value).strip()
+            }
+
     setattr(shell, "_last_delegation_launch_result", None)
     setattr(
         shell,
@@ -1341,6 +1352,7 @@ def request_delegated_service_ticket(
         {
             "domain": domain,
             "target_spn": target_spn,
+            "target_spns": sorted({*aggregated_ticket_paths.keys(), target_spn}),
             "username": username,
             "password": password,
             "force_forwardable": force_forwardable,
@@ -1355,6 +1367,7 @@ def request_delegated_service_ticket(
                 {
                     "success": False,
                     "target_spn": target_spn,
+                    "ticket_paths": aggregated_ticket_paths,
                     "target_user": None,
                     "ticket_path": None,
                     "error": "No privileged user found that can be delegated",
@@ -1383,6 +1396,7 @@ def request_delegated_service_ticket(
                 {
                     "success": False,
                     "target_spn": target_spn,
+                    "ticket_paths": aggregated_ticket_paths,
                     "target_user": target_user,
                     "ticket_path": None,
                     "error": error_message,
@@ -1406,6 +1420,8 @@ def request_delegated_service_ticket(
                 credential=password,
             ),
         )
+        if result.success and result.ticket_path:
+            aggregated_ticket_paths[target_spn] = result.ticket_path
         setattr(
             shell,
             "_last_delegation_launch_result",
@@ -1414,6 +1430,7 @@ def request_delegated_service_ticket(
                 "target_spn": target_spn,
                 "target_user": target_user,
                 "ticket_path": result.ticket_path,
+                "ticket_paths": aggregated_ticket_paths,
                 "error": result.error_message,
             },
         )
@@ -1433,6 +1450,7 @@ def request_delegated_service_ticket(
             {
                 "success": False,
                 "target_spn": target_spn,
+                "ticket_paths": aggregated_ticket_paths,
                 "target_user": None,
                 "ticket_path": None,
                 "error": str(e),
@@ -1465,15 +1483,29 @@ def refresh_last_delegated_service_ticket(
 
     previous_result = getattr(shell, "_last_delegation_launch_result", None)
     previous_ticket_path = None
+    previous_ticket_paths: dict[str, str] = {}
     if isinstance(previous_result, dict):
         previous_ticket_path = str(previous_result.get("ticket_path") or "").strip() or None
+        raw_ticket_paths = previous_result.get("ticket_paths")
+        if isinstance(raw_ticket_paths, dict):
+            previous_ticket_paths = {
+                str(key).strip(): str(value).strip()
+                for key, value in raw_ticket_paths.items()
+                if str(key).strip() and str(value).strip()
+            }
 
     requested_ticket_path = str(current_ticket_path or "").strip() or None
-    if (
+    known_ticket_paths = {
+        os.path.abspath(path)
+        for path in ([previous_ticket_path] if previous_ticket_path else [])
+        if path
+    }
+    known_ticket_paths.update(
+        os.path.abspath(path) for path in previous_ticket_paths.values() if path
+    )
+    if requested_ticket_path and known_ticket_paths and os.path.abspath(
         requested_ticket_path
-        and previous_ticket_path
-        and os.path.abspath(requested_ticket_path) != os.path.abspath(previous_ticket_path)
-    ):
+    ) not in known_ticket_paths:
         print_warning(
             "ADscan detected a delegated ticket mismatch and will not refresh "
             "an unrelated Kerberos cache automatically."
@@ -1482,34 +1514,51 @@ def refresh_last_delegated_service_ticket(
 
     domain = str(context.get("domain") or "").strip()
     target_spn = str(context.get("target_spn") or "").strip()
+    raw_target_spns = context.get("target_spns")
+    if isinstance(raw_target_spns, list):
+        target_spns = [str(item).strip() for item in raw_target_spns if str(item).strip()]
+    else:
+        target_spns = [target_spn] if target_spn else []
     username = str(context.get("username") or "").strip()
     password = str(context.get("password") or "")
     force_forwardable = bool(context.get("force_forwardable", True))
 
-    if not domain or not target_spn or not username or not password:
+    if not domain or not target_spns or not username or not password:
         print_warning(
             "ADscan cannot refresh this delegated ticket because the saved "
             "delegation context is incomplete."
         )
         return None
 
-    marked_spn = mark_sensitive(target_spn, "service")
-    print_info(
-        "Refreshing delegated service ticket for "
-        f"{marked_spn}."
-    )
-    success = request_delegated_service_ticket(
-        shell,
-        domain,
-        target_spn,
-        username,
-        password,
-        force_forwardable=force_forwardable,
-    )
-    if not success:
-        return None
+    for next_target_spn in target_spns:
+        marked_spn = mark_sensitive(next_target_spn, "service")
+        print_info(
+            "Refreshing delegated service ticket for "
+            f"{marked_spn}."
+        )
+        success = request_delegated_service_ticket(
+            shell,
+            domain,
+            next_target_spn,
+            username,
+            password,
+            force_forwardable=force_forwardable,
+        )
+        if not success:
+            return None
 
     refreshed_result = getattr(shell, "_last_delegation_launch_result", None)
     if not isinstance(refreshed_result, dict):
         return None
+    refreshed_ticket_paths = refreshed_result.get("ticket_paths")
+    if requested_ticket_path and isinstance(refreshed_ticket_paths, dict):
+        previous_match = None
+        for spn, prior_path in previous_ticket_paths.items():
+            if os.path.abspath(str(prior_path)) == os.path.abspath(requested_ticket_path):
+                previous_match = str(spn).strip()
+                break
+        if previous_match:
+            refreshed_match = str(refreshed_ticket_paths.get(previous_match) or "").strip()
+            if refreshed_match:
+                return refreshed_match
     return str(refreshed_result.get("ticket_path") or "").strip() or None

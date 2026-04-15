@@ -162,7 +162,6 @@ def run_session_preflight(
             preflight_overridden = True
         else:
             print_error("ADscan preflight checks failed.")
-            print_info("Run: adscan check --fix")
             _print_support_links(
                 docs_url=docs_url,
                 docs_tracking_key=config.docs_utm_medium,

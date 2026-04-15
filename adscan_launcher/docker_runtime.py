@@ -819,6 +819,15 @@ def build_adscan_run_command(
         "ADSCAN_ENV",
         "ADSCAN_TELEMETRY",
         "ADSCAN_ALLOW_PUBLIC_DNS",
+        # CI event pipeline: forward the structured-event sink config so the container
+        # emits JSON events to stderr (read by the Celery worker via PIPE).
+        # NOTE: ADSCAN_INTERACTIVE_SINK is intentionally NOT forwarded here — the
+        # container's Python runtime may not have the redis package available, and the
+        # Redis URL (typically localhost) is unreachable from inside Docker.  Interactive
+        # prompts are handled by ADSCAN_NONINTERACTIVE instead.
+        "ADSCAN_EVENT_SINK",
+        "ADSCAN_SCAN_ID",
+        "ADSCAN_NONINTERACTIVE",
         "CI",
         "GITHUB_ACTIONS",
         "GITLAB_CI",

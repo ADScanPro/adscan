@@ -7,9 +7,10 @@ from pivot hosts. It is intentionally conservative:
 - Cleanup is attempted again when the keepalive monitor observes tunnel death.
 - Cleanup is attempted on clean ADscan shutdown for persisted Ligolo pivots.
 
-The implementation only supports the current WinRM-backed Ligolo workflow. When
-no reusable cleartext credential is available, ADscan records that operator
-action is required and surfaces the exact remote path.
+Cleanup execution is transport-aware and reuses the shared remote Windows
+execution backends so WinRM/MSSQL pivots can converge on the same lifecycle.
+When no reusable cleartext credential is available, ADscan records that
+operator action is required and surfaces the exact remote path.
 """
 
 from __future__ import annotations
@@ -22,6 +23,10 @@ from typing import Any, Callable
 from adscan_internal import print_info, print_info_debug, print_warning, telemetry
 from adscan_internal.rich_output import confirm_operation, mark_sensitive
 from adscan_internal.services.ligolo_service import LigoloProxyService
+from adscan_internal.services.exploitation.remote_windows_execution import (
+    RemoteWindowsAuth,
+    RemoteWindowsExecutionService,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +159,7 @@ def cleanup_remote_ligolo_artifact(
     tunnel_id: str | None = None,
     reason: str,
 ) -> LigoloArtifactCleanupResult:
-    """Best-effort removal of one remote Ligolo agent artifact via WinRM."""
+    """Best-effort removal of one remote Ligolo agent artifact via one transport."""
 
     if not remote_agent_path:
         return LigoloArtifactCleanupResult(
@@ -316,7 +321,6 @@ def cleanup_workspace_ligolo_artifacts(
         dict(record)
         for record in service.load_tunnels_state()
         if str(record.get("pivot_tool") or "").strip().lower() == "ligolo"
-        and str(record.get("source_service") or "").strip().lower() == "winrm"
         and str(record.get("remote_agent_path") or "").strip()
         and str(record.get("remote_artifact_cleanup_status") or "").strip().lower() != "deleted"
     ]
@@ -328,6 +332,7 @@ def cleanup_workspace_ligolo_artifacts(
     for record in candidates:
         tunnel_id = str(record.get("tunnel_id") or "").strip() or None
         domain = str(record.get("domain") or "").strip()
+        source_service = str(record.get("source_service") or "winrm").strip().lower()
         pivot_host = str(record.get("pivot_host") or "").strip()
         username = str(record.get("pivot_username") or "").strip()
         remote_agent_path = str(record.get("remote_agent_path") or "").strip()
@@ -350,7 +355,27 @@ def cleanup_workspace_ligolo_artifacts(
             except Exception as exc:  # noqa: BLE001
                 print_info_debug(f"[ligolo-cleanup] stop_tunnel failed for {tunnel_id}: {exc}")
 
-        from adscan_internal.cli.winrm import _execute_powershell_via_psrp  # noqa: PLC0415
+        remote_executor = RemoteWindowsExecutionService(shell)
+
+        def _execute_remote_script(**kwargs: Any) -> str:
+            auth = RemoteWindowsAuth(
+                domain=str(kwargs.get("domain") or domain),
+                host=str(kwargs.get("host") or pivot_host),
+                username=str(kwargs.get("username") or username),
+                secret=str(kwargs.get("password") or password or ""),
+            )
+            result = remote_executor.execute_powershell(
+                auth,
+                str(kwargs.get("script") or ""),
+                operation_name=str(kwargs.get("operation_name") or "ligolo_agent_cleanup"),
+                preferred_transport=source_service,
+                timeout=300,
+            )
+            if not result.success:
+                raise RuntimeError(
+                    result.error_message or result.stderr or "Remote cleanup execution failed."
+                )
+            return str(result.stdout or "")
 
         result = cleanup_remote_ligolo_artifact(
             domain=domain,
@@ -359,7 +384,7 @@ def cleanup_workspace_ligolo_artifacts(
             password=str(password or ""),
             remote_agent_path=remote_agent_path,
             remote_agent_pid=remote_agent_pid if isinstance(remote_agent_pid, int) else None,
-            execute_remote_script=_execute_powershell_via_psrp,
+            execute_remote_script=_execute_remote_script,
             tunnel_id=tunnel_id,
             reason=reason,
         )

@@ -32,6 +32,16 @@ _PIVOT_SERVICE_CAPABILITIES: dict[str, PivotServiceCapability] = {
         followup_workflow_intent="pivot_search",
         relaunch_workflow_intent="pivot_relaunch",
     ),
+    "mssql": PivotServiceCapability(
+        service="mssql",
+        title="MSSQL",
+        pivot_tooling_hint="MSSQL command execution can stage Ligolo when xp_cmdshell or linked-server execution is available.",
+        priority=20,
+        required_ports=(1433,),
+        followup_handler_name="ask_for_mssql_access",
+        followup_workflow_intent="pivot_search",
+        relaunch_workflow_intent="pivot_relaunch",
+    ),
 }
 
 

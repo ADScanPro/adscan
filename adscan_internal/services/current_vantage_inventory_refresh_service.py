@@ -33,6 +33,12 @@ from adscan_internal.rich_output import (
     print_success,
     print_warning,
 )
+from adscan_internal.services.domain_connectivity_service import (
+    reconcile_domain_connectivity_from_current_vantage_report,
+)
+from adscan_internal.services.post_pivot_followup_service import (
+    maybe_offer_trust_followup_for_newly_reachable_domains,
+)
 
 CURRENT_VANTAGE_INVENTORY_STALE_AFTER_SECONDS = 24 * 60 * 60
 CURRENT_VANTAGE_INVENTORY_PROMPT_COOLDOWN_SECONDS = 12 * 60 * 60
@@ -414,6 +420,30 @@ def refresh_current_vantage_inventory(
 
     refreshed_report = _report_path(shell, domain=domain)
     if os.path.exists(refreshed_report):
+        newly_reachable_domains = reconcile_domain_connectivity_from_current_vantage_report(
+            shell,
+            source_domain=domain,
+        )
+        if newly_reachable_domains:
+            print_info_debug(
+                "[current-vantage-refresh] reconciled inter-domain connectivity from refreshed report: "
+                f"domain={mark_sensitive(domain, 'domain')} "
+                f"updated={len(newly_reachable_domains)}"
+            )
+            if not is_non_interactive(shell=shell) and not bool(getattr(shell, "auto", False)):
+                maybe_offer_trust_followup_for_newly_reachable_domains(
+                    shell,
+                    source_domain=domain,
+                    newly_reachable_domains=newly_reachable_domains,
+                    title="Trusted Domains Now Reachable",
+                    lead_lines=[
+                        "The refreshed current-vantage inventory unlocked additional trusted-domain reachability.",
+                    ],
+                    prompt=(
+                        "Do you want ADscan to continue trust-driven authenticated enumeration "
+                        f"from {mark_sensitive(domain, 'domain')} now?"
+                    ),
+                )
         print_success(
             f"Current-vantage inventory refresh completed for {marked_domain}."
         )

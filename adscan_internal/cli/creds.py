@@ -64,7 +64,8 @@ def normalize_creds_subcommand(subcommand: str) -> tuple[str, bool]:
     """Normalize `creds` subcommand aliases to their canonical form.
 
     Args:
-        subcommand: Raw subcommand provided by the user (for example `save`).
+        subcommand: Raw subcommand provided by the user (for example `save` or
+            `show_users`).
 
     Returns:
         Tuple ``(normalized, alias_used)``.
@@ -74,6 +75,7 @@ def normalize_creds_subcommand(subcommand: str) -> tuple[str, bool]:
         "add": "save",
         "remove": "delete",
         "del": "delete",
+        "show_users": "show",
     }
     target = aliases.get(normalized, normalized)
     return target, target != normalized

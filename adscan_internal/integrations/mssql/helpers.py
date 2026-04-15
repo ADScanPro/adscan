@@ -8,6 +8,8 @@ Utility functions for working with NetExec MSSQL including:
 
 from __future__ import annotations
 
+import shlex
+
 
 def is_hash_authentication(password: str) -> bool:
     """Check if password is NTLM hash format.
@@ -74,6 +76,39 @@ def build_mssql_execute_command(
     """
     auth_string = build_mssql_auth_string(username, password, domain)
     return f"{netexec_path} mssql '{host}' {auth_string} -x \"{command}\""
+
+
+def build_mssql_module_command(
+    netexec_path: str,
+    host: str,
+    username: str,
+    password: str,
+    module: str,
+    options: dict[str, str] | None = None,
+    domain: str | None = None,
+) -> str:
+    """Build a NetExec MSSQL module invocation.
+
+    Args:
+        netexec_path: Path to netexec executable.
+        host: Target host.
+        username: Username for authentication.
+        password: Password or NTLM hash.
+        module: NetExec MSSQL module name.
+        options: Optional module arguments passed after one ``-o`` flag.
+        domain: Optional domain.
+
+    Returns:
+        Complete command string ready for execution.
+    """
+    auth_string = build_mssql_auth_string(username, password, domain)
+    command = f"{netexec_path} mssql '{host}' {auth_string} -M {shlex.quote(module)}"
+    if options:
+        joined_options = " ".join(
+            f"{key}={shlex.quote(value)}" for key, value in options.items()
+        )
+        command += f" -o {joined_options}"
+    return command
 
 
 def escape_powershell_command(command: str) -> str:

@@ -458,12 +458,14 @@ def normalize_command_alias(
         - ``start auth`` -> (``start_auth``, [], True)
         - ``start unauth`` -> (``start_unauth``, [], True)
         - ``start-auth`` -> (``start_auth``, [...], True)
+        - ``reporting`` -> (``generate_report``, [...], True)
     """
     cmd = (command_name or "").strip().lower()
     if not cmd:
         return command_name, args_list, False
 
     direct_aliases = {
+        "reporting": "generate_report",
         "start-auth": "start_auth",
         "startauth": "start_auth",
         "start-unauth": "start_unauth",

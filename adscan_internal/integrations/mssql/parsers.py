@@ -34,6 +34,119 @@ class CommandResult:
     error: Optional[str] = None
 
 
+def has_authenticated_mssql_access(output: str) -> bool:
+    """Return whether NetExec MSSQL output confirms valid authenticated access.
+
+    For MSSQL post-auth workflows we treat the standard NetExec auth success
+    marker ``[+] domain\\user:secret`` as sufficient to continue with low-priv
+    follow-ups even when ``(Pwn3d!)`` is absent.
+    """
+    if not output:
+        return False
+
+    success_line = re.compile(r"^\s*MSSQL\b.*\[\+\]\s+\S+[:].*$", re.IGNORECASE)
+    return any(success_line.search(line) for line in output.splitlines())
+
+
+def parse_linked_servers(output: str) -> list[str]:
+    """Parse NetExec ``enum_links`` output into a unique server list."""
+    if not output:
+        return []
+
+    linked_servers: list[str] = []
+    server_pattern = re.compile(r"^\s*ENUM_LINKS\b.*\[\*\]\s+-\s+(.+?)\s*$", re.IGNORECASE)
+    for line in output.splitlines():
+        match = server_pattern.search(line)
+        if not match:
+            continue
+        server = str(match.group(1) or "").strip()
+        if server and server not in linked_servers:
+            linked_servers.append(server)
+    return linked_servers
+
+
+def parse_xp_cmdshell_enable_success(output: str) -> bool:
+    """Return whether xp_cmdshell enablement succeeded."""
+    if not output:
+        return False
+
+    normalized = output.lower()
+    success_indicators = (
+        "xp_cmdshell enabled",
+        "configuration option 'xp_cmdshell' changed from 0 to 1",
+    )
+    failure_indicators = (
+        "failed to enable xp_cmdshell",
+        "do not have permission",
+        "permission to run the reconfigure statement",
+    )
+    return any(marker in normalized for marker in success_indicators) and not any(
+        marker in normalized for marker in failure_indicators
+    )
+
+
+def parse_xp_cmdshell_enable_failure_reason(output: str) -> str | None:
+    """Return a user-facing reason when xp_cmdshell enablement fails.
+
+    This parser focuses on premium UX rather than full T-SQL fidelity:
+    it extracts the most actionable cause from common NetExec MSSQL module output.
+    """
+    if not output:
+        return None
+
+    normalized = output.lower()
+    if (
+        "do not have permission" in normalized
+        or "permission to run the reconfigure statement" in normalized
+        or "failed to enable xp_cmdshell" in normalized and "reconfigure" in normalized
+    ):
+        return "insufficient SQL privileges to run RECONFIGURE and enable xp_cmdshell"
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if "Failed to enable xp_cmdshell:" in line:
+            return line.split("Failed to enable xp_cmdshell:", 1)[1].strip() or None
+
+    if "xp_cmdshell is disabled" in normalized:
+        return "xp_cmdshell is currently disabled and could not be enabled"
+
+    return None
+
+
+def parse_link_xpcmd_execution_success(output: str) -> bool:
+    """Return whether NetExec reports command execution via linked server."""
+    if not output:
+        return False
+    return "Executed command via linked server" in output
+
+
+def parse_link_xpcmd_identity(output: str) -> str | None:
+    """Extract the command identity returned by a successful linked ``whoami``.
+
+    The output must already contain NetExec's linked execution success marker.
+    Wrapper lines and obvious error lines are ignored.
+    """
+    if not parse_link_xpcmd_execution_success(output):
+        return None
+
+    ignored_tokens = (
+        "MSSQL",
+        "LINK_XPCMD",
+        "[*]",
+        "[+]",
+        "[-]",
+        "Please provide both LINKED_SERVER and CMD options.",
+    )
+    for raw_line in reversed(output.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(token in line for token in ignored_tokens):
+            continue
+        return line
+    return None
+
+
 def parse_whoami_priv_output(output: str) -> List[WindowsPrivilege]:
     """Parse whoami /priv output for Windows privileges.
 

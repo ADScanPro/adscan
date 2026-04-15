@@ -71,6 +71,14 @@ class _NetworkPreflightCheck:
     suggestion: str | None = None
 
 
+@dataclass(frozen=True)
+class _DcDiscoveryRecoveryDecision:
+    """Next-step decision after an operator declines or misses DC discovery."""
+
+    action: Literal["retry_scope", "switch_context", "cancel"]
+    hosts: str | None = None
+
+
 _LAB_STRONG_INFERENCE_THRESHOLD = 0.90
 _USER_CONFIRMED_LAB_STATES = {"manual", "accepted_inference"}
 
@@ -678,6 +686,102 @@ def _handle_start_wizard_interrupt(
     return "return"
 
 
+def _show_host_range_discovery_intro() -> None:
+    """Render the discovery-mode guidance before asking for a target range."""
+    print_info(
+        "Host-range discovery mode enabled\n"
+        "[dim]We'll scan the specified host range to discover domains first[/dim]"
+    )
+    print_warning(
+        "[bold]Important:[/bold] Provide a range that actually contains DCs",
+        panel=True,
+        items=[
+            "Include AD members (workstations/servers)",
+            "LDAP (389) is preferred; SMB (445) is only a fallback",
+            "Single IP or CIDR (e.g., 10.10.10.100 or 10.10.10.0/24)",
+        ],
+    )
+
+
+def _prompt_domain_discovery_hosts(
+    shell: Any,
+    *,
+    default_hosts: str | None = None,
+) -> str | None:
+    """Prompt for discovery scope with UX tailored to domain discovery."""
+    default_value = str(default_hosts or getattr(shell, "hosts", "") or "").strip()
+    while True:
+        hosts_input = Prompt.ask(
+            Text(
+                "Enter a host range/IP for domain discovery "
+                "(single IP or CIDR, e.g., 10.10.10.100 or 10.10.10.0/24)",
+                style="cyan",
+            ),
+            default=default_value or "10.10.10.0/24",
+        ).strip()
+        if not hosts_input:
+            print_warning("Domain discovery cancelled before any targets were scanned.")
+            return None
+        shell.hosts = hosts_input
+        _warn_if_single_discovery_target(hosts_input)
+        return hosts_input
+
+
+def _prompt_dc_discovery_recovery(
+    shell: Any,
+    *,
+    current_target: str,
+    reason: Literal["scope_rejected", "no_candidates"],
+) -> _DcDiscoveryRecoveryDecision:
+    """Guide the operator to the best next step after discovery cannot continue."""
+    if reason == "scope_rejected":
+        body = (
+            "[bold]No scan was run.[/bold]\n\n"
+            "You stopped the discovery pass before scanning the large range.\n"
+            "Let's tighten the scope and keep momentum."
+        )
+        title = "[bold]🧭 Refine Discovery Scope[/bold]"
+        options = [
+            "Refine the host range/CIDR and try again (recommended)",
+            "Switch to known domain/DC input instead",
+            "Cancel start_unauth for now",
+        ]
+    else:
+        body = (
+            "[bold]Discovery completed, but no likely DCs were found.[/bold]\n\n"
+            "This usually means the range missed AD-connected hosts or the DC subnet.\n"
+            "You can refine the target or switch to direct domain context."
+        )
+        title = "[bold]🧭 Next Discovery Step[/bold]"
+        options = [
+            "Try a different host range/CIDR (recommended)",
+            "Switch to known domain/DC input instead",
+            "Cancel start_unauth for now",
+        ]
+
+    print_panel(
+        f"{body}\n\nCurrent scope: {mark_sensitive(current_target, 'host')}",
+        title=title,
+        border_style="cyan",
+        padding=(1, 2),
+    )
+    selection = _select_option_interactive(
+        shell,
+        message="Choose how you want to proceed:",
+        options=options,
+        default_index=0,
+    )
+    if selection in {None, 2}:
+        return _DcDiscoveryRecoveryDecision(action="cancel")
+    if selection == 1:
+        return _DcDiscoveryRecoveryDecision(action="switch_context")
+
+    new_hosts = _prompt_domain_discovery_hosts(shell, default_hosts=current_target)
+    if not new_hosts:
+        return _DcDiscoveryRecoveryDecision(action="cancel")
+    return _DcDiscoveryRecoveryDecision(action="retry_scope", hosts=new_hosts)
+
+
 def _run_start_unauth_impl(shell, args: str | None) -> None:
     """Start unauthenticated scan using the legacy PentestShell implementation.
 
@@ -783,21 +887,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                 )
 
         if not skip_domain_discovery:
-            from adscan_internal import print_warning
-
-            print_info(
-                "Host-range discovery mode enabled\n"
-                "[dim]We'll scan the specified host range to discover domains first[/dim]"
-            )
-            print_warning(
-                "[bold]Important:[/bold] Provide a range that actually contains DCs",
-                panel=True,
-                items=[
-                    "Include AD members (workstations/servers)",
-                    "LDAP (389) is preferred; SMB (445) is only a fallback",
-                    "Single IP or CIDR (e.g., 10.10.10.100 or 10.10.10.0/24)",
-                ],
-            )
+            _show_host_range_discovery_intro()
 
     # Args mode supports a few "shortcuts" for power users:
     # - `start_unauth <domain>` (attempt DNS-based PDC discovery)
@@ -996,10 +1086,11 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
 
         if not skip_domain_discovery:
             # User opted to fall back to discovery mode, ignore the domain arg.
-            if not shell._prompt_hosts_if_missing():
+            _show_host_range_discovery_intro()
+            target_input = _prompt_domain_discovery_hosts(shell)
+            if not target_input:
                 return
-            _warn_if_single_discovery_target(shell.hosts)
-            target = shell.hosts
+            target = target_input
             domain = None
             known_domain = None
             known_pdc_ip = None
@@ -1032,11 +1123,10 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
             target = known_pdc_ip
             domain = known_domain
         else:
-            if not shell._prompt_hosts_if_missing():
+            target_input = _prompt_domain_discovery_hosts(shell)
+            if not target_input:
                 return
-            _warn_if_single_discovery_target(shell.hosts)
-
-            target = shell.hosts
+            target = target_input
             domain = known_domain
 
     interactive_mode = bool(sys.stdin.isatty())
@@ -1108,8 +1198,6 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
         else:
             dns_ok = shell.do_check_dns(known_domain)
         if not dns_ok:
-            from adscan_internal import print_warning
-
             print_warning(
                 f"[bold]⚠️  DNS resolution issue for domain[/bold] {mark_sensitive(known_domain, 'domain')}\n"
                 "The scan will continue, but some enumeration may fail without proper DNS resolution."
@@ -1171,76 +1259,91 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     discover_dc_candidates_with_nmap_details,
                 )
 
-                candidate_port_map = discover_dc_candidates_with_nmap_details(
-                    shell, hosts=target, ports=[88, 389, 53]
-                )
-                candidates = sorted(candidate_port_map.keys())
-                if not candidates:
-                    marked_target = mark_sensitive(str(target), "host")
-                    print_panel(
-                        "[bold]No Domain Controllers Found[/bold]\n\n"
-                        f"Scanned {marked_target} for AD core ports "
-                        "(Kerberos 88, LDAP 389, DNS 53) and found no likely DCs.\n\n"
-                        "[bold]Recommended next step:[/bold]\n"
-                        "• Try a broader or different range that includes DCs\n\n"
-                        "[bold]If you already know the domain + DC IP:[/bold]\n"
-                        "• Run [bold]start_unauth <domain> <dc_ip>[/bold]\n",
-                        title="[bold]⚠️  Domain Discovery[/bold]",
-                        border_style="yellow",
-                        padding=(1, 2),
+                selected_summary = None
+                while True:
+                    candidate_port_map = discover_dc_candidates_with_nmap_details(
+                        shell, hosts=target, ports=[88, 389, 53]
                     )
-                    continue
-
-                summaries = discover_domains_from_candidate_ips(
-                    shell,
-                    candidate_ips=candidates,
-                    candidate_open_ports=candidate_port_map,
-                )
-                if not summaries:
-                    print_warning(
-                        "No domains inferred from candidate DC/DNS IPs. "
-                        "Try a broader range or provide domain + DC IP."
-                    )
-                    continue
-
-                rows = [
-                    (summary.domain, len(summary.candidate_ips), summary.methods)
-                    for summary in summaries
-                ]
-                selected_domain = select_domain_from_rows(
-                    shell,
-                    rows=rows,
-                    prompt="Multiple domains discovered. Select one to proceed:",
-                    title="[bold]🧩 Domains Inferred[/bold]",
-                )
-                if not selected_domain:
-                    return
-                selected_summary = next(
-                    summary
-                    for summary in summaries
-                    if summary.domain == selected_domain
-                )
-
-                decision = preflight_domain_pdc_from_candidates(
-                    shell,
-                    domain=selected_summary.domain,
-                    candidate_ips=selected_summary.candidate_ips,
-                    interactive=bool(sys.stdin.isatty()),
-                    mode_label="unauth",
-                    candidate_open_ports=candidate_port_map,
-                )
-                if decision.action != "use" or not decision.pdc_ip:
-                    if decision.action == "reenter":
-                        context = prompt_known_domain_and_pdc_interactive(
-                            shell, mode_label="unauth"
+                    candidates = sorted(candidate_port_map.keys())
+                    if not candidates:
+                        cancelled_by_user = bool(
+                            getattr(shell, "_last_dc_discovery_cancelled_by_user", False)
                         )
-                        if context is None:
+                        recovery = _prompt_dc_discovery_recovery(
+                            shell,
+                            current_target=str(target),
+                            reason=(
+                                "scope_rejected"
+                                if cancelled_by_user
+                                else "no_candidates"
+                            ),
+                        )
+                        if recovery.action == "cancel":
                             return
-                        known_domain, known_pdc_ip = context
-                    else:
+                        if recovery.action == "switch_context":
+                            context = _domain_context_wizard_for_unauth(shell)
+                            if context is None:
+                                return
+                            known_domain, known_pdc_ip = context
+                            break
+                        target = recovery.hosts or target
+                        shell.hosts = str(target)
+                        continue
+
+                    summaries = discover_domains_from_candidate_ips(
+                        shell,
+                        candidate_ips=candidates,
+                        candidate_open_ports=candidate_port_map,
+                    )
+                    if not summaries:
+                        print_warning(
+                            "No domains inferred from candidate DC/DNS IPs. "
+                            "Try a broader range or provide domain + DC IP."
+                        )
                         return
-                else:
+
+                    rows = [
+                        (summary.domain, len(summary.candidate_ips), summary.methods)
+                        for summary in summaries
+                    ]
+                    selected_domain = select_domain_from_rows(
+                        shell,
+                        rows=rows,
+                        prompt="Multiple domains discovered. Select one to proceed:",
+                        title="[bold]🧩 Domains Inferred[/bold]",
+                    )
+                    if not selected_domain:
+                        return
+                    selected_summary = next(
+                        summary
+                        for summary in summaries
+                        if summary.domain == selected_domain
+                    )
+
+                    decision = preflight_domain_pdc_from_candidates(
+                        shell,
+                        domain=selected_summary.domain,
+                        candidate_ips=selected_summary.candidate_ips,
+                        interactive=bool(sys.stdin.isatty()),
+                        mode_label="unauth",
+                        candidate_open_ports=candidate_port_map,
+                    )
+                    if decision.action != "use" or not decision.pdc_ip:
+                        if decision.action == "reenter":
+                            context = prompt_known_domain_and_pdc_interactive(
+                                shell, mode_label="unauth"
+                            )
+                            if context is None:
+                                return
+                            known_domain, known_pdc_ip = context
+                            break
+                        return
                     known_domain, known_pdc_ip = decision.domain, decision.pdc_ip
+                    persist_pdc_preflight_result(shell, decision)
+                    break
+
+                if not known_domain or not known_pdc_ip:
+                    return
 
                 if not hasattr(shell, "domains"):
                     shell.domains = []
@@ -1248,23 +1351,33 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     shell.domains.append(known_domain)
                     shell.create_sub_workspace_for_domain(known_domain, known_pdc_ip)
 
-                persist_pdc_preflight_result(shell, decision)
                 finalize_domain_context(
                     shell,
                     domain=known_domain,
                     pdc_ip=known_pdc_ip,
                     interactive=bool(sys.stdin.isatty()),
                 )
-                print_panel(
-                    "[bold]Discovery Summary[/bold]\n\n"
-                    f"Domain: {mark_sensitive(known_domain, 'domain')}\n"
-                    f"PDC/DC: {mark_sensitive(known_pdc_ip, 'ip')}\n"
-                    f"Candidates scanned: {len(selected_summary.candidate_ips)}\n\n"
-                    "[dim]Proceeding with unauthenticated enumeration.[/dim]",
-                    title="[bold]✅ Ready to Enumerate[/bold]",
-                    border_style="green",
-                    padding=(1, 2),
-                )
+                if selected_summary is not None:
+                    print_panel(
+                        "[bold]Discovery Summary[/bold]\n\n"
+                        f"Domain: {mark_sensitive(known_domain, 'domain')}\n"
+                        f"PDC/DC: {mark_sensitive(known_pdc_ip, 'ip')}\n"
+                        f"Candidates scanned: {len(selected_summary.candidate_ips)}\n\n"
+                        "[dim]Proceeding with unauthenticated enumeration.[/dim]",
+                        title="[bold]✅ Ready to Enumerate[/bold]",
+                        border_style="green",
+                        padding=(1, 2),
+                    )
+                else:
+                    print_panel(
+                        "[bold]Direct Domain Context Confirmed[/bold]\n\n"
+                        f"Domain: {mark_sensitive(known_domain, 'domain')}\n"
+                        f"PDC/DC: {mark_sensitive(known_pdc_ip, 'ip')}\n\n"
+                        "[dim]Skipping discovery and proceeding with unauthenticated enumeration.[/dim]",
+                        title="[bold]✅ Ready to Enumerate[/bold]",
+                        border_style="green",
+                        padding=(1, 2),
+                    )
 
                 if not _ensure_unauth_target_list(
                     shell,

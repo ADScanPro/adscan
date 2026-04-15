@@ -5322,7 +5322,14 @@ def handle_ci_docker(
             return 1
 
         try:
-            interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+            # In CI/Celery context the subprocess stdin/stdout are a PTY slave fd, so
+            # isatty() returns True even though there is no real interactive terminal.
+            # Running Docker with -t in that context merges the container's stderr into
+            # the PTY stream, which prevents the Celery worker from reading structured
+            # JSON events from the dedicated stderr pipe.  Force non-interactive mode so
+            # Docker does NOT allocate a TTY and the container's stderr stays separate.
+            is_ci_session = os.getenv("ADSCAN_SESSION_ENV") == "ci"
+            interactive = bool(sys.stdin.isatty() and sys.stdout.isatty() and not is_ci_session)
             local_resolver_ip = _select_container_local_resolver_ip()
             if local_resolver_ip is None:
                 return 1

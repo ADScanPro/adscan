@@ -11,7 +11,6 @@ from collections.abc import Sequence
 import os
 import sys
 import time
-import shlex
 import subprocess
 from typing import Any, Protocol
 
@@ -25,7 +24,6 @@ from adscan_internal.rich_output import (
     print_info,
     print_info_debug,
     print_info_verbose,
-    print_panel,
     print_success,
     print_warning,
 )
@@ -34,6 +32,10 @@ from adscan_internal.cli.dns import (
     confirm_domain_pdc_mapping,
     finalize_domain_context,
     prompt_pdc_ip_interactive,
+)
+from adscan_internal.cli.nmap import probe_host_reachability_with_nmap
+from adscan_internal.services.domain_connectivity_service import (
+    merge_domain_connectivity,
 )
 
 
@@ -51,6 +53,8 @@ class DomainShell(Protocol):
     cracking_dir: str
     ldap_dir: str
     enum_trusts_path: str | None
+    netexec_path: str | None
+    domain_connectivity: dict[str, dict[str, Any]]
 
     def save_domain_data(self) -> None: ...
 
@@ -60,13 +64,30 @@ class DomainShell(Protocol):
 
     def select_domain_curses(self, stdscr: Any, domains: Sequence[str]) -> None: ...
 
-    def run_command(self, command: str, timeout: int | None = None) -> subprocess.CompletedProcess: ...
+    def run_command(
+        self, command: str, timeout: int | None = None
+    ) -> subprocess.CompletedProcess: ...
 
-    def create_sub_workspace_for_domain(self, domain: str, pdc_ip: str | None = None) -> None: ...
+    def create_sub_workspace_for_domain(
+        self, domain: str, pdc_ip: str | None = None
+    ) -> None: ...
 
     def do_enum_domain_auth_phase1(self, domain: str) -> None: ...
 
     def ask_for_enum_domain_auth(self, domain: str) -> None: ...
+    def save_workspace_data(self) -> bool: ...
+
+    def _run_netexec(
+        self,
+        command: str,
+        *,
+        domain: str | None = None,
+        timeout: int | None = None,
+        pre_sync: bool = True,
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str] | None: ...
+
+    def _get_dns_discovery_service(self) -> Any: ...
 
 
 def domain_save(shell: DomainShell) -> None:
@@ -203,7 +224,7 @@ def domain_show(shell: DomainShell) -> None:
 
 
 def run_enum_trusts(shell: DomainShell, domain: str) -> None:
-    """Run enum-trusts for a domain and update workspace/domain metadata.
+    """Enumerate trusts for a domain and update workspace/domain metadata.
 
     This is a CLI orchestration helper extracted from the legacy shell to keep
     `adscan.py` slimmer. It expects PRO checks to have been done by the caller.
@@ -220,14 +241,15 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
         return
 
     try:
-        if not shell.enum_trusts_path:
+        if not shell.netexec_path:
             print_error(
-                "enum-trusts executable not found. Please ensure enum-trusts is installed and in your system's PATH."
+                "NetExec (nxc) executable not found. Please ensure NetExec is installed and configured."
             )
             return
 
         # Professional operation header
         from adscan_internal import print_operation_header
+        from adscan_internal.services.domain_service import DomainService
 
         username = shell.domains_data[domain]["username"]
         password = shell.domains_data[domain]["password"]
@@ -244,36 +266,95 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             icon="🔗",
         )
 
-        nxc_args = shell._get_nxc_cli_args()  # type: ignore[attr-defined]
-        cmd_parts = [
-            shell.enum_trusts_path,
-            "-u",
-            username,
-            "-p",
-            password,
-            "-d",
-            domain,
-            "-pdc",
-            pdc,
-            *nxc_args,
-        ]
-        command = " ".join(shlex.quote(part) for part in cmd_parts)
-
         marked_domain = mark_sensitive(domain, "domain")
         marked_user = mark_sensitive(username, "user")
         marked_password = mark_sensitive(password, "password")
         marked_pdc = mark_sensitive(pdc, "ip")
         cmd_preview = (
-            f"{shell.enum_trusts_path} -u {marked_user} -p {marked_password} "
-            f"-d {marked_domain} -pdc {marked_pdc}"
+            f"{shell.netexec_path} ldap {marked_pdc} -u {marked_user} "
+            f"-p {marked_password} -d {marked_domain} --dc-list"
         )
-        if nxc_args:
-            cmd_preview += " " + " ".join(
-                nxc_args[:-1] + [mark_sensitive(nxc_args[-1], "path")]
-            )
-        print_info_debug(f"Command: {cmd_preview}")
+        print_info_debug(f"Recursive trust enumeration via NetExec: {cmd_preview}")
 
-        _execute_enum_trusts(shell, command, domain)
+        dns_service = None
+        try:
+            dns_service = shell._get_dns_discovery_service()
+        except Exception:
+            dns_service = None
+
+        def _execute(
+            command: str, timeout_seconds: int
+        ) -> subprocess.CompletedProcess[str] | None:
+            netexec_runner = getattr(shell, "_run_netexec", None)
+            if callable(netexec_runner):
+                return netexec_runner(
+                    command,
+                    domain=domain,
+                    timeout=timeout_seconds,
+                )
+            return shell.run_command(command, timeout=timeout_seconds)
+
+        def _resolve_pdc_ip(trusted_domain: str, resolver_ip: str) -> str | None:
+            if not dns_service or not hasattr(dns_service, "find_pdc_with_selection"):
+                return None
+            selected_ip, _ = dns_service.find_pdc_with_selection(
+                domain=trusted_domain,
+                resolver_ip=resolver_ip,
+                preferred_ips=[resolver_ip],
+                reference_ip=resolver_ip,
+            )
+            return selected_ip
+
+        def _check_trusted_domain_reachability(
+            trusted_domain: str,
+            trusted_pdc_ip: str,
+            source_domain: str,
+        ) -> dict[str, Any]:
+            probe_result = probe_host_reachability_with_nmap(
+                shell,
+                host=trusted_pdc_ip,
+                ports=[88, 389, 53],
+                timeout_seconds=20,
+                report_label=f"trusted_dc_{trusted_domain.replace('.', '_')}",
+            )
+            probe_result["domain"] = trusted_domain
+            probe_result["source_domain"] = source_domain
+            probe_result["pdc_ip"] = trusted_pdc_ip
+            return probe_result
+
+        service = DomainService()
+        result = service.enumerate_trusts(
+            domain=domain,
+            pdc=pdc,
+            username=username,
+            password=password,
+            netexec_path=shell.netexec_path,
+            executor=_execute,
+            resolve_pdc_ip=_resolve_pdc_ip,
+            check_domain_reachability=_check_trusted_domain_reachability,
+        )
+
+        merge_domain_connectivity(
+            shell,
+            source_domain=domain,
+            connectivity_updates=result.domain_connectivity,
+        )
+        if result.domain_connectivity and hasattr(shell, "save_workspace_data"):
+            try:
+                shell.save_workspace_data()
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_warning(
+                    "Failed to persist trusted-domain reachability state to the workspace."
+                )
+
+        _handle_trust_enumeration_result(
+            shell,
+            domain=domain,
+            trusts=result.trusts,
+            discovered_domains=result.discovered_domains,
+            domain_pdc_mapping=result.domain_controllers,
+        )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         from adscan_internal import print_error_context
@@ -287,7 +368,7 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             suggestions=[
                 "Verify domain credentials are correct",
                 "Check network connectivity to PDC",
-                "Ensure enum-trusts is properly installed",
+                "Ensure NetExec is properly installed",
             ],
             show_exception=True,
             exception=exc,
@@ -341,216 +422,271 @@ def order_domains_for_scan(source_domain: str, domains: list[str]) -> list[str]:
     return [normalized_to_original.get(dom, dom) for dom in ordered_norm]
 
 
-def _execute_enum_trusts(shell: DomainShell, command: str, domain: str) -> None:
-    """Execute enum-trusts and process its output to extract domains."""
-
+def _handle_trust_enumeration_result(
+    shell: DomainShell,
+    *,
+    domain: str,
+    trusts: list[Any],
+    discovered_domains: list[str],
+    domain_pdc_mapping: dict[str, str],
+) -> None:
+    """Process recursive trust enumeration results and update domain state."""
     try:
-        completed_process = shell.run_command(command, timeout=300)
+        def _domain_reachable_from_current_vantage(candidate_domain: str) -> bool:
+            """Return whether one trusted domain is currently reachable."""
+            if candidate_domain == domain:
+                return True
+            domain_state = (
+                shell.domains_data.get(candidate_domain, {})
+                if isinstance(getattr(shell, "domains_data", {}), dict)
+                else {}
+            )
+            if not isinstance(domain_state, dict):
+                return True
+            connectivity = domain_state.get("connectivity", {})
+            if not isinstance(connectivity, dict):
+                return True
+            summary = connectivity.get("summary", {})
+            if not isinstance(summary, dict):
+                return True
+            if "reachable" not in summary:
+                return True
+            return bool(summary.get("reachable"))
 
-        if not isinstance(completed_process, subprocess.CompletedProcess):
-            # Error already printed by the wrapper
-            return
-
-        stdout = completed_process.stdout
-        stderr = completed_process.stderr
         invalid_domains: set[str] = set()
+        dns_service = None
+        try:
+            dns_service = shell._get_dns_discovery_service()
+        except Exception:
+            dns_service = None
 
-        if completed_process.returncode == 0:
+        ordered_domains: list[str] = []
+        seen_domains: set[str] = set()
+
+        for main_domain in discovered_domains:
+            if main_domain in invalid_domains or main_domain in seen_domains:
+                continue
+            seen_domains.add(main_domain)
+            ordered_domains.append(main_domain)
+            if main_domain not in shell.domains_data:
+                shell.domains_data[main_domain] = {}
+            is_reachable = _domain_reachable_from_current_vantage(main_domain)
+            if is_reachable:
+                shell.domains_data[main_domain]["auth"] = "auth"
+                print_warning(f"Valid domain found: {main_domain}")
+            else:
+                marked_domain = mark_sensitive(main_domain, "domain")
+                marked_pdc = mark_sensitive(
+                    str(
+                        shell.domains_data.get(main_domain, {})
+                        .get("connectivity", {})
+                        .get("summary", {})
+                        .get("pdc_ip")
+                        or domain_pdc_mapping.get(main_domain)
+                        or ""
+                    ),
+                    "ip",
+                )
+                print_warning(
+                    f"Trusted domain discovered but not currently reachable: {marked_domain}"
+                    + (
+                        f" (PDC/DC {marked_pdc})"
+                        if str(marked_pdc).strip()
+                        else ""
+                    )
+                )
+                continue
+            pdc_ip = domain_pdc_mapping.get(main_domain)
             if (
-                "SUMMARY OF FOUND TRUST RELATIONSHIPS" in stdout
-                and "[-] No trust relationships found." not in stdout
+                not pdc_ip
+                and dns_service
+                and hasattr(dns_service, "resolve_ipv4_addresses_robust")
             ):
-                summary_section = stdout.split(
-                    "SUMMARY OF FOUND TRUST RELATIONSHIPS"
-                )[1]
-                ordered_domains: list[str] = []
-                seen_domains: set[str] = set()
-                domain_pdc_mapping: dict[str, str] = {}
+                a_candidates = dns_service.resolve_ipv4_addresses_robust(main_domain)
+                if len(a_candidates) == 1:
+                    pdc_ip = a_candidates[0]
+                    domain_pdc_mapping[main_domain] = pdc_ip
+                    marked_domain = mark_sensitive(main_domain, "domain")
+                    marked_ip = mark_sensitive(pdc_ip, "ip")
+                    print_info_verbose(
+                        f"Using A-record fallback for {marked_domain}: {marked_ip}"
+                    )
+                elif a_candidates:
+                    marked_domain = mark_sensitive(main_domain, "domain")
+                    marked_candidates = mark_sensitive(a_candidates, "ip")
+                    print_info_verbose(
+                        f"Multiple A-record candidates for {marked_domain}: {marked_candidates}"
+                    )
+            if pdc_ip:
+                confirmed = confirm_domain_pdc_mapping(
+                    shell,
+                    domain=main_domain,
+                    candidate_ip=pdc_ip,
+                    interactive=bool(sys.stdin.isatty()),
+                    mode_label="trust_enum",
+                    on_reenter=lambda: (
+                        main_domain,
+                        prompt_pdc_ip_interactive(domain=main_domain),
+                    ),
+                )
+                if confirmed:
+                    main_domain, pdc_ip = confirmed
+                else:
+                    pdc_ip = None
+                    print_warning(
+                        "No confirmed DC/PDC for "
+                        f"{mark_sensitive(main_domain, 'domain')}; continuing without a PDC."
+                    )
 
-                # Extract domain and PDC IP mappings from the output
-                current_domain: str | None = None
-                for line in summary_section.splitlines():
-                    if "Domain: " in line and not line.startswith("  "):
-                        current_domain = (
-                            line.split("Domain: ")[1].strip().rstrip(":")
-                        )
-                    elif "PDC IP: " in line and current_domain:
-                        pdc_ip = line.split("PDC IP: ")[1].strip()
-                        domain_pdc_mapping[current_domain] = pdc_ip
-                        marked_pdc_ip = mark_sensitive(pdc_ip, "ip")
-                        print_info_verbose(
-                            f"Extracted PDC IP for {current_domain}: {marked_pdc_ip}"
-                        )
+            if pdc_ip:
+                shell.domains_data.setdefault(main_domain, {})["pdc"] = pdc_ip
+            if not os.path.exists(os.path.join("domains", main_domain)):
+                shell.domains.append(main_domain)
+                shell.domains = list(set(shell.domains))
 
-                dns_service = None
-                try:
-                    dns_service = shell._get_dns_discovery_service()
-                except Exception:
-                    dns_service = None
+                if pdc_ip:
+                    marked_pdc_ip = mark_sensitive(pdc_ip, "ip")
+                    print_info(
+                        f"Creating workspace for {main_domain} with PDC IP: {marked_pdc_ip}"
+                    )
+                    shell.create_sub_workspace_for_domain(main_domain, pdc_ip)
+                else:
+                    print_info(f"Creating workspace for {main_domain} without PDC IP")
+                    shell.create_sub_workspace_for_domain(main_domain)
 
-                for line in summary_section.splitlines():
-                    if "Domain: " in line and not line.startswith("  "):
-                        main_domain = line.split("Domain: ")[1].strip().rstrip(":")
-                        if (
-                            main_domain in invalid_domains
-                            or main_domain in seen_domains
-                        ):
-                            continue
-                        seen_domains.add(main_domain)
-                        ordered_domains.append(main_domain)
-                        if main_domain not in shell.domains_data:
-                            shell.domains_data[main_domain] = {}
-                        shell.domains_data[main_domain]["auth"] = "auth"
-                        print_warning(f"Valid domain found: {main_domain}")
-                        pdc_ip = domain_pdc_mapping.get(main_domain)
-                        if (
-                            not pdc_ip
-                            and dns_service
-                            and hasattr(dns_service, "resolve_ipv4_addresses_robust")
-                        ):
-                            a_candidates = dns_service.resolve_ipv4_addresses_robust(
-                                main_domain
-                            )
-                            if len(a_candidates) == 1:
-                                pdc_ip = a_candidates[0]
-                                domain_pdc_mapping[main_domain] = pdc_ip
-                                marked_domain = mark_sensitive(main_domain, "domain")
-                                marked_ip = mark_sensitive(pdc_ip, "ip")
-                                print_info_verbose(
-                                    f"Using A-record fallback for {marked_domain}: {marked_ip}"
-                                )
-                            elif a_candidates:
-                                marked_domain = mark_sensitive(main_domain, "domain")
-                                marked_candidates = mark_sensitive(
-                                    a_candidates, "ip"
-                                )
-                                print_info_verbose(
-                                    f"Multiple A-record candidates for {marked_domain}: {marked_candidates}"
-                                )
-                        if pdc_ip:
-                            confirmed = confirm_domain_pdc_mapping(
-                                shell,
-                                domain=main_domain,
-                                candidate_ip=pdc_ip,
-                                interactive=bool(sys.stdin.isatty()),
-                                mode_label="trust_enum",
-                                on_reenter=lambda: (
-                                    main_domain,
-                                    prompt_pdc_ip_interactive(domain=main_domain),
-                                ),
-                            )
-                            if confirmed:
-                                main_domain, pdc_ip = confirmed
-                            else:
-                                pdc_ip = None
-                                print_warning(
-                                    "No confirmed DC/PDC for "
-                                    f"{mark_sensitive(main_domain, 'domain')}; continuing without a PDC."
-                                )
+                time.sleep(1)
+                domain_path = os.path.join(shell.domains_dir, main_domain)
+                cracking_path = os.path.join(domain_path, shell.cracking_dir)
+                ldap_path = os.path.join(domain_path, shell.ldap_dir)
 
-                        if pdc_ip:
-                            shell.domains_data.setdefault(main_domain, {})["pdc"] = pdc_ip
-                        if not os.path.exists(os.path.join("domains", main_domain)):
-                            shell.domains.append(main_domain)
-                            shell.domains = list(set(shell.domains))
+                for directory in [cracking_path, ldap_path]:
+                    if not os.path.exists(directory):
+                        os.makedirs(directory)
 
-                            # Get PDC IP for this domain if available
-                            if pdc_ip:
-                                marked_pdc_ip = mark_sensitive(pdc_ip, "ip")
-                                print_info(
-                                    f"Creating workspace for {main_domain} with PDC IP: {marked_pdc_ip}"
-                                )
-                                shell.create_sub_workspace_for_domain(main_domain, pdc_ip)
-                            else:
-                                print_info(
-                                    f"Creating workspace for {main_domain} without PDC IP"
-                                )
-                                shell.create_sub_workspace_for_domain(main_domain)
-
-                            time.sleep(1)
-                            domain_path = os.path.join(shell.domains_dir, main_domain)
-                            cracking_path = os.path.join(domain_path, shell.cracking_dir)
-                            ldap_path = os.path.join(domain_path, shell.ldap_dir)
-
-                            for directory in [cracking_path, ldap_path]:
-                                if not os.path.exists(directory):
-                                    os.makedirs(directory)
-
-                        if pdc_ip:
-                            finalize_domain_context(
-                                shell,
-                                domain=main_domain,
-                                pdc_ip=pdc_ip,
-                                interactive=False,
-                            )
-
-                # Display discovered domains in professional table
-                from adscan_internal import (
-                    create_domains_table,
-                    get_console,
-                    print_results_summary,
+            if pdc_ip:
+                finalize_domain_context(
+                    shell,
+                    domain=main_domain,
+                    pdc_ip=pdc_ip,
+                    interactive=False,
                 )
 
-                ordered_domains = order_domains_for_scan(domain, ordered_domains)
+        from adscan_internal import (
+            create_domains_table,
+            get_console,
+            print_results_summary,
+        )
 
-                # Build domains data for table
-                discovered_domains_data: dict[str, dict[str, Any]] = {}
-                for main_domain in ordered_domains:
-                    discovered_domains_data[main_domain] = {
-                        "pdc": domain_pdc_mapping.get(main_domain, "N/A"),
-                        "auth": "auth",
-                        "credentials": {},  # Will be filled later
-                    }
+        ordered_domains = order_domains_for_scan(domain, ordered_domains)
 
-                # Print summary first (matches old behavior)
-                print_results_summary(
-                    "Trust Enumeration Results",
-                    {
-                        "Source Domain": domain,
-                    "Trusted Domains Found": len(ordered_domains),
+        discovered_domains_data: dict[str, dict[str, Any]] = {}
+        for main_domain in ordered_domains:
+            domain_state = (
+                shell.domains_data.get(main_domain, {})
+                if isinstance(getattr(shell, "domains_data", {}), dict)
+                else {}
+            )
+            connectivity_summary = (
+                domain_state.get("connectivity", {}).get("summary", {})
+                if isinstance(domain_state, dict)
+                and isinstance(domain_state.get("connectivity", {}), dict)
+                else {}
+            )
+            discovered_domains_data[main_domain] = {
+                "pdc": domain_pdc_mapping.get(main_domain, "N/A"),
+                "auth": "auth",
+                "reachable": (
+                    bool(connectivity_summary.get("reachable"))
+                    if isinstance(connectivity_summary, dict)
+                    and "reachable" in connectivity_summary
+                    else main_domain == domain
+                ),
+            }
+
+        if trusts:
+            print_results_summary(
+                "Trust Enumeration Results",
+                {
+                    "Source Domain": domain,
+                    "Trusted Domains Found": max(len(ordered_domains) - 1, 0),
+                    "Trust Relationships Found": len(trusts),
                     "Status": "Completed Successfully",
                 },
             )
-
-                # Print domains table if any found (matches old behavior)
-                if discovered_domains_data:
-                    console = get_console()
-                    table = create_domains_table(
-                        discovered_domains_data,
-                        title="Discovered Trust Relationships",
-                    )
-                    console.print(table)
-
-                # Phase 1 across all domains, then continue per-domain enumeration.
-                if len(ordered_domains) > 1:
-                    for main_domain in ordered_domains:
-                        shell.do_enum_domain_auth_phase1(main_domain)
-                    for main_domain in ordered_domains:
-                        shell.ask_for_enum_domain_auth(main_domain)
-                else:
-                    for main_domain in ordered_domains:
-                        shell.ask_for_enum_domain_auth(main_domain)
-            elif "[-] No trust relationships found." in stdout:
-                print_info("No trust relationships found.")
-                shell.domains_data[domain]["auth"] = "auth"
-                shell.ask_for_enum_domain_auth(domain)  # type: ignore[attr-defined]
-            else:
-                print_warning("Could not find the summary section in the output")
-        else:
-            # Non-zero exit code: log error details (matches old behavior)
-            marked_domain = mark_sensitive(domain, "domain")
-            print_error(f"Trust enumeration for {marked_domain} failed.")
-            output = stdout + stderr
-            if output.strip():
-                print_panel(
-                    output.strip(),
-                    title="enum-trusts Error",
-                    border_style="dim red",
-                    expand=False,
+            if discovered_domains_data:
+                console = get_console()
+                table = create_domains_table(
+                    discovered_domains_data,
+                    title="Discovered Trust Relationships",
                 )
+                console.print(table)
+            for trusted_domain, connectivity in sorted(
+                (
+                    (name, data)
+                    for name, data in domain_pdc_mapping.items()
+                    if name != domain
+                ),
+                key=lambda item: item[0].lower(),
+            ):
+                stored_connectivity = (
+                    shell.domains_data.get(trusted_domain, {}).get("connectivity", {})
+                    if isinstance(shell.domains_data.get(trusted_domain, {}), dict)
+                    else {}
+                )
+                if not isinstance(stored_connectivity, dict) or not stored_connectivity:
+                    continue
+                summary = stored_connectivity.get("summary", {})
+                if isinstance(summary, dict) and summary.get("reachable"):
+                    continue
+                marked_domain = mark_sensitive(trusted_domain, "domain")
+                marked_pdc = mark_sensitive(
+                    str(
+                        (
+                            summary.get("pdc_ip")
+                            if isinstance(summary, dict)
+                            else stored_connectivity.get("pdc_ip")
+                        )
+                        or connectivity
+                    ),
+                    "ip",
+                )
+                print_warning(
+                    f"Skipping recursive trust enumeration for {marked_domain}: "
+                    f"PDC/DC {marked_pdc} is not reachable from the current vantage."
+                )
+
+            pending_auth_domains = [
+                main_domain
+                for main_domain in ordered_domains
+                if _domain_reachable_from_current_vantage(main_domain)
+                if not bool(
+                    shell.domains_data.get(main_domain, {}).get("phase1_complete")
+                )
+            ]
+
+            if not pending_auth_domains:
+                print_info(
+                    "Trust analysis completed, but all reachable trusted domains were already authenticated and analyzed."
+                )
+                return
+
+            if len(pending_auth_domains) > 1:
+                for main_domain in pending_auth_domains:
+                    shell.do_enum_domain_auth_phase1(main_domain)
+                for main_domain in pending_auth_domains:
+                    shell.ask_for_enum_domain_auth(main_domain)
+            else:
+                for main_domain in pending_auth_domains:
+                    shell.ask_for_enum_domain_auth(main_domain)
+        else:
+            print_info("No trust relationships found.")
+            shell.domains_data[domain]["auth"] = "auth"
+            shell.ask_for_enum_domain_auth(domain)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_error("An unexpected error occurred while processing trust enumeration output.")
+        print_error(
+            "An unexpected error occurred while processing trust enumeration output."
+        )
         from adscan_internal.rich_output import print_exception
 
         print_exception(show_locals=False, exception=exc)

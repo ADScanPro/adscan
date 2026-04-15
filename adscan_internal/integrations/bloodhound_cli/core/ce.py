@@ -517,6 +517,8 @@ class BloodHoundCEClient(BloodHoundClient):
         *,
         bucket: Optional[str] = None,
         allow_auth_retry: bool = True,
+        allow_forbidden_reauth_retry: bool = False,
+        capture_forbidden_authz_context: bool = False,
         allow_rate_limit_retry: bool = True,
         max_rate_limit_retries: int = _BH_CE_MAX_429_RETRIES,
         **kwargs,
@@ -528,6 +530,7 @@ class BloodHoundCEClient(BloodHoundClient):
         url = self._resolve_request_url(url_or_path)
 
         auth_retried = False
+        forbidden_auth_retried = False
         rate_limit_retries = 0
 
         while True:
@@ -551,6 +554,23 @@ class BloodHoundCEClient(BloodHoundClient):
                 if self.ensure_authenticated_robust():
                     auth_retried = True
                     continue
+
+            if response.status_code == 403:
+                if capture_forbidden_authz_context:
+                    self._log_forbidden_authz_context(
+                        response,
+                        operation=f"{method.upper()} {url_or_path}",
+                        retried_after_reauth=forbidden_auth_retried,
+                    )
+                if allow_forbidden_reauth_retry and not forbidden_auth_retried:
+                    self._debug(
+                        "authorization failed, attempting non-interactive token renewal",
+                        bucket=resolved_bucket,
+                        path=url_or_path,
+                    )
+                    if self.auto_renew_token():
+                        forbidden_auth_retried = True
+                        continue
 
             if response.status_code == 429 and allow_rate_limit_retry:
                 raw_reset_wait = _get_rate_limit_reset_delay_seconds(
@@ -3540,18 +3560,98 @@ class BloodHoundCEClient(BloodHoundClient):
             print_info_debug(f"[bloodhound-ce] config summary failed: {exc}")
         return summary
 
+    def _get_authenticated_requester_summary(self) -> dict:
+        """Return a safe summary of the authenticated BloodHound requester."""
+        summary = {
+            "requester_type": None,
+            "principal_name": None,
+            "email_address": None,
+            "roles": [],
+        }
+        try:
+            response = self._request(
+                "get",
+                "/api/v2/self",
+                headers=self._get_headers(),
+                allow_auth_retry=False,
+            )
+            if response.status_code != 200:
+                summary["self_status"] = response.status_code
+                return summary
+
+            payload = response.json() if response.content else {}
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, dict):
+                return summary
+
+            summary["requester_type"] = (
+                "client" if "name" in data and "principal_name" not in data else "user"
+            )
+            summary["principal_name"] = data.get("principal_name") or data.get("name")
+            summary["email_address"] = data.get("email_address")
+
+            roles = data.get("roles")
+            if isinstance(roles, list):
+                normalized_roles = []
+                for role in roles:
+                    if isinstance(role, dict):
+                        role_name = role.get("name") or role.get("authority") or role.get("id")
+                        if role_name:
+                            normalized_roles.append(str(role_name))
+                    elif role:
+                        normalized_roles.append(str(role))
+                summary["roles"] = normalized_roles
+        except Exception as exc:
+            print_info_debug(
+                "[bloodhound-ce] requester summary probe failed: "
+                f"{mark_sensitive(str(exc), 'error')}"
+            )
+        return summary
+
+    def _log_forbidden_authz_context(
+        self, response: requests.Response, *, operation: str, retried_after_reauth: bool
+    ) -> None:
+        """Emit diagnostic context for a forbidden authenticated request."""
+        config_summary = self._config_summary()
+        requester_summary = self._get_authenticated_requester_summary()
+        request_id = (
+            response.headers.get("Requestid")
+            or response.headers.get("RequestId")
+            or response.headers.get("X-Request-Id")
+        )
+        response_preview = _safe_truncate((response.text or "").strip(), limit=400)
+        print_info_debug(
+            "[bloodhound-ce] authorization failure context: "
+            f"operation={operation}, "
+            f"status={response.status_code}, "
+            f"request_id={request_id or 'unknown'}, "
+            f"retried_after_reauth={retried_after_reauth}, "
+            f"base_url={config_summary.get('base_url')}, "
+            f"config_exists={config_summary.get('config_exists')}, "
+            f"has_username={config_summary.get('has_username')}, "
+            f"has_password={config_summary.get('has_password')}, "
+            f"has_api_token={config_summary.get('has_api_token')}, "
+            f"requester_type={requester_summary.get('requester_type')}, "
+            f"principal_name={mark_sensitive(str(requester_summary.get('principal_name') or ''), 'user')}, "
+            f"email_address={mark_sensitive(str(requester_summary.get('email_address') or ''), 'user')}, "
+            f"roles={requester_summary.get('roles')}, "
+            f"response={mark_sensitive(response_preview, 'error')}"
+        )
+
     def upload_data(self, file_path: str) -> bool:
         """Upload BloodHound data using the file upload API."""
         job_id = self.start_file_upload_job(file_path)
         return job_id is not None
 
-    def _create_file_upload_job_id(self) -> int | None:
+    def _create_file_upload_job_id(self, *, allow_reauth_retry: bool = True) -> int | None:
         """Create a file upload job and return its ID."""
         create_response = self._request(
             "post",
             "/api/v2/file-upload/start",
             headers=self._get_headers(),
             json={"collection_method": "manual"},
+            allow_forbidden_reauth_retry=allow_reauth_retry,
+            capture_forbidden_authz_context=True,
         )
 
         if create_response.status_code not in [200, 201]:

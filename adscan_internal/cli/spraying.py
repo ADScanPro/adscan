@@ -716,10 +716,8 @@ def _should_recommend_pre2k_for_ctf(shell: SprayShell, domain: str) -> bool:
 
 
 def maybe_offer_ctf_pre2k_followup(shell: SprayShell, domain: str, *, reason: str) -> None:
-    """Offer a premium CTF follow-up to run only pre2k when it was skipped so far."""
+    """Offer a focused pre2k follow-up when it was skipped so far."""
 
-    if str(getattr(shell, "type", "") or "").strip().lower() != "ctf":
-        return
     if shell.domains_data.get(domain, {}).get("auth") == "pwned":
         return
     if not _should_recommend_pre2k_for_ctf(shell, domain):
@@ -751,13 +749,13 @@ def maybe_offer_ctf_pre2k_followup(shell: SprayShell, domain: str, *, reason: st
             [
                 f"Domain: {marked_domain}",
                 "Computer pre2k spraying has not been attempted yet.",
-                "In many CTFs this is the intended foothold path when multiple computer accounts exist.",
+                "This is often a high-value foothold path when multiple computer accounts exist.",
                 "",
                 "Recommended focused action:",
                 "Run only the pre2k computer check now.",
             ]
         ),
-        title="[bold yellow]Recommended CTF Follow-up: Pre2k[/bold yellow]",
+        title="[bold yellow]Recommended Follow-up: Pre2k[/bold yellow]",
         border_style="yellow",
         expand=False,
     )
@@ -801,9 +799,7 @@ def maybe_show_ctf_spraying_recommendation(
     *,
     reason: str,
 ) -> None:
-    """Show one-time CTF recommendation when no recommended spraying was attempted."""
-    if str(getattr(shell, "type", "") or "").strip().lower() != "ctf":
-        return
+    """Show one-time spraying recommendation when no recommended spraying was attempted."""
     if shell.domains_data.get(domain, {}).get("auth") == "pwned":
         return
     if _has_recommended_spraying_attempt(shell, domain):
@@ -820,9 +816,14 @@ def maybe_show_ctf_spraying_recommendation(
         return
 
     marked_domain = mark_sensitive(domain, "domain")
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     panel_lines = [
         f"Domain: {marked_domain}",
-        "In many HTB/CTF environments, a first foothold comes from spraying.",
+        (
+            "In many HTB/CTF environments, a first foothold comes from spraying."
+            if workspace_type == "ctf"
+            else "An early foothold often comes from targeted spraying checks."
+        ),
         "",
         "High-value quick checks:",
         "1) Computer accounts (pre2k: hostname as password)",
@@ -832,13 +833,22 @@ def maybe_show_ctf_spraying_recommendation(
     ]
     print_panel(
         "\n".join(panel_lines),
-        title="[bold yellow]Recommended CTF Next Step[/bold yellow]",
+        title=(
+            "[bold yellow]Recommended CTF Next Step[/bold yellow]"
+            if workspace_type == "ctf"
+            else "[bold yellow]Recommended Next Step[/bold yellow]"
+        ),
         border_style="yellow",
         expand=False,
     )
-    print_instruction(
-        "If you skip spraying in CTF, you can miss the intended foothold path."
-    )
+    if workspace_type == "ctf":
+        print_instruction(
+            "If you skip spraying in CTF, you can miss the intended foothold path."
+        )
+    else:
+        print_instruction(
+            "If you skip spraying here, you can miss an early foothold path."
+        )
     ux_state["recommended_hint_shown"] = True
     _capture_spraying_ux_event(
         shell,
@@ -3037,14 +3047,13 @@ def ask_for_spraying(shell: SprayShell, domain: str) -> None:
         do_spraying(shell, domain)
         return
 
-    if str(getattr(shell, "type", "") or "").strip().lower() == "ctf":
-        ux_state["initial_declined"] = True
-        _capture_spraying_ux_event(shell, "ctf_spraying_skipped", domain)
-        maybe_offer_ctf_pre2k_followup(
-            shell,
-            domain,
-            reason="ask_for_spraying_declined",
-        )
+    ux_state["initial_declined"] = True
+    _capture_spraying_ux_event(shell, "ctf_spraying_skipped", domain)
+    maybe_offer_ctf_pre2k_followup(
+        shell,
+        domain,
+        reason="ask_for_spraying_declined",
+    )
 
 
 def do_spraying(shell: SprayShell, domain: str) -> None:
@@ -3166,12 +3175,11 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     )
     if current_row is None:
         print_warning("Spraying cancelled by user")
-        if ctf_mode:
-            maybe_offer_ctf_pre2k_followup(
-                shell,
-                domain,
-                reason="spraying_menu_cancelled",
-            )
+        maybe_offer_ctf_pre2k_followup(
+            shell,
+            domain,
+            reason="spraying_menu_cancelled",
+        )
         return
 
     selected_option = options[current_row]

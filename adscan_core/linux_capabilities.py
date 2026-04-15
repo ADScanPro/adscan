@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 
@@ -30,21 +31,29 @@ def get_binary_capabilities(binary_path: str) -> str:
     candidate = str(binary_path or "").strip()
     if not candidate:
         return ""
-    try:
-        result = subprocess.run(
-            ["getcap", candidate],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except Exception:
-        return ""
-    return " ".join(
-        part.strip()
-        for part in (result.stdout, result.stderr)
-        if str(part).strip()
-    ).strip()
+    resolved_candidate = os.path.realpath(candidate)
+    candidates_to_try = [candidate]
+    if resolved_candidate and resolved_candidate not in candidates_to_try:
+        candidates_to_try.append(resolved_candidate)
+    for candidate_path in candidates_to_try:
+        try:
+            result = subprocess.run(
+                ["getcap", candidate_path],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            continue
+        capability_output = " ".join(
+            part.strip()
+            for part in (result.stdout, result.stderr)
+            if str(part).strip()
+        ).strip()
+        if capability_output:
+            return capability_output
+    return ""
 
 
 def binary_has_capability(binary_path: str, capability_name: str) -> bool:

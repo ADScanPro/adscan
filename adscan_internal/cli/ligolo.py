@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 from typing import Any, Protocol
+from rich.prompt import Prompt
 from rich.table import Table
 
 from adscan_internal import telemetry
@@ -278,7 +279,6 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
 
     action = argv[1].lower() if len(argv) > 1 else "status"
     if action == "start":
-        api_laddr = argv[3] if len(argv) > 3 else DEFAULT_LIGOLO_PROXY_API_ADDR
         try:
             listen_addr = argv[2] if len(argv) > 2 else service.resolve_default_listen_addr()
         except Exception as exc:  # noqa: BLE001
@@ -290,6 +290,38 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                 "If Windows egress allows another port, start the proxy explicitly: ligolo proxy start 0.0.0.0:<port>"
             )
             return
+        if len(argv) > 3:
+            api_laddr = argv[3]
+        else:
+            while True:
+                try:
+                    api_laddr = service.resolve_default_api_laddr()
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_error("Failed to determine a default ligolo-ng API address.")
+                    print_exception(show_locals=False, exception=exc)
+                    action_choice = str(
+                        Prompt.ask(
+                            "Ligolo API recovery action",
+                            choices=["retry", "custom", "skip"],
+                            default="retry",
+                        )
+                        or "retry"
+                    ).strip().lower()
+                    if action_choice == "skip":
+                        print_info("Skipping Ligolo proxy start for now.")
+                        return
+                    if action_choice == "retry":
+                        continue
+                    api_laddr = str(
+                        Prompt.ask(
+                            "Enter the Ligolo API bind address",
+                            default=DEFAULT_LIGOLO_PROXY_API_ADDR,
+                        )
+                        or ""
+                    ).strip()
+                    break
         print_operation_header(
             "Ligolo Proxy Start",
             details={

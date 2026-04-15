@@ -529,6 +529,27 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         execution_target_access_requirement="computer_reachable",
     ),
     _entry(
+        "sqlaccess",
+        support_kind="supported",
+        support_reason="Confirm MSSQL authenticated access (SQLAccess)",
+        compromise_semantics="access_capability_only",
+        compromise_effort="medium",
+        category="lateral_movement",
+        description="Authenticated access over MSSQL without confirmed sysadmin-level control",
+        remediation_complexity="medium",
+        remediation_effort=(
+            "Remove unnecessary SQL login access for the identified principal. "
+            "Audit Windows-integrated SQL logins and limit who can connect to SQL Server instances."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1078",
+        mitre_technique_name="Valid Accounts",
+        detection_event_ids=("4624",),
+        bh_cypher_names=("SQLAccess",),
+        execution_relation_alias="sqladmin",
+        execution_target_access_requirement="computer_reachable",
+    ),
+    _entry(
         "sqladmin",
         support_kind="supported",
         support_reason="Confirm MSSQL administrative access (SQLAdmin)",
@@ -1737,6 +1758,7 @@ ATTACK_STEP_CATALOG: dict[str, AttackStepCatalogEntry] = {
 _RELATIONS_REQUIRING_EXECUTION_CONTEXT: frozenset[str] = frozenset(
     {
         "adminto",
+        "sqlaccess",
         "sqladmin",
         "canrdp",
         "canpsremote",

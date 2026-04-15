@@ -39,6 +39,7 @@ def build_winrm_backend(
     host: str,
     username: str,
     password: str,
+    auth_mode: str = "auto",
 ) -> WinRMExecutionBackend:
     """Return the default reusable WinRM backend implementation.
 
@@ -51,6 +52,7 @@ def build_winrm_backend(
         host=host,
         username=username,
         password=password,
+        auth_mode=auth_mode,
     )
     return WinRMLogonBypassService(
         domain=domain,

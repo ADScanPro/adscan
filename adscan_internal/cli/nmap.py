@@ -193,11 +193,13 @@ def discover_dc_candidates_with_nmap_details(
     445 was closed but LDAP/389 was open).
     """
     try:
+        setattr(shell, "_last_dc_discovery_cancelled_by_user", False)
         if not _confirm_large_dc_discovery_scan(
             shell,
             hosts=hosts,
             timeout_seconds=timeout_seconds,
         ):
+            setattr(shell, "_last_dc_discovery_cancelled_by_user", True)
             print_warning("DC discovery scan cancelled by user.")
             return {}
 
@@ -273,6 +275,99 @@ def discover_dc_candidates_with_nmap_details(
         print_error("Failed to run DC candidate discovery with Nmap.")
         print_exception(show_locals=False, exception=exc)
         return {}
+
+
+def probe_host_reachability_with_nmap(
+    shell: NmapShell,
+    *,
+    host: str,
+    ports: list[int] | None = None,
+    timeout_seconds: int = 20,
+    report_label: str = "trusted_dc",
+) -> dict[str, object]:
+    """Probe one host with Nmap and classify current-vantage reachability.
+
+    This is a lightweight reusable pre-check intended for targeted validation
+    of one already-known host, such as a trusted domain controller discovered
+    during trust enumeration.
+    """
+    target_host = str(host or "").strip()
+    target_ports = ports or [88, 389, 53]
+    ports_csv = ",".join(str(port) for port in target_ports)
+
+    if not target_host:
+        return {
+            "host": "",
+            "reachable": False,
+            "open_ports": [],
+            "status": "invalid_target",
+            "method": "nmap_single_host_probe",
+        }
+
+    output_path = None
+    workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
+    if workspace_dir:
+        safe_host = re.sub(r"[^A-Za-z0-9_.-]+", "_", target_host)
+        output_dir = os.path.join(workspace_dir, "trusted_dc_prechecks")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{report_label}_{safe_host}.gnmap")
+
+    if output_path:
+        scan_cmd = (
+            f"nmap --open -n -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
+            f"-oG {shlex.quote(output_path)} {shlex.quote(target_host)}"
+        )
+    else:
+        scan_cmd = (
+            f"nmap --open -n -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
+            f"{shlex.quote(target_host)}"
+        )
+
+    print_info_debug(f"[nmap][single-host-probe] {scan_cmd}")
+    completed = _run_nmap_command_with_optional_sudo_retry(
+        shell,
+        command=scan_cmd,
+        domain=target_host,
+        timeout_seconds=timeout_seconds,
+    )
+    if completed is None:
+        return {
+            "host": target_host,
+            "reachable": False,
+            "open_ports": [],
+            "status": "probe_failed",
+            "method": "nmap_single_host_probe",
+            "timeout_seconds": timeout_seconds,
+            "ports_scanned": target_ports,
+        }
+
+    gnmap_text = (
+        _read_text_file_best_effort(output_path)
+        if output_path
+        else ((completed.stdout or "") + "\n" + (completed.stderr or ""))
+    )
+    up_hosts = _parse_gnmap_up_hosts(gnmap_text)
+    open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
+
+    host_open_ports = sorted(open_ports_by_host.get(target_host, set()))
+    if not host_open_ports:
+        for candidate, candidate_ports in open_ports_by_host.items():
+            if str(candidate).strip() == target_host:
+                host_open_ports = sorted(candidate_ports)
+                break
+
+    reachable = target_host in up_hosts or bool(host_open_ports)
+    status = "reachable" if reachable else "no_response_from_current_vantage"
+    return {
+        "host": target_host,
+        "reachable": reachable,
+        "open_ports": host_open_ports,
+        "status": status,
+        "method": "nmap_single_host_probe",
+        "timeout_seconds": timeout_seconds,
+        "ports_scanned": target_ports,
+        "report_file": output_path,
+    }
 
 
 def _read_text_file_best_effort(path: str) -> str:
@@ -1978,7 +2073,7 @@ def convert_hostnames_to_ips_and_scan(
             for ip in unique_ips:
                 f.write(f"{ip}\n")
         shell.consolidate_domain_computers("")
-        important_ports = [21, 22, 53, 80, 88, 389, 443, 445, 1433, 3389, 5900, 5985]
+        important_ports = [22, 53, 80, 88, 389, 443, 445, 1433, 3389, 5900, 5985]
         important_ports_csv = ",".join(str(port) for port in important_ports)
         ip_count = len(unique_ips)
         marked_domain = mark_sensitive(domain, "domain")

@@ -18,10 +18,20 @@ import json
 import os
 from typing import Any
 
+from rich.prompt import Confirm
 from rich.table import Table
 
-from adscan_internal import print_info, print_info_debug, print_success, telemetry
+from adscan_internal import (
+    print_info,
+    print_info_debug,
+    print_panel,
+    print_success,
+    telemetry,
+)
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.domain_connectivity_service import (
+    reconcile_domain_connectivity_from_current_vantage_report,
+)
 from adscan_internal.services.pivot_runtime_state_service import (
     snapshot_direct_vantage_artifacts,
 )
@@ -359,6 +369,68 @@ def maybe_offer_post_pivot_owned_followup(
     _run_owned_user_followup_after_pivot(shell, domain=context.domain)
 
 
+def maybe_offer_trust_followup_for_newly_reachable_domains(
+    shell: Any,
+    *,
+    source_domain: str,
+    newly_reachable_domains: list[str],
+    title: str,
+    lead_lines: list[str],
+    prompt: str,
+    prompt_default: bool = True,
+) -> None:
+    """Offer trust follow-up when current-vantage changes unlock trusted domains."""
+    if not newly_reachable_domains:
+        return
+
+    domains_data = getattr(shell, "domains_data", {})
+    pending_domains = [
+        domain
+        for domain in newly_reachable_domains
+        if not bool(
+            (domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}).get(
+                "phase1_complete"
+            )
+        )
+    ]
+    if not pending_domains:
+        print_info_debug(
+            "[trust-followup] all newly reachable domains already completed Phase 1: "
+            f"source={mark_sensitive(source_domain, 'domain')}"
+        )
+        return
+
+    marked_source = mark_sensitive(source_domain, "domain")
+    domain_lines = [f"• {mark_sensitive(domain, 'domain')}" for domain in pending_domains[:8]]
+    if len(pending_domains) > 8:
+        domain_lines.append(f"• ... +{len(pending_domains) - 8} more")
+
+    print_panel(
+        "\n".join(
+            [
+                *lead_lines,
+                "",
+                f"Source domain: {marked_source}",
+                "",
+                "Newly reachable domains pending authenticated enumeration:",
+                *domain_lines,
+                "",
+                "ADscan can now re-run trust analysis from the source domain and continue authenticated enumeration only for domains that have not already completed Phase 1.",
+            ]
+        ),
+        title=title,
+        border_style="green",
+        expand=False,
+    )
+
+    trust_runner = getattr(shell, "do_enum_trusts", None)
+    if not callable(trust_runner):
+        print_info_debug("[trust-followup] shell does not expose do_enum_trusts().")
+        return
+    if Confirm.ask(prompt, default=prompt_default):
+        trust_runner(source_domain)
+
+
 def refresh_network_inventory_after_pivot(
     shell: Any,
     *,
@@ -486,6 +558,22 @@ def refresh_network_inventory_after_pivot(
                 with open(report_path, "w", encoding="utf-8") as handle:
                     json.dump(payload, handle, indent=2, sort_keys=False)
                     handle.write("\n")
+                newly_reachable_domains = reconcile_domain_connectivity_from_current_vantage_report(
+                    shell,
+                    source_domain=context.domain,
+                    payload=payload,
+                )
+                if newly_reachable_domains:
+                    print_info_debug(
+                        "[post-pivot] reconciled inter-domain connectivity from current-vantage report: "
+                        f"domain={mark_sensitive(context.domain, 'domain')} "
+                        f"updated={len(newly_reachable_domains)}"
+                    )
+                    _maybe_offer_post_pivot_trust_followup(
+                        shell,
+                        context=context,
+                        newly_reachable_domains=newly_reachable_domains,
+                    )
     except (OSError, json.JSONDecodeError) as exc:
         telemetry.capture_exception(exc)
         print_info_debug(
@@ -509,4 +597,27 @@ def refresh_network_inventory_after_pivot(
         report_path=report_path if os.path.exists(report_path) else None,
         newly_reachable_ips=newly_reachable_ips,
         newly_reachable_hosts=newly_reachable_hosts,
+    )
+
+
+def _maybe_offer_post_pivot_trust_followup(
+    shell: Any,
+    *,
+    context: PivotExecutionContext,
+    newly_reachable_domains: list[str],
+) -> None:
+    """Offer trust follow-up when pivoting unlocks new trusted domains."""
+    maybe_offer_trust_followup_for_newly_reachable_domains(
+        shell,
+        source_domain=context.domain,
+        newly_reachable_domains=newly_reachable_domains,
+        title="New Trusted Domains Reachable",
+        lead_lines=[
+            "The pivot changed your current vantage and unlocked additional trusted-domain reachability.",
+            f"Pivot host: {mark_sensitive(context.pivot_host, 'hostname')}",
+        ],
+        prompt=(
+            "Do you want ADscan to continue trust-driven authenticated enumeration "
+            f"from {mark_sensitive(context.domain, 'domain')} now?"
+        ),
     )

@@ -4,17 +4,22 @@ This module provides services for domain enumeration, trust relationships,
 and domain authentication operations.
 """
 
-from typing import Dict, List, Optional, Any, Tuple
-import logging
-import subprocess
-import shlex
+from __future__ import annotations
+
+from collections.abc import Callable
 from dataclasses import dataclass
+import logging
+import re
+import subprocess
+from typing import Any, Dict, List, Optional
 
 from adscan_internal.services.base_service import BaseService
+from adscan_internal.integrations.netexec.helpers import build_auth_nxc
 from adscan_internal.subprocess_env import get_clean_env_for_compilation
 
 
 logger = logging.getLogger(__name__)
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 @dataclass
@@ -46,6 +51,16 @@ class TrustRelationship:
         }
 
 
+@dataclass
+class TrustEnumerationResult:
+    """Structured output for recursive trust enumeration."""
+
+    trusts: List[TrustRelationship]
+    discovered_domains: List[str]
+    domain_controllers: Dict[str, str]
+    domain_connectivity: Dict[str, Dict[str, Any]]
+
+
 class DomainService(BaseService):
     """Service for domain operations.
 
@@ -62,99 +77,137 @@ class DomainService(BaseService):
         pdc: str,
         username: str,
         password: str,
-        enum_trusts_path: str,
-        nxc_args: Optional[List[str]] = None,
+        netexec_path: str,
+        executor: Callable[[str, int], subprocess.CompletedProcess[str] | None],
+        resolve_pdc_ip: Callable[[str, str], str | None] | None = None,
+        check_domain_reachability: Callable[[str, str, str], Dict[str, Any]] | None = None,
         scan_id: Optional[str] = None,
         timeout: int = 300,
-    ) -> Tuple[List[TrustRelationship], List[str]]:
-        """Enumerate trust relationships for a domain (PRO only).
+    ) -> TrustEnumerationResult:
+        """Enumerate domain trusts recursively using NetExec LDAP.
 
         Args:
             domain: Domain name to enumerate
-            pdc: Primary domain controller FQDN
+            pdc: Primary domain controller IP/FQDN for the starting domain
             username: Authentication username
             password: Authentication password
-            enum_trusts_path: Path to enum-trusts executable
-            nxc_args: Optional NetExec CLI arguments
+            netexec_path: Path to the NetExec executable
+            executor: Command executor routed through ADscan's NetExec runner
+            resolve_pdc_ip: Optional callback to resolve a trusted domain's PDC
+            check_domain_reachability: Optional callback to validate that a
+                newly discovered trusted domain controller is reachable before
+                recursing into it
             scan_id: Optional scan ID for progress tracking
             timeout: Command timeout in seconds
 
         Returns:
-            Tuple of:
-                - List of discovered trust relationships
-                - List of discovered domain names
-
-        Raises:
-            FileNotFoundError: If enum-trusts executable not found
-            subprocess.TimeoutExpired: If command times out
-            subprocess.CalledProcessError: If command fails
+            Structured trust enumeration result.
         """
+        normalized_domain = domain.strip().lower()
+        auth_string = build_auth_nxc(
+            username,
+            password,
+            normalized_domain,
+            kerberos=True,
+        )
+        pending_domains: list[str] = [normalized_domain]
+        seen_domains: set[str] = set()
+        discovered_domains: list[str] = [normalized_domain]
+        domain_controllers: Dict[str, str] = {normalized_domain: pdc}
+        domain_connectivity: Dict[str, Dict[str, Any]] = {}
+        trusts: List[TrustRelationship] = []
+
         self._emit_progress(
             scan_id=scan_id,
             phase="trust_enumeration",
             progress=0.0,
-            message=f"Starting trust enumeration for {domain}",
+            message=f"Starting trust enumeration for {normalized_domain}",
         )
 
-        # Build command
-        cmd_parts = [
-            enum_trusts_path,
-            "-u",
-            username,
-            "-p",
-            password,
-            "-d",
-            domain,
-            "-pdc",
-            pdc,
-        ]
-        if nxc_args:
-            cmd_parts.extend(nxc_args)
+        while pending_domains:
+            current_domain = pending_domains.pop(0)
+            if current_domain in seen_domains:
+                continue
 
-        command = " ".join(shlex.quote(part) for part in cmd_parts)
+            current_pdc = domain_controllers.get(current_domain)
+            if not current_pdc:
+                self.logger.warning(
+                    "Skipping trust enumeration for %s: missing PDC", current_domain
+                )
+                seen_domains.add(current_domain)
+                continue
 
-        self.logger.info(f"Executing trust enumeration for domain: {domain}")
-        self._emit_progress(
-            scan_id=scan_id,
-            phase="trust_enumeration",
-            progress=0.3,
-            message="Executing enum-trusts command",
-        )
-
-        # Execute command
-        try:
-            clean_env = get_clean_env_for_compilation()
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                env=clean_env,
-            )
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"Trust enumeration timed out after {timeout}s")
             self._emit_progress(
                 scan_id=scan_id,
                 phase="trust_enumeration",
-                progress=1.0,
-                message="Trust enumeration timed out",
+                progress=0.3,
+                message=f"Enumerating trusts for {current_domain}",
             )
-            raise
+            command = f"{netexec_path} ldap {current_pdc} {auth_string} --dc-list"
+            self.logger.info(
+                "Executing recursive trust enumeration for domain: %s", current_domain
+            )
 
-        self._emit_progress(
-            scan_id=scan_id,
-            phase="trust_enumeration",
-            progress=0.6,
-            message="Parsing trust enumeration results",
-        )
+            result = executor(command, timeout)
+            if result is None:
+                self.logger.warning(
+                    "NetExec runner returned no result for trust enumeration of %s",
+                    current_domain,
+                )
+                seen_domains.add(current_domain)
+                continue
 
-        # Parse results
-        trusts, discovered_domains = self._parse_trust_output(
-            result.stdout,
-            domain,
-        )
+            output = self._combine_process_output(result)
+            parsed_trusts = self._parse_netexec_trust_output(output)
+            seen_domains.add(current_domain)
+
+            if result.returncode != 0 and not parsed_trusts:
+                self.logger.warning(
+                    "Trust enumeration command for %s failed with rc=%s",
+                    current_domain,
+                    result.returncode,
+                )
+                continue
+
+            for parsed_trust in parsed_trusts:
+                partner = parsed_trust["partner"]
+                if not partner:
+                    continue
+
+                partner_pdc = domain_controllers.get(partner)
+                if not partner_pdc and resolve_pdc_ip is not None:
+                    partner_pdc = resolve_pdc_ip(partner, current_pdc)
+                    if partner_pdc:
+                        domain_controllers[partner] = partner_pdc
+
+                trusts.append(
+                    TrustRelationship(
+                        source_domain=current_domain,
+                        target_domain=partner,
+                        trust_type=parsed_trust["type"],
+                        trust_direction=parsed_trust["direction"],
+                        target_pdc=partner_pdc,
+                    )
+                )
+
+                if partner not in discovered_domains:
+                    discovered_domains.append(partner)
+                should_enqueue = True
+                if partner_pdc and check_domain_reachability is not None:
+                    connectivity = check_domain_reachability(
+                        partner,
+                        partner_pdc,
+                        current_domain,
+                    )
+                    if connectivity:
+                        domain_connectivity[partner] = connectivity
+                        should_enqueue = bool(connectivity.get("reachable"))
+                if (
+                    should_enqueue
+                    and partner not in seen_domains
+                    and partner not in pending_domains
+                ):
+                    pending_domains.append(partner)
 
         self._emit_progress(
             scan_id=scan_id,
@@ -162,72 +215,61 @@ class DomainService(BaseService):
             progress=1.0,
             message=f"Trust enumeration completed: {len(trusts)} trust(s) found",
         )
-
         self.logger.info(
-            f"Trust enumeration completed for {domain}: "
-            f"{len(trusts)} trust(s), {len(discovered_domains)} domain(s)"
+            "Trust enumeration completed for %s: %s trust(s), %s domain(s)",
+            normalized_domain,
+            len(trusts),
+            len(discovered_domains),
+        )
+        return TrustEnumerationResult(
+            trusts=trusts,
+            discovered_domains=discovered_domains,
+            domain_controllers=domain_controllers,
+            domain_connectivity=domain_connectivity,
         )
 
-        return trusts, discovered_domains
+    def _parse_netexec_trust_output(self, output: str) -> List[Dict[str, str]]:
+        """Parse NetExec trust lines from ``--dc-list`` output."""
+        trusts: List[Dict[str, str]] = []
+        for raw_line in output.splitlines():
+            parsed = self._parse_trust_line(raw_line)
+            if parsed:
+                trusts.append(parsed)
+        return trusts
 
-    def _parse_trust_output(
-        self,
-        output: str,
-        source_domain: str,
-    ) -> Tuple[List[TrustRelationship], List[str]]:
-        """Parse enum-trusts output.
+    def _parse_trust_line(self, line: str) -> Dict[str, str] | None:
+        """Extract trust metadata from one NetExec output line."""
+        normalized_line = _ANSI_ESCAPE_RE.sub("", line or "").strip()
+        if "->" not in normalized_line:
+            return None
 
-        Args:
-            output: Command stdout
-            source_domain: Source domain name
+        parts = [part.strip() for part in normalized_line.split("->")]
+        if len(parts) < 3:
+            return None
 
-        Returns:
-            Tuple of (trust relationships, discovered domains)
-        """
-        trusts: List[TrustRelationship] = []
-        discovered_domains: List[str] = []
-        domain_pdc_mapping: Dict[str, str] = {}
+        left_tokens = parts[0].split()
+        if not left_tokens:
+            return None
 
-        if "SUMMARY OF FOUND TRUST RELATIONSHIPS" not in output:
-            return trusts, discovered_domains
+        partner = left_tokens[-1].rstrip(":").lower()
+        if "." not in partner:
+            return None
 
-        if "[-] No trust relationships found." in output:
-            return trusts, discovered_domains
+        direction = parts[1].strip() or "Unknown"
+        trust_type = parts[2].strip() or "Unknown"
+        return {
+            "partner": partner,
+            "direction": direction,
+            "type": trust_type,
+        }
 
-        # Extract summary section
-        summary_section = output.split("SUMMARY OF FOUND TRUST RELATIONSHIPS")[1]
-
-        # First pass: Extract domain and PDC mappings
-        current_domain = None
-        for line in summary_section.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-
-            if "Domain: " in line and not line.startswith("  "):
-                current_domain = line.split("Domain: ")[1].strip().rstrip(":")
-            elif "PDC IP: " in line and current_domain:
-                pdc_ip = line.split("PDC IP: ")[1].strip()
-                domain_pdc_mapping[current_domain] = pdc_ip
-                self.logger.debug(f"Mapped {current_domain} -> PDC: {pdc_ip}")
-
-        # Second pass: Build domain list and trust relationships
-        for line in summary_section.splitlines():
-            line = line.strip()
-            if "Domain: " in line and not line.startswith("  "):
-                domain_name = line.split("Domain: ")[1].strip().rstrip(":")
-                if domain_name not in discovered_domains:
-                    discovered_domains.append(domain_name)
-
-                    # Create trust relationship
-                    trust = TrustRelationship(
-                        source_domain=source_domain,
-                        target_domain=domain_name,
-                        target_pdc=domain_pdc_mapping.get(domain_name),
-                    )
-                    trusts.append(trust)
-
-        return trusts, discovered_domains
+    def _combine_process_output(self, result: subprocess.CompletedProcess[str]) -> str:
+        """Return stdout and stderr combined for best-effort parsing."""
+        return "\n".join(
+            part
+            for part in [(result.stdout or "").strip(), (result.stderr or "").strip()]
+            if part
+        )
 
     def verify_domain_connectivity(
         self,

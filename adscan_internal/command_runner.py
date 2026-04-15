@@ -29,6 +29,53 @@ def _extract_non_empty_lines(text: str | None) -> list[str]:
     return [line for line in text.splitlines() if line.strip()]
 
 
+def _coerce_timeout_output_text(output: str | bytes | None) -> str:
+    """Normalize timeout output payloads into text."""
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return str(output)
+
+
+def build_text_preview(
+    text: str | None,
+    *,
+    head: int = 10,
+    tail: int = 10,
+    include_omission_notice: bool = True,
+) -> str:
+    """Build a compact head/tail preview for one multiline text payload.
+
+    Args:
+        text: Source text to summarize.
+        head: Number of non-empty lines to keep from the beginning.
+        tail: Number of non-empty lines to keep from the end when truncation occurs.
+        include_omission_notice: Whether to include an omitted-lines marker.
+
+    Returns:
+        A newline-joined preview string. Empty when the input has no non-empty lines.
+    """
+    lines = _extract_non_empty_lines(text)
+    if not lines:
+        return ""
+
+    head_lines = lines[:head]
+    tail_lines = (
+        lines[-tail:]
+        if len(lines) > (head + tail)
+        else lines[head:]
+    )
+    omitted_lines = len(lines) - len(head_lines) - len(tail_lines)
+
+    preview_lines: list[str] = []
+    preview_lines.extend(head_lines)
+    if include_omission_notice and omitted_lines > 0:
+        preview_lines.append(f"... ({omitted_lines} line(s) omitted) ...")
+    preview_lines.extend(tail_lines)
+    return "\n".join(preview_lines)
+
+
 def summarize_execution_result(result: ExecutionResult) -> tuple[int, int, int, str]:
     """Return normalized execution summary.
 
@@ -102,6 +149,30 @@ def build_execution_output_preview(
             preview_lines.extend(stderr_tail_lines)
 
     return "\n".join(preview_lines)
+
+
+def build_timeout_output_preview(
+    exc: subprocess.TimeoutExpired,
+    *,
+    stdout_head: int = 10,
+    stdout_tail: int = 10,
+    stderr_head: int = 10,
+    stderr_tail: int = 10,
+) -> str:
+    """Build a compact output preview from one ``TimeoutExpired`` exception."""
+    timeout_result = subprocess.CompletedProcess(
+        args=exc.cmd,
+        returncode=124,
+        stdout=_coerce_timeout_output_text(getattr(exc, "stdout", None)),
+        stderr=_coerce_timeout_output_text(getattr(exc, "stderr", None)),
+    )
+    return build_execution_output_preview(
+        timeout_result,
+        stdout_head=stdout_head,
+        stdout_tail=stdout_tail,
+        stderr_head=stderr_head,
+        stderr_tail=stderr_tail,
+    )
 
 
 class CommandRunner:

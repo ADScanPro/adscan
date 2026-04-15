@@ -438,6 +438,8 @@ def _render_rbcd_prepared_context(
     target_spn: str,
     delegated_user: str | None,
     ticket_path: str | None,
+    http_target_spn: str | None = None,
+    http_ticket_path: str | None = None,
 ) -> None:
     """Render a concise operator summary for a prepared RBCD ticket."""
     target_host = str(target_computer or "").rstrip("$")
@@ -451,6 +453,10 @@ def _render_rbcd_prepared_context(
         lines.append(f"Delegated user: {mark_sensitive(delegated_user, 'user')}")
     if ticket_path:
         lines.append(f"Saved ticket: {mark_sensitive(ticket_path, 'path')}")
+    if http_target_spn:
+        lines.append(f"HTTP SPN: {mark_sensitive(http_target_spn, 'service')}")
+    if http_ticket_path:
+        lines.append(f"HTTP ticket: {mark_sensitive(http_ticket_path, 'path')}")
 
     lines.extend(
         [
@@ -463,6 +469,10 @@ def _render_rbcd_prepared_context(
             (
                 "- For CIFS service tickets, prefer SMB-capable Kerberos tooling or a dedicated "
                 "host follow-up rather than assuming this automatically enables DCSync."
+            ),
+            (
+                "- For HTTP service tickets, prefer WinRM/HTTP-capable Kerberos workflows when "
+                "the target exposes that service."
             ),
         ]
     )
@@ -895,6 +905,7 @@ def _run_rodc_krbtgt_followup(
     preferred_transport: str,
     nxc_auth: str | None = None,
     auth_kind_label: str = "host access credential",
+    winrm_secret: str | None = None,
 ) -> None:
     """Run the common RODC per-krbtgt extraction follow-up.
 
@@ -982,19 +993,24 @@ def _run_rodc_krbtgt_followup(
     # ------------------------------------------------------------------
     # Step 3: choose extraction tier.
     #
-    # Tier-1 uses the catalog-backed mimikatz.exe directly.
-    # Tier-3 asks the extraction service to build and stage the in-memory loader.
+    # Tier 1 — prebuilt mimikatz.exe directly.
+    # Tier 2 — donut shellcode + Win32 loader (evades AV).
+    # Tier 3 — donut shellcode + SysWhispers4 loader (evades EDR hooks).
     # ------------------------------------------------------------------
     selected_tier = _select_rodc_krbtgt_extractor_tier(shell)
-    if selected_tier == 3 and loader_available():
+    if selected_tier in (2, 3) and loader_available():
         extractor_path = ""  # service builds and stages the loader
-        extractor_mode = "loader"
-        extractor_label = "mimikatz (in-memory, direct syscalls)"
+        if selected_tier == 3:
+            extractor_mode = "loader_sw4"
+            extractor_label = "mimikatz (in-memory, SysWhispers4 direct syscalls)"
+        else:
+            extractor_mode = "loader"
+            extractor_label = "mimikatz (in-memory, donut + Win32)"
         preview_cmd = f"[in-memory] {display_args(commands)}"
     else:
-        if selected_tier == 3 and not loader_available():
+        if selected_tier in (2, 3) and not loader_available():
             print_warning(
-                "Tier 3 loader prerequisites are unavailable. Falling back to Tier 1 mimikatz."
+                f"Tier {selected_tier} loader prerequisites are unavailable. Falling back to Tier 1 mimikatz."
             )
         extractor_path = mimikatz_path
         extractor_mode = base_mode
@@ -1008,6 +1024,14 @@ def _run_rodc_krbtgt_followup(
     # ------------------------------------------------------------------
     # Step 4: show plan and run (no confirmation prompt)
     # ------------------------------------------------------------------
+    if winrm_secret:
+        transport_label = "WinRM (exec) + SMB (file transfer)"
+    elif preferred_transport.lower() == "smb":
+        transport_label = "SMB"
+    elif preferred_transport.lower() == "winrm":
+        transport_label = "WinRM"
+    else:
+        transport_label = "WinRM → SMB (auto)"
     print_operation_header(
         "RODC krbtgt Live Extraction",
         details={
@@ -1015,7 +1039,7 @@ def _run_rodc_krbtgt_followup(
             "Domain": effective_domain,
             "Auth user": auth_username,
             "Auth type": auth_kind_label,
-            "Transport": preferred_transport.upper(),
+            "Transport": transport_label,
             "Extractor": extractor_label,
             "Command": preview_cmd,
         },
@@ -1039,6 +1063,7 @@ def _run_rodc_krbtgt_followup(
                 extractor_mode=extractor_mode,
                 nxc_auth=nxc_auth,
                 preferred_transport=preferred_transport,
+                winrm_secret=winrm_secret or None,
             )
         )
 
@@ -1053,17 +1078,24 @@ def _run_rodc_krbtgt_followup(
 def _select_rodc_krbtgt_extractor_tier(shell: Any) -> int:
     """Return the preferred extraction tier for RODC krbtgt follow-ups.
 
-    Tier 1 is the default because it is the most predictable path and does not
-    depend on local loader build prerequisites. Tier 3 is offered explicitly for
-    operators who want the in-memory loader workflow during dev sessions.
+    Tier 1 — prebuilt mimikatz.exe, most reliable, no prerequisites.
+    Tier 2 — donut shellcode + Win32 (VirtualAlloc/CreateThread), evades AV.
+    Tier 3 — donut shellcode + SysWhispers4 (direct syscalls, ntdll unhook,
+              ETW/AMSI bypass), evades EDR userland hooks.
     """
     is_dev = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
     selector = getattr(shell, "_questionary_select", None)
+    _loader_ok = loader_available()
     options = [
         "Tier 1 - Prebuilt mimikatz.exe (default, most reliable)",
         (
-            "Tier 3 - In-memory loader (direct syscalls)"
-            if loader_available()
+            "Tier 2 - In-memory loader (donut + Win32, evades AV)"
+            if _loader_ok
+            else "Tier 2 - In-memory loader (unavailable on this host)"
+        ),
+        (
+            "Tier 3 - In-memory loader (donut + SysWhispers4, evades EDR)"
+            if _loader_ok
             else "Tier 3 - In-memory loader (unavailable on this host)"
         ),
     ]
@@ -1074,6 +1106,8 @@ def _select_rodc_krbtgt_extractor_tier(shell: Any) -> int:
             default_idx=0,
         )
         if selected_idx == 1:
+            return 2
+        if selected_idx == 2:
             return 3
     elif not is_dev:
         print_info_debug(
@@ -1090,8 +1124,14 @@ def _run_rbcd_rodc_krbtgt_followup(
     target_computer: str,
     delegated_user: str,
     ticket_path: str,
+    http_ticket_path: str | None = None,
 ) -> None:
-    """Execute the common RODC krbtgt follow-up via delegated CIFS ticket."""
+    """Execute the common RODC krbtgt follow-up via delegated CIFS ticket.
+
+    When ``http_ticket_path`` is provided (http/ SPN ticket from dual-SPN
+    RBCD), WinRM is used as the primary execution transport and SMB/wmiexec
+    as the fallback.  Without it, only SMB is available.
+    """
     build_auth = getattr(shell, "build_auth_nxc", None)
     nxc_auth = None
     if callable(build_auth):
@@ -1103,6 +1143,9 @@ def _run_rbcd_rodc_krbtgt_followup(
                 kerberos=True,
             )
         )
+    # If we have an http/ ticket, prefer WinRM for exec (better token for SW4)
+    # and keep SMB for file transfer (upload/download always via SMB share).
+    preferred = "auto" if http_ticket_path else "smb"
     _run_rodc_krbtgt_followup(
         shell,
         domain=domain,
@@ -1110,9 +1153,10 @@ def _run_rbcd_rodc_krbtgt_followup(
         target_computer=target_computer,
         auth_username=delegated_user,
         auth_secret=ticket_path,
-        preferred_transport="smb",
+        preferred_transport=preferred,
         nxc_auth=nxc_auth,
-        auth_kind_label=f"Kerberos ccache ({ticket_path})",
+        auth_kind_label=f"Kerberos ccache ({delegated_user}@cifs_{target_computer})",
+        winrm_secret=http_ticket_path or None,
     )
 
 
@@ -1893,6 +1937,7 @@ def _build_rodc_host_access_followups(
     target_spn: str = "",
     delegated_user: str = "",
     ticket_path: str = "",
+    http_ticket_path: str | None = None,
 ) -> list[FollowupAction]:
     """Return RODC-specific follow-ups for any path that yields host access."""
     plan = resolve_rodc_followup_plan(
@@ -1928,6 +1973,7 @@ def _build_rodc_host_access_followups(
                 target_computer=plan.target_computer,
                 delegated_user=plan.auth_username,
                 ticket_path=plan.auth_secret,
+                http_ticket_path=http_ticket_path or None,
             )
 
         prepare_description = (
@@ -2383,7 +2429,7 @@ def build_followups_for_step(
         )
         return followups
 
-    if action == "sqladmin":
+    if action in {"sqlaccess", "sqladmin"}:
         marked_target = mark_sensitive(target_label or target_sam_or_label, "hostname")
 
         def _handle_mssql() -> None:
@@ -2574,11 +2620,17 @@ def build_followups_for_execution_outcome(
         target_spn = strip_sensitive_markers(
             str(outcome.get("target_spn") or "")
         ).strip()
+        http_target_spn = strip_sensitive_markers(
+            str(outcome.get("http_target_spn") or "")
+        ).strip()
         delegated_user = strip_sensitive_markers(
             str(outcome.get("delegated_user") or "")
         ).strip()
         ticket_path = strip_sensitive_markers(
             str(outcome.get("ticket_path") or "")
+        ).strip()
+        http_ticket_path = strip_sensitive_markers(
+            str(outcome.get("http_ticket_path") or "")
         ).strip()
         if rodc_access_context is not None:
             target_domain = rodc_access_context.target_domain
@@ -2616,6 +2668,7 @@ def build_followups_for_execution_outcome(
                     target_spn=target_spn,
                     delegated_user=delegated_user,
                     ticket_path=ticket_path,
+                    http_ticket_path=http_ticket_path or None,
                 )
                 if rodc_followups:
                     return rodc_followups
@@ -2638,6 +2691,8 @@ def build_followups_for_execution_outcome(
                         target_spn=target_spn,
                         delegated_user=delegated_user or None,
                         ticket_path=ticket_path or None,
+                        http_target_spn=http_target_spn or None,
+                        http_ticket_path=http_ticket_path or None,
                     ),
                 )
             )

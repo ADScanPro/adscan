@@ -105,6 +105,7 @@ from adscan_internal import (
     print_exception,
     TelemetryAwareConsole,
 )
+from adscan_internal.command_runner import build_timeout_output_preview
 from adscan_internal.cli.ci_events import emit_phase
 from adscan_internal.logging_config import init_logging
 from adscan_internal.reporting_compat import (
@@ -4174,6 +4175,9 @@ def _maybe_show_report_cta(shell) -> None:
     creds = getattr(shell, "_session_credentials_count", 0)
     victories = getattr(shell, "_session_victories", [])
     if not (bool(victories) or attack_paths > 0 or creds > 0):
+        return
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    if workspace_type != "audit":
         return
     shell.console.print()
     _reports_url = mark_passthrough("https://adscanpro.com/reports")
@@ -11168,7 +11172,30 @@ class PentestShell:
             return result
         except subprocess.TimeoutExpired as exc:
             if not ignore_errors:
-                telemetry.capture_exception(exc)
+                timeout_preview = ""
+                try:
+                    timeout_preview = build_timeout_output_preview(
+                        exc,
+                        stdout_head=20,
+                        stdout_tail=20,
+                        stderr_head=20,
+                        stderr_tail=20,
+                    )
+                    if timeout_preview:
+                        print_info_debug(
+                            "[cmd] Timeout output preview:\n" + timeout_preview,
+                            panel=True,
+                        )
+                except Exception:
+                    timeout_preview = ""
+                telemetry.capture_exception(
+                    exc,
+                    properties={
+                        "command": command,
+                        "timeout_seconds": timeout,
+                        "output_preview": timeout_preview or None,
+                    },
+                )
                 try:
                     print_error_verbose(
                         f"Command timed out after {timeout if timeout is not None else 'unknown'}s: "
@@ -14374,6 +14401,8 @@ class PentestShell:
 
             show: Displays the current workspace credentials.
 
+            show_users: Alias of `show`.
+
             clear <domain>: Clears all credentials for the specified domain in the current workspace.
 
             delete <domain>: Deletes one selected credential for the specified domain in the current workspace.
@@ -14403,7 +14432,7 @@ class PentestShell:
         command_parts = args.split()
         if not command_parts:
             print_instruction(
-                "Please provide a subcommand for 'creds'. Usage: creds <show|clear|delete|select|save> [options]"
+                "Please provide a subcommand for 'creds'. Usage: creds <show|show_users|clear|delete|select|save> [options]"
             )
             self.do_help("creds")
             return
@@ -15580,11 +15609,11 @@ class PentestShell:
         #  3) Quick Credential Wins (ADCS detect, LDAP descriptions, GPP)
         #  4) Roasting & Cracking
         #  5) Password Spraying
-        #  6) Unauthenticated Attack Surface
+        #  6) Audit-only Unauthenticated Attack Surface
         #  7) Audit-only Extras (CVE scan + configs)
         #
         # Plus User Privilege Assessment (+1) if username is present.
-        base_phases = 6 if self.type == "ctf" else 7
+        base_phases = 5 if self.type == "ctf" else 7
         total_phases = base_phases + (1 if username else 0)
 
         def _run_step(
@@ -16021,28 +16050,29 @@ class PentestShell:
         if stop_after_phase == 5:
             return
 
-        # ========== PHASE 6: Unauthenticated Attack Surface ==========
-        print_phase_header(
-            "Unauthenticated Attack Surface",
-            phase_number=6,
-            total_phases=total_phases,
-            details={
-                "Domain": domain,
-                "PDC": pdc,
-            },
-            icon="🛰️",
-        )
+        # ========== PHASE 6: Audit-only Unauthenticated Attack Surface ==========
+        if self.type == "audit":
+            print_phase_header(
+                "Unauthenticated Attack Surface",
+                phase_number=6,
+                total_phases=total_phases,
+                details={
+                    "Domain": domain,
+                    "PDC": pdc,
+                },
+                icon="🛰️",
+            )
 
-        if _run_step(
-            "Unauthenticated Scan",
-            lambda: self.ask_for_unauth_scan(domain),
-            step_number=1,
-            total_steps=1,
-        ):
-            return
+            if _run_step(
+                "Unauthenticated Scan",
+                lambda: self.ask_for_unauth_scan(domain),
+                step_number=1,
+                total_steps=1,
+            ):
+                return
 
-        if stop_after_phase == 6:
-            return
+            if stop_after_phase == 6:
+                return
 
         # ========== PHASE 7: Audit-only Extras ==========
         if self.type == "audit":
@@ -16075,9 +16105,9 @@ class PentestShell:
         # ========== User Privilege Assessment ==========
         # Conditional privilege enumeration (only if username is present)
         # This runs last to assess privileges after all enumeration is complete
-        # Phase number: 6 if not audit mode (no PHASE 6), 7 if audit mode (PHASE 6 exists)
+        # Phase number: 6 in CTF mode, 8 in audit mode.
         if username:
-            user_priv_phase_number = 8 if self.type == "audit" else 7
+            user_priv_phase_number = 8 if self.type == "audit" else 6
             print_phase_header(
                 "User Privilege Assessment",
                 phase_number=user_priv_phase_number,
@@ -17574,12 +17604,19 @@ class PentestShell:
             password=password,
         )
 
-    def ask_for_mssql_access(self, domain, host, username, password):
+    def ask_for_mssql_access(
+        self, domain, host, username, password, workflow_intent="default"
+    ):
         """Delegate to mssql module for consistency."""
         from adscan_internal.cli.mssql import ask_for_mssql_access
 
         return ask_for_mssql_access(
-            self, domain=domain, host=host, username=username, password=password
+            self,
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+            workflow_intent=workflow_intent,
         )
 
     def ask_for_mssql_impersonate(self, domain, host, username, password):
@@ -20734,6 +20771,73 @@ class PentestShell:
                         return parts[idx + 1]
                 return None
 
+            def _confirm_ambiguous_gpp_domain_check(
+                *,
+                username: str,
+                source_xml: str | None,
+                domain_name: str,
+            ) -> bool:
+                marked_username = mark_sensitive(username, "user")
+                marked_domain = mark_sensitive(domain_name, "domain")
+                marked_source_xml = (
+                    mark_sensitive(source_xml, "path")
+                    if source_xml
+                    else "unknown source"
+                )
+                print_info(
+                    "Recovered a GPP credential whose account scope is ambiguous. "
+                    "NetExec did not emit a domain-qualified userName, so this may be a "
+                    "local account, a domain account referenced without domain, or a reused password."
+                )
+                print_info(
+                    f"Account: {marked_username} | Domain to test: {marked_domain} | Source: {marked_source_xml}"
+                )
+                confirmer = getattr(self, "_questionary_confirm", None)
+                prompt = (
+                    f"Check whether {marked_username} also works as a domain credential "
+                    f"in {marked_domain}?"
+                )
+                if callable(confirmer):
+                    return bool(confirmer(prompt, default=True))
+                return True
+
+            def _store_ambiguous_gpp_candidate(
+                *,
+                domain_name: str,
+                username: str,
+                password: str,
+                source_xml: str | None,
+            ) -> None:
+                from adscan_internal.services.credential_store_service import (
+                    CredentialStoreService,
+                )
+
+                store_service = CredentialStoreService()
+                update_result = store_service.update_domain_credential(
+                    domains_data=self.domains_data,
+                    domain=domain_name,
+                    username=username.lower(),
+                    credential=password,
+                    is_hash=self.is_hash(password),
+                )
+                marked_username = mark_sensitive(username, "user")
+                marked_domain = mark_sensitive(domain_name, "domain")
+                marked_source_xml = (
+                    mark_sensitive(source_xml, "path")
+                    if source_xml
+                    else "unknown source"
+                )
+                if update_result.credential_changed:
+                    print_info(
+                        "Saved ambiguous GPP credential as an unverified candidate for "
+                        f"{marked_username} in {marked_domain}. Source: {marked_source_xml}"
+                    )
+                else:
+                    print_info_debug(
+                        "Ambiguous GPP credential candidate was already stored for "
+                        f"{marked_username} in {marked_domain}."
+                    )
+
             # Check the process output
             if completed_process.returncode == 0:
                 output_str = completed_process.stdout or ""
@@ -20753,13 +20857,50 @@ class PentestShell:
                     _update_gpp_report("gpp_passwords", found_passwords)
                     if parsed_passwords and domain:
                         for entry in parsed_passwords:
-                            credential_domain = (
-                                str(entry.domain or "").strip().lower() or domain
-                            )
-                            self.add_credential(
-                                credential_domain,
-                                entry.username,
-                                entry.password,
+                            if entry.is_domain_qualified:
+                                credential_domain = (
+                                    str(entry.domain or "").strip().lower() or domain
+                                )
+                                self.add_credential(
+                                    credential_domain,
+                                    entry.username,
+                                    entry.password,
+                                )
+                                continue
+
+                            if _confirm_ambiguous_gpp_domain_check(
+                                username=entry.username,
+                                source_xml=entry.source_xml,
+                                domain_name=domain,
+                            ):
+                                verification_result = self.verify_domain_credentials(
+                                    domain,
+                                    entry.username,
+                                    entry.password,
+                                )
+                                if verification_result:
+                                    self.add_credential(
+                                        domain,
+                                        entry.username,
+                                        entry.password,
+                                        trusted_manual_validation=True,
+                                        prompt_for_user_privs_after=False,
+                                    )
+                                    continue
+                                marked_username = mark_sensitive(
+                                    entry.username, "user"
+                                )
+                                marked_domain = mark_sensitive(domain, "domain")
+                                print_info(
+                                    "The ambiguous GPP credential did not verify as a domain "
+                                    f"account for {marked_username} in {marked_domain}."
+                                )
+
+                            _store_ambiguous_gpp_candidate(
+                                domain_name=domain,
+                                username=entry.username,
+                                password=entry.password,
+                                source_xml=entry.source_xml,
                             )
                     if found_passwords and domain:
                         try:
@@ -24863,10 +25004,17 @@ class PentestShell:
                     confirmed_findings: list[ServiceAccessFinding] = []
 
                     for line in output.splitlines():
-                        if (
-                            "RDP Access Granted" in line
-                            or "(Pwn3d!)" in line
-                        ):
+                        mssql_authenticated = (
+                            service == "mssql"
+                            and "[+]" in line
+                            and "\\" in line
+                            and ":" in line
+                            and "(name:" not in line
+                        )
+                        privileged_indicator = (
+                            "RDP Access Granted" in line or "(Pwn3d!)" in line
+                        )
+                        if privileged_indicator or mssql_authenticated:
                             match_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
                             match_hostname = re.search(
                                 r"^\S+\s+\S+\s+\S+\s+(\S+)", line
@@ -24880,7 +25028,11 @@ class PentestShell:
                                         host=host,
                                         username=username,
                                         category="confirmed",
-                                        reason="confirmed",
+                                        reason=(
+                                            "authenticated_access"
+                                            if mssql_authenticated and not privileged_indicator
+                                            else "confirmed"
+                                        ),
                                         status=line.strip(),
                                         backend="netexec",
                                     )
@@ -24892,20 +25044,26 @@ class PentestShell:
 
                                 marked_host = mark_sensitive(host, "hostname")
                                 print_warning(
-                                    f"User {marked_username} has {service} privileges on host {marked_host}"
+                                    f"User {marked_username} has confirmed {service} access on host {marked_host}"
                                 )
                                 try:
                                     from adscan_internal.services.attack_graph_service import (
                                         upsert_netexec_privilege_edge,
                                     )
 
-                                    relation_map = {
-                                        "smb": "AdminTo",
-                                        "mssql": "SQLAdmin",
-                                        "rdp": "CanRDP",
-                                        "winrm": "CanPSRemote",
-                                    }
-                                    relation = relation_map.get(service)
+                                    if service == "mssql":
+                                        relation = (
+                                            "SQLAdmin"
+                                            if "(Pwn3d!)" in line
+                                            else "SQLAccess"
+                                        )
+                                    else:
+                                        relation_map = {
+                                            "smb": "AdminTo",
+                                            "rdp": "CanRDP",
+                                            "winrm": "CanPSRemote",
+                                        }
+                                        relation = relation_map.get(service)
                                     if relation:
                                         hostname_hint = (
                                             match_hostname.group(1)
@@ -26816,6 +26974,7 @@ class PentestShell:
                        Example: "generate_report pdf"
                                 "generate_report pdf technical"
                                 "generate_report pdf technical ens,iso27001,dora"
+                                "reporting pdf technical"
         """
         from adscan_internal.cli.ci import run_generate_report
 
@@ -29483,7 +29642,6 @@ def _print_check_summary(all_ok: bool):
                 {
                     "name": "Python Virtual Env",
                     "status": "failed",
-                    "details": "Not found - Run: adscan check --fix",
                 }
             )
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import importlib
+import importlib.metadata
 import os
 import re
 import shutil
@@ -55,11 +57,45 @@ _REQUIRED_JOHN_CONVERTERS = (
     "ansible2john",
 )
 _RUNTIME_PYTHON_DEPENDENCIES = (
+    ("netifaces", "netifaces", "required for ADscan network/runtime startup flows"),
     ("certihound", "CertiHound", "used for ADCS BloodHound collection"),
     ("gssapi", "gssapi", "required for CertiHound Kerberos authentication"),
+    ("krb5", "krb5", "required for WinRM Kerberos (pyspnego backend)"),
     ("Crypto", "pycryptodome", "required for CertiHound password authentication"),
     ("pykeepass", "pykeepass", "used for KeePass artifact parsing"),
+    ("impacket", "impacket", "used by SMB/DCERPC/Kerberos-backed runtime services"),
+    ("markitdown", "markitdown", "used for runtime document content extraction"),
+    ("pydantic_ai", "pydantic_ai", "used for ADscan AI runtime features"),
+    ("pypsrp", "pypsrp", "required for WinRM/PSRP runtime operations"),
+    ("graphviz", "graphviz", "used for runtime graph rendering features"),
+    ("matplotlib", "matplotlib", "used for runtime chart/report rendering"),
+    ("pyarrow", "pyarrow", "used for runtime materialized attack-path caches"),
+    ("selenium", "selenium", "used for runtime browser-backed discovery features"),
+    ("textual", "textual", "required for the ADscan TUI runtime"),
+    ("magic", "python-magic", "used for runtime file type detection"),
+    ("rustworkx", "rustworkx", "used for runtime attack-graph processing"),
+    ("neo4j", "neo4j", "used for BloodHound/Neo4j-backed runtime integrations"),
 )
+_RUNTIME_PYTHON_DISTRIBUTION_NAMES = {
+    "netifaces": "netifaces",
+    "certihound": "certihound",
+    "gssapi": "gssapi",
+    "krb5": "krb5",
+    "Crypto": "pycryptodome",
+    "pykeepass": "pykeepass",
+    "impacket": "impacket",
+    "markitdown": "markitdown",
+    "pydantic_ai": "pydantic-ai",
+    "pypsrp": "pypsrp",
+    "graphviz": "graphviz",
+    "matplotlib": "matplotlib",
+    "pyarrow": "pyarrow",
+    "selenium": "selenium",
+    "textual": "textual",
+    "magic": "python-magic",
+    "rustworkx": "rustworkx",
+    "neo4j": "neo4j",
+}
 
 
 @dataclass(frozen=True)
@@ -1761,6 +1797,36 @@ def check_runtime_python_dependencies(*, full_container_runtime: bool, deps: Any
         return True
 
     deps.print_info("Checking runtime Python dependencies...")
+
+    if getattr(sys, "frozen", False):
+        deps.print_info_verbose(
+            "PyInstaller runtime detected; verifying runtime Python dependencies inside the current bundled interpreter."
+        )
+        all_ok = True
+        for import_name, display_name, usage in _RUNTIME_PYTHON_DEPENDENCIES:
+            try:
+                importlib.import_module(import_name)
+            except Exception as exc:  # noqa: BLE001 - import diagnostics must not crash check
+                deps.print_error(
+                    f"Runtime Python dependency '{display_name}' is not importable ({usage})."
+                )
+                deps.print_instruction("Rebuild or update the ADscan runtime image.")
+                deps.print_info_verbose(f"{display_name} import stderr: {exc}")
+                all_ok = False
+                continue
+
+            distribution_name = _RUNTIME_PYTHON_DISTRIBUTION_NAMES.get(
+                import_name, import_name
+            )
+            try:
+                dependency_version = importlib.metadata.version(distribution_name)
+            except importlib.metadata.PackageNotFoundError:
+                dependency_version = ""
+            version_suffix = f" ({dependency_version})" if dependency_version else ""
+            deps.print_success(
+                f"Runtime Python dependency '{display_name}' is importable{version_suffix}."
+            )
+        return all_ok
 
     runtime_python_candidates = [
         "/opt/adscan/venv/bin/python",

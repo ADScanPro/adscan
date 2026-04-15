@@ -463,6 +463,16 @@ def set_telemetry_console(console: Optional[Console]) -> None:
     _telemetry_console = console
 
 
+def is_debug_mode() -> bool:
+    """Return True when debug output mode is active."""
+    return _debug_mode
+
+
+def is_verbose_mode() -> bool:
+    """Return True when verbose output mode is active."""
+    return _verbose_mode
+
+
 def update_modes(
     verbose_mode: Optional[bool] = None,
     debug_mode: Optional[bool] = None,
@@ -4198,8 +4208,8 @@ def create_domains_table(
 
     Example:
         >>> domains_data = {
-        ...     "example.local": {"pdc": "10.0.0.1", "auth": "password"},
-        ...     "test.local": {"pdc": "10.0.0.2", "auth": "hash"}
+        ...     "example.local": {"pdc": "10.0.0.1", "auth": "password", "reachable": True},
+        ...     "test.local": {"pdc": "10.0.0.2", "auth": "hash", "reachable": False}
         ... }
         >>> table = create_domains_table(domains_data)
         >>> console.print(table)
@@ -4208,7 +4218,7 @@ def create_domains_table(
     table.add_column("Domain", style=f"bold {ADSCAN_PRIMARY}", no_wrap=True)
     table.add_column("PDC", style="cyan")
     table.add_column("Auth", justify="center")
-    table.add_column("Users", justify="center")
+    table.add_column("Reachable", justify="center")
 
     for domain, data in domains_data.items():
         pdc = data.get("pdc", "N/A")
@@ -4243,12 +4253,15 @@ def create_domains_table(
         else:
             auth_display = "[dim]○ Unauthenticated[/dim]"
 
-        # Count credentials
-        credentials = data.get("credentials", {})
-        user_count = len(credentials) if credentials else 0
-        user_display = str(user_count) if user_count > 0 else "[dim]0[/dim]"
+        reachable = data.get("reachable")
+        if reachable is True:
+            reachable_display = "[green]✓ Reachable[/green]"
+        elif reachable is False:
+            reachable_display = "[yellow]✗ Unreachable[/yellow]"
+        else:
+            reachable_display = "[dim]? Unknown[/dim]"
 
-        table.add_row(marked_domain, marked_pdc, auth_display, user_display)
+        table.add_row(marked_domain, marked_pdc, auth_display, reachable_display)
 
     return table
 

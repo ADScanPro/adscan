@@ -89,7 +89,7 @@ def build_intro_lines(version_tag: str) -> list[tuple[str, str]]:
     Suitable for both Rich ``console.print`` and Textual ``Static`` widgets.
 
     Args:
-        version_tag: e.g. "7.0.0-lite"
+        version_tag: e.g. "7.1.0-lite"
 
     Returns:
         List of (text, style) tuples.

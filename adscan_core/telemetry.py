@@ -2366,6 +2366,20 @@ def _replace_table_cell(segment: str, data_type: str) -> str:
     return _fit_to_segment(segment, replacement)
 
 
+def _looks_like_plain_text_table_row(line: str, *, min_columns: int) -> bool:
+    """Return whether one line still resembles a plain-text table row.
+
+    This is used by stateful table sanitizers to avoid staying "inside" a table
+    after Rich wrapping/export truncates the expected closing border. We only
+    accept rows that have at least ``min_columns`` non-empty cells separated by
+    runs of two or more spaces, which keeps normal prose/log lines out.
+    """
+    if "│" in line or "┃" in line:
+        return True
+    cells = [cell for cell in re.split(r"\s{2,}", line.strip()) if cell]
+    return len(cells) >= min_columns
+
+
 def _sanitize_by_markers(
     content: str,
     data_types: Optional[set[str]] = None,
@@ -3550,20 +3564,23 @@ def _sanitize_share_tables(content: str) -> str:
         if any(token in line for token in ("┌", "┬", "└", "┴", "├", "┼", "──")):
             continue
 
+        if "│" not in line:
+            in_share_table = False
+            continue
+
         share_replaced = False
         candidate_line = line
-        if "│" in line:
-            segments = line.split("│")
-            interior_indices = [
-                idx_seg
-                for idx_seg in range(1, len(segments) - 1)
-                if segments[idx_seg].strip()
-            ]
-            if len(interior_indices) >= 2:
-                share_idx = interior_indices[1]
-                segments[share_idx] = _replace_table_cell(segments[share_idx], "share")
-                candidate_line = "│".join(segments)
-                share_replaced = True
+        segments = line.split("│")
+        interior_indices = [
+            idx_seg
+            for idx_seg in range(1, len(segments) - 1)
+            if segments[idx_seg].strip()
+        ]
+        if len(interior_indices) >= 2:
+            share_idx = interior_indices[1]
+            segments[share_idx] = _replace_table_cell(segments[share_idx], "share")
+            candidate_line = "│".join(segments)
+            share_replaced = True
 
         raw_tokens = [
             tok for tok in line.replace("│", " ").split() if tok not in ("│", "┃", "──")
@@ -3620,6 +3637,15 @@ def _sanitize_gpp_tables(content: str) -> str:
         if any(token in line for token in ("┌", "┬", "└", "┴", "├", "┼", "──")):
             continue
 
+        if re.fullmatch(r"[\s-]+", line):
+            continue
+
+        if "│" not in line and not _looks_like_plain_text_table_row(
+            line, min_columns=3
+        ):
+            in_gpp_table = False
+            continue
+
         replaced = False
         candidate_line = line
 
@@ -3660,37 +3686,32 @@ def _sanitize_gpp_tables(content: str) -> str:
                         count=1,
                     )
         else:
-            plain_pattern = re.compile(
-                r"(?P<domain>\S+)(\s+)(?P<user>\S+)(\s+)(?P<cred>\S+)",
-                re.IGNORECASE,
-            )
-
-            def _plain_replace(match: re.Match[str]) -> str:
-                domain_value = match.group("domain")
-                user_value = match.group("user")
-                cred_value = match.group("cred")
-                domain_repl = _fit_to_length(
-                    _record_pseudonym(domain_value, "domain"), len(domain_value)
-                )
-                user_repl = _fit_to_length(
-                    _record_pseudonym(user_value, "user"), len(user_value)
-                )
-                cred_repl = _fit_to_length(
-                    _record_pseudonym(cred_value, "password"), len(cred_value)
-                )
-                return (
-                    domain_repl
-                    + match.group(2)
-                    + user_repl
-                    + match.group(4)
-                    + cred_repl
-                )
-
-            candidate_line, replaced = plain_pattern.subn(
-                _plain_replace,
-                line,
-                count=1,
-            )
+            parts = re.split(r"(\s{2,})", line.rstrip("\n"))
+            cell_indices = [
+                index
+                for index in range(0, len(parts), 2)
+                if parts[index].strip()
+            ]
+            if len(cell_indices) >= 3:
+                replacements = ("domain", "user", "password")
+                for cell_index, data_type in zip(cell_indices[:3], replacements):
+                    raw_cell = parts[cell_index]
+                    stripped_cell = raw_cell.strip()
+                    if not stripped_cell:
+                        continue
+                    replacement = _fit_to_length(
+                        _record_pseudonym(stripped_cell, data_type),
+                        len(stripped_cell),
+                    )
+                    leading = len(raw_cell) - len(raw_cell.lstrip(" "))
+                    trailing = len(raw_cell) - len(raw_cell.rstrip(" "))
+                    parts[cell_index] = (
+                        (" " * leading)
+                        + replacement
+                        + (" " * trailing)
+                    )
+                candidate_line = "".join(parts)
+                replaced = True
 
         if replaced:
             lines[idx] = candidate_line

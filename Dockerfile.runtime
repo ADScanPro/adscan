@@ -581,11 +581,12 @@ RUN set -eux; \
     sentry-sdk==2.52.0 \
     packaging==25.0 \
     questionary==2.1.1 \
-    pypsrp==0.9.0 \
+    pypsrp[kerberos]==0.9.0 \
     pydantic-settings==2.13.1 \
     pydantic-ai==1.62.0 \
     certihound==0.3.0 \
     gssapi==1.10.1 \
+    krb5==0.9.0 \
     python-magic==0.4.27 \
     markitdown==0.1.5 \
     credsweeper==${CREDSWEEPER_VERSION} \
@@ -599,7 +600,9 @@ RUN set -eux; \
     pyarrow==21.0.0 \
     rustworkx==0.15.1 \
     selenium==4.31.0 \
-    textual==0.80.1
+    textual==0.80.1; \
+  runtime_python="$(readlink -f /opt/adscan/venv/bin/python)"; \
+  setcap cap_net_bind_service+ep "${runtime_python}"
 
 COPY adscan.py /opt/adscan-src/adscan.py
 COPY adscan_core /opt/adscan-src/adscan_core

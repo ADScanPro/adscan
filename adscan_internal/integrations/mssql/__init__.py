@@ -40,6 +40,7 @@ Example usage:
 """
 
 from .runner import MSSQLRunner, MSSQLContext, ExecutionResult
+from .native_backend import ImpacketMSSQLBackend, NativeMSSQLQueryResult
 from .parsers import (
     parse_whoami_priv_output,
     check_seimpersonate_privilege,
@@ -47,6 +48,12 @@ from .parsers import (
     extract_netexec_mssql_output,
     check_xp_cmdshell_enabled,
     check_xp_cmdshell_disabled,
+    has_authenticated_mssql_access,
+    parse_linked_servers,
+    parse_xp_cmdshell_enable_success,
+    parse_xp_cmdshell_enable_failure_reason,
+    parse_link_xpcmd_execution_success,
+    parse_link_xpcmd_identity,
 )
 from .helpers import (
     build_mssql_auth_string,
@@ -59,6 +66,8 @@ __all__ = [
     "MSSQLRunner",
     "MSSQLContext",
     "ExecutionResult",
+    "ImpacketMSSQLBackend",
+    "NativeMSSQLQueryResult",
     # Parser functions
     "parse_whoami_priv_output",
     "check_seimpersonate_privilege",
@@ -66,6 +75,12 @@ __all__ = [
     "extract_netexec_mssql_output",
     "check_xp_cmdshell_enabled",
     "check_xp_cmdshell_disabled",
+    "has_authenticated_mssql_access",
+    "parse_linked_servers",
+    "parse_xp_cmdshell_enable_success",
+    "parse_xp_cmdshell_enable_failure_reason",
+    "parse_link_xpcmd_execution_success",
+    "parse_link_xpcmd_identity",
     # Helpers
     "build_mssql_auth_string",
     "build_mssql_execute_command",

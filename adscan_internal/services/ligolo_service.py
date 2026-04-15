@@ -42,6 +42,7 @@ from urllib import request as urllib_request
 from typing import Any
 
 from adscan_internal import print_info_debug, print_info_verbose
+from adscan_core.local_bind_address import resolve_first_available_bind_addr
 from adscan_core.linux_capabilities import (
     CAP_NET_BIND_SERVICE_BIT,
     binary_has_capability,
@@ -63,8 +64,13 @@ from adscan_internal.workspaces.io import read_json_file, write_json_file
 
 
 DEFAULT_LIGOLO_PROXY_LISTEN_ADDR = "0.0.0.0:443"
-DEFAULT_LIGOLO_PROXY_API_ADDR = "127.0.0.1:8080"
+DEFAULT_LIGOLO_PROXY_API_ADDR = "127.0.0.1:11601"
 DEFAULT_LIGOLO_PROXY_LISTEN_CANDIDATES = ("0.0.0.0:443", "0.0.0.0:80")
+DEFAULT_LIGOLO_PROXY_API_CANDIDATES = (
+    "127.0.0.1:11601",
+    "127.0.0.1:11602",
+    "127.0.0.1:11603",
+)
 _LIGOLO_PREVIEW_HEAD_LINES = 10
 _LIGOLO_PREVIEW_TAIL_LINES = 10
 _LIGOLO_STOP_WAIT_SECONDS = 5.0
@@ -548,25 +554,21 @@ class LigoloProxyService:
     def resolve_default_listen_addr(self) -> str:
         """Return the best default proxy bind address for Windows egress."""
 
-        conflict_summaries: list[str] = []
-        for candidate in DEFAULT_LIGOLO_PROXY_LISTEN_CANDIDATES:
-            if _is_bind_address_available(candidate):
-                print_info_debug(f"[ligolo] Selected default listen address: {candidate}")
-                return candidate
-            conflict = _inspect_bind_conflict(candidate)
-            if conflict is not None:
-                summary = conflict.render_summary()
-                conflict_summaries.append(summary)
-                print_info_debug(
-                    "[ligolo] Default listen candidate unavailable: "
-                    + str(mark_sensitive(f"{candidate} -> {summary}", "detail"))
-                )
-            else:
-                conflict_summaries.append(f"{candidate} -> busy (listener details unavailable)")
-                print_info_debug(
-                    "[ligolo] Default listen candidate unavailable: "
-                    + str(mark_sensitive(f"{candidate} -> busy (listener details unavailable)", "detail"))
-                )
+        def _emit_candidate_debug(bind_addr: str, summary: str) -> None:
+            print_info_debug(
+                "[ligolo] Default listen candidate unavailable: "
+                + str(mark_sensitive(f"{bind_addr} -> {summary}", "detail"))
+            )
+
+        selected, conflicts = resolve_first_available_bind_addr(
+            candidates=DEFAULT_LIGOLO_PROXY_LISTEN_CANDIDATES,
+            is_bind_addr_available=_is_bind_address_available,
+            inspect_bind_conflict=_inspect_bind_conflict,
+            on_candidate_unavailable=_emit_candidate_debug,
+        )
+        if selected:
+            print_info_debug(f"[ligolo] Selected default listen address: {selected}")
+            return selected
 
         tried = ", ".join(DEFAULT_LIGOLO_PROXY_LISTEN_CANDIDATES)
         host_network_note = ""
@@ -576,13 +578,63 @@ class LigoloProxyService:
                 "also occupy these ports inside the container."
             )
         occupancy_text = ""
-        if conflict_summaries:
-            occupancy_text = " Conflicts: " + "; ".join(conflict_summaries) + "."
+        if conflicts:
+            occupancy_text = " Conflicts: " + "; ".join(
+                f"{item.bind_addr} -> {item.summary}" for item in conflicts
+            ) + "."
         raise RuntimeError(
             "No default ligolo egress port is available. "
             f"Tried: {tried}.{occupancy_text}{host_network_note} "
             "Stop the conflicting listener and retry, or specify a custom listen address explicitly "
             "after verifying that the pivot host can egress to that port."
+        )
+
+    def resolve_default_api_laddr(
+        self,
+        *,
+        excluded_bind_addrs: tuple[str, ...] | list[str] = (),
+    ) -> str:
+        """Return one available loopback API bind address for the local Ligolo Web/API."""
+
+        def _emit_candidate_debug(bind_addr: str, summary: str) -> None:
+            print_info_debug(
+                "[ligolo] Default API candidate unavailable: "
+                + str(mark_sensitive(f"{bind_addr} -> {summary}", "detail"))
+            )
+
+        selected, conflicts = resolve_first_available_bind_addr(
+            candidates=DEFAULT_LIGOLO_PROXY_API_CANDIDATES,
+            excluded_bind_addrs=excluded_bind_addrs,
+            is_bind_addr_available=_is_bind_address_available,
+            inspect_bind_conflict=_inspect_bind_conflict,
+            on_candidate_unavailable=_emit_candidate_debug,
+        )
+        if selected:
+            print_info_debug(f"[ligolo] Selected default API address: {selected}")
+            return selected
+
+        tried = ", ".join(
+            str(candidate).strip()
+            for candidate in DEFAULT_LIGOLO_PROXY_API_CANDIDATES
+            if str(candidate).strip() and str(candidate).strip() not in {
+                str(item).strip() for item in excluded_bind_addrs if str(item).strip()
+            }
+        )
+        host_network_note = ""
+        if os.environ.get("ADSCAN_CONTAINER_RUNTIME") == "1":
+            host_network_note = (
+                " ADscan Docker runtime uses --network host, so listeners on the base host "
+                "also occupy these loopback ports inside the container."
+            )
+        occupancy_text = ""
+        if conflicts:
+            occupancy_text = " Conflicts: " + "; ".join(
+                f"{item.bind_addr} -> {item.summary}" for item in conflicts
+            ) + "."
+        raise RuntimeError(
+            "No default Ligolo API port is available. "
+            f"Tried: {tried or 'none'}.{occupancy_text}{host_network_note} "
+            "Stop the conflicting listener and retry, or specify a custom API listen address explicitly."
         )
 
     def _build_running_state(
@@ -680,8 +732,8 @@ class LigoloProxyService:
     def start_proxy(
         self,
         *,
-        listen_addr: str = DEFAULT_LIGOLO_PROXY_LISTEN_ADDR,
-        api_laddr: str = DEFAULT_LIGOLO_PROXY_API_ADDR,
+        listen_addr: str | None = None,
+        api_laddr: str | None = None,
         selfcert_domain: str = "ligolo",
     ) -> dict[str, Any]:
         """Start the workspace-scoped Ligolo proxy in daemon mode."""
@@ -692,6 +744,8 @@ class LigoloProxyService:
 
         self.ensure_runtime_dir()
         self.validate_proxy_api_contract()
+        listen_addr = str(listen_addr or "").strip() or self.resolve_default_listen_addr()
+        api_laddr = str(api_laddr or "").strip() or self.resolve_default_api_laddr()
         self._assert_bind_permissions_for_listen_addr(listen_addr)
         self._write_managed_config(api_laddr=api_laddr, selfcert_domain=selfcert_domain)
         command = self.build_proxy_command(
@@ -992,6 +1046,7 @@ class LigoloProxyService:
         )
         deadline = time.time() + timeout_seconds
         last_agents: list[dict[str, Any]] = []
+        last_debug_tick = 0.0
         while time.time() < deadline:
             agents = self.list_agents()
             last_agents = agents
@@ -1004,6 +1059,16 @@ class LigoloProxyService:
                         f"remote={agent.get('remote_addr')}"
                     )
                     return agent
+            now = time.time()
+            if now - last_debug_tick >= 5.0:
+                remaining = max(0.0, deadline - now)
+                agent_ids = ", ".join(str(a.get("id")) for a in agents) if agents else "none"
+                print_info_debug(
+                    f"Waiting for Ligolo agent… remaining={remaining:.0f}s "
+                    f"known_sessions={len(known_session_ids)} "
+                    f"current_agents=[{agent_ids}]"
+                )
+                last_debug_tick = now
             time.sleep(1.0)
         observed = ", ".join(
             f"{agent.get('id')}:{agent.get('session_id') or 'unknown'}" for agent in last_agents
@@ -1438,6 +1503,7 @@ class LigoloProxyService:
 
 __all__ = [
     "DEFAULT_LIGOLO_PROXY_API_ADDR",
+    "DEFAULT_LIGOLO_PROXY_API_CANDIDATES",
     "DEFAULT_LIGOLO_PROXY_LISTEN_ADDR",
     "DEFAULT_LIGOLO_PROXY_LISTEN_CANDIDATES",
     "LigoloProxyPaths",

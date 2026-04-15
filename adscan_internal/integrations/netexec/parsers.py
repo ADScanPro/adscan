@@ -286,6 +286,7 @@ class ParsedGppPasswordCredential:
     password: str
     domain: str | None = None
     source_xml: str | None = None
+    is_domain_qualified: bool = False
 
 
 def _parse_gpp_autologin_list(raw_value: str) -> list[str]:
@@ -409,14 +410,20 @@ def parse_netexec_gpp_password_credentials(
         raw_user = str(pending_username).strip()
         domain_value: str | None = None
         username_value = raw_user
+        is_domain_qualified = False
         if "\\" in raw_user:
             domain_part, username_part = raw_user.split("\\", 1)
             domain_value = domain_part.strip() or None
             username_value = username_part.strip()
+            is_domain_qualified = bool(domain_value)
         elif "/" in raw_user:
             domain_part, username_part = raw_user.split("/", 1)
             domain_value = domain_part.strip() or None
             username_value = username_part.strip()
+            is_domain_qualified = bool(domain_value)
+
+        if not is_domain_qualified:
+            username_value = username_value.lstrip("\\/").strip()
 
         if username_value and pending_password:
             parsed.append(
@@ -425,6 +432,7 @@ def parse_netexec_gpp_password_credentials(
                     password=str(pending_password).strip(),
                     domain=domain_value,
                     source_xml=current_source_xml,
+                    is_domain_qualified=is_domain_qualified,
                 )
             )
         pending_password = None
