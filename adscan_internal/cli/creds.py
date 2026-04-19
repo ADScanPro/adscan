@@ -50,6 +50,8 @@ NON_SPRAYABLE_CREDSWEEPER_RULES = {"uuid"}
 UUID_VALUE_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+LAPS_CREDENTIAL_SOURCE_RELATIONS = {"readlapspassword", "synclapspassword"}
+DEFAULT_LOCAL_ADMIN_RID = "500"
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,63 @@ class CredentialPresentationOptions:
 
     confidence_label: str | None = "ML Confidence"
     source_column_label: str = "Path(s)"
+
+
+def _normalize_optional_text(value: object) -> str:
+    """Return a stripped lowercase text value for optional provenance fields."""
+    return str(value or "").strip().lower()
+
+
+def _source_steps_contain_laps_relation(source_steps: list[object] | None) -> bool:
+    """Return whether provenance steps identify a LAPS password-read path."""
+    for step in source_steps or []:
+        relation = _normalize_optional_text(getattr(step, "relation", ""))
+        if relation in LAPS_CREDENTIAL_SOURCE_RELATIONS:
+            return True
+    return False
+
+
+def _source_steps_contain_default_local_admin_rid(
+    source_steps: list[object] | None,
+) -> bool:
+    """Return whether provenance notes carry the default local Administrator RID."""
+    for step in source_steps or []:
+        notes = getattr(step, "notes", None)
+        if not isinstance(notes, dict):
+            continue
+        for key in ("local_account_rid", "account_rid", "rid"):
+            if str(notes.get(key) or "").strip() == DEFAULT_LOCAL_ADMIN_RID:
+                return True
+    return False
+
+
+def _should_prompt_local_reuse_after(
+    *,
+    prompt_local_reuse_after: bool,
+    service: str | None,
+    credential_origin: str | None,
+    local_account_rid: str | None,
+    source_steps: list[object] | None,
+) -> bool:
+    """Decide whether a newly stored local credential should trigger reuse checks.
+
+    LAPS-managed passwords for the built-in local Administrator account are
+    expected to be unique per host, so probing other hosts from that acquisition
+    path creates noisy work and misleading attack-graph edges.
+    """
+    if not prompt_local_reuse_after or _normalize_optional_text(service) != "smb":
+        return False
+
+    origin_is_laps = _normalize_optional_text(
+        credential_origin
+    ) in LAPS_CREDENTIAL_SOURCE_RELATIONS or _source_steps_contain_laps_relation(
+        source_steps
+    )
+    rid_is_default_admin = (
+        str(local_account_rid or "").strip() == DEFAULT_LOCAL_ADMIN_RID
+        or _source_steps_contain_default_local_admin_rid(source_steps)
+    )
+    return not (origin_is_laps and rid_is_default_admin)
 
 
 def normalize_creds_subcommand(subcommand: str) -> tuple[str, bool]:
@@ -1495,6 +1554,8 @@ def add_credential(
     allow_empty_credential: bool = False,
     trusted_manual_validation: bool = False,
     mark_user_compromised: bool = True,
+    credential_origin: str | None = None,
+    local_account_rid: str | None = None,
 ) -> None:
     """Add a credential to the workspace.
 
@@ -1551,6 +1612,11 @@ def add_credential(
             should count as a compromised-user milestone for the current
             session. Manual/import flows such as ``creds save`` must override
             this to False.
+        credential_origin: Optional machine-readable source label for policy
+            decisions, for example ``ReadLAPSPassword``.
+        local_account_rid: Optional RID for local-account credentials. RID 500
+            combined with LAPS provenance suppresses local reuse prompts because
+            LAPS-managed built-in Administrator passwords are per-host secrets.
     """
     from adscan_internal import print_operation_header
     from adscan_internal.services.credential_store_service import (
@@ -1703,7 +1769,13 @@ def add_credential(
 
             if service == "mssql":
                 shell.ask_for_mssql_steal(domain, host, user, cred, "false")
-            elif service == "smb" and prompt_local_reuse_after:
+            elif _should_prompt_local_reuse_after(
+                prompt_local_reuse_after=prompt_local_reuse_after,
+                service=service,
+                credential_origin=credential_origin,
+                local_account_rid=local_account_rid,
+                source_steps=source_steps,
+            ):
                 shell.ask_for_local_cred_reuse(domain, user, cred)
 
             try:

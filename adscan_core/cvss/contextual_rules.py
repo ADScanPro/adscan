@@ -1,22 +1,27 @@
-"""Per-vulnerability CVSS 3.1 vectors and contextual elevation rules.
+"""CVSS 3.1 Base vectors + ADscan contextual risk overlay.
 
-Each entry in ``CVSS_RULES`` maps a vulnerability catalog key to a
-``VulnCvssDefinition`` that carries:
+IMPORTANT
+---------
+- ``cvss_vector`` is ONLY the CVSS v3.1 Base vector.
+- ``elevation_rules`` are ADscan contextual severity overlays for prioritization
+  and reporting. They are NOT CVSS Base metrics.
+- If a finding is primarily posture, attack-graph state, or a chaining
+  prerequisite rather than a clean standalone vulnerability, ``cvss_vector``
+  is set to ``None``. In those cases, use ADscan contextual severity rather
+  than pretending there is a formal Base CVSS.
 
-- The CVSS 3.1 Base vector string (shown in reports and the web UI).
-- An ordered list of ``CvssElevationRule`` objects evaluated against the
-  ``CvssContext`` produced at scan-result ingestion time.
+Why this split matters
+----------------------
+CVSS Base must describe intrinsic characteristics of the vulnerability that are
+stable across environments. Asset criticality (Tier-0, DC, crown jewel),
+confirmed exploitation, and attack-path amplification are environment/threat
+context, not Base CVSS.
 
-Rules are evaluated in declaration order; the **first matching** rule wins.
-This means higher-priority conditions (e.g. Tier-0 targets) must be listed
-before lower-priority ones (e.g. DC targets only).
-
-Vulnerability keys must match the canonical keys used in ``vuln_catalog.py``
-(both the CLI catalog and the web-service catalog).
-
-References:
-- CVSS 3.1 Spec: https://www.first.org/cvss/v3.1/specification-document
-- NVD calculator:  https://nvd.nist.gov/vuln-metrics/cvss/v3-calculator
+References
+----------
+- FIRST CVSS v3.1 specification / user guide
+- FIRST CVSS v4.0 specification / implementation guide
+- NVD / MSRC for concrete CVE vectors
 """
 
 from __future__ import annotations
@@ -33,41 +38,37 @@ from adscan_core.cvss.models import (
 
 @dataclass
 class VulnCvssDefinition:
-    """CVSS metadata and contextual elevation rules for one vulnerability type.
+    """Base CVSS metadata plus ADscan contextual severity rules.
 
     Attributes:
-        cvss_vector: CVSS 3.1 Base Score vector string.  ``None`` for
-            vulnerability types without a formally assigned vector (e.g.
-            detection-only informational findings).
-        elevation_rules: Ordered list of rules; first match wins.
-            May be empty for vulnerabilities whose severity never changes with
-            context (e.g. fixed CVEs like ZeroLogon with score 10.0).
+        cvss_vector:
+            Formal CVSS 3.1 Base vector string, or ``None`` if the finding is
+            not cleanly representable as a standalone Base CVSS issue.
+        elevation_rules:
+            ADscan contextual severity overlays evaluated in declaration order.
+            First match wins. These are NOT part of CVSS Base.
     """
 
     cvss_vector: str | None
     elevation_rules: list[CvssElevationRule] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Contextual elevation rules catalogue
-# Keys must match vuln_catalog.py keys exactly.
-# ---------------------------------------------------------------------------
-
 CVSS_RULES: dict[str, VulnCvssDefinition] = {
     # ------------------------------------------------------------------
-    # Kerberos attacks
+    # Kerberos roasting
     # ------------------------------------------------------------------
     "kerberoast": VulnCvssDefinition(
-        # Base: authenticated user can request TGS, needs offline crack.
-        # Confidentiality = Low (hash exposure, not plaintext yet).
+        # Authenticated attacker can request a TGS and obtain offline-crackable
+        # credential material. Direct impact is limited disclosure, not
+        # guaranteed plaintext compromise.
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.8,
                 reason=(
-                    "Kerberoastable Tier-0 or high-value accounts detected — "
-                    "successful crack directly yields domain-level credential material"
+                    "Kerberoastable Tier-0/high-value accounts detected — "
+                    "successful cracking would expose privileged credentials"
                 ),
             ),
             CvssElevationRule(
@@ -79,98 +80,106 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=7.5,
                 reason=(
-                    "Domain Controller service accounts are Kerberoastable — "
-                    "credential compromise enables DC-level lateral movement"
+                    "Kerberoastable DC-related service accounts detected — "
+                    "credential compromise materially improves DC attack paths"
                 ),
             ),
         ],
     ),
     "asreproast": VulnCvssDefinition(
-        # Base: no pre-auth required, unauthenticated hash capture possible.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+        # Same reasoning as Kerberoast, but PR:N because pre-auth is disabled.
+        # The direct outcome is still offline-crackable credential material,
+        # not guaranteed plaintext compromise.
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.1,
                 reason=(
-                    "AS-REP Roastable Tier-0 accounts detected — unauthenticated "
-                    "hash capture of privileged credentials enables direct domain compromise"
+                    "AS-REP roastable Tier-0/high-value accounts detected — "
+                    "unauthenticated credential material retrieval affects "
+                    "privileged identities"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=8.8,
-                reason="Hash cracking confirmed — plaintext credential of affected account recovered",
+                reason="Hash cracking confirmed — plaintext credential recovered",
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.0,
                 reason=(
-                    "Domain Controller accounts are AS-REP Roastable — "
-                    "credential exposure enables DC authentication without prior access"
+                    "DC-related accounts are AS-REP roastable — "
+                    "unauthenticated credential material retrieval impacts "
+                    "critical identities"
                 ),
             ),
         ],
     ),
+
     # ------------------------------------------------------------------
-    # Delegation attacks
+    # Delegation
     # ------------------------------------------------------------------
     "unconstrained_delegation": VulnCvssDefinition(
-        # Base: compromising host captures TGTs of all authenticating users
-        # including DAs; Scope = Changed (affects other hosts/users).
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:N",
+        # Dangerous posture/attack-path amplifier, but not a clean standalone
+        # CVSS Base issue without modeling an additional foothold on the host.
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
                 reason=(
-                    "Non-DC host with unconstrained delegation is reachable by Tier-0 principals — "
-                    "TGT capture + coercion path yields immediate domain admin"
+                    "Unconstrained delegation reachable by Tier-0 principals — "
+                    "TGT capture path can yield immediate privileged compromise"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.8,
-                reason="TGT capture confirmed — domain takeover via pass-the-ticket is viable",
+                reason="TGT capture confirmed — pass-the-ticket path is viable",
             ),
         ],
     ),
     "constrained_delegation": VulnCvssDefinition(
-        # Base: impersonation limited to specific services, still dangerous if
-        # the allowed service is sensitive.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+        # Similar problem: strong attack-path signal, but the standalone Base
+        # vector is highly dependent on the delegated SPNs and how you reach the
+        # principal that can perform S4U abuse.
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.5,
                 reason=(
-                    "Constrained delegation allows impersonation to a Tier-0 service — "
-                    "effective domain privilege escalation path exists"
+                    "Constrained delegation reaches Tier-0 services — "
+                    "effective privileged impersonation path exists"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.0,
                 reason=(
-                    "Delegation allows impersonation to Domain Controller services — "
-                    "lateral movement to DC is achievable"
+                    "Constrained delegation reaches DC services — "
+                    "effective DC lateral movement path exists"
                 ),
             ),
         ],
     ),
+
     # ------------------------------------------------------------------
     # SMB
     # ------------------------------------------------------------------
     "smb_relay_targets": VulnCvssDefinition(
-        # Base: adjacent-network relay attack; requires capturing auth first.
+        # Relay target posture. Adjacent + High complexity is reasonable in v3.1
+        # because exploitation generally needs MITM/coercion/on-path conditions.
         cvss_vector="CVSS:3.1/AV:A/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "Domain Controllers have SMB signing disabled — "
-                    "NTLM relay to DC enables LDAP privilege escalation or DCSync"
+                    "DCs are relayable SMB targets — relay to DC meaningfully "
+                    "raises privilege-escalation potential"
                 ),
             ),
             CvssElevationRule(
@@ -178,40 +187,40 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 elevated_score=9.0,
                 reason=(
                     "Tier-0 assets are relayable SMB targets — "
-                    "captured authentication yields immediate privileged access"
+                    "captured authentication can yield privileged access"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
-                reason="SMB relay confirmed — authenticated session on target obtained",
+                reason="SMB relay confirmed — authenticated session obtained",
             ),
         ],
     ),
     "smb_null_domain": VulnCvssDefinition(
-        # Base: unauthenticated enumeration of domain info via null session.
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=7.5,
                 reason=(
-                    "Null session accepted on Domain Controllers — "
-                    "unauthenticated domain enumeration exposes credential attack surface"
+                    "Null session accepted on DCs — "
+                    "unauthenticated domain enumeration expands attack surface"
                 ),
             ),
         ],
     ),
     "smb_guest_shares": VulnCvssDefinition(
-        # Base: unauthenticated share access, data exposure without creds.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N",
+        # Model this as read exposure. If you also detect anonymous/guest write,
+        # split that into a separate finding instead of baking I:L here.
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "Domain Controller shares accessible via guest session — "
-                    "SYSVOL/NETLOGON exposure enables GPP and policy credential harvest"
+                    "Guest-accessible shares on DCs materially raise the chance "
+                    "of policy/secrets exposure"
                 ),
             ),
             CvssElevationRule(
@@ -222,138 +231,144 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         ],
     ),
     "smbv1_enabled": VulnCvssDefinition(
-        # Base: deprecated protocol on domain hosts, wormable exposure.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        # SMBv1 enabled is posture, not the CVE itself. Do not pretend it is
+        # equivalent to EternalBlue-class RCE unless you separately detected a
+        # concrete vulnerable build/CVE.
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
-                elevated_score=9.8,
+                elevated_score=8.5,
                 reason=(
-                    "SMBv1 enabled on Domain Controllers — "
-                    "EternalBlue/WannaCry-class exploitation path to DC compromise"
+                    "SMBv1 enabled on DCs — obsolete protocol materially raises "
+                    "legacy remote-exploitation risk"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
-                elevated_score=9.8,
-                reason="SMBv1 enabled on Tier-0 assets — direct exploit path to privileged host",
+                elevated_score=8.5,
+                reason="SMBv1 enabled on Tier-0 assets — legacy exposure on privileged hosts",
             ),
         ],
     ),
     "smb_share_secrets": VulnCvssDefinition(
-        # Base: authenticated access to shares with credential material.
+        # Authenticated exposure of credential material in shares.
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
                 reason=(
-                    "Credentials found in shares belong to or enable access to Tier-0 accounts — "
-                    "direct path to domain compromise"
+                    "Credentials found in shares belong to or enable Tier-0 "
+                    "access — direct privileged path exists"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
-                reason="Exposed credentials successfully verified — confirmed valid account access",
+                reason="Exposed credentials verified — valid account access confirmed",
             ),
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.8,
-                reason="Credential material found on DC-accessible shares",
+                reason="Credential material found in DC-relevant share exposure",
             ),
         ],
     ),
+
     # ------------------------------------------------------------------
     # LDAP
     # ------------------------------------------------------------------
     "ldap_anonymous": VulnCvssDefinition(
-        # Base: unauthenticated LDAP enumeration of directory data.
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=7.5,
                 reason=(
-                    "Anonymous LDAP bind accepted on Domain Controllers — "
-                    "full unauthenticated directory enumeration accelerates credential attacks"
+                    "Anonymous LDAP bind accepted on DCs — "
+                    "directory enumeration is available without authentication"
                 ),
             ),
         ],
     ),
     "ldap_security_posture": VulnCvssDefinition(
-        # Base: unsigned LDAP allows relay to DC — high impact, high complexity.
+        # Signing/channel binding not enforced -> relay posture. This is
+        # defensible as a standalone misconfiguration because the service itself
+        # lacks required integrity protections.
         cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "LDAP signing/channel-binding not enforced on DCs — "
-                    "NTLM relay to LDAP enables ACL modification, DCSync, or shadow credentials"
+                    "LDAP protections not enforced on DCs — "
+                    "relay to LDAP can enable privileged directory operations"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
-                reason="LDAP relay exploitation confirmed — privileged LDAP operations executed",
+                reason="LDAP relay exploitation confirmed",
             ),
         ],
     ),
+
     # ------------------------------------------------------------------
     # GPP
     # ------------------------------------------------------------------
     "gpp_passwords": VulnCvssDefinition(
-        # Base: any domain user can decrypt SYSVOL cpassword field.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+        # Direct issue is credential disclosure to any authenticated domain user.
+        # Do not mark integrity impact in the Base vector just because the
+        # recovered credential might later be used to modify things.
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
                 reason=(
-                    "GPP credentials belong to or grant access to Tier-0 accounts — "
+                    "GPP credentials grant Tier-0 access — "
                     "trivial decryption yields privileged credential material"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
-                reason="GPP credentials decrypted and verified — confirmed valid account access",
+                reason="GPP credentials decrypted and verified",
             ),
         ],
     ),
     "gpp_autologin": VulnCvssDefinition(
-        # Base: autologin creds in SYSVOL, any domain user can retrieve.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
                 reason=(
-                    "GPP autologin credentials enable Tier-0 access — "
-                    "trivial decryption leads to domain privilege escalation"
+                    "Autologin credentials enable Tier-0 access — "
+                    "credential disclosure directly affects privileged identities"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
-                reason="Autologin credentials decrypted and account access confirmed",
+                reason="Autologin credentials decrypted and verified",
             ),
         ],
     ),
+
     # ------------------------------------------------------------------
     # LAPS
     # ------------------------------------------------------------------
     "laps": VulnCvssDefinition(
-        # Base: authenticated user retrieves LAPS password → local admin on host.
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "LAPS password readable for Domain Controllers — "
-                    "direct local admin access to DC bypasses tiered administration"
+                    "LAPS password readable for DCs — "
+                    "direct privileged local access to a DC-equivalent asset"
                 ),
             ),
             CvssElevationRule(
@@ -361,7 +376,7 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 elevated_score=8.8,
                 reason=(
                     "LAPS password readable for Tier-0 hosts — "
-                    "local admin access to privileged systems enables credential harvesting"
+                    "privileged local admin access path exists"
                 ),
             ),
         ],
@@ -373,8 +388,8 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "LAPS attributes readable for Domain Controllers — "
-                    "non-admin principals can retrieve DC local administrator credentials"
+                    "LAPS attributes readable for DCs — "
+                    "non-admin principals can retrieve DC local admin secrets"
                 ),
             ),
             CvssElevationRule(
@@ -382,36 +397,37 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 elevated_score=8.8,
                 reason=(
                     "LAPS attributes readable for Tier-0 assets — "
-                    "privilege escalation path via local admin credential exposure"
+                    "privileged local admin credential exposure"
                 ),
             ),
         ],
     ),
+
     # ------------------------------------------------------------------
-    # Account hygiene / policy
+    # Account hygiene / identity posture
     # ------------------------------------------------------------------
     "password_not_req": VulnCvssDefinition(
-        # Base: accounts may have no password → unauthenticated access possible.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+        # Weak-account posture modeled conservatively as low C/I impact.
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.5,
                 reason=(
-                    "Tier-0 accounts have no password required — "
-                    "unauthenticated access to privileged accounts is possible"
+                    "Tier-0 accounts do not require a password — "
+                    "privileged account takeover risk is extreme"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=8.5,
-                reason="Empty-password Tier-0 account access confirmed",
+                reason="Empty-password account access confirmed",
             ),
         ],
     ),
     "password_never_expires": VulnCvssDefinition(
-        # Base: informational/hygiene; increases credential-theft probability.
-        cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+        # Exposure posture only; do not force a formal Base CVSS.
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
@@ -424,147 +440,157 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         ],
     ),
     "stale_enabled_users": VulnCvssDefinition(
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.0,
                 reason=(
-                    "Stale enabled accounts are Tier-0 or high-value identities — "
-                    "dormant privileged accounts significantly increase attack surface"
+                    "Dormant enabled accounts include Tier-0/high-value identities"
                 ),
             ),
         ],
     ),
     "tier0_highvalue_sprawl": VulnCvssDefinition(
-        # Base: identity sprawl finding — always about Tier-0 by definition.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+        cvss_vector=None,
         elevation_rules=[
-            # Exploitation confirmation is the only meaningful escalation here.
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=8.5,
                 reason=(
-                    "Confirmed exploitation path leverages Tier-0 identity sprawl — "
-                    "excess privileged accounts directly enabled the attack"
+                    "Confirmed attack path was enabled by privileged identity sprawl"
                 ),
             ),
         ],
     ),
+
     # ------------------------------------------------------------------
-    # Privilege / sessions
+    # Sessions / compromise state
     # ------------------------------------------------------------------
     "da_sessions": VulnCvssDefinition(
-        # Base: DA sessions on workstations allow credential harvest.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+        # This is an exposure/attack-path state, not a clean standalone CVSS
+        # vulnerability.
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.5,
-                reason="DA session on endpoint actively harvested — domain credential confirmed",
+                reason="DA session actively harvested — privileged credential confirmed",
             ),
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.0,
                 reason=(
-                    "Domain Admin sessions present on hosts that are Tier-0 or "
-                    "have Tier-0 attack paths — session harvest yields immediate DA"
+                    "DA sessions present on hosts with privileged attack paths"
                 ),
             ),
         ],
     ),
     "krbtgt_pass": VulnCvssDefinition(
-        # Already critical — no elevation needed. Vector shown for transparency.
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+        # Ambiguous catalog key. If this means "KRBTGT secret recovered", that is
+        # a confirmed compromise state, not CVSS. If it means "KRBTGT password
+        # hygiene issue", it is posture. Split the catalog key later if needed.
+        cvss_vector=None,
         elevation_rules=[],
     ),
+
     # ------------------------------------------------------------------
-    # CVEs — fixed NVD scores, no contextual elevation.
-    # Vectors sourced from NVD / MSRC advisories.
+    # Concrete CVEs / vendor-scored issues
     # ------------------------------------------------------------------
     "zerologon": VulnCvssDefinition(
+        # NVD official CVSS 3.1
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
         elevation_rules=[],
     ),
     "nopac": VulnCvssDefinition(
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+        # Composite attack name, not a single CVE. Split into the underlying
+        # CVEs (e.g. 42278 / 42287) if you want formal CVSS.
+        cvss_vector=None,
         elevation_rules=[],
     ),
     "printnightmare": VulnCvssDefinition(
+        # Microsoft/NVD 8.8
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
         elevation_rules=[],
     ),
     "ms17-010": VulnCvssDefinition(
-        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        # Bulletin/rollup label rather than a single CVE. Prefer exact CVE keys
+        # if you want formal vendor/NVD vectors.
+        cvss_vector=None,
         elevation_rules=[],
     ),
+
+    # ------------------------------------------------------------------
+    # Coercion / chain prerequisites
+    # ------------------------------------------------------------------
     "petitpotam": VulnCvssDefinition(
-        # Authentication coercion; actual impact depends on what it's chained with.
-        cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N",
+        # Authentication coercion primitive. Direct impact depends on the relay
+        # target and environment; model as attack-path risk, not Base CVSS.
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "PetitPotam coercion path targets Domain Controllers — "
-                    "NTLM relay to ADCS or LDAP enables domain compromise"
+                    "Coercion path reaches DC-related relay targets — "
+                    "domain-impacting relay chain is plausible"
                 ),
             ),
         ],
     ),
     "dfscoerce": VulnCvssDefinition(
-        cvss_vector="CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:N",
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "DFSCoerce coercion path targets Domain Controllers — "
-                    "NTLM relay chain to DC enables domain takeover"
+                    "DFSCoerce path reaches DC-related relay targets"
                 ),
             ),
         ],
     ),
     "mseven": VulnCvssDefinition(
-        cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N",
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=9.0,
                 reason=(
-                    "MS-EFSRPC coercion path targets Domain Controllers — "
-                    "relay chain to DC enables privilege escalation"
+                    "MS-EFSRPC coercion path reaches DC-related relay targets"
                 ),
             ),
         ],
     ),
     "printerbug": VulnCvssDefinition(
-        cvss_vector="CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:N",
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.8,
                 reason=(
-                    "PrinterBug coercion path targets Domain Controllers — "
-                    "DC authentication coercion enables relay attacks"
+                    "PrinterBug coercion path reaches DC-related relay targets"
                 ),
             ),
         ],
     ),
     "webdav": VulnCvssDefinition(
-        cvss_vector="CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:N/A:N",
+        # WebDAV enabled is a chain helper / coercion surface, not a formal Base
+        # CVSS issue by itself.
+        cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.0,
                 reason=(
-                    "WebDAV enabled on Domain Controllers — "
-                    "coercion chain via WebDAV enables NTLM relay to DC services"
+                    "WebDAV on DC-related assets increases relay/coercion path viability"
                 ),
             ),
         ],
     ),
+
     "certifried": VulnCvssDefinition(
+        # Microsoft/NVD 8.8
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
         elevation_rules=[],
     ),
@@ -572,12 +598,4 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
 
 
 def get_vuln_cvss_definition(vuln_key: str) -> VulnCvssDefinition | None:
-    """Return the CVSS definition for *vuln_key*, or ``None`` if not defined.
-
-    Args:
-        vuln_key: Canonical vulnerability catalog key (e.g. ``"kerberoast"``).
-
-    Returns:
-        ``VulnCvssDefinition`` or ``None``.
-    """
     return CVSS_RULES.get(vuln_key)

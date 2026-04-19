@@ -213,8 +213,12 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
 
 def _is_adscan_managed_logon_script_path(path_value: str) -> bool:
     """Return whether one scriptPath value points to an ADscan-managed artifact."""
-    basename = os.path.basename(str(path_value or "").replace("\\", "/")).strip().lower()
-    return bool(basename) and basename.startswith("adscan-") and basename.endswith(".bat")
+    basename = (
+        os.path.basename(str(path_value or "").replace("\\", "/")).strip().lower()
+    )
+    return (
+        bool(basename) and basename.startswith("adscan-") and basename.endswith(".bat")
+    )
 
 
 def _join_smb_path(directory_path: str, filename: str) -> str:
@@ -228,7 +232,9 @@ def _join_smb_path(directory_path: str, filename: str) -> str:
     return f"{dir_clean}\\{file_clean}"
 
 
-def _get_pending_writelogonscript_manual_validations(shell: Any) -> list[dict[str, Any]]:
+def _get_pending_writelogonscript_manual_validations(
+    shell: Any,
+) -> list[dict[str, Any]]:
     """Return the mutable in-memory list of pending manual validations."""
     existing = getattr(shell, "_pending_writelogonscript_manual_validations", None)
     if isinstance(existing, list):
@@ -594,23 +600,31 @@ def persist_attack_path_snapshot(
         for index, summary in enumerate(summaries, start=1):
             if not isinstance(summary, dict):
                 continue
-            nodes = summary.get("nodes") if isinstance(summary.get("nodes"), list) else []
+            nodes = (
+                summary.get("nodes") if isinstance(summary.get("nodes"), list) else []
+            )
             relations = (
                 summary.get("relations")
                 if isinstance(summary.get("relations"), list)
                 else []
             )
-            steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
+            steps = (
+                summary.get("steps") if isinstance(summary.get("steps"), list) else []
+            )
             snapshot_paths.append(
                 {
-                    "id": str(summary.get("id") or f"{scope}:{index}:{summary.get('source')}->{summary.get('target')}"),
+                    "id": str(
+                        summary.get("id")
+                        or f"{scope}:{index}:{summary.get('source')}->{summary.get('target')}"
+                    ),
                     "index": index,
                     "source": str(summary.get("source") or ""),
                     "target": str(summary.get("target") or ""),
                     "length": int(summary.get("length") or 0),
                     "status": str(summary.get("status") or "theoretical"),
                     "is_high_value": bool(summary.get("target_is_high_value")),
-                    "is_tier_zero": _summary_target_priority_class(summary) == "tierzero",
+                    "is_tier_zero": _summary_target_priority_class(summary)
+                    == "tierzero",
                     "target_priority_class": _summary_target_priority_class(summary),
                     "nodes": [str(node or "") for node in nodes],
                     "relations": [str(relation or "") for relation in relations],
@@ -725,9 +739,7 @@ def _record_attack_path_execution_event(
                 else None
             ),
             "last_executable_idx": (
-                int(last_executable_idx)
-                if last_executable_idx is not None
-                else None
+                int(last_executable_idx) if last_executable_idx is not None else None
             ),
             "action": str(action or "").strip() or None,
             "from": str(from_label or "").strip() or None,
@@ -738,7 +750,9 @@ def _record_attack_path_execution_event(
             "target_host": str(target_host or "").strip() or None,
             "search_mode_label": str(search_mode_label or "").strip() or None,
         }
-        details = {key: value for key, value in details.items() if value not in {None, ""}}
+        details = {
+            key: value for key, value in details.items() if value not in {None, ""}
+        }
         record_technical_event(
             shell,
             domain,
@@ -756,6 +770,7 @@ _AUTO_REFRESH_AFFECTED_USERS_THRESHOLD = _env_int(
     150,
     minimum=0,
 )
+
 
 def _affected_user_count(summary: dict[str, Any]) -> int:
     """Return affected principal count (users + computers) from summary metadata.
@@ -800,7 +815,9 @@ def _get_stored_credential_map(shell: Any, domain: str) -> dict[str, str]:
     return normalized
 
 
-def _first_execution_readiness_step(summary: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+def _first_execution_readiness_step(
+    summary: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
     """Return the first path step that gates whether execution can start."""
     steps = summary.get("steps")
     if not isinstance(steps, list):
@@ -937,12 +954,14 @@ def _execution_readiness_meta(
                 target_kind = str(kind[0])
             elif isinstance(kind, str):
                 target_kind = kind
-            target_enabled, target_enabled_source = infer_directory_object_enabled_state(
-                shell,
-                domain=domain,
-                principal_name=to_label,
-                principal_kind=target_kind,
-                node=to_node,
+            target_enabled, target_enabled_source = (
+                infer_directory_object_enabled_state(
+                    shell,
+                    domain=domain,
+                    principal_name=to_label,
+                    principal_kind=target_kind,
+                    node=to_node,
+                )
             )
             if str(target_kind or "").strip().lower() == "computer":
                 target_viability = assess_computer_target_viability(
@@ -1002,9 +1021,7 @@ def _execution_readiness_meta(
         support_reason = ""
         if target_enabled is False:
             blocked_reason = "target_computer_disabled"
-            support_reason = (
-                "Host-bound execution is blocked because the target computer is disabled."
-            )
+            support_reason = "Host-bound execution is blocked because the target computer is disabled."
         elif target_viability_status == "resolved_but_unreachable":
             blocked_reason = "target_computer_unreachable_from_current_vantage"
             support_reason = (
@@ -1076,15 +1093,15 @@ def _execution_readiness_meta(
             "execution_candidate_count": 1,
             "execution_candidate_source": "context_username",
             "execution_readiness_reason": (
-                "context_username"
-                if ready
-                else "context_username_missing_credential"
+                "context_username" if ready else "context_username_missing_credential"
             ),
             "execution_context_action": action,
         }
 
     normalized_from_user = _normalize_account(from_label)
-    from_node = get_node_by_label(shell, domain, label=from_label) if from_label else None
+    from_node = (
+        get_node_by_label(shell, domain, label=from_label) if from_label else None
+    )
     from_kind = ""
     if isinstance(from_node, dict):
         kind = from_node.get("kind") or from_node.get("labels") or from_node.get("type")
@@ -1161,12 +1178,12 @@ def _execution_readiness_meta(
             "execution_target_reachable": target_reachable,
             "execution_target_reachable_source": target_reachable_source,
             "execution_target_resolved": target_resolved,
-        "execution_target_matched_ips": list(target_matched_ips),
-        "execution_target_vantage_mode": target_vantage_mode,
-        "execution_target_execution_advisory": target_execution_advisory,
-        "execution_target_access_requirement": target_access_requirement,
-        "execution_target_label": to_label,
-        "execution_ready_count": len(ready_users),
+            "execution_target_matched_ips": list(target_matched_ips),
+            "execution_target_vantage_mode": target_vantage_mode,
+            "execution_target_execution_advisory": target_execution_advisory,
+            "execution_target_access_requirement": target_access_requirement,
+            "execution_target_label": to_label,
+            "execution_ready_count": len(ready_users),
             "execution_candidate_count": affected_count or len(affected_users),
             "execution_candidate_source": "affected_users",
             "execution_readiness_reason": (
@@ -1301,7 +1318,9 @@ def _execution_block_message(meta: dict[str, Any]) -> tuple[str, str]:
     """Return user-visible warning and debug reason for one blocked execution summary."""
     support_reason = str(meta.get("execution_support_reason") or "").strip()
     readiness_reason = str(meta.get("execution_readiness_reason") or "").strip()
-    viability_summary = str(meta.get("execution_target_viability_summary") or "").strip()
+    viability_summary = str(
+        meta.get("execution_target_viability_summary") or ""
+    ).strip()
     if support_reason:
         return support_reason, readiness_reason or "execution_blocked"
     if viability_summary:
@@ -1685,16 +1704,21 @@ def _resolve_attack_path_start_step(
                 "Use ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS=1 or choose a custom "
                 "start step to force re-execution."
             )
-            return first_executable_idx if Confirm.ask(
-                "This path has no fresh executable steps left. Re-run from the first step?",
-                default=False,
-            ) else None
+            return (
+                first_executable_idx
+                if Confirm.ask(
+                    "This path has no fresh executable steps left. Re-run from the first step?",
+                    default=False,
+                )
+                else None
+            )
 
         options = [
             "Skip execution (Recommended)",
             f"Re-run from step #{first_executable_idx}",
-            "Choose custom start step",
         ]
+        if len(executable_indices) > 1:
+            options.append("Choose custom start step")
         choice = shell._questionary_select(
             "This path has no fresh executable steps left. What do you want to do?",
             options,
@@ -1725,16 +1749,21 @@ def _resolve_attack_path_start_step(
                 "Set ADSCAN_ATTACK_PATH_RERUN_SUCCESS_STEPS=1 to force re-execution "
                 "from the first step."
             )
-            return first_executable_idx if Confirm.ask(
-                "All executable steps are already successful. Re-run from the first step?",
-                default=False,
-            ) else None
+            return (
+                first_executable_idx
+                if Confirm.ask(
+                    "All executable steps are already successful. Re-run from the first step?",
+                    default=False,
+                )
+                else None
+            )
 
         options = [
             "Skip execution (Recommended)",
             f"Re-run from step #{first_executable_idx}",
-            "Choose custom start step",
         ]
+        if len(executable_indices) > 1:
+            options.append("Choose custom start step")
         choice = shell._questionary_select(
             "All executable steps are already successful. What do you want to do?",
             options,
@@ -1759,18 +1788,12 @@ def _resolve_attack_path_start_step(
         return default_start_idx
 
     resume_label = (
-        "first pending step"
-        if first_pending_idx is not None
-        else "first required step"
+        "first pending step" if first_pending_idx is not None else "first required step"
     )
 
     if not hasattr(shell, "_questionary_select"):
-        print_info(
-            f"Resuming from step #{default_start_idx} ({resume_label})."
-        )
-        print_info_verbose(
-            f"Skipping {completed_steps} previously successful step(s)."
-        )
+        print_info(f"Resuming from step #{default_start_idx} ({resume_label}).")
+        print_info_verbose(f"Skipping {completed_steps} previously successful step(s).")
         return default_start_idx
 
     options = [
@@ -1787,9 +1810,7 @@ def _resolve_attack_path_start_step(
     if choice is None or choice >= len(options) - 1:
         return None
     if choice == 0:
-        print_info(
-            f"Resuming from step #{default_start_idx} ({resume_label})."
-        )
+        print_info(f"Resuming from step #{default_start_idx} ({resume_label}).")
         return default_start_idx
     if choice == 1:
         return first_executable_idx
@@ -2174,7 +2195,9 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     return value
 
 
-def _resolve_default_domain_controller(domain_data: dict[str, Any], domain: str) -> str | None:
+def _resolve_default_domain_controller(
+    domain_data: dict[str, Any], domain: str
+) -> str | None:
     """Return the preferred DC target for SMB-backed execution helpers."""
     dc_fqdn = domain_data.get("pdc_hostname_fqdn") or domain_data.get("pdc_fqdn")
     if isinstance(dc_fqdn, str) and dc_fqdn.strip():
@@ -2289,7 +2312,9 @@ def _execute_writelogonscript_precheck(
             "blocked",
             {"reason": "no_usable_execution_context"},
         )
-    password = context_password or _resolve_domain_password(shell, domain, exec_username)
+    password = context_password or _resolve_domain_password(
+        shell, domain, exec_username
+    )
     if not password:
         return (
             "blocked",
@@ -2305,7 +2330,11 @@ def _execute_writelogonscript_precheck(
         if isinstance(domains_data, dict) and isinstance(domains_data.get(domain), dict)
         else {}
     )
-    target_host = str(details.get("host") or "").strip() or _resolve_default_domain_controller(domain_data, domain) or ""
+    target_host = (
+        str(details.get("host") or "").strip()
+        or _resolve_default_domain_controller(domain_data, domain)
+        or ""
+    )
     if not target_host:
         return ("failed", {"reason": "missing_target_host"})
 
@@ -2378,7 +2407,8 @@ def _execute_writelogonscript_precheck(
                 "name": str(candidate.get("name") or ""),
                 "share": share_name,
                 "path": directory_path,
-                "validation": str(candidate.get("validation") or "").strip().lower() or "runtime",
+                "validation": str(candidate.get("validation") or "").strip().lower()
+                or "runtime",
                 "success": probe_result.success,
                 "status_code": probe_result.status_code or "",
                 "error": probe_result.error_message or "",
@@ -2392,7 +2422,9 @@ def _execute_writelogonscript_precheck(
                     "target_host": target_host,
                     "share": share_name,
                     "path": directory_path,
-                    "selected_staging_candidate": str(candidate.get("name") or share_name),
+                    "selected_staging_candidate": str(
+                        candidate.get("name") or share_name
+                    ),
                     "probe_path": probe_result.probed_file_path,
                     "auth_mode": probe_result.auth_mode,
                     "netlogon_write_confirmed": True,
@@ -2497,7 +2529,9 @@ def _execute_writelogonscript_force_change_password_strategy(
         summary=summary,
         from_label=from_label,
     )
-    password = context_password or _resolve_domain_password(shell, domain, exec_username)
+    password = context_password or _resolve_domain_password(
+        shell, domain, exec_username
+    )
     if not exec_username or not password:
         return (
             "blocked",
@@ -2507,11 +2541,15 @@ def _execute_writelogonscript_force_change_password_strategy(
             },
         )
 
-    target_host = str(precheck_notes.get("target_host") or details.get("host") or "").strip()
+    target_host = str(
+        precheck_notes.get("target_host") or details.get("host") or ""
+    ).strip()
     if not target_host:
         return ("failed", {"reason": "missing_target_host"})
 
-    target_object = str(details.get("target_dn") or "").strip() or _extract_account_name_from_label(to_label)
+    target_object = str(
+        details.get("target_dn") or ""
+    ).strip() or _extract_account_name_from_label(to_label)
     next_target_label = str(strategy.get("target_user_label") or "").strip()
     next_target_user = _extract_account_name_from_label(next_target_label)
     if not target_object or not next_target_user:
@@ -2590,13 +2628,17 @@ def _execute_writelogonscript_force_change_password_strategy(
         timeout=180,
     )
     if get_attrs_result.success:
-        previous_script_path = str(get_attrs_result.attributes.get("scriptPath") or "").strip()
+        previous_script_path = str(
+            get_attrs_result.attributes.get("scriptPath") or ""
+        ).strip()
         previous_script_path_readable = True
     previous_script_path_original = previous_script_path
     stale_managed_script_path = ""
     stale_managed_script_deleted = False
     stale_managed_script_delete_error = ""
-    if previous_script_path_readable and _is_adscan_managed_logon_script_path(previous_script_path):
+    if previous_script_path_readable and _is_adscan_managed_logon_script_path(
+        previous_script_path
+    ):
         stale_managed_script_path = previous_script_path
         previous_script_path = ""
         print_warning(
@@ -2611,8 +2653,12 @@ def _execute_writelogonscript_force_change_password_strategy(
     if _is_audit_mode(shell):
         marked_target = mark_sensitive(to_label, "user")
         marked_executor = mark_sensitive(exec_username, "user")
-        marked_next_target = mark_sensitive(next_target_label or next_target_user, "user")
-        marked_share = mark_sensitive(str(precheck_notes.get("share") or "NETLOGON"), "text")
+        marked_next_target = mark_sensitive(
+            next_target_label or next_target_user, "user"
+        )
+        marked_share = mark_sensitive(
+            str(precheck_notes.get("share") or "NETLOGON"), "text"
+        )
         marked_path = mark_sensitive(str(precheck_notes.get("path") or "\\"), "path")
         cleanup_notes: list[str] = []
         if stale_managed_script_path:
@@ -2659,16 +2705,25 @@ def _execute_writelogonscript_force_change_password_strategy(
             print_info_debug(
                 "[writelogonscript] non-interactive audit execution defaulted to 'No' for disruptive staging"
             )
-            return ("blocked", {"reason": "operator_cancelled_disruptive_writelogonscript"})
+            return (
+                "blocked",
+                {"reason": "operator_cancelled_disruptive_writelogonscript"},
+            )
         if not Confirm.ask("Proceed with WriteLogonScript staging?", default=False):
-            return ("blocked", {"reason": "operator_cancelled_disruptive_writelogonscript"})
+            return (
+                "blocked",
+                {"reason": "operator_cancelled_disruptive_writelogonscript"},
+            )
 
     upload_service = SMBPathAccessService()
     if stale_managed_script_path:
         stale_delete_result = upload_service.delete_file(
             target_host=target_host,
-            share_name=str(precheck_notes.get("share") or "NETLOGON").strip() or "NETLOGON",
-            file_path=_join_smb_path(str(precheck_notes.get("path") or "").strip(), stale_managed_script_path),
+            share_name=str(precheck_notes.get("share") or "NETLOGON").strip()
+            or "NETLOGON",
+            file_path=_join_smb_path(
+                str(precheck_notes.get("path") or "").strip(), stale_managed_script_path
+            ),
             username=str(exec_username),
             password=password,
             auth_domain=str(domain),
@@ -2676,7 +2731,9 @@ def _execute_writelogonscript_force_change_password_strategy(
             kdc_host=target_host if use_kerberos else None,
         )
         stale_managed_script_deleted = bool(stale_delete_result.success)
-        stale_managed_script_delete_error = str(stale_delete_result.error_message or "").strip()
+        stale_managed_script_delete_error = str(
+            stale_delete_result.error_message or ""
+        ).strip()
         if stale_managed_script_deleted:
             print_info(
                 "WriteLogonScript removed the stale ADscan-managed payload before staging the new one."
@@ -2760,7 +2817,9 @@ def _execute_writelogonscript_force_change_password_strategy(
             "stale_managed_script_delete_error": stale_managed_script_delete_error,
             "scriptpath_updated": True,
             "next_step_index": int(strategy.get("next_step_index") or -1),
-            "next_step_action": str(strategy.get("next_action") or "ForceChangePassword"),
+            "next_step_action": str(
+                strategy.get("next_action") or "ForceChangePassword"
+            ),
             "next_step_target_user": next_target_user,
             "chained_step_index": int(strategy.get("chained_step_index") or -1),
             "chained_step_action": str(
@@ -2770,12 +2829,16 @@ def _execute_writelogonscript_force_change_password_strategy(
                 strategy.get("chained_step_from_label") or to_label or ""
             ),
             "chained_step_to_label": str(
-                strategy.get("chained_step_to_label") or strategy.get("target_user_label") or ""
+                strategy.get("chained_step_to_label")
+                or strategy.get("target_user_label")
+                or ""
             ),
             "generated_password": selected_password,
             "target_login_required": True,
             "auth_mode": upload_result.auth_mode,
-            "selected_staging_candidate": str(precheck_notes.get("selected_staging_candidate") or ""),
+            "selected_staging_candidate": str(
+                precheck_notes.get("selected_staging_candidate") or ""
+            ),
             "cleanup_pending": True,
         },
     )
@@ -2858,7 +2921,9 @@ def _poll_writelogonscript_followup_credential(
     marked_domain = mark_sensitive(domain, "domain")
     marked_from = mark_sensitive(from_label, "user")
     marked_to = mark_sensitive(to_label, "user")
-    step_count = len(summary.get("steps", [])) if isinstance(summary.get("steps"), list) else 0
+    step_count = (
+        len(summary.get("steps", [])) if isinstance(summary.get("steps"), list) else 0
+    )
     print_info(
         "WriteLogonScript validation started: polling LDAP for "
         f"{marked_target_user}@{marked_domain} for up to {initial_wait_seconds}s."
@@ -3009,7 +3074,10 @@ def _attempt_writelogonscript_cleanup_if_ready(
         details = step.get("details") if isinstance(step.get("details"), dict) else {}
         if not bool(details.get("cleanup_pending")):
             continue
-        if str(details.get("payload_strategy") or "").strip().lower() != "force_change_password":
+        if (
+            str(details.get("payload_strategy") or "").strip().lower()
+            != "force_change_password"
+        ):
             continue
 
         next_target_user = str(details.get("next_step_target_user") or "").strip()
@@ -3043,14 +3111,23 @@ def _attempt_writelogonscript_cleanup_if_ready(
             domain=domain,
             username=cleanup_user,
             credential=cleanup_password or "",
-            domain_data=cleanup_domain_data if isinstance(cleanup_domain_data, dict) else {},
+            domain_data=cleanup_domain_data
+            if isinstance(cleanup_domain_data, dict)
+            else {},
         )
 
         cleanup_notes = dict(details)
         cleanup_notes["cleanup_checked_at"] = datetime.now(UTC).isoformat()
         cleanup_notes["cleanup_trigger_user"] = next_target_user
 
-        if not cleanup_user or not cleanup_password or not target_host or not share_name or not uploaded_file_path or not target_object:
+        if (
+            not cleanup_user
+            or not cleanup_password
+            or not target_host
+            or not share_name
+            or not uploaded_file_path
+            or not target_object
+        ):
             cleanup_notes.update(
                 {
                     "cleanup_status": "failed",
@@ -3105,9 +3182,13 @@ def _attempt_writelogonscript_cleanup_if_ready(
                 timeout=180,
             )
             revert_success = bool(revert_result.success)
-            revert_error = str(revert_result.error_message or revert_result.raw_output or "").strip()
+            revert_error = str(
+                revert_result.error_message or revert_result.raw_output or ""
+            ).strip()
         else:
-            revert_error = "Original scriptPath value was not captured; automatic revert skipped."
+            revert_error = (
+                "Original scriptPath value was not captured; automatic revert skipped."
+            )
 
         cleanup_ok = bool(delete_result.success and revert_success)
         cleanup_notes.update(
@@ -3290,7 +3371,9 @@ def _resolve_hassession_host_and_user(
     from_target = resolve_netexec_target_for_node_label(
         shell, domain, node_label=from_label
     )
-    to_target = resolve_netexec_target_for_node_label(shell, domain, node_label=to_label)
+    to_target = resolve_netexec_target_for_node_label(
+        shell, domain, node_label=to_label
+    )
     from_user = _normalize_account(from_label)
     to_user = _normalize_account(to_label)
 
@@ -3436,8 +3519,7 @@ def _select_candidate_executor_user(
         return candidates[0][0]
 
     options = [
-        f"{mark_sensitive(user, 'user')}  [{reason}]"
-        for user, reason in candidates
+        f"{mark_sensitive(user, 'user')}  [{reason}]" for user, reason in candidates
     ]
     options.append("Cancel")
     selected = shell._questionary_select(
@@ -3552,8 +3634,10 @@ def _resolve_hassession_execution_user(
         )
         if password:
             reason_map = {user: reason for user, reason in candidates}
-            return selected_user, password, reason_map.get(
-                selected_user, "previous_host_access"
+            return (
+                selected_user,
+                password,
+                reason_map.get(selected_user, "previous_host_access"),
             )
 
     exec_username = _resolve_execution_user(
@@ -3716,7 +3800,9 @@ def _attempt_post_adminto_credential_harvest(
     This is a best-effort optimization for mixed paths such as:
     ``... -> AdminTo -> COMPUTER$ -> GoldenCert -> Domain``.
     """
-    if str(os.getenv("ADSCAN_ATTACK_PATH_POST_ADMINTO_HARVEST", "1")).strip().lower() not in {
+    if str(
+        os.getenv("ADSCAN_ATTACK_PATH_POST_ADMINTO_HARVEST", "1")
+    ).strip().lower() not in {
         "1",
         "true",
         "yes",
@@ -3735,7 +3821,11 @@ def _attempt_post_adminto_credential_harvest(
     if golden_status == "success":
         return
 
-    details = golden_step.get("details") if isinstance(golden_step.get("details"), dict) else {}
+    details = (
+        golden_step.get("details")
+        if isinstance(golden_step.get("details"), dict)
+        else {}
+    )
     golden_from_label = str(details.get("from") or "").strip()
     if not golden_from_label:
         return
@@ -3782,9 +3872,7 @@ def _attempt_post_adminto_credential_harvest(
                 dump_lsa(domain, exec_username, exec_password, host_target, "false")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            print_info_debug(
-                f"[attack_path] Post-AdminTo LSA harvest failed: {exc}"
-            )
+            print_info_debug(f"[attack_path] Post-AdminTo LSA harvest failed: {exc}")
 
     if _resolve_domain_password(shell, domain, golden_exec_user):
         marked_user = mark_sensitive(golden_exec_user, "user")
@@ -3799,9 +3887,7 @@ def _attempt_post_adminto_credential_harvest(
             dump_dpapi(domain, exec_username, exec_password, host_target, "false")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            print_info_debug(
-                f"[attack_path] Post-AdminTo DPAPI harvest failed: {exc}"
-            )
+            print_info_debug(f"[attack_path] Post-AdminTo DPAPI harvest failed: {exc}")
 
     if _resolve_domain_password(shell, domain, golden_exec_user):
         marked_user = mark_sensitive(golden_exec_user, "user")
@@ -4271,7 +4357,10 @@ def execute_selected_attack_path(
 
             if not isinstance(outcome, dict):
                 return
-            if str(outcome.get("key") or "").strip().lower() != "user_credential_obtained":
+            if (
+                str(outcome.get("key") or "").strip().lower()
+                != "user_credential_obtained"
+            ):
                 return
 
             compromised_user = _normalize_account(
@@ -4902,7 +4991,9 @@ def execute_selected_attack_path(
                         from_label=from_label,
                         to_label=to_label,
                         step_status="blocked",
-                        reason=str(probe_notes.get("reason") or "no_usable_execution_context"),
+                        reason=str(
+                            probe_notes.get("reason") or "no_usable_execution_context"
+                        ),
                         actor=str(probe_notes.get("user") or ""),
                     )
                     print_warning(
@@ -4925,7 +5016,9 @@ def execute_selected_attack_path(
                         to_label=to_label,
                         step_status="failed",
                         actor=str(probe_notes.get("user") or ""),
-                        reason=str(probe_notes.get("reason") or "netlogon_write_probe_failed"),
+                        reason=str(
+                            probe_notes.get("reason") or "netlogon_write_probe_failed"
+                        ),
                     )
                     print_warning(
                         f"{action} precheck failed: could not upload a benign probe file to any supported staging share."
@@ -4947,19 +5040,23 @@ def execute_selected_attack_path(
                     to_label=to_label,
                     step_status="attempted",
                     actor=str(probe_notes.get("user") or ""),
-                    reason=str(probe_notes.get("reason") or "netlogon_write_probe_succeeded"),
+                    reason=str(
+                        probe_notes.get("reason") or "netlogon_write_probe_succeeded"
+                    ),
                 )
-                strategy_state, strategy_notes = _execute_writelogonscript_force_change_password_strategy(
-                    shell,
-                    domain=domain,
-                    summary=summary,
-                    current_step_index=idx - 1,
-                    from_label=from_label,
-                    to_label=to_label,
-                    details=details,
-                    context_username=context_username,
-                    context_password=context_password,
-                    precheck_notes=probe_notes,
+                strategy_state, strategy_notes = (
+                    _execute_writelogonscript_force_change_password_strategy(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        current_step_index=idx - 1,
+                        from_label=from_label,
+                        to_label=to_label,
+                        details=details,
+                        context_username=context_username,
+                        context_password=context_password,
+                        precheck_notes=probe_notes,
+                    )
                 )
                 if strategy_state == "payload_staged":
                     final_notes = dict(details)
@@ -4985,7 +5082,13 @@ def execute_selected_attack_path(
                         shell,
                         domain=domain,
                         username=str(strategy_notes.get("user") or ""),
-                        password=str(context_password or _resolve_domain_password(shell, domain, str(strategy_notes.get("user") or "")) or ""),
+                        password=str(
+                            context_password
+                            or _resolve_domain_password(
+                                shell, domain, str(strategy_notes.get("user") or "")
+                            )
+                            or ""
+                        ),
                     )
                     final_notes["validation_policy"] = validation_policy
                     if not bool(validation_policy.get("auto_validation_safe")):
@@ -5010,16 +5113,24 @@ def execute_selected_attack_path(
                         register_writelogonscript_manual_validation(
                             shell,
                             domain=domain,
-                            username=str(strategy_notes.get("next_step_target_user") or ""),
-                            credential=str(strategy_notes.get("generated_password") or ""),
+                            username=str(
+                                strategy_notes.get("next_step_target_user") or ""
+                            ),
+                            credential=str(
+                                strategy_notes.get("generated_password") or ""
+                            ),
                             summary=summary,
                             from_label=from_label,
                             to_label=to_label,
                         )
                         _render_writelogonscript_manual_validation_panel(
                             domain=domain,
-                            target_user=str(strategy_notes.get("next_step_target_user") or ""),
-                            credential=str(strategy_notes.get("generated_password") or ""),
+                            target_user=str(
+                                strategy_notes.get("next_step_target_user") or ""
+                            ),
+                            credential=str(
+                                strategy_notes.get("generated_password") or ""
+                            ),
                             policy_state=validation_policy,
                         )
                         return execution_started
@@ -5029,8 +5140,12 @@ def execute_selected_attack_path(
                         summary=summary,
                         from_label=from_label,
                         to_label=to_label,
-                        target_user=str(strategy_notes.get("next_step_target_user") or ""),
-                        target_password=str(strategy_notes.get("generated_password") or ""),
+                        target_user=str(
+                            strategy_notes.get("next_step_target_user") or ""
+                        ),
+                        target_password=str(
+                            strategy_notes.get("generated_password") or ""
+                        ),
                     )
                     final_notes.update(poll_notes)
                     step["status"] = "success"
@@ -5079,8 +5194,7 @@ def execute_selected_attack_path(
                                     or ""
                                 ),
                                 "to_label": str(
-                                    strategy_notes.get("chained_step_to_label")
-                                    or ""
+                                    strategy_notes.get("chained_step_to_label") or ""
                                 ),
                                 "status": "success",
                                 "notes": chained_step_notes,
@@ -5089,7 +5203,8 @@ def execute_selected_attack_path(
                                 "follow_on_outcome": {
                                     "key": "user_credential_obtained",
                                     "compromised_user": str(
-                                        strategy_notes.get("next_step_target_user") or ""
+                                        strategy_notes.get("next_step_target_user")
+                                        or ""
                                     ),
                                     "credential": str(
                                         strategy_notes.get("generated_password") or ""
@@ -5132,8 +5247,7 @@ def execute_selected_attack_path(
                                     or ""
                                 ),
                                 "to_label": str(
-                                    strategy_notes.get("chained_step_to_label")
-                                    or ""
+                                    strategy_notes.get("chained_step_to_label") or ""
                                 ),
                                 "status": "attempted",
                                 "notes": {
@@ -5142,7 +5256,8 @@ def execute_selected_attack_path(
                                     "execution_origin_from": from_label,
                                     "execution_origin_to": to_label,
                                     "credential_confirmed_user": str(
-                                        strategy_notes.get("next_step_target_user") or ""
+                                        strategy_notes.get("next_step_target_user")
+                                        or ""
                                     ),
                                     "verification_wait_seconds": int(
                                         poll_notes.get("verification_wait_seconds") or 0
@@ -5189,9 +5304,7 @@ def execute_selected_attack_path(
                         status="blocked",
                         notes=final_notes,
                     )
-                    print_warning(
-                        "WriteLogonScript payload staging was blocked."
-                    )
+                    print_warning("WriteLogonScript payload staging was blocked.")
                     return execution_started
                 print_info(
                     "WriteLogonScript precheck succeeded: staging-share write was confirmed with a benign .bat probe. "
@@ -5602,7 +5715,9 @@ def execute_selected_attack_path(
                     except Exception as exc:  # noqa: BLE001
                         telemetry.capture_exception(exc)
 
-                    spray_runner = getattr(shell, "execute_password_spray_attack_step", None)
+                    spray_runner = getattr(
+                        shell, "execute_password_spray_attack_step", None
+                    )
                     if callable(spray_runner):
                         attempted = bool(
                             spray_runner(
@@ -6714,9 +6829,7 @@ def execute_selected_attack_path(
                                 str(user).strip()
                                 for user in stored_creds.keys()
                                 if isinstance(user, str)
-                                and _is_valid_domain_username(
-                                    _normalize_account(user)
-                                )
+                                and _is_valid_domain_username(_normalize_account(user))
                             },
                             key=str.lower,
                         )
@@ -6946,7 +7059,9 @@ def execute_selected_attack_path(
                                 )
                             )
                             if credential_to_register:
-                                add_credential_fn = getattr(shell, "add_credential", None)
+                                add_credential_fn = getattr(
+                                    shell, "add_credential", None
+                                )
                                 if callable(add_credential_fn):
                                     add_credential_fn(
                                         domain,
@@ -7486,7 +7601,9 @@ def offer_attack_paths_with_non_high_value_fallback(
             domain,
             summaries=direct_summaries,
             max_display=max_display,
-            search_mode_label=_target_search_mode_label(target=target, target_mode=target_mode),
+            search_mode_label=_target_search_mode_label(
+                target=target, target_mode=target_mode
+            ),
             context_username=context_username,
             context_password=context_password,
             allow_execute_all=allow_execute_all,
@@ -7550,9 +7667,7 @@ def offer_attack_paths_with_non_high_value_fallback(
 
     fallback_default = str(getattr(shell, "type", "")).strip().lower() == "ctf"
     marked_domain = mark_sensitive(domain, "domain")
-    subject = (
-        "owned users" if start_norm == "owned" else mark_sensitive(start, "user")
-    )
+    subject = "owned users" if start_norm == "owned" else mark_sensitive(start, "user")
 
     message = Text()
     message.append(
@@ -7766,7 +7881,9 @@ def offer_attack_paths_for_execution_for_principals(
         domain,
         summaries=summaries,
         max_display=max_display,
-        search_mode_label=_target_search_mode_label(target=target, target_mode=target_mode),
+        search_mode_label=_target_search_mode_label(
+            target=target, target_mode=target_mode
+        ),
         context_username=context_username,
         context_password=context_password,
         allow_execute_all=allow_execute_all,
@@ -7935,12 +8052,18 @@ def offer_attack_paths_for_execution_summaries(
             desired_statuses=desired_statuses_set,
         )
         reason_summary = _format_non_actionable_reason_summary(reasons)
-        if reasons["needs_context"] > 0 and non_actionable_total == reasons["needs_context"]:
+        if (
+            reasons["needs_context"] > 0
+            and non_actionable_total == reasons["needs_context"]
+        ):
             print_warning(
                 "No actionable attack paths are currently executable because the "
                 "available paths have no usable execution credential context."
             )
-        elif reasons["unsupported"] > 0 and non_actionable_total == reasons["unsupported"]:
+        elif (
+            reasons["unsupported"] > 0
+            and non_actionable_total == reasons["unsupported"]
+        ):
             print_warning(
                 "No actionable attack paths are currently executable because the "
                 "available paths are not implemented for execution."
@@ -8077,7 +8200,9 @@ def offer_attack_paths_for_execution_summaries(
                     continue
                 if status == "exploited":
                     continue
-                meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+                meta = (
+                    summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+                )
                 support_status = (
                     str(meta.get("execution_support_status") or "").strip().lower()
                     if isinstance(meta, dict)
@@ -8212,7 +8337,9 @@ def offer_attack_paths_for_execution_summaries(
         )
 
         status = str(selected.get("status") or "theoretical").lower()
-        selected_meta = selected.get("meta") if isinstance(selected.get("meta"), dict) else {}
+        selected_meta = (
+            selected.get("meta") if isinstance(selected.get("meta"), dict) else {}
+        )
         execution_context_required = bool(
             isinstance(selected_meta, dict)
             and selected_meta.get("execution_context_required")
@@ -8286,7 +8413,9 @@ def offer_attack_paths_for_execution_summaries(
             else None
         )
         computer_viability_status = (
-            str(selected_meta.get("execution_target_viability_status") or "").strip().lower()
+            str(selected_meta.get("execution_target_viability_status") or "")
+            .strip()
+            .lower()
             if isinstance(selected_meta, dict)
             else ""
         )
@@ -8337,9 +8466,7 @@ def offer_attack_paths_for_execution_summaries(
                     f"Computer target viability check: {computer_viability_summary}"
                 )
             if computer_execution_advisory:
-                print_info(
-                    f"Execution advisory: {computer_execution_advisory}"
-                )
+                print_info(f"Execution advisory: {computer_execution_advisory}")
             print_info_debug(
                 "[attack_paths] computer target viability warning: "
                 f"domain={marked_domain} status={mark_sensitive(computer_viability_status, 'detail')}"
@@ -8475,7 +8602,10 @@ def offer_attack_paths_for_execution_summaries(
                     desired_statuses=desired_statuses_set,
                 )
                 reason_summary = _format_non_actionable_reason_summary(reasons)
-                if reasons["exploited"] == non_actionable_total and non_actionable_total > 0:
+                if (
+                    reasons["exploited"] == non_actionable_total
+                    and non_actionable_total > 0
+                ):
                     print_info(
                         "Execution completed. No further actionable attack paths remain "
                         "because the remaining paths are already exploited."

@@ -84,6 +84,8 @@ _AD_LABS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
         "Pirate",
         "Overwatch",
         "Garfield",
+        "Logging",
+        "PingPong",
         "Intercept",
         "Sidecar",
         "Push",
@@ -291,9 +293,10 @@ _MACHINE_DOMAIN_FINGERPRINTS: dict[str, tuple[str, str]] = {
     # Child domains strip to offshore.com via subdomain stripping, so one fingerprint covers all.
     # Non-standard .com TLD bypasses SLD heuristic; explicit fingerprint required.
     "offshore.com": ("hackthebox", "offshore"),
-    # Zephyr (HTB Pro Lab) — two organizations: zephyr.local + painters.local
-    # zephyr.local SLD matches lab name (covered by SLD rule); painters.local doesn't.
-    "painters.local": ("hackthebox", "zephyr"),
+    # Zephyr (HTB Pro Lab) — two domains: zsm.local + painters.htb
+    # Neither SLD matches catalog entry "zephyr"; both require explicit fingerprints.
+    "zsm.local": ("hackthebox", "zephyr"),
+    "painters.htb": ("hackthebox", "zephyr"),
     # ---------------------------------------------------------------------------
     # GOAD (Game of Active Directory) — Orange Cyberdefense self-hosted lab
     # ---------------------------------------------------------------------------

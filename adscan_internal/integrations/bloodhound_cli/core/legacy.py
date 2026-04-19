@@ -283,7 +283,10 @@ class BloodHoundLegacyClient(BloodHoundClient):
         return self.execute_query(query, domain=domain)
 
     def get_password_last_change(
-        self, domain: str, user: Optional[str] = None
+        self,
+        domain: str,
+        user: Optional[str] = None,
+        users: Optional[List[str]] = None,
     ) -> List[Dict]:
         if user:
             query = """
@@ -293,6 +296,23 @@ class BloodHoundLegacyClient(BloodHoundClient):
             RETURN u.samaccountname AS samaccountname, u.pwdlastset AS pwdlastset, u.whencreated AS whencreated
             """
             params = {"domain": domain, "user": user}
+        elif users:
+            normalized_users = sorted(
+                {
+                    str(candidate or "").strip().casefold()
+                    for candidate in users
+                    if str(candidate or "").strip()
+                }
+            )
+            if not normalized_users:
+                return []
+            query = """
+            MATCH (u:User)
+            WHERE u.enabled = true AND toLower(u.domain) = toLower($domain)
+              AND toLower(u.samaccountname) IN $users
+            RETURN u.samaccountname AS samaccountname, u.pwdlastset AS pwdlastset, u.whencreated AS whencreated
+            """
+            params = {"domain": domain, "users": normalized_users}
         else:
             query = """
             MATCH (u:User)

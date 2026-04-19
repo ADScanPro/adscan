@@ -1911,19 +1911,21 @@ def _guard_container_runtime_launcher_contract(command: str | None) -> None:
         "ADscan will not run from this shell.\n\n"
         f"Runtime image: {marked_runtime_image}\n"
         f"Host-helper socket: {marked_helper_sock}\n\n"
-        "Missing runtime requirements:\n"
-        + "\n".join(detail_lines)
-        + "\n\n"
+        "Missing runtime requirements:\n" + "\n".join(detail_lines) + "\n\n"
         "The official launcher sets up the host-helper, loopback DNS context, "
         "workspace/state mounts, and container runtime environment before ADscan starts.",
         title="[bold]🧭 Official Launcher Required[/bold]",
         border_style="yellow",
         padding=(1, 2),
     )
-    print_instruction("Install the official launcher on the host with `pipx install adscan`.")
+    print_instruction(
+        "Install the official launcher on the host with `pipx install adscan`."
+    )
     print_instruction("Alternative: `pip install adscan`.")
     print_instruction("Exit the container shell and run `adscan start` from the host.")
-    print_instruction("Do not launch ADscan manually from inside the FULL runtime container.")
+    print_instruction(
+        "Do not launch ADscan manually from inside the FULL runtime container."
+    )
     raise SystemExit(1)
 
 
@@ -9645,9 +9647,7 @@ class PentestShell:
             int | None: Index of selected option or None if cancelled
         """
         remote_context = dict(context or {})
-        allow_remote_interaction = bool(
-            remote_context.pop("remote_interaction", False)
-        )
+        allow_remote_interaction = bool(remote_context.pop("remote_interaction", False))
         if allow_remote_interaction:
             remote_selection = request_remote_select(
                 title=title,
@@ -9684,9 +9684,7 @@ class PentestShell:
     ) -> bool | None:
         """Request a yes/no decision with optional remote delegation."""
         remote_context = dict(context or {})
-        allow_remote_interaction = bool(
-            remote_context.pop("remote_interaction", False)
-        )
+        allow_remote_interaction = bool(remote_context.pop("remote_interaction", False))
         if allow_remote_interaction:
             remote_confirmation = request_remote_confirm(
                 prompt=prompt,
@@ -13224,7 +13222,9 @@ class PentestShell:
                 border_style="red",
                 padding=(1, 2),
             )
-            print_warning("Interactive shell not started because no workspace is active.")
+            print_warning(
+                "Interactive shell not started because no workspace is active."
+            )
             return
 
         history_path = self._resolve_prompt_history_path_for_workspace(
@@ -13719,7 +13719,9 @@ class PentestShell:
 
         # Version + edition on one clean line
         license_mode = str(getattr(self, "license_mode", "LITE") or "LITE").upper()
-        badge_style = f"bold {ADSCAN_PRIMARY}" if license_mode == "PRO" else "bold #d29922"
+        badge_style = (
+            f"bold {ADSCAN_PRIMARY}" if license_mode == "PRO" else "bold #d29922"
+        )
         self.console.print(
             f"  [bold {ADSCAN_PRIMARY}]ADscan[/bold {ADSCAN_PRIMARY}]"
             f"  [dim]{version_tag}[/dim]"
@@ -13913,13 +13915,13 @@ class PentestShell:
         Returns the configured IP or None if it could not be obtained.
         """
         try:
-            # Get the addresses associated with the interface
-            addresses = netifaces.ifaddresses(interface)
-            # Look for IPv4 addresses
-            inet_addresses = addresses.get(netifaces.AF_INET)
-            if inet_addresses and len(inet_addresses) > 0:
-                # Assign the first found IP
-                self.myip = inet_addresses[0]["addr"]
+            from adscan_internal.services.network_preflight_service import (
+                get_interface_ipv4_addresses,
+            )
+
+            ips = get_interface_ipv4_addresses(interface)
+            if ips:
+                self.myip = ips[0]
                 return self.myip
             print_error(f"The interface '{interface}' does not have an assigned IP.")
             return None
@@ -14507,7 +14509,9 @@ class PentestShell:
                 trusted_manual_validation=trusted_manual_validation,
                 mark_user_compromised=False,
             )
-            if trusted_manual_validation and isinstance(pending_manual_validation, dict):
+            if trusted_manual_validation and isinstance(
+                pending_manual_validation, dict
+            ):
                 _attempt_writelogonscript_cleanup_if_ready(
                     self,
                     domain=domain,
@@ -14811,6 +14815,8 @@ class PentestShell:
         allow_empty_credential: bool = False,
         trusted_manual_validation: bool = False,
         mark_user_compromised: bool = True,
+        credential_origin: str | None = None,
+        local_account_rid: str | None = None,
     ):
         """Add a credential (domain or local) delegating to the CLI helper for reuse."""
         from adscan_internal.cli.creds import add_credential
@@ -14837,6 +14843,8 @@ class PentestShell:
             allow_empty_credential=allow_empty_credential,
             trusted_manual_validation=trusted_manual_validation,
             mark_user_compromised=mark_user_compromised,
+            credential_origin=credential_origin,
+            local_account_rid=local_account_rid,
         )
 
     def add_credentials_batch(
@@ -15062,6 +15070,61 @@ class PentestShell:
         marked_user = mark_sensitive(user, "user")
         marked_domain_name = mark_sensitive(domain_name, "domain")
 
+        def _maybe_retry_pwdlastset_year_variant() -> bool:
+            """Offer one same-user retry when pwdLastSet suggests a newer year."""
+            if password_change_attempted or ui_silent or self.is_hash(cred_value):
+                return False
+
+            from adscan_internal.services.password_year_variant_service import (
+                resolve_password_year_variant_suggestion,
+            )
+
+            suggestion = resolve_password_year_variant_suggestion(
+                self,
+                domain=domain_name,
+                username=user,
+                password=cred_value,
+            )
+            if suggestion is None:
+                return False
+
+            marked_original_password = mark_sensitive(cred_value, "password")
+            marked_suggested_password = mark_sensitive(
+                suggestion.suggested_password, "password"
+            )
+            print_info(
+                "The password contains year "
+                f"{suggestion.original_year}, but BloodHound reports that "
+                f"'[bold]{marked_user}[/bold]' last changed their password in "
+                f"{suggestion.pwdlastset_year}."
+            )
+            retry_variant = Confirm.ask(
+                "Try the likely year-rolled variant "
+                f"{marked_suggested_password} for this same user?",
+                default=True,
+            )
+            if not retry_variant:
+                print_info_verbose(
+                    "Password year-rollover same-user retry declined by operator."
+                )
+                return False
+
+            print_info_verbose(
+                "Retrying credential verification with pwdLastSet year-rollover "
+                f"variant for {marked_user}: {marked_original_password} -> "
+                f"{marked_suggested_password}"
+            )
+            return bool(
+                self.verify_domain_credentials(
+                    domain_name,
+                    user,
+                    suggestion.suggested_password,
+                    ui_silent=ui_silent,
+                    password_change_attempted=True,
+                    source_steps=source_steps,
+                )
+            )
+
         if status == CredentialStatus.VALID:
             self._last_verified_domain_name = domain_name
             self._last_verified_domain_username = user
@@ -15099,7 +15162,9 @@ class PentestShell:
                 )
 
                 if not CredentialStoreService._looks_like_ntlm_hash(cred_value):
-                    if not ui_silent:
+                    if _maybe_retry_pwdlastset_year_variant():
+                        return True
+                    if not ui_silent and not password_change_attempted:
                         respuesta = Confirm.ask(
                             "Would you like to perform a password spraying with this password?",
                             default=True,
@@ -15114,9 +15179,13 @@ class PentestShell:
                                 },
                                 source_steps=source_steps,
                             )
-                    else:
+                    elif ui_silent:
                         print_info_verbose(
                             "[ui_silent] Password spraying prompt suppressed."
+                        )
+                    else:
+                        print_info_verbose(
+                            "Password spraying prompt skipped for failed year-rollover retry."
                         )
                 return False
 
@@ -15140,7 +15209,9 @@ class PentestShell:
                 should_offer_spraying
                 and not CredentialStoreService._looks_like_ntlm_hash(cred_value)
             ):
-                if not ui_silent:
+                if _maybe_retry_pwdlastset_year_variant():
+                    return True
+                if not ui_silent and not password_change_attempted:
                     respuesta = Confirm.ask(
                         "Would you like to perform a password spraying with this password?",
                         default=True,
@@ -15156,9 +15227,13 @@ class PentestShell:
                             },
                             source_steps=source_steps,
                         )
-                else:
+                elif ui_silent:
                     print_info_verbose(
                         "[ui_silent] Password spraying prompt suppressed."
+                    )
+                else:
+                    print_info_verbose(
+                        "Password spraying prompt skipped for failed year-rollover retry."
                     )
             return False
 
@@ -16935,7 +17010,9 @@ class PentestShell:
 
         return run_ligolo_command(self, args)
 
-    def refresh_current_vantage_inventory(self, domain: str, *, reason: str = "manual") -> bool:
+    def refresh_current_vantage_inventory(
+        self, domain: str, *, reason: str = "manual"
+    ) -> bool:
         """Refresh only the current-vantage reachability/service inventory for one domain."""
         from adscan_internal.services.current_vantage_inventory_refresh_service import (
             refresh_current_vantage_inventory,
@@ -16963,7 +17040,9 @@ class PentestShell:
         if selected.lower() == "all":
             if isinstance(self.domains_data, dict):
                 domains_to_refresh = [
-                    str(domain).strip() for domain in self.domains_data.keys() if str(domain).strip()
+                    str(domain).strip()
+                    for domain in self.domains_data.keys()
+                    if str(domain).strip()
                 ]
             if not domains_to_refresh and self.current_domain:
                 domains_to_refresh = [str(self.current_domain).strip()]
@@ -16986,7 +17065,9 @@ class PentestShell:
                 f"Refreshed current-vantage inventory for {refreshed}/{len(set(domains_to_refresh))} domain(s)."
             )
         else:
-            print_warning("No current-vantage inventory refresh completed successfully.")
+            print_warning(
+                "No current-vantage inventory refresh completed successfully."
+            )
 
     def gpp_passwords(self, domain, username, password, share):
         from adscan_internal.cli.smb import run_gpp_passwords_share
@@ -20542,6 +20623,7 @@ class PentestShell:
         from adscan_internal.services.attack_graph_service import upsert_cve_host_edge
 
         vulnerable_ips_dc = set()  # Set for vulnerable DCs
+        vulnerable_dc_labels = set()
         detected_takeover_cves: set[str] = set()
         recorded_ips = set()
 
@@ -20612,6 +20694,8 @@ class PentestShell:
                             # If the line does not match any of the patterns, skip it.
                             continue
                         vulnerable_ips_dc.add(ip)
+                        if host_label:
+                            vulnerable_dc_labels.add(str(host_label).strip())
                         self._record_cve_finding(
                             target_domain=target_domain,
                             scope="dcs",
@@ -20713,9 +20797,11 @@ class PentestShell:
                         target_domain,
                         cve=takeover_cve,
                         status="discovered",
+                        vulnerable_dc_labels=sorted(list(vulnerable_dc_labels)),
                         notes={
                             "source": "netexec",
                             "module": str(cve or ""),
+                            "vulnerable_dc_labels": sorted(list(vulnerable_dc_labels)),
                             "vulnerable_dcs": sorted(list(vulnerable_ips_dc)),
                         },
                     )
@@ -20887,9 +20973,7 @@ class PentestShell:
                                         prompt_for_user_privs_after=False,
                                     )
                                     continue
-                                marked_username = mark_sensitive(
-                                    entry.username, "user"
-                                )
+                                marked_username = mark_sensitive(entry.username, "user")
                                 marked_domain = mark_sensitive(domain, "domain")
                                 print_info(
                                     "The ambiguous GPP credential did not verify as a domain "
@@ -22297,9 +22381,8 @@ class PentestShell:
 
             if is_machine_account(username):
                 dc_role = self.get_user_dc_role(domain, username)
-                if (
-                    dc_role == "rodc"
-                    and not bool(privileged_groups.get("read_only_domain_controllers"))
+                if dc_role == "rodc" and not bool(
+                    privileged_groups.get("read_only_domain_controllers")
                 ):
                     privileged_groups = dict(privileged_groups)
                     privileged_groups["read_only_domain_controllers"] = True
@@ -22415,11 +22498,7 @@ class PentestShell:
                 return actionable[0]
 
             labels = [
-                (
-                    f"{option.label} (Recommended)"
-                    if index == 0
-                    else option.label
-                )
+                (f"{option.label} (Recommended)" if index == 0 else option.label)
                 for index, option in enumerate(actionable)
             ]
             choice_idx = selector(
@@ -22430,7 +22509,9 @@ class PentestShell:
                 labels,
                 default_idx=0,
             )
-            if not isinstance(choice_idx, int) or not (0 <= choice_idx < len(actionable)):
+            if not isinstance(choice_idx, int) or not (
+                0 <= choice_idx < len(actionable)
+            ):
                 return actionable[0]
             return actionable[choice_idx]
 
@@ -22682,7 +22763,9 @@ class PentestShell:
                 )
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
-                print_info_debug(f"[exchange-windows-permissions] escalation helper failed: {exc}")
+                print_info_debug(
+                    f"[exchange-windows-permissions] escalation helper failed: {exc}"
+                )
 
         if selected_key == "exchange_trusted_subsystem":
             print_warning(
@@ -22701,7 +22784,9 @@ class PentestShell:
                 )
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
-                print_info_debug(f"[exchange-trusted-subsystem] escalation helper failed: {exc}")
+                print_info_debug(
+                    f"[exchange-trusted-subsystem] escalation helper failed: {exc}"
+                )
 
         return privileged_groups
 
@@ -22751,9 +22836,7 @@ class PentestShell:
                             isinstance(distinguished_name, str)
                             and distinguished_name.strip()
                         ):
-                            group_distinguished_names.append(
-                                distinguished_name.strip()
-                            )
+                            group_distinguished_names.append(distinguished_name.strip())
                         else:
                             group_distinguished_names.append("")
 
@@ -23108,7 +23191,9 @@ class PentestShell:
         from adscan_internal.services.adcs_target_filter import (
             domain_has_adcs_for_attack_steps,
         )
-        from adscan_internal.services.attack_graph_service import ATTACK_PATHS_MAX_DEPTH_USER
+        from adscan_internal.services.attack_graph_service import (
+            ATTACK_PATHS_MAX_DEPTH_USER,
+        )
         from adscan_internal.services.privileged_group_classifier import (
             resolve_privileged_followup_decision,
         )
@@ -25030,7 +25115,8 @@ class PentestShell:
                                         category="confirmed",
                                         reason=(
                                             "authenticated_access"
-                                            if mssql_authenticated and not privileged_indicator
+                                            if mssql_authenticated
+                                            and not privileged_indicator
                                             else "confirmed"
                                         ),
                                         status=line.strip(),
@@ -25093,14 +25179,18 @@ class PentestShell:
                                 workspace_dir=(
                                     self._get_workspace_cwd()
                                     if hasattr(self, "_get_workspace_cwd")
-                                    else getattr(self, "current_workspace_dir", os.getcwd())
+                                    else getattr(
+                                        self, "current_workspace_dir", os.getcwd()
+                                    )
                                 ),
                                 domains_dir=getattr(self, "domains_dir", "domains"),
                                 domain=domain,
                                 username=username,
                                 service=service,
                                 targets=target_entries,
-                                confirmed_hosts=[finding.host for finding in confirmed_findings],
+                                confirmed_hosts=[
+                                    finding.host for finding in confirmed_findings
+                                ],
                                 source="run_service_command",
                                 backend="netexec",
                                 pivot_capable=is_service_pivot_capable(service),
@@ -25124,9 +25214,7 @@ class PentestShell:
                                     selected_hosts = [
                                         finding.host for finding in selected_followups
                                     ]
-                                    marked_username = mark_sensitive(
-                                        username, "user"
-                                    )
+                                    marked_username = mark_sensitive(username, "user")
                                     marked_hosts = [
                                         mark_sensitive(host, "hostname")
                                         for host in selected_hosts
@@ -25160,7 +25248,8 @@ class PentestShell:
                                             password,
                                             **(
                                                 {"workflow_intent": workflow_intent}
-                                                if service == "winrm" and workflow_intent
+                                                if service == "winrm"
+                                                and workflow_intent
                                                 else {}
                                             ),
                                         )
@@ -25193,9 +25282,7 @@ class PentestShell:
                                 marked_username = mark_sensitive(
                                     finding.username, "user"
                                 )
-                                marked_host = mark_sensitive(
-                                    finding.host, "hostname"
-                                )
+                                marked_host = mark_sensitive(finding.host, "hostname")
                                 print_info_debug(
                                     "[service-access] service follow-up prompt suppressed: "
                                     f"service={service} user={marked_username} host={marked_host}"
@@ -25212,7 +25299,9 @@ class PentestShell:
                                 workspace_dir=(
                                     self._get_workspace_cwd()
                                     if hasattr(self, "_get_workspace_cwd")
-                                    else getattr(self, "current_workspace_dir", os.getcwd())
+                                    else getattr(
+                                        self, "current_workspace_dir", os.getcwd()
+                                    )
                                 ),
                                 domains_dir=getattr(self, "domains_dir", "domains"),
                                 domain=domain,
@@ -25264,8 +25353,16 @@ class PentestShell:
             except Exception as e:
                 telemetry.capture_exception(e)
 
-                print_error("Unexpected error during {service} enumeration.")
-                print_exception(show_locals=False, exception=e)
+                print_error(f"Unexpected error during {service} enumeration.")
+                print_exception(
+                    show_locals=False,
+                    exception=e,
+                    context={
+                        "service": mark_sensitive(service, "service"),
+                        "domain": mark_sensitive(domain, "domain"),
+                        "username": mark_sensitive(username, "user"),
+                    },
+                )
                 return found_privileged_hosts
 
         return found_privileged_hosts
@@ -25375,7 +25472,9 @@ class PentestShell:
             attack_paths north.sevenkingdoms.local 2
         """
         from adscan_internal.cli.bloodhound import run_show_attack_paths
-        from adscan_internal.services.attack_graph_service import ATTACK_PATHS_MAX_DEPTH_USER
+        from adscan_internal.services.attack_graph_service import (
+            ATTACK_PATHS_MAX_DEPTH_USER,
+        )
 
         parts = args.split()
         domain = parts[0] if parts else (self.domain or "")
@@ -27249,7 +27348,9 @@ class PentestShell:
             self.domains_data[domain]["pdc"] = fallback_pdc_ip
             if best_effort_hostname:
                 self.domains_data[domain]["pdc_hostname"] = best_effort_hostname
-                self.domains_data[domain]["dcs_hostnames"] = [best_effort_hostname.lower()]
+                self.domains_data[domain]["dcs_hostnames"] = [
+                    best_effort_hostname.lower()
+                ]
             else:
                 self.domains_data[domain]["dcs_hostnames"] = []
 
@@ -29932,6 +30033,7 @@ if __name__ == "__main__":
     # Required for multiprocessing with spawn context inside a PyInstaller binary.
     # Must be called before any other code in the __main__ block.
     import multiprocessing
+
     multiprocessing.freeze_support()
 
     init_sentry()
@@ -30217,8 +30319,7 @@ if __name__ == "__main__":
     # Set global verbose mode (VERBOSE_MODE) if --verbose is passed with start/install/auto command
     if (
         hasattr(args, "command")
-        and args.command
-        in ("start", "ci", "install", "check")
+        and args.command in ("start", "ci", "install", "check")
         and hasattr(args, "verbose")
         and args.verbose
     ):
@@ -30233,8 +30334,7 @@ if __name__ == "__main__":
     # Debug mode (public in OSS launcher/runtime; does not enable SECRET_MODE).
     if (
         hasattr(args, "command")
-        and args.command
-        in ("start", "ci", "install", "check")
+        and args.command in ("start", "ci", "install", "check")
         and hasattr(args, "debug")
         and args.debug
     ):

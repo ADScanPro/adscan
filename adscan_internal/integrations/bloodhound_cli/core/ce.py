@@ -5,6 +5,7 @@ BloodHound CE implementation using HTTP API
 # pylint: skip-file
 import configparser
 import email.utils
+import json
 import os
 import random
 import threading
@@ -1497,7 +1498,10 @@ class BloodHoundCEClient(BloodHoundClient):
             return []
 
     def get_password_last_change(
-        self, domain: str, user: Optional[str] = None
+        self,
+        domain: str,
+        user: Optional[str] = None,
+        users: Optional[List[str]] = None,
     ) -> List[Dict]:
         """Get password last change information using CySQL query"""
         try:
@@ -1506,6 +1510,22 @@ class BloodHoundCEClient(BloodHoundClient):
                 MATCH (u:User)
                 WHERE u.enabled = true AND toUpper(u.domain) = '{domain.upper()}'
                   AND u.samaccountname = '{user}'
+                RETURN u
+                """
+            elif users:
+                normalized_users = sorted(
+                    {
+                        str(candidate or "").strip().casefold()
+                        for candidate in users
+                        if str(candidate or "").strip()
+                    }
+                )
+                if not normalized_users:
+                    return []
+                cypher_query = f"""
+                MATCH (u:User)
+                WHERE u.enabled = true AND toUpper(u.domain) = '{domain.upper()}'
+                  AND toLower(u.samaccountname) IN {json.dumps(normalized_users)}
                 RETURN u
                 """
             else:

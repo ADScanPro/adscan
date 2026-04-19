@@ -628,6 +628,30 @@ def _collect_host_distro_context() -> dict[str, str]:
         return {}
 
 
+def _make_docker_accessible_url(url: str) -> str:
+    """Rewrite a Redis URL so it is reachable from inside a Docker container.
+
+    Docker containers cannot reach the host via ``localhost`` or ``127.0.0.1``.
+    This helper replaces those hostnames with ``host-gateway``, which Docker
+    resolves to the host's bridge IP when ``--add-host=host-gateway:host-gateway``
+    is passed to ``docker run``.
+
+    Args:
+        url: Original Redis URL (e.g. ``redis://localhost:6379/0``).
+
+    Returns:
+        URL with ``localhost``/``127.0.0.1`` replaced by ``host-gateway``,
+        or the original URL unchanged if no replacement is needed.
+    """
+    import re
+
+    return re.sub(
+        r"(?<=[/@:])(?:localhost|127\.0\.0\.1)(?=[:/]|$)",
+        "host-gateway",
+        url,
+    )
+
+
 def build_adscan_run_command(
     cfg: DockerRunConfig,
     *,
@@ -821,13 +845,15 @@ def build_adscan_run_command(
         "ADSCAN_ALLOW_PUBLIC_DNS",
         # CI event pipeline: forward the structured-event sink config so the container
         # emits JSON events to stderr (read by the Celery worker via PIPE).
-        # NOTE: ADSCAN_INTERACTIVE_SINK is intentionally NOT forwarded here — the
-        # container's Python runtime may not have the redis package available, and the
-        # Redis URL (typically localhost) is unreachable from inside Docker.  Interactive
-        # prompts are handled by ADSCAN_NONINTERACTIVE instead.
         "ADSCAN_EVENT_SINK",
         "ADSCAN_SCAN_ID",
         "ADSCAN_NONINTERACTIVE",
+        # Remote interaction bridge: forward the sink type so the container can delegate
+        # interactive prompts (e.g. attack path selection) back to the web UI via Redis.
+        # The Redis URL is NOT forwarded as-is because localhost/127.0.0.1 is unreachable
+        # from inside Docker; instead we compute a host-gateway-based URL below.
+        "ADSCAN_INTERACTIVE_SINK",
+        "ADSCAN_INTERACTIVE_TIMEOUT_SECONDS",
         "CI",
         "GITHUB_ACTIONS",
         "GITLAB_CI",
@@ -852,6 +878,30 @@ def build_adscan_run_command(
     for key in passthrough_keys:
         if key in os.environ and str(os.environ.get(key, "")).strip():
             cmd.extend(["-e", f"{key}={os.environ[key]}"])
+
+    # Remote interaction bridge: forward a Docker-accessible Redis URL so the
+    # container can reach the host Redis instance when delegating interactive
+    # prompts (e.g. attack path selection) to the web UI.
+    #
+    # The host uses localhost/127.0.0.1 which is unreachable from inside a
+    # Docker container.  We rewrite these to the special `host-gateway` hostname
+    # that Docker maps to the host's bridge IP, and add --add-host so Docker
+    # resolves it correctly on Linux (where host.docker.internal is unavailable).
+    _interactive_sink = str(os.environ.get("ADSCAN_INTERACTIVE_SINK", "") or "").strip().lower()
+    if _interactive_sink == "redis":
+        _host_redis_url = str(
+            os.environ.get("ADSCAN_REDIS_URL")
+            or os.environ.get("REDIS_URL")
+            or ""
+        ).strip()
+        if _host_redis_url:
+            _docker_redis_url = _make_docker_accessible_url(_host_redis_url)
+            cmd.extend(["--add-host", "host-gateway:host-gateway"])
+            cmd.extend(["-e", f"ADSCAN_REDIS_URL={_docker_redis_url}"])
+            print_info_debug(
+                f"[docker] forwarding Redis URL for interactive bridge: "
+                f"{_docker_redis_url} (host: {_host_redis_url})"
+            )
 
     # Forward host distro metadata so telemetry inside the container reports the
     # real host distribution instead of the runtime image base distro.

@@ -1,20 +1,13 @@
-"""Data models for the contextual CVSS scoring engine.
-
-Three core types:
-- CvssContext   — environmental signals extracted from a finding at evaluation time.
-- CvssElevationRule — a single condition → elevated-score mapping for a vulnerability type.
-- CvssResult    — the fully-computed output returned to callers.
-"""
+"""Data models for ADscan severity evaluation."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 @dataclass
 class CvssContext:
-    """Environmental signals that can elevate a vulnerability's effective CVSS score.
+    """Environmental signals that can elevate ADscan contextual priority.
 
     Attributes:
         has_tier_zero_targets: At least one Tier-0 (DA, KRBTGT, DC, EA…) entity
@@ -62,51 +55,11 @@ class CvssElevationRule:
         condition: Which ``CvssContext`` flag triggers this rule.
             One of: ``has_tier_zero_targets``, ``has_dc_targets``,
             ``exploitation_confirmed``.
-        elevated_score: The contextual CVSS score that replaces the base score
-            when the condition is True (must be > base_score).
+        elevated_score: The ADscan contextual priority score applied when the
+            condition is True (must be > base_score).
         reason: Human-readable explanation shown in reports and the web UI.
     """
 
     condition: str
     elevated_score: float
     reason: str
-
-
-@dataclass
-class CvssResult:
-    """Fully-computed CVSS scoring result for one finding instance.
-
-    Attributes:
-        base_score: Static base score from the vulnerability catalog.
-        base_severity: Severity label derived from ``base_score``.
-        effective_score: Contextual score when elevation applied; else ``base_score``.
-        effective_severity: Severity label derived from ``effective_score``.
-        cvss_vector: CVSS 3.1 Base vector string (e.g. ``CVSS:3.1/AV:N/AC:L/…``).
-            ``None`` when no vector is defined for the vulnerability type.
-        is_elevated: ``True`` when effective_score > base_score.
-        elevation_reason: Human-readable explanation of what caused the elevation.
-            ``None`` when the score was not elevated.
-        context: The ``CvssContext`` that was evaluated (may be ``None`` when the
-            result was computed without environmental context).
-    """
-
-    base_score: float
-    base_severity: str
-    effective_score: float
-    effective_severity: str
-    cvss_vector: Optional[str]
-    is_elevated: bool
-    elevation_reason: Optional[str]
-    context: Optional[CvssContext] = field(default=None, repr=False)
-
-    def to_dict(self) -> dict[str, object]:
-        """Serialise to a plain dict suitable for JSON storage or API responses."""
-        return {
-            "base_score": self.base_score,
-            "base_severity": self.base_severity,
-            "effective_score": self.effective_score,
-            "effective_severity": self.effective_severity,
-            "cvss_vector": self.cvss_vector,
-            "is_elevated": self.is_elevated,
-            "elevation_reason": self.elevation_reason,
-        }

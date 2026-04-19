@@ -63,7 +63,10 @@ class BloodHoundClient(ABC):
 
     @abstractmethod
     def get_password_last_change(
-        self, domain: str, user: Optional[str] = None
+        self,
+        domain: str,
+        user: Optional[str] = None,
+        users: Optional[List[str]] = None,
     ) -> List[Dict]:
         """Get password last change information"""
         raise NotImplementedError

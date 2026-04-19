@@ -203,6 +203,12 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       unbound \
       unbound-anchor \
       dns-root-data \
+      libpango-1.0-0 \
+      libcairo2 \
+      libglib2.0-0 \
+      libpangocairo-1.0-0 \
+      libharfbuzz0b \
+      libfontconfig1 \
     && mkdir -p /etc/OpenCL/vendors \
     && printf '%s\n' 'libnvidia-opencl.so.1' > /etc/OpenCL/vendors/nvidia.icd \
     && rm -rf /var/lib/apt/lists/*
@@ -600,7 +606,10 @@ RUN set -eux; \
     pyarrow==21.0.0 \
     rustworkx==0.15.1 \
     selenium==4.31.0 \
-    textual==0.80.1; \
+    textual==0.80.1 \
+    "redis>=5.0.0,<5.3.0" \
+    weasyprint>=60.0 \
+    jinja2>=3.0; \
   runtime_python="$(readlink -f /opt/adscan/venv/bin/python)"; \
   setcap cap_net_bind_service+ep "${runtime_python}"
 

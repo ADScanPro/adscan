@@ -16,9 +16,6 @@ from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
 )
-from adscan_internal.integrations.netexec.parsers import (
-    parse_netexec_ldap_query_objects,
-)
 from adscan_internal.execution_outcomes import (
     result_is_exact_ldap_connection_timeout,
 )
@@ -721,7 +718,7 @@ class LDAPEnumerationMixin:
             timeout: Timeout in seconds.
 
         Returns:
-            List of best-effort user records extracted from NetExec query output.
+            List of best-effort user records extracted from LDAP query output.
         """
         effective_filter = (
             ldap_filter
@@ -734,16 +731,20 @@ class LDAPEnumerationMixin:
             message=f"Querying anonymous LDAP user inventory on {pdc}",
         )
 
-        log_part = f' --log "{log_file}"' if log_file else ""
-        command = (
-            f'{netexec_path} ldap {pdc} -u "" -p "" '
-            f"--query '{effective_filter}' \"\"{log_part}"
-        )
+        _ = (netexec_path, log_file, executor)
 
         try:
-            exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
-            if result.returncode != 0:
+            from ldap3 import ALL_ATTRIBUTES, BASE, SUBTREE, Connection, Server
+
+            server = Server(pdc, use_ssl=False, connect_timeout=min(timeout, 10))
+            connection = Connection(
+                server,
+                user="",
+                password="",
+                auto_bind=False,
+                receive_timeout=timeout,
+            )
+            if not connection.bind():
                 self.parent._emit_progress(
                     scan_id=scan_id,
                     phase="ldap_anonymous_user_inventory",
@@ -752,11 +753,35 @@ class LDAPEnumerationMixin:
                 )
                 return []
 
-            combined_output = "\n".join(
-                segment for segment in ((result.stdout or ""), (result.stderr or "")) if segment
+            connection.search(
+                search_base="",
+                search_filter="(objectClass=*)",
+                attributes=["defaultNamingContext", "namingContexts"],
+                search_scope=BASE,
             )
-            objects = parse_netexec_ldap_query_objects(combined_output)
-            records = self._parse_netexec_anonymous_user_inventory(objects)
+            root_entries = list(getattr(connection, "entries", []) or [])
+            base_dn = ""
+            if root_entries:
+                attrs = getattr(root_entries[0], "entry_attributes_as_dict", {}) or {}
+                contexts = attrs.get("defaultNamingContext") or attrs.get("namingContexts") or []
+                if not isinstance(contexts, list):
+                    contexts = [contexts]
+                base_dn = str(contexts[0] if contexts else "").strip()
+            if not base_dn:
+                connection.unbind()
+                return []
+
+            connection.search(
+                search_base=base_dn,
+                search_filter=effective_filter,
+                attributes=ALL_ATTRIBUTES,
+                search_scope=SUBTREE,
+                paged_size=1000,
+            )
+            records = self._parse_ldap_entries_anonymous_user_inventory(
+                list(getattr(connection, "entries", []) or [])
+            )
+            connection.unbind()
 
             self.parent._emit_progress(
                 scan_id=scan_id,
@@ -782,6 +807,19 @@ class LDAPEnumerationMixin:
                 message="Anonymous LDAP user inventory failed",
             )
             return []
+
+    def _parse_ldap_entries_anonymous_user_inventory(
+        self, entries: list[object]
+    ) -> List[LDAPAnonymousUserRecord]:
+        """Normalize ldap3 entries into anonymous user records."""
+        objects: list[dict[str, object]] = []
+        for entry in entries:
+            dn = str(getattr(entry, "entry_dn", "") or "").strip()
+            attrs = getattr(entry, "entry_attributes_as_dict", {}) or {}
+            if not isinstance(attrs, dict):
+                attrs = {}
+            objects.append({"distinguished_name": dn, "attributes": attrs})
+        return self._parse_netexec_anonymous_user_inventory(objects)
 
     def enumerate_computers(
         self,

@@ -56,7 +56,6 @@ from adscan_internal.cli.host_file_picker import (
 from adscan_internal.integrations.netexec.parsers import (
     parse_machine_account_quota,
     parse_netexec_group_members,
-    parse_netexec_samaccountnames,
 )
 from adscan_internal.execution_outcomes import output_has_exact_ldap_connection_timeout
 from adscan_internal.path_utils import get_effective_user_home
@@ -2543,12 +2542,9 @@ def run_ldap_admincount_and_signing(
     password: str,
     logging: bool = True,
 ) -> bool | None:
-    """Check `adminCount` for a user via NetExec LDAP, handling LDAP Signing.
+    """Check `adminCount` for a user via native LDAP, handling transport fallback.
 
-    This helper encapsula la lógica legacy de:
-    - Construir el comando ``netexec ldap ... --query '(sAMAccountName=...)' adminCount``
-    - Detectar el mensaje ``LDAP Signing IS Enforced`` y reintentar con Kerberos (-k)
-    - Interpretar el resultado:
+    This helper keeps the legacy return contract:
       - ``True``  → adminCount == 1
       - ``False`` → adminCount != 1 (sin error)
       - ``None``  → credenciales inválidas / error de ejecución
@@ -2563,19 +2559,6 @@ def run_ldap_admincount_and_signing(
         print_error(f"Domain {marked_domain} is not configured.")
         return None
 
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-        )
-        return None
-
-    # Build authentication string (password mode primero, Kerberos en fallback)
-    auth_str = shell.build_auth_nxc(
-        shell.domains_data[domain]["username"],
-        shell.domains_data[domain]["password"],
-        domain,
-        kerberos=False,
-    )
     workspace_cwd = shell.current_workspace_dir or shell._get_workspace_cwd()
     ldap_dir_abs = domain_subpath(
         workspace_cwd,
@@ -2586,91 +2569,46 @@ def run_ldap_admincount_and_signing(
     os.makedirs(ldap_dir_abs, exist_ok=True)
     marked_domain = mark_sensitive(domain, "domain")
     marked_username = mark_sensitive(username, "user")
-    base_log = domain_relpath(
-        shell.domains_dir,
-        domain,
-        shell.ldap_dir,
-        f"admincount_{username}.log",
-    )
-
-    def _build_command(current_auth: str) -> str:
-        return (
-            f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} "
-            f"{current_auth} --log {base_log} "
-            f"--query '(sAMAccountName={username})' adminCount"
-        )
-
-    command = _build_command(auth_str)
     if logging:
         print_info(f"Enumerating adminCount for {marked_username}.")
-    print_info_debug(f"[ldap-admincount] Command: {command}")
+    try:
+        from adscan_internal.services.ldap_query_service import (
+            query_shell_ldap_attribute_values,
+        )
 
-    completed_process = shell.run_command(command, timeout=300)
-    if not completed_process:
-        return None
-
-    if _is_exact_ldap_connection_timeout_result(completed_process):
-        mark_exact_ldap_connection_timeout_state(shell)
+        values = query_shell_ldap_attribute_values(
+            shell,
+            domain=domain,
+            ldap_filter=f"(sAMAccountName={username})",
+            attribute="adminCount",
+            auth_username=str(shell.domains_data[domain]["username"]),
+            auth_password=str(shell.domains_data[domain]["password"]),
+            pdc=str(shell.domains_data[domain].get("pdc") or ""),
+            prefer_kerberos=True,
+            allow_ntlm_fallback=True,
+            operation_name="adminCount check",
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
         print_info_debug(
-            "[ldap-admincount] Exact LDAP connection timeout detected; "
-            "skipping Kerberos/signing fallback for adminCount."
+            f"[ldap-admincount] Native LDAP adminCount query failed for {marked_username}: "
+            f"{mark_sensitive(str(exc), 'detail')}"
         )
         return None
 
-    output_str = completed_process.stdout or ""
-    errors_str = completed_process.stderr or ""
-
-    # Handle LDAP Signing enforced: retry with Kerberos (-k)
-    if "LDAP Signing IS Enforced" in (
-        output_str or ""
-    ) or "LDAP Signing IS Enforced" in (errors_str or ""):
-        print_error("LDAP Signing is enforced, retrying with Kerberos (-k)...")
-        auth_str = shell.build_auth_nxc(
-            shell.domains_data[domain]["username"],
-            shell.domains_data[domain]["password"],
-            domain,
-            kerberos=True,
-        )
-        command = _build_command(auth_str)
-        print_info_debug(f"[ldap-admincount] Command (Kerberos): {command}")
-        completed_process = shell.run_command(command, timeout=300)
-        if _is_exact_ldap_connection_timeout_result(completed_process):
-            mark_exact_ldap_connection_timeout_state(shell)
-            print_info_debug(
-                "[ldap-admincount] Exact LDAP connection timeout detected after "
-                "Kerberos retry; stopping adminCount checks."
-            )
-            return None
-        output_str = completed_process.stdout or ""
-        errors_str = completed_process.stderr or ""
-
-    if completed_process.returncode != 0:
-        error_detail = (errors_str or output_str or "").strip()
-        print_error(
-            f"Error executing NetExec for adminCount check on {marked_username}. "
-            f"Return code: {completed_process.returncode}"
-        )
-        if error_detail:
-            print_error(f"Details: {error_detail}")
+    if values is None:
         return None
 
-    # Credenciales inválidas
-    if "[-]" in (output_str or "") and "Response for object:" not in (output_str or ""):
-        if logging:
-            print_error(f"Invalid credential for user {marked_username}")
-        return None
-
-    # Buscar adminCount==1
-    if "adminCount" in (output_str or ""):
-        import re
-
-        admin_count_match = re.search(r"adminCount\s+(\d+)", output_str)
-        if admin_count_match and int(admin_count_match.group(1)) == 1:
-            if logging:
-                print_success(
-                    f"User {marked_username} has adminCount=1 (likely privileged account)."
-                )
-            return True
+    for value in values:
+        try:
+            if int(str(value).strip()) == 1:
+                if logging:
+                    print_success(
+                        f"User {marked_username} has adminCount=1 (likely privileged account)."
+                    )
+                return True
+        except ValueError:
+            continue
 
     if logging:
         print_error(
@@ -2826,7 +2764,7 @@ def _run_netexec_ldap_query_attribute_values(
     allow_ntlm_fallback: bool = True,
     debug_label: str = "ldap-query",
 ) -> list[str] | None:
-    """Run a NetExec LDAP query and parse attribute values with retries.
+    """Run a native LDAP query and return attribute values with retries.
 
     This helper centralizes a robust execution policy used by runtime privilege
     verification flows:
@@ -2834,129 +2772,65 @@ def _run_netexec_ldap_query_attribute_values(
     - Optionally fallback to NTLM if Kerberos does not return usable data.
     - Retry transient failures and optional empty result-sets with backoff.
     """
-    from adscan_internal.integrations.netexec.parsers import (
-        parse_netexec_ldap_query_attribute_values,
+    from adscan_internal.services.ldap_query_service import (
+        query_shell_ldap_attribute_values,
     )
 
     if domain not in shell.domains_data:
         return None
-    if not getattr(shell, "netexec_path", None):
-        return None
-
-    netexec_runner = getattr(shell, "_run_netexec", None)
-    use_netexec_runner = callable(netexec_runner)
-
-    def _run(command: str) -> subprocess.CompletedProcess[str] | None:
-        if use_netexec_runner:
-            return netexec_runner(command, domain=domain, timeout=timeout)  # type: ignore[misc]
-        return shell.run_command(command, timeout=timeout)
 
     attempts = max(1, int(retries))
     delay = max(0.0, float(retry_delay_seconds))
     backoff = max(1.0, float(retry_backoff))
 
-    marked_auth_user = mark_sensitive(str(auth_username), "user")
-    marked_auth_pass = mark_sensitive(str(auth_password), "password")
-    marked_domain = mark_sensitive(str(domain), "domain")
-    marked_pdc = mark_sensitive(
-        str(pdc), "ip" if str(pdc).replace(".", "").isdigit() else "hostname"
-    )
-
-    auth_modes: list[bool] = [bool(prefer_kerberos)]
-    if prefer_kerberos and allow_ntlm_fallback:
-        auth_modes.append(False)
-
     saw_successful_query = False
 
-    for auth_mode in auth_modes:
-        successful_empty_result = False
-        auth_str = shell.build_auth_nxc(
-            str(auth_username),
-            str(auth_password),
-            domain,
-            kerberos=auth_mode,
+    successful_empty_result = False
+    for attempt in range(1, attempts + 1):
+        print_info_debug(
+            f"[ldap-in-chain] {debug_label} native LDAP query "
+            f"(attempt {attempt}/{attempts}) for attribute {attribute}"
         )
-        auth_str = auth_str.replace(str(auth_username), str(marked_auth_user)).replace(
-            str(auth_password), str(marked_auth_pass)
+        values = query_shell_ldap_attribute_values(
+            shell,
+            domain=domain,
+            ldap_filter=ldap_query,
+            attribute=attribute,
+            auth_username=str(auth_username),
+            auth_password=str(auth_password),
+            pdc=str(pdc),
+            prefer_kerberos=prefer_kerberos,
+            allow_ntlm_fallback=allow_ntlm_fallback,
+            operation_name=debug_label,
         )
-        auth_str = auth_str.replace(str(domain), str(marked_domain))
-
-        auth_label = "kerberos" if auth_mode else "ntlm"
-        for attempt in range(1, attempts + 1):
-            command = (
-                f"{shell.netexec_path} ldap {marked_pdc} {auth_str} "
-                f'--query "{ldap_query}" {attribute}'
-            )
-            print_info_debug(
-                f"[ldap-in-chain] {debug_label} command "
-                f"({auth_label}, attempt {attempt}/{attempts}): {command}"
-            )
-
-            completed_process = _run(command)
-            if not completed_process:
-                if attempt < attempts:
-                    time.sleep(delay * (backoff ** (attempt - 1)))
-                continue
-            if completed_process.returncode != 0:
-                if _is_exact_ldap_connection_timeout_result(completed_process):
-                    mark_exact_ldap_connection_timeout_state(shell)
-                    print_info_debug(
-                        "[ldap-in-chain] "
-                        f"{debug_label} hit the exact LDAP connection-timeout signature "
-                        f"({auth_label}, attempt {attempt}/{attempts}) via error result; "
-                        "stopping retries and skipping auth fallback."
-                    )
-                    return None
-                output = str(completed_process.stderr or "").strip() or str(
-                    completed_process.stdout or ""
-                ).strip()
-                if output:
-                    print_info_debug(
-                        "[ldap-in-chain] "
-                        f"{debug_label} failed ({auth_label}, attempt {attempt}/{attempts}): "
-                        f"{mark_sensitive(output[:400], 'detail')}"
-                    )
-                if attempt < attempts:
-                    time.sleep(delay * (backoff ** (attempt - 1)))
-                continue
-
-            saw_successful_query = True
-            values = parse_netexec_ldap_query_attribute_values(
-                completed_process.stdout or "", attribute
-            )
-            values = [str(value).strip() for value in values if str(value).strip()]
-            if values:
-                return values
-
-            if not require_non_empty:
-                return []
-
-            successful_empty_result = True
-            if _is_exact_ldap_connection_timeout_result(completed_process):
-                mark_exact_ldap_connection_timeout_state(shell)
-                print_info_debug(
-                    "[ldap-in-chain] "
-                    f"{debug_label} hit the exact LDAP connection-timeout signature "
-                    f"({auth_label}, attempt {attempt}/{attempts}); stopping retries "
-                    "and skipping auth fallback."
-                )
-                return None
-
+        if values is None:
             if attempt < attempts:
-                print_info_debug(
-                    "[ldap-in-chain] "
-                    f"{debug_label} returned 0 {attribute} values "
-                    f"({auth_label}, attempt {attempt}/{attempts}); retrying."
-                )
                 time.sleep(delay * (backoff ** (attempt - 1)))
+            continue
 
-        if auth_mode and successful_empty_result:
+        saw_successful_query = True
+        values = [str(value).strip() for value in values if str(value).strip()]
+        if values:
+            return values
+
+        if not require_non_empty:
+            return []
+
+        successful_empty_result = True
+        if attempt < attempts:
             print_info_debug(
                 "[ldap-in-chain] "
-                f"{debug_label} exhausted Kerberos retries with 0 {attribute} values; "
-                "skipping NTLM fallback."
+                f"{debug_label} returned 0 {attribute} values "
+                f"(attempt {attempt}/{attempts}); retrying."
             )
-            return []
+            time.sleep(delay * (backoff ** (attempt - 1)))
+
+    if successful_empty_result:
+        print_info_debug(
+            "[ldap-in-chain] "
+            f"{debug_label} exhausted retries with 0 {attribute} values."
+        )
+        return []
 
     if saw_successful_query:
         return []
@@ -3006,8 +2880,6 @@ def get_recursive_user_groups_in_chain(
         otherwise None when prerequisites are missing or lookup failed.
     """
     if domain not in shell.domains_data:
-        return None
-    if not getattr(shell, "netexec_path", None):
         return None
 
     auth_username = auth_username or shell.domains_data[domain].get("username")
@@ -3133,8 +3005,6 @@ def get_recursive_principal_group_sids_in_chain(
         List of group objectSid strings on success, otherwise None.
     """
     if domain not in shell.domains_data:
-        return None
-    if not getattr(shell, "netexec_path", None):
         return None
 
     auth_username = auth_username or shell.domains_data[domain].get("username")
@@ -4305,34 +4175,30 @@ def get_domain_controllers(shell: LdapShell, domain: str) -> list[str]:
 
 
 def get_not_delegated_users(shell: LdapShell, domain: str) -> list[str]:
-    """Return users with the NOT_DELEGATED UAC flag via NetExec LDAP query."""
+    """Return users with the NOT_DELEGATED UAC flag via native LDAP query."""
     try:
-        auth = shell.build_auth_nxc(
-            shell.domains_data[domain]["username"],
-            shell.domains_data[domain]["password"],
-            domain,
-            kerberos=False,
+        from adscan_internal.services.ldap_query_service import (
+            query_shell_ldap_attribute_values,
         )
-        log_path = domain_relpath(
-            shell.domains_dir, domain, shell.ldap_dir, "not_delegated_users.log"
-        )
-        auth_domain = shell.domain or domain
-        command = (
-            f"{shell.netexec_path} ldap {shell.domains_data[domain]['pdc']} {auth} "
-            f"-d {auth_domain} --log {log_path} "
-            "--query '(&(objectCategory=person)(objectClass=user)"
-            "(userAccountControl:1.2.840.113556.1.4.803:=1048576))' samAccountName"
-        )
-        print_info_debug(f"Command: {command}")
-        completed_process = shell.run_command(command, timeout=300)
-        output = completed_process.stdout or ""
-        errors = completed_process.stderr or ""
 
-        if completed_process.returncode != 0:
-            print_error(f"Error retrieving NOT_DELEGATED users: {errors}")
+        values = query_shell_ldap_attribute_values(
+            shell,
+            domain=domain,
+            ldap_filter=(
+                "(&(objectCategory=person)(objectClass=user)"
+                "(userAccountControl:1.2.840.113556.1.4.803:=1048576))"
+            ),
+            attribute="samAccountName",
+            auth_username=str(shell.domains_data[domain]["username"]),
+            auth_password=str(shell.domains_data[domain]["password"]),
+            pdc=str(shell.domains_data[domain].get("pdc") or ""),
+            prefer_kerberos=True,
+            allow_ntlm_fallback=True,
+            operation_name="NOT_DELEGATED users",
+        )
+        if values is None:
             return []
-
-        return parse_netexec_samaccountnames(output)
+        return sorted({str(value).strip() for value in values if str(value).strip()}, key=str.lower)
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_error("Error in get_not_delegated_users.")

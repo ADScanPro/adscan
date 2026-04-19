@@ -2691,6 +2691,22 @@ def run_winrm_sensitive_data_scan(
             except WinRMPSRPError as exc:
                 print_error(f"WinRM PSRP mapping failed: {exc}")
                 return {"completed": False, "error": str(exc)}
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_error(
+                    "Unexpected error during WinRM filesystem mapping "
+                    f"({type(exc).__name__})."
+                )
+                print_exception(
+                    show_locals=False,
+                    exception=exc,
+                    context={
+                        "domain": mark_sensitive(domain, "domain"),
+                        "host": mark_sensitive(host, "hostname"),
+                        "username": mark_sensitive(username, "user"),
+                    },
+                )
+                return {"completed": False, "error": str(exc), "error_type": type(exc).__name__}
             mapping_duration_seconds = time.perf_counter() - mapping_started_at
     else:
         if mapping_mode == _WINRM_MAPPING_MODE_REFRESH and os.path.exists(cache_manifest_abs):
@@ -2720,6 +2736,22 @@ def run_winrm_sensitive_data_scan(
         except WinRMPSRPError as exc:
             print_error(f"WinRM PSRP mapping failed: {exc}")
             return {"completed": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_error(
+                "Unexpected error during WinRM filesystem mapping "
+                f"({type(exc).__name__})."
+            )
+            print_exception(
+                show_locals=False,
+                exception=exc,
+                context={
+                    "domain": mark_sensitive(domain, "domain"),
+                    "host": mark_sensitive(host, "hostname"),
+                    "username": mark_sensitive(username, "user"),
+                },
+            )
+            return {"completed": False, "error": str(exc), "error_type": type(exc).__name__}
         mapping_duration_seconds = time.perf_counter() - mapping_started_at
 
     entries = list(mapping_result.get("entries") or [])

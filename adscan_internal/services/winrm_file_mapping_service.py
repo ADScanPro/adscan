@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from adscan_internal.services.windows_file_mapping_service import (
+    PowerShellCommandExecutor,
     WindowsFileMapEntry,
     WindowsFileMappingError,
     WindowsFileMappingService,
@@ -43,13 +44,17 @@ class WinRMFileMappingService(WindowsFileMappingService):
     def discover_file_system_roots(
         self,
         *,
-        psrp_service: WinRMPSRPService,
+        psrp_service: WinRMPSRPService | None = None,
+        command_executor: PowerShellCommandExecutor | None = None,
     ) -> tuple[str, ...]:
         """Discover reachable filesystem roots for one WinRM target."""
+        executor = command_executor
+        if executor is None:
+            if psrp_service is None:
+                raise TypeError("psrp_service or command_executor is required")
+            executor = self._wrap_psrp_service(psrp_service)
         try:
-            return super().discover_file_system_roots(
-                command_executor=self._wrap_psrp_service(psrp_service)
-            )
+            return super().discover_file_system_roots(command_executor=executor)
         except WindowsFileMappingError as exc:
             raise WinRMPSRPError(str(exc)) from exc
 

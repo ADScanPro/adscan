@@ -10,7 +10,8 @@ This module provides:
 
 - :func:`detect_myip_staleness` – pure staleness check, no side-effects.
 - :func:`check_and_refresh_myip` – check + auto-update ``shell.myip`` + display
-  a premium Rich warning so the user understands what changed and why.
+  a premium Rich warning so the user understands what changed and why. This
+  also initializes ``myip`` from the configured interface when it was missing.
 
 Typical call sites
 ------------------
@@ -71,21 +72,24 @@ def detect_myip_staleness(
         - ``stored_ip`` (str | None): the value originally stored.
         - ``current_ip`` (str | None): the IP currently on the interface.
         - ``is_stale`` (bool): True when stored_ip ≠ current_ip.
+        - ``is_missing`` (bool): True when an interface exists but stored_ip is
+          empty and a current interface IP can be used to initialize it.
         - ``no_ip_on_interface`` (bool): True when the interface exists but has
           no IPv4 address (VPN not connected?).
         - ``check_skipped`` (bool): True when the check could not be performed
-          (interface or stored_ip unknown).
+          because the interface is unknown.
     """
     result: dict[str, Any] = {
         "interface": interface,
         "stored_ip": stored_ip,
         "current_ip": None,
         "is_stale": False,
+        "is_missing": False,
         "no_ip_on_interface": False,
         "check_skipped": False,
     }
 
-    if not interface or not stored_ip:
+    if not interface:
         result["check_skipped"] = True
         return result
 
@@ -94,6 +98,10 @@ def detect_myip_staleness(
 
     if current_ip is None:
         result["no_ip_on_interface"] = True
+        return result
+
+    if not stored_ip:
+        result["is_missing"] = True
         return result
 
     result["is_stale"] = current_ip != stored_ip
@@ -153,6 +161,47 @@ def _display_no_ip_warning(
     )
 
 
+def _display_ip_initialized_warning(
+    *,
+    interface: str,
+    current_ip: str,
+    context: str,
+) -> None:
+    """Render a warning panel when ``myip`` is initialized from an interface."""
+    ctx_suffix = f" ({context})" if context else ""
+    marked_current = mark_sensitive(current_ip, "host")
+    print_warning(
+        f"[bold]myip[/bold] was not configured, but interface [bold cyan]{interface}[/bold cyan] "
+        f"has an IPv4 address{ctx_suffix}.",
+        items=[
+            f"Current IP:   [bold green]{marked_current}[/bold green]  [dim](auto-configured)[/dim]",
+            "ADscan needs this value for reverse-connect workflows such as Ligolo pivots.",
+        ],
+        panel=True,
+        spacing="before",
+    )
+    print_success(
+        f"myip automatically configured as [bold]{marked_current}[/bold].",
+        spacing="after",
+    )
+
+
+def _persist_myip_update(shell: Any, *, context: str) -> None:
+    """Best-effort persist of an automatic ``myip`` update."""
+    saver = getattr(shell, "save_workspace_data", None)
+    if not callable(saver):
+        saver = getattr(shell, "workspace_save", None)
+    if not callable(saver):
+        return
+    try:
+        saver()
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[myip] Failed to persist automatic myip update context={context!r}: {exc}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -206,6 +255,30 @@ def check_and_refresh_myip(
 
     current_ip = staleness["current_ip"]
 
+    if staleness["is_missing"]:
+        try:
+            _display_ip_initialized_warning(
+                interface=interface,
+                current_ip=current_ip,
+                context=context,
+            )
+        except Exception as exc:  # never let display failure block the update
+            print_info_debug(f"[myip] Display error: {exc}")
+
+        shell.myip = current_ip
+        _persist_myip_update(shell, context=context)
+        print_info_verbose(
+            f"[myip] Auto-configured: interface={interface} new={current_ip} context={context!r}"
+        )
+        telemetry.capture(
+            "myip_auto_configured",
+            {
+                "interface": interface,
+                "context": context,
+            },
+        )
+        return current_ip
+
     if not staleness["is_stale"]:
         print_info_debug(
             f"[myip] IP is current: interface={interface} myip={stored_ip}"
@@ -224,6 +297,7 @@ def check_and_refresh_myip(
         print_info_debug(f"[myip] Display error: {exc}")
 
     shell.myip = current_ip
+    _persist_myip_update(shell, context=context)
     print_info_verbose(
         f"[myip] Auto-updated: interface={interface} old={stored_ip} new={current_ip} context={context!r}"
     )

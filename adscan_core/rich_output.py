@@ -2544,6 +2544,68 @@ def print_error_debug(message: Union[str, Text], panel: bool = False, icon: str 
             _print_logger_format_fallback("DEBUG", message, level_color="cyan")
 
 
+def _format_exception_context(context: Optional[Dict[str, Any]]) -> str:
+    """Format optional exception context for file-only diagnostics."""
+    context_items = []
+    for key, value in dict(context or {}).items():
+        context_items.append(f"{key}={value}")
+    return " ".join(context_items)
+
+
+def _log_exception_to_file(
+    *,
+    message: str,
+    exception: Optional[BaseException] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist one exception traceback without changing user-facing output."""
+    import logging
+    import sys
+
+    plain_text = str(message or "Unhandled exception").strip() or "Unhandled exception"
+    context_text = _format_exception_context(context)
+    if context_text:
+        plain_text = f"{plain_text}: {context_text}"
+
+    if exception is not None:
+        exc_info: object = (type(exception), exception, exception.__traceback__)
+    else:
+        active_exc = sys.exc_info()
+        exc_info = active_exc if active_exc[0] is not None else None
+
+    logger = _get_logger()
+    try:
+        from adscan_internal import logging_config as _logging_config  # type: ignore
+
+        record = logger.makeRecord(
+            logger.name,
+            logging.ERROR,
+            "",
+            0,
+            plain_text,
+            args=(),
+            exc_info=exc_info,
+        )
+        emitted = False
+        for handler in (
+            getattr(_logging_config, "_file_handler", None),
+            getattr(_logging_config, "_workspace_file_handler", None),
+        ):
+            if handler is None:
+                continue
+            try:
+                handler.emit(record)
+                emitted = True
+            except Exception:
+                continue
+        if emitted:
+            return
+    except Exception:
+        pass
+
+    logger.error(plain_text, exc_info=exc_info, stacklevel=3)
+
+
 def print_instruction(
     message: Union[str, Text], panel: bool = False, spacing: str = "auto"
 ):
@@ -3082,17 +3144,25 @@ def print_group(messages: List[tuple], group_title: Optional[str] = None):
             telemetry_console.print(group_renderable)
 
 
-def print_exception(show_locals: bool = False, exception: Optional[Exception] = None):
+def print_exception(
+    show_locals: bool = False,
+    exception: Optional[Exception] = None,
+    *,
+    context: Optional[Dict[str, Any]] = None,
+):
     """Print exception traceback with Rich formatting.
 
     **IMPORTANT**: Tracebacks are only shown when `SECRET_MODE = True` to protect
     internal implementation details. When `SECRET_MODE = False`, only a generic
-    error message is displayed to end users.
+    error message is displayed to end users. Full traceback details are still
+    persisted to ADscan log files through the centralized Rich logging pipeline.
 
     Args:
         show_locals: If True, show local variables in traceback (default: False)
         exception: Optional exception object to extract message from. If None, uses
             the current exception context (must be called within except block).
+        context: Optional key/value diagnostics for the file log. Values should
+            already be wrapped with ``mark_sensitive`` when sensitive.
 
     Examples:
         try:
@@ -3102,6 +3172,11 @@ def print_exception(show_locals: bool = False, exception: Optional[Exception] = 
             # In normal mode: shows generic error message
             print_exception(show_locals=True, exception=e)
     """
+    _log_exception_to_file(
+        message="Exception rendered via print_exception",
+        exception=exception,
+        context=context,
+    )
     console = _get_console()
     telemetry_console = _get_telemetry_console()
 

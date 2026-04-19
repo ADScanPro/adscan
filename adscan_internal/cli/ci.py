@@ -134,6 +134,16 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
 
     shell.type = args.type
     shell.interface = args.interface
+    try:
+        from adscan_internal.services.myip_staleness import check_and_refresh_myip
+
+        check_and_refresh_myip(shell, context="ci_start")
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_verbose(
+            "CI could not auto-configure myip from the selected interface: "
+            f"{mark_sensitive(str(exc), 'detail')}"
+        )
     shell.auto = True
 
     def _run_auto_auth() -> bool:

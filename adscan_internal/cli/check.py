@@ -75,6 +75,7 @@ _RUNTIME_PYTHON_DEPENDENCIES = (
     ("magic", "python-magic", "used for runtime file type detection"),
     ("rustworkx", "rustworkx", "used for runtime attack-graph processing"),
     ("neo4j", "neo4j", "used for BloodHound/Neo4j-backed runtime integrations"),
+    ("redis", "redis", "used for web service interactive prompt delegation"),
 )
 _RUNTIME_PYTHON_DISTRIBUTION_NAMES = {
     "netifaces": "netifaces",
@@ -95,6 +96,7 @@ _RUNTIME_PYTHON_DISTRIBUTION_NAMES = {
     "magic": "python-magic",
     "rustworkx": "rustworkx",
     "neo4j": "neo4j",
+    "redis": "redis",
 }
 
 

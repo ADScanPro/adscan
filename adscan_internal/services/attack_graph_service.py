@@ -1248,8 +1248,8 @@ def _should_validate_domain_sid(
 
 def _lookup_domain_sid_via_ldap(shell: object, domain: str) -> str | None:
     try:
-        from adscan_internal.integrations.netexec.parsers import (
-            parse_netexec_ldap_query_attribute_values,
+        from adscan_internal.services.ldap_query_service import (
+            query_shell_ldap_attribute_values,
         )
     except Exception:
         return None
@@ -1260,46 +1260,27 @@ def _lookup_domain_sid_via_ldap(shell: object, domain: str) -> str | None:
     domain_entry = domains_data.get(domain)
     if not isinstance(domain_entry, dict):
         return None
-    netexec_path = getattr(shell, "netexec_path", None)
-    if not netexec_path:
-        return None
-
     auth_username = domain_entry.get("username")
     auth_password = domain_entry.get("password")
     pdc = domain_entry.get("pdc")
     if not auth_username or not auth_password or not pdc:
         return None
 
-    kerberos = bool(domain_entry.get("kerberos_tickets"))
-    auth_str = shell.build_auth_nxc(  # type: ignore[attr-defined]
-        str(auth_username),
-        str(auth_password),
-        str(domain),
-        kerberos=kerberos,
-    )
-    marked_user = mark_sensitive(str(auth_username), "user")
-    marked_pass = mark_sensitive(str(auth_password), "password")
-    marked_domain = mark_sensitive(str(domain), "domain")
-    marked_pdc = mark_sensitive(
-        str(pdc),
-        "ip" if str(pdc).replace(".", "").isdigit() else "hostname",
-    )
-    auth_str = auth_str.replace(str(auth_username), str(marked_user)).replace(
-        str(auth_password), str(marked_pass)
-    )
-    auth_str = auth_str.replace(str(domain), str(marked_domain))
-
     query = f"(&(objectClass=domain)(name={domain}))"
-    command = f'{netexec_path} ldap {marked_pdc} {auth_str} --query "{query}" objectSid'
-    print_info_debug(f"[membership] domain SID LDAP command: {command}")
-    runner = getattr(shell, "_run_netexec", None)
-    if callable(runner):
-        result = runner(command, domain=domain)  # type: ignore[misc]
-    else:
-        result = shell.run_command(command)  # type: ignore[attr-defined]
-    if not result or result.returncode != 0:
+    sids = query_shell_ldap_attribute_values(
+        shell,
+        domain=domain,
+        ldap_filter=query,
+        attribute="objectSid",
+        auth_username=str(auth_username),
+        auth_password=str(auth_password),
+        pdc=str(pdc),
+        prefer_kerberos=True,
+        allow_ntlm_fallback=True,
+        operation_name="domain SID lookup",
+    )
+    if sids is None:
         return None
-    sids = parse_netexec_ldap_query_attribute_values(result.stdout or "", "objectSid")
     sids = [sid.strip() for sid in sids if str(sid).strip()]
     if not sids:
         return None
@@ -1308,15 +1289,12 @@ def _lookup_domain_sid_via_ldap(shell: object, domain: str) -> str | None:
 
 def _lookup_user_sid_via_ldap(shell: object, domain: str, username: str) -> str | None:
     try:
-        from adscan_internal.integrations.netexec.parsers import (
-            parse_netexec_ldap_query_attribute_values,
+        from adscan_internal.services.ldap_query_service import (
+            query_shell_ldap_attribute_values,
         )
     except Exception:
         return None
     domain_entry = getattr(shell, "domains_data", {}).get(domain, {})
-    netexec_path = getattr(shell, "netexec_path", None)
-    if not netexec_path:
-        return None
 
     auth_username = domain_entry.get("username")
     auth_password = domain_entry.get("password")
@@ -1324,36 +1302,21 @@ def _lookup_user_sid_via_ldap(shell: object, domain: str, username: str) -> str 
     if not auth_username or not auth_password or not pdc:
         return None
 
-    kerberos = bool(domain_entry.get("kerberos_tickets"))
-    auth_str = shell.build_auth_nxc(  # type: ignore[attr-defined]
-        str(auth_username),
-        str(auth_password),
-        str(domain),
-        kerberos=kerberos,
-    )
-    marked_user = mark_sensitive(str(auth_username), "user")
-    marked_pass = mark_sensitive(str(auth_password), "password")
-    marked_domain = mark_sensitive(str(domain), "domain")
-    marked_pdc = mark_sensitive(
-        str(pdc),
-        "ip" if str(pdc).replace(".", "").isdigit() else "hostname",
-    )
-    auth_str = auth_str.replace(str(auth_username), str(marked_user)).replace(
-        str(auth_password), str(marked_pass)
-    )
-    auth_str = auth_str.replace(str(domain), str(marked_domain))
-
     query = f"(&(objectCategory=person)(objectClass=user)(sAMAccountName={username}))"
-    command = f'{netexec_path} ldap {marked_pdc} {auth_str} --query "{query}" objectSid'
-    print_info_debug(f"[membership] user SID LDAP command: {command}")
-    runner = getattr(shell, "_run_netexec", None)
-    if callable(runner):
-        result = runner(command, domain=domain)  # type: ignore[misc]
-    else:
-        result = shell.run_command(command)  # type: ignore[attr-defined]
-    if not result or result.returncode != 0:
+    sids = query_shell_ldap_attribute_values(
+        shell,
+        domain=domain,
+        ldap_filter=query,
+        attribute="objectSid",
+        auth_username=str(auth_username),
+        auth_password=str(auth_password),
+        pdc=str(pdc),
+        prefer_kerberos=True,
+        allow_ntlm_fallback=True,
+        operation_name="user SID lookup",
+    )
+    if sids is None:
         return None
-    sids = parse_netexec_ldap_query_attribute_values(result.stdout or "", "objectSid")
     sids = [sid.strip() for sid in sids if str(sid).strip()]
     if not sids:
         return None
@@ -10110,8 +10073,13 @@ def upsert_cve_takeover_edge(
     cve: str,
     status: str = "discovered",
     notes: dict[str, Any] | None = None,
+    vulnerable_dc_labels: list[str] | None = None,
 ) -> bool:
-    """Upsert a CVE takeover edge: Domain Users -> CVE -> Domain.
+    """Upsert CVE takeover edges: Domain Users -> CVE -> DC (one edge per vulnerable DC).
+
+    Creates one edge per vulnerable DC computer node so the paths align with
+    how BloodHound models these CVEs (Computer targets, not Domain node).
+    Falls back to the domain node only when no DC labels are available.
 
     Args:
         shell: Shell instance used for workspace paths and BloodHound service access.
@@ -10119,6 +10087,7 @@ def upsert_cve_takeover_edge(
         cve: "nopac" or "zerologon" (case-insensitive).
         status: Edge status (default: discovered).
         notes: Optional notes (e.g., affected DC IPs, log path).
+        vulnerable_dc_labels: SAM account names / hostnames of vulnerable DCs.
     """
     cve_norm = (cve or "").strip().lower()
     if cve_norm not in {"nopac", "zerologon"}:
@@ -10127,17 +10096,33 @@ def upsert_cve_takeover_edge(
     relation = "NoPac" if cve_norm == "nopac" else "Zerologon"
     graph = load_attack_graph(shell, domain)
     entry_id = ensure_entry_node_for_domain(shell, domain, graph, label="Domain Users")
-    domain_id = ensure_domain_node_for_domain(shell, domain, graph)
 
-    upsert_edge(
-        graph,
-        from_id=entry_id,
-        to_id=domain_id,
-        relation=relation,
-        edge_type="cve_takeover",
-        status=status,
-        notes=notes,
-    )
+    dc_labels = [lbl for lbl in (vulnerable_dc_labels or []) if lbl]
+    if dc_labels:
+        for dc_label in dc_labels:
+            dc_id = ensure_computer_node_for_domain(shell, domain, graph, principal=dc_label)
+            upsert_edge(
+                graph,
+                from_id=entry_id,
+                to_id=dc_id,
+                relation=relation,
+                edge_type="cve_takeover",
+                status=status,
+                notes=notes,
+            )
+    else:
+        # Fallback: no DC info available — edge to domain node
+        domain_id = ensure_domain_node_for_domain(shell, domain, graph)
+        upsert_edge(
+            graph,
+            from_id=entry_id,
+            to_id=domain_id,
+            relation=relation,
+            edge_type="cve_takeover",
+            status=status,
+            notes=notes,
+        )
+
     save_attack_graph(shell, domain, graph)
     return True
 

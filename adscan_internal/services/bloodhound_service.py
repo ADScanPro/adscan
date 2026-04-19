@@ -901,6 +901,7 @@ class BloodHoundService(BaseService):
         domain: str,
         *,
         user: Optional[str] = None,
+        users: Optional[List[str]] = None,
         scan_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Get password last change data for one user or the full domain."""
@@ -912,7 +913,11 @@ class BloodHoundService(BaseService):
         )
 
         try:
-            records = self.client.get_password_last_change(domain, user=user)
+            records = self.client.get_password_last_change(
+                domain,
+                user=user,
+                users=users,
+            )
             self._emit_progress(
                 scan_id=scan_id,
                 phase="bloodhound_user_enumeration",
@@ -924,6 +929,7 @@ class BloodHoundService(BaseService):
                 extra={
                     "domain": domain,
                     "user": user,
+                    "users_count": len(users) if users else None,
                     "count": len(records),
                 },
             )

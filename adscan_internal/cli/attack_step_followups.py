@@ -775,15 +775,13 @@ def _iter_rodc_krbtgt_candidates_from_bloodhound(shell: Any, *, domain: str) -> 
 
 
 def _iter_rodc_krbtgt_candidates_from_ldap(shell: Any, *, domain: str) -> list[str]:
-    """Return per-RODC krbtgt usernames via authenticated NetExec LDAP query."""
-    from adscan_internal.integrations.netexec.parsers import (
-        parse_netexec_ldap_query_attribute_values,
+    """Return per-RODC krbtgt usernames via authenticated native LDAP query."""
+    from adscan_internal.services.ldap_query_service import (
+        query_shell_ldap_attribute_values,
     )
 
     domain_data = getattr(shell, "domains_data", {}).get(domain, {})
     if not isinstance(domain_data, dict):
-        return []
-    if not getattr(shell, "netexec_path", None):
         return []
 
     pdc = str(domain_data.get("pdc") or "").strip()
@@ -792,36 +790,23 @@ def _iter_rodc_krbtgt_candidates_from_ldap(shell: Any, *, domain: str) -> list[s
     if not pdc or not username or not password:
         return []
 
-    build_auth = getattr(shell, "build_auth_nxc", None)
-    if not callable(build_auth):
-        return []
-    runner = getattr(shell, "_run_netexec", None)
-    if not callable(runner):
-        return []
-
-    auth = build_auth(username, password, domain, kerberos=True)
-    command = (
-        f"{shell.netexec_path} ldap {pdc} {auth} "
-        "--query '(&(objectCategory=person)(objectClass=user)(sAMAccountName=krbtgt_*))' "
-        "sAMAccountName"
-    )
-
     try:
-        completed_process = runner(
-            command,
+        values = query_shell_ldap_attribute_values(
+            shell,
             domain=domain,
-            timeout=180,
-            shell=True,
-            capture_output=True,
-            text=True,
+            ldap_filter="(&(objectCategory=person)(objectClass=user)(sAMAccountName=krbtgt_*))",
+            attribute="sAMAccountName",
+            auth_username=username,
+            auth_password=password,
+            pdc=pdc,
+            prefer_kerberos=True,
+            allow_ntlm_fallback=True,
+            operation_name="RODC krbtgt candidate lookup",
         )
     except Exception:
         return []
-    if not completed_process or getattr(completed_process, "returncode", 1) != 0:
+    if values is None:
         return []
-
-    output = f"{completed_process.stdout or ''}\n{completed_process.stderr or ''}"
-    values = parse_netexec_ldap_query_attribute_values(output, "sAMAccountName")
 
     seen: set[str] = set()
     ordered: list[str] = []

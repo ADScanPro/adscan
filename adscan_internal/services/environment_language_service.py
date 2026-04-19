@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from adscan_internal.services.membership_snapshot import load_membership_snapshot
-from adscan_internal.integrations.netexec.parsers import parse_netexec_samaccountnames
+from adscan_internal.services.ldap_query_service import query_shell_ldap_attribute_values
 from adscan_internal.workspaces import domain_subpath
 
 
@@ -235,44 +235,32 @@ def _iter_bloodhound_usernames(shell: Any, *, domain: str) -> list[str]:
 
 
 def _iter_ldap_usernames(shell: Any, *, domain: str) -> list[str]:
-    """Return usernames inferred from a lightweight authenticated NetExec LDAP query."""
+    """Return usernames inferred from a lightweight authenticated LDAP query."""
     domain_data = getattr(shell, "domains_data", {}).get(domain, {}) or {}
-    if not getattr(shell, "netexec_path", None):
-        return []
     pdc = str(domain_data.get("pdc") or "").strip()
     username = str(domain_data.get("username") or "").strip()
     password = str(domain_data.get("password") or "").strip()
     if not pdc or not username or not password:
         return []
-    build_auth = getattr(shell, "build_auth_nxc", None)
-    if not callable(build_auth):
-        return []
-    runner = getattr(shell, "_run_netexec", None)
-    if not callable(runner):
-        return []
-
-    auth = build_auth(username, password, domain, kerberos=True)
-    command = (
-        f"{shell.netexec_path} ldap {pdc} {auth} "
-        "--query '(&(objectCategory=person)(objectClass=user))' samAccountName"
-    )
 
     try:
-        completed_process = runner(
-            command,
+        values = query_shell_ldap_attribute_values(
+            shell,
             domain=domain,
-            timeout=180,
-            shell=True,
-            capture_output=True,
-            text=True,
+            ldap_filter="(&(objectCategory=person)(objectClass=user))",
+            attribute="samAccountName",
+            auth_username=username,
+            auth_password=password,
+            pdc=pdc,
+            prefer_kerberos=True,
+            allow_ntlm_fallback=True,
+            operation_name="environment language username sample",
         )
     except Exception:
         return []
-    if not completed_process or getattr(completed_process, "returncode", 1) != 0:
+    if values is None:
         return []
 
-    output = f"{completed_process.stdout or ''}\n{completed_process.stderr or ''}"
-    values = parse_netexec_samaccountnames(output)
     seen: set[str] = set()
     ordered: list[str] = []
     for value in values:
