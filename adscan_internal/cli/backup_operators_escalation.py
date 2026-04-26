@@ -30,6 +30,8 @@ from adscan_internal.services.attack_graph_runtime_service import (
     update_active_step_status,
 )
 from adscan_internal.services.attack_graph_service import (
+    load_attack_graph,
+    resolve_domain_node_record_for_domain,
     update_edge_status_by_labels,
 )
 from adscan_internal.workspaces import domain_subpath
@@ -52,8 +54,7 @@ _SYSVOL_FILES = (
 _SYSVOL_SHARE_FILES = ("SAM", "SYSTEM", "SECURITY")
 _BACKUP_OPS_RELATION = "backup_operator"
 _BACKUP_OPS_GROUP_LABEL = "Backup Operators"
-_BACKUP_OPS_DA_RELATION = "DumpRegistries"
-_DOMAIN_ADMINS_LABEL = "Domain Admins"
+_BACKUP_OPS_GRAPH_RELATION = "BackupOperatorEscalation"
 
 
 def _extract_dc_hostname(output: str) -> str | None:
@@ -197,12 +198,17 @@ def _update_backup_ops_da_edge(
     status: str,
     notes: dict[str, object] | None = None,
 ) -> None:
+    graph = load_attack_graph(shell, domain)
+    domain_record = resolve_domain_node_record_for_domain(shell, domain, graph=graph)
+    domain_label = str(
+        domain_record.get("label") or domain_record.get("name") or domain
+    ).strip()
     update_edge_status_by_labels(
         shell,
         domain,
         from_label=_BACKUP_OPS_GROUP_LABEL,
-        relation=_BACKUP_OPS_DA_RELATION,
-        to_label=_DOMAIN_ADMINS_LABEL,
+        relation=_BACKUP_OPS_GRAPH_RELATION,
+        to_label=domain_label,
         status=status,
         notes=notes,
     )
@@ -213,7 +219,7 @@ def record_backup_ops_discovered(shell: Any, *, domain: str, username: str) -> N
         shell,
         domain=domain,
         status="discovered",
-        notes={"action": _BACKUP_OPS_DA_RELATION},
+        notes={"action": _BACKUP_OPS_GRAPH_RELATION},
     )
 
 
@@ -506,7 +512,7 @@ def offer_backup_operators_escalation(
                     shell,
                     domain=domain,
                     status="discovered",
-                    notes={"action": _BACKUP_OPS_DA_RELATION, "skipped": True},
+                    notes={"action": _BACKUP_OPS_GRAPH_RELATION, "skipped": True},
                 )
                 return False
 
@@ -521,7 +527,7 @@ def offer_backup_operators_escalation(
             shell,
             domain=domain,
             status="attempted",
-            notes={"action": _BACKUP_OPS_DA_RELATION},
+            notes={"action": _BACKUP_OPS_GRAPH_RELATION},
         )
         update_active_step_status(
             shell,
@@ -730,7 +736,7 @@ def offer_backup_operators_escalation(
             shell,
             domain=domain,
             status="success",
-            notes={"action": _BACKUP_OPS_DA_RELATION},
+            notes={"action": _BACKUP_OPS_GRAPH_RELATION},
         )
         update_active_step_status(
             shell,

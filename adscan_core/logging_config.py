@@ -19,14 +19,25 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 from adscan_core.path_utils import expand_effective_user_path, get_adscan_home
+from adscan_core.sensitive import strip_sensitive_markers
 
 
 # Global logger instance (initialized by init_logging)
 _logger: Optional[logging.Logger] = None
 _console_handler: Optional[RichHandler] = None
 _file_handler: Optional[RotatingFileHandler] = None
+_debug_file_handler: Optional[RotatingFileHandler] = None
 _workspace_file_handler: Optional[RotatingFileHandler] = None
+_workspace_debug_file_handler: Optional[RotatingFileHandler] = None
 _telemetry_console_handler: Optional[RichHandler] = None
+
+
+class MarkerStrippingFormatter(logging.Formatter):
+    """Formatter that strips invisible sensitivity markers from rendered logs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        return strip_sensitive_markers(rendered)
 
 
 def _diag_enabled() -> bool:
@@ -123,7 +134,8 @@ def init_logging(
     Returns:
         Configured logger instance
     """
-    global _logger, _console_handler, _file_handler, _workspace_file_handler
+    global _logger, _console_handler, _file_handler, _debug_file_handler
+    global _workspace_file_handler, _workspace_debug_file_handler
     global _telemetry_console_handler
 
     # CRITICAL: Preserve active verbose/debug modes from rich_output if they're already active
@@ -192,10 +204,12 @@ def init_logging(
     # CRITICAL: Preserve existing handlers BEFORE clearing handlers
     # This prevents losing debug/verbose mode and telemetry during module re-execution (e.g., PyInstaller).
     preserved_console_level = None
-    if _console_handler is not None:
+    if _console_handler is not None and (debug_mode or verbose_mode):
         existing_level = _console_handler.level
-        if existing_level <= logging.INFO:  # DEBUG (10) or INFO (20)
-            # Existing handler has better level, preserve it even if reinitializing with worse values
+        requested_level = logging.DEBUG if debug_mode else logging.INFO
+        if existing_level <= requested_level:
+            # Preserve an already-more-permissive console level only while the
+            # active runtime mode still asks for verbose/debug console logging.
             preserved_console_level = existing_level
 
     # Preserve existing telemetry handler if it exists, but only if console hasn't changed
@@ -249,6 +263,7 @@ def init_logging(
 
     # Global file handler (always active, INFO+ by default) - best-effort.
     file_handler: RotatingFileHandler | None = None
+    debug_file_handler: RotatingFileHandler | None = None
     if log_dir is not None:
         try:
             log_file = log_dir / "adscan.log"
@@ -263,17 +278,36 @@ def init_logging(
             # still receive DEBUG in all modes.
             file_handler.setLevel(logging.INFO)
             file_handler.setFormatter(
-                logging.Formatter(
+                MarkerStrippingFormatter(
                     "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S",
                 )
             )
             logger.addHandler(file_handler)
+
+            debug_log_file = log_dir / "adscan.debug.log"
+            debug_file_handler = RotatingFileHandler(
+                debug_log_file,
+                maxBytes=25 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+            debug_file_handler.setLevel(logging.DEBUG)
+            debug_file_handler.setFormatter(
+                MarkerStrippingFormatter(
+                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            logger.addHandler(debug_file_handler)
         except PermissionError:
             file_handler = None
+            debug_file_handler = None
         except Exception:
             file_handler = None
+            debug_file_handler = None
     _file_handler = file_handler
+    _debug_file_handler = debug_file_handler
 
     # Workspace-specific file handler (if workspace_dir is provided)
     if workspace_dir:
@@ -281,6 +315,7 @@ def init_logging(
             workspace_log_dir = Path(workspace_dir) / "logs"
             workspace_log_dir.mkdir(parents=True, exist_ok=True)
             workspace_log_file = workspace_log_dir / "adscan.log"
+            workspace_debug_log_file = workspace_log_dir / "adscan.debug.log"
             workspace_file_handler = RotatingFileHandler(
                 workspace_log_file,
                 maxBytes=10 * 1024 * 1024,  # 10 MB
@@ -290,19 +325,38 @@ def init_logging(
             # Same policy as the global file handler: INFO+ by default.
             workspace_file_handler.setLevel(logging.INFO)
             workspace_file_handler.setFormatter(
-                logging.Formatter(
+                MarkerStrippingFormatter(
                     "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S",
                 )
             )
             logger.addHandler(workspace_file_handler)
             _workspace_file_handler = workspace_file_handler
+
+            workspace_debug_file_handler = RotatingFileHandler(
+                workspace_debug_log_file,
+                maxBytes=25 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+            workspace_debug_file_handler.setLevel(logging.DEBUG)
+            workspace_debug_file_handler.setFormatter(
+                MarkerStrippingFormatter(
+                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            logger.addHandler(workspace_debug_file_handler)
+            _workspace_debug_file_handler = workspace_debug_file_handler
         except PermissionError:
             _workspace_file_handler = None
+            _workspace_debug_file_handler = None
         except Exception:
             _workspace_file_handler = None
+            _workspace_debug_file_handler = None
     else:
         _workspace_file_handler = None
+        _workspace_debug_file_handler = None
 
     # Console handler (Rich, conditional based on verbose/debug mode)
     console_handler = RichHandler(
@@ -724,7 +778,7 @@ def update_workspace_logging(workspace_dir: Optional[Path]):
     Args:
         workspace_dir: Workspace directory path. If None, removes workspace handler.
     """
-    global _logger, _workspace_file_handler
+    global _logger, _workspace_file_handler, _workspace_debug_file_handler
 
     if _logger is None:
         return
@@ -734,6 +788,10 @@ def update_workspace_logging(workspace_dir: Optional[Path]):
         _logger.removeHandler(_workspace_file_handler)
         _workspace_file_handler.close()
         _workspace_file_handler = None
+    if _workspace_debug_file_handler is not None:
+        _logger.removeHandler(_workspace_debug_file_handler)
+        _workspace_debug_file_handler.close()
+        _workspace_debug_file_handler = None
 
     # Add new workspace handler if workspace_dir is provided
     if workspace_dir:
@@ -741,6 +799,7 @@ def update_workspace_logging(workspace_dir: Optional[Path]):
             workspace_log_dir = Path(workspace_dir) / "logs"
             workspace_log_dir.mkdir(parents=True, exist_ok=True)
             workspace_log_file = workspace_log_dir / "adscan.log"
+            workspace_debug_log_file = workspace_log_dir / "adscan.debug.log"
             workspace_file_handler = RotatingFileHandler(
                 workspace_log_file,
                 maxBytes=10 * 1024 * 1024,  # 10 MB
@@ -755,17 +814,35 @@ def update_workspace_logging(workspace_dir: Optional[Path]):
             else:
                 workspace_file_handler.setLevel(logging.INFO)
             workspace_file_handler.setFormatter(
-                logging.Formatter(
+                MarkerStrippingFormatter(
                     "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S",
                 )
             )
             _logger.addHandler(workspace_file_handler)
             _workspace_file_handler = workspace_file_handler
+
+            workspace_debug_file_handler = RotatingFileHandler(
+                workspace_debug_log_file,
+                maxBytes=25 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+            workspace_debug_file_handler.setLevel(logging.DEBUG)
+            workspace_debug_file_handler.setFormatter(
+                MarkerStrippingFormatter(
+                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            _logger.addHandler(workspace_debug_file_handler)
+            _workspace_debug_file_handler = workspace_debug_file_handler
         except PermissionError:
             _workspace_file_handler = None
+            _workspace_debug_file_handler = None
         except Exception:
             _workspace_file_handler = None
+            _workspace_debug_file_handler = None
 
 
 def log_to_file_only(level: int, message: str):
@@ -778,7 +855,8 @@ def log_to_file_only(level: int, message: str):
         level: Logging level (logging.DEBUG, logging.INFO, etc.)
         message: Message to log
     """
-    global _file_handler, _workspace_file_handler
+    global _file_handler, _debug_file_handler
+    global _workspace_file_handler, _workspace_debug_file_handler
 
     logger = get_logger()
 
@@ -796,7 +874,11 @@ def log_to_file_only(level: int, message: str):
     # Emit to global file handler
     if _file_handler is not None:
         _file_handler.emit(record)
+    if _debug_file_handler is not None:
+        _debug_file_handler.emit(record)
 
     # Emit to workspace file handler if present
     if _workspace_file_handler is not None:
         _workspace_file_handler.emit(record)
+    if _workspace_debug_file_handler is not None:
+        _workspace_debug_file_handler.emit(record)

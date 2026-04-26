@@ -20,7 +20,6 @@ import os
 import re
 import shlex
 import subprocess
-import tempfile
 
 from adscan_internal import (
     print_error,
@@ -55,6 +54,7 @@ except ImportError:
     KerberosTicketService = None  # type: ignore[assignment, misc]
 
 from adscan_internal.services.hashcat_service import HashcatCrackingService
+from adscan_internal.services.weakpass_service import WeakpassService
 from adscan_internal.services.cracking_history_service import (
     build_cracking_attempt,
     find_matching_attempt,
@@ -146,7 +146,6 @@ class CrackingShell(Protocol):
 class HashCrackingShell(Protocol):
     """Minimal shell surface required for weakpass hash cracking."""
 
-    weakpass_path: str | None
     domains_data: dict
 
     def run_command(
@@ -398,9 +397,7 @@ def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
         has_gpu = bool(
             re.search(r"Type\s*\.+?:\s*(GPU|Accelerator)\b", output, re.IGNORECASE)
         )
-        has_cpu_opencl = bool(
-            re.search(r"Type\s*\.+?:\s*CPU\b", output, re.IGNORECASE)
-        )
+        has_cpu_opencl = bool(re.search(r"Type\s*\.+?:\s*CPU\b", output, re.IGNORECASE))
         no_devices = _HASHCAT_NO_DEVICE_TEXT.lower() in output.lower()
 
         if force_cpu and has_cpu_opencl:
@@ -517,7 +514,10 @@ def _is_benign_hashcat_stderr(stderr: str) -> bool:
     if not lines:
         return False
     return all(
-        any(pattern.lower() in line.lower() for pattern in _HASHCAT_BENIGN_STDERR_PATTERNS)
+        any(
+            pattern.lower() in line.lower()
+            for pattern in _HASHCAT_BENIGN_STDERR_PATTERNS
+        )
         for line in lines
     )
 
@@ -612,9 +612,7 @@ def run_cracking(
         else HashcatBackendSelection(args=(), label="N/A", is_available=True)
     )
     if hashcat_mode != "Unknown" and not backend_selection.is_available:
-        print_error(
-            "hashcat could not find a usable compute device for cracking."
-        )
+        print_error("hashcat could not find a usable compute device for cracking.")
         print_warning(_hashcat_no_device_guidance())
         print_info_debug(
             "hashcat -I output (first 40 lines):\n"
@@ -999,7 +997,7 @@ def handle_hash_cracking(
     """Attempt to crack an NTLM hash with weakpass.
 
     Args:
-        shell: Shell instance with weakpass_path, license_mode, and helper methods.
+        shell: Shell instance with cracking helpers and runtime context.
         domain: Domain name for the credential.
         user: Username for the credential.
         cred: NTLM hash to crack.
@@ -1011,19 +1009,24 @@ def handle_hash_cracking(
     """
     try:
         marked_cred = mark_sensitive(cred, "password")
-        command = f"{shell.weakpass_path} -H {marked_cred}"
         marked_user = mark_sensitive(user, "user")
         print_info_verbose(f"Attempting to crack NTLM hash for user '{marked_user}'...")
-        print_info_debug(f"Command: {command}")
-        proc = shell.run_command(command)
+        print_info_debug("Weakpass lookup mode: internal HTTP client")
+        service = WeakpassService()
+        result = service.lookup_hash(cred)
 
-        if (
-            isinstance(proc, subprocess.CompletedProcess)
-            and proc.returncode == 0
-            and proc.stdout
-            and "Cracked hash" in proc.stdout
-        ):
-            password = proc.stdout.split(":")[-1].strip()
+        if result.used_insecure_tls_fallback:
+            print_warning(
+                "Weakpass TLS verification failed in this environment. "
+                "Falling back to an unverified HTTPS request for this best-effort public lookup."
+            )
+            print_info_debug(
+                f"[weakpass] insecure TLS fallback used for hash {marked_cred}: "
+                f"reason={mark_sensitive(str(result.error or 'ssl_verification_failed'), 'error')}"
+            )
+
+        if result.password:
+            password = result.password
             marked_user = mark_sensitive(user, "user")
             marked_password = mark_sensitive(password, "password")
             print_warning(
@@ -1031,11 +1034,16 @@ def handle_hash_cracking(
             )
             return password, False
 
-        if isinstance(proc, subprocess.CompletedProcess):
-            marked_user = mark_sensitive(user, "user")
-            print_info_verbose(
-                f"Could not crack the hash for user '{marked_user}'. Proceeding with the hash."
+        if result.error:
+            print_info_debug(
+                f"[weakpass] lookup failed for hash {marked_cred}: "
+                f"error={mark_sensitive(result.error, 'error')}"
             )
+
+        marked_user = mark_sensitive(user, "user")
+        print_info_verbose(
+            f"Could not crack the hash for user '{marked_user}'. Proceeding with the hash."
+        )
     except Exception as e:  # pragma: no cover - mirrors legacy best-effort handling
         telemetry.capture_exception(e)
         print_error("An unexpected error occurred during hash cracking.")
@@ -1050,7 +1058,7 @@ def handle_hash_cracking_batch(
     """Attempt to crack multiple NTLM hashes with a single weakpass call.
 
     Args:
-        shell: Shell instance with weakpass_path and run_command.
+        shell: Shell instance with cracking helpers and runtime context.
         hashes: Candidate NTLM hashes (32 hex chars). Duplicates are allowed.
 
     Returns:
@@ -1058,8 +1066,6 @@ def handle_hash_cracking_batch(
         hashes. Missing entries indicate "not cracked".
     """
     if not hashes:
-        return {}
-    if not getattr(shell, "weakpass_path", None):
         return {}
 
     valid_hashes: list[str] = []
@@ -1076,72 +1082,63 @@ def handle_hash_cracking_batch(
     if not valid_hashes:
         return {}
 
-    temp_file_path = ""
     cracked_by_hash: dict[str, str] = {}
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            delete=False,
-            prefix="adscan-weakpass-",
-            suffix=".txt",
-        ) as temp_file:
-            temp_file.write("\n".join(valid_hashes))
-            temp_file.write("\n")
-            temp_file_path = temp_file.name
-
-        command = (
-            f"{shell.weakpass_path} -f {shlex.quote(temp_file_path)} "
-            f"-w {max(4, min(32, len(valid_hashes)))}"
-        )
-        masked_temp_file = mark_sensitive(temp_file_path, "path")
-        command_for_log = (
-            f"{shell.weakpass_path} -f {masked_temp_file} "
-            f"-w {max(4, min(32, len(valid_hashes)))}"
-        )
         print_info_verbose(
             f"Attempting batch NTLM crack for {len(valid_hashes)} hash(es)..."
         )
-        print_info_debug(f"Command: {command_for_log}")
-        proc = shell.run_command(command)
-        stdout = proc.stdout if isinstance(proc, subprocess.CompletedProcess) else ""
+        print_info_debug(
+            f"Weakpass batch lookup mode: internal HTTP client "
+            f"(workers={max(4, min(32, len(valid_hashes)))})"
+        )
+        service = WeakpassService()
+        results = service.lookup_hashes(
+            valid_hashes,
+            max_workers=max(4, min(32, len(valid_hashes))),
+        )
 
-        for raw_line in str(stdout or "").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            match = re.search(
-                r"Cracked hash:\s*([0-9a-fA-F]{32})\s*:(.*)$",
-                line,
+        insecure_fallback_used = any(
+            result.used_insecure_tls_fallback for result in results.values()
+        )
+        if insecure_fallback_used and service.consume_tls_fallback_notice():
+            print_warning(
+                "Weakpass TLS verification failed in this environment. "
+                "Falling back to unverified HTTPS requests for this best-effort public lookup."
             )
-            if not match:
-                continue
-            hash_key = match.group(1).lower()
-            password = match.group(2).strip()
-            if password:
-                cracked_by_hash[hash_key] = password
 
-        # weakpass bulk mode usually writes cracked pairs to `<input>_cracked.txt`.
-        # Parse that file when stdout only contains summary lines.
-        cracked_output_file = f"{os.path.splitext(temp_file_path)[0]}_cracked.txt"
-        if os.path.exists(cracked_output_file):
-            try:
-                with open(cracked_output_file, "r", encoding="utf-8") as output_handle:
-                    for raw_line in output_handle:
-                        line = raw_line.strip()
-                        if not line or ":" not in line:
-                            continue
-                        hash_value, password = line.split(":", 1)
-                        hash_key = hash_value.strip().lower()
-                        plain_value = password.strip()
-                        if re.fullmatch(r"[0-9a-f]{32}", hash_key) and plain_value:
-                            cracked_by_hash[hash_key] = plain_value
-            except Exception as file_exc:  # pragma: no cover - best effort only
-                telemetry.capture_exception(file_exc)
-                print_warning_debug(
-                    "Failed to parse weakpass cracked output file; "
-                    "continuing with stdout-derived results."
-                )
+        for hash_key, result in results.items():
+            if result.password:
+                cracked_by_hash[hash_key] = result.password
+
+        error_results = {
+            hash_key: result
+            for hash_key, result in results.items()
+            if getattr(result, "error", None)
+        }
+        tls_failed_count = sum(
+            1 for result in results.values() if getattr(result, "tls_verification_failed", False)
+        )
+        fallback_count = sum(
+            1 for result in results.values() if getattr(result, "used_insecure_tls_fallback", False)
+        )
+        missing_result_count = max(len(valid_hashes) - len(results), 0)
+        if error_results or tls_failed_count or fallback_count or missing_result_count:
+            print_info_debug(
+                "[weakpass] batch diagnostics: "
+                f"requested={len(valid_hashes)} returned={len(results)} "
+                f"cracked={len(cracked_by_hash)} errors={len(error_results)} "
+                f"tls_failed={tls_failed_count} insecure_fallback={fallback_count} "
+                f"missing_results={missing_result_count}"
+            )
+        for hash_key, result in list(error_results.items())[:10]:
+            print_info_debug(
+                f"[weakpass] batch lookup failed for hash {mark_sensitive(hash_key, 'password')}: "
+                f"error={mark_sensitive(str(result.error), 'error')}"
+            )
+        if len(error_results) > 10:
+            print_info_debug(
+                f"[weakpass] {len(error_results) - 10} additional batch lookup error(s) omitted."
+            )
 
         print_info_verbose(
             f"Batch NTLM crack finished: {len(cracked_by_hash)}/{len(valid_hashes)} hash(es) cracked."
@@ -1150,22 +1147,6 @@ def handle_hash_cracking_batch(
         telemetry.capture_exception(e)
         print_error("An unexpected error occurred during batch hash cracking.")
         print_exception(show_locals=False, exception=e)
-    finally:
-        if temp_file_path:
-            try:
-                os.unlink(temp_file_path)
-            except OSError:
-                pass
-            cracked_output_file = f"{os.path.splitext(temp_file_path)[0]}_cracked.txt"
-            uncracked_output_file = (
-                f"{os.path.splitext(temp_file_path)[0]}_uncracked.txt"
-            )
-            for auxiliary_file in (cracked_output_file, uncracked_output_file):
-                try:
-                    if os.path.exists(auxiliary_file):
-                        os.unlink(auxiliary_file)
-                except OSError:
-                    pass
 
     return cracked_by_hash
 
@@ -1504,7 +1485,10 @@ def execute_cracking(
                 attempted_users = set(_extract_hash_users(hash))
                 cracked_users = set(creds.keys())
                 for username, password in creds.items():
-                    if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES or hash_type == "timeroast":
+                    if (
+                        hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES
+                        or hash_type == "timeroast"
+                    ):
                         try:
                             from adscan_internal.services.attack_graph_service import (
                                 update_roast_entry_edge_status,

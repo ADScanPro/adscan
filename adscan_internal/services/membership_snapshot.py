@@ -11,7 +11,7 @@ from adscan_internal.rich_output import (
     print_exception,
     print_info_debug,
 )
-from adscan_internal.workspaces import domain_subpath, read_json_file
+from adscan_internal.workspaces import domain_subpath, read_json_file, write_json_file
 from adscan_internal.services import attack_paths_core
 from adscan_internal.services.cache_metrics import (
     copy_stats,
@@ -59,6 +59,143 @@ def membership_snapshot_path(shell: object, domain: str) -> str:
     domains_dir = getattr(shell, "domains_dir", "domains")
     path = domain_subpath(workspace_cwd, domains_dir, domain, "memberships.json")
     return path
+
+
+def _canonical_membership_label(domain: str, value: str) -> str:
+    """Return the canonical ``NAME@DOMAIN`` membership label."""
+    raw = str(value or "").strip()
+    domain_clean = str(domain or "").strip()
+    if not raw:
+        return ""
+    if "\\" in raw:
+        raw_domain, _, raw_name = raw.partition("\\")
+        raw = raw_name or raw
+        if raw_domain and "." in raw_domain:
+            domain_clean = raw_domain
+    if "@" in raw:
+        left, _, right = raw.partition("@")
+        if left and right:
+            return f"{left.strip().upper()}@{right.strip().upper()}"
+    if not domain_clean:
+        return raw.strip().upper()
+    return f"{raw.strip().upper()}@{domain_clean.upper()}"
+
+
+def _invalidate_membership_snapshot_cache(domain: str) -> None:
+    """Invalidate in-memory cache for one domain after a snapshot mutation."""
+    domain_key = str(domain or "").strip().lower()
+    if not domain_key:
+        return
+    _MEMBERSHIP_SNAPSHOT_CACHE.pop(domain_key, None)
+    _MEMBERSHIP_SNAPSHOT_MTIME.pop(domain_key, None)
+    _MEMBERSHIP_SNAPSHOT_CACHE_LOGGED.discard(domain_key)
+
+
+def add_runtime_user_group_membership(
+    shell: object,
+    domain: str,
+    *,
+    username: str,
+    group_name: str,
+    source: str,
+    evidence: dict[str, Any] | None = None,
+) -> bool:
+    """Persist an effective runtime user-to-group membership in ``memberships.json``.
+
+    This helper is intended for attack outcomes that create effective access for
+    ADscan's graph engine without necessarily changing the LDAP ``memberOf``
+    attribute, for example ESC13 PAC group authorization from a certificate.
+
+    Args:
+        shell: Shell object used to resolve the workspace path.
+        domain: AD domain.
+        username: User receiving effective membership.
+        group_name: Group that should be considered effective for path search.
+        source: Short source identifier for auditability.
+        evidence: Optional structured evidence to persist.
+
+    Returns:
+        True when the snapshot was created or updated, otherwise False.
+    """
+    user_label = _canonical_membership_label(domain, username)
+    group_label = _canonical_membership_label(domain, group_name)
+    if not user_label or not group_label:
+        return False
+
+    path = membership_snapshot_path(shell, domain)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = read_json_file(path) if os.path.exists(path) else {}
+    if not isinstance(data, dict):
+        data = {}
+
+    user_to_groups = data.setdefault("user_to_groups", {})
+    if not isinstance(user_to_groups, dict):
+        user_to_groups = {}
+        data["user_to_groups"] = user_to_groups
+
+    current_groups = user_to_groups.setdefault(user_label, [])
+    if not isinstance(current_groups, list):
+        current_groups = []
+        user_to_groups[user_label] = current_groups
+
+    changed = False
+    if group_label not in current_groups:
+        current_groups.append(group_label)
+        current_groups.sort(key=str.lower)
+        changed = True
+
+    group_labels = data.setdefault("group_labels", [])
+    if not isinstance(group_labels, list):
+        group_labels = []
+        data["group_labels"] = group_labels
+    if group_label not in group_labels:
+        group_labels.append(group_label)
+        group_labels.sort(key=str.lower)
+        changed = True
+
+    data.setdefault("computer_to_groups", {})
+    data.setdefault("group_to_parents", {})
+    data.setdefault("label_to_sid", {})
+    data.setdefault("sid_to_label", {})
+
+    runtime_memberships = data.setdefault("runtime_memberships", [])
+    if not isinstance(runtime_memberships, list):
+        runtime_memberships = []
+        data["runtime_memberships"] = runtime_memberships
+    runtime_key = (user_label, group_label, str(source or "").strip())
+    existing_runtime = {
+        (
+            str(item.get("user") or ""),
+            str(item.get("group") or ""),
+            str(item.get("source") or ""),
+        )
+        for item in runtime_memberships
+        if isinstance(item, dict)
+    }
+    if runtime_key not in existing_runtime:
+        runtime_memberships.append(
+            {
+                "user": user_label,
+                "group": group_label,
+                "source": str(source or "runtime").strip() or "runtime",
+                "evidence": evidence or {},
+            }
+        )
+        changed = True
+
+    if not changed:
+        return False
+
+    write_json_file(path, data)
+    _invalidate_membership_snapshot_cache(domain)
+    print_info_debug(
+        "[membership] runtime membership persisted: "
+        f"user={mark_sensitive(user_label, 'user')} "
+        f"group={mark_sensitive(group_label, 'group')} "
+        f"source={mark_sensitive(str(source), 'detail')} "
+        f"path={mark_sensitive(path, 'path')}"
+    )
+    return True
 
 
 def load_membership_snapshot(
@@ -202,6 +339,7 @@ def load_membership_snapshot(
 
 
 __all__ = [
+    "add_runtime_user_group_membership",
     "get_membership_snapshot_cache_stats",
     "load_membership_snapshot",
     "membership_snapshot_path",

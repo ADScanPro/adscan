@@ -93,6 +93,8 @@ _BUILTIN_PERFORMANCE_LOG_USERS_RID = 559
 _BUILTIN_DISTRIBUTED_COM_USERS_RID = 562
 _CRYPTOGRAPHIC_OPERATORS_RID = 569
 _CERT_PUBLISHERS_RID = 517
+_SCHEMA_ADMINS_RID = 518
+_ENTERPRISE_ADMINS_RID = 519
 _KEY_ADMINS_RID = 526
 _ENTERPRISE_KEY_ADMINS_RID = 527
 _DNSADMINS_RID = 1101
@@ -141,6 +143,8 @@ class PrivilegedGroupMembership:
     """Structured privileged membership flags for a principal."""
 
     domain_admin: bool = False
+    enterprise_admins: bool = False
+    schema_admins: bool = False
     administrators: bool = False
     backup_operators: bool = False
     read_only_domain_controllers: bool = False
@@ -160,6 +164,8 @@ class PrivilegedGroupMembership:
         """Return a dict compatible with existing `check_privileged_groups` callers."""
         return {
             "domain_admin": bool(self.domain_admin),
+            "enterprise_admins": bool(self.enterprise_admins),
+            "schema_admins": bool(self.schema_admins),
             "Administrators": bool(self.administrators),
             "backup_operators": bool(self.backup_operators),
             "read_only_domain_controllers": bool(self.read_only_domain_controllers),
@@ -630,6 +636,8 @@ def classify_privileged_membership_from_group_sids(
         - BUILTIN\\Account Operators (RID 548)
     """
     domain_admin = False
+    enterprise_admins = False
+    schema_admins = False
     administrators = False
     backup_operators = False
     read_only_domain_controllers = False
@@ -655,6 +663,10 @@ def classify_privileged_membership_from_group_sids(
         # Domain-specific: Domain Admins.
         if rid == 512:
             domain_admin = True
+        elif rid == _ENTERPRISE_ADMINS_RID:
+            enterprise_admins = True
+        elif rid == _SCHEMA_ADMINS_RID:
+            schema_admins = True
         elif rid == _CERT_PUBLISHERS_RID:
             cert_publishers = True
         elif rid == _READ_ONLY_DOMAIN_CONTROLLERS_RID:
@@ -685,6 +697,8 @@ def classify_privileged_membership_from_group_sids(
 
         if (
             domain_admin
+            and enterprise_admins
+            and schema_admins
             and administrators
             and backup_operators
             and read_only_domain_controllers
@@ -702,6 +716,8 @@ def classify_privileged_membership_from_group_sids(
 
     return PrivilegedGroupMembership(
         domain_admin=domain_admin,
+        enterprise_admins=enterprise_admins,
+        schema_admins=schema_admins,
         administrators=administrators,
         backup_operators=backup_operators,
         read_only_domain_controllers=read_only_domain_controllers,
@@ -725,6 +741,8 @@ def classify_privileged_membership(
 ) -> PrivilegedGroupMembership:
     """Classify privileged memberships using SIDs first, then normalized group names."""
     base = classify_privileged_membership_from_group_sids(group_sids or [])
+    enterprise_admins = False
+    schema_admins = False
     cert_publishers = False
     read_only_domain_controllers = False
     key_admins = False
@@ -756,6 +774,16 @@ def classify_privileged_membership(
             distinguished_name=str(distinguished_name or ""),
         ):
             exchange_windows_permissions = True
+        if not enterprise_admins and (
+            sid_rid(str(sid or "")) == _ENTERPRISE_ADMINS_RID
+            or normalize_group_name(str(name or "")) == "enterprise admins"
+        ):
+            enterprise_admins = True
+        if not schema_admins and (
+            sid_rid(str(sid or "")) == _SCHEMA_ADMINS_RID
+            or normalize_group_name(str(name or "")) == "schema admins"
+        ):
+            schema_admins = True
         if not account_operators and (
             sid_rid(str(sid or "")) == _BUILTIN_ACCOUNT_OPERATORS_RID
             or is_account_operators_group_name(str(name or ""))
@@ -818,6 +846,8 @@ def classify_privileged_membership(
 
     return PrivilegedGroupMembership(
         domain_admin=base.domain_admin,
+        enterprise_admins=enterprise_admins or base.enterprise_admins,
+        schema_admins=schema_admins or base.schema_admins,
         administrators=base.administrators,
         backup_operators=base.backup_operators,
         read_only_domain_controllers=(

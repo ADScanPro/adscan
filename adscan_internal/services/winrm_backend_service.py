@@ -40,6 +40,7 @@ def build_winrm_backend(
     username: str,
     password: str,
     auth_mode: str = "auto",
+    kerberos_spn_host: str | None = None,
 ) -> WinRMExecutionBackend:
     """Return the default reusable WinRM backend implementation.
 
@@ -53,6 +54,7 @@ def build_winrm_backend(
         username=username,
         password=password,
         auth_mode=auth_mode,
+        kerberos_spn_host=kerberos_spn_host,
     )
     return WinRMLogonBypassService(
         domain=domain,

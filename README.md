@@ -4,7 +4,7 @@
 
 # ADscan - Active Directory Pentesting CLI
 
-[![Version](https://img.shields.io/badge/version-7.2.0--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
+[![Version](https://img.shields.io/badge/version-8.0.0--lite-blue.svg)](https://github.com/ADscanPro/adscan/releases)
 [![downloads](https://static.pepy.tech/badge/adscan)](https://pepy.tech/projects/adscan)
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](https://github.com/ADscanPro/adscan/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://github.com/ADscanPro/adscan)

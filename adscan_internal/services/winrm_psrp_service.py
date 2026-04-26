@@ -86,12 +86,14 @@ class WinRMPSRPService:
         username: str,
         password: str,
         auth_mode: str = "auto",
+        kerberos_spn_host: str | None = None,
     ) -> None:
         self.domain = domain
         self.host = host
         self.username = username
         self.password = password
         self.auth_mode = str(auth_mode or "auto").strip().lower() or "auto"
+        self.kerberos_spn_host = str(kerberos_spn_host or "").strip() or None
         self._client = None
         self._client_auth_settings: WinRMPSRPAuthSettings | None = None
 
@@ -150,7 +152,7 @@ class WinRMPSRPService:
             username=username,
             password=password,
             kerberos_ticket_path=kerberos_ticket_path,
-            negotiate_hostname_override=self.host
+            negotiate_hostname_override=(self.kerberos_spn_host or self.host)
             if effective_auth in {"kerberos", "negotiate"}
             else None,
             negotiate_service="HTTP"
@@ -223,11 +225,7 @@ class WinRMPSRPService:
             f"service={mark_sensitive(str(auth_settings.negotiate_service or '-'), 'text')}, "
             f"spn_host={mark_sensitive(str(auth_settings.negotiate_hostname_override or self.host), 'hostname')}, "
             f"ccache={mark_sensitive(str(krb5ccname or '-'), 'path')}"
-            + (
-                f", note={mark_sensitive(note, 'text')}"
-                if note
-                else ""
-            )
+            + (f", note={mark_sensitive(note, 'text')}" if note else "")
         )
 
     @staticmethod
@@ -306,7 +304,9 @@ class WinRMPSRPService:
             return {"tool": "klist", "available": False, "error": str(exc)}
 
         output = f"{result.stdout or ''}\n{result.stderr or ''}"
-        normalized_lines = [line.strip() for line in output.splitlines() if line.strip()]
+        normalized_lines = [
+            line.strip() for line in output.splitlines() if line.strip()
+        ]
         default_principal = None
         server_principals: list[str] = []
         for line in normalized_lines:
@@ -345,15 +345,27 @@ class WinRMPSRPService:
         impacket_diag = self._read_ccache_diagnostics_with_impacket(ticket_path)
         klist_diag = self._read_ccache_diagnostics_with_klist(ticket_path)
 
-        impacket_servers = impacket_diag.get("server_principals", []) if isinstance(impacket_diag, dict) else []
+        impacket_servers = (
+            impacket_diag.get("server_principals", [])
+            if isinstance(impacket_diag, dict)
+            else []
+        )
         if isinstance(impacket_servers, list):
-            impacket_servers = [str(item).strip() for item in impacket_servers if str(item).strip()]
+            impacket_servers = [
+                str(item).strip() for item in impacket_servers if str(item).strip()
+            ]
         else:
             impacket_servers = []
 
-        klist_servers = klist_diag.get("server_principals", []) if isinstance(klist_diag, dict) else []
+        klist_servers = (
+            klist_diag.get("server_principals", [])
+            if isinstance(klist_diag, dict)
+            else []
+        )
         if isinstance(klist_servers, list):
-            klist_servers = [str(item).strip() for item in klist_servers if str(item).strip()]
+            klist_servers = [
+                str(item).strip() for item in klist_servers if str(item).strip()
+            ]
         else:
             klist_servers = []
 
@@ -420,20 +432,30 @@ class WinRMPSRPService:
         has_tgt = False
 
         if isinstance(impacket_diag, dict):
-            primary_principal = str(impacket_diag.get("primary_principal") or "").strip() or None
+            primary_principal = (
+                str(impacket_diag.get("primary_principal") or "").strip() or None
+            )
             raw_servers = impacket_diag.get("server_principals", [])
             if isinstance(raw_servers, list):
-                server_principals = [str(item).strip() for item in raw_servers if str(item).strip()]
+                server_principals = [
+                    str(item).strip() for item in raw_servers if str(item).strip()
+                ]
             has_tgt = bool(impacket_diag.get("has_tgt"))
 
         if not primary_principal and isinstance(klist_diag, dict):
-            primary_principal = str(klist_diag.get("default_principal") or "").strip() or None
+            primary_principal = (
+                str(klist_diag.get("default_principal") or "").strip() or None
+            )
         if not server_principals and isinstance(klist_diag, dict):
             raw_servers = klist_diag.get("server_principals", [])
             if isinstance(raw_servers, list):
-                server_principals = [str(item).strip() for item in raw_servers if str(item).strip()]
+                server_principals = [
+                    str(item).strip() for item in raw_servers if str(item).strip()
+                ]
         if not has_tgt:
-            has_tgt = any(item.lower().startswith("krbtgt/") for item in server_principals)
+            has_tgt = any(
+                item.lower().startswith("krbtgt/") for item in server_principals
+            )
 
         service_ticket_only = bool(server_principals) and not has_tgt
         return WinRMPSRPCcacheDiagnosticsSummary(
@@ -505,10 +527,7 @@ class WinRMPSRPService:
         effective_auth = auth_settings or self._resolve_auth_settings()
         if self._client is not None and self._client_auth_settings is None:
             return self._client
-        if (
-            self._client is None
-            or self._client_auth_settings != effective_auth
-        ):
+        if self._client is None or self._client_auth_settings != effective_auth:
             try:
                 self._client = self._build_client(effective_auth)
                 self._client_auth_settings = effective_auth
@@ -555,8 +574,7 @@ class WinRMPSRPService:
         except Exception as exc:
             fallback_auth = self._retry_auth_settings_with_wsmam_fallback(auth_settings)
             if not (
-                fallback_auth
-                and self._is_matching_credential_not_found_error(exc)
+                fallback_auth and self._is_matching_credential_not_found_error(exc)
             ):
                 raise
             self._log_auth_debug(
@@ -606,7 +624,9 @@ class WinRMPSRPService:
                 summarize_execution_result(synthetic_result)
             )
             script_hash = hashlib.sha1((script or "").encode("utf-8")).hexdigest()[:12]
-            script_lines = len([line for line in (script or "").splitlines() if line.strip()])
+            script_lines = len(
+                [line for line in (script or "").splitlines() if line.strip()]
+            )
             print_info_debug(
                 "[winrm_psrp] Result: "
                 f"host={mark_sensitive(self.host, 'hostname')}, "
@@ -830,6 +850,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         total_chunks = (file_size + chunk_size - 1) // chunk_size
 
         try:
+
             def _upload_operation(client, _auth_settings):
                 with RunspacePool(client.wsman) as pool:
                     temp_file_path = ""
@@ -900,7 +921,9 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         except WinRMPSRPError:
             raise
         except Exception as exc:  # pragma: no cover - runtime specific
-            raise WinRMPSRPError(f"WinRM upload failed for {remote_path}: {exc}") from exc
+            raise WinRMPSRPError(
+                f"WinRM upload failed for {remote_path}: {exc}"
+            ) from exc
 
     @staticmethod
     def _escape_ps_single_quoted(value: str) -> str:
@@ -911,7 +934,10 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         """Build a PowerShell script that stages selected files into one ZIP."""
         manifest_json = json.dumps(
             [
-                {"RemotePath": remote_path, "RelativePath": relative_path.replace("/", "\\")}
+                {
+                    "RemotePath": remote_path,
+                    "RelativePath": relative_path.replace("/", "\\"),
+                }
                 for remote_path, relative_path in files
             ]
         )
@@ -956,6 +982,7 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
     @staticmethod
     def _build_archive_cleanup_script(*, archive_path: str, stage_root: str) -> str:
         """Build a PowerShell cleanup script for remote staging artifacts."""
+
         def _quoted(value: str) -> str:
             return "'" + value.replace("'", "''") + "'"
 
@@ -972,14 +999,24 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
         download_dir: str,
     ) -> WinRMPSRPBatchFetchResult:
         """Stage selected remote files into one ZIP, fetch it, and extract locally."""
-        file_list = [(remote_path, relative_path) for remote_path, relative_path in files if remote_path and relative_path]
+        file_list = [
+            (remote_path, relative_path)
+            for remote_path, relative_path in files
+            if remote_path and relative_path
+        ]
         if not file_list:
-            return WinRMPSRPBatchFetchResult(downloaded_files=[], staged_file_count=0, skipped_files=[])
+            return WinRMPSRPBatchFetchResult(
+                downloaded_files=[], staged_file_count=0, skipped_files=[]
+            )
 
         os.makedirs(download_dir, exist_ok=True)
-        stage_result = self.execute_powershell(self._build_archive_stage_script(files=file_list))
+        stage_result = self.execute_powershell(
+            self._build_archive_stage_script(files=file_list)
+        )
         if stage_result.had_errors and not stage_result.stdout.strip():
-            raise WinRMPSRPError(stage_result.stderr or "WinRM PSRP archive staging failed.")
+            raise WinRMPSRPError(
+                stage_result.stderr or "WinRM PSRP archive staging failed."
+            )
 
         archive_path = ""
         stage_root = ""
@@ -998,7 +1035,8 @@ if ($ChunkType -eq 1 -or $ChunkType -eq 3) {
                         str(item.get("Reason") or "").strip(),
                     )
                     for item in skipped_payload
-                    if isinstance(item, dict) and str(item.get("RemotePath") or "").strip()
+                    if isinstance(item, dict)
+                    and str(item.get("RemotePath") or "").strip()
                 ]
         except (json.JSONDecodeError, AttributeError) as exc:
             raise WinRMPSRPError(

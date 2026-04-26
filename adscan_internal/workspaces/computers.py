@@ -217,6 +217,8 @@ def resolve_domain_service_target_file(
                 return str(service_ips), source
         except OSError:
             pass
+        if report_has_current_vantage_scan:
+            return None, f"{service_name}_no_open_hosts_current_vantage"
 
     if preference in {"optimized", "reachable"}:
         try:

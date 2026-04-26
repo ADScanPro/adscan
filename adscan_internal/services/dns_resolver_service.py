@@ -32,6 +32,97 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.services.base_service import BaseService
 
+DEFAULT_PUBLIC_DNS_RESOLVERS = ("1.1.1.1", "8.8.8.8", "8.8.4.4")
+KNOWN_PUBLIC_DNS_RESOLVERS = {
+    "1.1.1.1",
+    "1.0.0.1",
+    "8.8.8.8",
+    "8.8.4.4",
+    "9.9.9.9",
+    "149.112.112.112",
+}
+
+
+def get_public_dns_mode() -> str:
+    """Return ADscan's public DNS policy for root-zone forwarding.
+
+    Modes:
+        prefer-public: Put public resolvers before inherited host resolvers.
+        inherit: Preserve host/Docker resolvers first.
+        disabled: Do not add known public resolvers.
+    """
+    legacy_allowed = str(os.environ.get("ADSCAN_ALLOW_PUBLIC_DNS", "1")).strip() == "1"
+    if not legacy_allowed:
+        return "disabled"
+
+    raw_mode = str(os.environ.get("ADSCAN_PUBLIC_DNS_MODE", "") or "").strip().lower()
+    if not raw_mode:
+        return (
+            "prefer-public"
+            if str(os.environ.get("ADSCAN_CONTAINER_RUNTIME", "")).strip() == "1"
+            else "inherit"
+        )
+    aliases = {
+        "prefer": "prefer-public",
+        "public": "prefer-public",
+        "prefer_public": "prefer-public",
+        "prefer-public": "prefer-public",
+        "inherit": "inherit",
+        "host": "inherit",
+        "system": "inherit",
+        "off": "disabled",
+        "false": "disabled",
+        "no": "disabled",
+        "disabled": "disabled",
+    }
+    return aliases.get(raw_mode, "inherit")
+
+
+def get_public_dns_resolvers() -> list[str]:
+    """Return configured public DNS resolvers in priority order."""
+    raw_resolvers = str(os.environ.get("ADSCAN_PUBLIC_DNS_RESOLVERS", "") or "").strip()
+    if not raw_resolvers:
+        return list(DEFAULT_PUBLIC_DNS_RESOLVERS)
+
+    resolvers: list[str] = []
+    for raw in re.split(r"[\s,]+", raw_resolvers):
+        candidate = raw.strip()
+        if not candidate or candidate in resolvers:
+            continue
+        resolvers.append(candidate)
+    return resolvers or list(DEFAULT_PUBLIC_DNS_RESOLVERS)
+
+
+def build_root_forwarders(
+    *,
+    existing_root: list[str],
+    local_nameservers: list[str],
+    is_loopback_ip: Callable[[str], bool],
+) -> list[str]:
+    """Build ordered root forwarders according to the public DNS policy."""
+    mode = get_public_dns_mode()
+    root_forwarders: list[str] = []
+
+    def _append(candidate: str | None) -> None:
+        ns = str(candidate or "").strip()
+        if not ns or is_loopback_ip(ns):
+            return
+        if mode == "disabled" and ns in KNOWN_PUBLIC_DNS_RESOLVERS:
+            return
+        if ns not in root_forwarders:
+            root_forwarders.append(ns)
+
+    if mode == "prefer-public":
+        for resolver in get_public_dns_resolvers():
+            _append(resolver)
+
+    for ns in existing_root or []:
+        _append(ns)
+    for ns in local_nameservers or []:
+        _append(ns)
+
+    return root_forwarders
+
 
 def normalize_dns_like(value: str) -> str:
     """Normalize domain/FQDN-like tokens for comparison."""

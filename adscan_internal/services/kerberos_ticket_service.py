@@ -272,6 +272,34 @@ class KerberosTicketService(BaseService):
             KerberosTGTResult instance with operation outcome.
         """
         try:
+            credential_path = str(credential or "").strip()
+            if credential_path.lower().endswith(".ccache"):
+                path_obj = Path(credential_path).expanduser()
+                if path_obj.exists():
+                    resolved_path = str(path_obj.resolve())
+                    self.logger.debug(
+                        "Reusing existing Kerberos ccache for %s@%s at %s",
+                        username,
+                        domain,
+                        resolved_path,
+                    )
+                    return KerberosTGTResult(
+                        username=username,
+                        domain=domain,
+                        ticket_path=resolved_path,
+                        method="existing_ccache",
+                        success=True,
+                        error_message=None,
+                    )
+                return KerberosTGTResult(
+                    username=username,
+                    domain=domain,
+                    ticket_path=None,
+                    method="existing_ccache",
+                    success=False,
+                    error_message=f"Kerberos ccache not found: {credential_path}",
+                )
+
             is_ntlm_hash = self._is_ntlm_credential(credential)
 
             if is_ntlm_hash:
@@ -682,8 +710,8 @@ class KerberosTicketService(BaseService):
             )
         )
 
-        exit_code, stdout_count, stderr_count, duration_text = summarize_execution_result(
-            result
+        exit_code, stdout_count, stderr_count, duration_text = (
+            summarize_execution_result(result)
         )
         self.logger.debug(
             "%s result: exit_code=%s, stdout_lines=%s, stderr_lines=%s, duration=%s",
@@ -1473,10 +1501,7 @@ class KerberosTicketService(BaseService):
             or "doesn't exist" in lowered_output
             or not ticket_path
         ):
-            msg = (
-                output_text
-                or "getST.py did not report a saved ticket path"
-            )
+            msg = output_text or "getST.py did not report a saved ticket path"
             self.logger.warning(
                 "getST.py returned an unusable result for %s@%s: %s",
                 target_user,

@@ -16,6 +16,7 @@ from typing import Any, Optional
 import subprocess
 import re
 import shlex
+from pathlib import Path
 
 from adscan_internal.core import EventBus, LicenseMode
 from adscan_internal.command_runner import (
@@ -70,6 +71,7 @@ class PassTheCertificateResult:
         resolved_domain: Parsed domain component (from principal or fallback
             to ``domain`` argument).
         nt_hash: Extracted NT hash (if any).
+        ticket_path: Extracted Kerberos ccache path (if any).
         raw_output: Combined stdout/stderr from Certipy.
         success: Whether the operation appears to have succeeded.
         error_message: Optional human-readable error description.
@@ -80,9 +82,26 @@ class PassTheCertificateResult:
     username: Optional[str]
     resolved_domain: Optional[str]
     nt_hash: Optional[str]
+    ticket_path: Optional[str]
     raw_output: str
     success: bool
     error_message: Optional[str] = None
+
+
+def _extract_ccache_path_from_output(output: str) -> str | None:
+    """Extract one generated Kerberos ccache path from Certipy output."""
+    patterns = (
+        r"Saved (?:credential cache|TGT) to(?: file)? ['\"]?([^'\"\s]+\.ccache)['\"]?",
+        r"Saving ticket in ['\"]?([^'\"\s]+\.ccache)['\"]?",
+        r"['\"]([^'\"]+\.ccache)['\"]",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            candidate = str(match.group(1) or "").strip()
+            if candidate:
+                return candidate
+    return None
 
 
 class CertipyService(BaseService):
@@ -108,6 +127,7 @@ class CertipyService(BaseService):
         username: Optional[str] = None,
         timeout: int = 300,
         shell: Any | None = None,
+        cwd: str | None = None,
     ) -> PassTheCertificateResult:
         """Run Certipy ``auth -pfx`` and parse the resulting NT hash.
 
@@ -123,6 +143,7 @@ class CertipyService(BaseService):
             shell: Optional shell instance that provides ``run_command``. When
                 provided, this uses the centralized command runner (consistent
                 output/logging/clean env) instead of raw ``subprocess.run``.
+            cwd: Optional working directory where Certipy should write artifacts.
 
         Returns:
             PassTheCertificateResult with parsed principal and NT hash.
@@ -162,7 +183,10 @@ class CertipyService(BaseService):
         try:
             completed: subprocess.CompletedProcess[str] | None
             if shell is not None and hasattr(shell, "run_command"):
-                completed = shell.run_command(command, timeout=timeout)
+                try:
+                    completed = shell.run_command(command, timeout=timeout, cwd=cwd)
+                except TypeError:
+                    completed = shell.run_command(command, timeout=timeout)
             else:
                 env = (
                     get_clean_env_for_compilation()
@@ -178,6 +202,7 @@ class CertipyService(BaseService):
                         text=True,
                         check=False,
                         env=env,
+                        cwd=cwd,
                     )
                 )
         except subprocess.TimeoutExpired as exc:
@@ -188,6 +213,7 @@ class CertipyService(BaseService):
                 username=None,
                 resolved_domain=None,
                 nt_hash=None,
+                ticket_path=None,
                 raw_output=output,
                 success=False,
                 error_message="Certipy auth command timed out",
@@ -199,6 +225,7 @@ class CertipyService(BaseService):
                 username=None,
                 resolved_domain=None,
                 nt_hash=None,
+                ticket_path=None,
                 raw_output="",
                 success=False,
                 error_message=str(exc),
@@ -206,7 +233,9 @@ class CertipyService(BaseService):
 
         if completed is None:
             # Central command runner returns None on timeout/errors; it stores context on the shell.
-            last_error = getattr(shell, "_last_run_command_error", None) if shell else None
+            last_error = (
+                getattr(shell, "_last_run_command_error", None) if shell else None
+            )
             err_kind = last_error[0] if last_error else "error"
             if err_kind == "timeout":
                 err_msg = (
@@ -229,17 +258,18 @@ class CertipyService(BaseService):
                 username=None,
                 resolved_domain=None,
                 nt_hash=None,
+                ticket_path=None,
                 raw_output="",
                 success=False,
                 error_message=err_msg,
             )
 
         if result_is_timeout(completed, tool_name="certipy"):
-            timeout_error = (
-                "Certipy auth command timed out. Verify VPN/network connectivity to the target and retry."
-            )
+            timeout_error = "Certipy auth command timed out. Verify VPN/network connectivity to the target and retry."
             print_error(timeout_error)
-            print_instruction("Verify VPN/network connectivity to the target and retry.")
+            print_instruction(
+                "Verify VPN/network connectivity to the target and retry."
+            )
             output = (completed.stdout or "") + (completed.stderr or "")
             return PassTheCertificateResult(
                 domain=domain,
@@ -247,13 +277,14 @@ class CertipyService(BaseService):
                 username=None,
                 resolved_domain=None,
                 nt_hash=None,
+                ticket_path=None,
                 raw_output=output,
                 success=False,
                 error_message=timeout_error,
             )
 
-        exit_code, stdout_count, stderr_count, duration_text = summarize_execution_result(
-            completed
+        exit_code, stdout_count, stderr_count, duration_text = (
+            summarize_execution_result(completed)
         )
         print_info_debug(
             "[certipy] Result: "
@@ -266,15 +297,14 @@ class CertipyService(BaseService):
 
         output = (completed.stdout or "") + (completed.stderr or "")
         if output_has_timeout_marker(output):
-            timeout_error = (
-                "Certipy auth command timed out. Verify VPN/network connectivity to the target and retry."
-            )
+            timeout_error = "Certipy auth command timed out. Verify VPN/network connectivity to the target and retry."
             return PassTheCertificateResult(
                 domain=domain,
                 principal=None,
                 username=None,
                 resolved_domain=None,
                 nt_hash=None,
+                ticket_path=None,
                 raw_output=output,
                 success=False,
                 error_message=timeout_error,
@@ -292,6 +322,7 @@ class CertipyService(BaseService):
                 username=None,
                 resolved_domain=None,
                 nt_hash=None,
+                ticket_path=None,
                 raw_output=output,
                 success=False,
                 error_message=lab_error,
@@ -305,16 +336,21 @@ class CertipyService(BaseService):
         )
         if not match:
             identity_error = None
-            if re.search(r"Could not find identity", output, re.IGNORECASE) or re.search(
+            if re.search(
+                r"Could not find identity", output, re.IGNORECASE
+            ) or re.search(
                 r"Username or domain is not specified", output, re.IGNORECASE
             ):
-                identity_error = "Certipy could not resolve identity from the certificate"
+                identity_error = (
+                    "Certipy could not resolve identity from the certificate"
+                )
             return PassTheCertificateResult(
                 domain=domain,
                 principal=None,
                 username=None,
                 resolved_domain=None,
                 nt_hash=None,
+                ticket_path=None,
                 raw_output=output,
                 success=False,
                 error_message=identity_error
@@ -331,12 +367,17 @@ class CertipyService(BaseService):
             username = principal
             resolved_domain = domain
 
+        ticket_path = _extract_ccache_path_from_output(output)
+        if ticket_path and cwd and not ticket_path.startswith("/"):
+            ticket_path = str((Path(cwd) / ticket_path).resolve())
+
         return PassTheCertificateResult(
             domain=domain,
             principal=principal,
             username=username,
             resolved_domain=resolved_domain,
             nt_hash=nt_hash,
+            ticket_path=ticket_path,
             raw_output=output,
             success=True,
         )

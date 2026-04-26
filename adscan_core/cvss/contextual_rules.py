@@ -491,7 +491,21 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         # a confirmed compromise state, not CVSS. If it means "KRBTGT password
         # hygiene issue", it is posture. Split the catalog key later if needed.
         cvss_vector=None,
-        elevation_rules=[],
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.8,
+                reason=(
+                    "KRBTGT secret material was recovered or validated — "
+                    "Golden Ticket persistence is available"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=9.0,
+                reason="KRBTGT/Tier-0 credential exposure affects the Kerberos trust root",
+            ),
+        ],
     ),
 
     # ------------------------------------------------------------------
@@ -529,11 +543,18 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
-                condition=CONDITION_DC_TARGETS,
-                elevated_score=9.0,
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.2,
                 reason=(
-                    "Coercion path reaches DC-related relay targets — "
-                    "domain-impacting relay chain is plausible"
+                    "Coercion was chained into confirmed relay/certificate/LDAP abuse"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=8.8,
+                reason=(
+                    "Coercion affects Domain Controllers, but no relay outcome was "
+                    "confirmed; treat as a high-risk attack-chain prerequisite"
                 ),
             ),
         ],
@@ -542,10 +563,18 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
-                condition=CONDITION_DC_TARGETS,
-                elevated_score=9.0,
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.2,
                 reason=(
-                    "DFSCoerce path reaches DC-related relay targets"
+                    "DFSCoerce was chained into confirmed relay/certificate/LDAP abuse"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=8.8,
+                reason=(
+                    "DFSCoerce affects Domain Controllers, but no relay outcome was "
+                    "confirmed; treat as a high-risk attack-chain prerequisite"
                 ),
             ),
         ],
@@ -554,10 +583,18 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
-                condition=CONDITION_DC_TARGETS,
-                elevated_score=9.0,
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.2,
                 reason=(
-                    "MS-EFSRPC coercion path reaches DC-related relay targets"
+                    "MS-EFSRPC coercion was chained into confirmed relay/certificate/LDAP abuse"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=8.8,
+                reason=(
+                    "MS-EFSRPC coercion affects Domain Controllers, but no relay "
+                    "outcome was confirmed; treat as a high-risk attack-chain prerequisite"
                 ),
             ),
         ],
@@ -566,10 +603,15 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.0,
+                reason="PrinterBug coercion was chained into confirmed relay abuse",
+            ),
+            CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
                 elevated_score=8.8,
                 reason=(
-                    "PrinterBug coercion path reaches DC-related relay targets"
+                    "PrinterBug coercion affects Domain Controllers, but no relay outcome was confirmed"
                 ),
             ),
         ],
@@ -585,6 +627,43 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 reason=(
                     "WebDAV on DC-related assets increases relay/coercion path viability"
                 ),
+            ),
+        ],
+    ),
+
+    # ------------------------------------------------------------------
+    # Active Directory Certificate Services
+    # ------------------------------------------------------------------
+    "adcs_esc8": VulnCvssDefinition(
+        # AD CS relay exposure. The standalone posture is high; it becomes
+        # critical only when ADscan confirms a relay/certificate abuse outcome
+        # or an explicit Tier-0/DC-impacting path.
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.5,
+                reason="AD CS relay/certificate abuse was confirmed",
+            ),
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=9.0,
+                reason="ESC8 provides a Tier-0 certificate abuse path",
+            ),
+        ],
+    ),
+    "adcs_esc11": VulnCvssDefinition(
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.5,
+                reason="AD CS RPC relay/certificate abuse was confirmed",
+            ),
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=9.0,
+                reason="ESC11 provides a Tier-0 certificate abuse path",
             ),
         ],
     ),

@@ -114,6 +114,11 @@ from adscan_internal.reporting_compat import (
     load_optional_report_service_attr,
     is_optional_report_service_import_error,
 )
+from adscan_internal.session_summary import (
+    count_workspace_credentials,
+    get_attack_path_summary_breakdown,
+    resolve_session_attack_paths_for_summary,
+)
 from adscan_internal.ssl_certificates import configure_ssl_certificates
 from adscan_internal.subprocess_env import (
     command_needs_clean_env as _command_needs_clean_env,
@@ -907,8 +912,9 @@ def _configure_prompt_runtime_behavior() -> None:
     configure_prompt_behavior(
         should_disable_interactive_prompts=_should_disable_interactive_prompts,
         interrupt_logger=_interrupt_logger,
-        use_questionary_in_container=lambda: os.getenv("ADSCAN_CONTAINER_RUNTIME")
-        == "1",
+        use_questionary_in_container=lambda: (
+            os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1"
+        ),
     )
     install_prompt_logging_wrappers()
 
@@ -2016,6 +2022,7 @@ _migrate_adscan_state_files()
 # Public releases built from this repository must keep this as "LITE".
 # Private customer builds may override this constant at build time to "PRO".
 DEFAULT_LICENSE_MODE = "LITE"
+ADSCAN_RUNTIME_LICENSE_MODE_ENV = "ADSCAN_RUNTIME_LICENSE_MODE"
 
 # DNS tooling compatibility
 #
@@ -2034,6 +2041,12 @@ def _resolve_license_mode(*, requested_pro: bool) -> str:
         Default runtime license mode for this build.
     """
     _ = requested_pro
+    env_license_mode = str(
+        os.getenv(ADSCAN_RUNTIME_LICENSE_MODE_ENV, DEFAULT_LICENSE_MODE)
+    ).strip()
+    normalized_license_mode = env_license_mode.upper() or DEFAULT_LICENSE_MODE
+    if normalized_license_mode in {"LITE", "PRO"}:
+        return normalized_license_mode
     return DEFAULT_LICENSE_MODE
 
 
@@ -3105,7 +3118,7 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         "extra_specs": ["pycryptodome==3.23.0"],
     },
     "netexec": {
-        "spec": "git+https://github.com/Pennyw0rth/NetExec.git@f187717",
+        "spec": "git+https://github.com/Pennyw0rth/NetExec.git@73ccf0d",
         "check_target": "nxc",
         "check_type": "executable",
         "exe_name": "nxc",
@@ -3137,12 +3150,6 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         "check_target": "bloodhound",
         "check_type": "module",
         "exe_name": "bloodhound-ce-python",  # Executable name for bloodhound.py
-    },
-    "weakpass": {
-        "spec": "weakpass-lookup",
-        "check_target": "weakpass-lookup",
-        "check_type": "executable",
-        "exe_name": "weakpass-lookup",
     },
     "enum-trusts": {
         "spec": "git+https://github.com/ADScanPro/enum-trusts.git@f7eae14",
@@ -3187,7 +3194,7 @@ PipToolsConfig = {  # pylint: disable=invalid-name
 
 # --- Rich Console Initialization ---
 # Primary console for user-facing output (no recording needed here).
-console = _build_rich_console(theme=ADSCAN_THEME)
+console = _build_rich_console(theme=ADSCAN_THEME, strip_markers=True)
 
 # Dedicated telemetry console that records everything rendered via the Rich
 # helpers and logging. This console is never shown directly to the user; we
@@ -4106,12 +4113,13 @@ def _show_exit_summary(shell) -> str | None:
     """
     victories = getattr(shell, "_session_victories", [])
     session_attack_paths = getattr(shell, "_session_attack_paths_count", 0)
-    attack_paths = _resolve_session_attack_paths_for_summary(
+    attack_paths = resolve_session_attack_paths_for_summary(
         shell, fallback_count=session_attack_paths
     )
     creds = getattr(shell, "_session_credentials_count", 0)
     hashes = getattr(shell, "_session_hashes_count", 0)
-    workspace_creds = _count_workspace_credentials(shell)
+    workspace_creds = count_workspace_credentials(shell)
+    path_breakdown = get_attack_path_summary_breakdown(shell)
 
     start_time = getattr(shell, "_session_start_time", None)
     duration_str = ""
@@ -4136,6 +4144,19 @@ def _show_exit_summary(shell) -> str | None:
     if attack_paths:
         s = "s" if attack_paths != 1 else ""
         lines.append(f"[cyan]{attack_paths}[/cyan] attack path{s} identified")
+    theoretical_paths = int(path_breakdown.get("total") or 0)
+    blocked_paths = int(path_breakdown.get("blocked") or 0)
+    unsupported_paths = int(path_breakdown.get("unsupported") or 0)
+    if theoretical_paths and theoretical_paths != attack_paths:
+        suffix_parts = []
+        if blocked_paths:
+            suffix_parts.append(f"{blocked_paths} blocked")
+        if unsupported_paths:
+            suffix_parts.append(f"{unsupported_paths} unsupported")
+        suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+        lines.append(
+            f"[dim]{theoretical_paths} theoretical graph path(s) persisted{suffix}[/dim]"
+        )
     if creds:
         s = "s" if creds != 1 else ""
         lines.append(f"[cyan]{creds}[/cyan] new credential{s} obtained")
@@ -4171,7 +4192,7 @@ def _show_exit_summary(shell) -> str | None:
 def _maybe_show_report_cta(shell) -> None:
     """Show a contextual report CTA when the session produced actionable findings."""
     session_attack_paths = getattr(shell, "_session_attack_paths_count", 0)
-    attack_paths = _resolve_session_attack_paths_for_summary(
+    attack_paths = resolve_session_attack_paths_for_summary(
         shell, fallback_count=session_attack_paths
     )
     creds = getattr(shell, "_session_credentials_count", 0)
@@ -4201,85 +4222,6 @@ def _maybe_show_report_cta(shell) -> None:
             f"PRO generates a Word/PDF report with findings and remediation steps "
             f"→ {_reports_url}[/dim]"
         )
-
-
-def _count_workspace_credentials(shell: object) -> int:
-    """Return total credentials currently stored across all loaded domains."""
-    try:
-        domains_data = getattr(shell, "domains_data", {}) or {}
-        if not isinstance(domains_data, dict):
-            return 0
-        total = 0
-        for domain_data in domains_data.values():
-            if not isinstance(domain_data, dict):
-                continue
-            creds = domain_data.get("credentials")
-            if isinstance(creds, dict):
-                total += len(creds)
-        return max(0, total)
-    except Exception as exc:  # pragma: no cover - defensive
-        telemetry.capture_exception(exc)
-        return 0
-
-
-def _resolve_session_attack_paths_for_summary(
-    shell: object, *, fallback_count: int
-) -> int:
-    """Resolve user-facing attack-path count for summaries and CTAs.
-
-    Runtime counters can include raw BloodHound path-entry vectors and accumulate
-    across repeated refreshes. For UX-facing summaries we prefer stable
-    domain-level path totals (`paths_to_tier0`) derived from each attack graph.
-    """
-    fallback = max(0, int(fallback_count or 0))
-    if fallback == 0:
-        return 0
-
-    try:
-        from adscan_internal.services.attack_graph_service import (
-            compute_attack_path_metrics,
-        )
-
-        workspace_cwd = (
-            shell._get_workspace_cwd()
-            if hasattr(shell, "_get_workspace_cwd")
-            else getattr(shell, "current_workspace_dir", os.getcwd())
-        )
-        domains_dir = getattr(shell, "domains_dir", "domains")
-        domains_data = getattr(shell, "domains_data", {}) or {}
-        if not isinstance(domains_data, dict):
-            return fallback
-
-        total_paths = 0
-        analyzed_domains = 0
-        for domain_name in domains_data.keys():
-            domain = str(domain_name or "").strip()
-            if not domain:
-                continue
-            graph_path = domain_subpath(
-                workspace_cwd, domains_dir, domain, "attack_graph.json"
-            )
-            if not os.path.exists(graph_path):
-                continue
-            metrics = compute_attack_path_metrics(shell, domain, max_depth=10)
-            paths_to_tier0 = int(metrics.get("paths_to_tier0") or 0)
-            total_paths += max(0, paths_to_tier0)
-            analyzed_domains += 1
-
-        if analyzed_domains == 0:
-            return fallback
-
-        print_info_debug(
-            "[summary] attack-path count recalculated from attack graphs: "
-            f"domains={analyzed_domains} total={total_paths} fallback={fallback}"
-        )
-        return total_paths
-    except Exception as exc:  # pragma: no cover - best effort
-        telemetry.capture_exception(exc)
-        print_info_debug(
-            f"[summary] attack-path count fallback ({fallback}) due to recalculation error: {exc}"
-        )
-        return fallback
 
 
 def _maybe_show_star_cta(shell) -> None:
@@ -9451,11 +9393,11 @@ class PentestShell:
 
         return get_domain_post_da_state(self, domain)
 
-    def _collect_tier0_path_counts(self, domain: str) -> tuple[int, int]:
-        """Return (paths_to_tier0, paths_not_attempted) from attack graph metrics."""
-        from adscan_internal.cli.post_da import collect_tier0_path_counts
+    def _collect_attack_path_snapshot_counts(self, domain: str) -> tuple[int, int]:
+        """Return user-facing summary attack-path counts for one domain."""
+        from adscan_internal.cli.post_da import collect_attack_path_snapshot_counts
 
-        return collect_tier0_path_counts(self, domain)
+        return collect_attack_path_snapshot_counts(self, domain)
 
     def _run_audit_post_da_bloodhound_refresh(
         self,
@@ -10140,6 +10082,290 @@ class PentestShell:
         else:
             print_success(f"{count} {label} found.")
 
+    def _print_identity_inventory_panel(
+        self,
+        *,
+        domain: str,
+        filename: str,
+        users: List[str],
+    ) -> None:
+        """Render ADscan-owned identity inventory summaries for premium CLI UX."""
+        from adscan_internal.services.identity_risk_service import (
+            CONTROL_EXPOSURE_IDENTITIES_FILENAME,
+            DIRECT_DOMAIN_CONTROL_IDENTITIES_FILENAME,
+            DOMAIN_COMPROMISE_ENABLERS_FILENAME,
+            HIGH_IMPACT_PRIVILEGES_FILENAME,
+            load_identity_risk_snapshot,
+        )
+        from adscan_internal.services.identity_choke_point_service import (
+            load_identity_choke_point_snapshot,
+        )
+
+        snapshot = load_identity_risk_snapshot(self, domain)
+        if not isinstance(snapshot, dict):
+            label_map = {
+                CONTROL_EXPOSURE_IDENTITIES_FILENAME: "Control-Exposure Identities",
+                DIRECT_DOMAIN_CONTROL_IDENTITIES_FILENAME: "Direct Domain Control",
+                DOMAIN_COMPROMISE_ENABLERS_FILENAME: "Domain Compromise Enablers",
+                HIGH_IMPACT_PRIVILEGES_FILENAME: "High-Impact Privileges",
+                "enabled_users.txt": "Enabled Users",
+            }
+            self._display_items(users, label_map.get(filename, "Users"))
+            return
+
+        marked_domain = mark_sensitive(domain, "domain")
+        users_map = (
+            snapshot.get("users") if isinstance(snapshot.get("users"), dict) else {}
+        )
+        if not isinstance(users_map, dict):
+            users_map = {}
+
+        def _format_choke_point_summary_line(record: dict[str, Any]) -> str:
+            title_text = str(record.get("title") or "Unknown transition").strip()
+            directness = (
+                str(
+                    record.get("choke_point_directness")
+                    or record.get("directness")
+                    or "contextual"
+                )
+                .strip()
+                .lower()
+            )
+            severity = str(record.get("severity") or "medium").strip().upper()
+            blast_radius = int(record.get("blast_radius") or 0)
+            directness_label = (
+                "direct control"
+                if directness == "direct"
+                else "indirect path"
+                if directness == "indirect"
+                else "context-dependent"
+            )
+            line = f"- {title_text} | {directness_label} | {severity}"
+            if blast_radius > 0:
+                line += f" | affects {blast_radius} principal(s)"
+            return line
+
+        direct_domain_control = 0
+        domain_control_enablers = 0
+        high_impact_privileges = 0
+        standard = 0
+
+        for user in users:
+            normalized = str(user or "").strip().lower()
+            record = users_map.get(normalized)
+            control_level = (
+                str(record.get("control_level") or "").strip().lower()
+                if isinstance(record, dict)
+                else ""
+            )
+            if control_level == "direct_domain_control":
+                direct_domain_control += 1
+            elif control_level == "domain_control_enabler":
+                domain_control_enablers += 1
+            elif control_level == "high_impact_privilege":
+                high_impact_privileges += 1
+            else:
+                standard += 1
+
+        if filename == "enabled_users.txt":
+            title = "Identity Inventory"
+            lines = [
+                f"Domain: {marked_domain}",
+                f"Enabled users discovered: {len(users)}",
+            ]
+            if (
+                direct_domain_control
+                or domain_control_enablers
+                or high_impact_privileges
+            ):
+                lines.extend(
+                    [
+                        "",
+                        "ADscan control exposure overview:",
+                        f"Direct domain control: {direct_domain_control}",
+                        f"Domain compromise enablers: {domain_control_enablers}",
+                        f"High-impact privileges: {high_impact_privileges}",
+                        f"Standard users: {standard}",
+                    ]
+                )
+            print_panel(
+                "\n".join(lines), title=title, border_style="cyan", expand=False
+            )
+            return
+
+        if filename == CONTROL_EXPOSURE_IDENTITIES_FILENAME:
+            choke_snapshot = load_identity_choke_point_snapshot(self, domain)
+            choke_points = (
+                choke_snapshot.get("choke_points")
+                if isinstance(choke_snapshot, dict)
+                else []
+            )
+            if not isinstance(choke_points, list):
+                choke_points = []
+            top_choke_points = choke_points[:3]
+            title = "Control-Exposure Identity Inventory"
+            summary_lines = [
+                f"Domain: {marked_domain}",
+                f"Control-exposed identities: {len(users)}",
+                "",
+                "These identities already have direct domain control, enable domain compromise, or carry high-impact privilege.",
+                f"Direct domain control: {direct_domain_control}",
+                f"Domain compromise enablers: {domain_control_enablers}",
+                f"High-impact privileges: {high_impact_privileges}",
+            ]
+            identity_preview_lines = self._build_identity_inventory_preview_lines(users)
+            if identity_preview_lines:
+                summary_lines.extend(["", *identity_preview_lines])
+            if top_choke_points:
+                summary_lines.extend(["", "Priority transitions to review first:"])
+                for record in top_choke_points:
+                    if isinstance(record, dict):
+                        summary_lines.append(_format_choke_point_summary_line(record))
+            print_panel(
+                "\n".join(summary_lines),
+                title=title,
+                border_style="yellow",
+                expand=False,
+            )
+            return
+
+        if filename == DIRECT_DOMAIN_CONTROL_IDENTITIES_FILENAME:
+            title = "Direct Domain Control Inventory"
+            summary_lines = [
+                f"Domain: {marked_domain}",
+                f"Direct domain control identities: {len(users)}",
+                "",
+                "These identities already have direct administrative control over the domain or forest boundary.",
+                f"Direct domain control: {direct_domain_control}",
+            ]
+            identity_preview_lines = self._build_identity_inventory_preview_lines(users)
+            if identity_preview_lines:
+                summary_lines.extend(["", *identity_preview_lines])
+            print_panel(
+                "\n".join(summary_lines),
+                title=title,
+                border_style="red",
+                expand=False,
+            )
+            return
+
+        if filename == DOMAIN_COMPROMISE_ENABLERS_FILENAME:
+            choke_snapshot = load_identity_choke_point_snapshot(self, domain)
+            choke_points = (
+                choke_snapshot.get("choke_points")
+                if isinstance(choke_snapshot, dict)
+                else []
+            )
+            if not isinstance(choke_points, list):
+                choke_points = []
+            indirect_choke_points = [
+                record
+                for record in choke_points
+                if str(record.get("directness") or "") == "indirect"
+            ][:3]
+            title = "Domain Compromise Enabler Inventory"
+            summary_lines = [
+                f"Domain: {marked_domain}",
+                f"Domain compromise enablers: {len(users)}",
+                "",
+                "These identities are not direct domain control, but they can enable domain compromise via follow-up abuse or graph expansion.",
+                f"Direct domain control: {direct_domain_control}",
+                f"Domain compromise enablers: {domain_control_enablers}",
+                f"High-impact privileges: {high_impact_privileges}",
+            ]
+            identity_preview_lines = self._build_identity_inventory_preview_lines(users)
+            if identity_preview_lines:
+                summary_lines.extend(["", *identity_preview_lines])
+            if indirect_choke_points:
+                summary_lines.extend(["", "Priority indirect transitions:"])
+                for record in indirect_choke_points:
+                    if isinstance(record, dict):
+                        summary_lines.append(_format_choke_point_summary_line(record))
+            print_panel(
+                "\n".join(summary_lines),
+                title=title,
+                border_style="yellow",
+                expand=False,
+            )
+            return
+
+        if filename == HIGH_IMPACT_PRIVILEGES_FILENAME:
+            choke_snapshot = load_identity_choke_point_snapshot(self, domain)
+            choke_points = (
+                choke_snapshot.get("choke_points")
+                if isinstance(choke_snapshot, dict)
+                else []
+            )
+            if not isinstance(choke_points, list):
+                choke_points = []
+            direct_choke_points = [
+                record
+                for record in choke_points
+                if str(record.get("directness") or "") == "direct"
+            ][:2]
+            indirect_choke_points = [
+                record
+                for record in choke_points
+                if str(record.get("directness") or "") == "indirect"
+            ][:2]
+            title = "High-Impact Privilege Inventory"
+            summary_lines = [
+                f"Domain: {marked_domain}",
+                f"High-impact privilege identities: {len(users)}",
+                "",
+                "ADscan tracks high-impact privileges separately from direct control and domain-compromise enablers.",
+                f"Direct domain control: {direct_domain_control}",
+                f"Domain compromise enablers: {domain_control_enablers}",
+                f"High-impact privileges: {high_impact_privileges}",
+            ]
+            identity_preview_lines = self._build_identity_inventory_preview_lines(users)
+            if identity_preview_lines:
+                summary_lines.extend(["", *identity_preview_lines])
+            if direct_choke_points:
+                summary_lines.extend(["", "Direct control transitions:"])
+                for record in direct_choke_points:
+                    if isinstance(record, dict):
+                        summary_lines.append(_format_choke_point_summary_line(record))
+            if indirect_choke_points:
+                summary_lines.extend(["", "Indirect compromise transitions:"])
+                for record in indirect_choke_points:
+                    if isinstance(record, dict):
+                        summary_lines.append(_format_choke_point_summary_line(record))
+            print_panel(
+                "\n".join(summary_lines),
+                title=title,
+                border_style="yellow",
+                expand=False,
+            )
+            return
+
+        self._display_items(users, "Users")
+
+    @staticmethod
+    def _build_identity_inventory_preview_lines(users: list[str]) -> list[str]:
+        """Return compact preview lines for small identity inventories."""
+        cleaned_users = [
+            str(user or "").strip() for user in users if str(user or "").strip()
+        ]
+        if not cleaned_users:
+            return []
+
+        if len(cleaned_users) <= 10:
+            return ["Identities in this inventory:"] + [
+                f"- {user}" for user in cleaned_users
+            ]
+
+        if len(cleaned_users) <= 25:
+            preview = cleaned_users[:10]
+            remaining = len(cleaned_users) - len(preview)
+            lines = ["Representative identities in this inventory:"]
+            lines.extend(f"- {user}" for user in preview)
+            if remaining > 0:
+                lines.append(f"- +{remaining} more")
+            return lines
+
+        return []
+
     # Prompt is now handled by prompt-toolkit session
 
     license_mode = DEFAULT_LICENSE_MODE
@@ -10392,7 +10618,6 @@ class PentestShell:
         self.bloodyad_path = get_tool_executable_path(
             "bloodyad"
         )  # exe_name is 'bloodyAD'
-        self.weakpass_path = get_tool_executable_path("weakpass")
         self.enum_trusts_path = get_tool_executable_path("enum-trusts")
         self.manspider_path = get_tool_executable_path("manspider")
         self.credsweeper_path = get_tool_executable_path("credsweeper")
@@ -10989,8 +11214,9 @@ class PentestShell:
             state_owner=self,
             default_domain=getattr(self, "domain", None),
             extract_domain=self._extract_domain_from_netexec_command,
-            is_domain_configured=lambda value: value
-            in getattr(self, "domains_data", {}),
+            is_domain_configured=lambda value: (
+                value in getattr(self, "domains_data", {})
+            ),
             sync_clock_with_pdc=lambda value: bool(
                 self.do_sync_clock_with_pdc(value, verbose=True)
             ),
@@ -11003,8 +11229,8 @@ class PentestShell:
             confirm_ask=lambda question, default: Confirm.ask(
                 question, default=default
             ),
-            refresh_delegated_ticket=lambda ticket_path: self.refresh_last_delegated_service_ticket(
-                ticket_path
+            refresh_delegated_ticket=lambda ticket_path: (
+                self.refresh_last_delegated_service_ticket(ticket_path)
             ),
         )
 
@@ -11388,7 +11614,9 @@ class PentestShell:
                         # Create a new Console instance specifically for this input operation
                         # This helps ensure Rich's input handling is not affected by shared state
                         # or terminal modes potentially set by prompt_toolkit via self.console.
-                        input_console = _build_rich_console(theme=ADSCAN_THEME)
+                        input_console = _build_rich_console(
+                            theme=ADSCAN_THEME, strip_markers=True
+                        )
 
                         # Comparisons reverted to strings to match what queued_prompt sends
                         if prompt_type_for_queue == "choice":
@@ -15761,10 +15989,43 @@ class PentestShell:
             )
             return os.path.exists(computers_file) and os.path.exists(users_file)
 
-        phase1_already_done = (
-            bool(self.domains_data.get(domain, {}).get("phase1_complete"))
-            or _phase1_outputs_ready()
+        phase1_marked_complete = bool(
+            self.domains_data.get(domain, {}).get("phase1_complete")
         )
+        phase1_outputs_exist = _phase1_outputs_ready()
+        phase1_already_done = phase1_marked_complete or phase1_outputs_exist
+        rerun_phase1 = False
+
+        if phase1_already_done:
+            phase1_reason_parts: list[str] = []
+            if phase1_marked_complete:
+                phase1_reason_parts.append(
+                    "the domain state is already marked as complete"
+                )
+            if phase1_outputs_exist:
+                phase1_reason_parts.append(
+                    "Phase 1 output files already exist in the workspace"
+                )
+
+            marked_domain = mark_sensitive(domain, "domain")
+            print_info(f"Phase 1 results already exist for {marked_domain}.")
+            if phase1_reason_parts:
+                print_info(
+                    "ADscan detected this because "
+                    + " and ".join(phase1_reason_parts)
+                    + "."
+                )
+
+            confirmer = getattr(self, "_questionary_confirm", None)
+            prompt = f"Do you want to re-run Phase 1 for {marked_domain} and refresh the existing results?"
+            if callable(confirmer):
+                rerun_phase1 = bool(confirmer(prompt, default=False))
+            else:
+                rerun_phase1 = bool(Confirm.ask(prompt, default=False))
+
+            if rerun_phase1:
+                print_info("Re-running Phase 1 and refreshing existing results.")
+                self.domains_data.setdefault(domain, {})["phase1_complete"] = False
 
         # ========== PHASE 1: Domain Analysis ==========
         emit_phase("domain_analysis")
@@ -15780,27 +16041,27 @@ class PentestShell:
             icon="🔍",
         )
 
-        if phase1_already_done:
+        if phase1_already_done and not rerun_phase1:
             print_step_status(
                 "BloodHound Computers Query",
                 status="skipped",
                 step_number=1,
                 total_steps=3,
-                details="Phase 1 already completed",
+                details="Using existing Phase 1 results",
             )
             print_step_status(
                 "BloodHound Users Query",
                 status="skipped",
                 step_number=2,
                 total_steps=3,
-                details="Phase 1 already completed",
+                details="Using existing Phase 1 results",
             )
             print_step_status(
                 "ADCS Discovery",
                 status="skipped",
                 step_number=3,
                 total_steps=3,
-                details="Phase 1 already completed",
+                details="Using existing Phase 1 results",
             )
         else:
             if _run_step(
@@ -19451,7 +19712,7 @@ class PentestShell:
 
         Args:
             domain: Target domain.
-            filename: List filename (e.g. "admins.txt", "privileged.txt").
+            filename: List filename (for example `control_exposure_identities.txt`).
             trigger_followups: Whether to launch follow-up enumeration flows
                 after sanitizing and displaying the list.
             source: Logical source that produced this user list. Used for
@@ -19482,44 +19743,16 @@ class PentestShell:
 
         users = [line.strip() for line in sanitized_lines if line.strip()]
 
-        if filename == "privileged.txt":
-            admins_file = domain_subpath(
-                workspace_cwd, self.domains_dir, domain, "admins.txt"
-            )
-            try:
-                if os.path.exists(admins_file):
-                    with open(
-                        admins_file, "r", encoding="utf-8", errors="ignore"
-                    ) as af:
-                        admin_lines = [strip_ansi_codes(line).strip() for line in af]
-                    admin_users = [u for u in admin_lines if u]
-
-                    seen = {u.lower(): True for u in users}
-                    merged = list(users)
-                    for admin in admin_users:
-                        key = admin.lower()
-                        if key not in seen:
-                            merged.append(admin)
-                            seen[key] = True
-
-                    if merged != users:
-                        users = merged
-                        with open(users_file, "w", encoding="utf-8") as pf:
-                            pf.write("\n".join(users) + "\n")
-            except Exception as merge_exc:
-                telemetry.capture_exception(merge_exc)
-                print_info_debug(
-                    f"[users] Failed to merge admins into privileged list: {merge_exc}"
-                )
-
         count = len(users)
 
         effective_source = source or f"postprocess_user_list:{filename}"
 
         try:
             user_type_map = {
-                "admins.txt": "admins",
-                "privileged.txt": "privileged",
+                "control_exposure_identities.txt": "control_exposure_identities",
+                "direct_domain_control.txt": "direct_domain_control",
+                "domain_compromise_enablers.txt": "domain_compromise_enablers",
+                "high_impact_privileges.txt": "high_impact_privileges",
                 "users.txt": "users",
                 "enabled_users.txt": "enabled_users",
             }
@@ -19536,14 +19769,20 @@ class PentestShell:
         except Exception as e:
             telemetry.capture_exception(e)
 
-        if filename == "admins.txt":
-            self._display_items(users, "Admin Users")
-        elif filename == "privileged.txt":
-            self._display_items(users, "Privileged Users")
+        if filename in {
+            "control_exposure_identities.txt",
+            "direct_domain_control.txt",
+            "domain_compromise_enablers.txt",
+            "high_impact_privileges.txt",
+            "enabled_users.txt",
+        }:
+            self._print_identity_inventory_panel(
+                domain=domain,
+                filename=filename,
+                users=users,
+            )
         elif filename == "users.txt":
             self._display_items(users, "Users")
-        elif filename == "enabled_users.txt":
-            self._display_items(users, "Enabled Users")
 
         if not trigger_followups:
             print_info_debug(
@@ -19585,7 +19824,7 @@ class PentestShell:
 
         Args:
             domain: Target domain.
-            filename: Output filename (e.g. "admins.txt").
+            filename: Output filename (for example `control_exposure_identities.txt`).
             users: Usernames to write (one per line).
             merge_existing: When True, preserve any existing entries already
                 present in the file and append only newly discovered users.
@@ -21931,7 +22170,9 @@ class PentestShell:
                 print_info_debug(
                     f"[admin-count] Not a machine account: {marked_username}"
                 )
-            admins_file = os.path.join("domains", domain, "privileged.txt")
+            admins_file = os.path.join(
+                "domains", domain, "control_exposure_identities.txt"
+            )
             if os.path.exists(admins_file):
                 with open(admins_file, "r", encoding="utf-8") as f:
                     # Each line is read with whitespace and newlines stripped, ignoring empty lines.
@@ -21942,14 +22183,14 @@ class PentestShell:
                         marked_username = mark_sensitive(username, "user")
                         marked_domain = mark_sensitive(domain, "domain")
                         print_warning(
-                            f"The user {marked_username} is in the privileged list of domain {marked_domain}"
+                            f"The user {marked_username} appears in the control exposure inventory for domain {marked_domain}"
                         )
                     return True
                 if logging:
                     marked_username = mark_sensitive(username, "user")
                     marked_domain = mark_sensitive(domain, "domain")
                     print_info(
-                        f"The user {marked_username} is not in the privileged list of domain {marked_domain}"
+                        f"The user {marked_username} is not present in the control exposure inventory for domain {marked_domain}"
                     )
                 return False
             # Continue with old admin check
@@ -22030,12 +22271,15 @@ class PentestShell:
             # but still allow best-effort fallbacks (attack_graph/BloodHound/snapshot).
             workspace_cwd = self.current_workspace_dir or os.getcwd()
             admins_file = domain_subpath(
-                workspace_cwd, self.domains_dir, domain, "admins.txt"
+                workspace_cwd,
+                self.domains_dir,
+                domain,
+                "control_exposure_identities.txt",
             )
             if logging and not os.path.exists(admins_file):
                 marked_domain = mark_sensitive(domain, "domain")
                 print_warning(
-                    f"No cached Tier-0/high-value list found for {marked_domain} (admins.txt). "
+                    f"No cached control exposure inventory found for {marked_domain} (control_exposure_identities.txt). "
                     "Using best-effort detection."
                 )
 
@@ -22048,11 +22292,11 @@ class PentestShell:
                 marked_domain = mark_sensitive(domain, "domain")
                 if result:
                     print_success(
-                        f"The user {marked_username} is Tier-0/high-value in domain {marked_domain}"
+                        f"The user {marked_username} is classified as control-exposed in domain {marked_domain}"
                     )
                 else:
                     print_info(
-                        f"The user {marked_username} is not Tier-0/high-value in domain {marked_domain}"
+                        f"The user {marked_username} is not classified as control-exposed in domain {marked_domain}"
                     )
             return bool(result)
 
@@ -24061,6 +24305,19 @@ class PentestShell:
             client_auth_template=client_auth_template,
         )
 
+    def adcs_esc13(self, domain, username, password, template, effective_group=None):
+        """Wrapper for ADCS ESC13 exploitation."""
+        from adscan_internal.cli.adcs_exploitation import adcs_esc13 as _adcs_esc13
+
+        _adcs_esc13(
+            shell=self,
+            domain=domain,
+            username=username,
+            password=password,
+            template=template,
+            effective_group=effective_group,
+        )
+
     def adcs_golden_cert(self, domain, username, password, ca_target_host=None):
         """Wrapper for GoldenCert exploitation."""
         from adscan_internal.cli.adcs_exploitation import (
@@ -24521,6 +24778,7 @@ class PentestShell:
         username=None,
         *,
         step_context: dict[str, object] | None = None,
+        preserve_certipy_ticket: bool = False,
     ):
         """Perform Pass-the-Certificate using Certipy and display the result."""
         from adscan_internal.rich_output import mark_sensitive
@@ -24532,6 +24790,11 @@ class PentestShell:
 
         try:
             pdc_ip = self.domains_data[domain]["pdc"]
+            workspace_cwd = self._get_workspace_cwd()
+            kerberos_dir = domain_subpath(
+                workspace_cwd, self.domains_dir, domain, self.kerberos_dir
+            )
+            os.makedirs(kerberos_dir, exist_ok=True)
             service = CertipyService()
             result = service.pass_the_certificate(
                 certipy_path=self.certipy_path,
@@ -24541,6 +24804,7 @@ class PentestShell:
                 pfx_password=pfx_password,
                 username=username,
                 shell=self,
+                cwd=kerberos_dir,
             )
 
             if not result.success or not result.nt_hash or not result.username:
@@ -24696,8 +24960,40 @@ class PentestShell:
                     notes=refreshed_notes,
                 )
 
-            # Persist credential in domains_data
-            self.add_credential(resolved_domain, result.username, result.nt_hash)
+            if result.ticket_path:
+                from adscan_internal.services.credential_store_service import (
+                    CredentialStoreService,
+                )
+
+                CredentialStoreService().store_kerberos_ticket(
+                    domains_data=self.domains_data,
+                    domain=resolved_domain,
+                    username=result.username,
+                    ticket_path=result.ticket_path,
+                )
+                print_info_debug(
+                    "[certipy] Registered Kerberos ccache from PTC: "
+                    f"user={mark_sensitive(result.username, 'user')} "
+                    f"ticket={mark_sensitive(result.ticket_path, 'path')}"
+                )
+
+            # Persist credential in domains_data.  ESC13 must preserve the certificate
+            # ccache because a password-derived TGT does not carry the issuance-policy
+            # group authorization.
+            if preserve_certipy_ticket:
+                self.add_credential(
+                    resolved_domain,
+                    result.username,
+                    result.nt_hash,
+                    verify_credential=False,
+                    prompt_for_user_privs_after=False,
+                    skip_user_privs_enumeration=True,
+                    ensure_fresh_kerberos_ticket=False,
+                    mark_user_compromised=False,
+                    credential_origin="adcs_esc13_ptc",
+                )
+            else:
+                self.add_credential(resolved_domain, result.username, result.nt_hash)
 
             # Mark the attack-graph step as success only if it achieved the expected user
             # (typically: DA) for this attack path.
@@ -25397,16 +25693,20 @@ class PentestShell:
         run_bloodhound_all_users(self, target_domain)
 
     def do_bloodhound_admin_users(self, target_domain):
-        """Wrapper for run_bloodhound_admin_users - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_admin_users
+        """Persist the ADscan control-exposure inventory for one domain."""
+        from adscan_internal.cli.bloodhound import (
+            run_bloodhound_control_exposure_identities,
+        )
 
-        run_bloodhound_admin_users(self, target_domain)
+        run_bloodhound_control_exposure_identities(self, target_domain)
 
     def do_bloodhound_privileged_users(self, target_domain):
-        """Wrapper for run_bloodhound_privileged_users - maintains compatibility."""
-        from adscan_internal.cli.bloodhound import run_bloodhound_privileged_users
+        """Persist the ADscan domain-compromise-enabler inventory for one domain."""
+        from adscan_internal.cli.bloodhound import (
+            run_bloodhound_domain_compromise_enablers,
+        )
 
-        run_bloodhound_privileged_users(self, target_domain)
+        run_bloodhound_domain_compromise_enablers(self, target_domain)
 
     def do_bloodhound_attack_paths(self, args):
         """Enumerate low-priv BloodHound attack paths to high-value targets."""
@@ -25739,12 +26039,13 @@ class PentestShell:
         for error in errors:
             print_warning(f"- {error}")
 
-    def ask_for_bloodhound(self, target_domain, callback=None):
-        self.do_bloodhound_collector(target_domain)
+    def ask_for_bloodhound(self, target_domain, callback=None) -> list[str]:
+        collector_results = self.do_bloodhound_collector(target_domain)
 
         # Always call the callback if it exists, regardless of whether BloodHound ran or not (mimicking original logic for user 'no' choice)
         if callback:
             callback()
+        return collector_results
 
     def do_bloodhound_collector(
         self,
@@ -27060,52 +27361,38 @@ class PentestShell:
 
     def do_generate_report(self, args):
         """
-        Generates a Word or PDF report from the technical report JSON using report_generator module.
+        Generates a premium PDF report from the technical report JSON.
 
-        The report uses the template.docx file if available (bundled with PyInstaller or in project root).
+        The public report flow generates the premium HTML-to-PDF report.
         The report includes detailed vulnerability information with CWE, CVSS, descriptions, remediation, etc.
 
         Args:
-            args (str): Required format and optional profile and frameworks.
-                       Format: "word" or "pdf"
+            args (str): Optional profile and frameworks.
                        Profile: "full" (default), "technical", or "executive"
                        Frameworks (optional, comma-separated): ens, iso27001, dora
-                       Example: "generate_report pdf"
-                                "generate_report pdf technical"
-                                "generate_report pdf technical ens,iso27001,dora"
-                                "reporting pdf technical"
+                       Example: "generate_report"
+                                "generate_report technical"
+                                "generate_report technical ens,iso27001,dora"
         """
         from adscan_internal.cli.ci import run_generate_report
 
-        # Parse format/profile arguments
-        if not args or not args.strip():
-            print_error("Report format is required. Usage: generate_report <word|pdf>")
-            print_info(
-                "Example: generate_report pdf  or  generate_report pdf technical"
-            )
-            return None
-
-        args_parts = args.strip().split()
-        if not args_parts:
-            print_error("Report format is required. Usage: generate_report <word|pdf>")
-            print_info(
-                "Example: generate_report pdf  or  generate_report pdf technical"
-            )
-            return None
-
-        format_arg = args_parts[0].lower()
-        if format_arg not in ["word", "pdf"]:
-            print_error(f"Invalid format '{format_arg}'. Valid formats: word, pdf")
-            print_info("Usage: generate_report <word|pdf>")
-            return None
+        args_parts = args.strip().split() if args and args.strip() else []
+        format_arg = "pdf"
         profile_arg = "full"
-        if len(args_parts) > 1:
-            profile_arg = args_parts[1].lower()
+        profile_index = 0
+        if args_parts and args_parts[0].lower() in {"pdf", "word"}:
+            if args_parts[0].lower() == "word":
+                print_error("Word report generation is not currently supported.")
+                print_info("Use generate_report for the premium PDF report.")
+                return None
+            profile_index = 1
+        if len(args_parts) > profile_index:
+            profile_arg = args_parts[profile_index].lower()
         if profile_arg not in ["full", "technical", "executive"]:
             print_error(
                 f"Invalid profile '{profile_arg}'. Valid profiles: full, technical, executive"
             )
-            print_info("Usage: generate_report <word|pdf> [full|technical|executive]")
+            print_info("Usage: generate_report [full|technical|executive] [frameworks]")
             return None
 
         # Check if report_file is set
@@ -27122,20 +27409,22 @@ class PentestShell:
             "ENS Alto + NIS2 — Spain / CCN-CERT (recommended)": "ens",
             "ISO 27001:2022 — International ISMS standard": "iso27001",
             "DORA — EU 2022/2554 (financial sector)": "dora",
+            "PCI DSS v4.0 — Payment Card Industry": "pci_dss",
         }
-        _VALID_FRAMEWORK_KEYS = {"ens", "iso27001", "dora"}
+        _VALID_FRAMEWORK_KEYS = {"ens", "iso27001", "dora", "pci_dss"}
 
         frameworks_arg: list[str] | None = None
-        if len(args_parts) > 2:
+        frameworks_index = profile_index + 1
+        if len(args_parts) > frameworks_index:
             # Explicit frameworks from CLI, e.g. "ens,iso27001,dora"
-            raw_fw = args_parts[2].lower().split(",")
+            raw_fw = args_parts[frameworks_index].lower().split(",")
             frameworks_arg = [
                 f.strip() for f in raw_fw if f.strip() in _VALID_FRAMEWORK_KEYS
             ]
             if not frameworks_arg:
                 print_error(
-                    f"Invalid frameworks '{args_parts[2]}'. "
-                    f"Valid values: ens, iso27001, dora"
+                    f"Invalid frameworks '{args_parts[frameworks_index]}'. "
+                    f"Valid values: ens, iso27001, dora, pci_dss"
                 )
                 return None
         else:
@@ -27159,6 +27448,22 @@ class PentestShell:
                 if not frameworks_arg:
                     frameworks_arg = ["ens"]
 
+        # ── Report stack ────────────────────────────────────────────────────
+        engine_arg = "chromium"
+        renderer_arg = "cytoscape"
+        template_arg = "premium"
+        _THEME_MAP = {
+            "Corporate Light — white/navy, print-safe": "corporate_light",
+            "Premium Dark — navy/cyan palette": "premium_dark",
+        }
+        _theme_keys = list(_THEME_MAP.keys())
+        theme_idx = self._questionary_select("Report theme:", _theme_keys)
+        theme_arg = (
+            _THEME_MAP[_theme_keys[theme_idx]]
+            if theme_idx is not None
+            else "corporate_light"
+        )
+
         # Delegate to CLI helper
         return run_generate_report(
             self,
@@ -27166,6 +27471,10 @@ class PentestShell:
             format_arg,
             profile_arg,
             frameworks=frameworks_arg,
+            engine=engine_arg,
+            renderer=renderer_arg,
+            template=template_arg,
+            theme=theme_arg,
         )
 
     def do_extract_netbios(self, domain):
@@ -28877,13 +29186,15 @@ class PentestShell:
     def do_clear_all(self, arg):
         """
         Clears the current workspace by deleting all files and folders,
-        except for the files 'variables.json' and 'technical_report.json'.
+        except for workspace metadata and logging directories.
         Resets the authentication values for each domain and clears the domains list.
         """
         protected_files = [
             "variables.json",
             "technical_report.json",
             ".adscan_history",
+            "logs",
+            "log",
         ]
 
         # Obtain a list of all files and folders in the current directory
@@ -29065,12 +29376,12 @@ class PentestShell:
                 # Case study metrics (TTFAP, TTFH only - TTFC/TTC in their own events)
                 "ttfap_minutes": ttfap_minutes,
                 "ttfh_minutes": ttfh_minutes,
-                "attack_paths_count": _resolve_session_attack_paths_for_summary(
+                "attack_paths_count": resolve_session_attack_paths_for_summary(
                     self,
                     fallback_count=getattr(self, "_session_attack_paths_count", 0),
                 ),
                 "credentials_count": getattr(self, "_session_credentials_count", 0),
-                "workspace_credentials_count": _count_workspace_credentials(self),
+                "workspace_credentials_count": count_workspace_credentials(self),
                 "hashes_count": getattr(self, "_session_hashes_count", 0),
             }
             session_summary.update(build_session_compromise_metadata(self))
@@ -29998,6 +30309,121 @@ def handle_uninstall():
     )
 
 
+def _handle_report_command(args) -> int:
+    """Handle `adscan report` — generate a report from an existing workspace."""
+    import os as _os
+    from pathlib import Path as _Path
+    from adscan_internal.cli.ci import run_generate_report
+
+    workspace = str(getattr(args, "workspace", "") or "")
+    report_json = getattr(args, "report_json", None)
+
+    # Auto-detect technical_report.json if not provided
+    if not report_json:
+        workspace_base = _Path(_os.path.expanduser("~/.adscan/workspaces"))
+        candidate = workspace_base / workspace / "technical_report.json"
+        if candidate.exists():
+            report_json = str(candidate)
+        else:
+            # Look for newest .run_* sub-workspace
+            run_dirs = sorted(
+                [d for d in workspace_base.glob(f".run_{workspace}_*") if d.is_dir()],
+                key=lambda d: d.stat().st_mtime,
+                reverse=True,
+            )
+            for d in run_dirs:
+                c = d / "technical_report.json"
+                if c.exists():
+                    report_json = str(c)
+                    print_info(f"Using report data from execution workspace: {d.name}")
+                    break
+
+    if not report_json:
+        print_error(f"No technical_report.json found for workspace '{workspace}'.")
+        print_info("Run a scan first or specify --json <path>.")
+        return 1
+
+    # Public report generation is PDF-only. DOCX generation remains internal
+    # for future reactivation, but it is intentionally not exposed in CLI UX.
+    fmt = "pdf"
+
+    profile = getattr(args, "profile", None) or "full"
+
+    frameworks_raw = getattr(args, "frameworks", None)
+    if frameworks_raw:
+        frameworks = [f.strip() for f in frameworks_raw.split(",") if f.strip()]
+    else:
+        from questionary import checkbox
+
+        _FW_MAP = {
+            "ENS Alto + NIS2 (Spain)": "ens",
+            "ISO 27001:2022": "iso27001",
+            "DORA (EU financial)": "dora",
+            "PCI DSS v4.0": "pci_dss",
+        }
+        selected = checkbox(
+            "Select compliance frameworks:", choices=list(_FW_MAP.keys())
+        ).ask()
+        frameworks = [_FW_MAP[s] for s in (selected or [])] or ["ens"]
+
+    engine = getattr(args, "engine", None) or ""
+    renderer = getattr(args, "renderer", None) or ""
+    template = getattr(args, "template", None) or ""
+    theme = getattr(args, "theme", None) or ""
+
+    if fmt == "pdf" and not engine:
+        # Guided prompts for PDF stack
+        _THEME_MAP = {
+            "Corporate Light — white/navy, print-safe (recommended)": "corporate_light",
+            "Premium Dark — navy/cyan, screen-first": "premium_dark",
+            "No theme — template is self-contained": "",
+        }
+
+        def _sel(prompt, mapping):
+            keys = list(mapping.keys())
+            from questionary import select
+
+            chosen = select(prompt, choices=keys).ask()
+            return mapping.get(chosen or keys[0], mapping[keys[0]])
+
+        engine = "chromium"
+        renderer = "cytoscape"
+        template = "premium"
+        theme = _sel("Report theme:", _THEME_MAP)
+
+    display_name = str(getattr(args, "display_name", "") or "").strip()
+    result = run_generate_report(
+        None,  # no shell needed — report-only command
+        report_json,
+        fmt,
+        profile,
+        frameworks=frameworks,
+        engine=engine,
+        renderer=renderer,
+        template=template,
+        theme=theme,
+        display_name=display_name,
+    )
+    if result:
+        print_success(f"Report generated: {result}")
+        return 0
+    print_error("Report generation failed.")
+    return 1
+
+
+def _questionary_select_standalone(title: str, options: list, default_idx: int = 0):
+    """Minimal questionary select for use outside the shell class."""
+    try:
+        from questionary import select
+
+        chosen = select(title, choices=options).ask()
+        if chosen is None:
+            return default_idx
+        return options.index(chosen) if chosen in options else default_idx
+    except Exception:
+        return default_idx
+
+
 def handle_ci(args):
     """
     Handle non-interactive CI scan for automated testing.
@@ -30012,7 +30438,11 @@ def handle_ci(args):
         ),
         deps=CiDeps(
             enable_auto_mode=enable_auto_mode,
-            build_preflight_args=lambda: argparse.Namespace(command="check", fix=False),
+            build_preflight_args=lambda: argparse.Namespace(
+                command="check",
+                fix=False,
+                preflight_mode="ci",
+            ),
             handle_check=handle_check,
             get_last_check_extra=lambda: _LAST_CHECK_SESSION_EXTRA or {},
             track_docs_link_shown=track_docs_link_shown,
@@ -30071,11 +30501,6 @@ if __name__ == "__main__":
         help="Install only specific components (for QA testing). Use: --only bloodhound rusthound pyenv",
     )
     install_parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    install_parser.add_argument(
         "--dev",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -30090,10 +30515,7 @@ if __name__ == "__main__":
         dest="bh_admin_password",
         default="Adscan4thewin!",
         type=_parse_bh_admin_password_arg,
-        help=(
-            "BloodHound CE admin password to set during installation "
-            "(used for Docker mode and legacy mode)."
-        ),
+        help="BloodHound CE admin password to set during Docker installation.",
     )
     install_parser.add_argument(
         "--no-open-browser",
@@ -30131,11 +30553,6 @@ if __name__ == "__main__":
         "--verbose",
         action="store_true",
         help="Enable verbose mode for detailed informational output.",
-    )
-    start_parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help=argparse.SUPPRESS,
     )
     start_parser.add_argument(
         "--dev",
@@ -30190,11 +30607,6 @@ if __name__ == "__main__":
         help="Enable verbose mode for detailed informational output.",
     )
     ci_parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    ci_parser.add_argument(
         "--dev",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -30217,9 +30629,111 @@ if __name__ == "__main__":
     )
     ci_parser.add_argument(
         "--report-format",
-        choices=["word", "pdf"],
-        default="word",
-        help="Report format: word or pdf (default: word). PDF requires libreoffice to be installed.",
+        choices=["pdf"],
+        default="pdf",
+        help="Report format: pdf.",
+    )
+    ci_parser.add_argument(
+        "--frameworks",
+        default=None,
+        help="Comma-separated compliance frameworks: ens,iso27001,dora,pci_dss (default: ens).",
+    )
+    ci_parser.add_argument(
+        "--report-engine",
+        dest="report_engine",
+        choices=["chromium"],
+        default=None,
+        help="PDF engine (chromium).",
+    )
+    ci_parser.add_argument(
+        "--report-renderer",
+        dest="report_renderer",
+        choices=["cytoscape"],
+        default=None,
+        help="Attack-path renderer (cytoscape).",
+    )
+    ci_parser.add_argument(
+        "--report-template",
+        dest="report_template",
+        choices=["premium"],
+        default=None,
+        help="Report template (only premium supported).",
+    )
+    ci_parser.add_argument(
+        "--report-theme",
+        dest="report_theme",
+        choices=["premium_dark", "corporate_light"],
+        default=None,
+        help="Report theme: premium_dark or corporate_light (default: none).",
+    )
+    ci_parser.add_argument(
+        "--display-name",
+        dest="display_name",
+        default=None,
+        help="Client-facing name shown on the report cover (e.g. the web workspace name).",
+    )
+
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Generate a report from an existing workspace without re-scanning.",
+    )
+    report_parser.add_argument(
+        "--workspace",
+        required=True,
+        help="Workspace name (logical or .run_* execution workspace).",
+    )
+    report_parser.add_argument(
+        "--json",
+        dest="report_json",
+        default=None,
+        help="Path to technical_report.json (auto-detected from workspace if omitted).",
+    )
+    report_parser.add_argument(
+        "--format",
+        choices=["pdf"],
+        default="pdf",
+        help="Output format: pdf.",
+    )
+    report_parser.add_argument(
+        "--profile",
+        choices=["full", "technical", "executive"],
+        default=None,
+        help="Report profile (default: full).",
+    )
+    report_parser.add_argument(
+        "--frameworks",
+        default=None,
+        help="Comma-separated compliance frameworks: ens,iso27001,dora,pci_dss.",
+    )
+    report_parser.add_argument(
+        "--engine",
+        choices=["chromium"],
+        default=None,
+        help="PDF engine (chromium).",
+    )
+    report_parser.add_argument(
+        "--renderer",
+        choices=["cytoscape"],
+        default=None,
+        help="Attack-path renderer (cytoscape).",
+    )
+    report_parser.add_argument(
+        "--template",
+        choices=["premium"],
+        default=None,
+        help="Report template (only premium supported).",
+    )
+    report_parser.add_argument(
+        "--theme",
+        choices=["premium_dark", "corporate_light"],
+        default=None,
+        help="Report theme.",
+    )
+    report_parser.add_argument(
+        "--display-name",
+        dest="display_name",
+        default=None,
+        help="Client-facing name shown on the report cover (overrides workspace dir name).",
     )
 
     check_parser = subparsers.add_parser(
@@ -30241,11 +30755,6 @@ if __name__ == "__main__":
         "--fix",
         action="store_true",
         help="Attempt automatic repairs for detected issues (best effort).",
-    )
-    check_parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help=argparse.SUPPRESS,
     )
     check_parser.add_argument(
         "--dev",
@@ -30361,11 +30870,6 @@ if __name__ == "__main__":
         "install",
         "check",
     ) and getattr(args, "dev", False):
-        if getattr(args, "legacy", False):
-            print_error(
-                "Parameter --dev is only supported in Docker mode (remove --legacy)."
-            )
-            sys.exit(1)
         os.environ["ADSCAN_DOCKER_CHANNEL"] = "dev"
 
     # Offer upgrades early for relevant subcommands (interactive only).
@@ -30382,58 +30886,11 @@ if __name__ == "__main__":
 
     _guard_container_runtime_launcher_contract(args.command)
 
-    # Install requires privileged system operations (apt/systemctl). Allow users to run
-    # `adscan install` without prefixing sudo; re-exec through sudo with a minimal set of
-    # preserved environment variables (no `-E`).
-    if (
-        args.command == "install"
-        and os.geteuid() != 0
-        and getattr(args, "legacy", False)
-    ):
-        # Keep ADscan state in the invoking user's home even when running as root.
-        os.environ.setdefault("ADSCAN_HOME", ADSCAN_BASE_DIR)
-
-        # Ensure CI/dev/prod environment detection survives sudo's environment reset.
-        # GitHub Actions runners can be dev machines (machine-id), but CI should win.
-        ci_marker_keys = (
-            "CI",
-            "GITHUB_ACTIONS",
-            "GITLAB_CI",
-            "CIRCLECI",
-            "TRAVIS",
-            "JENKINS_HOME",
-            "TEAMCITY_VERSION",
-            "BUILDKITE",
-            "DRONE",
-            "CONTINUOUS_INTEGRATION",
-        )
-        ci_marker_present = any(os.getenv(key) for key in ci_marker_keys)
-        # Respect explicit manual overrides via ADSCAN_ENV; otherwise, avoid leaking "dev"
-        # into CI runs when debug mode defaulted to dev.
-        if not os.getenv("ADSCAN_ENV"):
-            if ci_marker_present and os.getenv("ADSCAN_SESSION_ENV") == "dev":
-                os.environ["ADSCAN_SESSION_ENV"] = "ci"
-            elif not os.getenv("ADSCAN_SESSION_ENV"):
-                os.environ["ADSCAN_SESSION_ENV"] = _determine_session_environment()
-
-        preserve_env = (
-            "ADSCAN_HOME,ADSCAN_TELEMETRY,ADSCAN_SESSION_ENV,"
-            "FORCE_COLOR,TERM,"
-            "CI,GITHUB_ACTIONS,GITLAB_CI,CIRCLECI,TRAVIS,JENKINS_HOME,"
-            "TEAMCITY_VERSION,BUILDKITE,DRONE,CONTINUOUS_INTEGRATION"
-        )
-        sudo_argv = [
-            "sudo",
-            f"--preserve-env={preserve_env}",
-            sys.argv[0],
-        ] + sys.argv[1:]
-        os.execvp("sudo", sudo_argv)
-
     if args.command == "install":
         install_success = False
         installation_mode = "unknown"
         try:
-            use_docker_mode = not getattr(args, "legacy", False) and not is_docker_env()
+            use_docker_mode = not is_docker_env()
             if use_docker_mode:
                 # Track Docker mode selection
                 installation_mode = "docker"
@@ -30454,24 +30911,6 @@ if __name__ == "__main__":
                     ),
                     pull_timeout_seconds=getattr(args, "pull_timeout", None),
                 )
-            elif getattr(args, "legacy", False):
-                # Track legacy mode selection
-                installation_mode = "legacy"
-                telemetry.capture(
-                    "installation_mode_selected",
-                    {
-                        "mode": "legacy",
-                        "explicit_flag": True,
-                    },
-                )
-                telemetry.capture(
-                    "legacy_install_triggered",
-                    {
-                        "explicit_flag": True,
-                        "reason": "user_flag",
-                    },
-                )
-                install_success = handle_install(args)
             else:
                 # Running inside a container already: nothing to install here.
                 # The host-side `adscan install` is responsible for pulling images and
@@ -30495,7 +30934,7 @@ if __name__ == "__main__":
             )
         sys.exit(0 if install_success else 1)
     elif args.command == "start":
-        use_docker_mode = not getattr(args, "legacy", False) and not is_docker_env()
+        use_docker_mode = not is_docker_env()
         if use_docker_mode:
             exit_code = _handle_start_docker_mode(
                 verbose=bool(getattr(args, "verbose", False)),
@@ -30513,12 +30952,10 @@ if __name__ == "__main__":
         check_success = False
         use_docker_mode = False
         try:
-            use_docker_mode = not getattr(args, "legacy", False) and not is_docker_env()
+            use_docker_mode = not is_docker_env()
             if use_docker_mode:
                 check_success = _handle_check_docker_mode()
                 _LAST_CHECK_SESSION_EXTRA = {"mode": "docker"}
-            elif getattr(args, "legacy", False):
-                check_success = handle_check(args)
             else:
                 check_success = handle_check(args)
         finally:
@@ -30556,7 +30993,7 @@ if __name__ == "__main__":
         print(f"ADscan {_format_runtime_version_tag(license_mode)}")
         sys.exit(0)
     elif args.command == "ci":
-        use_docker_mode = not getattr(args, "legacy", False) and not is_docker_env()
+        use_docker_mode = not is_docker_env()
         if use_docker_mode:
             exit_code = _handle_ci_docker_mode(
                 mode=str(getattr(args, "mode", "")),
@@ -30572,7 +31009,11 @@ if __name__ == "__main__":
                 debug=bool(getattr(args, "debug", False)),
                 keep_workspace=bool(getattr(args, "keep_workspace", False)),
                 generate_report=bool(getattr(args, "generate_report", False)),
-                report_format=str(getattr(args, "report_format", "word")),
+                report_format="pdf",
+                report_engine=str(getattr(args, "report_engine", "") or ""),
+                report_renderer=str(getattr(args, "report_renderer", "") or ""),
+                report_template=str(getattr(args, "report_template", "") or ""),
+                report_theme=str(getattr(args, "report_theme", "") or ""),
             )
             # Docker-mode CI runs inside the container and should own session uploads.
             _SESSION_CAPTURE_FINALIZED = True
@@ -30585,8 +31026,11 @@ if __name__ == "__main__":
             _capture_command_session(
                 "ci",
                 success=(exit_code == 0),
-                extra={"mode": "legacy", "ci_mode": str(getattr(args, "mode", ""))},
+                extra={"mode": "container", "ci_mode": str(getattr(args, "mode", ""))},
             )
+        sys.exit(exit_code)
+    elif args.command == "report":
+        exit_code = _handle_report_command(args)
         sys.exit(exit_code)
     # If a command was given but not matched (shouldn't happen if 'required=True' for subparsers,
     # but good for safety if 'required=False' or for the initial no-command case)

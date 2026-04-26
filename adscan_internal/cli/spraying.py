@@ -120,7 +120,9 @@ def _normalize_validated_domain_hits(
                 "credential": credential,
                 "is_hash": False,
             }
-    return sorted(deduped.values(), key=lambda item: str(item.get("username") or "").lower())
+    return sorted(
+        deduped.values(), key=lambda item: str(item.get("username") or "").lower()
+    )
 
 
 def handle_validated_domain_hits_followup(
@@ -251,9 +253,9 @@ def handle_validated_domain_hits_followup(
         if pivot_now:
             selected = privileged_hits[0]
             if len(privileged_hits) > 1 and hasattr(shell, "_questionary_select"):
-                options = [str(hit.get("username") or "") for hit in privileged_hits] + [
-                    "Cancel"
-                ]
+                options = [
+                    str(hit.get("username") or "") for hit in privileged_hits
+                ] + ["Cancel"]
                 selected_idx = shell._questionary_select(
                     "Select a privileged user to continue with:",
                     options,
@@ -348,9 +350,9 @@ def handle_validated_domain_hits_followup(
         if choice_idx == 0:
             selection = normalized_hits
         elif choice_idx == 1:
-            user_options = [str(hit.get("username") or "") for hit in normalized_hits] + [
-                "Cancel"
-            ]
+            user_options = [
+                str(hit.get("username") or "") for hit in normalized_hits
+            ] + ["Cancel"]
             if hasattr(shell, "_questionary_select"):
                 idx = shell._questionary_select(
                     "Select a user to enumerate:",
@@ -386,9 +388,9 @@ def handle_validated_domain_hits_followup(
                 print_warning(
                     "Multi-select prompt cancelled. Please choose a single user instead."
                 )
-                user_options = [str(hit.get("username") or "") for hit in normalized_hits] + [
-                    "Cancel"
-                ]
+                user_options = [
+                    str(hit.get("username") or "") for hit in normalized_hits
+                ] + ["Cancel"]
                 if hasattr(shell, "_questionary_select"):
                     idx = shell._questionary_select(
                         "Select a user to enumerate:",
@@ -511,6 +513,28 @@ _DOMAIN_SPRAY_FAILURE_CODE_RE = re.compile(
 _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS = 3
 _DEFAULT_MULTI_SPRAY_RESERVE = 2
 _MAX_MULTI_SPRAY_PREVIEW = 10
+_ADAPTIVE_YEAR_SUMMARY_PREVIEW_PER_YEAR = 5
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchPasswordCombo:
+    """One username/password combo in a batched Kerbrute bruteforce plan."""
+
+    username: str
+    password: str
+    base_password: str
+    mode: str
+    pwdlastset_year: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchPasswordSprayPlan:
+    """Execution plan for one batched multi-password Kerbrute bruteforce run."""
+
+    combos: tuple[_BatchPasswordCombo, ...]
+    base_passwords: tuple[str, ...]
+    adaptive_base_passwords: tuple[str, ...]
+    flat_base_passwords: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,6 +580,7 @@ def _run_netexec_query_with_parse_retry(
     timeout: int = 300,
 ) -> subprocess.CompletedProcess[str] | None:
     """Run a NetExec query and retry when output is present but not parseable."""
+
     def _drop_kerberos_flag(cmd: str) -> tuple[str, bool]:
         try:
             argv = shlex.split(cmd)
@@ -676,7 +701,9 @@ def _get_enabled_computer_account_count(shell: SprayShell, domain: str) -> int |
 
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
     try:
-        count = count_enabled_computer_accounts(workspace_cwd, shell.domains_dir, domain)
+        count = count_enabled_computer_accounts(
+            workspace_cwd, shell.domains_dir, domain
+        )
     except OSError as exc:
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(
@@ -686,9 +713,7 @@ def _get_enabled_computer_account_count(shell: SprayShell, domain: str) -> int |
         return None
 
     marked_domain = mark_sensitive(domain, "domain")
-    print_info_debug(
-        f"[spray] enabled computer count for {marked_domain}: {count}"
-    )
+    print_info_debug(f"[spray] enabled computer count for {marked_domain}: {count}")
     return count
 
 
@@ -715,7 +740,9 @@ def _should_recommend_pre2k_for_ctf(shell: SprayShell, domain: str) -> bool:
     return True
 
 
-def maybe_offer_ctf_pre2k_followup(shell: SprayShell, domain: str, *, reason: str) -> None:
+def maybe_offer_ctf_pre2k_followup(
+    shell: SprayShell, domain: str, *, reason: str
+) -> None:
     """Offer a focused pre2k follow-up when it was skipped so far."""
 
     if shell.domains_data.get(domain, {}).get("auth") == "pwned":
@@ -737,7 +764,10 @@ def maybe_offer_ctf_pre2k_followup(shell: SprayShell, domain: str, *, reason: st
         "ask_for_spraying_declined",
         "spraying_menu_cancelled",
     }
-    if bool(ux_state.get("pre2k_followup_prompted", False)) and not repeat_on_explicit_user_skip:
+    if (
+        bool(ux_state.get("pre2k_followup_prompted", False))
+        and not repeat_on_explicit_user_skip
+    ):
         print_info_debug(
             "[spray] premium pre2k follow-up already shown in this session."
         )
@@ -1027,9 +1057,7 @@ def _render_valid_spray_hits_panel(
     from rich.text import Text
 
     table = Table(
-        title=Text(
-            "Valid Credentials Found", style=f"bold {BRAND_COLORS['info']}"
-        ),
+        title=Text("Valid Credentials Found", style=f"bold {BRAND_COLORS['info']}"),
         show_header=True,
         header_style=f"bold {BRAND_COLORS['info']}",
         show_lines=True,
@@ -1039,9 +1067,7 @@ def _render_valid_spray_hits_panel(
     table.add_column("Method", style="dim")
     table.add_column("Accepted Secret", style="yellow")
 
-    hits_sorted = sorted(
-        hits, key=lambda item: str(item.get("username", "")).lower()
-    )
+    hits_sorted = sorted(hits, key=lambda item: str(item.get("username", "")).lower())
     for idx, hit in enumerate(hits_sorted[:10], start=1):
         user = str(hit.get("username") or "")
         password = str(hit.get("password") or "")
@@ -1088,6 +1114,7 @@ def _persist_and_record_spray_hits(
     source_steps: list[object] | None,
     persist_via_add_credential: bool = False,
     allow_empty_credential: bool = False,
+    run_validated_hits_followup: bool = True,
 ) -> None:
     """Persist spray hits and record related attack-graph provenance."""
     from adscan_internal.services.attack_graph_service import (
@@ -1101,15 +1128,15 @@ def _persist_and_record_spray_hits(
 
     typed_source_steps = _extract_typed_source_steps(source_steps)
     share_provenance_service = ShareCredentialProvenanceService()
-    artifact_source_steps = share_provenance_service.build_password_artifact_source_steps(
-        source_context=source_context,
-        spray_type=spray_type,
-        secret=None,
-        verified_via="spraying",
+    artifact_source_steps = (
+        share_provenance_service.build_password_artifact_source_steps(
+            source_context=source_context,
+            spray_type=spray_type,
+            secret=None,
+            verified_via="spraying",
+        )
     )
-    hits_sorted = sorted(
-        hits, key=lambda item: str(item.get("username", "")).lower()
-    )
+    hits_sorted = sorted(hits, key=lambda item: str(item.get("username", "")).lower())
 
     grouped_hits: dict[str, set[str]] = {}
     for hit in hits_sorted:
@@ -1245,20 +1272,21 @@ def _persist_and_record_spray_hits(
             )
         return
 
-    handle_validated_domain_hits_followup(
-        shell,
-        domain=domain,
-        hits=[
-            {
-                "username": str(hit.get("username") or ""),
-                "credential": str(hit.get("password") or ""),
-                "is_hash": False,
-            }
-            for hit in hits_sorted
-        ],
-        source_steps=source_steps,
-        discovery_label="sprayed",
-    )
+    if run_validated_hits_followup:
+        handle_validated_domain_hits_followup(
+            shell,
+            domain=domain,
+            hits=[
+                {
+                    "username": str(hit.get("username") or ""),
+                    "credential": str(hit.get("password") or ""),
+                    "is_hash": False,
+                }
+                for hit in hits_sorted
+            ],
+            source_steps=source_steps,
+            discovery_label="sprayed",
+        )
 
 
 def validate_domain_reuse_with_ntlm_hash(
@@ -1512,7 +1540,9 @@ def validate_selected_domain_reuse_candidates(
     domain: str,
     candidates: list[DomainReuseValidationCandidate],
     eligibility: SprayEligibilityResult,
-) -> tuple[list[dict[str, object]], dict[str, dict[str, object]], list[dict[str, object]]]:
+) -> tuple[
+    list[dict[str, object]], dict[str, dict[str, object]], list[dict[str, object]]
+]:
     """Validate selected SAM-derived credential variants against the domain."""
     result_rows: list[dict[str, object]] = []
     domain_results_by_credential: dict[str, dict[str, object]] = {}
@@ -1582,7 +1612,9 @@ def validate_selected_domain_reuse_candidates(
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
 
-        outcome_summary = _summarize_outcomes_for_table(outcomes, excluded_codes={"SUCCESS"})
+        outcome_summary = _summarize_outcomes_for_table(
+            outcomes, excluded_codes={"SUCCESS"}
+        )
         domain_results_by_credential[credential] = {
             "status": status,
             "hits": hits,
@@ -2300,7 +2332,10 @@ def _resolve_multi_credential_spray_budget(
     if any("no lockout enforced" in note.lower() for note in eligibility.notes):
         return requested_count, "Domain reports no account lockout threshold."
 
-    if eligibility.used_policy_data and eligibility.minimum_remaining_attempts is not None:
+    if (
+        eligibility.used_policy_data
+        and eligibility.minimum_remaining_attempts is not None
+    ):
         safe_budget = max(
             0,
             eligibility.minimum_remaining_attempts
@@ -2395,7 +2430,9 @@ def _select_values_with_limit(
             return None
         if skip_option in selected_values:
             return []
-        selected_items = [option_map[item] for item in selected_values if item in option_map]
+        selected_items = [
+            option_map[item] for item in selected_values if item in option_map
+        ]
         if len(selected_items) <= max_selectable:
             return selected_items
         print_warning(
@@ -2422,7 +2459,9 @@ def _select_passwords_for_spraying(
     )
 
 
-def _build_domain_reuse_selection_option(candidate: DomainReuseValidationCandidate) -> str:
+def _build_domain_reuse_selection_option(
+    candidate: DomainReuseValidationCandidate,
+) -> str:
     """Return one compact checkbox label for one domain reuse candidate."""
     preview = (
         candidate.credential
@@ -2581,7 +2620,9 @@ def _sanitize_spraying_context_for_json(
             continue
         if isinstance(value, list):
             sanitized[str(key)] = [
-                item if isinstance(item, (str, int, float, bool)) or item is None else str(item)
+                item
+                if isinstance(item, (str, int, float, bool)) or item is None
+                else str(item)
                 for item in value
             ]
             continue
@@ -2589,7 +2630,8 @@ def _sanitize_spraying_context_for_json(
             sanitized[str(key)] = {
                 str(sub_key): (
                     sub_value
-                    if isinstance(sub_value, (str, int, float, bool)) or sub_value is None
+                    if isinstance(sub_value, (str, int, float, bool))
+                    or sub_value is None
                     else str(sub_value)
                 )
                 for sub_key, sub_value in value.items()
@@ -2642,7 +2684,9 @@ def _load_pending_spraying_password_candidates(
                 password=password,
                 reason_not_sprayed=str(entry.get("reason_not_sprayed") or "").strip(),
                 deferred_at=str(entry.get("deferred_at") or "").strip(),
-                source=_sanitize_spraying_context_for_json(source if isinstance(source, dict) else {}),
+                source=_sanitize_spraying_context_for_json(
+                    source if isinstance(source, dict) else {}
+                ),
             )
         )
     return candidates
@@ -2746,7 +2790,11 @@ def _remove_pending_spraying_password_candidates(
     pending_entries = _load_pending_spraying_password_candidates(shell, domain=domain)
     if not pending_entries:
         return _get_pending_spraying_passwords_path(shell, domain=domain)
-    removal_set = {str(password or "").strip() for password in passwords if str(password or "").strip()}
+    removal_set = {
+        str(password or "").strip()
+        for password in passwords
+        if str(password or "").strip()
+    }
     retained_entries = [
         entry for entry in pending_entries if entry.password not in removal_set
     ]
@@ -2806,12 +2854,18 @@ def _load_pending_domain_reuse_candidates(
                     else []
                 ),
                 source_hostnames=(
-                    [str(item).strip() for item in source_hostnames_raw if str(item).strip()]
+                    [
+                        str(item).strip()
+                        for item in source_hostnames_raw
+                        if str(item).strip()
+                    ]
                     if isinstance(source_hostnames_raw, list)
                     else []
                 ),
                 source_scope=str(entry.get("source_scope") or "").strip(),
-                reason_not_validated=str(entry.get("reason_not_validated") or "").strip(),
+                reason_not_validated=str(
+                    entry.get("reason_not_validated") or ""
+                ).strip(),
                 deferred_at=str(entry.get("deferred_at") or "").strip(),
             )
         )
@@ -3144,13 +3198,17 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         )
     if has_netexec:
         options.append(_SPRAYING_OPTION_BLANK_PASSWORD)
-    pending_candidates = _load_pending_spraying_password_candidates(shell, domain=domain)
+    pending_candidates = _load_pending_spraying_password_candidates(
+        shell, domain=domain
+    )
     pending_domain_reuse_candidates = _load_pending_domain_reuse_candidates(
         shell, domain=domain
     )
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
     ctf_mode = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
-    pre2k_recommended = _should_recommend_pre2k_for_ctf(shell, domain) if ctf_mode else True
+    pre2k_recommended = (
+        _should_recommend_pre2k_for_ctf(shell, domain) if ctf_mode else True
+    )
     if has_enabled_computer_list(workspace_cwd, shell.domains_dir, domain) and (
         not ctf_mode or pre2k_recommended
     ):
@@ -3163,7 +3221,11 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     default_idx = 0
     if ctf_mode:
         pre2k_idx = next(
-            (idx for idx, opt in enumerate(options) if opt == _SPRAYING_OPTION_COMPUTER_PRE2K),
+            (
+                idx
+                for idx, opt in enumerate(options)
+                if opt == _SPRAYING_OPTION_COMPUTER_PRE2K
+            ),
             None,
         )
         if pre2k_idx is not None and pre2k_recommended:
@@ -3278,6 +3340,15 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         )
         return
 
+    if spray_category == "password" and spray_password is not None:
+        _execute_single_password_spraying(
+            shell,
+            domain=domain,
+            password=spray_password,
+            eligibility=eligibility,
+        )
+        return
+
     # Transform usernames for the spraying mode when using user-as-pass.
     eligible_for_kerbrute = list(eligibility.eligible_users)
     if user_as_pass and user_transform:
@@ -3338,7 +3409,9 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         else:
             if is_auth:
                 password_fragment = (
-                    safe_log_filename_fragment(spray_password) if spray_password else None
+                    safe_log_filename_fragment(spray_password)
+                    if spray_password
+                    else None
                 )
                 output_file = os.path.join(
                     "domains",
@@ -3356,7 +3429,9 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
                 )
             else:
                 password_fragment = (
-                    safe_log_filename_fragment(spray_password) if spray_password else None
+                    safe_log_filename_fragment(spray_password)
+                    if spray_password
+                    else None
                 )
                 output_file = os.path.join(
                     "domains",
@@ -3457,9 +3532,13 @@ def _execute_single_password_spraying(
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
     show_intro: bool = False,
+    offer_adaptive_year: bool = True,
 ) -> bool:
     """Execute one custom-password spray using a prevalidated eligibility set."""
     from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
+    from adscan_internal.services.password_year_variant_service import (
+        extract_password_year_candidates,
+    )
 
     if not eligibility.eligible_users:
         print_warning(
@@ -3479,11 +3558,12 @@ def _execute_single_password_spraying(
         list(eligibility.eligible_users), directory=kerberos_output_dir
     )
     try:
+        auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
         output_file = os.path.join(
             "domains",
             domain,
             "kerberos",
-            f"{'auth' if shell.domains_data[domain]['auth'] == 'auth' else 'unauth'}_spray_"
+            f"{'auth' if auth_state in {'auth', 'pwned'} else 'unauth'}_spray_"
             f"{safe_log_filename_fragment(password)}.log",
         )
         kerbrute_cmd = build_kerbrute_command(
@@ -3495,7 +3575,10 @@ def _execute_single_password_spraying(
             password=password,
             user_as_pass=False,
         )
-        spraying_command(
+        has_year_candidate = (
+            offer_adaptive_year and len(extract_password_year_candidates(password)) == 1
+        )
+        base_hits = execute_spraying_command(
             shell,
             kerbrute_cmd,
             domain,
@@ -3503,7 +3586,158 @@ def _execute_single_password_spraying(
             entry_label=entry_label,
             source_context=source_context,
             source_steps=source_steps,
+            persist_hits=not has_year_candidate,
+            run_validated_hits_followup=not has_year_candidate,
+            render_hits_panel=not has_year_candidate,
         )
+        if not has_year_candidate:
+            return True
+
+        print_panel(
+            "\n".join(
+                [
+                    f"Base password: {mark_sensitive(password, 'password')}",
+                    f"Users tested: {len(eligibility.eligible_users)}",
+                    f"Base spray hits: {len(base_hits)}",
+                    f"Unmatched users: {max(len(eligibility.eligible_users) - len(base_hits), 0)}",
+                ]
+            ),
+            title="[bold cyan]Base Spraying Result[/bold cyan]",
+            border_style="cyan",
+            expand=False,
+        )
+
+        hit_users = {
+            str(hit.get("username") or "").strip().casefold()
+            for hit in base_hits
+            if str(hit.get("username") or "").strip()
+        }
+        unmatched_users = [
+            user
+            for user in eligibility.eligible_users
+            if str(user or "").strip() and str(user).strip().casefold() not in hit_users
+        ]
+        if not unmatched_users:
+            if base_hits:
+                _render_valid_spray_hits_panel(
+                    base_hits,
+                    spray_type="Custom Password",
+                )
+                _persist_and_record_spray_hits(
+                    shell,
+                    domain=domain,
+                    hits=base_hits,
+                    spray_type="Custom Password",
+                    entry_label=entry_label,
+                    source_context=source_context,
+                    source_steps=source_steps,
+                )
+            return True
+
+        followup_prompt_lines = [
+            f"Base password hits: {len(base_hits)}",
+            f"Unmatched users: {len(unmatched_users)}",
+        ]
+        followup_eligibility = eligibility
+        if unmatched_users:
+            subset_users_path = write_temp_users_file(
+                unmatched_users,
+                directory=kerberos_output_dir,
+            )
+            try:
+                followup_eligibility = (
+                    compute_spraying_eligibility(
+                        shell,
+                        domain=domain,
+                        user_list_file=subset_users_path,
+                        safe_threshold=eligibility.safe_remaining_threshold,
+                    )
+                    or eligibility
+                )
+            finally:
+                try:
+                    os.remove(subset_users_path)
+                except OSError:
+                    pass
+
+        if (
+            followup_eligibility.lockout_threshold is not None
+            and followup_eligibility.lockout_threshold > 0
+            and not followup_eligibility.eligible_users
+        ):
+            followup_prompt_lines.append(
+                "Adaptive follow-up unavailable: no safe spray budget remains for unmatched users."
+            )
+            print_panel(
+                "\n".join(followup_prompt_lines),
+                title="[bold cyan]Adaptive Follow-Up Summary[/bold cyan]",
+                border_style="cyan",
+                expand=False,
+            )
+            if base_hits:
+                _render_valid_spray_hits_panel(
+                    base_hits,
+                    spray_type="Custom Password",
+                )
+                _persist_and_record_spray_hits(
+                    shell,
+                    domain=domain,
+                    hits=base_hits,
+                    spray_type="Custom Password",
+                    entry_label=entry_label,
+                    source_context=source_context,
+                    source_steps=source_steps,
+                )
+            return True
+
+        adaptive_followup_hits = _maybe_execute_adaptive_year_password_spraying(
+            shell,
+            domain=domain,
+            password=password,
+            eligibility=followup_eligibility,
+            source_context=source_context,
+            source_steps=source_steps,
+            return_hits=True,
+            only_for_users=unmatched_users,
+            prompt_preamble_lines=followup_prompt_lines,
+        )
+        combined_hits_by_user = {
+            str(hit.get("username") or "").strip().casefold(): hit
+            for hit in base_hits
+            if str(hit.get("username") or "").strip()
+        }
+        for hit in adaptive_followup_hits:
+            username = str(hit.get("username") or "").strip()
+            if not username:
+                continue
+            combined_hits_by_user.setdefault(username.casefold(), hit)
+        combined_hits = list(combined_hits_by_user.values())
+        if combined_hits:
+            _render_valid_spray_hits_panel(
+                combined_hits,
+                spray_type="Combined Password Spray",
+            )
+            print_panel(
+                "\n".join(
+                    [
+                        f"Base spray hits: {len(base_hits)}",
+                        f"Adaptive follow-up hits: {len(adaptive_followup_hits)}",
+                        f"Combined valid credentials: {len(combined_hits)}",
+                    ]
+                ),
+                title="[bold green]Combined Spraying Result[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+            _persist_and_record_spray_hits(
+                shell,
+                domain=domain,
+                hits=combined_hits,
+                spray_type="Custom Password",
+                entry_label=entry_label,
+                source_context=source_context,
+                source_steps=source_steps,
+            )
         return True
     finally:
         try:
@@ -3519,7 +3753,10 @@ def _execute_adaptive_year_password_spraying(
     plan: object,
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
-) -> bool:
+    persist_hits: bool = True,
+    run_validated_hits_followup: bool = True,
+    render_hits_panel: bool = True,
+) -> bool | list[dict[str, str]]:
     """Execute a pwdLastSet-adaptive Kerbrute bruteforce combo spray."""
     from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
 
@@ -3555,7 +3792,7 @@ def _execute_adaptive_year_password_spraying(
             combos_file=combos_path,
             output_file=output_file,
         )
-        spraying_command(
+        hits = execute_spraying_command(
             shell,
             kerbrute_cmd,
             domain,
@@ -3568,6 +3805,398 @@ def _execute_adaptive_year_password_spraying(
                 "adaptive_year_spray": True,
                 "pwdlastset_source": str(getattr(plan, "source", "unknown")),
                 "base_year": getattr(plan, "original_year", None),
+            },
+            source_steps=source_steps,
+            persist_hits=persist_hits,
+            run_validated_hits_followup=run_validated_hits_followup,
+            render_hits_panel=render_hits_panel,
+        )
+        if persist_hits:
+            return True
+        return hits
+    finally:
+        try:
+            os.remove(combos_path)
+        except OSError:
+            pass
+
+
+def _maybe_execute_adaptive_year_password_spraying(
+    shell: SprayShell,
+    *,
+    domain: str,
+    password: str,
+    eligibility: SprayEligibilityResult,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+    pwdlastset_years_by_user: dict[str, int] | None = None,
+    return_hits: bool = False,
+    only_for_users: list[str] | None = None,
+    prompt_preamble_lines: list[str] | None = None,
+) -> bool | list[dict[str, str]]:
+    """Offer and execute pwdLastSet-adaptive spraying for one fixed password."""
+    marked_password = mark_sensitive(password, "password")
+    try:
+        from adscan_internal.services.password_year_spray_plan_service import (
+            build_adaptive_year_spray_plan,
+            resolve_bloodhound_pwdlastset_years,
+        )
+        from adscan_internal.services.password_year_variant_service import (
+            extract_password_year_candidates,
+        )
+
+        if len(extract_password_year_candidates(password)) != 1:
+            return False
+        if pwdlastset_years_by_user is None:
+            pwdlastset_years_by_user = resolve_bloodhound_pwdlastset_years(
+                shell,
+                domain=domain,
+                users=list(only_for_users or eligibility.eligible_users),
+            )
+        adaptive_plan = build_adaptive_year_spray_plan(
+            base_password=password,
+            users=list(only_for_users or eligibility.eligible_users),
+            pwdlastset_years_by_user=pwdlastset_years_by_user,
+            source="bloodhound",
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[adaptive-year-spray] plan resolution failed for {marked_password}: {exc}"
+        )
+        return False
+
+    if adaptive_plan is None:
+        return False
+
+    combos = list(getattr(adaptive_plan, "combos", ()))
+    original_year = getattr(adaptive_plan, "original_year", None)
+    original_year_int = original_year if isinstance(original_year, int) else None
+    grouped = _group_adaptive_year_combos_by_year(combos)
+    summary_rows = _format_adaptive_year_summary_lines(
+        grouped_combos=grouped,
+        original_year=original_year_int,
+        include_examples=True,
+    )
+    prompt_lines = list(prompt_preamble_lines or [])
+    prompt_lines.extend(
+        [
+            f"Base password: {marked_password}",
+            f"Detected year: {original_year if original_year is not None else 'N/A'}",
+            f"pwdLastSet source: {getattr(adaptive_plan, 'source', 'unknown')}",
+            f"Generated combos: {len(combos)}",
+            f"Year buckets: {len(grouped)}",
+        ]
+    )
+    if summary_rows:
+        prompt_lines.append("")
+        prompt_lines.append("Generated password distribution:")
+        prompt_lines.extend(summary_rows)
+    print_panel(
+        "\n".join(prompt_lines),
+        title="[bold cyan]Adaptive Year Spray Available[/bold cyan]",
+        border_style="cyan",
+        expand=False,
+    )
+    use_adaptive = Confirm.ask(
+        (
+            "Run pwdLastSet-adaptive Kerbrute bruteforce follow-up for the "
+            "unmatched users?"
+            if only_for_users is not None
+            else "Run pwdLastSet-adaptive Kerbrute bruteforce instead of the normal spray for this password?"
+        ),
+        default=True,
+    )
+    if not use_adaptive:
+        return [] if return_hits else False
+
+    if not should_proceed_with_repeated_spraying(
+        shell,
+        domain,
+        "adaptive_year_password",
+        password,
+    ):
+        print_info(
+            f"Skipping adaptive year spray for {marked_password} because repeated spraying was not approved."
+        )
+        return [] if return_hits else True
+
+    manifest_path = _persist_adaptive_year_spray_manifest(
+        shell,
+        domain=domain,
+        base_password=password,
+        original_year=original_year_int,
+        source=str(getattr(adaptive_plan, "source", "unknown")),
+        combos=combos,
+        suffix="single",
+    )
+    if manifest_path:
+        print_info(
+            "Adaptive year combo manifest saved to "
+            f"{mark_sensitive(manifest_path, 'path')}."
+        )
+
+    result = _execute_adaptive_year_password_spraying(
+        shell,
+        domain=domain,
+        plan=adaptive_plan,
+        source_context=source_context,
+        source_steps=source_steps,
+        persist_hits=not return_hits,
+        run_validated_hits_followup=not return_hits,
+        render_hits_panel=not return_hits,
+    )
+    if return_hits:
+        return result if isinstance(result, list) else []
+    return bool(result)
+
+
+def _group_adaptive_year_combos_by_year(
+    combos: list[object],
+) -> dict[int, list[object]]:
+    """Group adaptive spray combos by pwdLastSet year."""
+    grouped: dict[int, list[object]] = {}
+    for combo in combos:
+        year = getattr(combo, "pwdlastset_year", None)
+        if not isinstance(year, int):
+            continue
+        grouped.setdefault(year, []).append(combo)
+    return dict(sorted(grouped.items(), key=lambda item: item[0], reverse=True))
+
+
+def _format_adaptive_year_summary_lines(
+    *,
+    grouped_combos: dict[int, list[object]],
+    original_year: int | None,
+    include_examples: bool,
+) -> list[str]:
+    """Build user-facing summary lines for adaptive year transformations."""
+    lines: list[str] = []
+    for year, year_combos in grouped_combos.items():
+        original_marker = " (original year)" if original_year == year else ""
+        lines.append(f"{year}{original_marker}: {len(year_combos)} users")
+        if not include_examples:
+            continue
+        for combo in year_combos[:_ADAPTIVE_YEAR_SUMMARY_PREVIEW_PER_YEAR]:
+            username = mark_sensitive(str(getattr(combo, "username", "")), "user")
+            password = mark_sensitive(str(getattr(combo, "password", "")), "password")
+            lines.append(f"  {username} -> {password}")
+        remaining = len(year_combos) - _ADAPTIVE_YEAR_SUMMARY_PREVIEW_PER_YEAR
+        if remaining > 0:
+            lines.append(f"  +{remaining} more")
+    return lines
+
+
+def _persist_adaptive_year_spray_manifest(
+    shell: SprayShell,
+    *,
+    domain: str,
+    base_password: str,
+    original_year: int | None,
+    source: str,
+    combos: list[object],
+    suffix: str,
+) -> str | None:
+    """Persist the full adaptive year mapping for later diagnostics."""
+    workspace_cwd = shell.current_workspace_dir or os.getcwd()
+    kerberos_dir = domain_subpath(workspace_cwd, shell.domains_dir, domain, "kerberos")
+    os.makedirs(kerberos_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = (
+        f"adaptive_year_plan_{safe_log_filename_fragment(base_password)}_"
+        f"{safe_log_filename_fragment(suffix)}_{timestamp}.json"
+    )
+    manifest_path = os.path.join(kerberos_dir, filename)
+    grouped = _group_adaptive_year_combos_by_year(combos)
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "domain": domain,
+        "base_password": base_password,
+        "original_year": original_year,
+        "pwdlastset_source": source,
+        "combo_count": len(combos),
+        "year_summary": {
+            str(year): {
+                "count": len(year_combos),
+                "is_original_year": year == original_year,
+            }
+            for year, year_combos in grouped.items()
+        },
+        "combos": [
+            {
+                "username": str(getattr(combo, "username", "")),
+                "generated_password": str(getattr(combo, "password", "")),
+                "base_password": str(getattr(combo, "base_password", base_password)),
+                "pwdlastset_year": getattr(combo, "pwdlastset_year", None),
+                "mode": str(getattr(combo, "mode", "adaptive_year")),
+            }
+            for combo in combos
+        ],
+    }
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+        print_info_debug(
+            "[adaptive-year-spray] Persisted full adaptive plan manifest at "
+            f"{mark_sensitive(manifest_path, 'path')}"
+        )
+        return manifest_path
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning("Failed to persist adaptive year spray diagnostic manifest.")
+        print_info_debug(f"[adaptive-year-spray] Manifest persistence failed: {exc}")
+        return None
+
+
+def _build_batch_password_spray_plan(
+    *,
+    passwords: list[str],
+    eligible_users: list[str],
+    adaptive_pwdlastset_years_by_user: dict[str, int],
+) -> _BatchPasswordSprayPlan | None:
+    """Build a single Kerbrute bruteforce plan for selected passwords.
+
+    Passwords with one clear year token use pwdLastSet-adaptive combos when
+    BloodHound data is available. Other passwords fall back to flat
+    user:password combos, which are equivalent to passwordspray attempts but
+    cheaper to execute as one Kerbrute process.
+    """
+    from adscan_internal.services.password_year_spray_plan_service import (
+        build_adaptive_year_spray_plan,
+    )
+    from adscan_internal.services.password_year_variant_service import (
+        extract_password_year_candidates,
+    )
+
+    combos: list[_BatchPasswordCombo] = []
+    base_passwords: list[str] = []
+    adaptive_base_passwords: list[str] = []
+    flat_base_passwords: list[str] = []
+    unique_users = []
+    seen_users: set[str] = set()
+    for raw_user in eligible_users:
+        username = str(raw_user or "").strip()
+        user_key = username.casefold()
+        if not username or user_key in seen_users:
+            continue
+        seen_users.add(user_key)
+        unique_users.append(username)
+
+    for password in passwords:
+        if not password:
+            continue
+        base_passwords.append(password)
+        adaptive_plan = None
+        if (
+            adaptive_pwdlastset_years_by_user
+            and len(extract_password_year_candidates(password)) == 1
+        ):
+            adaptive_plan = build_adaptive_year_spray_plan(
+                base_password=password,
+                users=unique_users,
+                pwdlastset_years_by_user=adaptive_pwdlastset_years_by_user,
+                source="bloodhound",
+            )
+        if adaptive_plan is not None:
+            adaptive_base_passwords.append(password)
+            for combo in adaptive_plan.combos:
+                combos.append(
+                    _BatchPasswordCombo(
+                        username=combo.username,
+                        password=combo.password,
+                        base_password=password,
+                        mode="adaptive_year",
+                        pwdlastset_year=combo.pwdlastset_year,
+                    )
+                )
+            continue
+
+        flat_base_passwords.append(password)
+        for username in unique_users:
+            combos.append(
+                _BatchPasswordCombo(
+                    username=username,
+                    password=password,
+                    base_password=password,
+                    mode="flat",
+                )
+            )
+
+    if not combos:
+        return None
+    return _BatchPasswordSprayPlan(
+        combos=tuple(combos),
+        base_passwords=tuple(base_passwords),
+        adaptive_base_passwords=tuple(adaptive_base_passwords),
+        flat_base_passwords=tuple(flat_base_passwords),
+    )
+
+
+def _execute_batch_password_spraying(
+    shell: SprayShell,
+    *,
+    domain: str,
+    plan: _BatchPasswordSprayPlan,
+    source_context: dict[str, object] | None = None,
+    source_steps: list[object] | None = None,
+) -> bool:
+    """Execute one batched Kerbrute bruteforce plan."""
+    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
+
+    combo_lines = [f"{combo.username}:{combo.password}" for combo in plan.combos]
+    if not combo_lines:
+        print_warning("No batched password spray combos were generated.")
+        return False
+
+    kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
+    adaptive_combos = [combo for combo in plan.combos if combo.mode == "adaptive_year"]
+    if adaptive_combos:
+        manifest_path = _persist_adaptive_year_spray_manifest(
+            shell,
+            domain=domain,
+            base_password=f"batch_{len(plan.base_passwords)}_passwords",
+            original_year=None,
+            source="bloodhound",
+            combos=list(adaptive_combos),
+            suffix="batch",
+        )
+        if manifest_path:
+            print_info(
+                "Adaptive year combo manifest saved to "
+                f"{mark_sensitive(manifest_path, 'path')}."
+            )
+    combos_path = write_temp_combo_file(combo_lines, directory=kerberos_output_dir)
+    try:
+        auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
+        output_file = os.path.join(
+            "domains",
+            domain,
+            "kerberos",
+            f"{'auth' if auth_state in {'auth', 'pwned'} else 'unauth'}_spray_batch_"
+            f"{len(plan.base_passwords)}_passwords.log",
+        )
+        kerbrute_cmd = build_kerbrute_bruteforce_command(
+            kerbrute_path=shell.kerbrute_path,
+            domain=domain,
+            dc_ip=shell.domains_data[domain]["pdc"],
+            combos_file=combos_path,
+            output_file=output_file,
+        )
+        spraying_command(
+            shell,
+            kerbrute_cmd,
+            domain,
+            spray_type="Batch Password",
+            source_context={
+                **(source_context or {}),
+                "origin": str(
+                    (source_context or {}).get("origin") or "batch_password_spray"
+                ),
+                "batch_password_spray": True,
+                "password_count": len(plan.base_passwords),
+                "combo_count": len(plan.combos),
+                "adaptive_password_count": len(plan.adaptive_base_passwords),
+                "flat_password_count": len(plan.flat_base_passwords),
             },
             source_steps=source_steps,
         )
@@ -4072,6 +4701,150 @@ def spraying_with_passwords(
 
     executed_passwords: list[str] = []
     adaptive_pwdlastset_years_by_user: dict[str, int] | None = None
+    no_lockout_enforced = any(
+        "no lockout enforced" in note.lower() for note in eligibility.notes
+    )
+    if len(selected_passwords) > 1:
+        try:
+            from adscan_internal.services.password_year_spray_plan_service import (
+                resolve_bloodhound_pwdlastset_years,
+            )
+            from adscan_internal.services.password_year_variant_service import (
+                extract_password_year_candidates,
+            )
+
+            if any(
+                len(extract_password_year_candidates(password)) == 1
+                for password in selected_passwords
+            ):
+                adaptive_pwdlastset_years_by_user = resolve_bloodhound_pwdlastset_years(
+                    shell,
+                    domain=domain,
+                    users=list(eligibility.eligible_users),
+                )
+            else:
+                adaptive_pwdlastset_years_by_user = {}
+            batch_plan = _build_batch_password_spray_plan(
+                passwords=selected_passwords,
+                eligible_users=list(eligibility.eligible_users),
+                adaptive_pwdlastset_years_by_user=adaptive_pwdlastset_years_by_user,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[batch-spray] plan resolution failed: {exc}")
+            batch_plan = None
+
+        if batch_plan is not None:
+            prompt_lines = [
+                f"Selected passwords: {len(batch_plan.base_passwords)}",
+                f"Eligible users: {len(eligibility.eligible_users)}",
+                f"Total Kerbrute combos: {len(batch_plan.combos)}",
+                f"Adaptive year passwords: {len(batch_plan.adaptive_base_passwords)}",
+                f"Flat password rounds: {len(batch_plan.flat_base_passwords)}",
+                f"Reason: {'No lockout enforced by domain policy.' if no_lockout_enforced else 'Selected passwords are within the computed safe spray budget.'}",
+            ]
+            if batch_plan.adaptive_base_passwords:
+                prompt_lines.append("")
+                prompt_lines.append("Adaptive year distribution:")
+                for base_password in batch_plan.adaptive_base_passwords:
+                    candidates = extract_password_year_candidates(base_password)
+                    original_year = candidates[0].year if len(candidates) == 1 else None
+                    adaptive_combos = [
+                        combo
+                        for combo in batch_plan.combos
+                        if combo.base_password == base_password
+                        and combo.mode == "adaptive_year"
+                    ]
+                    grouped = _group_adaptive_year_combos_by_year(list(adaptive_combos))
+                    prompt_lines.append(
+                        f"{mark_sensitive(base_password, 'password')}: "
+                        f"{len(adaptive_combos)} combos"
+                    )
+                    prompt_lines.extend(
+                        _format_adaptive_year_summary_lines(
+                            grouped_combos=grouped,
+                            original_year=original_year,
+                            include_examples=False,
+                        )
+                    )
+            print_panel(
+                "\n".join(prompt_lines),
+                title="[bold cyan]Batch Kerbrute Plan Available[/bold cyan]",
+                border_style="cyan",
+                expand=False,
+            )
+            use_batch = Confirm.ask(
+                "Run selected passwords as one Kerbrute bruteforce batch?",
+                default=no_lockout_enforced,
+            )
+            if use_batch:
+                approved_passwords: list[str] = []
+                approved_password_set: set[str] = set()
+                adaptive_password_set = set(batch_plan.adaptive_base_passwords)
+                for password in batch_plan.base_passwords:
+                    category = (
+                        "adaptive_year_password"
+                        if password in adaptive_password_set
+                        else "password"
+                    )
+                    if should_proceed_with_repeated_spraying(
+                        shell,
+                        domain,
+                        category,
+                        password,
+                    ):
+                        approved_passwords.append(password)
+                        approved_password_set.add(password)
+                    else:
+                        print_info(
+                            "Skipping repeated batch password "
+                            f"{mark_sensitive(password, 'password')}."
+                        )
+                if approved_passwords:
+                    filtered_plan = _BatchPasswordSprayPlan(
+                        combos=tuple(
+                            combo
+                            for combo in batch_plan.combos
+                            if combo.base_password in approved_password_set
+                        ),
+                        base_passwords=tuple(approved_passwords),
+                        adaptive_base_passwords=tuple(
+                            password
+                            for password in batch_plan.adaptive_base_passwords
+                            if password in approved_password_set
+                        ),
+                        flat_base_passwords=tuple(
+                            password
+                            for password in batch_plan.flat_base_passwords
+                            if password in approved_password_set
+                        ),
+                    )
+                    if _execute_batch_password_spraying(
+                        shell,
+                        domain=domain,
+                        plan=filtered_plan,
+                        source_context=source_context,
+                        source_steps=source_steps,
+                    ):
+                        executed_passwords.extend(approved_passwords)
+
+                result_lines = [
+                    f"Sprayed now: {len(executed_passwords)}",
+                    f"Deferred: {len(deferred_passwords)}",
+                    "Execution mode: Kerbrute bruteforce batch",
+                ]
+                if deferred_path:
+                    result_lines.append(
+                        f"Deferred file: {mark_sensitive(deferred_path, 'path')}"
+                    )
+                print_panel(
+                    "\n".join(result_lines),
+                    title="[bold green]Multi-Password Spraying Result[/bold green]",
+                    border_style="green",
+                    expand=False,
+                )
+                return executed_passwords
+
     for index, password in enumerate(selected_passwords, start=1):
         marked_password = mark_sensitive(password, "password")
         print_info(
@@ -4085,88 +4858,17 @@ def spraying_with_passwords(
                 f"Skipping password {marked_password} because repeated spraying was not approved."
             )
             continue
-        adaptive_executed = False
-        try:
-            from adscan_internal.services.password_year_spray_plan_service import (
-                build_adaptive_year_spray_plan,
-                resolve_bloodhound_pwdlastset_years,
-            )
-            from adscan_internal.services.password_year_variant_service import (
-                extract_password_year_candidates,
-            )
-
-            if len(extract_password_year_candidates(password)) != 1:
-                adaptive_plan = None
-            else:
-                if adaptive_pwdlastset_years_by_user is None:
-                    adaptive_pwdlastset_years_by_user = resolve_bloodhound_pwdlastset_years(
-                        shell,
-                        domain=domain,
-                        users=list(eligibility.eligible_users),
-                    )
-                adaptive_plan = build_adaptive_year_spray_plan(
-                    base_password=password,
-                    users=list(eligibility.eligible_users),
-                    pwdlastset_years_by_user=adaptive_pwdlastset_years_by_user,
-                    source="bloodhound",
-                )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_info_debug(
-                f"[adaptive-year-spray] plan resolution failed for {marked_password}: {exc}"
-            )
-            adaptive_plan = None
-
-        if adaptive_plan is not None:
-            combos = list(getattr(adaptive_plan, "combos", ()))
-            preview_rows = []
-            for combo in combos[:5]:
-                preview_rows.append(
-                    f"{mark_sensitive(str(getattr(combo, 'username', '')), 'user')} -> "
-                    f"{mark_sensitive(str(getattr(combo, 'password', '')), 'password')}"
-                )
-            if len(combos) > 5:
-                preview_rows.append(f"+{len(combos) - 5} more")
-            prompt_lines = [
-                f"Base password: {marked_password}",
-                f"Detected year: {getattr(adaptive_plan, 'original_year', 'N/A')}",
-                f"pwdLastSet source: {getattr(adaptive_plan, 'source', 'unknown')}",
-                f"Generated combos: {len(combos)}",
-            ]
-            if preview_rows:
-                prompt_lines.append("")
-                prompt_lines.extend(preview_rows)
-            print_panel(
-                "\n".join(prompt_lines),
-                title="[bold cyan]Adaptive Year Spray Available[/bold cyan]",
-                border_style="cyan",
-                expand=False,
-            )
-            use_adaptive = Confirm.ask(
-                "Run pwdLastSet-adaptive Kerbrute bruteforce instead of the normal spray for this password?",
-                default=True,
-            )
-            if use_adaptive:
-                if not should_proceed_with_repeated_spraying(
-                    shell,
-                    domain,
-                    "adaptive_year_password",
-                    password,
-                ):
-                    print_info(
-                        f"Skipping adaptive year spray for {marked_password} because repeated spraying was not approved."
-                    )
-                    continue
-                adaptive_executed = _execute_adaptive_year_password_spraying(
-                    shell,
-                    domain=domain,
-                    plan=adaptive_plan,
-                    source_context=source_context,
-                    source_steps=source_steps,
-                )
-                if adaptive_executed:
-                    executed_passwords.append(password)
-                    continue
+        if _maybe_execute_adaptive_year_password_spraying(
+            shell,
+            domain=domain,
+            password=password,
+            eligibility=eligibility,
+            source_context=source_context,
+            source_steps=source_steps,
+            pwdlastset_years_by_user=adaptive_pwdlastset_years_by_user,
+        ):
+            executed_passwords.append(password)
+            continue
 
         if _execute_single_password_spraying(
             shell,
@@ -4176,6 +4878,7 @@ def spraying_with_passwords(
             source_context=source_context,
             source_steps=source_steps,
             show_intro=False,
+            offer_adaptive_year=False,
         ):
             executed_passwords.append(password)
 
@@ -4196,7 +4899,9 @@ def spraying_with_passwords(
 
 def retry_pending_password_spraying(shell: SprayShell, domain: str) -> list[str]:
     """Resume spraying from deferred password candidates saved in the workspace."""
-    pending_candidates = _load_pending_spraying_password_candidates(shell, domain=domain)
+    pending_candidates = _load_pending_spraying_password_candidates(
+        shell, domain=domain
+    )
     if not pending_candidates:
         print_warning("No saved password spray candidates were found for this domain.")
         return []
@@ -4208,13 +4913,17 @@ def retry_pending_password_spraying(shell: SprayShell, domain: str) -> list[str]
     table.add_column("Reason", style="yellow")
     table.add_column("Source", style="dim")
     for index, candidate in enumerate(pending_candidates, start=1):
-        source_summary = str(candidate.source.get("artifact") or candidate.source.get("origin") or "N/A")
+        source_summary = str(
+            candidate.source.get("artifact") or candidate.source.get("origin") or "N/A"
+        )
         table.add_row(
             str(index),
             mark_sensitive(candidate.password, "password"),
             candidate.deferred_at or "-",
             candidate.reason_not_sprayed or "-",
-            mark_sensitive(source_summary, "path") if source_summary != "N/A" else source_summary,
+            mark_sensitive(source_summary, "path")
+            if source_summary != "N/A"
+            else source_summary,
         )
     print_table(table)
 
@@ -4252,7 +4961,9 @@ def retry_pending_domain_reuse_validation(shell: SprayShell, domain: str) -> lis
     """Resume SAM-to-domain reuse validation from deferred credential variants."""
     pending_candidates = _load_pending_domain_reuse_candidates(shell, domain=domain)
     if not pending_candidates:
-        print_warning("No saved SAM-to-domain reuse candidates were found for this domain.")
+        print_warning(
+            "No saved SAM-to-domain reuse candidates were found for this domain."
+        )
         return []
 
     table = Table(title="Saved SAM -> Domain Reuse Candidates", show_lines=False)
@@ -4267,8 +4978,14 @@ def retry_pending_domain_reuse_validation(shell: SprayShell, domain: str) -> lis
             str(index),
             mark_sensitive(candidate.credential, "password"),
             candidate.credential_type or "-",
-            ", ".join(mark_sensitive(account, "user") for account in candidate.accounts[:2])
-            + (f" (+{len(candidate.accounts) - 2} more)" if len(candidate.accounts) > 2 else ""),
+            ", ".join(
+                mark_sensitive(account, "user") for account in candidate.accounts[:2]
+            )
+            + (
+                f" (+{len(candidate.accounts) - 2} more)"
+                if len(candidate.accounts) > 2
+                else ""
+            ),
             candidate.deferred_at or "-",
             candidate.reason_not_validated or "-",
         )
@@ -4439,7 +5156,10 @@ def execute_spraying_command(
     entry_label: str | None = None,
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
-) -> None:
+    persist_hits: bool = True,
+    run_validated_hits_followup: bool = True,
+    render_hits_panel: bool = True,
+) -> list[dict[str, str]]:
     """Execute the spraying command and process results."""
     from adscan_internal.cli.common import SECRET_MODE
 
@@ -4469,7 +5189,7 @@ def execute_spraying_command(
 
         if completed_process is None:
             print_error("Failed to execute password spraying command")
-            return
+            return []
 
         # Process output after command completes (avoids interleaving)
         raw_output = completed_process.stdout or ""
@@ -4507,19 +5227,22 @@ def execute_spraying_command(
 
         if found_credentials:
             hits = list(hits_by_user.values())
-            _render_valid_spray_hits_panel(
-                hits,
-                spray_type=spray_type,
-            )
-            _persist_and_record_spray_hits(
-                shell,
-                domain=domain,
-                hits=hits,
-                spray_type=spray_type,
-                entry_label=entry_label,
-                source_context=source_context,
-                source_steps=source_steps,
-            )
+            if render_hits_panel:
+                _render_valid_spray_hits_panel(
+                    hits,
+                    spray_type=spray_type,
+                )
+            if persist_hits:
+                _persist_and_record_spray_hits(
+                    shell,
+                    domain=domain,
+                    hits=hits,
+                    spray_type=spray_type,
+                    entry_label=entry_label,
+                    source_context=source_context,
+                    source_steps=source_steps,
+                    run_validated_hits_followup=run_validated_hits_followup,
+                )
 
         # Handle command result
         if completed_process.returncode != 0:
@@ -4564,6 +5287,8 @@ def execute_spraying_command(
         telemetry.capture_exception(e)
         print_error("Error executing password spraying command.")
         print_exception(show_locals=False, exception=e)
+        return []
+    return list(hits_by_user.values()) if found_credentials else []
 
 
 def execute_netexec_spraying_command(
@@ -4606,7 +5331,9 @@ def execute_netexec_spraying_command(
         combined_output = "\n".join(
             text for text in (raw_output, raw_stderr_output) if text
         )
-        hit_usernames, outcome_counts = _summarize_domain_spray_outcomes(combined_output)
+        hit_usernames, outcome_counts = _summarize_domain_spray_outcomes(
+            combined_output
+        )
         hits = [{"username": username, "password": ""} for username in hit_usernames]
 
         if hits:

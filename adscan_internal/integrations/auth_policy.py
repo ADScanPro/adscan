@@ -20,6 +20,9 @@ _NTLM_DISABLED_MARKERS = (
     "STATUS_NOT_SUPPORTED",
     "NTLM NEGOTIATION FAILED",
     "NTLMAUTHNEGOTIATE REQUEST",
+    "INVALID NTLM CHALLENGE RECEIVED",
+    "NTLM IS NOT SUPPORTED",
+    "ONLY SUPPORT NTLM CURRENTLY",
 )
 
 _KERBEROS_FAILURE_MARKERS = (
@@ -164,19 +167,19 @@ def resolve_netexec_auth_policy_decision(
         )
 
     protocol_key = str(protocol or "").strip().lower()
-    if protocol_key not in _NETEXEC_KERBEROS_SUPPORTED_PROTOCOLS:
-        return AuthPolicyDecision(
-            prefer_kerberos=False,
-            ntlm_status="unknown",
-            reason="protocol_kerberos_unsupported",
-        )
-
     base_decision = resolve_auth_policy_decision(
         domains_data=domains_data,
         domain=domain,
         protocol=protocol,
         default_preference=False,
     )
+    if protocol_key not in _NETEXEC_KERBEROS_SUPPORTED_PROTOCOLS:
+        return AuthPolicyDecision(
+            prefer_kerberos=False,
+            ntlm_status=base_decision.ntlm_status,
+            reason="protocol_kerberos_unsupported",
+        )
+
     if base_decision.ntlm_status in {"likely_disabled", "likely_enabled"}:
         return base_decision
 
@@ -355,7 +358,9 @@ def _build_impacket_getuserspns_kerberos_command(tokens: list[str]) -> str | Non
     if not has_password_auth and not has_hash_auth:
         return None
     target_domain_index = _find_flag_index(tokens, "-target-domain")
-    insert_at = target_domain_index if target_domain_index is not None else auth_index + 1
+    insert_at = (
+        target_domain_index if target_domain_index is not None else auth_index + 1
+    )
     return shlex.join(_insert_token(tokens, insert_at, "-k"))
 
 
@@ -373,7 +378,8 @@ def _build_impacket_secretsdump_kerberos_command(tokens: list[str]) -> str | Non
     if any(token.upper() == "LOCAL" for token in tokens[1:]):
         return None
     has_password_auth = any(
-        not token.startswith("-") and "@" in token and ":" in token for token in tokens[1:]
+        not token.startswith("-") and "@" in token and ":" in token
+        for token in tokens[1:]
     )
     has_hash_auth = "-hashes" in tokens
     if not has_password_auth and not has_hash_auth:
@@ -383,7 +389,11 @@ def _build_impacket_secretsdump_kerberos_command(tokens: list[str]) -> str | Non
         target_index = outputfile_index - 1
     else:
         target_index = next(
-            (index for index in range(len(tokens) - 1, 0, -1) if not tokens[index].startswith("-")),
+            (
+                index
+                for index in range(len(tokens) - 1, 0, -1)
+                if not tokens[index].startswith("-")
+            ),
             None,
         )
         if target_index is None:
@@ -393,7 +403,11 @@ def _build_impacket_secretsdump_kerberos_command(tokens: list[str]) -> str | Non
 
 def _flag_has_value(argv: list[str], flag: str) -> bool:
     index = _find_flag_index(argv, flag)
-    return index is not None and index + 1 < len(argv) and argv[index + 1].strip().strip("'\"") != ""
+    return (
+        index is not None
+        and index + 1 < len(argv)
+        and argv[index + 1].strip().strip("'\"") != ""
+    )
 
 
 def _get_flag_value(argv: list[str], flag: str) -> str | None:
@@ -450,7 +464,18 @@ def _extract_netexec_target(command: str) -> str | None:
 
 def _find_netexec_service_index(argv: list[str]) -> int | None:
     """Return the index of the NetExec service token in one argv list."""
-    services = {"smb", "ldap", "mssql", "rdp", "winrm", "ssh", "vnc", "ftp", "http", "https"}
+    services = {
+        "smb",
+        "ldap",
+        "mssql",
+        "rdp",
+        "winrm",
+        "ssh",
+        "vnc",
+        "ftp",
+        "http",
+        "https",
+    }
     return next((idx for idx, token in enumerate(argv) if token in services), None)
 
 
@@ -484,7 +509,11 @@ def _target_matches_known_dc(
 
     pdc_ip = str(domain_info.get("pdc") or "").strip().casefold()
     pdc_hostname = str(domain_info.get("pdc_hostname") or "").strip().casefold()
-    pdc_fqdn = str(domain_info.get("pdc_hostname_fqdn") or domain_info.get("pdc_fqdn") or "").strip().casefold()
+    pdc_fqdn = (
+        str(domain_info.get("pdc_hostname_fqdn") or domain_info.get("pdc_fqdn") or "")
+        .strip()
+        .casefold()
+    )
     domain_name = str(domain or "").strip().casefold()
     candidates = {
         candidate

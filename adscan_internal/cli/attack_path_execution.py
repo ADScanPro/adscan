@@ -87,7 +87,11 @@ from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
     POLICY_BLOCKED_RELATIONS,
     SUPPORTED_RELATION_NOTES,
+    build_path_execution_priority_key,
     classify_relation_support,
+    describe_search_mode_label,
+    describe_path_target_outcome,
+    normalize_search_mode_label,
 )
 from adscan_internal.services.ldap_transport_service import (
     prepare_kerberos_ldap_environment,
@@ -136,24 +140,13 @@ def _summary_target_priority_class(summary: dict[str, Any]) -> str:
 def _sort_target_priority_groups(
     summaries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Return summaries grouped Tier-0 first, then high-value, then pivots."""
-    ordered_classes = ("tierzero", "highvalue", "pivot")
-    return [
-        summary
-        for priority_class in ordered_classes
-        for summary in summaries
-        if _summary_target_priority_class(summary) == priority_class
-    ]
+    """Return summaries ordered by the canonical ADscan execution priority."""
+    return sorted(summaries, key=build_path_execution_priority_key)
 
 
 def _summary_search_mode_label(summary: dict[str, Any]) -> str:
-    """Return the per-summary search-mode label used by execution UX."""
-    priority_class = _summary_target_priority_class(summary)
-    if priority_class == "tierzero":
-        return "Tier-0 Search"
-    if priority_class == "highvalue":
-        return "High-Value Search"
-    return "Pivot Search"
+    """Return the per-summary outcome label used by execution UX."""
+    return describe_path_target_outcome(summary)
 
 
 def _normalize_account(value: str) -> str:
@@ -1890,6 +1883,43 @@ def _extract_cert_templates_from_step_details(
     return unique
 
 
+def _extract_effective_group_from_step_details(details: dict[str, Any]) -> str | None:
+    """Extract an effective group name from attack-step metadata."""
+    candidate_keys = (
+        "effective_group",
+        "linked_group",
+        "policy_group",
+        "issuance_policy_group",
+        "target_group",
+        "group",
+    )
+    for key in candidate_keys:
+        value = details.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    raw_groups = details.get("groups") or details.get("linked_groups")
+    if isinstance(raw_groups, list):
+        for item in raw_groups:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("group") or item.get("label")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+
+    templates = details.get("templates")
+    if isinstance(templates, list):
+        for item in templates:
+            if not isinstance(item, dict):
+                continue
+            for key in candidate_keys:
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return None
+
+
 def _extract_cert_templates_by_role(
     details: dict[str, Any],
     *,
@@ -2250,12 +2280,21 @@ def _prepare_kerberos_for_smb_execution(
     if ticket_state is not False:
         return True
 
+    is_ccache_credential = str(credential or "").strip().lower().endswith(".ccache")
     dc_ip = str(domain_data.get("pdc") or "").strip() or None
-    print_warning_debug(
-        "[writelogonscript] Kerberos ticket appears expired before SMB operation; "
-        f"refreshing ticket for {mark_sensitive(username, 'user')} in "
-        f"{mark_sensitive(domain, 'domain')}"
-    )
+    if is_ccache_credential:
+        print_warning_debug(
+            "[writelogonscript] Kerberos ccache appears invalid before SMB operation; "
+            "preserving the operator-supplied ticket context instead of regenerating "
+            f"credentials for {mark_sensitive(username, 'user')} in "
+            f"{mark_sensitive(domain, 'domain')}"
+        )
+    else:
+        print_warning_debug(
+            "[writelogonscript] Kerberos ticket appears expired before SMB operation; "
+            f"refreshing ticket for {mark_sensitive(username, 'user')} in "
+            f"{mark_sensitive(domain, 'domain')}"
+        )
     auto_generate = getattr(shell, "_auto_generate_kerberos_ticket", None)
     if not callable(auto_generate):
         return True
@@ -3932,7 +3971,7 @@ def execute_selected_attack_path(
             )
             cleanup_scope_owner = True
 
-        is_pivot_search = str(search_mode_label or "").strip().lower() == "pivot search"
+        is_pivot_search = normalize_search_mode_label(search_mode_label) == "pivot"
 
         non_executable_actions = CONTEXT_ONLY_RELATIONS
         dangerous_actions = POLICY_BLOCKED_RELATIONS
@@ -6549,6 +6588,176 @@ def execute_selected_attack_path(
                         )
                 continue
 
+            if key == "adcsesc13":
+                if not from_label or not to_label:
+                    print_warning("Cannot execute ADCSESC13: missing from/to details.")
+                    return execution_started
+
+                exec_username = _resolve_execution_user(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=summary,
+                    from_label=from_label,
+                )
+                if not exec_username:
+                    marked_user = mark_sensitive(from_label, "user")
+                    print_warning(
+                        f"Cannot execute ADCSESC13: no execution user context available for {marked_user}."
+                    )
+                    _mark_blocked_step(
+                        "ADCSESC13",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing execution user context",
+                    )
+                    return execution_started
+
+                password = context_password or _resolve_domain_password(
+                    shell, domain, exec_username
+                )
+                if not password:
+                    marked_user = mark_sensitive(exec_username, "user")
+                    print_warning(
+                        f"Cannot execute ADCSESC13: no stored domain credential found for {marked_user}."
+                    )
+                    _mark_blocked_step(
+                        "ADCSESC13",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing stored credential for execution user",
+                    )
+                    return execution_started
+
+                domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+                if not isinstance(domain_data, dict):
+                    domain_data = {}
+                if not domain_data.get("pdc"):
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_warning(
+                        f"Cannot execute ADCSESC13 for {marked_domain}: missing PDC IP in domain data."
+                    )
+                    _mark_blocked_step(
+                        "ADCSESC13",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing PDC IP in domain data",
+                    )
+                    return execution_started
+                if not domain_data.get("adcs") or not domain_data.get("ca"):
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_warning(
+                        f"Cannot execute ADCSESC13 for {marked_domain}: missing ADCS/CA info."
+                    )
+                    _mark_blocked_step(
+                        "ADCSESC13",
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        reason="Missing ADCS/CA info in domain data",
+                    )
+                    return execution_started
+
+                esc13_templates = _resolve_adcs_template_candidates(
+                    shell,
+                    domain=domain,
+                    exec_username=exec_username,
+                    password=password,
+                    esc_number="13",
+                    details=details,
+                    to_label=to_label,
+                    domain_data=domain_data,
+                )
+                if not esc13_templates:
+                    manual_template = _prompt_for_manual_adcs_template(esc_number="13")
+                    if manual_template:
+                        esc13_templates = [manual_template]
+                        print_info_debug(
+                            "[adcsesc13] Using operator-specified template: "
+                            f"{mark_sensitive(manual_template, 'service')}"
+                        )
+                    else:
+                        print_warning(
+                            "No ESC13 vulnerable certificate templates found for this user."
+                        )
+                        return execution_started
+                if not esc13_templates:
+                    print_warning(
+                        "No ESC13 vulnerable certificate templates found for this user."
+                    )
+                    return execution_started
+
+                template = _select_adcs_template(
+                    shell,
+                    esc_number="13",
+                    templates=esc13_templates,
+                )
+                if not template:
+                    print_warning("ESC13 execution cancelled.")
+                    return execution_started
+                effective_group = _extract_effective_group_from_step_details(details)
+
+                execution_started = True
+                with _active_step_context(
+                    action="ADCSESC13",
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes={
+                        "username": exec_username,
+                        "template": template,
+                        **(
+                            {"effective_group": effective_group}
+                            if effective_group
+                            else {}
+                        ),
+                    },
+                ):
+                    try:
+                        notes = {
+                            "username": exec_username,
+                            "template": template,
+                            **(
+                                {"effective_group": effective_group}
+                                if effective_group
+                                else {}
+                            ),
+                        }
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation="ADCSESC13",
+                            to_label=to_label,
+                            status="attempted",
+                            notes=notes,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    if hasattr(shell, "adcs_esc13"):
+                        shell.adcs_esc13(  # type: ignore[attr-defined]
+                            domain,
+                            exec_username,
+                            password,
+                            template,
+                            effective_group=effective_group,
+                        )
+                    else:
+                        from adscan_internal.cli.adcs_exploitation import adcs_esc13
+
+                        adcs_esc13(
+                            shell,
+                            domain=domain,
+                            username=exec_username,
+                            password=password,
+                            template=template,
+                            effective_group=effective_group,
+                        )
+                continue
+
             if key == "goldencert":
                 if not from_label or not to_label:
                     print_warning("Cannot execute GoldenCert: missing from/to details.")
@@ -7423,12 +7632,12 @@ def _target_scope_label(*, target: str, target_mode: str) -> str:
 def _target_search_mode_label(*, target: str, target_mode: str) -> str:
     """Return a compact label describing the current attack-path search mode."""
     if target == "all":
-        return "Pivot Search"
+        return describe_search_mode_label("pivot")
     if target == "lowpriv":
-        return "Low-Priv Search"
+        return describe_search_mode_label("low_priv")
     if str(target_mode or "impact").strip().lower() == "tier0":
-        return "Tier-0 Search"
-    return "High-Value Search"
+        return describe_search_mode_label("direct_compromise")
+    return describe_search_mode_label("followup_terminal")
 
 
 def _resolve_summary_search_mode_label(

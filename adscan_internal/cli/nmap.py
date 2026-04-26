@@ -2140,7 +2140,7 @@ def convert_hostnames_to_ips_and_scan(
                 f"Run the optional important-port Nmap scan for domain {marked_domain}? "
                 "[recommended to confirm reachable hosts and AD service exposure]"
             )
-            prompt_default = False
+            prompt_default = True
         else:
             decision_lines = [
                 "This Nmap scan is the source of truth for current-vantage service exposure and possible segmentation in large domains.",
@@ -2160,7 +2160,7 @@ def convert_hostnames_to_ips_and_scan(
                 f"Run the important-port Nmap scan for domain {marked_domain}? "
                 "[recommended when you want current-vantage reachability and service evidence]"
             )
-            prompt_default = False
+            prompt_default = True
         print_panel(
             "\n".join(decision_lines),
             title=panel_title,

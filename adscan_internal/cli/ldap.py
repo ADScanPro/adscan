@@ -194,7 +194,9 @@ class LdapShell(Protocol):
 
     def do_sync_clock_with_pdc(self, domain: str) -> None: ...
 
-    def ask_for_bloodhound(self, target_domain: str, callback=None) -> None: ...
+    def ask_for_bloodhound(
+        self, target_domain: str, callback=None
+    ) -> list[str] | None: ...
 
     def run_enumeration(
         self, domain: str, *, stop_after_phase: int | None = None
@@ -2373,7 +2375,7 @@ def _run_enum_domain_auth(
         )
 
         if get_bloodhound_mode() == "ce":
-            shell.ask_for_bloodhound(  # type: ignore[attr-defined]
+            collector_results = shell.ask_for_bloodhound(  # type: ignore[attr-defined]
                 domain,
                 callback=lambda: run_post_bloodhound_ce(
                     shell,
@@ -2383,7 +2385,7 @@ def _run_enum_domain_auth(
             )
         else:
             legacy_config_path = get_legacy_bloodhound_config_path()
-            shell.ask_for_bloodhound(  # type: ignore[attr-defined]
+            collector_results = shell.ask_for_bloodhound(  # type: ignore[attr-defined]
                 domain,
                 callback=lambda: run_post_bloodhound(
                     shell,
@@ -2392,7 +2394,12 @@ def _run_enum_domain_auth(
                     legacy_config_path=legacy_config_path,
                 ),
             )
-        tracker.complete_step(details="BloodHound data collection completed")
+        if collector_results == []:
+            tracker.complete_step(
+                details="BloodHound collection skipped in dev mode; continuing with Phase 1"
+            )
+        else:
+            tracker.complete_step(details="BloodHound data collection completed")
     except Exception as exc:  # noqa: BLE001
         tracker.fail_step(details=f"BloodHound error: {str(exc)[:50]}")
 

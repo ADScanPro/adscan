@@ -31,7 +31,7 @@ from adscan_internal.rich_output import (
     print_panel,
     print_success,
     print_warning,
-    print_exception
+    print_exception,
 )
 from adscan_internal.services.attack_step_catalog import get_bh_native_acl_cypher_names
 from adscan_internal.services.host_docker_service import (
@@ -46,6 +46,60 @@ def _safe_truncate(value: str, limit: int = 1200) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}...[truncated]"
+
+
+_BH_UPLOAD_JOB_STATUS_LABELS: dict[int, str] = {
+    -1: "Invalid",
+    0: "Pending",
+    1: "Running",
+    2: "Complete",
+    3: "Canceled",
+    4: "Timed out",
+    5: "Failed",
+    6: "Ingesting",
+    7: "Queued",
+    8: "Partially complete",
+}
+
+
+def _describe_upload_job_status(status: object, status_message: object) -> str:
+    """Return a concise, operator-friendly description for a BH CE upload job state."""
+    try:
+        normalized_status = int(status)
+    except (TypeError, ValueError):
+        normalized_status = None
+
+    label = (
+        _BH_UPLOAD_JOB_STATUS_LABELS.get(
+            normalized_status, f"Unknown status {normalized_status}"
+        )
+        if normalized_status is not None
+        else "Unknown status"
+    )
+    message = str(status_message or "").strip()
+    if message and message.lower() != label.lower():
+        return f"{label} - {message}"
+    return label
+
+
+def _format_upload_wait_message(
+    *,
+    job_id: int,
+    elapsed_seconds: int,
+    status: object,
+    status_message: object,
+) -> str:
+    """Return a human-readable progress message for the upload ingestion wait loop."""
+    status_summary = _describe_upload_job_status(status, status_message)
+    normal_wait_hint = ""
+    if elapsed_seconds < 90:
+        normal_wait_hint = (
+            " This can be normal while BloodHound CE processes the uploaded graph."
+        )
+    return (
+        f"Still waiting for ingestion... elapsed={elapsed_seconds}s, "
+        f"job_id={job_id}, state={status_summary}.{normal_wait_hint}"
+    )
 
 
 def _get_default_admin_password() -> str:
@@ -90,7 +144,13 @@ def _warn_bh_complexity_limit() -> None:
 
 def _build_cypher_relationship_union(relationships: set[str]) -> str:
     """Return a deterministic ``:TypeA|TypeB|...`` union for Cypher path patterns."""
-    ordered = sorted({str(value or "").strip() for value in relationships if str(value or "").strip()})
+    ordered = sorted(
+        {
+            str(value or "").strip()
+            for value in relationships
+            if str(value or "").strip()
+        }
+    )
     return ":" + "|".join(ordered) if ordered else ""
 
 
@@ -220,16 +280,26 @@ class _BloodHoundApiRateLimiter:
             self._next_request_at = scheduled_at + interval_seconds
             return delay_seconds
 
-    def note_response(self, headers: requests.structures.CaseInsensitiveDict) -> float | None:
+    def note_response(
+        self, headers: requests.structures.CaseInsensitiveDict
+    ) -> float | None:
         """Update limiter state from response headers and return any proactive pause."""
-        limit_header = headers.get("X-Ratelimit-Limit") or headers.get("X-RateLimit-Limit")
-        remaining_header = headers.get("X-Ratelimit-Remaining") or headers.get("X-RateLimit-Remaining")
-        reset_header = headers.get("X-Ratelimit-Reset") or headers.get("X-RateLimit-Reset")
+        limit_header = headers.get("X-Ratelimit-Limit") or headers.get(
+            "X-RateLimit-Limit"
+        )
+        remaining_header = headers.get("X-Ratelimit-Remaining") or headers.get(
+            "X-RateLimit-Remaining"
+        )
+        reset_header = headers.get("X-Ratelimit-Reset") or headers.get(
+            "X-RateLimit-Reset"
+        )
         server_date_header = headers.get("Date")
 
         if limit_header:
             try:
-                self._server_limit_per_second = max(0.2, float(str(limit_header).strip()))
+                self._server_limit_per_second = max(
+                    0.2, float(str(limit_header).strip())
+                )
             except (TypeError, ValueError):
                 pass
 
@@ -246,18 +316,24 @@ class _BloodHoundApiRateLimiter:
                 )
                 if proactive_pause and proactive_pause > 0:
                     with self._lock:
-                        self._pause_until = max(self._pause_until, time.monotonic() + proactive_pause)
+                        self._pause_until = max(
+                            self._pause_until, time.monotonic() + proactive_pause
+                        )
                         self._awaiting_recovery_notice = True
         return proactive_pause
 
-    def note_rate_limited(self, headers: requests.structures.CaseInsensitiveDict) -> float:
+    def note_rate_limited(
+        self, headers: requests.structures.CaseInsensitiveDict
+    ) -> float:
         """Register a 429 response and return the pause duration to honor."""
         retry_after_seconds = _parse_retry_after_seconds(headers.get("Retry-After"))
         reset_seconds = _parse_rate_limit_reset_seconds(
             headers.get("X-Ratelimit-Reset") or headers.get("X-RateLimit-Reset"),
             server_date_header=headers.get("Date"),
         )
-        pause_seconds = retry_after_seconds or reset_seconds or _BH_CE_DEFAULT_429_WAIT_SECONDS
+        pause_seconds = (
+            retry_after_seconds or reset_seconds or _BH_CE_DEFAULT_429_WAIT_SECONDS
+        )
         pause_seconds = max(_BH_CE_DEFAULT_429_WAIT_SECONDS, pause_seconds)
 
         with self._lock:
@@ -332,7 +408,9 @@ class BloodHoundCEClient(BloodHoundClient):
             configured_rps = (
                 _BH_CE_LOGIN_MAX_RPS
                 if bucket == "login"
-                else float(os.getenv("ADSCAN_BH_API_MAX_RPS", str(_BH_CE_DEFAULT_MAX_RPS)))
+                else float(
+                    os.getenv("ADSCAN_BH_API_MAX_RPS", str(_BH_CE_DEFAULT_MAX_RPS))
+                )
             )
             limiter = _BloodHoundApiRateLimiter(configured_max_rps=configured_rps)
             _BH_CE_RATE_LIMITERS[key] = limiter
@@ -340,11 +418,15 @@ class BloodHoundCEClient(BloodHoundClient):
 
     def _resolve_request_url(self, url_or_path: str) -> str:
         """Return an absolute BloodHound CE URL for the given path or URL."""
-        if str(url_or_path).startswith("http://") or str(url_or_path).startswith("https://"):
+        if str(url_or_path).startswith("http://") or str(url_or_path).startswith(
+            "https://"
+        ):
             return str(url_or_path)
         return f"{self.base_url}{url_or_path}"
 
-    def _resolve_rate_limit_bucket(self, url_or_path: str, bucket: Optional[str] = None) -> str:
+    def _resolve_rate_limit_bucket(
+        self, url_or_path: str, bucket: Optional[str] = None
+    ) -> str:
         """Resolve the rate-limit bucket for a request."""
         if bucket:
             return bucket
@@ -364,10 +446,15 @@ class BloodHoundCEClient(BloodHoundClient):
                 )
                 self._rate_limit_notice_active = True
                 self._rate_limit_notice_kind = "proactive"
-            self._debug("proactive BloodHound CE pacing pause", wait_seconds=rounded_pause)
+            self._debug(
+                "proactive BloodHound CE pacing pause", wait_seconds=rounded_pause
+            )
             return
 
-        if not self._rate_limit_notice_active or self._rate_limit_notice_kind != "reactive":
+        if (
+            not self._rate_limit_notice_active
+            or self._rate_limit_notice_kind != "reactive"
+        ):
             print_warning(
                 "BloodHound CE API rate limit reached. "
                 f"ADscan is pausing for about {rounded_pause}s and will resume automatically."
@@ -380,7 +467,9 @@ class BloodHoundCEClient(BloodHoundClient):
         """Emit a one-time recovery message after a server-directed pause."""
         if not self._rate_limit_notice_active:
             return
-        print_success("BloodHound CE API budget recovered. ADscan resumed automatically.")
+        print_success(
+            "BloodHound CE API budget recovered. ADscan resumed automatically."
+        )
         self._rate_limit_notice_active = False
         self._rate_limit_notice_kind = None
         self._stuck_rate_limit_notice_shown = False
@@ -484,7 +573,9 @@ class BloodHoundCEClient(BloodHoundClient):
         retry_after = headers.get("Retry-After")
         server_date = headers.get("Date")
         request_id = headers.get("Requestid") or headers.get("RequestId")
-        remaining = headers.get("X-Ratelimit-Remaining") or headers.get("X-RateLimit-Remaining")
+        remaining = headers.get("X-Ratelimit-Remaining") or headers.get(
+            "X-RateLimit-Remaining"
+        )
         limit = headers.get("X-Ratelimit-Limit") or headers.get("X-RateLimit-Limit")
         server_epoch = _parse_http_date_epoch(server_date)
         local_epoch = time.time()
@@ -548,10 +639,15 @@ class BloodHoundCEClient(BloodHoundClient):
             response = request_callable(url, verify=self.verify, **kwargs)
             proactive_pause = rate_limiter.note_response(response.headers)
             if proactive_pause and proactive_pause >= 0.25:
-                self._emit_rate_limit_pause(pause_seconds=proactive_pause, proactive=True)
+                self._emit_rate_limit_pause(
+                    pause_seconds=proactive_pause, proactive=True
+                )
 
             if response.status_code == 401 and allow_auth_retry and not auth_retried:
-                self._debug("authentication failed, attempting token renewal", bucket=resolved_bucket)
+                self._debug(
+                    "authentication failed, attempting token renewal",
+                    bucket=resolved_bucket,
+                )
                 if self.ensure_authenticated_robust():
                     auth_retried = True
                     continue
@@ -575,7 +671,8 @@ class BloodHoundCEClient(BloodHoundClient):
 
             if response.status_code == 429 and allow_rate_limit_retry:
                 raw_reset_wait = _get_rate_limit_reset_delay_seconds(
-                    response.headers.get("X-Ratelimit-Reset") or response.headers.get("X-RateLimit-Reset"),
+                    response.headers.get("X-Ratelimit-Reset")
+                    or response.headers.get("X-RateLimit-Reset"),
                     server_date_header=response.headers.get("Date"),
                 )
                 self._debug_rate_limit_diagnostics(
@@ -590,7 +687,8 @@ class BloodHoundCEClient(BloodHoundClient):
                 ):
                     self._emit_stuck_rate_limit_warning(
                         wait_seconds=raw_reset_wait,
-                        request_id=response.headers.get("Requestid") or response.headers.get("RequestId"),
+                        request_id=response.headers.get("Requestid")
+                        or response.headers.get("RequestId"),
                     )
                     if self._attempt_recover_from_stuck_rate_limit():
                         rate_limit_retries += 1
@@ -598,7 +696,9 @@ class BloodHoundCEClient(BloodHoundClient):
                         continue
                     return response
                 pause_seconds = rate_limiter.note_rate_limited(response.headers)
-                self._emit_rate_limit_pause(pause_seconds=pause_seconds, proactive=False)
+                self._emit_rate_limit_pause(
+                    pause_seconds=pause_seconds, proactive=False
+                )
                 if rate_limit_retries >= max_rate_limit_retries:
                     return response
                 rate_limit_retries += 1
@@ -769,7 +869,9 @@ class BloodHoundCEClient(BloodHoundClient):
             props = raw.get("Props") or {}
             labels: List[str] = raw.get("Labels") or []
             # Prefer the most specific label (skip the generic "Base" label).
-            kind = next((lbl for lbl in labels if lbl != "Base"), labels[0] if labels else "")
+            kind = next(
+                (lbl for lbl in labels if lbl != "Base"), labels[0] if labels else ""
+            )
             label = str(
                 props.get("name")
                 or props.get("samaccountname")
@@ -807,7 +909,9 @@ class BloodHoundCEClient(BloodHoundClient):
             results.append(
                 {
                     "nodes": [_node_from_literal(n) for n in raw_nodes],
-                    "rels": [str(r.get("Type") or r.get("kind") or "") for r in raw_rels],
+                    "rels": [
+                        str(r.get("Type") or r.get("kind") or "") for r in raw_rels
+                    ],
                 }
             )
             i += 2
@@ -867,21 +971,29 @@ class BloodHoundCEClient(BloodHoundClient):
             )
             literals: List[Dict] = (data.get("data") or {}).get("literals") or []
             paths = self._parse_path_literals(literals)
-            self._debug("path query parsed", raw_literals=len(literals), parsed_paths=len(paths))
+            self._debug(
+                "path query parsed", raw_literals=len(literals), parsed_paths=len(paths)
+            )
             if paths:
                 for i, sample in enumerate(paths[:2]):
                     node_names = " → ".join(
                         str(nd.get("label") or nd.get("objectId") or "?")
                         for nd in (sample.get("nodes") or [])
                     )
-                    self._debug(f"path sample [{i}]", nodes=node_names, rels=sample.get("rels"))
+                    self._debug(
+                        f"path sample [{i}]", nodes=node_names, rels=sample.get("rels")
+                    )
                 if len(paths) > 4:
                     for i, sample in enumerate(paths[-2:], start=len(paths) - 2):
                         node_names = " → ".join(
                             str(nd.get("label") or nd.get("objectId") or "?")
                             for nd in (sample.get("nodes") or [])
                         )
-                        self._debug(f"path sample [{i}]", nodes=node_names, rels=sample.get("rels"))
+                        self._debug(
+                            f"path sample [{i}]",
+                            nodes=node_names,
+                            rels=sample.get("rels"),
+                        )
             return paths
 
         except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -1008,7 +1120,11 @@ class BloodHoundCEClient(BloodHoundClient):
     @staticmethod
     def _normalize_graph_node(raw_node: Dict) -> Dict:
         """Normalize one graph node from the CE graph payload into ADscan shape."""
-        props = raw_node.get("properties") if isinstance(raw_node.get("properties"), dict) else {}
+        props = (
+            raw_node.get("properties")
+            if isinstance(raw_node.get("properties"), dict)
+            else {}
+        )
         labels = raw_node.get("kinds") or raw_node.get("labels") or []
         kind = str(raw_node.get("kind") or "").strip()
         if not kind and isinstance(labels, list):
@@ -1031,10 +1147,7 @@ class BloodHoundCEClient(BloodHoundClient):
             or "admin_tier_0" in str(props.get("system_tags") or "")
         )
         label = str(
-            props.get("name")
-            or raw_node.get("label")
-            or raw_node.get("objectId")
-            or ""
+            props.get("name") or raw_node.get("label") or raw_node.get("objectId") or ""
         ).strip()
         return {
             "label": label,
@@ -1066,7 +1179,9 @@ class BloodHoundCEClient(BloodHoundClient):
             RETURN n
             """
             graph_data = self.execute_query_with_relationships(cypher_query)
-            nodes_data = graph_data.get("nodes") if isinstance(graph_data, dict) else None
+            nodes_data = (
+                graph_data.get("nodes") if isinstance(graph_data, dict) else None
+            )
             if not isinstance(nodes_data, dict):
                 return []
             return [
@@ -1326,9 +1441,7 @@ class BloodHoundCEClient(BloodHoundClient):
         except Exception:
             return []
 
-    def get_stale_enabled_users(
-        self, domain: str, stale_days: int = 180
-    ) -> List[Dict]:
+    def get_stale_enabled_users(self, domain: str, stale_days: int = 180) -> List[Dict]:
         """Get enabled users that appear stale based on last logon age."""
         try:
             domain_value = str(domain or "").strip().replace("'", "\\'")
@@ -1362,7 +1475,9 @@ class BloodHoundCEClient(BloodHoundClient):
                 for node_properties in result:
                     if not isinstance(node_properties, dict):
                         continue
-                    samaccountname = node_properties.get("samaccountname") or node_properties.get("name", "")
+                    samaccountname = node_properties.get(
+                        "samaccountname"
+                    ) or node_properties.get("name", "")
                     if samaccountname and "@" in samaccountname:
                         samaccountname = samaccountname.split("@")[0]
                     if not samaccountname:
@@ -1374,13 +1489,16 @@ class BloodHoundCEClient(BloodHoundClient):
                         if isinstance(lastlogon, (int, float)) and int(lastlogon) > 0
                         else (
                             int(whencreated)
-                            if isinstance(whencreated, (int, float)) and int(whencreated) > 0
+                            if isinstance(whencreated, (int, float))
+                            and int(whencreated) > 0
                             else None
                         )
                     )
                     days_since_last_seen = None
                     if last_seen_seconds is not None:
-                        days_since_last_seen = int((current_epoch - last_seen_seconds) // 86400)
+                        days_since_last_seen = int(
+                            (current_epoch - last_seen_seconds) // 86400
+                        )
 
                     stale_users.append(
                         {
@@ -1502,13 +1620,15 @@ class BloodHoundCEClient(BloodHoundClient):
         domain: str,
         user: Optional[str] = None,
         users: Optional[List[str]] = None,
+        enabled_only: bool = True,
     ) -> List[Dict]:
         """Get password last change information using CySQL query"""
         try:
+            enabled_clause = "u.enabled = true AND " if enabled_only else ""
             if user:
                 cypher_query = f"""
                 MATCH (u:User)
-                WHERE u.enabled = true AND toUpper(u.domain) = '{domain.upper()}'
+                WHERE {enabled_clause}toUpper(u.domain) = '{domain.upper()}'
                   AND u.samaccountname = '{user}'
                 RETURN u
                 """
@@ -1524,14 +1644,14 @@ class BloodHoundCEClient(BloodHoundClient):
                     return []
                 cypher_query = f"""
                 MATCH (u:User)
-                WHERE u.enabled = true AND toUpper(u.domain) = '{domain.upper()}'
+                WHERE {enabled_clause}toUpper(u.domain) = '{domain.upper()}'
                   AND toLower(u.samaccountname) IN {json.dumps(normalized_users)}
                 RETURN u
                 """
             else:
                 cypher_query = f"""
                 MATCH (u:User)
-                WHERE u.enabled = true AND toUpper(u.domain) = '{domain.upper()}'
+                WHERE {enabled_clause}toUpper(u.domain) = '{domain.upper()}'
                 RETURN u
                 """
 
@@ -2085,7 +2205,9 @@ class BloodHoundCEClient(BloodHoundClient):
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = ""
             elif target == "lowpriv":
-                target_clause = f"  AND NOT {self._build_terminal_target_filter(alias='h')}"
+                target_clause = (
+                    f"  AND NOT {self._build_terminal_target_filter(alias='h')}"
+                )
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=False)}"
             else:  # "all"
@@ -2093,7 +2215,9 @@ class BloodHoundCEClient(BloodHoundClient):
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=True)}"
 
-            limit_clause = f"\nLIMIT {max(1, max_paths)}" if max_paths is not None else ""
+            limit_clause = (
+                f"\nLIMIT {max(1, max_paths)}" if max_paths is not None else ""
+            )
             cypher_query = f"""
             MATCH p=(u:User)-[{edge_filter}*1..{depth}]->(h)
             WHERE {source_domain_filter}
@@ -2150,7 +2274,9 @@ class BloodHoundCEClient(BloodHoundClient):
         path discovery because their main value comes from extending the graph
         toward downstream direct-compromise targets.
         """
-        sid_expr = f"toUpper(coalesce({alias}.objectid, coalesce({alias}.objectId, '')))"
+        sid_expr = (
+            f"toUpper(coalesce({alias}.objectid, coalesce({alias}.objectId, '')))"
+        )
         dn_expr = f"toUpper(coalesce({alias}.distinguishedname, ''))"
         return (
             "("
@@ -2228,7 +2354,9 @@ class BloodHoundCEClient(BloodHoundClient):
         terminal_target = self._build_terminal_target_filter(alias=f"last({ns})")
         return f"({base} OR ({terminal_target}))"
 
-    def _build_no_intermediate_high_value_filter(self, *, nodes_alias: str = "nodes(p)") -> str:
+    def _build_no_intermediate_high_value_filter(
+        self, *, nodes_alias: str = "nodes(p)"
+    ) -> str:
         """Return a predicate ensuring only the terminal node can be high-value.
 
         Prevents BH from returning paths that pass *through* a high-value node on
@@ -2536,7 +2664,9 @@ class BloodHoundCEClient(BloodHoundClient):
         targets so the second ACL phase is reserved for additional low-priv pivots.
         """
         try:
-            target_filter = f"\n              AND NOT {self._build_high_value_filter(alias='t')}"
+            target_filter = (
+                f"\n              AND NOT {self._build_high_value_filter(alias='t')}"
+            )
             return self._get_low_priv_acl_paths_with_filters(
                 domain,
                 max_results=max_results,
@@ -2572,13 +2702,16 @@ class BloodHoundCEClient(BloodHoundClient):
             limit_value = max(1, min(int(max_results), 5000))
             limit_clause = f"\n        LIMIT {limit_value}"
 
-        cypher_query = f"""
+        cypher_query = (
+            f"""
         MATCH p=(s)-[r]->(t)
         WHERE 1=1
           {source_filter}
           AND type(r) IN {sorted(allowed_relations)!r}{target_filter}{excluded_sources_filter}
         RETURN p
-        """.rstrip() + limit_clause
+        """.rstrip()
+            + limit_clause
+        )
 
         graph_data = self.execute_query_with_relationships(cypher_query)
         if not graph_data:
@@ -2605,9 +2738,7 @@ class BloodHoundCEClient(BloodHoundClient):
         if not cleaned:
             return ""
         escaped = "[" + ", ".join(repr(value) for value in cleaned) + "]"
-        return (
-            f"\n              AND NOT coalesce({alias}.objectid, {alias}.objectId, '') IN {escaped}"
-        )
+        return f"\n              AND NOT coalesce({alias}.objectid, {alias}.objectId, '') IN {escaped}"
 
     def get_low_priv_adcs_paths(
         self, domain: str, *, max_results: int = 1000
@@ -3087,7 +3218,6 @@ class BloodHoundCEClient(BloodHoundClient):
 
         return results
 
-
     def _bh_paths_to_display_records(
         self,
         bh_paths: List[Dict],
@@ -3230,7 +3360,9 @@ class BloodHoundCEClient(BloodHoundClient):
             sam_safe = sam.replace("'", "\\'")
             dom_safe = dom.replace("'", "\\'")
             edge_filter = self._build_bh_edge_type_filter()
-            non_membership_filter = self._build_non_membership_path_filter(path_alias="p")
+            non_membership_filter = self._build_non_membership_path_filter(
+                path_alias="p"
+            )
             acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
 
             named_target_filter = f"\n  AND {self._build_named_node_filter(alias='h')}"
@@ -3241,7 +3373,9 @@ class BloodHoundCEClient(BloodHoundClient):
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = ""
             elif target == "lowpriv":
-                where_target = f"  AND NOT {self._build_terminal_target_filter(alias='h')}"
+                where_target = (
+                    f"  AND NOT {self._build_terminal_target_filter(alias='h')}"
+                )
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=False)}"
             else:  # "all"
@@ -3249,7 +3383,9 @@ class BloodHoundCEClient(BloodHoundClient):
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=True)}"
 
-            limit_clause = f"\nLIMIT {max(1, max_paths)}" if max_paths is not None else ""
+            limit_clause = (
+                f"\nLIMIT {max(1, max_paths)}" if max_paths is not None else ""
+            )
             cypher_query = f"""
             MATCH p=(s)-[{edge_filter}*1..{depth}]->(h)
             WHERE toLower(coalesce(s.samaccountname, "")) = toLower('{sam_safe}')
@@ -3297,10 +3433,14 @@ class BloodHoundCEClient(BloodHoundClient):
                 alias="s", domain_value=domain_value
             )
             edge_filter = self._build_bh_edge_type_filter()
-            non_membership_filter = self._build_non_membership_path_filter(path_alias="p")
+            non_membership_filter = self._build_non_membership_path_filter(
+                path_alias="p"
+            )
             acyclic_filter = self._build_acyclic_path_filter(nodes_alias="ns")
 
-            named_target_filter = f"\n              AND {self._build_named_node_filter(alias='h')}"
+            named_target_filter = (
+                f"\n              AND {self._build_named_node_filter(alias='h')}"
+            )
 
             if target == "highvalue":
                 target_filter = self._build_terminal_target_filter(alias="h")
@@ -3316,7 +3456,9 @@ class BloodHoundCEClient(BloodHoundClient):
                 no_intermediate_hv = f"\n  AND {self._build_no_intermediate_high_value_filter(nodes_alias='ns')}"
                 no_terminal_memberof = f"\n  AND {self._build_non_terminal_memberof_filter(nodes_alias='ns', except_highvalue_terminal=True)}"
 
-            limit_clause = f"\nLIMIT {max(1, max_paths)}" if max_paths is not None else ""
+            limit_clause = (
+                f"\nLIMIT {max(1, max_paths)}" if max_paths is not None else ""
+            )
             cypher_query = f"""
             MATCH p=(s)-[{edge_filter}*1..{depth}]->(h)
             WHERE {domain_filter}
@@ -3371,7 +3513,9 @@ class BloodHoundCEClient(BloodHoundClient):
                 owned=owned,
             )
             if owned:
-                if current_tags == "owned" or "owned" in [t.strip() for t in current_tags.split(",") if t.strip()]:
+                if current_tags == "owned" or "owned" in [
+                    t.strip() for t in current_tags.split(",") if t.strip()
+                ]:
                     return True
 
                 if not current_tags:
@@ -3494,7 +3638,9 @@ class BloodHoundCEClient(BloodHoundClient):
             1 for username in to_mark if self.mark_principal_owned(username, owned=True)
         )
         unmarked = sum(
-            1 for username in to_unmark if self.mark_principal_owned(username, owned=False)
+            1
+            for username in to_unmark
+            if self.mark_principal_owned(username, owned=False)
         )
         self._debug(
             "owned sync sets",
@@ -3615,7 +3761,9 @@ class BloodHoundCEClient(BloodHoundClient):
                 normalized_roles = []
                 for role in roles:
                     if isinstance(role, dict):
-                        role_name = role.get("name") or role.get("authority") or role.get("id")
+                        role_name = (
+                            role.get("name") or role.get("authority") or role.get("id")
+                        )
                         if role_name:
                             normalized_roles.append(str(role_name))
                     elif role:
@@ -3663,7 +3811,9 @@ class BloodHoundCEClient(BloodHoundClient):
         job_id = self.start_file_upload_job(file_path)
         return job_id is not None
 
-    def _create_file_upload_job_id(self, *, allow_reauth_retry: bool = True) -> int | None:
+    def _create_file_upload_job_id(
+        self, *, allow_reauth_retry: bool = True
+    ) -> int | None:
         """Create a file upload job and return its ID."""
         create_response = self._request(
             "post",
@@ -3829,7 +3979,7 @@ class BloodHoundCEClient(BloodHoundClient):
         *,
         poll_interval: int = 5,
         timeout_seconds: int = 1800,
-        heartbeat_seconds: int = 60,
+        heartbeat_seconds: int = 30,
     ) -> bool:
         """Wait for ingestion of a specific file upload job."""
         import time
@@ -3839,7 +3989,10 @@ class BloodHoundCEClient(BloodHoundClient):
             last_status = None
             last_heartbeat = start_time
 
-            print_info("Waiting for ingestion to complete...")
+            print_info(
+                "Waiting for ingestion to complete. "
+                "BloodHound CE may need some time to process the uploaded graph before queries are ready."
+            )
             print_info_debug(f"[bloodhound-ce] waiting for ingestion: job_id={job_id}")
 
             def _format_job_snapshot(job: Dict | None) -> str:
@@ -3876,9 +4029,13 @@ class BloodHoundCEClient(BloodHoundClient):
                     status = job.get("status")
                     status_message = job.get("status_message", "")
                     elapsed_seconds = int(time.time() - start_time)
+                    status_summary = _describe_upload_job_status(
+                        status,
+                        status_message,
+                    )
 
                     if status != last_status:
-                        print_info(f"Job status: {status} - {status_message}")
+                        print_info(f"Job status: {status} - {status_summary}")
                         print_info_debug(
                             f"[bloodhound-ce] upload job state change: job_id={job_id} "
                             f"elapsed={elapsed_seconds}s {_format_job_snapshot(job)}"
@@ -3914,10 +4071,17 @@ class BloodHoundCEClient(BloodHoundClient):
                         )
                         return False
 
-                    if heartbeat_seconds > 0 and (time.time() - last_heartbeat) >= heartbeat_seconds:
+                    if (
+                        heartbeat_seconds > 0
+                        and (time.time() - last_heartbeat) >= heartbeat_seconds
+                    ):
                         print_info(
-                            f"Still waiting for ingestion... elapsed={elapsed_seconds}s, "
-                            f"job_id={job_id}, status={status}"
+                            _format_upload_wait_message(
+                                job_id=job_id,
+                                elapsed_seconds=elapsed_seconds,
+                                status=status,
+                                status_message=status_message,
+                            )
                         )
                         print_info_debug(
                             f"[bloodhound-ce] upload job heartbeat: job_id={job_id} "
@@ -4142,7 +4306,9 @@ class BloodHoundCEClient(BloodHoundClient):
 
             return None
         except Exception as e:
-            print_info_debug(f"[bloodhound-ce] get upload job failed: job_id={job_id} error={e}")
+            print_info_debug(
+                f"[bloodhound-ce] get upload job failed: job_id={job_id} error={e}"
+            )
             return None
 
     def infer_latest_file_upload_job_id(self) -> Optional[int]:

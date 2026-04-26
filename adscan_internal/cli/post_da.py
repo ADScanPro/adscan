@@ -52,6 +52,24 @@ def get_domain_post_da_state(shell: PostDAShell, domain: str) -> dict[str, objec
     return post_da
 
 
+def _should_offer_privileged_refresh(shell: PostDAShell, domain: str) -> bool:
+    """Return whether audit post-DA refresh should be offered for a domain."""
+    policy = str(
+        getattr(shell, "audit_post_da_bh_refresh_policy", "once") or "once"
+    ).strip().lower()
+    if policy in {"off", "false", "0", "never", "disabled"}:
+        return False
+
+    state = get_domain_post_da_state(shell, domain)
+    runs = int(state.get("bh_da_refresh_runs", 0) or 0)
+    max_cycles = int(getattr(shell, "audit_post_da_bh_refresh_max_cycles", 1) or 1)
+    if max_cycles > 0 and runs >= max_cycles:
+        return False
+    if policy == "once" and runs >= 1:
+        return False
+    return True
+
+
 def _prompt_opt_in_privileged_refresh(
     *,
     shell: PostDAShell,
@@ -108,17 +126,20 @@ def _prompt_opt_in_privileged_refresh(
     return proceed
 
 
-def collect_tier0_path_counts(shell: PostDAShell, domain: str) -> tuple[int, int]:
-    """Return (paths_to_tier0, paths_not_attempted) from attack graph metrics."""
+def collect_attack_path_snapshot_counts(shell: PostDAShell, domain: str) -> tuple[int, int]:
+    """Return persisted summary attack-path counts for one domain.
+
+    The user-facing attack-path snapshot is the source of truth here. The tuple is:
+    ``(summary_paths_total, unresolved_paths_total)`` where unresolved currently
+    means ``blocked + unsupported``.
+    """
     try:
-        from adscan_internal.services.attack_graph_service import (
-            compute_attack_path_metrics,
+        from adscan_internal.session_summary import (
+            get_attack_path_snapshot_metrics,
         )
 
-        metrics = compute_attack_path_metrics(shell, domain, max_depth=10)
-        total = int(metrics.get("paths_to_tier0", 0) or 0)
-        theoretical = int(metrics.get("paths_not_attempted", 0) or 0)
-        return total, theoretical
+        metrics = get_attack_path_snapshot_metrics(shell, domains=[domain])
+        return int(metrics.total or 0), int(metrics.unresolved or 0)
     except Exception as exc:
         telemetry.capture_exception(exc)
         return 0, 0
@@ -132,6 +153,8 @@ def run_audit_post_da_bloodhound_refresh(
 ) -> None:
     """Refresh graph collection and rerun path analysis after DA in audit mode."""
     if shell.type != "audit":
+        return
+    if not _should_offer_privileged_refresh(shell, domain):
         return
 
     state = get_domain_post_da_state(shell, domain)
@@ -150,7 +173,9 @@ def run_audit_post_da_bloodhound_refresh(
         return
 
     state["bh_da_refresh_last_opt_in"] = True
-    previous_total, previous_theoretical = collect_tier0_path_counts(shell, domain)
+    previous_total, previous_unresolved = collect_attack_path_snapshot_counts(
+        shell, domain
+    )
     upload_ok = True
     print_info(
         "Refreshing relationship-graph collection as "
@@ -193,20 +218,22 @@ def run_audit_post_da_bloodhound_refresh(
         print_exception(show_locals=False, exception=exc)
         return
 
-    current_total, current_theoretical = collect_tier0_path_counts(shell, domain)
+    current_total, current_unresolved = collect_attack_path_snapshot_counts(
+        shell, domain
+    )
     state["bh_da_refresh_done"] = True
     state["bh_da_refresh_username"] = str(username or "").strip().lower()
     state["bh_da_refresh_at"] = datetime.now(timezone.utc).isoformat()
     state["bh_da_refresh_upload_ok"] = bool(upload_ok)
     state["bh_da_refresh_runs"] = int(state.get("bh_da_refresh_runs", 0) or 0) + 1
-    state["bh_da_refresh_last_paths_to_tier0_before"] = previous_total
-    state["bh_da_refresh_last_theoretical_before"] = previous_theoretical
-    state["bh_da_refresh_last_paths_to_tier0_after"] = current_total
-    state["bh_da_refresh_last_theoretical_after"] = current_theoretical
+    state["bh_da_refresh_last_summary_paths_before"] = previous_total
+    state["bh_da_refresh_last_unresolved_paths_before"] = previous_unresolved
+    state["bh_da_refresh_last_summary_paths_after"] = current_total
+    state["bh_da_refresh_last_unresolved_paths_after"] = current_unresolved
 
 
 __all__ = [
-    "collect_tier0_path_counts",
+    "collect_attack_path_snapshot_counts",
     "get_domain_post_da_state",
     "run_audit_post_da_bloodhound_refresh",
 ]

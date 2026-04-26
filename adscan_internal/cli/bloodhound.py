@@ -44,6 +44,18 @@ from adscan_internal.services.high_value import (
     classify_users_tier0_high_value,
     normalize_samaccountname,
 )
+from adscan_internal.services.identity_risk_service import (
+    build_identity_risk_snapshot,
+    CONTROL_EXPOSURE_IDENTITIES_FILENAME,
+    DIRECT_DOMAIN_CONTROL_IDENTITIES_FILENAME,
+    DOMAIN_COMPROMISE_ENABLERS_FILENAME,
+    HIGH_IMPACT_PRIVILEGES_FILENAME,
+    get_identity_risk_record,
+    load_or_build_identity_risk_snapshot,
+)
+from adscan_internal.services.identity_choke_point_service import (
+    build_identity_choke_point_snapshot,
+)
 from adscan_internal.services.adcs_path_display import (
     format_adcs_templates_summary,
     resolve_adcs_display_target,
@@ -58,7 +70,12 @@ from adscan_internal.services.attack_graph_service import (
     ATTACK_PATHS_MAX_DEPTH_USER,
     get_netlogon_write_support_paths,
 )
-from adscan_internal.services.ldap_transport_service import resolve_ldap_target_endpoints
+from adscan_internal.services.attack_step_support_registry import (
+    describe_search_mode_label,
+)
+from adscan_internal.services.ldap_transport_service import (
+    resolve_ldap_target_endpoints,
+)
 from adscan_internal.workspaces import domain_relpath, domain_subpath, write_json_file
 
 
@@ -101,12 +118,13 @@ def get_bloodhound_collector_timeout_seconds(tool_name: str) -> int:
     return defaults.get(tool_name, _BLOODHOUND_CE_PY_COLLECTOR_TIMEOUT_SECONDS)
 
 
-def _resolve_requested_bloodhound_collectors(shell: object) -> list[str]:
+def _resolve_requested_bloodhound_collectors(shell: object) -> list[str] | None:
     """Return the BloodHound collectors that should run for the current session.
 
     In non-dev sessions, run the current production collector pair. In dev
     sessions, allow engineers to choose the collector subset interactively via
-    Questionary checkbox.
+    Questionary checkbox. An empty selection in dev mode means the collection
+    phase should be skipped entirely.
     """
     default_collectors = ["bloodhound-ce-python"]
     is_dev = os.getenv("ADSCAN_SESSION_ENV", "").strip().lower() == "dev"
@@ -143,10 +161,10 @@ def _resolve_requested_bloodhound_collectors(shell: object) -> list[str]:
     if selected_labels is None:
         return default_collectors
     if not selected_labels:
-        print_warning(
-            "No BloodHound collectors selected in dev mode; falling back to the default pair."
+        print_info(
+            "No BloodHound collectors selected in dev mode; skipping BloodHound collection and upload."
         )
-        return default_collectors
+        return None
 
     selected_collectors = [
         label_to_collector[label]
@@ -442,6 +460,7 @@ def _sanitize_acl_paths_for_attack_graph(
         _node_id,
         add_bloodhound_path_edges,
     )
+
     threshold = _get_acl_sanitization_threshold()
     sanitize_depth = max(max_depth, _get_acl_sanitization_depth())
 
@@ -539,10 +558,14 @@ def _sanitize_acl_paths_for_attack_graph(
         {
             "source": _bloodhound_node_display_label((entry.get("nodes") or [None])[0]),
             "relation": str((entry.get("rels") or [""])[0] or ""),
-            "target": _bloodhound_node_display_label((entry.get("nodes") or [None, None])[1]),
+            "target": _bloodhound_node_display_label(
+                (entry.get("nodes") or [None, None])[1]
+            ),
         }
         for entry in direct_entries[:20]
-        if isinstance(entry, dict) and len(entry.get("nodes") or []) >= 2 and (entry.get("rels") or [])
+        if isinstance(entry, dict)
+        and len(entry.get("nodes") or []) >= 2
+        and (entry.get("rels") or [])
     ]
     direct_source_counts = {
         source_id: len(entries)
@@ -638,7 +661,10 @@ def _sanitize_acl_paths_for_attack_graph(
     report["dropped_acl_rows"] = len(valid_entries) - len(kept_paths)
     report["top_noisy_sources"] = sorted(
         report["top_noisy_sources"],
-        key=lambda item: (-int(item.get("acl_count", 0)), str(item.get("source") or "").lower()),
+        key=lambda item: (
+            -int(item.get("acl_count", 0)),
+            str(item.get("source") or "").lower(),
+        ),
     )[:20]
     retained_sources: list[dict[str, Any]] = []
     dropped_sources: list[dict[str, Any]] = []
@@ -677,11 +703,17 @@ def _sanitize_acl_paths_for_attack_graph(
             )
     retained_sources = sorted(
         retained_sources,
-        key=lambda item: (-int(item.get("retained_acl_count", 0)), str(item.get("source") or "").lower()),
+        key=lambda item: (
+            -int(item.get("retained_acl_count", 0)),
+            str(item.get("source") or "").lower(),
+        ),
     )
     dropped_sources = sorted(
         dropped_sources,
-        key=lambda item: (-int(item.get("original_acl_count", 0)), str(item.get("source") or "").lower()),
+        key=lambda item: (
+            -int(item.get("original_acl_count", 0)),
+            str(item.get("source") or "").lower(),
+        ),
     )
     report["retained_sources"] = retained_sources
     report["dropped_sources"] = dropped_sources
@@ -786,10 +818,13 @@ def _resolve_attack_paths_compute_cap(max_display: int) -> int | None:
 
 
 def _summarize_high_value_session_paths(
+    *,
+    shell: BloodHoundShell,
+    domain: str,
     paths: list[dict[str, Any]],
-) -> tuple[dict[str, set[str]], int]:
-    """Return host->users session map and valid edge count for HasSession paths."""
-    host_to_users: dict[str, set[str]] = {}
+) -> tuple[dict[str, dict[str, set[str]]], int]:
+    """Return host->segmented-users session map and valid edge count for HasSession paths."""
+    host_to_users: dict[str, dict[str, set[str]]] = {}
     valid_edges = 0
 
     for entry in paths:
@@ -834,58 +869,139 @@ def _summarize_high_value_session_paths(
         if not host_name or not user_name:
             continue
 
+        normalized_user = normalize_samaccountname(user_name)
+        identity_record = (
+            get_identity_risk_record(
+                shell,
+                domain=domain,
+                samaccountname=normalized_user,
+            )
+            if normalized_user
+            else None
+        )
+        bucket = "control_exposure"
+        if isinstance(identity_record, dict):
+            if bool(identity_record.get("has_direct_domain_control")):
+                bucket = "direct_domain_control"
+            elif bool(identity_record.get("is_domain_compromise_enabler")):
+                bucket = "domain_compromise_enabler"
+            elif bool(identity_record.get("has_high_impact_privilege")):
+                bucket = "high_impact_privilege"
+            elif bool(identity_record.get("is_control_exposed")):
+                bucket = "control_exposure"
+
         valid_edges += 1
-        host_to_users.setdefault(host_name, set()).add(user_name)
+        host_bucket = host_to_users.setdefault(
+            host_name,
+            {
+                "direct_domain_control": set(),
+                "domain_compromise_enabler": set(),
+                "high_impact_privilege": set(),
+                "control_exposure": set(),
+            },
+        )
+        host_bucket.setdefault(bucket, set()).add(user_name)
 
     return host_to_users, valid_edges
 
 
 def _print_high_value_session_summary(
+    shell: BloodHoundShell,
     *,
     domain: str,
     paths: list[dict[str, Any]],
     max_hosts: int = 20,
     max_users_per_host: int = 4,
 ) -> None:
-    """Render a focused UX summary for high-value session relationships."""
-    host_to_users, valid_edges = _summarize_high_value_session_paths(paths)
+    """Render a focused UX summary for control-exposed session relationships."""
+    host_to_users, valid_edges = _summarize_high_value_session_paths(
+        shell=shell,
+        domain=domain,
+        paths=paths,
+    )
     if not host_to_users or valid_edges <= 0:
         return
 
     marked_domain = mark_sensitive(domain, "domain")
     total_hosts = len(host_to_users)
-    total_users = len({user for users in host_to_users.values() for user in users})
+    direct_domain_control_users = {
+        user
+        for users in host_to_users.values()
+        for user in users.get("direct_domain_control", set())
+    }
+    domain_compromise_enabler_users = {
+        user
+        for users in host_to_users.values()
+        for user in users.get("domain_compromise_enabler", set())
+    }
+    high_impact_privilege_users = {
+        user
+        for users in host_to_users.values()
+        for user in users.get("high_impact_privilege", set())
+    }
+    control_exposure_users = {
+        user
+        for users in host_to_users.values()
+        for user in users.get("control_exposure", set())
+    }
+    total_users = (
+        len(direct_domain_control_users)
+        + len(domain_compromise_enabler_users)
+        + len(high_impact_privilege_users)
+        + len(control_exposure_users)
+    )
 
     print_panel(
         "\n".join(
             [
                 f"Domain: {marked_domain}",
-                "Detected active sessions from Tier Zero / high-value users.",
+                "Detected active sessions from control-exposed identities.",
                 f"Relationships discovered: {valid_edges}",
                 f"Affected hosts: {total_hosts}",
-                f"Unique high-value users in sessions: {total_users}",
+                f"Unique control-exposed identities in sessions: {total_users}",
+                f"Direct domain control identities: {len(direct_domain_control_users)}",
+                f"Domain compromise enablers: {len(domain_compromise_enabler_users)}",
+                f"High-impact privilege identities: {len(high_impact_privilege_users)}",
             ]
         ),
-        title="Tier-Zero Session Exposure",
+        title="Control-Exposure Session Exposure",
         border_style="yellow",
     )
 
     table = Table(
-        title=f"High-Value Sessions by Host (showing up to {max_hosts})",
+        title=f"Control-Exposure Sessions by Host (showing up to {max_hosts})",
         show_header=True,
         header_style="bold yellow",
         box=ROUNDED,
     )
     table.add_column("Host", style="cyan", overflow="fold")
-    table.add_column("Tier0 Users", justify="right", style="yellow")
+    table.add_column("Direct", justify="right", style="red")
+    table.add_column("Enablers", justify="right", style="yellow")
+    table.add_column("Other Exposed", justify="right", style="blue")
     table.add_column("Users", style="white", overflow="fold")
 
     ordered = sorted(
         host_to_users.items(),
-        key=lambda item: (-len(item[1]), item[0].lower()),
+        key=lambda item: (
+            -len(item[1].get("direct_domain_control", set())),
+            -len(item[1].get("domain_compromise_enabler", set())),
+            -(
+                len(item[1].get("high_impact_privilege", set()))
+                + len(item[1].get("control_exposure", set()))
+            ),
+            item[0].lower(),
+        ),
     )
-    for host, users in ordered[:max_hosts]:
-        user_list = sorted(users, key=str.lower)
+    for host, segmented_users in ordered[:max_hosts]:
+        direct_users = segmented_users.get("direct_domain_control", set())
+        enabler_users = segmented_users.get("domain_compromise_enabler", set())
+        other_users = segmented_users.get(
+            "high_impact_privilege", set()
+        ) | segmented_users.get("control_exposure", set())
+        user_list = sorted(
+            direct_users | enabler_users | other_users,
+            key=str.lower,
+        )
         shown = user_list[:max_users_per_host]
         users_text = ", ".join(mark_sensitive(u, "user") for u in shown)
         extra = len(user_list) - len(shown)
@@ -893,14 +1009,16 @@ def _print_high_value_session_summary(
             users_text = f"{users_text} (+{extra} more)"
         table.add_row(
             mark_sensitive(host, "hostname"),
-            str(len(user_list)),
+            str(len(direct_users)),
+            str(len(enabler_users)),
+            str(len(other_users)),
             users_text,
         )
 
     print_table(table)
     if total_hosts > max_hosts:
         print_info(
-            f"Showing first {max_hosts} hosts only (total hosts with Tier0 sessions: {total_hosts})."
+            f"Showing first {max_hosts} hosts only (total hosts with control-exposure sessions: {total_hosts})."
         )
 
 
@@ -1528,6 +1646,9 @@ def run_bloodhound_collector(
     zip_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     generated_zip_paths: list[str] = []
     requested_collectors = _resolve_requested_bloodhound_collectors(shell)
+    if requested_collectors is None:
+        return []
+
     for collector_name in requested_collectors:
         if collector_name == "rusthound-ce":
             kerberos_env_ready = shell._ensure_kerberos_environment_for_command(
@@ -1600,7 +1721,9 @@ def run_bloodhound_collector(
             _print_collector_long_running_notice(
                 "rusthound-ce",
                 target_domain,
-                timeout_seconds=get_bloodhound_collector_timeout_seconds("rusthound-ce"),
+                timeout_seconds=get_bloodhound_collector_timeout_seconds(
+                    "rusthound-ce"
+                ),
             )
             sync_domain = resolved_auth_domain if kerberos_env_ready else None
             rusthound_zip = f"{target_domain}_rusthound-ce_{zip_timestamp}.zip"
@@ -1694,9 +1817,7 @@ def run_bloodhound_collector(
                 },
                 icon="🩸",
             )
-            print_info_debug(
-                f"Command: {ce_py_display_command or ce_py_command}"
-            )
+            print_info_debug(f"Command: {ce_py_display_command or ce_py_command}")
             _print_collector_long_running_notice(
                 "bloodhound-ce-python",
                 target_domain,
@@ -2171,9 +2292,7 @@ def _load_rodc_prp_control_discovery(
         paths = get_rodc_prp_control_paths(shell, target_domain, graph=graph)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_info_debug(
-            f"[rodc-prp] Delegated RODC PRP discovery load failed: {exc}"
-        )
+        print_info_debug(f"[rodc-prp] Delegated RODC PRP discovery load failed: {exc}")
     return paths
 
 
@@ -2373,7 +2492,7 @@ def run_bloodhound_attack_paths(
             lambda: service.get_low_priv_access_paths(target_domain, max_results=1000),
         ),  # type: ignore[attr-defined]
         (
-            "High-Value User Sessions",
+            "Control-Exposure User Sessions",
             "get_high_value_session_paths",
             lambda: service.get_high_value_session_paths(
                 target_domain, max_results=1000
@@ -2410,7 +2529,7 @@ def run_bloodhound_attack_paths(
             _get_netlogon_write_support_paths,
         ),
     ]
-    total_steps = len(steps) + 1
+    total_steps = len(steps) + 2
     step_offset = 0
 
     unique_paths = 0
@@ -2439,6 +2558,62 @@ def run_bloodhound_attack_paths(
             isinstance(node, dict) and node_is_rodc_computer(node)
             for node in nodes_map.values()
         )
+
+    def _collect_followup_step_samples(
+        *,
+        edge_type: str,
+        existing_edge_ids: set[str] | None = None,
+    ) -> list[str]:
+        """Return display-safe samples for newly created follow-up edges."""
+        edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
+        nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+        samples: list[str] = []
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            if str(edge.get("edge_type") or "") != edge_type:
+                continue
+            edge_id = str(edge.get("id") or "")
+            if not edge_id:
+                continue
+            if existing_edge_ids is not None and edge_id in existing_edge_ids:
+                continue
+            from_id = str(edge.get("from") or "")
+            to_id = str(edge.get("to") or "")
+            relation = str(edge.get("relation") or "").strip()
+            if not from_id or not to_id or not relation:
+                continue
+            from_node = nodes_map.get(from_id) if isinstance(nodes_map, dict) else None
+            to_node = nodes_map.get(to_id) if isinstance(nodes_map, dict) else None
+            from_label = str(
+                (from_node.get("label") or from_node.get("name") or from_id)
+                if isinstance(from_node, dict)
+                else from_id
+            )
+            to_label = str(
+                (to_node.get("label") or to_node.get("name") or to_id)
+                if isinstance(to_node, dict)
+                else to_id
+            )
+            sample_line = (
+                f"{mark_sensitive(from_label, 'node')} -> {relation} -> "
+                f"{mark_sensitive(to_label, 'node')}"
+            )
+            notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+            affected_count = int(notes.get("affected_principal_count") or 0)
+            sample_users = notes.get("sample_users")
+            if affected_count > 0:
+                sample_line += f" | members={affected_count}"
+            if isinstance(sample_users, list) and sample_users:
+                display_users = [
+                    mark_sensitive(str(user), "user") for user in sample_users[:5]
+                ]
+                sample_line += " | users=" + ", ".join(display_users)
+                remaining = affected_count - len(display_users)
+                if remaining > 0:
+                    sample_line += f" (+{remaining} more)"
+            samples.append(sample_line)
+        return samples
 
     # ADCS discovery happens in Phase 1 (Domain Analysis).
 
@@ -2647,9 +2822,7 @@ def run_bloodhound_attack_paths(
             raw_paths = runner()
         except Exception as exc:
             telemetry.capture_exception(exc)
-            print_info_debug(
-                f"[bloodhound] {method_name} runner exception: {exc}"
-            )
+            print_info_debug(f"[bloodhound] {method_name} runner exception: {exc}")
             print_step_status(
                 title, status="failed", step_number=step_number, total_steps=total_steps
             )
@@ -2791,7 +2964,9 @@ def run_bloodhound_attack_paths(
                     warned_relation_mismatches.add(rel_upper)
             if entry_notes:
                 for note_idx, note_value in entry_notes.items():
-                    if not isinstance(note_idx, int) or not isinstance(note_value, dict):
+                    if not isinstance(note_idx, int) or not isinstance(
+                        note_value, dict
+                    ):
                         continue
                     merged_note = dict(note_value)
                     existing_note = notes_by_relation_index.get(note_idx)
@@ -2912,6 +3087,7 @@ def run_bloodhound_attack_paths(
                 print_info_list(promoted_samples, title=promoted_title, icon="→")
         if method_name == "get_high_value_session_paths":
             _print_high_value_session_summary(
+                shell,
                 domain=target_domain,
                 paths=[entry for entry in raw_paths if isinstance(entry, dict)],
             )
@@ -2922,9 +3098,114 @@ def run_bloodhound_attack_paths(
             print_info_list(sampled_steps, title=title_text, icon="→")
 
     print_step_status(
-        "Entry Node Reconciliation",
+        "Privileged Group Follow-ups",
         status="running",
         step_number=total_steps - 1,
+        total_steps=total_steps,
+    )
+    try:
+        from adscan_internal.services.attack_graph_service import (
+            persist_privileged_group_followup_edges,
+            persist_rodc_followup_chain_edges,
+        )
+
+        existing_edge_ids = {
+            str(edge.get("id") or "")
+            for edge in (
+                graph.get("edges") if isinstance(graph.get("edges"), list) else []
+            )
+            if isinstance(edge, dict) and str(edge.get("id") or "")
+        }
+        followup_edges = persist_privileged_group_followup_edges(
+            shell,
+            target_domain,
+            graph,
+        )
+        rodc_followup_edges = persist_rodc_followup_chain_edges(
+            shell,
+            target_domain,
+            graph,
+        )
+        created_followup_edges = int(followup_edges or 0) + int(
+            rodc_followup_edges or 0
+        )
+        privileged_available_samples = _collect_followup_step_samples(
+            edge_type="privileged_group_followup",
+        )
+        rodc_available_samples = _collect_followup_step_samples(
+            edge_type="rodc_followup",
+        )
+        total_available_edges = len(privileged_available_samples) + len(
+            rodc_available_samples
+        )
+        reused_followup_edges = max(0, total_available_edges - created_followup_edges)
+        if created_followup_edges or total_available_edges:
+            marked_domain = mark_sensitive(target_domain, "domain")
+            print_info(
+                "Privileged Group Follow-ups: "
+                f"created={created_followup_edges}; existing={reused_followup_edges}; "
+                f"available={total_available_edges}."
+            )
+            print_info_debug(
+                "[attack_graph] Privileged-group follow-up edge inventory: "
+                f"domain={marked_domain} created_privileged={followup_edges} "
+                f"created_rodc={rodc_followup_edges} reused={reused_followup_edges} "
+                f"available={total_available_edges}"
+            )
+            if show_samples:
+                privileged_created_samples = _collect_followup_step_samples(
+                    edge_type="privileged_group_followup",
+                    existing_edge_ids=existing_edge_ids,
+                )
+                rodc_created_samples = _collect_followup_step_samples(
+                    edge_type="rodc_followup",
+                    existing_edge_ids=existing_edge_ids,
+                )
+                combined_samples = (
+                    privileged_available_samples + rodc_available_samples
+                )[:sample_limit]
+                if combined_samples:
+                    title_text = "Privileged Group Follow-ups - discovered steps"
+                    if total_available_edges > len(combined_samples):
+                        title_text = (
+                            "Privileged Group Follow-ups - discovered steps "
+                            f"(showing {len(combined_samples)}/{total_available_edges})"
+                        )
+                    print_info_list(combined_samples, title=title_text, icon="→")
+                created_sample_count = len(privileged_created_samples) + len(
+                    rodc_created_samples
+                )
+                if created_sample_count:
+                    print_info_debug(
+                        "[attack_graph] Privileged-group follow-ups created this run: "
+                        f"{created_sample_count}"
+                    )
+            save_attack_graph(shell, target_domain, graph)
+        print_step_status(
+            "Privileged Group Follow-ups",
+            status="completed",
+            step_number=total_steps - 1,
+            total_steps=total_steps,
+            details=(
+                f"created={created_followup_edges} existing={reused_followup_edges} "
+                f"available={total_available_edges}"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc, show_locals=False)
+        print_step_status(
+            "Privileged Group Follow-ups",
+            status="failed",
+            step_number=total_steps - 1,
+            total_steps=total_steps,
+            details="follow-up persistence failed",
+        )
+
+    print_step_status(
+        "Entry Node Reconciliation",
+        status="running",
+        step_number=total_steps,
         total_steps=total_steps,
     )
     try:
@@ -2938,7 +3219,7 @@ def run_bloodhound_attack_paths(
         print_step_status(
             "Entry Node Reconciliation",
             status="completed",
-            step_number=total_steps - 1,
+            step_number=total_steps,
             total_steps=total_steps,
             details=f"reconciled={reconciled}",
         )
@@ -2948,10 +3229,12 @@ def run_bloodhound_attack_paths(
         print_step_status(
             "Entry Node Reconciliation",
             status="failed",
-            step_number=total_steps - 1,
+            step_number=total_steps,
             total_steps=total_steps,
             details="reconciliation failed",
         )
+
+    save_attack_graph(shell, target_domain, graph)
 
     if unique_paths == 0:
         last_error = None
@@ -2963,64 +3246,6 @@ def run_bloodhound_attack_paths(
             print_info_debug(f"[bloodhound] last query error: {last_error}")
         print_warning("No attack steps recorded from BloodHound.")
         return
-
-    save_attack_graph(shell, target_domain, graph)
-
-    # Persist recursive MemberOf edges so external consumers (e.g. web UI) can
-    # compute paths identically without runtime LDAP/BH group expansion.
-    try:
-        from adscan_internal.services.attack_graph_service import (
-            ATTACK_GRAPH_PERSIST_MEMBERSHIPS,
-            persist_memberof_chain_edges,
-        )
-        from adscan_internal.workspaces import domain_subpath
-
-        if ATTACK_GRAPH_PERSIST_MEMBERSHIPS:
-            workspace_cwd = (
-                shell._get_workspace_cwd()
-                if hasattr(shell, "_get_workspace_cwd")
-                else getattr(shell, "current_workspace_dir", os.getcwd())
-            )
-            memberships_path = domain_subpath(
-                workspace_cwd, shell.domains_dir, target_domain, "memberships.json"
-            )
-            if os.path.exists(memberships_path):
-                print_info_verbose(
-                    f"[attack_graph] memberships.json already exists for {marked_domain}; "
-                    "skipping persisted MemberOf edges."
-                )
-                skip_persist_memberships = True
-            else:
-                skip_persist_memberships = False
-        else:
-            skip_persist_memberships = True
-
-        if ATTACK_GRAPH_PERSIST_MEMBERSHIPS and not skip_persist_memberships:
-            edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
-            candidate_node_ids: set[str] = set()
-            for edge in edges:
-                if not isinstance(edge, dict):
-                    continue
-                for key in ("from", "to"):
-                    nid = str(edge.get(key) or "")
-                    if nid:
-                        candidate_node_ids.add(nid)
-            injected = persist_memberof_chain_edges(
-                shell,
-                target_domain,
-                graph,
-                principal_node_ids=candidate_node_ids,
-                skip_tier0_principals=True,
-            )
-            if injected:
-                marked_domain = mark_sensitive(target_domain, "domain")
-                print_info_verbose(
-                    f"[attack_graph] Persisted {injected} MemberOf edges for {marked_domain}."
-                )
-                save_attack_graph(shell, target_domain, graph)
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_info_debug(f"[attack_graph] Failed to persist MemberOf edges: {exc}")
 
     # Next step: look for high-value attack paths from owned users and optionally execute one.
     # When a domain is already marked as compromised ("pwned"), this prompt is redundant and noisy.
@@ -3104,13 +3329,13 @@ def run_bloodhound_attack_paths(
                 scope="domain",
                 target="highvalue",
                 target_mode="tier0",
-                search_mode_label="High-Value Search",
+                search_mode_label=describe_search_mode_label("followup_terminal"),
             )
             print_attack_paths_summary(
                 target_domain,
                 display_paths,
                 max_display=20,
-                search_mode_label="High-Value Search",
+                search_mode_label=describe_search_mode_label("followup_terminal"),
             )
             is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
             if (
@@ -3132,7 +3357,7 @@ def run_bloodhound_attack_paths(
                     target_domain,
                     display_paths[idx - 1],
                     index=idx,
-                    search_mode_label="High-Value Search",
+                    search_mode_label=describe_search_mode_label("followup_terminal"),
                 )
 
     # Track TTFAP (Time To First Attack Path) for case study metrics
@@ -3469,11 +3694,11 @@ def run_show_attack_paths(
     summary_search_mode_label = (
         None
         if show_sections
-        else "Low-Priv Search"
+        else describe_search_mode_label("low_priv")
         if target == "lowpriv"
-        else "Tier-0 Search"
+        else describe_search_mode_label("direct_compromise")
         if str(target_mode or "impact").strip().lower() == "tier0"
-        else "High-Value Search"
+        else describe_search_mode_label("followup_terminal")
     )
     domain_auth = (
         str(getattr(shell, "domains_data", {}).get(target_domain, {}).get("auth") or "")
@@ -3500,7 +3725,9 @@ def run_show_attack_paths(
 
     def _compute_paths() -> list[dict[str, Any]]:
         if start_user_norm == "owned":
-            owned_users = get_owned_domain_usernames_for_attack_paths(shell, target_domain)
+            owned_users = get_owned_domain_usernames_for_attack_paths(
+                shell, target_domain
+            )
             if not owned_users:
                 marked_domain = mark_sensitive(target_domain, "domain")
                 print_warning(
@@ -3520,9 +3747,7 @@ def run_show_attack_paths(
             if not owned_paths:
                 marked_domain = mark_sensitive(target_domain, "domain")
                 scope = (
-                    "Tier-0 targets"
-                    if target_mode == "tier0"
-                    else "high-value targets"
+                    "Tier-0 targets" if target_mode == "tier0" else "high-value targets"
                 )
                 print_warning(
                     "No attack paths found for owned users in "
@@ -4459,7 +4684,8 @@ def parse_bloodhound_acls(output: str) -> list[dict]:
 def run_bloodhound_users(shell: BloodHoundShell, target_domain: str) -> None:
     """Create BloodHound user lists for the specified domain.
 
-    Three lists are created: all users, admin users, and privileged users.
+    ADscan writes the enabled-user inventory plus the product-owned control
+    exposure inventories used by the rest of the platform.
 
     Args:
         shell: Shell instance implementing BloodHoundShell protocol
@@ -4472,8 +4698,27 @@ def run_bloodhound_users(shell: BloodHoundShell, target_domain: str) -> None:
         )
         return
     run_bloodhound_all_users(shell, target_domain)
-    run_bloodhound_admin_users(shell, target_domain)
-    run_bloodhound_privileged_users(shell, target_domain)
+    run_bloodhound_control_exposure_identities(shell, target_domain)
+    run_bloodhound_direct_domain_control_identities(shell, target_domain)
+    run_bloodhound_domain_compromise_enablers(shell, target_domain)
+    run_bloodhound_high_impact_privileges(shell, target_domain)
+    if hasattr(shell, "update_report_field"):
+        try:
+            from adscan_internal.services.identity_choke_point_service import (
+                load_or_build_identity_choke_point_snapshot,
+            )
+
+            snapshot = load_or_build_identity_choke_point_snapshot(shell, target_domain)
+            choke_points = (
+                snapshot.get("choke_points") if isinstance(snapshot, dict) else None
+            )
+            shell.update_report_field(
+                target_domain,
+                "identity_choke_points",
+                choke_points,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
 
 
 def run_bloodhound_all_users(shell: BloodHoundShell, target_domain: str) -> None:
@@ -4497,6 +4742,8 @@ def run_bloodhound_all_users(shell: BloodHoundShell, target_domain: str) -> None
             "enabled_users.txt",
             source="bloodhound_enabled_users",
         )
+        build_identity_risk_snapshot(shell, target_domain)
+        build_identity_choke_point_snapshot(shell, target_domain)
         emit_event(
             "coverage",
             phase="domain_analysis",
@@ -4518,8 +4765,10 @@ def run_bloodhound_all_users(shell: BloodHoundShell, target_domain: str) -> None
         return
 
 
-def run_bloodhound_admin_users(shell: BloodHoundShell, target_domain: str) -> None:
-    """Create a BloodHound admin user list for the specified domain and save it to a file.
+def run_bloodhound_control_exposure_identities(
+    shell: BloodHoundShell, target_domain: str
+) -> None:
+    """Persist the ADscan control-exposure identity inventory for one domain.
 
     Args:
         shell: Shell instance implementing BloodHoundShell protocol
@@ -4532,32 +4781,119 @@ def run_bloodhound_admin_users(shell: BloodHoundShell, target_domain: str) -> No
         )
         return
     try:
-        users = shell._get_bloodhound_service().get_users(
-            domain=target_domain, filter_type="high_value"
+        snapshot = load_or_build_identity_risk_snapshot(shell, target_domain)
+        users = (
+            snapshot.get("control_exposure_identities")
+            if isinstance(snapshot, dict)
+            else []
         )
-        shell._write_user_list_file(target_domain, "admins.txt", users)
+        if not isinstance(users, list):
+            users = []
+        shell._write_user_list_file(
+            target_domain, CONTROL_EXPOSURE_IDENTITIES_FILENAME, users
+        )
         shell._postprocess_user_list_file(
             target_domain,
-            "admins.txt",
-            source="bloodhound_admin_users",
+            CONTROL_EXPOSURE_IDENTITIES_FILENAME,
+            source="adscan_identity_control_exposure_identities",
         )
         return
     except Exception as e:
         telemetry.capture_exception(e)
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_error(
-            f"BloodHound high-value user query failed for {marked_target_domain}. Ensure data is ingested in BloodHound CE."
+            f"BloodHound control exposure inventory query failed for {marked_target_domain}. Ensure data is ingested in BloodHound CE."
         )
         print_exception(show_locals=False, exception=e)
         return
 
 
-def run_bloodhound_privileged_users(shell: BloodHoundShell, target_domain: str) -> None:
-    """Create a BloodHound privileged user list for the specified domain and save it to a file.
+def run_bloodhound_direct_domain_control_identities(
+    shell: BloodHoundShell, target_domain: str
+) -> None:
+    """Persist the direct-domain-control identity inventory for one domain."""
+    if target_domain not in shell.domains:
+        marked_target_domain = mark_sensitive(target_domain, "domain")
+        print_error(
+            f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
+        )
+        return
+    try:
+        snapshot = load_or_build_identity_risk_snapshot(shell, target_domain)
+        users = (
+            snapshot.get("direct_domain_control_identities")
+            if isinstance(snapshot, dict)
+            else []
+        )
+        if not isinstance(users, list):
+            users = []
+        shell._write_user_list_file(
+            target_domain, DIRECT_DOMAIN_CONTROL_IDENTITIES_FILENAME, users
+        )
+        shell._postprocess_user_list_file(
+            target_domain,
+            DIRECT_DOMAIN_CONTROL_IDENTITIES_FILENAME,
+            source="adscan_identity_direct_domain_control",
+            trigger_followups=False,
+        )
+        return
+    except Exception as e:
+        telemetry.capture_exception(e)
+        marked_target_domain = mark_sensitive(target_domain, "domain")
+        print_error(
+            f"BloodHound direct domain control inventory query failed for {marked_target_domain}. Ensure data is ingested in BloodHound CE."
+        )
+        print_exception(show_locals=False, exception=e)
+        return
+
+
+def run_bloodhound_domain_compromise_enablers(
+    shell: BloodHoundShell, target_domain: str
+) -> None:
+    """Persist the domain-compromise-enabler identity inventory for one domain."""
+    if target_domain not in shell.domains:
+        marked_target_domain = mark_sensitive(target_domain, "domain")
+        print_error(
+            f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
+        )
+        return
+    try:
+        snapshot = load_or_build_identity_risk_snapshot(shell, target_domain)
+        users = (
+            snapshot.get("domain_compromise_enablers")
+            if isinstance(snapshot, dict)
+            else []
+        )
+        if not isinstance(users, list):
+            users = []
+        shell._write_user_list_file(
+            target_domain, DOMAIN_COMPROMISE_ENABLERS_FILENAME, users
+        )
+        shell._postprocess_user_list_file(
+            target_domain,
+            DOMAIN_COMPROMISE_ENABLERS_FILENAME,
+            source="adscan_identity_domain_compromise_enablers",
+            trigger_followups=False,
+        )
+        return
+    except Exception as e:
+        telemetry.capture_exception(e)
+        marked_target_domain = mark_sensitive(target_domain, "domain")
+        print_error(
+            f"BloodHound domain compromise enabler inventory query failed for {marked_target_domain}. Ensure data is ingested in BloodHound CE."
+        )
+        print_exception(show_locals=False, exception=e)
+        return
+
+
+def run_bloodhound_high_impact_privileges(
+    shell: BloodHoundShell, target_domain: str
+) -> None:
+    """Persist the high-impact privilege inventory for one domain.
 
     Args:
         shell: Shell instance implementing BloodHoundShell protocol
-        target_domain: Domain name to enumerate privileged users for
+        target_domain: Domain name to enumerate users for
     """
     if target_domain not in shell.domains:
         marked_target_domain = mark_sensitive(target_domain, "domain")
@@ -4566,21 +4902,27 @@ def run_bloodhound_privileged_users(shell: BloodHoundShell, target_domain: str) 
         )
         return
     try:
-        users = shell._get_bloodhound_service().get_users(
-            domain=target_domain, filter_type="admin"
+        snapshot = load_or_build_identity_risk_snapshot(shell, target_domain)
+        users = (
+            snapshot.get("high_impact_privileges") if isinstance(snapshot, dict) else []
         )
-        shell._write_user_list_file(target_domain, "privileged.txt", users)
+        if not isinstance(users, list):
+            users = []
+        shell._write_user_list_file(
+            target_domain, HIGH_IMPACT_PRIVILEGES_FILENAME, users
+        )
         shell._postprocess_user_list_file(
             target_domain,
-            "privileged.txt",
-            source="bloodhound_privileged_users",
+            HIGH_IMPACT_PRIVILEGES_FILENAME,
+            source="adscan_identity_high_impact_privileges",
+            trigger_followups=False,
         )
         return
     except Exception as e:
         telemetry.capture_exception(e)
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_error(
-            f"BloodHound admincount user query failed for {marked_target_domain}. Ensure data is ingested in BloodHound CE."
+            f"BloodHound high-impact privilege inventory query failed for {marked_target_domain}. Ensure data is ingested in BloodHound CE."
         )
         print_exception(show_locals=False, exception=e)
         return
@@ -4621,7 +4963,7 @@ def _segment_password_policy_users(
     domain: str,
     users: list[str],
 ) -> dict[str, object]:
-    """Split risky users into Tier-0, high-value, and low-priv segments."""
+    """Split risky users into direct-control, control-exposed, and standard segments."""
     ordered_users: list[str] = []
     normalized_to_display: dict[str, str] = {}
     for user in users:
@@ -4638,28 +4980,28 @@ def _segment_password_policy_users(
         usernames=ordered_users,
     )
 
-    tier0_users: list[str] = []
-    high_value_users: list[str] = []
-    low_priv_users: list[str] = []
+    direct_domain_control_users: list[str] = []
+    control_exposure_users: list[str] = []
+    standard_users: list[str] = []
     for user in ordered_users:
         normalized = normalize_samaccountname(user)
         risk = flags.get(normalized, UserRiskFlags())
         if risk.is_tier0:
-            tier0_users.append(user)
+            direct_domain_control_users.append(user)
         elif risk.is_high_value:
-            high_value_users.append(user)
+            control_exposure_users.append(user)
         else:
-            low_priv_users.append(user)
+            standard_users.append(user)
 
     return {
         "all_users": ordered_users or None,
-        "tier0_users": tier0_users or None,
-        "high_value_users": high_value_users or None,
-        "low_priv_users": low_priv_users or None,
+        "direct_domain_control_users": direct_domain_control_users or None,
+        "control_exposure_users": control_exposure_users or None,
+        "standard_users": standard_users or None,
         "total_count": len(ordered_users),
-        "tier0_count": len(tier0_users),
-        "high_value_count": len(high_value_users),
-        "low_priv_count": len(low_priv_users),
+        "direct_domain_control_count": len(direct_domain_control_users),
+        "control_exposure_count": len(control_exposure_users),
+        "standard_count": len(standard_users),
     }
 
 
@@ -4674,9 +5016,9 @@ def _persist_password_policy_segment_artifacts(
     base_name = os.path.splitext(base_filename)[0]
     artifact_paths: dict[str, str] = {}
     mapping = {
-        "tier0_users": f"{base_name}_tier0.txt",
-        "high_value_users": f"{base_name}_highvalue.txt",
-        "low_priv_users": f"{base_name}_lowpriv.txt",
+        "direct_domain_control_users": f"{base_name}_direct_domain_control.txt",
+        "control_exposure_users": f"{base_name}_control_exposure.txt",
+        "standard_users": f"{base_name}_standard.txt",
     }
     for segment_key, filename in mapping.items():
         users = segmented_users.get(segment_key)
@@ -4689,6 +5031,164 @@ def _persist_password_policy_segment_artifacts(
     return artifact_paths
 
 
+def _render_identity_hygiene_segmentation_summary(
+    *,
+    domain: str,
+    title: str,
+    posture_label: str,
+    total_label: str,
+    no_findings_posture: str,
+    direct_posture: str,
+    control_posture: str,
+    standard_posture: str,
+    segmented_users: dict[str, object],
+    artifact_paths: dict[str, str],
+    context_lines: list[str] | None = None,
+) -> None:
+    """Render a consistent tiered identity-risk summary for hygiene checks.
+
+    Args:
+        domain: Domain name being assessed.
+        title: Panel/table title for this check.
+        posture_label: Label for the summary posture line.
+        total_label: Label for the total affected identity count.
+        no_findings_posture: Posture text when no matching identities exist.
+        direct_posture: Posture text when direct domain-control identities exist.
+        control_posture: Posture text when control-exposed identities exist.
+        standard_posture: Posture text when only standard identities exist.
+        segmented_users: Output from `_segment_password_policy_users`.
+        artifact_paths: Segment artifact paths returned by `_persist_password_policy_segment_artifacts`.
+        context_lines: Optional extra summary lines, such as stale-user thresholds.
+    """
+    direct_users = segmented_users.get("direct_domain_control_users") or []
+    control_users = segmented_users.get("control_exposure_users") or []
+    standard_users = segmented_users.get("standard_users") or []
+    total_count = int(segmented_users.get("total_count") or 0)
+    direct_count = int(segmented_users.get("direct_domain_control_count") or 0)
+    control_count = int(segmented_users.get("control_exposure_count") or 0)
+    standard_count = int(segmented_users.get("standard_count") or 0)
+
+    posture = (
+        direct_posture
+        if direct_count
+        else control_posture
+        if control_count
+        else standard_posture
+        if total_count
+        else no_findings_posture
+    )
+    border_style = (
+        "red"
+        if direct_count
+        else "yellow"
+        if control_count
+        else "cyan"
+        if total_count
+        else "green"
+    )
+    artifact_count = sum(1 for path in artifact_paths.values() if path)
+    summary_lines = [
+        f"Domain: {mark_sensitive(domain, 'domain')}",
+        *(context_lines or []),
+        f"{posture_label}: {posture}",
+        f"{total_label}: {total_count}",
+        f"Direct domain control: {direct_count}",
+        f"Control-exposed identities: {control_count}",
+        f"Standard identities: {standard_count}",
+        f"Segment artifacts written: {artifact_count}",
+    ]
+    print_panel(
+        "\n".join(summary_lines),
+        title=title,
+        border_style=border_style,
+        fit=True,
+    )
+
+    if total_count == 0:
+        return
+
+    table = Table(
+        title=f"{title} Breakdown", show_header=True, header_style="bold magenta"
+    )
+    table.add_column("Priority", style="cyan", no_wrap=True)
+    table.add_column("Identities", justify="right", style="white", no_wrap=True)
+    table.add_column("Why it matters", style="white", max_width=72)
+    table.add_column("Artifact", style="dim", max_width=34)
+    table.add_row(
+        "P0 Direct control",
+        str(direct_count),
+        (
+            "These identities sit on the direct domain-control boundary. Treat as immediate remediation."
+            if direct_count
+            else "No direct domain-control identities found."
+        ),
+        _format_segment_artifact(artifact_paths, "direct_domain_control_users"),
+    )
+    table.add_row(
+        "P1 Control exposed",
+        str(control_count),
+        (
+            "These identities are not direct-control accounts, but their graph exposure can still enable escalation."
+            if control_count
+            else "No additional control-exposed identities found."
+        ),
+        _format_segment_artifact(artifact_paths, "control_exposure_users"),
+    )
+    table.add_row(
+        "P2 Standard",
+        str(standard_count),
+        (
+            "These are hygiene findings without known control exposure; still reduce them to shrink attack surface."
+            if standard_count
+            else "No standard identities found."
+        ),
+        _format_segment_artifact(artifact_paths, "standard_users"),
+    )
+    print_table(table)
+
+    _render_identity_hygiene_samples(
+        direct_users=direct_users,
+        control_users=control_users,
+        standard_users=standard_users,
+        direct_count=direct_count,
+        control_count=control_count,
+        standard_count=standard_count,
+    )
+
+
+def _format_segment_artifact(artifact_paths: dict[str, str], segment_key: str) -> str:
+    """Return a compact artifact name for summary tables."""
+    artifact_path = artifact_paths.get(segment_key)
+    if not artifact_path:
+        return "N/A"
+    return mark_sensitive(os.path.basename(artifact_path), "path")
+
+
+def _render_identity_hygiene_samples(
+    *,
+    direct_users: object,
+    control_users: object,
+    standard_users: object,
+    direct_count: int,
+    control_count: int,
+    standard_count: int,
+) -> None:
+    """Render small identity samples using one consistent naming scheme."""
+    samples = [
+        ("P0 direct control sample", direct_users, direct_count),
+        ("P1 control-exposed sample", control_users, control_count),
+        ("P2 standard sample", standard_users, standard_count),
+    ]
+    for title, users, count in samples:
+        if not isinstance(users, list) or not users:
+            continue
+        print_info_list(
+            [mark_sensitive(user, "user") for user in users[:5]],
+            title=f"{title} ({count} total)",
+            icon="-",
+        )
+
+
 def _render_password_policy_user_summary(
     *,
     domain: str,
@@ -4697,123 +5197,25 @@ def _render_password_policy_user_summary(
     artifact_paths: dict[str, str],
 ) -> None:
     """Render one premium summary for password policy hygiene findings."""
-    total_count = int(segmented_users.get("total_count") or 0)
-    tier0_users = segmented_users.get("tier0_users") or []
-    high_value_users = segmented_users.get("high_value_users") or []
-    low_priv_users = segmented_users.get("low_priv_users") or []
-
-    tier0_count = int(segmented_users.get("tier0_count") or 0)
-    high_value_count = int(segmented_users.get("high_value_count") or 0)
-    low_priv_count = int(segmented_users.get("low_priv_count") or 0)
-
-    marked_domain = mark_sensitive(domain, "domain")
-    if total_count == 0:
-        print_panel(
-            "\n".join(
-                [
-                    f"Domain: {marked_domain}",
-                    "Risk posture: No matching users identified",
-                    "Tier-0 users: 0",
-                    "High-value users: 0",
-                    "Low-priv users: 0",
-                ]
-            ),
-            title=title,
-            border_style="green",
-            fit=True,
-        )
-        return
-
-    risk_posture = (
-        "Critical: Tier-0 users affected"
-        if tier0_count
-        else "High: High-value users affected"
-        if high_value_count
-        else "Moderate: Limited to low-priv users"
-    )
-    border_style = "red" if tier0_count else "yellow" if high_value_count else "cyan"
-    print_panel(
-        "\n".join(
-            [
-                f"Domain: {marked_domain}",
-                f"Risk posture: {risk_posture}",
-                f"Total affected users: {total_count}",
-                f"Tier-0 users: {tier0_count}",
-                f"High-value users: {high_value_count}",
-                f"Low-priv users: {low_priv_count}",
-                "",
-                "Artifacts",
-                f"- Tier-0 subset: {mark_sensitive(artifact_paths.get('tier0_users', 'N/A'), 'path') if artifact_paths.get('tier0_users') else 'N/A'}",
-                f"- High-value subset: {mark_sensitive(artifact_paths.get('high_value_users', 'N/A'), 'path') if artifact_paths.get('high_value_users') else 'N/A'}",
-                f"- Low-priv subset: {mark_sensitive(artifact_paths.get('low_priv_users', 'N/A'), 'path') if artifact_paths.get('low_priv_users') else 'N/A'}",
-            ]
-        ),
+    _render_identity_hygiene_segmentation_summary(
+        domain=domain,
         title=title,
-        border_style=border_style,
-        fit=True,
+        posture_label="Risk posture",
+        total_label="Affected users",
+        no_findings_posture="No matching users identified",
+        direct_posture="Critical: direct domain-control identities affected",
+        control_posture="High: control-exposed identities affected",
+        standard_posture="Moderate: limited to standard identities",
+        segmented_users=segmented_users,
+        artifact_paths=artifact_paths,
     )
-
-    table = Table(title="Risk Breakdown", show_header=True, header_style="bold magenta")
-    table.add_column("Segment", style="cyan")
-    table.add_column("Count", justify="right", style="white")
-    table.add_column("Assessment", style="white", max_width=68)
-    table.add_row(
-        "Tier-0",
-        str(tier0_count),
-        (
-            "Accounts in the Tier-0 boundary were identified. This materially increases "
-            "exposure because these principals can often lead directly to domain compromise."
-            if tier0_count
-            else "No Tier-0 principals were identified."
-        ),
-    )
-    table.add_row(
-        "High-value",
-        str(high_value_count),
-        (
-            "High-value identities outside Tier-0 are exposed and should be prioritised "
-            "after Tier-0 remediation."
-            if high_value_count
-            else "No additional high-value principals were identified."
-        ),
-    )
-    table.add_row(
-        "Low-priv",
-        str(low_priv_count),
-        (
-            "The remaining exposure is limited to low-privileged users, but still reflects "
-            "weak directory hygiene and should be remediated."
-            if low_priv_count
-            else "No low-privileged users were identified."
-        ),
-    )
-    print_table(table)
-
-    if isinstance(tier0_users, list) and tier0_users:
-        print_info_list(
-            [mark_sensitive(user, "user") for user in tier0_users[:5]],
-            title=f"Tier-0 sample ({tier0_count} total)",
-            icon="🔴",
-        )
-    if isinstance(high_value_users, list) and high_value_users:
-        print_info_list(
-            [mark_sensitive(user, "user") for user in high_value_users[:5]],
-            title=f"High-value sample ({high_value_count} total)",
-            icon="🟠",
-        )
-    if isinstance(low_priv_users, list) and low_priv_users:
-        print_info_list(
-            [mark_sensitive(user, "user") for user in low_priv_users[:5]],
-            title=f"Low-priv sample ({low_priv_count} total)",
-            icon="🟢",
-        )
 
 
 def _build_segmented_user_details(
     raw_records: list[dict[str, object]],
     segmented_users: dict[str, object],
 ) -> dict[str, list[dict[str, object]]]:
-    """Attach per-user metadata to Tier-0/high-value/low-priv segments."""
+    """Attach per-user metadata to direct-control/control-exposure/standard segments."""
     records_by_normalized: dict[str, dict[str, object]] = {}
     for record in raw_records:
         if not isinstance(record, dict):
@@ -4823,7 +5225,11 @@ def _build_segmented_user_details(
             records_by_normalized[normalized] = record
 
     details: dict[str, list[dict[str, object]]] = {}
-    for segment_key in ("tier0_users", "high_value_users", "low_priv_users"):
+    for segment_key in (
+        "direct_domain_control_users",
+        "control_exposure_users",
+        "standard_users",
+    ):
         users = segmented_users.get(segment_key)
         if not isinstance(users, list):
             continue
@@ -4846,92 +5252,19 @@ def _render_stale_enabled_user_summary(
     stale_days: int,
 ) -> None:
     """Render one premium summary for enabled-but-stale users."""
-    total_count = int(segmented_users.get("total_count") or 0)
-    tier0_count = int(segmented_users.get("tier0_count") or 0)
-    high_value_count = int(segmented_users.get("high_value_count") or 0)
-    low_priv_count = int(segmented_users.get("low_priv_count") or 0)
-
-    marked_domain = mark_sensitive(domain, "domain")
-    if total_count == 0:
-        print_panel(
-            "\n".join(
-                [
-                    f"Domain: {marked_domain}",
-                    f"Threshold: {stale_days} days",
-                    "Hygiene posture: No stale enabled users identified",
-                    "Tier-0 users: 0",
-                    "High-value users: 0",
-                    "Low-priv users: 0",
-                ]
-            ),
-            title=title,
-            border_style="green",
-            fit=True,
-        )
-        return
-
-    posture = (
-        "Critical: Tier-0 users remain enabled despite prolonged inactivity"
-        if tier0_count
-        else "High: High-value users appear stale and still enabled"
-        if high_value_count
-        else "Moderate: Exposure limited to low-privileged stale accounts"
-    )
-    border_style = "red" if tier0_count else "yellow" if high_value_count else "cyan"
-    print_panel(
-        "\n".join(
-            [
-                f"Domain: {marked_domain}",
-                f"Threshold: {stale_days} days without observed logon activity",
-                f"Hygiene posture: {posture}",
-                f"Total stale enabled users: {total_count}",
-                f"Tier-0 users: {tier0_count}",
-                f"High-value users: {high_value_count}",
-                f"Low-priv users: {low_priv_count}",
-                "",
-                "Artifacts",
-                f"- Tier-0 subset: {mark_sensitive(artifact_paths.get('tier0_users', 'N/A'), 'path') if artifact_paths.get('tier0_users') else 'N/A'}",
-                f"- High-value subset: {mark_sensitive(artifact_paths.get('high_value_users', 'N/A'), 'path') if artifact_paths.get('high_value_users') else 'N/A'}",
-                f"- Low-priv subset: {mark_sensitive(artifact_paths.get('low_priv_users', 'N/A'), 'path') if artifact_paths.get('low_priv_users') else 'N/A'}",
-            ]
-        ),
+    _render_identity_hygiene_segmentation_summary(
+        domain=domain,
         title=title,
-        border_style=border_style,
-        fit=True,
+        posture_label="Hygiene posture",
+        total_label="Stale enabled users",
+        no_findings_posture="No stale enabled users identified",
+        direct_posture="Critical: stale direct domain-control identities remain enabled",
+        control_posture="High: stale control-exposed identities remain enabled",
+        standard_posture="Moderate: stale exposure limited to standard identities",
+        segmented_users=segmented_users,
+        artifact_paths=artifact_paths,
+        context_lines=[f"Threshold: {stale_days} days without observed logon activity"],
     )
-
-    table = Table(title="Stale Identity Breakdown", show_header=True, header_style="bold magenta")
-    table.add_column("Segment", style="cyan")
-    table.add_column("Count", justify="right", style="white")
-    table.add_column("Assessment", style="white", max_width=72)
-    table.add_row(
-        "Tier-0",
-        str(tier0_count),
-        (
-            "These identities belong to the Tier-0 boundary and should almost never remain enabled without recent use."
-            if tier0_count
-            else "No stale Tier-0 principals were identified."
-        ),
-    )
-    table.add_row(
-        "High-value",
-        str(high_value_count),
-        (
-            "High-value identities appear unused for a prolonged period and should be validated or disabled."
-            if high_value_count
-            else "No stale additional high-value principals were identified."
-        ),
-    )
-    table.add_row(
-        "Low-priv",
-        str(low_priv_count),
-        (
-            "Inactive enabled low-privilege accounts increase attack surface for password attacks and should be cleaned up."
-            if low_priv_count
-            else "No stale low-privileged principals were identified."
-        ),
-    )
-    print_table(table)
 
 
 def _load_workspace_user_list(
@@ -4954,18 +5287,20 @@ def _load_workspace_user_list(
         return []
 
 
-def _calculate_tier0_highvalue_sprawl(
+def _calculate_control_exposure_sprawl(
     *,
     enabled_users: list[str],
-    tier0_highvalue_users: list[str],
+    control_exposed_users: list[str],
 ) -> dict[str, object]:
-    """Calculate Tier-0/high-value sprawl metrics from two user inventories."""
-    enabled_unique = sorted({str(user).strip() for user in enabled_users if str(user).strip()})
+    """Calculate control-exposure sprawl metrics from two user inventories."""
+    enabled_unique = sorted(
+        {str(user).strip() for user in enabled_users if str(user).strip()}
+    )
     enabled_keys = {normalize_samaccountname(user) for user in enabled_unique}
     enabled_keys.discard(None)  # type: ignore[arg-type]
 
     privileged_unique = sorted(
-        {str(user).strip() for user in tier0_highvalue_users if str(user).strip()}
+        {str(user).strip() for user in control_exposed_users if str(user).strip()}
     )
     privileged_in_enabled: list[str] = []
     for user in privileged_unique:
@@ -4978,40 +5313,40 @@ def _calculate_tier0_highvalue_sprawl(
     ratio = (privileged_count / enabled_count) if enabled_count else 0.0
 
     if privileged_count >= 20 or ratio >= 0.20:
-        posture = "Critical: Tier-0 / high-value identity sprawl"
+        posture = "Critical: Control-exposure identity sprawl"
         exceeds_threshold = True
     elif privileged_count >= 10 or ratio >= 0.10:
-        posture = "High: Privileged identity concentration is elevated"
+        posture = "High: Control-exposed identity concentration is elevated"
         exceeds_threshold = True
     elif privileged_count >= 5 and ratio >= 0.05:
-        posture = "Moderate: Privileged identity footprint should be reduced"
+        posture = "Moderate: Control-exposed identity footprint should be reduced"
         exceeds_threshold = True
     else:
-        posture = "Controlled: No material Tier-0 / high-value sprawl detected"
+        posture = "Controlled: No material control-exposure sprawl detected"
         exceeds_threshold = False
 
     return {
         "enabled_user_count": enabled_count,
-        "tier0_highvalue_count": privileged_count,
-        "tier0_highvalue_ratio": round(ratio, 4),
-        "tier0_highvalue_percentage": round(ratio * 100, 2),
-        "tier0_highvalue_users": privileged_in_enabled or None,
+        "control_exposure_count": privileged_count,
+        "control_exposure_ratio": round(ratio, 4),
+        "control_exposure_percentage": round(ratio * 100, 2),
+        "control_exposure_users": privileged_in_enabled or None,
         "exceeds_threshold": exceeds_threshold,
         "posture": posture,
     }
 
 
-def _render_tier0_highvalue_sprawl_summary(
+def _render_control_exposure_sprawl_summary(
     *,
     domain: str,
     metrics: dict[str, object],
 ) -> None:
-    """Render a premium summary for Tier-0/high-value identity sprawl."""
+    """Render a premium summary for control-exposure identity sprawl."""
     enabled_count = int(metrics.get("enabled_user_count") or 0)
-    privileged_count = int(metrics.get("tier0_highvalue_count") or 0)
-    percentage = float(metrics.get("tier0_highvalue_percentage") or 0.0)
+    privileged_count = int(metrics.get("control_exposure_count") or 0)
+    percentage = float(metrics.get("control_exposure_percentage") or 0.0)
     posture = str(metrics.get("posture") or "Unknown")
-    privileged_users = metrics.get("tier0_highvalue_users") or []
+    privileged_users = metrics.get("control_exposure_users") or []
 
     border_style = (
         "red"
@@ -5025,17 +5360,21 @@ def _render_tier0_highvalue_sprawl_summary(
             [
                 f"Domain: {mark_sensitive(domain, 'domain')}",
                 f"Enabled users: {enabled_count}",
-                f"Tier-0 / high-value users: {privileged_count}",
-                f"Privileged ratio: {percentage:.2f}%",
+                f"Control-exposed identities: {privileged_count}",
+                f"Control exposure ratio: {percentage:.2f}%",
                 f"Assessment: {posture}",
             ]
         ),
-        title="Tier-0 / High-Value Identity Sprawl",
+        title="Control-Exposure Identity Sprawl",
         border_style=border_style,
         fit=True,
     )
 
-    table = Table(title="Privileged Identity Concentration", show_header=True, header_style="bold magenta")
+    table = Table(
+        title="Control-Exposure Concentration",
+        show_header=True,
+        header_style="bold magenta",
+    )
     table.add_column("Metric", style="cyan")
     table.add_column("Value", justify="right", style="white")
     table.add_column("Interpretation", style="white", max_width=72)
@@ -5045,17 +5384,17 @@ def _render_tier0_highvalue_sprawl_summary(
         "Active identity baseline used for hygiene ratio calculations.",
     )
     table.add_row(
-        "Tier-0 / High-Value users",
+        "Control-exposed identities",
         str(privileged_count),
-        "Users sourced from admins.txt (Tier-0 / high-value union).",
+        "Users sourced from control_exposure_identities.txt.",
     )
     table.add_row(
-        "Privileged ratio",
+        "Control exposure ratio",
         f"{percentage:.2f}%",
         (
-            "Elevated privileged identity concentration increases standing access and the blast radius of credential compromise."
+            "Elevated control-exposure concentration increases standing access and the blast radius of credential compromise."
             if bool(metrics.get("exceeds_threshold"))
-            else "Privileged identity concentration appears comparatively contained."
+            else "Control-exposure concentration appears comparatively contained."
         ),
     )
     print_table(table)
@@ -5063,16 +5402,16 @@ def _render_tier0_highvalue_sprawl_summary(
     if isinstance(privileged_users, list) and privileged_users:
         print_info_list(
             [mark_sensitive(user, "user") for user in privileged_users[:8]],
-            title=f"Tier-0 / High-Value sample ({privileged_count} total)",
+            title=f"Control-exposure sample ({privileged_count} total)",
             icon="🔶",
         )
 
 
 def run_bloodhound_tier0_highvalue_sprawl(shell: BloodHoundShell, domain: str) -> None:
-    """Assess Tier-0/high-value identity concentration using current inventories."""
+    """Assess control-exposure identity concentration using current inventories."""
     marked_domain = mark_sensitive(domain, "domain")
     print_info(
-        f"Assessing Tier-0 / high-value identity concentration on domain {marked_domain}"
+        f"Assessing control-exposure identity concentration on domain {marked_domain}"
     )
     try:
         enabled_users = _load_workspace_user_list(
@@ -5087,24 +5426,32 @@ def run_bloodhound_tier0_highvalue_sprawl(shell: BloodHoundShell, domain: str) -
             enabled_users = shell._get_bloodhound_service().get_users(domain=domain)
             shell._write_user_list_file(domain, "enabled_users.txt", enabled_users)
 
-        tier0_highvalue_users = _load_workspace_user_list(
+        control_exposed_users = _load_workspace_user_list(
             shell,
             domain=domain,
-            filename="admins.txt",
+            filename=CONTROL_EXPOSURE_IDENTITIES_FILENAME,
         )
-        if not tier0_highvalue_users:
+        if not control_exposed_users:
             print_info_debug(
-                "[identity-sprawl] admins.txt missing or empty; querying BloodHound high-value users."
+                "[identity-sprawl] control_exposure_identities.txt missing or empty; rebuilding identity risk snapshot."
             )
-            tier0_highvalue_users = shell._get_bloodhound_service().get_users(
-                domain=domain,
-                filter_type="high_value",
+            snapshot = load_or_build_identity_risk_snapshot(shell, domain)
+            control_exposed_users = (
+                snapshot.get("control_exposure_identities")
+                if isinstance(snapshot, dict)
+                else []
             )
-            shell._write_user_list_file(domain, "admins.txt", tier0_highvalue_users)
+            if not isinstance(control_exposed_users, list):
+                control_exposed_users = []
+            shell._write_user_list_file(
+                domain,
+                CONTROL_EXPOSURE_IDENTITIES_FILENAME,
+                control_exposed_users,
+            )
 
-        metrics = _calculate_tier0_highvalue_sprawl(
+        metrics = _calculate_control_exposure_sprawl(
             enabled_users=enabled_users,
-            tier0_highvalue_users=tier0_highvalue_users,
+            control_exposed_users=control_exposed_users,
         )
         execute_bloodhound_tier0_highvalue_sprawl(
             shell,
@@ -5113,9 +5460,7 @@ def run_bloodhound_tier0_highvalue_sprawl(shell: BloodHoundShell, domain: str) -
         )
     except Exception as exc:
         telemetry.capture_exception(exc)
-        print_error(
-            "Failed to assess Tier-0 / high-value identity concentration."
-        )
+        print_error("Failed to assess control-exposure identity concentration.")
         print_exception(show_locals=False, exception=exc)
 
 
@@ -5189,7 +5534,8 @@ def run_bloodhound_stale_enabled_users(
         users = [
             str(record.get("samaccountname") or "").strip()
             for record in records
-            if isinstance(record, dict) and str(record.get("samaccountname") or "").strip()
+            if isinstance(record, dict)
+            and str(record.get("samaccountname") or "").strip()
         ]
         shell._write_user_list_file(domain, "stale_enabled_users.txt", users)
         execute_bloodhound_stale_enabled_users(
@@ -5320,7 +5666,9 @@ def execute_bloodhound_stale_enabled_users(
             domain=domain,
             users=users or [],
         )
-        segmented_details = _build_segmented_user_details(records or [], segmented_users)
+        segmented_details = _build_segmented_user_details(
+            records or [], segmented_users
+        )
         artifact_paths = _persist_password_policy_segment_artifacts(
             shell,
             domain=domain,
@@ -5387,15 +5735,15 @@ def execute_bloodhound_tier0_highvalue_sprawl(
     domain: str,
     metrics: dict[str, object],
 ) -> None:
-    """Persist and render Tier-0/high-value identity concentration metrics."""
+    """Persist and render control-exposure identity concentration metrics."""
     try:
-        affected_users = metrics.get("tier0_highvalue_users")
+        affected_users = metrics.get("control_exposure_users")
         if not isinstance(affected_users, list):
             affected_users = []
 
         artifact_path = shell._write_user_list_file(
             domain,
-            "tier0_highvalue_sprawl.txt",
+            "control_exposure_sprawl.txt",
             affected_users,
         )
         value = {
@@ -5403,17 +5751,17 @@ def execute_bloodhound_tier0_highvalue_sprawl(
             "artifact_path": domain_relpath(
                 shell.domains_dir,
                 domain,
-                "tier0_highvalue_sprawl.txt",
+                "control_exposure_sprawl.txt",
             ),
         }
-        shell.update_report_field(domain, "tier0_highvalue_sprawl", value)
+        shell.update_report_field(domain, "control_exposure_sprawl", value)
         try:
             from adscan_internal.services.report_service import record_technical_finding
 
             record_technical_finding(
                 shell,
                 domain,
-                key="tier0_highvalue_sprawl",
+                key="control_exposure_sprawl",
                 value=bool(metrics.get("exceeds_threshold")),
                 details=value,
                 evidence=[
@@ -5428,20 +5776,20 @@ def execute_bloodhound_tier0_highvalue_sprawl(
                     },
                     {
                         "type": "artifact",
-                        "summary": "Tier-0 / high-value user inventory",
+                        "summary": "Control-exposure identity inventory",
                         "artifact_path": domain_relpath(
                             shell.domains_dir,
                             domain,
-                            "admins.txt",
+                            CONTROL_EXPOSURE_IDENTITIES_FILENAME,
                         ),
                     },
                     {
                         "type": "artifact",
-                        "summary": "Tier-0 / high-value users within enabled-user baseline",
+                        "summary": "Control-exposed identities within enabled-user baseline",
                         "artifact_path": domain_relpath(
                             shell.domains_dir,
                             domain,
-                            "tier0_highvalue_sprawl.txt",
+                            "control_exposure_sprawl.txt",
                         ),
                     },
                 ],
@@ -5461,7 +5809,7 @@ def execute_bloodhound_tier0_highvalue_sprawl(
         print_info_debug(
             f"[identity-sprawl] Wrote intersection artifact to {mark_sensitive(artifact_path, 'path')}"
         )
-        _render_tier0_highvalue_sprawl_summary(
+        _render_control_exposure_sprawl_summary(
             domain=domain,
             metrics=metrics,
         )
@@ -5469,7 +5817,7 @@ def execute_bloodhound_tier0_highvalue_sprawl(
         telemetry.capture_exception(e)
         marked_domain = mark_sensitive(domain, "domain")
         print_error(
-            f"Error assessing Tier-0 / high-value identity concentration for domain {marked_domain}: {str(e)}"
+            f"Error assessing control-exposure identity concentration for domain {marked_domain}: {str(e)}"
         )
         print_exception(show_locals=False, exception=e)
 
@@ -5661,6 +6009,7 @@ def run_bloodhound_krbtgt(shell: BloodHoundShell, domain: str) -> None:
         records = shell._get_bloodhound_service().get_password_last_change(
             domain=domain,
             user="krbtgt",
+            enabled_only=False,
         )
         execute_bloodhound_krbtgt(shell, None, domain, records=records)
     except Exception as e:
@@ -5694,6 +6043,7 @@ def execute_bloodhound_krbtgt(
             records = shell._get_bloodhound_service().get_password_last_change(
                 domain=domain,
                 user="krbtgt",
+                enabled_only=False,
             )
     except Exception as e:
         telemetry.capture_exception(e)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "7.2.0"
+version = "8.0.0"
 description = "Free Active Directory pentesting CLI for AD enumeration, BloodHound, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
@@ -57,6 +57,7 @@ cli = [
     "psutil",
     "python-docx",
     "weasyprint>=60.0",
+    "playwright==1.57.0",
     "jinja2>=3.0",
     "graphviz>=0.20",
     "python-magic>=0.4.27,<0.5; platform_system == 'Linux'",

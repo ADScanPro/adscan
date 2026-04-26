@@ -92,6 +92,7 @@ LEGACY_DEFAULT_DOCKER_IMAGE = "adscan/adscan:latest"
 LEGACY_DEFAULT_DEV_DOCKER_IMAGE = "adscan/adscan-dev:edge"
 DEFAULT_BLOODHOUND_ADMIN_PASSWORD = "Adscan4thewin!"
 DEFAULT_BLOODHOUND_STACK_MODE = "managed"
+ADSCAN_RUNTIME_LICENSE_MODE_ENV = "ADSCAN_RUNTIME_LICENSE_MODE"
 SUPPORTED_BLOODHOUND_STACK_MODES = ("managed",)
 DEFAULT_HOST_HELPER_SOCKET_NAME = "host-helper.sock"
 _DOCKER_RUN_HELP_HAS_GPUS_RE = re.compile(r"\s--gpus\b", re.IGNORECASE)
@@ -138,6 +139,55 @@ BH_CONFIG_FILE = get_effective_user_home() / ".bloodhound_config"
 def _get_runtime_session_lock_path() -> Path:
     """Return the launcher-wide runtime lock file path."""
     return _get_run_dir() / _RUNTIME_SESSION_LOCK_NAME
+
+
+def _infer_runtime_license_mode_from_image(image: str) -> str | None:
+    """Best-effort runtime license inference from the Docker image reference.
+
+    This is only a compatibility fallback for older runtime images that were
+    published before the explicit runtime license environment variable existed.
+
+    Args:
+        image: Docker image reference selected by the launcher.
+
+    Returns:
+        ``"PRO"`` or ``"LITE"`` when the image name is unambiguous, otherwise
+        ``None`` so the runtime can fall back to its own default.
+    """
+    normalized_image = _strip_default_docker_io_prefix(str(image or "")).strip().lower()
+    if not normalized_image:
+        return None
+    if "adscan-pro" in normalized_image:
+        return "PRO"
+    if "adscan-lite" in normalized_image:
+        return "LITE"
+    return None
+
+
+def _build_runtime_license_env(image: str) -> tuple[tuple[str, str], ...]:
+    """Return explicit runtime license env overrides for Docker execution.
+
+    Preference order:
+    1. Explicit host override via ``ADSCAN_RUNTIME_LICENSE_MODE``.
+    2. Image-name inference for backward compatibility with older images.
+    3. No override; let the runtime resolve its own default.
+
+    Args:
+        image: Docker image reference selected by the launcher.
+
+    Returns:
+        Zero or one ``(key, value)`` tuples suitable for ``DockerRunConfig``.
+    """
+    explicit_license_mode = str(
+        os.getenv(ADSCAN_RUNTIME_LICENSE_MODE_ENV, "")
+    ).strip().upper()
+    if explicit_license_mode in {"LITE", "PRO"}:
+        return ((ADSCAN_RUNTIME_LICENSE_MODE_ENV, explicit_license_mode),)
+
+    inferred_license_mode = _infer_runtime_license_mode_from_image(image)
+    if inferred_license_mode is None:
+        return ()
+    return ((ADSCAN_RUNTIME_LICENSE_MODE_ENV, inferred_license_mode),)
 
 
 def _build_runtime_session_lock_metadata(
@@ -5049,7 +5099,10 @@ def handle_check_docker(
 
             if all_ok:
                 cfg = DockerRunConfig(
-                    image=image, workspaces_host_dir=workspaces_dir, interactive=False
+                    image=image,
+                    workspaces_host_dir=workspaces_dir,
+                    interactive=False,
+                    extra_env=_build_runtime_license_env(image),
                 )
                 cmd = build_adscan_run_command(cfg, adscan_args=["--version"])
                 print_info_debug(f"[docker] probe: {shell_quote_cmd(cmd)}")
@@ -5190,7 +5243,8 @@ def handle_start_docker(
                 interactive=True,
                 extra_run_args=tuple(extra_run_args),
                 extra_env=tuple(
-                    [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+                    list(_build_runtime_license_env(image))
+                    + [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
                     + (
                         [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
                         if compose_path is not None
@@ -5248,6 +5302,10 @@ def handle_ci_docker(
     keep_workspace: bool,
     generate_report: bool,
     report_format: str,
+    report_engine: str = "",
+    report_renderer: str = "",
+    report_template: str = "",
+    report_theme: str = "",
     pull_timeout_seconds: int | None = None,
     bloodhound_stack_mode: str | None = None,
     allow_low_memory: bool = False,
@@ -5360,7 +5418,8 @@ def handle_ci_docker(
                 interactive=interactive,
                 extra_run_args=tuple(extra_run_args),
                 extra_env=tuple(
-                    [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+                    list(_build_runtime_license_env(image))
+                    + [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
                     + (
                         [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
                         if compose_path is not None
@@ -5399,6 +5458,14 @@ def handle_ci_docker(
             if generate_report:
                 adscan_args.append("--generate-report")
                 adscan_args.extend(["--report-format", report_format])
+                if report_engine:
+                    adscan_args.extend(["--report-engine", report_engine])
+                if report_renderer:
+                    adscan_args.extend(["--report-renderer", report_renderer])
+                if report_template:
+                    adscan_args.extend(["--report-template", report_template])
+                if report_theme:
+                    adscan_args.extend(["--report-theme", report_theme])
 
             cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
             print_info_debug(f"[docker] ci: {shell_quote_cmd(cmd)}")
@@ -5551,7 +5618,8 @@ def run_adscan_passthrough_docker(
                 interactive=interactive,
                 extra_run_args=tuple(extra_run_args),
                 extra_env=tuple(
-                    [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
+                    list(_build_runtime_license_env(image))
+                    + [("ADSCAN_BLOODHOUND_STACK_MODE", resolved_stack_mode)]
                     + (
                         [("ADSCAN_HOST_BLOODHOUND_COMPOSE", str(compose_path))]
                         if compose_path is not None

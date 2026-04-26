@@ -30,6 +30,10 @@ from adscan_internal.cli.session_preflight import (
     SessionPreflightDeps,
     run_session_preflight,
 )
+from adscan_internal.workspaces import (
+    create_workspace_dir,
+    write_initial_workspace_variables,
+)
 
 try:
     from adscan_internal.services.report_service import (
@@ -100,9 +104,13 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     if getattr(args, "workspace", None):
         ws_dir = os.path.join(shell.workspaces_dir, args.workspace)
         if not os.path.isdir(ws_dir):
-            marked_workspace = mark_sensitive(args.workspace, "workspace")
-            print_error(f"Workspace '{marked_workspace}' not found")
-            return False
+            create_workspace_dir(shell.workspaces_dir, args.workspace)
+            write_initial_workspace_variables(
+                workspace_name=args.workspace,
+                workspace_path=ws_dir,
+                workspace_type=args.type,
+            )
+            created_workspace = True
         shell.current_workspace = args.workspace
         shell.current_workspace_dir = ws_dir
         shell.load_workspace_data(ws_dir)
@@ -278,9 +286,23 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
             report_json_path = os.path.join(
                 shell.current_workspace_dir, "technical_report.json"
             )
-            report_format = getattr(args, "report_format", "word")
+            report_format = "pdf"
+            frameworks_raw = getattr(args, "frameworks", None)
+            frameworks = (
+                [f.strip() for f in frameworks_raw.split(",") if f.strip()]
+                if frameworks_raw
+                else None
+            )
             report_file_path = run_generate_report(
-                shell, report_json_path, report_format
+                shell,
+                report_json_path,
+                report_format,
+                frameworks=frameworks,
+                engine=getattr(args, "report_engine", "") or "",
+                renderer=getattr(args, "report_renderer", "") or "",
+                template=getattr(args, "report_template", "") or "",
+                theme=getattr(args, "report_theme", "") or "",
+                display_name=getattr(args, "display_name", "") or "",
             )
             if not report_file_path:
                 print_warning("Report generation failed")
@@ -347,19 +369,29 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
 def run_generate_report(
     shell: object,
     report_file: str,
-    report_format: str = "word",
+    report_format: str = "pdf",
     report_profile: str = "full",
     frameworks: Optional[list] = None,
+    *,
+    engine: str = "",
+    renderer: str = "",
+    template: str = "",
+    theme: str = "",
+    display_name: str = "",
 ) -> Optional[str]:
-    """Generate a Word or PDF report from technical report JSON.
+    """Generate a report from technical report JSON.
 
     Args:
         shell: Shell instance with license_mode and event_bus
         report_file: Path to technical_report.json
-        report_format: Format to generate ("word" or "pdf")
+        report_format: Format to generate. Public CLI flows pass "pdf".
         report_profile: Report profile ("full", "technical", "executive")
-        frameworks: Compliance frameworks to include. Valid values: "ens",
-            "iso27001", "dora". Defaults to ["ens"] (ENS Alto + NIS2).
+        frameworks: Compliance frameworks. Valid values: "ens", "iso27001",
+            "dora", "pci_dss". Defaults to ["ens"] (ENS Alto + NIS2).
+        engine: PDF engine ("weasyprint" | "chromium"). Empty = env/default.
+        renderer: Attack-path renderer ("graphviz" | "cytoscape"). Empty = env/default.
+        template: Report template ("legacy" | "premium"). Empty = env/default.
+        theme: Report theme ("premium_dark" | "corporate_light" | ""). Empty = env/default.
 
     Returns:
         Path to generated report file, or None on failure
@@ -401,6 +433,11 @@ def run_generate_report(
         profile=report_profile_lower,
         workspace_dir=workspace_dir,
         frameworks=frameworks,
+        engine=engine,
+        renderer=renderer,
+        template=template,
+        theme=theme,
+        display_name=display_name,
     )
 
     result_path = report_service.generate_report(config)

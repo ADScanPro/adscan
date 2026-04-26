@@ -935,6 +935,7 @@ def handle_auth_and_optional_privs(
     )
     from adscan_internal.services.attack_step_support_registry import (
         classify_relation_support,
+        normalize_search_mode_label,
     )
     from adscan_internal.services.privileged_group_classifier import (
         resolve_privileged_followup_decision,
@@ -955,9 +956,10 @@ def handle_auth_and_optional_privs(
         return "other", "other"
 
     def _get_terminal_attack_path_search_mode() -> str | None:
-        """Return the normalized terminal search mode when the active step is last."""
+        """Return the canonical terminal search mode when the active step is last."""
         context = get_attack_path_step_context(shell)
-        search_mode = str(context.get("search_mode_label") or "").strip().lower()
+        raw_search_mode = str(context.get("search_mode_label") or "").strip()
+        search_mode = normalize_search_mode_label(raw_search_mode)
         compromise_semantics, compromise_effort = (
             _resolve_active_step_compromise_metadata()
         )
@@ -972,7 +974,8 @@ def handle_auth_and_optional_privs(
             return None
         terminal_mode = (
             search_mode
-            if search_mode in {"pivot search", "high-value search", "tier-0 search"}
+            if search_mode
+            in {"pivot", "direct_compromise", "followup_terminal"}
             and step_index > 0
             and step_index == last_executable_idx
             else None
@@ -990,7 +993,7 @@ def handle_auth_and_optional_privs(
     def _is_terminal_pivot_attack_step() -> bool:
         """Return True when the active step is the final pivot-search step."""
         terminal_mode = _get_terminal_attack_path_search_mode()
-        is_terminal_pivot = terminal_mode == "pivot search"
+        is_terminal_pivot = terminal_mode == "pivot"
         print_info_debug(
             "[creds] terminal pivot check: "
             f"search_mode={mark_sensitive(terminal_mode or 'none', 'detail')} "
@@ -1144,7 +1147,7 @@ def handle_auth_and_optional_privs(
             return False
 
         terminal_search_mode = _get_terminal_attack_path_search_mode()
-        if terminal_search_mode not in {"tier-0 search", "high-value search"}:
+        if terminal_search_mode not in {"direct_compromise", "followup_terminal"}:
             return False
 
         normalized_user = normalize_samaccountname(user)
@@ -1335,7 +1338,7 @@ def handle_auth_and_optional_privs(
             normalized_user = normalize_samaccountname(user)
             target_principal = _resolve_active_step_target_principal()
 
-            if terminal_search_mode == "pivot search":
+            if terminal_search_mode == "pivot":
                 if _run_terminal_pivot_user_followups(user, cred):
                     continue
                 if target_principal and normalized_user == target_principal:
@@ -1348,11 +1351,11 @@ def handle_auth_and_optional_privs(
             if _run_terminal_effective_privileged_followups(user, cred):
                 continue
 
-            if terminal_search_mode in {"high-value search", "tier-0 search"} and normalized_user:
+            if terminal_search_mode in {"direct_compromise", "followup_terminal"} and normalized_user:
                 mode_label = (
-                    "high-value"
-                    if terminal_search_mode == "high-value search"
-                    else "tier-0"
+                    "domain-compromise-enabler"
+                    if terminal_search_mode == "followup_terminal"
+                    else "direct-domain-control"
                 )
                 print_info_debug(
                     f"[creds] enabling ask_for_user_privs for terminal {mode_label} path "
@@ -1362,7 +1365,7 @@ def handle_auth_and_optional_privs(
                 continue
 
             if (
-                terminal_search_mode == "pivot search"
+                terminal_search_mode == "pivot"
                 and normalized_user
                 and normalized_user != target_principal
             ):
@@ -1390,7 +1393,7 @@ def handle_auth_and_optional_privs(
             if (
                 is_attack_path_execution_active(shell)
                 and not force_full_user_privs_from_attack_context
-                and terminal_search_mode in {"high-value search", "tier-0 search"}
+                and terminal_search_mode in {"direct_compromise", "followup_terminal"}
                 and normalized_user
             ):
                 should_force_high_value_terminal_user_privs = (
@@ -1406,7 +1409,7 @@ def handle_auth_and_optional_privs(
                 if should_force_high_value_terminal_user_privs:
                     print_info_debug(
                         "[creds] enabling ask_for_user_privs for terminal "
-                        "high-value direct compromise "
+                        "high-value path "
                         f"user={mark_sensitive(normalized_user, 'user')}"
                     )
             if (

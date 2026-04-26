@@ -71,6 +71,11 @@ _RUNTIME_PYTHON_DEPENDENCIES = (
     ("matplotlib", "matplotlib", "used for runtime chart/report rendering"),
     ("pyarrow", "pyarrow", "used for runtime materialized attack-path caches"),
     ("selenium", "selenium", "used for runtime browser-backed discovery features"),
+    (
+        "playwright.sync_api",
+        "Playwright",
+        "used for Chromium-backed PDF report generation",
+    ),
     ("textual", "textual", "required for the ADscan TUI runtime"),
     ("magic", "python-magic", "used for runtime file type detection"),
     ("rustworkx", "rustworkx", "used for runtime attack-graph processing"),
@@ -92,6 +97,7 @@ _RUNTIME_PYTHON_DISTRIBUTION_NAMES = {
     "matplotlib": "matplotlib",
     "pyarrow": "pyarrow",
     "selenium": "selenium",
+    "playwright.sync_api": "playwright",
     "textual": "textual",
     "magic": "python-magic",
     "rustworkx": "rustworkx",
@@ -111,23 +117,71 @@ class CheckFailureRecoveryGuidance:
 
 
 def _check_container_runtime_version_alignment(deps: Any) -> bool:
-    """Return whether launcher/runtime version metadata looks aligned."""
+    """Return whether the launcher/runtime contract is compatible."""
     version_fields = get_telemetry_version_fields()
     launcher_version = str(version_fields.get("launcher_version") or "").strip()
     runtime_version = str(version_fields.get("runtime_version") or "").strip()
     launcher_source = str(version_fields.get("launcher_version_source") or "unknown")
     runtime_source = str(version_fields.get("runtime_version_source") or "unknown")
+    launcher_contract = str(
+        version_fields.get("launcher_runtime_contract_version") or ""
+    ).strip()
+    runtime_contract = str(version_fields.get("runtime_contract_version") or "").strip()
 
     deps.print_info_debug(
         "[check] container runtime version context: "
         f"launcher_version={launcher_version!r} ({launcher_source}), "
-        f"runtime_version={runtime_version!r} ({runtime_source})"
+        f"runtime_version={runtime_version!r} ({runtime_source}), "
+        f"launcher_contract={launcher_contract!r}, "
+        f"runtime_contract={runtime_contract!r}"
     )
 
-    if not launcher_version or not runtime_version or launcher_version == runtime_version:
+    if launcher_contract and runtime_contract and launcher_contract != runtime_contract:
+        deps.print_warning("Launcher/runtime contract mismatch detected.")
+        print_panel = getattr(deps, "print_panel", None)
+        if callable(print_panel):
+            print_panel(
+                Group(
+                    Text(
+                        f"Launcher contract: {launcher_contract}",
+                        style="bold yellow",
+                    ),
+                    Text(
+                        f"Runtime contract: {runtime_contract}",
+                        style="bold yellow",
+                    ),
+                    Text(
+                        "The host launcher and Docker runtime do not agree on the "
+                        "runtime control contract.",
+                        style="cyan",
+                    ),
+                    Text(
+                        "Action: Use a matching ADscan launcher/runtime delivery.",
+                        style="bold white",
+                    ),
+                ),
+                title="Runtime Compatibility",
+                border_style="yellow",
+                padding=(1, 2),
+            )
+        deps.print_instruction("Use a matching ADscan launcher/runtime delivery.")
+        return False
+
+    if is_dev_update_context():
+        deps.print_info_debug(
+            "[check] Dev runtime detected; skipping launcher/runtime product "
+            "version alignment warning."
+        )
         return True
 
-    deps.print_warning("Launcher/runtime version mismatch detected.")
+    if (
+        not launcher_version
+        or not runtime_version
+        or launcher_version == runtime_version
+    ):
+        return True
+
+    deps.print_warning("Launcher/runtime product versions differ.")
     print_panel = getattr(deps, "print_panel", None)
     if callable(print_panel):
         print_panel(
@@ -141,11 +195,15 @@ def _check_container_runtime_version_alignment(deps: Any) -> bool:
                     style="bold yellow",
                 ),
                 Text(
-                    "State mismatch can cause incorrect checks, stale bug behavior, "
-                    "and older attack/escalation coverage.",
+                    "The launcher and Docker runtime are contract-compatible, but "
+                    "they were built from different product versions.",
                     style="cyan",
                 ),
-                Text("Action: Run on the host: adscan update", style="bold white"),
+                Text(
+                    "Continuing. For reproducible results, use the launcher/runtime "
+                    "pair from the same delivery.",
+                    style="bold white",
+                ),
             ),
             title="Version Alignment",
             border_style="yellow",
@@ -156,12 +214,11 @@ def _check_container_runtime_version_alignment(deps: Any) -> bool:
         f"{launcher_version} ({launcher_source}) does not match runtime version "
         f"{runtime_version} ({runtime_source})."
     )
-    deps.print_instruction("Run on the host: adscan update")
     deps.print_info(
-        "Keeping both the launcher and runtime image updated is recommended because "
-        "updates regularly ship bug fixes, new attack coverage, and new escalation paths."
+        "Continuing because the launcher/runtime contract is compatible. "
+        "For reproducible results, use the launcher/runtime pair from the same delivery."
     )
-    return False
+    return True
 
 
 def _emit_local_update_recency_guidance(deps: Any) -> None:
@@ -264,8 +321,10 @@ def _resolve_runtime_managed_john_converter_path(converter_name: str) -> str | N
     ]
     for candidate in candidates:
         normalized_candidate = str(candidate or "").strip()
-        if normalized_candidate and os.path.exists(normalized_candidate) and os.access(
-            normalized_candidate, os.X_OK
+        if (
+            normalized_candidate
+            and os.path.exists(normalized_candidate)
+            and os.access(normalized_candidate, os.X_OK)
         ):
             return os.path.realpath(normalized_candidate)
     return None
@@ -280,8 +339,9 @@ def _validate_runtime_managed_john_converters(
     normalized_john = str(john_executable or "").strip()
     if not normalized_john:
         return []
-    if normalized_john not in _RUNTIME_MANAGED_JOHN_PATHS and not normalized_john.startswith(
-        "/opt/adscan/"
+    if (
+        normalized_john not in _RUNTIME_MANAGED_JOHN_PATHS
+        and not normalized_john.startswith("/opt/adscan/")
     ):
         return []
 
@@ -1168,9 +1228,7 @@ def check_system_packages(
         )
         deps.print_error(f"Missing system packages: {', '.join(missing_pkgs)}")
         if config.full_container_runtime:
-            deps.print_instruction(
-                "Run on the host: adscan update"
-            )
+            deps.print_instruction("Run on the host: adscan update")
             deps.print_info(
                 "This check is running inside the ADscan runtime, so missing runtime-managed "
                 "packages should be repaired by refreshing the host launcher/runtime image."
@@ -1504,9 +1562,9 @@ def _normalize_missing_system_packages_for_runtime(
                         f"stdout={stdout_text[:200]!r}, "
                         f"stderr={stderr_text[:200]!r}"
                     )
-                    if _JOHN_AVX2_REQUIRED_RE.search(stdout_text) or _JOHN_AVX2_REQUIRED_RE.search(
-                        stderr_text
-                    ):
+                    if _JOHN_AVX2_REQUIRED_RE.search(
+                        stdout_text
+                    ) or _JOHN_AVX2_REQUIRED_RE.search(stderr_text):
                         issues.append(
                             "John the Ripper is present but incompatible with the CPU exposed by this host/VM "
                             "(the current binary requires AVX2)."
@@ -1728,7 +1786,9 @@ def check_ligolo_ng_runtime_tooling(*, full_container_runtime: bool, deps: Any) 
         process_has_cap_net_bind_service = _process_has_cap_net_bind_service()
         binary_capabilities = _get_binary_capabilities(str(proxy_path))
         binary_has_cap_net_admin = _binary_has_cap_net_admin(str(proxy_path))
-        binary_has_cap_net_bind_service = _binary_has_cap_net_bind_service(str(proxy_path))
+        binary_has_cap_net_bind_service = _binary_has_cap_net_bind_service(
+            str(proxy_path)
+        )
         print_info_debug = getattr(deps, "print_info_debug", None)
         if callable(print_info_debug):
             print_info_debug(
@@ -1771,7 +1831,9 @@ def check_ligolo_ng_runtime_tooling(*, full_container_runtime: bool, deps: Any) 
                 "ADscan process already has CAP_NET_BIND_SERVICE in its effective capability set."
             )
 
-    cached_windows_agent = get_ligolo_agent_local_path(target_os="windows", arch="amd64")
+    cached_windows_agent = get_ligolo_agent_local_path(
+        target_os="windows", arch="amd64"
+    )
     if cached_windows_agent is not None:
         deps.print_success(
             "ligolo-ng Windows agent cache available at "
@@ -1785,7 +1847,9 @@ def check_ligolo_ng_runtime_tooling(*, full_container_runtime: bool, deps: Any) 
     return True
 
 
-def check_runtime_python_dependencies(*, full_container_runtime: bool, deps: Any) -> bool:
+def check_runtime_python_dependencies(
+    *, full_container_runtime: bool, deps: Any
+) -> bool:
     """Check that runtime-managed Python libraries are importable.
 
     These dependencies live in the ADscan runtime Python environment rather
@@ -1853,6 +1917,12 @@ def check_runtime_python_dependencies(*, full_container_runtime: bool, deps: Any
         return False
 
     clean_env = deps.get_clean_env_for_compilation()
+    if os.path.isdir("/opt/adscan/ms-playwright"):
+        clean_env.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/adscan/ms-playwright")
+    elif os.path.exists("/usr/bin/chromium"):
+        clean_env.setdefault("ADSCAN_CHROMIUM_EXECUTABLE", "/usr/bin/chromium")
+    elif os.path.exists("/usr/bin/chromium-browser"):
+        clean_env.setdefault("ADSCAN_CHROMIUM_EXECUTABLE", "/usr/bin/chromium-browser")
     runtime_python_dir = os.path.dirname(runtime_python)
     runtime_venv_dir = os.path.dirname(runtime_python_dir)
     if os.path.basename(runtime_python_dir) == "bin":
@@ -1893,6 +1963,113 @@ def check_runtime_python_dependencies(*, full_container_runtime: bool, deps: Any
             f"Runtime Python dependency '{display_name}' is importable{version_suffix}."
         )
     return all_ok
+
+
+def check_playwright_chromium_runtime(
+    *, full_container_runtime: bool, deps: Any
+) -> bool:
+    """Check that Playwright can launch Chromium in the ADscan runtime.
+
+    Importability alone is not enough for the Chromium PDF engine: the bundled
+    Playwright Python package must also be able to locate and start a browser in
+    the runtime image.
+    """
+    if not full_container_runtime:
+        deps.print_info_verbose(
+            "Skipping Playwright Chromium verification outside the ADscan container runtime."
+        )
+        return True
+
+    deps.print_info("Checking Playwright Chromium runtime...")
+    launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+    if getattr(sys, "frozen", False):
+        try:
+            sync_playwright = importlib.import_module(
+                "playwright.sync_api"
+            ).sync_playwright
+
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=launch_args,
+                )
+                browser.close()
+        except Exception as exc:  # noqa: BLE001 - check diagnostics must continue
+            deps.print_error("Playwright could not launch Chromium for PDF reports.")
+            deps.print_instruction("Run on the host: adscan update")
+            deps.print_info_verbose(f"Playwright Chromium probe failed: {exc}")
+            return False
+
+        deps.print_success("Playwright can launch Chromium for PDF reports.")
+        return True
+
+    runtime_python_candidates = [
+        "/opt/adscan/venv/bin/python",
+        shutil.which("python3"),
+    ]
+    if os.path.basename(sys.executable).startswith("python"):
+        runtime_python_candidates.append(sys.executable)
+
+    runtime_python = next(
+        (
+            candidate
+            for candidate in runtime_python_candidates
+            if candidate and os.path.exists(candidate)
+        ),
+        None,
+    )
+    if runtime_python is None:
+        deps.print_error(
+            "Could not determine a Python interpreter for Playwright Chromium verification."
+        )
+        deps.print_instruction("Run on the host: adscan update")
+        return False
+
+    clean_env = deps.get_clean_env_for_compilation()
+    if os.path.isdir("/opt/adscan/ms-playwright"):
+        clean_env.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/adscan/ms-playwright")
+    elif os.path.exists("/usr/bin/chromium"):
+        clean_env.setdefault("ADSCAN_CHROMIUM_EXECUTABLE", "/usr/bin/chromium")
+    elif os.path.exists("/usr/bin/chromium-browser"):
+        clean_env.setdefault("ADSCAN_CHROMIUM_EXECUTABLE", "/usr/bin/chromium-browser")
+    runtime_python_dir = os.path.dirname(runtime_python)
+    runtime_venv_dir = os.path.dirname(runtime_python_dir)
+    if os.path.basename(runtime_python_dir) == "bin":
+        clean_env["PATH"] = (
+            f"{runtime_python_dir}{os.pathsep}{clean_env.get('PATH', os.environ.get('PATH', ''))}"
+        )
+        clean_env["VIRTUAL_ENV"] = runtime_venv_dir
+
+    probe_script = """
+from playwright.sync_api import sync_playwright
+with sync_playwright() as playwright:
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+    )
+    browser.close()
+"""
+    probe_result = deps.run_command(
+        [runtime_python, "-c", probe_script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=clean_env,
+    )
+    if probe_result.returncode == 0:
+        deps.print_success("Playwright can launch Chromium for PDF reports.")
+        return True
+
+    deps.print_error("Playwright could not launch Chromium for PDF reports.")
+    deps.print_instruction("Run on the host: adscan update")
+    stderr = (probe_result.stderr or "").strip()
+    stdout = (probe_result.stdout or "").strip()
+    if stderr:
+        deps.print_info_verbose(f"Playwright Chromium probe stderr: {stderr}")
+    elif stdout:
+        deps.print_info_verbose(f"Playwright Chromium probe stdout: {stdout}")
+    return False
 
 
 # ─── DNS/Unbound Resolver Check ──────────────────────────────────────────────
@@ -2759,6 +2936,12 @@ class CheckConfig:
     python_version: str
 
 
+def _is_ci_compact_preflight(config: CheckConfig) -> bool:
+    """Return whether the current check run is a reduced-noise CI preflight."""
+    args = getattr(config, "args", None)
+    return str(getattr(args, "preflight_mode", "") or "").strip().lower() == "ci"
+
+
 @dataclass(frozen=True)
 class CheckDeps:
     """Dependency bundle for the main check flow."""
@@ -2897,7 +3080,11 @@ def run_check(
     Returns:
         True if all checks passed, False otherwise.
     """
-    deps.print_info("Checking adscan installation status...")
+    compact_ci_preflight = _is_ci_compact_preflight(config)
+    if compact_ci_preflight:
+        deps.print_info("Running CI runtime preflight...")
+    else:
+        deps.print_info("Checking adscan installation status...")
     deps.set_last_check_session_extra(None)
 
     all_ok = True
@@ -2964,28 +3151,31 @@ def run_check(
         VirtualEnvCheckDeps,
     )
 
-    adscan_venv_ok, all_ok = deps.check_virtual_environment(
-        config=VirtualEnvCheckConfig(
-            adscan_base_dir=config.adscan_base_dir,
-            venv_path=config.venv_path,
-            full_container_runtime=full_container_runtime,
-            fix_mode=fix_mode,
-        ),
-        deps=VirtualEnvCheckDeps(
-            ensure_dir_writable=deps.ensure_dir_writable,
-            install_pyenv_python_and_venv=deps.install_pyenv_python_and_venv,
-            run_command=deps.run_command,
-            path_exists=deps.os_path_exists,
-            print_success=deps.print_success,
-            print_warning=deps.print_warning,
-            print_error=deps.print_error,
-            print_instruction=deps.print_instruction,
-            print_info=deps.print_info,
-            print_info_verbose=deps.print_info_verbose,
-            telemetry_capture_exception=deps.telemetry_capture_exception,
-            print_exception=deps.print_exception,
-        ),
-    )
+    if compact_ci_preflight and full_container_runtime:
+        adscan_venv_ok = True
+    else:
+        adscan_venv_ok, all_ok = deps.check_virtual_environment(
+            config=VirtualEnvCheckConfig(
+                adscan_base_dir=config.adscan_base_dir,
+                venv_path=config.venv_path,
+                full_container_runtime=full_container_runtime,
+                fix_mode=fix_mode,
+            ),
+            deps=VirtualEnvCheckDeps(
+                ensure_dir_writable=deps.ensure_dir_writable,
+                install_pyenv_python_and_venv=deps.install_pyenv_python_and_venv,
+                run_command=deps.run_command,
+                path_exists=deps.os_path_exists,
+                print_success=deps.print_success,
+                print_warning=deps.print_warning,
+                print_error=deps.print_error,
+                print_instruction=deps.print_instruction,
+                print_info=deps.print_info,
+                print_info_verbose=deps.print_info_verbose,
+                telemetry_capture_exception=deps.telemetry_capture_exception,
+                print_exception=deps.print_exception,
+            ),
+        )
 
     # 2. Check Core Dependencies in System Python (delegated helper)
     from adscan_internal.cli.check import (
@@ -3003,13 +3193,15 @@ def run_check(
                 py, pkg, env=deps.get_clean_env_for_compilation()
             ),
             assess_version_compliance=deps.assess_version_compliance,
-            get_installed_vcs_reference=lambda py,
-            pkg: deps.get_installed_vcs_reference(
-                py, pkg, env=deps.get_clean_env_for_compilation()
+            get_installed_vcs_reference=lambda py, pkg: (
+                deps.get_installed_vcs_reference(
+                    py, pkg, env=deps.get_clean_env_for_compilation()
+                )
             ),
-            get_installed_vcs_reference_by_url=lambda py,
-            url: deps.get_installed_vcs_reference_by_url(  # noqa: E501
-                py, url, env=deps.get_clean_env_for_compilation()
+            get_installed_vcs_reference_by_url=lambda py, url: (
+                deps.get_installed_vcs_reference_by_url(  # noqa: E501
+                    py, url, env=deps.get_clean_env_for_compilation()
+                )
             ),
             normalize_vcs_repo_url=deps.normalize_vcs_repo_url,
             vcs_reference_matches=deps.vcs_reference_matches,
@@ -3075,6 +3267,13 @@ def run_check(
         deps=deps,
     )
     if not runtime_python_deps_ok:
+        all_ok = False
+
+    playwright_chromium_ok = check_playwright_chromium_runtime(
+        full_container_runtime=full_container_runtime,
+        deps=deps,
+    )
+    if not playwright_chromium_ok:
         all_ok = False
 
     # 4. Check System Packages (delegated)
@@ -3150,15 +3349,16 @@ def run_check(
         all_ok = False
 
     # Check libreoffice specifically for PDF conversion capability
-    deps.print_info("Checking libreoffice for PDF conversion...")
-    libreoffice_available, libreoffice_info = deps.is_libreoffice_available()
-    if libreoffice_available:
-        deps.print_success(f"libreoffice is available: {libreoffice_info}")
-    else:
-        deps.print_warning(f"libreoffice is not available: {libreoffice_info}")
-        deps.print_info("libreoffice is required for PDF report generation")
-        deps.print_instruction("Install with: sudo apt-get install -y libreoffice")
-        # Don't set all_ok = False here as libreoffice is optional (only needed for PDF reports)
+    if not compact_ci_preflight:
+        deps.print_info("Checking libreoffice for PDF conversion...")
+        libreoffice_available, libreoffice_info = deps.is_libreoffice_available()
+        if libreoffice_available:
+            deps.print_success(f"libreoffice is available: {libreoffice_info}")
+        else:
+            deps.print_warning(f"libreoffice is not available: {libreoffice_info}")
+            deps.print_info("libreoffice is required for PDF report generation")
+            deps.print_instruction("Install with: sudo apt-get install -y libreoffice")
+            # Don't set all_ok = False here as libreoffice is optional (only needed for PDF reports)
 
     # 5. Check External Tools (delegated for non-Python tools)
     from adscan_internal.cli.check import (
@@ -3215,37 +3415,38 @@ def run_check(
         DockerComposeCheckDeps,
     )
 
-    docker_ok = deps.check_docker_compose(
-        config=DockerComposeCheckConfig(
-            bh_mode=bh_mode,
-            fix_mode=fix_mode,
-            full_container_runtime=full_container_runtime,
-            bloodhound_ce_dir=config.bloodhound_ce_dir,
-        ),
-        deps=DockerComposeCheckDeps(
-            is_docker_official_installed=deps.is_docker_official_installed,
-            is_docker_compose_plugin_available=deps.is_docker_compose_plugin_available,
-            check_bloodhound_ce_running=deps.check_bloodhound_ce_running,
-            start_bloodhound_ce=deps.start_bloodhound_ce,
-            get_bloodhound_cli_executable_path=deps.get_bloodhound_cli_executable_path,
-            is_docker_env=deps.is_docker_env,
-            expand_effective_user_path=deps.expand_effective_user_path,
-            path_exists=deps.os_path_exists,
-            path_access=deps.os_path_access,
-            print_info=deps.print_info,
-            print_info_verbose=deps.print_info_verbose,
-            print_success=deps.print_success,
-            print_success_verbose=deps.print_success_verbose,
-            print_warning=deps.print_warning,
-            print_error=deps.print_error,
-            print_instruction=deps.print_instruction,
-            print_panel=deps.print_panel,
-            print_exception=deps.print_exception,
-            telemetry_capture_exception=deps.telemetry_capture_exception,
-        ),
-    )
-    if not docker_ok:
-        all_ok = False
+    if not (compact_ci_preflight and full_container_runtime):
+        docker_ok = deps.check_docker_compose(
+            config=DockerComposeCheckConfig(
+                bh_mode=bh_mode,
+                fix_mode=fix_mode,
+                full_container_runtime=full_container_runtime,
+                bloodhound_ce_dir=config.bloodhound_ce_dir,
+            ),
+            deps=DockerComposeCheckDeps(
+                is_docker_official_installed=deps.is_docker_official_installed,
+                is_docker_compose_plugin_available=deps.is_docker_compose_plugin_available,
+                check_bloodhound_ce_running=deps.check_bloodhound_ce_running,
+                start_bloodhound_ce=deps.start_bloodhound_ce,
+                get_bloodhound_cli_executable_path=deps.get_bloodhound_cli_executable_path,
+                is_docker_env=deps.is_docker_env,
+                expand_effective_user_path=deps.expand_effective_user_path,
+                path_exists=deps.os_path_exists,
+                path_access=deps.os_path_access,
+                print_info=deps.print_info,
+                print_info_verbose=deps.print_info_verbose,
+                print_success=deps.print_success,
+                print_success_verbose=deps.print_success_verbose,
+                print_warning=deps.print_warning,
+                print_error=deps.print_error,
+                print_instruction=deps.print_instruction,
+                print_panel=deps.print_panel,
+                print_exception=deps.print_exception,
+                telemetry_capture_exception=deps.telemetry_capture_exception,
+            ),
+        )
+        if not docker_ok:
+            all_ok = False
 
     # 9. Check Rust tools (rusthound-ce) - delegated helper
     from adscan_internal.cli.check import (
@@ -3279,30 +3480,31 @@ def run_check(
         GoToolchainCheckDeps,
     )
 
-    go_ok = deps.check_go_toolchain(
-        config=GoToolchainCheckConfig(
-            full_container_runtime=full_container_runtime,
-            fix_mode=fix_mode,
-            session_env=session_env,
-        ),
-        deps=GoToolchainCheckDeps(
-            configure_go_official_path=deps.configure_go_official_path,
-            configure_go_path=deps.configure_go_path,
-            is_go_available=deps.is_go_available,
-            is_go_bin_in_path=deps.is_go_bin_in_path,
-            is_htb_cli_installed=deps.is_htb_cli_installed,
-            is_htb_cli_accessible=deps.is_htb_cli_accessible,
-            os_environ=deps.os_environ,
-            subprocess_run=deps.subprocess_run,
-            print_info=deps.print_info,
-            print_info_verbose=deps.print_info_verbose,
-            print_success=deps.print_success,
-            print_warning=deps.print_warning,
-            print_error=deps.print_error,
-        ),
-    )
-    if not go_ok:
-        all_ok = False
+    if not (compact_ci_preflight and full_container_runtime):
+        go_ok = deps.check_go_toolchain(
+            config=GoToolchainCheckConfig(
+                full_container_runtime=full_container_runtime,
+                fix_mode=fix_mode,
+                session_env=session_env,
+            ),
+            deps=GoToolchainCheckDeps(
+                configure_go_official_path=deps.configure_go_official_path,
+                configure_go_path=deps.configure_go_path,
+                is_go_available=deps.is_go_available,
+                is_go_bin_in_path=deps.is_go_bin_in_path,
+                is_htb_cli_installed=deps.is_htb_cli_installed,
+                is_htb_cli_accessible=deps.is_htb_cli_accessible,
+                os_environ=deps.os_environ,
+                subprocess_run=deps.subprocess_run,
+                print_info=deps.print_info,
+                print_info_verbose=deps.print_info_verbose,
+                print_success=deps.print_success,
+                print_warning=deps.print_warning,
+                print_error=deps.print_error,
+            ),
+        )
+        if not go_ok:
+            all_ok = False
 
     # 11. Check pyenv and Python version management - delegated helper
     from adscan_internal.cli.check import (
@@ -3311,42 +3513,46 @@ def run_check(
         check_pyenv_status as check_pyenv_status_fn,
     )
 
-    pyenv_ok = check_pyenv_status_fn(
-        config=PyenvCheckConfig(
-            full_container_runtime=full_container_runtime,
-            fix_mode=fix_mode,
-            python_version=config.python_version,
-            venv_path=config.venv_path,
-        ),
-        deps=PyenvCheckDeps(
-            check_and_ensure_pyenv_status=deps.check_and_ensure_pyenv_status,
-            install_pyenv_python_and_venv=deps.install_pyenv_python_and_venv,
-            expand_effective_user_path=deps.expand_effective_user_path,
-            regenerate_pyenv_shims=deps.regenerate_pyenv_shims,
-            fix_pyenv_shims_permissions=deps.fix_pyenv_shims_permissions,
-            mark_sensitive=deps.mark_sensitive,
-            print_info=deps.print_info,
-            print_info_verbose=deps.print_info_verbose,
-            print_success=deps.print_success,
-            print_warning=deps.print_warning,
-            print_error=deps.print_error,
-            print_instruction=deps.print_instruction,
-            print_panel=deps.print_panel,
-            print_exception=deps.print_exception,
-            telemetry_capture_exception=deps.telemetry_capture_exception,
-        ),
-    )
-    if not pyenv_ok:
-        all_ok = False
+    if not (compact_ci_preflight and full_container_runtime):
+        pyenv_ok = check_pyenv_status_fn(
+            config=PyenvCheckConfig(
+                full_container_runtime=full_container_runtime,
+                fix_mode=fix_mode,
+                python_version=config.python_version,
+                venv_path=config.venv_path,
+            ),
+            deps=PyenvCheckDeps(
+                check_and_ensure_pyenv_status=deps.check_and_ensure_pyenv_status,
+                install_pyenv_python_and_venv=deps.install_pyenv_python_and_venv,
+                expand_effective_user_path=deps.expand_effective_user_path,
+                regenerate_pyenv_shims=deps.regenerate_pyenv_shims,
+                fix_pyenv_shims_permissions=deps.fix_pyenv_shims_permissions,
+                mark_sensitive=deps.mark_sensitive,
+                print_info=deps.print_info,
+                print_info_verbose=deps.print_info_verbose,
+                print_success=deps.print_success,
+                print_warning=deps.print_warning,
+                print_error=deps.print_error,
+                print_instruction=deps.print_instruction,
+                print_panel=deps.print_panel,
+                print_exception=deps.print_exception,
+                telemetry_capture_exception=deps.telemetry_capture_exception,
+            ),
+        )
+        if not pyenv_ok:
+            all_ok = False
 
     if all_ok:
-        deps.print_success(
-            "All checks passed! adscan installation appears to be complete."
-        )
-        deps.print_instruction("Now you can start the tool with adscan start")
+        if compact_ci_preflight:
+            deps.print_success("CI runtime preflight passed.")
+        else:
+            deps.print_success(
+                "All checks passed! adscan installation appears to be complete."
+            )
+            deps.print_instruction("Now you can start the tool with adscan start")
 
-        # Final consolidated summary table
-        deps.print_check_summary(all_ok)
+            # Final consolidated summary table
+            deps.print_check_summary(all_ok)
         deps.set_last_check_session_extra(
             {
                 "fix_mode": fix_mode,
@@ -3506,9 +3712,7 @@ def run_check(
                     "check_recovery",
                     properties={"method": "override", "recovered": True},
                 )
-                deps.print_warning(
-                    "Proceeding despite failed checks at user request."
-                )
+                deps.print_warning("Proceeding despite failed checks at user request.")
                 return True
 
             deps.telemetry_capture("check_override_declined")

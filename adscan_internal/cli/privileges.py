@@ -25,6 +25,19 @@ from adscan_internal.cli.rdp import run_rdp_service_access_sweep_with_medusa
 from adscan_internal.services.service_access_probe_history import (
     load_service_access_probe_history,
     partition_targets_by_probe_history,
+    record_service_access_probe_batch,
+)
+from adscan_internal.services.service_access_results import (
+    render_no_confirmed_service_access,
+    render_service_access_results,
+    select_confirmed_service_access_followup_targets,
+)
+from adscan_internal.services.pivot_capability_registry import is_service_pivot_capable
+from adscan_internal.services.auth_posture_service import get_ntlm_status
+from adscan_internal.services.winrm_access_probe_service import (
+    WINRM_ACCESS_PROBE_BACKEND,
+    get_winrm_probe_worker_count,
+    run_winrm_access_probe_sweep,
 )
 from adscan_internal.workspaces import domain_subpath
 from adscan_internal.workspaces.computers import (
@@ -35,6 +48,214 @@ from adscan_internal.workspaces.computers import (
     resolve_domain_service_target_file,
 )
 from rich.prompt import Confirm
+
+
+def _handle_confirmed_service_followups(
+    shell: Any,
+    *,
+    domain: str,
+    service: str,
+    username: str,
+    password: str,
+    findings: list[Any],
+    prompt: bool,
+    workflow_intent: str | None = None,
+) -> None:
+    """Launch optional follow-up prompts for confirmed service-access findings."""
+    if not prompt:
+        for finding in findings:
+            print_info_debug(
+                "[service-access] service follow-up prompt suppressed: "
+                f"service={service} user={mark_sensitive(finding.username, 'user')} "
+                f"host={mark_sensitive(finding.host, 'hostname')}"
+            )
+        return
+
+    selected_followups, used_selector = (
+        select_confirmed_service_access_followup_targets(
+            shell,
+            service=service,
+            findings=findings,
+        )
+    )
+    followups = selected_followups if used_selector else findings
+    func = getattr(shell, f"ask_for_{service}_access", None)
+    if not callable(func):
+        return
+    for finding in followups:
+        print_info_debug(
+            "[service-access] launching service follow-up prompt: "
+            f"service={service} user={mark_sensitive(finding.username, 'user')} "
+            f"host={mark_sensitive(finding.host, 'hostname')}"
+        )
+        func(
+            domain,
+            finding.host,
+            finding.username,
+            password,
+            **(
+                {"workflow_intent": workflow_intent}
+                if service == "winrm" and workflow_intent
+                else {}
+            ),
+        )
+
+
+def _run_winrm_psrp_service_access_sweep(
+    shell: Any,
+    *,
+    workspace_dir: str,
+    domains_dir: str,
+    domain: str,
+    username: str,
+    password: str,
+    targets: list[str],
+    prompt: bool,
+    workflow_intent: str | None = None,
+) -> bool:
+    """Run a reusable PSRP-backed WinRM access sweep and persist normalized results."""
+    findings = run_winrm_access_probe_sweep(
+        domain=domain,
+        username=username,
+        password=password,
+        targets=targets,
+        workspace_dir=workspace_dir,
+        domains_dir=domains_dir,
+        domain_data=shell.domains_data.get(domain, {}),
+        auth_mode="kerberos",
+        max_workers=get_winrm_probe_worker_count(),
+    )
+    confirmed_findings = [finding for finding in findings if finding.is_confirmed]
+    if findings:
+        render_service_access_results(
+            service="winrm",
+            username=username,
+            findings=findings,
+            total_targets=len(targets),
+        )
+    else:
+        render_no_confirmed_service_access(
+            service="winrm",
+            username=username,
+            total_targets=len(targets),
+        )
+
+    try:
+        record_service_access_probe_batch(
+            workspace_dir=workspace_dir,
+            domains_dir=domains_dir,
+            domain=domain,
+            username=username,
+            service="winrm",
+            targets=targets,
+            confirmed_hosts=[finding.host for finding in confirmed_findings],
+            source="run_winrm_psrp_service_access_sweep",
+            backend=WINRM_ACCESS_PROBE_BACKEND,
+            pivot_capable=is_service_pivot_capable("winrm"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[service-access] failed to persist WinRM PSRP probe history: {exc}"
+        )
+
+    if confirmed_findings:
+        for finding in confirmed_findings:
+            try:
+                from adscan_internal.services.attack_graph_service import (
+                    upsert_netexec_privilege_edge,
+                )
+
+                upsert_netexec_privilege_edge(
+                    shell,
+                    domain,
+                    username=username,
+                    relation="CanPSRemote",
+                    target_ip=finding.host,
+                    target_hostname=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+        _handle_confirmed_service_followups(
+            shell,
+            domain=domain,
+            service="winrm",
+            username=username,
+            password=password,
+            findings=confirmed_findings,
+            prompt=prompt,
+            workflow_intent=workflow_intent,
+        )
+    return bool(confirmed_findings)
+
+
+def _resolve_winrm_psrp_backend_reason(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+) -> str | None:
+    """Return whether WinRM access checks should use PSRP instead of NetExec."""
+    override = os.getenv("ADSCAN_WINRM_ACCESS_BACKEND", "").strip().lower()
+    if override in {"psrp", "pypsrp", "kerberos", "always"}:
+        return f"override:{override}"
+    if override in {"netexec", "nxc", "legacy"}:
+        return None
+
+    if str(password or "").strip().lower().endswith(".ccache"):
+        return "credential_ccache"
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
+    kerberos_tickets = (
+        domain_data.get("kerberos_tickets", {}) if isinstance(domain_data, dict) else {}
+    )
+    if isinstance(kerberos_tickets, dict):
+        username_key = str(username or "").strip().casefold()
+        if any(
+            str(key or "").strip().casefold() == username_key
+            for key in kerberos_tickets
+        ):
+            return "stored_kerberos_ticket"
+
+    if (
+        get_ntlm_status(
+            getattr(shell, "domains_data", {}),
+            domain=domain,
+            protocol="winrm",
+        )
+        == "likely_disabled"
+    ):
+        return "ntlm_likely_disabled"
+    return None
+
+
+def _netexec_auth_uses_kerberos(auth_str: str) -> bool:
+    """Return whether one NetExec auth fragment requests Kerberos/kcache auth."""
+    try:
+        parts = shlex.split(str(auth_str or ""))
+    except ValueError:
+        parts = str(auth_str or "").split()
+    return "-k" in parts or "--kerberos" in parts or "--use-kcache" in parts
+
+
+def _should_use_winrm_psrp_backend(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+) -> bool:
+    """Return whether WinRM access checks should use PSRP instead of NetExec."""
+    return (
+        _resolve_winrm_psrp_backend_reason(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+        )
+        is not None
+    )
 
 
 def _build_service_sweep_target_argument(
@@ -127,9 +348,7 @@ def _select_effective_service_targets(
     )
     confirmer = getattr(shell, "_questionary_confirm", None)
     should_recheck = (
-        bool(confirmer(prompt, default=False))
-        if callable(confirmer)
-        else False
+        bool(confirmer(prompt, default=False)) if callable(confirmer) else False
     )
     if should_recheck:
         print_info(
@@ -424,6 +643,17 @@ def run_service_access_sweep(
                         scope_preference=current_scope_preference,
                     )
                     if not default_hosts_file:
+                        if source.endswith("_no_open_hosts_current_vantage"):
+                            print_info(
+                                f"{service.upper()} sweep skipped: no "
+                                f"{service.upper()}-open hosts were found in the "
+                                "current-vantage port inventory."
+                            )
+                            print_info_debug(
+                                "[privileges] skipping service sweep because "
+                                f"source={source} domain={mark_sensitive(domain, 'domain')} "
+                                f"service={service}"
+                            )
                         break
                     targets = default_hosts_file
                     target_count = count_target_file_entries(default_hosts_file)
@@ -464,7 +694,10 @@ def run_service_access_sweep(
                 effective_target_entries = {
                     entry.lower() for entry in effective_target_list
                 }
-                if effective_target_list == current_target_list and original_targets_arg:
+                if (
+                    effective_target_list == current_target_list
+                    and original_targets_arg
+                ):
                     targets = original_targets_arg
                 else:
                     targets = _build_service_sweep_target_argument(
@@ -486,19 +719,23 @@ def run_service_access_sweep(
                     )
                     if not next_scope_preference:
                         break
-                    next_targets_file, _next_source = resolve_domain_service_target_file(
-                        workspace_cwd,
-                        domains_dir,
-                        domain,
-                        service=service,
-                        domain_data=shell.domains_data.get(domain, {}),
-                        scope_preference=next_scope_preference,
+                    next_targets_file, _next_source = (
+                        resolve_domain_service_target_file(
+                            workspace_cwd,
+                            domains_dir,
+                            domain,
+                            service=service,
+                            domain_data=shell.domains_data.get(domain, {}),
+                            scope_preference=next_scope_preference,
+                        )
                     )
                     next_target_count = count_target_file_entries(next_targets_file)
                     if not next_targets_file or next_target_count <= 0:
                         break
                     next_target_entries = load_target_entries(next_targets_file)
-                    if next_target_entries and next_target_entries.issubset(current_target_entries):
+                    if next_target_entries and next_target_entries.issubset(
+                        current_target_entries
+                    ):
                         print_info_debug(
                             "[privileges] skipping broader sweep prompt because "
                             f"{mark_sensitive(next_scope_preference, 'detail')} does not add "
@@ -523,6 +760,16 @@ def run_service_access_sweep(
                 print_info(
                     f"Starting {service} privilege enumeration for user {marked_username}"
                 )
+                winrm_psrp_reason = (
+                    _resolve_winrm_psrp_backend_reason(
+                        shell,
+                        domain=domain,
+                        username=username,
+                        password=password,
+                    )
+                    if service == "winrm"
+                    else None
+                )
                 if service == "rdp":
                     print_info_debug(
                         "[privileges] service access sweep dispatch: "
@@ -545,6 +792,29 @@ def run_service_access_sweep(
                             ),
                         )
                     )
+                elif service == "winrm" and winrm_psrp_reason:
+                    print_info(
+                        "Using PSRP Kerberos backend for WINRM access checks "
+                        f"({mark_sensitive(winrm_psrp_reason, 'detail')})."
+                    )
+                    print_info_debug(
+                        "[privileges] service access sweep dispatch: "
+                        f"domain={marked_domain} user={marked_username} service={service} "
+                        f"backend={WINRM_ACCESS_PROBE_BACKEND} reason={winrm_psrp_reason} "
+                        f"prompt_on_success={prompt!r} "
+                        f"targets={mark_sensitive(str(targets), 'path')}"
+                    )
+                    found_hosts = _run_winrm_psrp_service_access_sweep(
+                        shell,
+                        workspace_dir=workspace_cwd,
+                        domains_dir=domains_dir,
+                        domain=domain,
+                        username=username,
+                        password=password,
+                        targets=effective_target_list,
+                        prompt=prompt,
+                        workflow_intent=workflow_intent,
+                    )
                 else:
                     auth_str = shell.build_auth_nxc(
                         username,
@@ -552,7 +822,90 @@ def run_service_access_sweep(
                         domain,
                         kerberos=False,
                     )
+                    if service == "winrm" and _netexec_auth_uses_kerberos(auth_str):
+                        print_info(
+                            "Using PSRP Kerberos backend for WINRM access checks "
+                            "(netexec_winrm_kerberos_unsupported)."
+                        )
+                        print_info_debug(
+                            "[privileges] refusing NetExec Kerberos for WinRM because "
+                            "NetExec's WinRM backend is NTLM-only; "
+                            f"domain={marked_domain} user={marked_username} "
+                            f"targets={mark_sensitive(str(targets), 'path')}"
+                        )
+                        found_hosts = _run_winrm_psrp_service_access_sweep(
+                            shell,
+                            workspace_dir=workspace_cwd,
+                            domains_dir=domains_dir,
+                            domain=domain,
+                            username=username,
+                            password=password,
+                            targets=effective_target_list,
+                            prompt=prompt,
+                            workflow_intent=workflow_intent,
+                        )
+                        if found_hosts:
+                            pass
+                        else:
+                            print_info_debug(
+                                "[privileges] PSRP WinRM Kerberos fallback returned no confirmed hosts."
+                            )
+                        # Skip NetExec execution for this WinRM Kerberos auth path.
+                        if True:
+                            if found_hosts or cleaned_hosts:
+                                break
+                            next_scope_preference = _resolve_next_broader_scope(
+                                service=service,
+                                source=source,
+                                current_scope_preference=current_scope_preference,
+                            )
+                            if not next_scope_preference:
+                                break
+                            next_targets_file, _next_source = (
+                                resolve_domain_service_target_file(
+                                    workspace_cwd,
+                                    domains_dir,
+                                    domain,
+                                    service=service,
+                                    domain_data=shell.domains_data.get(domain, {}),
+                                    scope_preference=next_scope_preference,
+                                )
+                            )
+                            next_target_count = count_target_file_entries(
+                                next_targets_file
+                            )
+                            if not next_targets_file or next_target_count <= 0:
+                                break
+                            next_target_entries = load_target_entries(next_targets_file)
+                            if next_target_entries and next_target_entries.issubset(
+                                effective_target_entries or current_target_entries
+                            ):
+                                print_info_debug(
+                                    "[privileges] skipping broader sweep prompt because "
+                                    f"{mark_sensitive(next_scope_preference, 'detail')} does not add "
+                                    f"new {service.upper()} targets beyond "
+                                    f"{mark_sensitive(source, 'detail')}"
+                                )
+                                break
+                            if not _prompt_broader_postauth_scope_retry(
+                                shell,
+                                service=service,
+                                domain=domain,
+                                current_source=source,
+                                next_scope_preference=next_scope_preference,
+                                next_target_count=next_target_count,
+                            ):
+                                break
+                            current_scope_preference = next_scope_preference
+                            continue
                     netexec_timeout_seconds = get_recommended_internal_timeout(service)
+                    log_dir = domain_subpath(
+                        workspace_cwd,
+                        domains_dir,
+                        domain,
+                        service,
+                    )
+                    os.makedirs(log_dir, exist_ok=True)
                     command = (
                         f"{shlex.quote(shell.netexec_path)} {service} {shlex.quote(targets)} {auth_str} "
                         f"-t 20 --timeout {netexec_timeout_seconds} "
@@ -565,6 +918,11 @@ def run_service_access_sweep(
                         f"targets={mark_sensitive(str(targets), 'path')}"
                     )
                     print_info_verbose(f"Command: {command}")
+                    run_service_kwargs: dict[str, Any] = {
+                        "prompt": prompt,
+                    }
+                    if workflow_intent:
+                        run_service_kwargs["workflow_intent"] = workflow_intent
                     found_hosts = bool(
                         shell.run_service_command(
                             command,
@@ -572,10 +930,34 @@ def run_service_access_sweep(
                             service,
                             username,
                             password,
+                            **run_service_kwargs,
+                        )
+                    )
+                    if (
+                        service == "winrm"
+                        and not found_hosts
+                        and _should_use_winrm_psrp_backend(
+                            shell,
+                            domain=domain,
+                            username=username,
+                            password=password,
+                        )
+                    ):
+                        print_info_debug(
+                            "[privileges] WinRM NetExec result updated NTLM posture; "
+                            f"retrying service access sweep with backend={WINRM_ACCESS_PROBE_BACKEND}"
+                        )
+                        found_hosts = _run_winrm_psrp_service_access_sweep(
+                            shell,
+                            workspace_dir=workspace_cwd,
+                            domains_dir=domains_dir,
+                            domain=domain,
+                            username=username,
+                            password=password,
+                            targets=effective_target_list,
                             prompt=prompt,
                             workflow_intent=workflow_intent,
                         )
-                    )
                 if found_hosts or cleaned_hosts:
                     break
 

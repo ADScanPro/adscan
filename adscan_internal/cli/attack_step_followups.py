@@ -77,11 +77,24 @@ from adscan_internal.services.rodc_followup_planner import (
 from adscan_internal.services.rodc_followup_state_service import (
     RodcFollowupStateService,
 )
-from adscan_internal.services.attack_graph_service import resolve_user_sid
+from adscan_internal.services.attack_graph_service import (
+    resolve_domain_node_record_for_domain,
+    resolve_user_sid,
+    rodc_followup_state_label,
+    update_edge_status_by_labels,
+)
 from adscan_internal.services.credential_store_service import CredentialStoreService
 
 
 _RODC_KRBTGT_RE = re.compile(r"^krbtgt[_-](\d+)$", re.IGNORECASE)
+
+
+def _canonical_rodc_graph_label(target_computer: str, domain: str) -> str:
+    """Return the canonical RODC computer label used in the persisted graph."""
+    machine = str(target_computer or "").strip().rstrip("$")
+    if machine:
+        machine = f"{machine}$"
+    return f"{machine}@{str(domain or '').strip().upper()}".strip("@")
 
 
 @dataclass(frozen=True, slots=True)
@@ -906,8 +919,17 @@ def _run_rodc_krbtgt_followup(
     """
     effective_domain = target_domain or domain
     host_target = str(target_computer or "").rstrip("$")
+    rodc_graph_label = _canonical_rodc_graph_label(target_computer, effective_domain)
     if "." not in host_target:
         host_target = f"{host_target}.{effective_domain}"
+    cache_ready_label = rodc_followup_state_label(
+        target_computer=rodc_graph_label,
+        stage="prepare_credential_caching",
+    )
+    krbtgt_ready_label = rodc_followup_state_label(
+        target_computer=rodc_graph_label,
+        stage="extract_krbtgt",
+    )
 
     viability = ensure_host_bound_workflow_target_viable(
         shell,
@@ -1037,6 +1059,15 @@ def _run_rodc_krbtgt_followup(
         source="attack_path_runtime_followup",
         title="Extract RODC krbtgt Secret",
     ):
+        update_edge_status_by_labels(
+            shell,
+            effective_domain,
+            from_label=cache_ready_label,
+            relation="ExtractRodcKrbtgtSecret",
+            to_label=krbtgt_ready_label,
+            status="attempted",
+            notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+        )
         outcome = service.extract(
             RodcKrbtgtExtractionRequest(
                 domain=effective_domain,
@@ -1051,6 +1082,16 @@ def _run_rodc_krbtgt_followup(
                 winrm_secret=winrm_secret or None,
             )
         )
+
+    update_edge_status_by_labels(
+        shell,
+        effective_domain,
+        from_label=cache_ready_label,
+        relation="ExtractRodcKrbtgtSecret",
+        to_label=krbtgt_ready_label,
+        status="success" if bool(outcome.success and outcome.credentials) else "failed",
+        notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+    )
 
     _persist_rodc_krbtgt_outcome(
         shell,
@@ -1590,6 +1631,15 @@ def _run_rodc_golden_ticket_followup(
     plan: RodcKrbtgtKeyPlan,
 ) -> None:
     """Execute the forged-ticket phase for one ready RODC context."""
+    rodc_graph_label = _canonical_rodc_graph_label(plan.target_computer, plan.domain)
+    krbtgt_ready_label = rodc_followup_state_label(
+        target_computer=rodc_graph_label,
+        stage="extract_krbtgt",
+    )
+    golden_ticket_label = rodc_followup_state_label(
+        target_computer=rodc_graph_label,
+        stage="forge_golden_ticket",
+    )
     target_user = _resolve_rodc_followup_target_user(shell, domain=plan.domain)
     if not target_user:
         print_info("Skipping RODC golden ticket follow-up by user choice.")
@@ -1599,11 +1649,29 @@ def _run_rodc_golden_ticket_followup(
         source="attack_path_runtime_followup",
         title="Forge RODC Golden Ticket",
     ):
-        _forge_rodc_golden_ticket(
+        update_edge_status_by_labels(
+            shell,
+            plan.domain,
+            from_label=krbtgt_ready_label,
+            relation="ForgeRodcGoldenTicket",
+            to_label=golden_ticket_label,
+            status="attempted",
+            notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+        )
+        ticket_path = _forge_rodc_golden_ticket(
             shell,
             plan=plan,
             target_user=target_user,
         )
+    update_edge_status_by_labels(
+        shell,
+        plan.domain,
+        from_label=krbtgt_ready_label,
+        relation="ForgeRodcGoldenTicket",
+        to_label=golden_ticket_label,
+        status="success" if bool(ticket_path) else "failed",
+        notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+    )
 
 
 _RODC_PRP_NEEDED_PATTERNS = (
@@ -1626,6 +1694,13 @@ def _run_rodc_key_list_followup(
     plan: RodcKrbtgtKeyPlan,
 ) -> None:
     """Run the Kerberos Key List step using reusable per-RODC AES material."""
+    rodc_graph_label = _canonical_rodc_graph_label(plan.target_computer, plan.domain)
+    golden_ticket_label = rodc_followup_state_label(
+        target_computer=rodc_graph_label,
+        stage="forge_golden_ticket",
+    )
+    domain_record = resolve_domain_node_record_for_domain(shell, plan.domain)
+    domain_label = str(domain_record.get("label") or domain_record.get("name") or plan.domain)
     material = _resolve_rodc_key_material(shell, plan=plan)
     if material is None:
         print_error(
@@ -1696,6 +1771,15 @@ def _run_rodc_key_list_followup(
         source="attack_path_runtime_followup",
         title="Run Kerberos Key List",
     ):
+        update_edge_status_by_labels(
+            shell,
+            plan.domain,
+            from_label=golden_ticket_label,
+            relation="KerberosKeyList",
+            to_label=domain_label,
+            status="attempted",
+            notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+        )
         outcome = KerberosKeyListService().run(
             request,
             run_command=getattr(shell, "run_command", None),
@@ -1710,6 +1794,15 @@ def _run_rodc_key_list_followup(
             output=outcome.raw_output,
         )
     if not outcome.success:
+        update_edge_status_by_labels(
+            shell,
+            plan.domain,
+            from_label=golden_ticket_label,
+            relation="KerberosKeyList",
+            to_label=domain_label,
+            status="failed",
+            notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
+        )
         error_detail = str(outcome.error_message or "unknown error")
         print_warning(
             "Kerberos Key List did not recover credentials: "
@@ -1738,6 +1831,15 @@ def _run_rodc_key_list_followup(
         domain=plan.domain,
         target_computer=plan.target_computer,
         target_user=target_user,
+    )
+    update_edge_status_by_labels(
+        shell,
+        plan.domain,
+        from_label=golden_ticket_label,
+        relation="KerberosKeyList",
+        to_label=domain_label,
+        status="success",
+        notes={"source": "rodc_followup_chain_runtime", "rodc_target": rodc_graph_label},
     )
     print_success(f"Kerberos Key List recovered NTLM material for {recovered}.")
 

@@ -28,10 +28,12 @@ from adscan_internal.services.domain_controller_classifier import (
 )
 from adscan_internal.services.adcs_target_filter import is_adcs_tier_zero_group
 from adscan_internal.services.privileged_group_classifier import (
+    classify_privileged_membership,
     is_dependency_only_tier_zero_group,
     is_future_followup_tier_zero_group,
     is_followup_terminal_group,
     is_graph_extension_group,
+    normalize_group_name,
 )
 
 from adscan_internal.services.attack_step_support_registry import (
@@ -1545,6 +1547,51 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
             return str(node.get("label") or node_id)
         return node_id
 
+    def _resolve_membership_followup_step(
+        target_node: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(target_node, dict):
+            return None
+        target_kind = target_node.get("kind") or target_node.get("labels") or target_node.get("type")
+        if isinstance(target_kind, list):
+            target_kind = str(target_kind[0] if target_kind else "")
+        if str(target_kind or "") != "Group":
+            return None
+        props = (
+            target_node.get("properties")
+            if isinstance(target_node.get("properties"), dict)
+            else {}
+        )
+        sid_upper, _ = _extract_node_sid_and_rid(target_node)
+        group_name = str(props.get("name") or target_node.get("label") or "").strip()
+        membership = classify_privileged_membership(
+            group_sids=[sid_upper],
+            group_names=[group_name],
+        )
+        normalized_group_name = normalize_group_name(group_name)
+        if membership.dns_admins:
+            return {
+                "relation": "DnsAdminAbuse",
+                "status": "blocked",
+                "to": "Domain Control",
+                "reason": "Production-impacting DNS modification is blocked by design",
+            }
+        if membership.backup_operators:
+            return {
+                "relation": "BackupOperatorEscalation",
+                "status": "theoretical",
+                "to": "Domain Control",
+                "reason": "Backup Operators can enable a follow-up path to domain compromise",
+            }
+        if normalized_group_name == "print operators":
+            return {
+                "relation": "PrintOperatorAbuse",
+                "status": "unsupported",
+                "to": "Domain Control",
+                "reason": "Print Operators exposure is modeled, but ADscan has no automated follow-up yet",
+            }
+        return None
+
     nodes = [label(path.source_id)]
     relations: list[str] = []
     for step in path.steps:
@@ -1558,11 +1605,24 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         if isinstance(getattr(s, "relation", None), str)
         and str(s.relation).strip().lower() not in context_relations
     ]
+    target_node = nodes_map.get(path.target_id) if isinstance(nodes_map, dict) else None
+    synthetic_followup = None
+    if (
+        not executable_steps
+        and path.steps
+        and str(path.steps[-1].relation or "").strip().lower() == "memberof"
+    ):
+        synthetic_followup = _resolve_membership_followup_step(target_node)
+        if synthetic_followup is not None:
+            relations.append(str(synthetic_followup["relation"]))
+            nodes.append(str(synthetic_followup["to"]))
     statuses = [
         s.status.lower()
         for s in executable_steps
         if isinstance(s.status, str) and s.status
     ]
+    if synthetic_followup is not None:
+        statuses.append(str(synthetic_followup.get("status") or "").strip().lower())
     if statuses and all(s == "success" for s in statuses):
         derived_status = "exploited"
     elif any(s in {"attempted", "failed", "error"} for s in statuses):
@@ -1592,6 +1652,30 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                 },
             }
         )
+    if synthetic_followup is not None:
+        synthetic_status = str(synthetic_followup.get("status") or "theoretical")
+        steps_for_ui.append(
+            {
+                "step": len(steps_for_ui) + 1,
+                "action": str(synthetic_followup["relation"]),
+                "status": synthetic_status,
+                "details": {
+                    "from": label(path.target_id),
+                    "to": str(synthetic_followup["to"]),
+                    "reason": str(synthetic_followup.get("reason") or ""),
+                    "synthetic_followup": True,
+                    "followup_source_group": label(path.target_id),
+                    **(
+                        {
+                            "blocked_kind": "dangerous",
+                            "reason": str(synthetic_followup.get("reason") or ""),
+                        }
+                        if synthetic_status.strip().lower() == "blocked"
+                        else {}
+                    ),
+                },
+            }
+        )
 
     return {
         "nodes": nodes,
@@ -1604,6 +1688,7 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         ),
         "source": nodes[0] if nodes else "",
         "target": nodes[-1] if nodes else "",
+        "terminal_target_label": label(path.target_id),
         "status": derived_status,
         "steps": steps_for_ui,
     }

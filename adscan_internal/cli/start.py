@@ -496,12 +496,30 @@ def _workspace_has_domain_data(shell: Any) -> bool:
     return bool(domains_data)
 
 
-_WORKSPACE_CLEAN_CONFIRMATION = "I want to clean the workspace"
+def _get_workspace_cleanup_confirmation_name(shell: Any) -> str:
+    """Return the workspace name required to confirm cleanup.
+
+    Args:
+        shell: ADscan shell carrying the active workspace context.
+    """
+    workspace_name = str(getattr(shell, "current_workspace", "") or "").strip()
+    if workspace_name:
+        return workspace_name
+
+    workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
+    if workspace_dir:
+        return os.path.basename(workspace_dir.rstrip(os.sep))
+
+    return ""
 
 
 def _prompt_workspace_cleanup(shell: Any) -> None:
     """Prompt to clean the workspace with a strong confirmation."""
     if not _workspace_has_domain_data(shell):
+        return
+    confirmation_name = _get_workspace_cleanup_confirmation_name(shell)
+    if not confirmation_name:
+        print_warning("Workspace cleanup skipped because no active workspace name is available.")
         return
 
     print_panel(
@@ -535,8 +553,8 @@ def _prompt_workspace_cleanup(shell: Any) -> None:
         return
 
     print_panel(
-        "[bold yellow]Type this phrase exactly to confirm cleanup:[/bold yellow]\n\n"
-        f"[bold]{_WORKSPACE_CLEAN_CONFIRMATION}[/bold]\n\n"
+        "[bold yellow]Type the workspace name exactly to confirm cleanup:[/bold yellow]\n\n"
+        f"[bold]{mark_sensitive(confirmation_name, 'workspace')}[/bold]\n\n"
         "[dim]Tip: this is case-sensitive. Type `exit` to cancel.[/dim]",
         title="[bold]⚠️ Confirmation Required[/bold]",
         border_style="yellow",
@@ -545,7 +563,7 @@ def _prompt_workspace_cleanup(shell: Any) -> None:
 
     for _ in range(5):
         confirmation_prompt = Text("Type exactly: ", style="cyan")
-        confirmation_prompt.append(_WORKSPACE_CLEAN_CONFIRMATION, style="bold yellow")
+        confirmation_prompt.append(confirmation_name, style="bold yellow")
         confirmation_prompt.append(" (or 'exit' to cancel)")
         confirmation = Prompt.ask(
             confirmation_prompt,
@@ -556,9 +574,9 @@ def _prompt_workspace_cleanup(shell: Any) -> None:
         if confirmation_clean == "exit":
             print_warning("Workspace cleanup cancelled by operator.")
             return
-        if confirmation_clean == _WORKSPACE_CLEAN_CONFIRMATION:
+        if confirmation_clean == confirmation_name:
             break
-        print_warning("Confirmation phrase did not match.")
+        print_warning("Workspace name did not match.")
     else:
         print_warning("Workspace cleanup cancelled; confirmation failed.")
         return

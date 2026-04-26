@@ -22,6 +22,7 @@ from adscan_internal.rich_output import (
     print_exception,
     print_attack_paths_summary_debug,
 )
+from adscan_core.rich_output import strip_sensitive_markers
 from adscan_internal.workspaces import domain_subpath, read_json_file, write_json_file
 from adscan_internal.workspaces.computers import load_enabled_computer_samaccounts
 
@@ -66,6 +67,12 @@ from adscan_internal.services.membership_snapshot import (
 from adscan_internal.services.high_value import (
     classify_users_tier0_high_value,
     normalize_samaccountname,
+)
+from adscan_internal.services.identity_risk_service import (
+    load_or_build_identity_risk_snapshot,
+)
+from adscan_internal.services.choke_point_classifier import (
+    classify_attack_graph_edge_choke_point,
 )
 from adscan_internal.services.cache_metrics import (
     copy_stats,
@@ -1559,6 +1566,35 @@ def get_users_in_group_rid_from_snapshot(
     return sorted(set(members), key=str.lower)
 
 
+def _get_users_in_group_label_from_snapshot(
+    shell: object,
+    domain: str,
+    group_label: str,
+) -> list[str] | None:
+    """Return usernames that recursively belong to one canonical group label."""
+    snapshot = _load_membership_snapshot(shell, domain)
+    if not snapshot:
+        return None
+    canonical_group = _canonical_membership_label(domain, group_label)
+    if not canonical_group:
+        return []
+    user_groups = snapshot.get("user_to_groups")
+    if not isinstance(user_groups, dict):
+        return []
+    members: list[str] = []
+    for user_label in user_groups:
+        if not isinstance(user_label, str) or not user_label:
+            continue
+        recursive_labels = _snapshot_get_recursive_group_labels(
+            shell, domain, user_label
+        )
+        if not recursive_labels:
+            continue
+        if canonical_group in recursive_labels:
+            members.append(_membership_label_to_name(user_label).lower())
+    return sorted(set(members), key=str.lower)
+
+
 def resolve_group_name_by_rid(
     shell: object,
     domain: str,
@@ -2073,7 +2109,9 @@ def _build_recursive_membership_closure(
     user_to_groups = snapshot.get("user_to_groups")
     computer_to_groups = snapshot.get("computer_to_groups")
     group_to_parents = snapshot.get("group_to_parents")
-    if not isinstance(user_to_groups, dict) and not isinstance(computer_to_groups, dict):
+    if not isinstance(user_to_groups, dict) and not isinstance(
+        computer_to_groups, dict
+    ):
         return {}
 
     recursive_groups_by_principal: dict[str, tuple[str, ...]] = {}
@@ -2201,7 +2239,9 @@ def _load_or_build_materialized_attack_path_artifacts(
         base_graph,
         domain=domain,
     )
-    recursive_groups_by_principal = _build_recursive_membership_closure(domain, snapshot)
+    recursive_groups_by_principal = _build_recursive_membership_closure(
+        domain, snapshot
+    )
     built = MaterializedAttackPathArtifacts(
         fingerprint=fingerprint,
         node_id_by_label=node_id_by_label,
@@ -2752,14 +2792,14 @@ def _apply_affected_user_metadata(
             )
             resolution_reason = "refresh_broad_group_metadata"
             print_info_debug(
-                    "[attack_paths] broad-group affected user evaluation: "
-                    f"domain={mark_sensitive(domain, 'domain')} "
-                    f"source={mark_sensitive(source_name or 'N/A', 'group')} "
-                    f"scope={mark_sensitive(scope_name, 'group')} "
-                    f"classification={broad_group_scope or 'N/A'} "
-                    f"existing_count={existing_user_count} "
-                    f"resolved_count={affected_count} "
-                    f"existing_source={meta.get('affected_users_source') or 'N/A'} "
+                "[attack_paths] broad-group affected user evaluation: "
+                f"domain={mark_sensitive(domain, 'domain')} "
+                f"source={mark_sensitive(source_name or 'N/A', 'group')} "
+                f"scope={mark_sensitive(scope_name, 'group')} "
+                f"classification={broad_group_scope or 'N/A'} "
+                f"existing_count={existing_user_count} "
+                f"resolved_count={affected_count} "
+                f"existing_source={meta.get('affected_users_source') or 'N/A'} "
                 f"resolved_source={affected_source or 'N/A'} "
                 f"replace={should_apply_resolution}"
             )
@@ -3046,7 +3086,9 @@ def _load_certipy_ca_access_principals(
     for entry in certificate_authorities.values():
         if not isinstance(entry, dict):
             continue
-        entry_ca_name = str(entry.get("CA Name") or entry.get("DNS Name") or "").strip().upper()
+        entry_ca_name = (
+            str(entry.get("CA Name") or entry.get("DNS Name") or "").strip().upper()
+        )
         if entry_ca_name != ca_name_clean:
             continue
         return _extract_certipy_ca_access_principals(entry)
@@ -3225,7 +3267,9 @@ def _is_compatible_certihound_detection_report(report: dict[str, Any]) -> bool:
     return isinstance(enrichment, dict)
 
 
-def _persist_certihound_detection_report(domain_dir: str, report: dict[str, Any]) -> None:
+def _persist_certihound_detection_report(
+    domain_dir: str, report: dict[str, Any]
+) -> None:
     """Persist CertiHound detections to the canonical workspace cache file."""
     report_path = _certihound_detection_report_path(domain_dir)
     if not report_path:
@@ -3297,14 +3341,14 @@ def _resolve_certihound_detection_report(
     dc_target = ldap_targets.dc_address
     kerberos_target_hostname = ldap_targets.kerberos_target_hostname
     if not dc_target:
-        print_info_debug(
-            "[adcs] Missing DC target for CertiHound detection; skipping."
-        )
+        print_info_debug("[adcs] Missing DC target for CertiHound detection; skipping.")
         return None
 
     service = CertiHoundDetectionService()
 
-    def _run_detection(*, dc_address: str, use_kerberos_auth: bool) -> dict[str, Any] | None:
+    def _run_detection(
+        *, dc_address: str, use_kerberos_auth: bool
+    ) -> dict[str, Any] | None:
         return service.build_detection_report(
             target_domain=domain_key,
             dc_address=str(dc_address),
@@ -3398,14 +3442,16 @@ def _resolve_writable_attribute_report(
         f"[writable-attrs] attempting domain-wide writable-attribute discovery for "
         f"{mark_sensitive(domain_key, 'domain')} via {mark_sensitive(str(dc_target), 'host')}"
     )
-    report = DomainWritableAttributeDetectionService().build_user_attribute_write_report(
-        dc_address=str(dc_target),
-        kerberos_target_hostname=kerberos_target_hostname,
-        target_domain=domain_key,
-        username=str(username),
-        password=str(password),
-        use_kerberos=kerberos_ready,
-        use_ldaps=True,
+    report = (
+        DomainWritableAttributeDetectionService().build_user_attribute_write_report(
+            dc_address=str(dc_target),
+            kerberos_target_hostname=kerberos_target_hostname,
+            target_domain=domain_key,
+            username=str(username),
+            password=str(password),
+            use_kerberos=kerberos_ready,
+            use_ldaps=True,
+        )
     )
     if not isinstance(report, dict):
         return None
@@ -3486,9 +3532,7 @@ def _resolve_rodc_prp_report(
         f"{mark_sensitive(domain_key, 'domain')} via {mark_sensitive(str(dc_target), 'host')}"
     )
     password_fallback_secret = (
-        ""
-        if CredentialStoreService._looks_like_ntlm_hash(password)
-        else str(password)
+        "" if CredentialStoreService._looks_like_ntlm_hash(password) else str(password)
     )
     report = DomainRodcPrpDetectionService().build_rodc_prp_write_report(
         dc_address=str(dc_target),
@@ -3551,7 +3595,9 @@ def get_netlogon_write_support_paths(
     domain_key = str(domain or "").strip()
     if not domain_key:
         return []
-    graph_data = graph if isinstance(graph, dict) else load_attack_graph(shell, domain_key)
+    graph_data = (
+        graph if isinstance(graph, dict) else load_attack_graph(shell, domain_key)
+    )
 
     report = _resolve_writable_attribute_report(shell, domain_key)
     if not isinstance(report, dict):
@@ -3733,27 +3779,33 @@ def get_netlogon_write_support_paths(
             "validated_via_username": str(username),
             "staging_candidates": candidate_notes,
         }
-        primary_candidate = selected_candidate or (candidate_notes[0] if candidate_notes else None)
+        primary_candidate = selected_candidate or (
+            candidate_notes[0] if candidate_notes else None
+        )
         if isinstance(primary_candidate, dict):
             top_level_notes.update(
                 {
                     "share": primary_candidate.get("share"),
                     "path": primary_candidate.get("path"),
                     "auth_mode": primary_candidate.get("auth_mode"),
-                    "share_descriptor_readable": primary_candidate.get("share_descriptor_readable"),
-                    "path_descriptor_readable": primary_candidate.get("path_descriptor_readable"),
+                    "share_descriptor_readable": primary_candidate.get(
+                        "share_descriptor_readable"
+                    ),
+                    "path_descriptor_readable": primary_candidate.get(
+                        "path_descriptor_readable"
+                    ),
                     "share_backing_path": primary_candidate.get("share_backing_path"),
                     "share_allows_write": primary_candidate.get("share_allows_write"),
                     "path_allows_write": primary_candidate.get("path_allows_write"),
-                    "matched_share_sids": primary_candidate.get("matched_share_sids", []),
+                    "matched_share_sids": primary_candidate.get(
+                        "matched_share_sids", []
+                    ),
                     "matched_path_sids": primary_candidate.get("matched_path_sids", []),
                 }
             )
         if selected_candidate is not None:
             validation_state = "validated"
-            reason = (
-                f"{selected_candidate['name']} share and path ACLs allow write for the source principal"
-            )
+            reason = f"{selected_candidate['name']} share and path ACLs allow write for the source principal"
             top_level_notes.update(
                 {
                     "selected_staging_candidate": selected_candidate.get("name"),
@@ -3762,14 +3814,10 @@ def get_netlogon_write_support_paths(
             seen_source_labels.add(source_label.upper())
         elif all_candidates_denied and candidate_notes:
             validation_state = "denied"
-            reason = (
-                "No supported staging share/path candidate provides write access for the source principal"
-            )
+            reason = "No supported staging share/path candidate provides write access for the source principal"
         else:
             validation_state = "unknown"
-            reason = (
-                "Supported staging share/path candidates could not be fully validated for the source principal"
-            )
+            reason = "Supported staging share/path candidates could not be fully validated for the source principal"
 
         updated = _annotate_writelogonscript_prerequisite_status(
             graph_data,
@@ -3910,7 +3958,9 @@ def _build_certihound_enterpriseca_node(
         or object_id
         or "EnterpriseCA"
     ).strip()
-    canonical_name = ca_name if "@" in ca_name else f"{ca_name.upper()}@{domain.upper()}"
+    canonical_name = (
+        ca_name if "@" in ca_name else f"{ca_name.upper()}@{domain.upper()}"
+    )
     return {
         "name": canonical_name,
         "kind": ["EnterpriseCA"],
@@ -3971,10 +4021,10 @@ def get_certihound_adcs_paths(
         if not relation or not start_object_id:
             continue
 
-        if (
-            not start_object_id.upper().startswith("S-1-")
-            and relation.upper() in {"ADCSESC8", "ADCSESC11"}
-        ):
+        if not start_object_id.upper().startswith("S-1-") and relation.upper() in {
+            "ADCSESC8",
+            "ADCSESC11",
+        }:
             principal_refs: list[str] = []
             ca_principal_sids = details.get("ca_enrollment_principals")
             if isinstance(ca_principal_sids, list):
@@ -4120,8 +4170,12 @@ def _expand_certihound_ca_attack_step_paths(
                 )
                 if normalize_sid(ref_clean)
                 else _canonical_group_label(
-                    domain=_normalize_certipy_principal(domain=domain, principal=ref_clean)[0],
-                    group_name=_normalize_certipy_principal(domain=domain, principal=ref_clean)[1],
+                    domain=_normalize_certipy_principal(
+                        domain=domain, principal=ref_clean
+                    )[0],
+                    group_name=_normalize_certipy_principal(
+                        domain=domain, principal=ref_clean
+                    )[1],
                 )
             )
             principal_node = _build_synthetic_principal_node_from_sid(
@@ -4230,7 +4284,9 @@ def _is_non_emittable_builtin_sid(sid: str) -> bool:
     return sid_clean in well_known
 
 
-def _is_population_wide_lowpriv_trustee_sid(shell: object, *, domain: str, sid: str) -> bool:
+def _is_population_wide_lowpriv_trustee_sid(
+    shell: object, *, domain: str, sid: str
+) -> bool:
     """Return whether one trustee SID intentionally expands to the enabled low-priv population."""
     sid_clean = str(sid or "").strip().upper()
     if not sid_clean:
@@ -4344,11 +4400,15 @@ def _expand_low_priv_usernames_from_trustee_sid(
     if not isinstance(snapshot, dict):
         return set()
 
-    candidate_usernames = candidate_users or get_domain_users_for_domain(shell, domain_key) or set()
+    candidate_usernames = (
+        candidate_users or get_domain_users_for_domain(shell, domain_key) or set()
+    )
     expanded: set[str] = set()
     target_group_label = _canonical_membership_label(domain_key, label)
     for username in candidate_usernames:
-        recursive_labels = _snapshot_get_recursive_group_labels(shell, domain_key, username)
+        recursive_labels = _snapshot_get_recursive_group_labels(
+            shell, domain_key, username
+        )
         if recursive_labels and target_group_label in recursive_labels:
             normalized = normalize_samaccountname(username)
             if normalized:
@@ -4398,9 +4458,7 @@ def _index_existing_user_object_control_relations(
 
         target_node = node_index.get(target_id)
         target_kinds = (
-            target_node.get("kind")
-            if isinstance(target_node, dict)
-            else None
+            target_node.get("kind") if isinstance(target_node, dict) else None
         )
         if isinstance(target_kinds, list) and target_kinds:
             if not any(str(kind).strip().lower() == "user" for kind in target_kinds):
@@ -4694,7 +4752,9 @@ def get_writable_user_attribute_paths(
                 "samaccountname": target_username,
                 "domain": domain_key.upper(),
                 "distinguishedname": finding.get("target_dn"),
-                "highvalue": bool(target_flags.is_high_value) if target_flags else False,
+                "highvalue": bool(target_flags.is_high_value)
+                if target_flags
+                else False,
                 "isTierZero": bool(target_flags.is_tier0) if target_flags else False,
                 "objectid": str(finding.get("target_object_id") or "").strip() or None,
             },
@@ -4713,9 +4773,7 @@ def get_writable_user_attribute_paths(
             continue
         source_object_id = str(source_node.get("objectId") or "").strip()
         target_object_id = str(finding.get("target_object_id") or "").strip()
-        if (
-            relation.lower() == "writelogonscript"
-        ):
+        if relation.lower() == "writelogonscript":
             pair_variants = _candidate_pair_variants(
                 source_node=source_node,
                 target_node=target_node,
@@ -4748,9 +4806,7 @@ def get_writable_user_attribute_paths(
             "attribute": str(finding.get("attribute") or "").strip() or "scriptPath",
             "target_dn": str(finding.get("target_dn") or "").strip(),
             "principal_sid": str(finding.get("principal_sid") or "").strip(),
-            "applies_to_all_properties": bool(
-                finding.get("applies_to_all_properties")
-            ),
+            "applies_to_all_properties": bool(finding.get("applies_to_all_properties")),
             "is_inherited": bool(finding.get("is_inherited")),
         }
         sig = (
@@ -4828,7 +4884,12 @@ def get_rodc_prp_control_paths(
         target_machine = str(finding.get("target_machine") or "").strip()
         target_object_id = str(finding.get("target_object_id") or "").strip()
         target_dn = str(finding.get("target_dn") or "").strip()
-        if not relation or not principal_sid or not target_machine or not target_object_id:
+        if (
+            not relation
+            or not principal_sid
+            or not target_machine
+            or not target_object_id
+        ):
             discard_counters["skipped_invalid_row"] += 1
             continue
 
@@ -5097,7 +5158,9 @@ def get_certipy_adcs_paths(
         }
         if template_names:
             sorted_templates = sorted(template_names, key=str.lower)
-            notes["templates"] = [{"name": template_name} for template_name in sorted_templates]
+            notes["templates"] = [
+                {"name": template_name} for template_name in sorted_templates
+            ]
             if len(sorted_templates) == 1:
                 notes["template"] = sorted_templates[0]
         edges.append(
@@ -5138,7 +5201,9 @@ def get_certipy_adcs_paths(
         }
         if template_names:
             sorted_templates = sorted(template_names, key=str.lower)
-            notes["templates"] = [{"name": template_name} for template_name in sorted_templates]
+            notes["templates"] = [
+                {"name": template_name} for template_name in sorted_templates
+            ]
             if len(sorted_templates) == 1:
                 notes["template"] = sorted_templates[0]
         edges.append(
@@ -5910,7 +5975,9 @@ def _resolve_attack_step_group_node(
     domain_clean = str(domain or "").strip()
     domain_lookup = domain_clean.lower()
     group_clean = str(group_name or "").strip()
-    canonical_label = _canonical_group_label(domain=domain_clean, group_name=group_clean)
+    canonical_label = _canonical_group_label(
+        domain=domain_clean, group_name=group_clean
+    )
     if not domain_lookup or not group_clean or not canonical_label:
         node_record = {
             "name": canonical_label or group_clean or "UNKNOWN",
@@ -5956,13 +6023,18 @@ def _resolve_attack_step_group_node(
         )
 
     def _finalize(node: dict[str, Any]) -> dict[str, Any]:
-        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-        canonical_name = str(
-            node.get("name")
-            or props.get("name")
-            or node.get("label")
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        )
+        canonical_name = (
+            str(
+                node.get("name")
+                or props.get("name")
+                or node.get("label")
+                or canonical_label
+            ).strip()
             or canonical_label
-        ).strip() or canonical_label
+        )
         object_id = (
             node.get("objectId")
             or node.get("objectid")
@@ -6363,6 +6435,328 @@ def persist_memberof_chain_edges(
     return created
 
 
+def _resolve_privileged_group_followup_spec(
+    node: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return one canonical persisted follow-up spec for a privileged group node."""
+    if _node_kind(node) != "Group":
+        return None
+
+    sid_upper, rid = attack_graph_core._extract_node_sid_and_rid(node)  # noqa: SLF001
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    group_name = str(props.get("name") or node.get("label") or "").strip()
+    membership = classify_privileged_membership(
+        group_sids=[sid_upper] if sid_upper else [],
+        group_names=[group_name] if group_name else [],
+    )
+
+    if membership.backup_operators:
+        return {
+            "relation": "BackupOperatorEscalation",
+            "status": "theoretical",
+            "reason": "Backup Operators can enable a follow-up path to domain compromise",
+            "followup_kind": "direct",
+        }
+    if membership.dns_admins:
+        return {
+            "relation": "DnsAdminAbuse",
+            "status": "discovered",
+            "reason": "DNSAdmins abuse is modeled but blocked in production-safe execution mode",
+            "followup_kind": "blocked",
+        }
+    if rid == 550 and isinstance(sid_upper, str) and sid_upper.startswith("S-1-5-32-"):
+        return {
+            "relation": "PrintOperatorAbuse",
+            "status": "discovered",
+            "reason": "Print Operators can unlock a domain-compromise path but ADscan does not execute it automatically yet",
+            "followup_kind": "unsupported",
+        }
+    return None
+
+
+def persist_privileged_group_followup_edges(
+    shell: object,
+    domain: str,
+    graph: dict[str, Any],
+) -> int:
+    """Persist canonical privileged-group follow-up edges into the attack graph.
+
+    These edges are ADscan-owned semantics layered on top of persisted
+    ``MemberOf`` relationships so that path discovery, execution tracking and
+    reporting all use the same source of truth.
+    """
+    domain_node_id = ensure_domain_node_for_domain(shell, domain, graph)
+    if not domain_node_id:
+        return 0
+
+    snapshot = _load_membership_snapshot(shell, domain)
+    candidate_node_ids: set[str] = set()
+    if isinstance(snapshot, dict):
+        group_labels: set[str] = set()
+        snapshot_group_labels = snapshot.get("group_labels")
+        if isinstance(snapshot_group_labels, list):
+            for group_label in snapshot_group_labels:
+                canonical_group = _canonical_membership_label(
+                    domain, str(group_label or "")
+                )
+                if canonical_group:
+                    group_labels.add(canonical_group)
+        for mapping_key in ("user_to_groups", "computer_to_groups"):
+            mapping = snapshot.get(mapping_key)
+            if not isinstance(mapping, dict):
+                continue
+            for groups in mapping.values():
+                if not isinstance(groups, list):
+                    continue
+                for group in groups:
+                    group_label = _canonical_membership_label(domain, str(group or ""))
+                    if group_label:
+                        group_labels.add(group_label)
+        group_to_parents = snapshot.get("group_to_parents")
+        if isinstance(group_to_parents, dict):
+            for group, parents in group_to_parents.items():
+                group_label = _canonical_membership_label(domain, str(group or ""))
+                if group_label:
+                    group_labels.add(group_label)
+                if not isinstance(parents, list):
+                    continue
+                for parent in parents:
+                    parent_label = _canonical_membership_label(domain, str(parent or ""))
+                    if parent_label:
+                        group_labels.add(parent_label)
+
+        label_to_sid = snapshot.get("label_to_sid")
+        if isinstance(label_to_sid, dict) and group_labels:
+            for label in sorted(group_labels):
+                sid = label_to_sid.get(label)
+                group_label = _canonical_membership_label(domain, str(label or ""))
+                group_sid = str(sid or "").strip()
+                if not group_label:
+                    continue
+                group_node: dict[str, Any] = {
+                    "name": group_label,
+                    "label": group_label,
+                    "kind": ["Group"],
+                    "objectId": group_sid or None,
+                    "properties": {
+                        "name": group_label,
+                        "domain": str(domain or "").strip().upper(),
+                        **({"objectid": group_sid} if group_sid else {}),
+                    },
+                }
+                upsert_nodes(graph, [group_node])
+                candidate_node_ids.add(_node_id(group_node))
+
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    if not isinstance(nodes_map, dict):
+        return 0
+    if not candidate_node_ids:
+        candidate_node_ids = {
+            str(node_id)
+            for node_id, node in nodes_map.items()
+            if isinstance(node, dict) and _node_kind(node) == "Group"
+        }
+
+    created = 0
+    for node_id in sorted(candidate_node_ids):
+        node = nodes_map.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        followup = _resolve_privileged_group_followup_spec(node)
+        if not isinstance(followup, dict):
+            continue
+
+        group_label = str(node.get("label") or node.get("name") or "").strip()
+        member_users = _get_users_in_group_label_from_snapshot(shell, domain, group_label)
+        affected_principal_count = len(member_users) if isinstance(member_users, list) else 0
+        sample_users = (
+            [str(user) for user in member_users[:5]]
+            if isinstance(member_users, list)
+            else []
+        )
+
+        before_count = len(graph.get("edges") if isinstance(graph.get("edges"), list) else [])
+        upsert_edge(
+            graph,
+            from_id=str(node_id),
+            to_id=domain_node_id,
+            relation=str(followup["relation"]),
+            edge_type="privileged_group_followup",
+            status=str(followup.get("status") or "discovered"),
+            notes={
+                "source": "privileged_group_followup",
+                "followup_source_group": str(node.get("label") or ""),
+                "followup_kind": str(followup.get("followup_kind") or ""),
+                "reason": str(followup.get("reason") or ""),
+                "affected_principal_count": affected_principal_count,
+                "sample_users": sample_users,
+            },
+        )
+        after_count = len(graph.get("edges") if isinstance(graph.get("edges"), list) else [])
+        if after_count > before_count:
+            created += 1
+    return created
+
+
+def _persist_synthetic_followup_node(
+    graph: dict[str, Any],
+    *,
+    name: str,
+    kind: str,
+    domain: str,
+    source: str,
+    properties: dict[str, Any] | None = None,
+) -> str:
+    """Persist one synthetic follow-up state node and return its node id."""
+    node_record: dict[str, Any] = {
+        "name": str(name),
+        "kind": [str(kind)],
+        "properties": {
+            "name": str(name),
+            "domain": str(domain or "").strip().upper(),
+            **(properties or {}),
+        },
+    }
+    _mark_synthetic_node_record(
+        node_record,
+        domain=domain,
+        source=source,
+    )
+    upsert_nodes(graph, [node_record])
+    return _node_id(node_record)
+
+
+def rodc_followup_state_label(*, target_computer: str, stage: str) -> str:
+    """Return the canonical synthetic node label for one RODC follow-up stage."""
+    rodc_label = str(target_computer or "").strip()
+    stage_key = str(stage or "").strip().lower()
+    stage_titles = {
+        "prepare_credential_caching": "RODC Credential Cache Ready",
+        "extract_krbtgt": "RODC krbtgt Secret Ready",
+        "forge_golden_ticket": "RODC Golden Ticket Ready",
+    }
+    title = stage_titles.get(stage_key, "RODC Follow-up State")
+    return f"{title} ({rodc_label})"
+
+
+def persist_rodc_followup_chain_edges(
+    shell: object,
+    domain: str,
+    graph: dict[str, Any],
+) -> int:
+    """Persist the canonical multi-step RODC follow-up chain into the attack graph."""
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    if not isinstance(nodes_map, dict):
+        return 0
+
+    domain_node_id = ensure_domain_node_for_domain(shell, domain, graph)
+    if not domain_node_id:
+        return 0
+
+    created = 0
+    for node_id, node in list(nodes_map.items()):
+        if not isinstance(node, dict) or not node_is_rodc_computer(node):
+            continue
+
+        rodc_label = str(node.get("label") or node.get("name") or node_id).strip()
+        cache_ready_label = rodc_followup_state_label(
+            target_computer=rodc_label,
+            stage="prepare_credential_caching",
+        )
+        cache_ready_id = _persist_synthetic_followup_node(
+            graph,
+            name=cache_ready_label,
+            kind="FollowupState",
+            domain=domain,
+            source="rodc_followup_chain",
+            properties={
+                "rodc_target": rodc_label,
+                "stage": "prepare_credential_caching",
+            },
+        )
+        krbtgt_ready_label = rodc_followup_state_label(
+            target_computer=rodc_label,
+            stage="extract_krbtgt",
+        )
+        krbtgt_ready_id = _persist_synthetic_followup_node(
+            graph,
+            name=krbtgt_ready_label,
+            kind="FollowupState",
+            domain=domain,
+            source="rodc_followup_chain",
+            properties={
+                "rodc_target": rodc_label,
+                "stage": "extract_krbtgt",
+            },
+        )
+        golden_ticket_label = rodc_followup_state_label(
+            target_computer=rodc_label,
+            stage="forge_golden_ticket",
+        )
+        golden_ticket_id = _persist_synthetic_followup_node(
+            graph,
+            name=golden_ticket_label,
+            kind="FollowupState",
+            domain=domain,
+            source="rodc_followup_chain",
+            properties={
+                "rodc_target": rodc_label,
+                "stage": "forge_golden_ticket",
+            },
+        )
+
+        chain = (
+            (
+                str(node_id),
+                cache_ready_id,
+                "PrepareRodcCredentialCaching",
+                "Prepare RODC credential caching via password-replication-policy changes on the RODC object",
+            ),
+            (
+                cache_ready_id,
+                krbtgt_ready_id,
+                "ExtractRodcKrbtgtSecret",
+                "Extract per-RODC krbtgt material from the compromised RODC",
+            ),
+            (
+                krbtgt_ready_id,
+                golden_ticket_id,
+                "ForgeRodcGoldenTicket",
+                "Forge a reusable RODC golden ticket from recovered per-RODC krbtgt material",
+            ),
+            (
+                golden_ticket_id,
+                domain_node_id,
+                "KerberosKeyList",
+                "Use the forged RODC golden ticket to retrieve Key List data from a writable domain controller",
+            ),
+        )
+
+        for from_id, to_id, relation, reason in chain:
+            before_count = len(
+                graph.get("edges") if isinstance(graph.get("edges"), list) else []
+            )
+            upsert_edge(
+                graph,
+                from_id=from_id,
+                to_id=to_id,
+                relation=relation,
+                edge_type="rodc_followup",
+                status="theoretical",
+                notes={
+                    "source": "rodc_followup_chain",
+                    "rodc_target": rodc_label,
+                    "reason": reason,
+                },
+            )
+            after_count = len(
+                graph.get("edges") if isinstance(graph.get("edges"), list) else []
+            )
+            if after_count > before_count:
+                created += 1
+    return created
+
+
 def _inject_runtime_recursive_memberof_edges(
     shell: object,
     *,
@@ -6561,10 +6955,12 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
                 reuse_notes_compacted = _compact_local_reuse_edge_notes(data)
                 maintenance["normalization"] = maintenance_target
 
-            target_priority_overrides_updated = _apply_recursive_target_priority_overrides(
-                data,
-                snapshot,
-                domain=domain,
+            target_priority_overrides_updated = (
+                _apply_recursive_target_priority_overrides(
+                    data,
+                    snapshot,
+                    domain=domain,
+                )
             )
 
             if (
@@ -6812,7 +7208,9 @@ def _classify_edge_execution_support(
     """
     base_support = classify_relation_support(relation)
     nodes = graph.get("nodes")
-    target_node = nodes.get(str(to_id or "").strip()) if isinstance(nodes, dict) else None
+    target_node = (
+        nodes.get(str(to_id or "").strip()) if isinstance(nodes, dict) else None
+    )
     target_kind = (
         str(target_node.get("kind") or "").strip().lower()
         if isinstance(target_node, dict)
@@ -7014,9 +7412,7 @@ def refresh_attack_graph_execution_support(
     }
 
 
-def reset_attack_graph_execution_statuses(
-    shell: object, domain: str
-) -> dict[str, int]:
+def reset_attack_graph_execution_statuses(shell: object, domain: str) -> dict[str, int]:
     """Reset persisted edge execution states to their support-derived defaults.
 
     This helper is intended for local testing workflows where operators want to
@@ -7158,7 +7554,9 @@ def upsert_nodes(
         existing = node_map.get(nid)
         merged = existing if isinstance(existing, dict) else {}
         existing_properties = (
-            merged.get("properties") if isinstance(merged.get("properties"), dict) else {}
+            merged.get("properties")
+            if isinstance(merged.get("properties"), dict)
+            else {}
         )
         incoming_properties = (
             node.get("properties") if isinstance(node.get("properties"), dict) else {}
@@ -7192,13 +7590,26 @@ def upsert_nodes(
 
         system_tags = sorted(
             {
-                *[tag.lower() for tag in _normalize_system_tags(merged.get("system_tags"))],
                 *[
                     tag.lower()
-                    for tag in _normalize_system_tags(existing_properties.get("system_tags"))
+                    for tag in _normalize_system_tags(merged.get("system_tags"))
                 ],
-                *[tag.lower() for tag in _normalize_system_tags(node.get("system_tags"))],
-                *[tag.lower() for tag in _normalize_system_tags(node_properties.get("system_tags"))],
+                *[
+                    tag.lower()
+                    for tag in _normalize_system_tags(
+                        existing_properties.get("system_tags")
+                    )
+                ],
+                *[
+                    tag.lower()
+                    for tag in _normalize_system_tags(node.get("system_tags"))
+                ],
+                *[
+                    tag.lower()
+                    for tag in _normalize_system_tags(
+                        node_properties.get("system_tags")
+                    )
+                ],
             }
         )
         is_tier_zero = bool(
@@ -7300,6 +7711,18 @@ def upsert_edge(
                 "exec_support": support.kind,
                 "exec_support_version": version,
             }
+    choke_point_notes = classify_attack_graph_edge_choke_point(
+        graph,
+        from_id=from_id,
+        relation=relation_norm,
+        to_id=to_id,
+        notes=notes,
+    )
+    if isinstance(choke_point_notes, dict):
+        desired_notes = _merge_attack_step_notes(
+            existing=desired_notes,
+            incoming=choke_point_notes,
+        )
 
     edges: list[dict[str, Any]] = graph.setdefault("edges", [])
     if not isinstance(edges, list):
@@ -7963,7 +8386,7 @@ def compute_maximal_attack_paths(
 
 
 def _normalize_account(value: str) -> str:
-    name = (value or "").strip()
+    name = strip_sensitive_markers(str(value or "")).strip()
     if "\\" in name:
         name = name.split("\\", 1)[1]
     if "@" in name:
@@ -8304,6 +8727,51 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
             return str(node.get("label") or node_id)
         return node_id
 
+    def _resolve_membership_followup_step(
+        target_node: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(target_node, dict):
+            return None
+        target_kind = target_node.get("kind") or target_node.get("labels") or target_node.get("type")
+        if isinstance(target_kind, list):
+            target_kind = str(target_kind[0] if target_kind else "")
+        if str(target_kind or "") != "Group":
+            return None
+        props = (
+            target_node.get("properties")
+            if isinstance(target_node.get("properties"), dict)
+            else {}
+        )
+        sid_upper, _ = attack_graph_core._extract_node_sid_and_rid(target_node)  # noqa: SLF001
+        group_name = str(props.get("name") or target_node.get("label") or "").strip()
+        membership = classify_privileged_membership(
+            group_sids=[sid_upper],
+            group_names=[group_name],
+        )
+        normalized_group_name = normalize_group_name(group_name)
+        if membership.dns_admins:
+            return {
+                "relation": "DnsAdminAbuse",
+                "status": "blocked",
+                "to": "Domain Control",
+                "reason": "Production-impacting DNS modification is blocked by design",
+            }
+        if membership.backup_operators:
+            return {
+                "relation": "BackupOperatorEscalation",
+                "status": "theoretical",
+                "to": "Domain Control",
+                "reason": "Backup Operators can enable a follow-up path to domain compromise",
+            }
+        if normalized_group_name == "print operators":
+            return {
+                "relation": "PrintOperatorAbuse",
+                "status": "unsupported",
+                "to": "Domain Control",
+                "reason": "Print Operators exposure is modeled, but ADscan has no automated follow-up yet",
+            }
+        return None
+
     nodes = [label(path.source_id)]
     relations: list[str] = []
     for step in path.steps:
@@ -8317,11 +8785,24 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         if isinstance(getattr(s, "relation", None), str)
         and str(s.relation).strip().lower() not in context_relations
     ]
+    target_node = nodes_map.get(path.target_id) if isinstance(nodes_map, dict) else None
+    synthetic_followup = None
+    if (
+        not executable_steps
+        and path.steps
+        and str(path.steps[-1].relation or "").strip().lower() == "memberof"
+    ):
+        synthetic_followup = _resolve_membership_followup_step(target_node)
+        if synthetic_followup is not None:
+            relations.append(str(synthetic_followup["relation"]))
+            nodes.append(str(synthetic_followup["to"]))
     statuses = [
         s.status.lower()
         for s in executable_steps
         if isinstance(s.status, str) and s.status
     ]
+    if synthetic_followup is not None:
+        statuses.append(str(synthetic_followup.get("status") or "").strip().lower())
     if statuses and all(s == "success" for s in statuses):
         derived_status = "exploited"
     elif any(s in {"attempted", "failed", "error"} for s in statuses):
@@ -8360,7 +8841,9 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                 fallback_target=str(step_details.get("to") or ""),
             )
             if display_to and display_to != str(step_details.get("to") or ""):
-                step_details.setdefault("impact_target", str(step_details.get("to") or ""))
+                step_details.setdefault(
+                    "impact_target", str(step_details.get("to") or "")
+                )
                 step_details["display_to"] = display_to
         steps_for_ui.append(
             {
@@ -8382,6 +8865,30 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
                 },
             }
         )
+    if synthetic_followup is not None:
+        synthetic_status = str(synthetic_followup.get("status") or "theoretical")
+        steps_for_ui.append(
+            {
+                "step": len(steps_for_ui) + 1,
+                "action": str(synthetic_followup["relation"]),
+                "status": synthetic_status,
+                "details": {
+                    "from": label(path.target_id),
+                    "to": str(synthetic_followup["to"]),
+                    "reason": str(synthetic_followup.get("reason") or ""),
+                    "synthetic_followup": True,
+                    "followup_source_group": label(path.target_id),
+                    **(
+                        {
+                            "blocked_kind": "dangerous",
+                            "reason": str(synthetic_followup.get("reason") or ""),
+                        }
+                        if synthetic_status.strip().lower() == "blocked"
+                        else {}
+                    ),
+                },
+            }
+        )
 
     return {
         "nodes": nodes,
@@ -8395,6 +8902,7 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         ),
         "source": nodes[0] if nodes else "",
         "target": nodes[-1] if nodes else "",
+        "terminal_target_label": label(path.target_id),
         "status": derived_status,
         "steps": steps_for_ui,
     }
@@ -8632,15 +9140,25 @@ def _resolve_bloodhound_principal_node(
             )
             if isinstance(node_props, dict):
                 kind_map = {"user": "User", "group": "Group", "computer": "Computer"}
-                node_kind = kind_map.get(kind_hint, "Group" if " " in label_clean else "User")
-                canonical_name = str(node_props.get("name") or label_clean).strip() or label_clean
+                node_kind = kind_map.get(
+                    kind_hint, "Group" if " " in label_clean else "User"
+                )
+                canonical_name = (
+                    str(node_props.get("name") or label_clean).strip() or label_clean
+                )
                 return {
                     "name": canonical_name,
                     "kind": [node_kind],
-                    "objectId": node_props.get("objectid") or node_props.get("objectId") or object_id or None,
+                    "objectId": node_props.get("objectid")
+                    or node_props.get("objectId")
+                    or object_id
+                    or None,
                     "properties": node_props,
                 }
-            if object_id and (_looks_like_sid(lookup_name_clean) or lookup_name_clean.upper() == str(object_id).strip().upper()):
+            if object_id and (
+                _looks_like_sid(lookup_name_clean)
+                or lookup_name_clean.upper() == str(object_id).strip().upper()
+            ):
                 return None
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -10100,7 +10618,9 @@ def upsert_cve_takeover_edge(
     dc_labels = [lbl for lbl in (vulnerable_dc_labels or []) if lbl]
     if dc_labels:
         for dc_label in dc_labels:
-            dc_id = ensure_computer_node_for_domain(shell, domain, graph, principal=dc_label)
+            dc_id = ensure_computer_node_for_domain(
+                shell, domain, graph, principal=dc_label
+            )
             upsert_edge(
                 graph,
                 from_id=entry_id,
@@ -11484,7 +12004,8 @@ def _annotate_record_target_priority(
     shell: object | None = None,
     domain: str | None = None,
     recursive_groups_by_principal: dict[str, tuple[str, ...]] | None = None,
-    ou_contained_tierzero_groups_cache: dict[str, tuple[dict[str, Any], ...]] | None = None,
+    ou_contained_tierzero_groups_cache: dict[str, tuple[dict[str, Any], ...]]
+    | None = None,
     adcs_available: bool | None = None,
 ) -> None:
     """Annotate one display record with ADscan-owned target priority fields."""
@@ -11860,7 +12381,9 @@ def _collect_effective_principal_basis_records(
 
     records: list[dict[str, Any]] = []
     for recursive_group in recursive_groups:
-        synthetic_group = _build_synthetic_tierzero_group_node(str(recursive_group or ""))
+        synthetic_group = _build_synthetic_tierzero_group_node(
+            str(recursive_group or "")
+        )
         if synthetic_group is None:
             continue
         record = _build_effective_target_basis_record_from_node(
@@ -11945,7 +12468,10 @@ def _load_ou_contained_tierzero_objects(
             if not node_kind:
                 node_kind = str(node_data.get("kind") or "").strip()
             name = str(
-                props.get("name") or node_data.get("name") or node_data.get("label") or ""
+                props.get("name")
+                or node_data.get("name")
+                or node_data.get("label")
+                or ""
             ).strip()
             objectid = str(
                 props.get("objectid")
@@ -12092,7 +12618,9 @@ def _annotate_effective_target_basis(
             recursive_groups_by_principal=recursive_groups_by_principal,
         )
 
-    primary_record, extra_records = _select_effective_target_basis_records(basis_records)
+    primary_record, extra_records = _select_effective_target_basis_records(
+        basis_records
+    )
     record["effective_target_basis_kind"] = (
         str(primary_record.get("basis_kind") or "").strip().lower()
         if isinstance(primary_record, dict)
@@ -12253,7 +12781,9 @@ def _resolve_target_followup_status(
                         recursive_groups_by_principal=recursive_groups_by_principal,
                     )
                     if membership is None:
-                        sid_upper, _ = attack_graph_core._extract_node_sid_and_rid(group_node)  # noqa: SLF001
+                        sid_upper, _ = attack_graph_core._extract_node_sid_and_rid(
+                            group_node
+                        )  # noqa: SLF001
                         props = (
                             group_node.get("properties")
                             if isinstance(group_node.get("properties"), dict)
@@ -12280,9 +12810,13 @@ def _resolve_target_followup_status(
         return "actionable"
     if terminal == "followup_terminal":
         sid_upper, _ = attack_graph_core._extract_node_sid_and_rid(node)  # noqa: SLF001
-        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        )
         group_name = str(props.get("name") or node.get("label") or "")
-        membership = classify_privileged_membership(group_sids=[sid_upper], group_names=[group_name])
+        membership = classify_privileged_membership(
+            group_sids=[sid_upper], group_names=[group_name]
+        )
         if membership.dns_admins:
             return "unsupported"
         return "theoretical"
@@ -12357,7 +12891,9 @@ def _apply_local_postprocessing_pipeline(
         f"minimize: [{_minimize_rules}] | scope-filter: [{_scope_filter}] | "
         f"dedup: [exact key safety-net, all scopes]"
     )
-    _maybe_print_attack_paths_summary_debug(domain, records, stage_label="1/6 · raw local-dfs")
+    _maybe_print_attack_paths_summary_debug(
+        domain, records, stage_label="1/6 · raw local-dfs"
+    )
 
     # Stage 2: Non-terminal MemberOf filter — mirrors BH CE _build_non_terminal_memberof_filter.
     #   Runs BEFORE minimize so redundant_memberof cannot strip a trailing MemberOf and hide
@@ -12559,8 +13095,8 @@ def _apply_local_postprocessing_pipeline(
         records = result
         _maybe_print_attack_paths_summary_debug(
             domain,
-                records,
-                stage_label=(
+            records,
+            stage_label=(
                 f"6/6 · after contained filter [hv-aware, {scope}] ({n_contained} removed)"
             ),
         )
@@ -12578,8 +13114,8 @@ def _apply_local_postprocessing_pipeline(
         records = result
         _maybe_print_attack_paths_summary_debug(
             domain,
-                records,
-                stage_label=(
+            records,
+            stage_label=(
                 f"6/6 · after contained filter [keep_longest, domain] ({n_contained} removed)"
             ),
         )
@@ -12590,7 +13126,10 @@ def _apply_local_postprocessing_pipeline(
     _tier0_count = 0
     _hv_count = 0
     for rec in records:
-        tgt_node = _label_to_node.get(str(rec.get("target") or "")) or {}
+        target_lookup_label = str(
+            rec.get("terminal_target_label") or rec.get("target") or ""
+        )
+        tgt_node = _label_to_node.get(target_lookup_label) or {}
         _annotate_record_target_priority(
             rec,
             target_node=tgt_node,
@@ -12983,6 +13522,12 @@ def _resolve_domain_enabled_low_priv_user_start_ids(
         if _normalize_account(username)
     }
     normalized_domain = str(domain or "").strip().upper()
+    identity_snapshot = load_or_build_identity_risk_snapshot(shell, domain)
+    risk_users = (
+        identity_snapshot.get("users") if isinstance(identity_snapshot, dict) else {}
+    )
+    if not isinstance(risk_users, dict):
+        risk_users = {}
 
     start_node_ids: set[str] = set()
     for node_id, node in nodes_map.items():
@@ -12991,8 +13536,6 @@ def _resolve_domain_enabled_low_priv_user_start_ids(
         node = _enrich_node_enabled_metadata(shell, graph, node)
         nodes_map[str(node_id)] = node
         if not _node_is_enabled_user(node):
-            continue
-        if _node_is_effectively_high_value(node):
             continue
 
         props = (
@@ -13011,6 +13554,14 @@ def _resolve_domain_enabled_low_priv_user_start_ids(
             normalized_enabled_users
             and normalized_username not in normalized_enabled_users
         ):
+            continue
+        risk_record = risk_users.get(normalized_username)
+        if isinstance(risk_record, dict) and (
+            bool(risk_record.get("has_direct_domain_control"))
+            or bool(risk_record.get("is_control_exposed"))
+        ):
+            continue
+        if risk_record is None and _node_is_effectively_high_value(node):
             continue
         start_node_ids.add(str(node_id))
 
@@ -13151,12 +13702,10 @@ def get_owned_domain_usernames_for_attack_paths(
 
     filtered: list[str] = []
     skipped_tier0: list[str] = []
+    risk_flags = classify_users_tier0_high_value(shell, domain=domain, usernames=owned)
     for username in owned:
-        label = f"{username}@{domain}"
-        node = get_node_by_label(shell, domain, label=label)
-        if node is None:
-            node = get_node_by_label(shell, domain, label=username)
-        if node is not None and _node_is_tier0(node):
+        flags = risk_flags.get(normalize_samaccountname(username))
+        if bool(getattr(flags, "is_tier0", False)):
             skipped_tier0.append(username)
             continue
         filtered.append(username)
@@ -13685,9 +14234,7 @@ def _compute_bh_attack_paths(
 
         snapshot = _load_membership_snapshot(shell, domain)
         _recursive_groups_by_principal = (
-            _build_recursive_membership_closure(domain, snapshot)
-            if snapshot
-            else None
+            _build_recursive_membership_closure(domain, snapshot) if snapshot else None
         )
 
         # minimize_display_paths applies scope-aware rules to clean up display paths:
@@ -13815,7 +14362,10 @@ def _compute_bh_attack_paths(
         _tier0_count = 0
         _hv_count = 0
         for rec in result:
-            tgt_node = _label_to_node.get(str(rec.get("target") or "")) or {}
+            target_lookup_label = str(
+                rec.get("terminal_target_label") or rec.get("target") or ""
+            )
+            tgt_node = _label_to_node.get(target_lookup_label) or {}
             _annotate_record_target_priority(
                 rec,
                 target_node=tgt_node,
@@ -13885,9 +14435,7 @@ def get_attack_path_summaries(
     else:
         _engine = str(engine_override or "local").strip().lower() or "local"
         _dev_workers = (
-            int(dev_workers_override)
-            if isinstance(dev_workers_override, int)
-            else -1
+            int(dev_workers_override) if isinstance(dev_workers_override, int) else -1
         )
 
     # Temporarily override the worker count for this computation when a dev
@@ -14033,17 +14581,17 @@ def _compute_attack_path_summaries_inner(
     if engine == "rustworkx":
         return _apply_attack_path_summary_filters(
             _compute_rustworkx_display_paths(
-            shell,
-            domain,
-            scope=scope_norm,
-            username=username,
-            principals=list(principals or []),
-            max_depth=max_depth,
-            max_paths=max_paths,
-            target=target,
-            target_mode=target_mode,
-            membership_sample_max=membership_sample_max,
-        ),
+                shell,
+                domain,
+                scope=scope_norm,
+                username=username,
+                principals=list(principals or []),
+                max_depth=max_depth,
+                max_paths=max_paths,
+                target=target,
+                target_mode=target_mode,
+                membership_sample_max=membership_sample_max,
+            ),
             filters=summary_filters,
         )
 

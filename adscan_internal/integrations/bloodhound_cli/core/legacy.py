@@ -140,9 +140,7 @@ class BloodHoundLegacyClient(BloodHoundClient):
         results = self.execute_query(query, domain=domain)
         return [record["samaccountname"] for record in results]
 
-    def get_stale_enabled_users(
-        self, domain: str, stale_days: int = 180
-    ) -> List[Dict]:
+    def get_stale_enabled_users(self, domain: str, stale_days: int = 180) -> List[Dict]:
         """Legacy client best-effort stale-user query."""
         current_epoch = int(time.time())
         stale_seconds = max(1, int(stale_days or 180)) * 24 * 60 * 60
@@ -287,11 +285,13 @@ class BloodHoundLegacyClient(BloodHoundClient):
         domain: str,
         user: Optional[str] = None,
         users: Optional[List[str]] = None,
+        enabled_only: bool = True,
     ) -> List[Dict]:
+        enabled_clause = "u.enabled = true AND " if enabled_only else ""
         if user:
-            query = """
+            query = f"""
             MATCH (u:User)
-            WHERE u.enabled = true AND toLower(u.domain) = toLower($domain)
+            WHERE {enabled_clause}toLower(u.domain) = toLower($domain)
               AND u.samaccountname = $user
             RETURN u.samaccountname AS samaccountname, u.pwdlastset AS pwdlastset, u.whencreated AS whencreated
             """
@@ -306,17 +306,17 @@ class BloodHoundLegacyClient(BloodHoundClient):
             )
             if not normalized_users:
                 return []
-            query = """
+            query = f"""
             MATCH (u:User)
-            WHERE u.enabled = true AND toLower(u.domain) = toLower($domain)
+            WHERE {enabled_clause}toLower(u.domain) = toLower($domain)
               AND toLower(u.samaccountname) IN $users
             RETURN u.samaccountname AS samaccountname, u.pwdlastset AS pwdlastset, u.whencreated AS whencreated
             """
             params = {"domain": domain, "users": normalized_users}
         else:
-            query = """
+            query = f"""
             MATCH (u:User)
-            WHERE u.enabled = true AND toLower(u.domain) = toLower($domain)
+            WHERE {enabled_clause}toLower(u.domain) = toLower($domain)
             RETURN u.samaccountname AS samaccountname, u.pwdlastset AS pwdlastset, u.whencreated AS whencreated
             """
             params = {"domain": domain}

@@ -8,6 +8,7 @@ Supported commands (host-side):
 - check: sanity checks for Docker mode
 - start: run interactive container session
 - ci: run CI mode inside container
+- report: generate a report from an existing workspace inside the container
 - update/upgrade: update the launcher and pull the latest image
 - version: show launcher version
 
@@ -94,9 +95,20 @@ _LINUX_REQUIRED_COMMANDS = {
     "check",
     "start",
     "ci",
+    "report",
     "update",
     "upgrade",
     "host-helper",
+}
+_KNOWN_LAUNCHER_COMMANDS = {
+    "install",
+    "check",
+    "start",
+    "ci",
+    "report",
+    "update",
+    "upgrade",
+    "version",
 }
 
 
@@ -294,6 +306,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Arguments passed to the container after `ci`",
     )
 
+    sub.add_parser(
+        "report",
+        help="Generate a report from an existing workspace inside the container",
+    )
+
     upd = sub.add_parser(
         "update", help="Update the launcher (pip) and pull the latest ADscan image"
     )
@@ -346,9 +363,8 @@ def _consume_trailing_global_flags(
     `adscan start --debug`; for known launcher commands we normalize both forms.
     """
     cmd = str(getattr(ns, "command", "") or "")
-    known_cmds = {"install", "check", "start", "ci", "update", "upgrade", "version"}
     low_memory_supported_cmds = {"install", "check", "start", "ci"}
-    if cmd not in known_cmds:
+    if cmd not in _KNOWN_LAUNCHER_COMMANDS:
         return unknown
 
     remaining: list[str] = []
@@ -461,10 +477,7 @@ def _emit_launcher_privilege_context(command: str | None) -> None:
         # Best-effort heuristic for root shells entered via `sudo su` / `su -`.
         # We avoid storing usernames/paths and only capture boolean context.
         likely_sudo_su_shell = (
-            is_root
-            and not is_sudo_invocation
-            and not has_adscan_home
-            and not has_ci
+            is_root and not is_sudo_invocation and not has_adscan_home and not has_ci
         )
         context = {
             "command_type": str(command or ""),
@@ -652,9 +665,7 @@ def _guard_supported_host_platform(
             )
             return
 
-        print_error(
-            "ADscan launcher Docker mode is not currently supported on WSL."
-        )
+        print_error("ADscan launcher Docker mode is not currently supported on WSL.")
         print_instruction("Detected environment: Windows Subsystem for Linux (WSL)")
         print_instruction(
             "Use a native Linux host or Linux VM instead of Docker-from-WSL."
@@ -830,9 +841,7 @@ def _resolve_bloodhound_stack_mode_with_legacy_detection(
             detected_names = list(detection.get("container_names") or [])
             if detected_names:
                 manual_stop = "docker stop " + " ".join(detected_names)
-                print_instruction(
-                    f"Stop them manually (`{manual_stop}`) and retry."
-                )
+                print_instruction(f"Stop them manually (`{manual_stop}`) and retry.")
             else:
                 print_instruction(
                     "Stop non-managed BloodHound CE containers manually and retry."
@@ -870,7 +879,9 @@ def _resolve_bloodhound_stack_mode_with_legacy_detection(
                 },
             )
             return "managed"
-        print_error("Could not stop non-managed BloodHound CE containers automatically.")
+        print_error(
+            "Could not stop non-managed BloodHound CE containers automatically."
+        )
         detected_names = list(detection.get("container_names") or [])
         if detected_names:
             manual_stop = "docker stop " + " ".join(detected_names)
@@ -898,9 +909,7 @@ def _resolve_bloodhound_stack_mode_with_legacy_detection(
     detected_names = list(detection.get("container_names") or [])
     if detected_names:
         manual_stop = "docker stop " + " ".join(detected_names)
-        print_instruction(
-            f"Stop them manually (`{manual_stop}`) and retry."
-        )
+        print_instruction(f"Stop them manually (`{manual_stop}`) and retry.")
     else:
         print_instruction(
             "Stop non-managed BloodHound CE containers manually and retry."
@@ -1142,8 +1151,10 @@ def main(argv: list[str] | None = None) -> None:
     ns, unknown = parser.parse_known_args(raw_argv)
     unknown = _consume_trailing_global_flags(ns, unknown)
     _consume_ci_remainder_global_flags(ns)
-    known_cmds = {"install", "check", "start", "ci", "update", "upgrade", "version"}
-    if getattr(ns, "command", None) in known_cmds and unknown:
+    if (
+        getattr(ns, "command", None) in _KNOWN_LAUNCHER_COMMANDS - {"report"}
+        and unknown
+    ):
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
 
     cmd = getattr(ns, "command", None)
@@ -1195,7 +1206,9 @@ def main(argv: list[str] | None = None) -> None:
                     print_warning(recency_message)
                 else:
                     print_info(recency_message)
-        print_info("Recommended: keep both launcher and runtime current with `adscan update`.")
+        print_info(
+            "Recommended: keep both launcher and runtime current with `adscan update`."
+        )
         raise SystemExit(0)
 
     _guard_supported_host_platform(
@@ -1322,6 +1335,26 @@ def main(argv: list[str] | None = None) -> None:
                     pull_timeout_seconds=int(ns.pull_timeout),
                     bloodhound_stack_mode=resolved_stack_mode,
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
+                ),
+                extra={"mode": "docker", "session_scope": "launcher_preflight"},
+                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
+            )
+        )
+
+    if cmd == "report":
+        passthrough = list(unknown)
+        if passthrough and passthrough[0] == "--":
+            passthrough = passthrough[1:]
+        raise SystemExit(
+            _run_host_command_with_session_capture(
+                command_type="report",
+                telemetry_console=telemetry_console,
+                runner=lambda: run_adscan_passthrough_docker(
+                    adscan_args=["report"] + passthrough,
+                    verbose=bool(getattr(ns, "verbose", False)),
+                    debug=bool(getattr(ns, "debug", False)),
+                    pull_timeout_seconds=3600,
+                    bloodhound_stack_mode=resolved_stack_mode,
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),

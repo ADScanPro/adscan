@@ -1188,6 +1188,11 @@ else:
         id_dir.mkdir(parents=True, exist_ok=True)
         id_file.write_text(TELEMETRY_ID, encoding="utf-8")
 
+# Partner tag — baked into PRO images at build time via ADSCAN_PARTNER_TAG env var.
+# Identifies which partner/beta tester the image was built for (e.g. "glenn-mssp-beta1").
+# Empty string for LITE and untagged builds — never sent when absent.
+PARTNER_TAG: str = os.getenv("ADSCAN_PARTNER_TAG", "").strip()
+
 _SANITIZATION_KEY: Optional[bytes] = None
 _SANITIZED_VALUES: set[str] = set()
 
@@ -1854,6 +1859,8 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
                     continue
                 props[key] = value
             props["environment"] = current_environment
+            if PARTNER_TAG:
+                props["partner_tag"] = PARTNER_TAG
 
             # Add environment to person properties (for user-level filtering).
             # Use a single, consistent key name `downloaded_source` so dashboards
@@ -1866,6 +1873,8 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
                 "downloaded_source": DOWNLOAD_SOURCE,
                 "environment": current_environment,
             }
+            if PARTNER_TAG:
+                default_set["partner_tag"] = PARTNER_TAG
             for key, value in version_fields.items():
                 if key == "adscan_version":
                     continue
@@ -4312,6 +4321,8 @@ def _send_session_to_vercel(
             "user_id_hash": TELEMETRY_ID,
             "html": html_content,
         }
+        if PARTNER_TAG:
+            payload["partner_tag"] = PARTNER_TAG
         payload.update(_vercel_version_field())
         # _vercel_metadata_fields() already applies the privacy policy for
         # lab/session context. Do not re-sanitize here or we will destroy the

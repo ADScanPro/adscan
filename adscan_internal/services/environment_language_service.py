@@ -368,7 +368,7 @@ def resolve_environment_language(
     for known_username in _iter_workspace_list_usernames(
         shell,
         domain=domain,
-        filename="admins.txt",
+        filename="direct_domain_control.txt",
     ):
         inferred_language = _ADMIN_VARIANT_TO_LANGUAGE.get(known_username.casefold())
         if not inferred_language:
@@ -376,7 +376,7 @@ def resolve_environment_language(
         resolution = _build_resolution(
             language_code=inferred_language,
             preferred_name=known_username,
-            source="admins_txt",
+            source="direct_domain_control_txt",
         )
         persist_environment_language_hint(
             shell,

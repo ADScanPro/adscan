@@ -1,8 +1,7 @@
-"""High-value / Tier-0 helpers.
+"""ADscan control-exposure helpers.
 
-This module centralizes logic for determining whether an identity is:
-- Tier-0 (domain-compromise) or
-- High-value (impact) per BloodHound/attack-graph metadata.
+This module centralizes best-effort logic for determining whether an identity
+has direct domain control or broader control exposure under ADscan semantics.
 
 Callers sometimes have a fully-resolved attack-graph node, and sometimes only
 have a user identifier (samAccountName/label). Provide both APIs:
@@ -19,6 +18,10 @@ from typing import Any
 
 from adscan_internal import print_info_debug, telemetry
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.identity_risk_service import (
+    CONTROL_EXPOSURE_IDENTITIES_FILENAME,
+    get_identity_risk_record,
+)
 
 
 def normalize_samaccountname(value: str) -> str:
@@ -64,7 +67,7 @@ def is_node_tier0_or_high_value(node: dict[str, Any]) -> bool:
 
 @dataclass(frozen=True)
 class UserRiskFlags:
-    """Tier-0/high-value classification flags for a user."""
+    """ADscan control-exposure classification flags for a user."""
 
     is_tier0: bool = False
     is_high_value: bool = False
@@ -261,6 +264,14 @@ def is_user_tier0(shell: Any, *, domain: str, samaccountname: str) -> bool:
     if not normalized_sam:
         return False
 
+    identity_record = get_identity_risk_record(
+        shell,
+        domain=domain,
+        samaccountname=normalized_sam,
+    )
+    if isinstance(identity_record, dict):
+        return bool(identity_record.get("has_direct_domain_control"))
+
     node = _find_user_node_in_attack_graph(
         shell, domain=domain, samaccountname=normalized_sam
     )
@@ -326,6 +337,14 @@ def is_user_high_value(shell: Any, *, domain: str, samaccountname: str) -> bool:
     if not normalized_sam:
         return False
 
+    identity_record = get_identity_risk_record(
+        shell,
+        domain=domain,
+        samaccountname=normalized_sam,
+    )
+    if isinstance(identity_record, dict):
+        return bool(identity_record.get("is_control_exposed"))
+
     node = _find_user_node_in_attack_graph(
         shell, domain=domain, samaccountname=normalized_sam
     )
@@ -370,20 +389,20 @@ def is_user_tier0_or_high_value(
     if not normalized_sam:
         return False
 
-    # Fast-path: Phase 1 writes `admins.txt` as "Tier-0/high-value" (union) list.
+    # Fast-path: Phase 1 writes the ADscan control-exposure union list.
     # Use it as a positive-only cache to avoid unnecessary BloodHound queries.
     cached_hit = _is_user_in_cached_user_list_file(
         shell,
         domain=domain,
         samaccountname=normalized_sam,
-        filename="admins.txt",
+        filename=CONTROL_EXPOSURE_IDENTITIES_FILENAME,
     )
     if cached_hit is True:
         _debug_resolve_source(
             domain=domain,
             samaccountname=normalized_sam,
             source="user_list_files",
-            detail="admins.txt hit",
+            detail="control_exposure_identities hit",
         )
         return True
 
@@ -425,11 +444,23 @@ def classify_users_tier0_high_value(
         return {}
 
     results: dict[str, dict[str, bool]] = {
-        user: {"is_tier0": False, "is_high_value": False}
-        for user in normalized_users
+        user: {"is_tier0": False, "is_high_value": False} for user in normalized_users
     }
 
-    # Pass 1: attack_graph.json (single load).
+    for user in normalized_users:
+        identity_record = get_identity_risk_record(
+            shell,
+            domain=domain,
+            samaccountname=user,
+        )
+        if not isinstance(identity_record, dict):
+            continue
+        results[user]["is_tier0"] = bool(
+            identity_record.get("has_direct_domain_control")
+        )
+        results[user]["is_high_value"] = bool(identity_record.get("is_control_exposed"))
+
+    # Pass 1: attack_graph.json (single load) for unresolved users.
     try:
         from adscan_internal.services.attack_graph_service import load_attack_graph
 
@@ -461,7 +492,14 @@ def classify_users_tier0_high_value(
                     if normalized:
                         candidates.add(normalized)
 
-                if not candidates:
+                candidates &= set(results)
+                unresolved_candidates = {
+                    candidate
+                    for candidate in candidates
+                    if not results[candidate]["is_tier0"]
+                    and not results[candidate]["is_high_value"]
+                }
+                if not unresolved_candidates:
                     continue
 
                 is_tier0_user = is_node_tier0(node)
@@ -469,9 +507,7 @@ def classify_users_tier0_high_value(
                 if not is_tier0_user and not is_high_value_user:
                     continue
 
-                for candidate in candidates:
-                    if candidate not in results:
-                        continue
+                for candidate in unresolved_candidates:
                     if is_tier0_user:
                         results[candidate]["is_tier0"] = True
                     if is_high_value_user:
@@ -505,7 +541,7 @@ def classify_users_tier0_high_value(
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
 
-    # Pass 3: positive-only high-value cache fallback (admins.txt union list).
+    # Pass 3: positive-only control-exposure cache fallback.
     unresolved_high_value = {
         user
         for user, flags in results.items()
@@ -513,7 +549,9 @@ def classify_users_tier0_high_value(
     }
     if unresolved_high_value:
         cached_admins = _load_cached_user_list_file(
-            shell, domain=domain, filename="admins.txt"
+            shell,
+            domain=domain,
+            filename=CONTROL_EXPOSURE_IDENTITIES_FILENAME,
         )
         if cached_admins:
             for user in unresolved_high_value:

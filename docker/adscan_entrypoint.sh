@@ -232,6 +232,51 @@ _is_public_resolver() {
   esac
 }
 
+_public_dns_mode() {
+  if [[ "${ADSCAN_ALLOW_PUBLIC_DNS:-1}" != "1" ]]; then
+    echo "disabled"
+    return 0
+  fi
+  local mode
+  mode="$(printf '%s' "${ADSCAN_PUBLIC_DNS_MODE:-prefer-public}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+  case "${mode}" in
+    prefer|public|prefer-public)
+      echo "prefer-public"
+      ;;
+    inherit|host|system)
+      echo "inherit"
+      ;;
+    disabled|off|false|no)
+      echo "disabled"
+      ;;
+    *)
+      _ep_log "unknown ADSCAN_PUBLIC_DNS_MODE='${ADSCAN_PUBLIC_DNS_MODE:-}'; using inherit"
+      echo "inherit"
+      ;;
+  esac
+}
+
+_public_dns_resolvers() {
+  local raw="${ADSCAN_PUBLIC_DNS_RESOLVERS:-1.1.1.1,8.8.8.8,8.8.4.4}"
+  raw="${raw//,/ }"
+  local resolver
+  local -a emitted=()
+  for resolver in ${raw}; do
+    [[ -z "${resolver}" ]] && continue
+    local seen=0
+    for existing in "${emitted[@]}"; do
+      if [[ "${existing}" == "${resolver}" ]]; then
+        seen=1
+        break
+      fi
+    done
+    if [[ "${seen}" -eq 0 ]]; then
+      emitted+=("${resolver}")
+      printf '%s\n' "${resolver}"
+    fi
+  done
+}
+
 _write_resolv_conf_local_first() {
   local local_resolver_ip="$1"
   local allow_public_dns="${ADSCAN_ALLOW_PUBLIC_DNS:-1}"
@@ -292,6 +337,31 @@ _write_resolv_conf_local_first() {
 _get_unbound_upstreams() {
   local local_resolver_ip="$1"
   local -a upstreams=()
+  local public_dns_mode
+  public_dns_mode="$(_public_dns_mode)"
+
+  _append_upstream() {
+    local ns="$1"
+    if [[ -z "${ns}" ]]; then
+      return 0
+    fi
+    if [[ "${ns}" == "${local_resolver_ip}" || "${ns}" == "127.0.0.53" || "${ns}" == 127.* ]]; then
+      return 0
+    fi
+    if [[ "${public_dns_mode}" == "disabled" ]] && _is_public_resolver "${ns}"; then
+      return 0
+    fi
+    local seen=0
+    for existing in "${upstreams[@]}"; do
+      if [[ "${existing}" == "${ns}" ]]; then
+        seen=1
+        break
+      fi
+    done
+    if [[ "${seen}" -eq 0 ]]; then
+      upstreams+=("${ns}")
+    fi
+  }
 
   _get_systemd_resolved_upstreams() {
     local resolver_ip="$1"
@@ -307,7 +377,7 @@ _get_unbound_upstreams() {
           if [[ "${ns}" == 127.* ]]; then
             continue
           fi
-          if [[ "${ADSCAN_ALLOW_PUBLIC_DNS:-1}" != "1" ]] && _is_public_resolver "${ns}"; then
+          if [[ "${public_dns_mode}" == "disabled" ]] && _is_public_resolver "${ns}"; then
             continue
           fi
           local seen=0
@@ -326,41 +396,24 @@ _get_unbound_upstreams() {
     printf '%s\n' "${resolved_upstreams[@]}"
   }
 
-  # Prefer whatever Docker/host provided in the initial resolv.conf. This is
-  # generally more reliable than hardcoding public resolvers (which can be
-  # blocked or hijacked in lab/enterprise networks).
-  for ns in ${existing_ns:-}; do
-    # Avoid loops and obvious stubs.
-    if [[ -z "${ns}" ]]; then
-      continue
-    fi
-    if [[ "${ns}" == "${local_resolver_ip}" ]]; then
-      continue
-    fi
-    if [[ "${ns}" == "127.0.0.53" ]]; then
-      continue
-    fi
-    if [[ "${ADSCAN_ALLOW_PUBLIC_DNS:-1}" != "1" ]] && _is_public_resolver "${ns}"; then
-      continue
-    fi
+  if [[ "${public_dns_mode}" == "prefer-public" ]]; then
+    while IFS= read -r ns; do
+      _append_upstream "${ns}"
+    done < <(_public_dns_resolvers)
+  fi
 
-    local seen=0
-    for existing in "${upstreams[@]}"; do
-      if [[ "${existing}" == "${ns}" ]]; then
-        seen=1
-        break
-      fi
-    done
-    if [[ "${seen}" -eq 0 ]]; then
-      upstreams+=("${ns}")
-    fi
+  # Prefer whatever Docker/host provided in the initial resolv.conf. This is
+  # used either as primary policy (inherit) or as fallback after preferred
+  # public resolvers (prefer-public).
+  for ns in ${existing_ns:-}; do
+    _append_upstream "${ns}"
   done
 
   # Fallback: if the initial resolv.conf only had a loopback entry (common when
   # a host-local resolver was configured), try systemd-resolved's upstream list.
   if [[ "${#upstreams[@]}" -eq 0 ]]; then
     while IFS= read -r ns; do
-      [[ -n "${ns}" ]] && upstreams+=("${ns}")
+      _append_upstream "${ns}"
     done < <(_get_systemd_resolved_upstreams "${local_resolver_ip}")
     if [[ "${#upstreams[@]}" -gt 0 ]]; then
       _ep_log "upstream nameservers from systemd-resolved: ${upstreams[*]}"
@@ -368,8 +421,10 @@ _get_unbound_upstreams() {
   fi
 
   # Final fallback: optionally add public resolvers when allowed.
-  if [[ "${#upstreams[@]}" -eq 0 ]] && [[ "${ADSCAN_ALLOW_PUBLIC_DNS:-1}" == "1" ]]; then
-    upstreams=("1.1.1.1" "8.8.8.8" "8.8.4.4")
+  if [[ "${#upstreams[@]}" -eq 0 ]] && [[ "${public_dns_mode}" != "disabled" ]]; then
+    while IFS= read -r ns; do
+      _append_upstream "${ns}"
+    done < <(_public_dns_resolvers)
   fi
 
   printf '%s\n' "${upstreams[@]}"

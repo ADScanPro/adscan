@@ -33,7 +33,9 @@ from adscan_internal.services.attack_graph_service import (
     get_owned_domain_usernames_for_attack_paths,
     get_rodc_prp_control_paths,
     load_attack_graph,
+    rodc_followup_state_label,
     resolve_user_sid,
+    update_edge_status_by_labels,
     save_attack_graph,
 )
 from adscan_internal.services.pivot_opportunity_service import (
@@ -2146,6 +2148,23 @@ def offer_rodc_escalation(
             to_label=tracking_to_label,
             notes=tracking_notes,
         ):
+            prepare_state_label = rodc_followup_state_label(
+                target_computer=tracking_to_label,
+                stage="prepare_credential_caching",
+            )
+            update_edge_status_by_labels(
+                shell,
+                domain,
+                from_label=tracking_to_label,
+                relation="PrepareRodcCredentialCaching",
+                to_label=prepare_state_label,
+                status="attempted",
+                notes={
+                    "source": "rodc_followup_chain_runtime",
+                    "rodc_target": tracking_to_label,
+                    "target_user": target_user,
+                },
+            )
             update_active_step_status(
                 shell,
                 domain=domain,
@@ -2171,6 +2190,19 @@ def offer_rodc_escalation(
                 kerberos=True,
             )
             if not reveal_update.success:
+                update_edge_status_by_labels(
+                    shell,
+                    domain,
+                    from_label=tracking_to_label,
+                    relation="PrepareRodcCredentialCaching",
+                    to_label=prepare_state_label,
+                    status="failed",
+                    notes={
+                        "source": "rodc_followup_chain_runtime",
+                        "rodc_target": tracking_to_label,
+                        "failed_attribute": "msDS-RevealOnDemandGroup",
+                    },
+                )
                 update_active_step_status(
                     shell,
                     domain=domain,
@@ -2202,6 +2234,19 @@ def offer_rodc_escalation(
                     kerberos=True,
                 )
                 if not never_reveal_update.success:
+                    update_edge_status_by_labels(
+                        shell,
+                        domain,
+                        from_label=tracking_to_label,
+                        relation="PrepareRodcCredentialCaching",
+                        to_label=prepare_state_label,
+                        status="failed",
+                        notes={
+                            "source": "rodc_followup_chain_runtime",
+                            "rodc_target": tracking_to_label,
+                            "failed_attribute": "msDS-NeverRevealGroup",
+                        },
+                    )
                     update_active_step_status(
                         shell,
                         domain=domain,
@@ -2237,6 +2282,19 @@ def offer_rodc_escalation(
                     "never_reveal_action": "cleared_temporarily"
                     if cleared_never_reveal
                     else "unchanged_empty",
+                },
+            )
+            update_edge_status_by_labels(
+                shell,
+                domain,
+                from_label=tracking_to_label,
+                relation="PrepareRodcCredentialCaching",
+                to_label=prepare_state_label,
+                status="success",
+                notes={
+                    "source": "rodc_followup_chain_runtime",
+                    "rodc_target": tracking_to_label,
+                    "target_user": target_user,
                 },
             )
 

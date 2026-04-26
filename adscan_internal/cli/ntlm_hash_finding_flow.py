@@ -335,13 +335,13 @@ def render_ntlm_hash_findings_flow(
             {
                 "kind": "Computer" if username.endswith("$") else "User",
                 "risk_label": "Computer" if username.endswith("$") else "Standard",
-                "is_tier0": False,
-                "is_high_value": False,
+                "has_direct_domain_control": False,
+                "is_control_exposed": False,
             },
         )
-        if bool(risk.get("is_tier0")):
+        if bool(risk.get("has_direct_domain_control")):
             tier_zero_count += 1
-        elif bool(risk.get("is_high_value")):
+        elif bool(risk.get("is_control_exposed")):
             high_value_count += 1
         risk_label = str(risk.get("risk_label") or "-")
         risk_rank = (

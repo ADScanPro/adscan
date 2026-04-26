@@ -61,6 +61,25 @@ class WorkspaceSelectionOption:
     is_create_new: bool = False
 
 
+def _confirm_workspace_delete(workspace_name: str) -> bool:
+    """Return True only when the operator types the exact workspace name.
+
+    Args:
+        workspace_name: Workspace name that must be typed to confirm deletion.
+    """
+    marked_workspace_name = mark_sensitive(workspace_name, "workspace")
+    print_warning(
+        f"Deleting workspace '{marked_workspace_name}' will permanently remove its local data."
+    )
+    print_instruction("Type the exact workspace name to confirm deletion.")
+    confirmation = Prompt.ask(
+        Text("Workspace name: ", style="input"),
+        default="",
+        show_default=False,
+    ).strip()
+    return confirmation == workspace_name
+
+
 def do_workspace(shell: WorkspaceShell, args: str) -> None:
     """Handle `workspace` subcommands.
 
@@ -236,6 +255,11 @@ def workspace_delete(shell: WorkspaceShell, workspace_name: str) -> None:
         print_warning(
             f"Workspace '{marked_workspace_name}' is currently active. Please select another workspace before deleting it."
         )
+        return
+
+    if not _confirm_workspace_delete(workspace_name):
+        marked_workspace_name = mark_sensitive(workspace_name, "workspace")
+        print_warning(f"Workspace '{marked_workspace_name}' deletion cancelled.")
         return
 
     try:

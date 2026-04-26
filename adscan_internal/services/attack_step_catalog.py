@@ -88,6 +88,21 @@ class AttackStepCatalogEntry:
     requires_execution_context: bool = False
     counts_for_execution_readiness: bool = False
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none"
+    # BloodHound-style narrative templates with placeholders.
+    # Placeholders resolved at render time by render_step_narrative():
+    #   {source}      — display name of source principal
+    #   {target}      — display name of target principal
+    #   {source_type} — "user" | "computer" | "group" | "domain" | "service account"
+    #   {target_type} — same, for the destination
+    #   {template}    — ADCS template name (if applicable; "" otherwise)
+    #   {relation}    — human-formatted relation label (e.g. "Kerberoasting")
+    # Long form: used in attack-path narratives section of the report.
+    narrative_template: str = ""
+    # Short form: one-liner used in cards / chips / tooltips (web + PDF).
+    short_narrative_template: str = ""
+    # Structured remediation steps (ordered). Each string may also contain
+    # the same placeholder set as narrative_template.
+    remediation_steps: tuple[str, ...] = ()
 
 
 def _entry(
@@ -113,6 +128,9 @@ def _entry(
     requires_execution_context: bool = False,
     counts_for_execution_readiness: bool = False,
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none",
+    narrative_template: str = "",
+    short_narrative_template: str = "",
+    remediation_steps: tuple[str, ...] = (),
 ) -> AttackStepCatalogEntry:
     """Build a normalized catalog entry."""
     return AttackStepCatalogEntry(
@@ -139,6 +157,9 @@ def _entry(
         requires_execution_context=requires_execution_context,
         counts_for_execution_readiness=counts_for_execution_readiness,
         execution_target_access_requirement=execution_target_access_requirement,
+        narrative_template=narrative_template.strip(),
+        short_narrative_template=short_narrative_template.strip(),
+        remediation_steps=tuple(remediation_steps),
     )
 
 
@@ -158,6 +179,102 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         # No MITRE — pure graph context node, not an attack technique
         bh_native=True,
         bh_cypher_names=("MemberOf",),
+    ),
+    _entry(
+        "privilegedgroupcontrol",
+        support_kind="unsupported",
+        support_reason="Membership-derived direct control outcome; no separate execution step",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="immediate",
+        category="privilege",
+        description="Direct control achieved through membership in a terminal privileged group",
+        remediation_complexity="low",
+        remediation_effort="Remove the principal from the privileged control group.",
+        can_fully_mitigate=True,
+    ),
+    _entry(
+        "backupoperatorescalation",
+        support_kind="unsupported",
+        support_reason="Backup Operators follow-up is modeled but not executed automatically yet",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="medium",
+        category="privilege",
+        description="Potential domain compromise path via Backup Operators follow-up abuse",
+        remediation_complexity="medium",
+        remediation_effort="Remove unnecessary membership from Backup Operators and constrain backup privileges.",
+        can_fully_mitigate=True,
+    ),
+    _entry(
+        "printoperatorabuse",
+        support_kind="unsupported",
+        support_reason="Print Operators follow-up is modeled but not executed automatically yet",
+        compromise_semantics="access_capability_only",
+        compromise_effort="medium",
+        category="privilege",
+        description="Potential escalation path unlocked by Print Operators membership",
+        remediation_complexity="medium",
+        remediation_effort="Remove unnecessary membership from Print Operators and restrict DC local execution paths.",
+        can_fully_mitigate=True,
+    ),
+    _entry(
+        "dnsadminabuse",
+        support_kind="policy_blocked",
+        support_reason="DNSAdmins abuse is intentionally blocked in production-safe execution mode",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="medium",
+        category="privilege",
+        description="Potential domain compromise path via DNSAdmins abuse",
+        remediation_complexity="medium",
+        remediation_effort="Remove unnecessary DNSAdmins membership and harden DNS administration workflows.",
+        can_fully_mitigate=True,
+    ),
+    _entry(
+        "preparerodccredentialcaching",
+        support_kind="supported",
+        support_reason="RODC PRP preparation is supported through the dedicated RODC follow-up workflow",
+        compromise_semantics="access_capability_only",
+        compromise_effort="high",
+        category="privilege",
+        description="Prepare RODC credential caching by modifying the RODC password-replication policy",
+        remediation_complexity="high",
+        remediation_effort="Remove unnecessary RODC PRP delegation and review all principals allowed to modify RODC password-replication policy.",
+        can_fully_mitigate=True,
+    ),
+    _entry(
+        "extractrodckrbtgtsecret",
+        support_kind="supported",
+        support_reason="RODC per-krbtgt extraction is supported through the dedicated follow-up workflow",
+        compromise_semantics="credential_access_only",
+        compromise_effort="high",
+        category="credential_access",
+        description="Extract the per-RODC krbtgt secret from the compromised RODC",
+        remediation_complexity="high",
+        remediation_effort="Prevent unauthorized RODC host access and monitor RODC memory/LSA extraction activity closely.",
+        can_fully_mitigate=False,
+    ),
+    _entry(
+        "forgerodcgoldenticket",
+        support_kind="supported",
+        support_reason="RODC golden ticket forging is supported once per-RODC krbtgt material exists",
+        compromise_semantics="credential_access_only",
+        compromise_effort="high",
+        category="kerberos",
+        description="Forge a reusable RODC golden ticket from recovered per-RODC krbtgt material",
+        remediation_complexity="high",
+        remediation_effort="Rotate affected per-RODC krbtgt material and investigate unauthorized Kerberos ticket creation.",
+        can_fully_mitigate=False,
+    ),
+    _entry(
+        "kerberoskeylist",
+        support_kind="supported",
+        support_reason="Kerberos Key List is supported when AES material is available for the per-RODC krbtgt account",
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
+        category="kerberos",
+        description="Use the forged RODC golden ticket to request Key List data from a writable domain controller",
+        remediation_complexity="high",
+        remediation_effort="Review and reset replicated target credentials, rotate per-RODC krbtgt material, and investigate Key List abuse activity.",
+        can_fully_mitigate=False,
     ),
     _entry(
         "localadminpassreuse",
@@ -886,7 +1003,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "adcsesc13",
-        support_kind="unsupported",
+        support_kind="supported",
         support_reason="Not implemented yet in ADscan",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
@@ -2037,3 +2154,517 @@ def get_step_detection_event_ids(relation: str) -> tuple[str, ...]:
     """Return Windows Event IDs relevant for detecting this step."""
     entry = get_attack_step_entry(relation)
     return entry.detection_event_ids if entry else ()
+
+
+# ── Narrative rendering (BloodHound-style, reusable from web + reports) ───────
+
+# Narrative templates for the most common relations. These are kept here (and
+# not in the report template) so the CLI, PDF report, DOCX report, and web
+# service can all share one source of truth. Placeholder syntax:
+#   {source} / {target}           — display names
+#   {source_type} / {target_type} — "user" | "computer" | "group" | ...
+#   {template}                    — ADCS template name (when applicable)
+#   {relation}                    — human-formatted relation label
+#
+# The templates are registered after the main _CATALOG_ENTRIES tuple so we
+# don't have to retype the existing 99 entries; a separate overlay dict keeps
+# this manageable and easy to extend incrementally.
+
+_NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
+    "kerberoasting": {
+        "short": "Kerberoasting: {source} can request service tickets for {target} and crack the TGS-REP offline to recover the service account password.",
+        "long": (
+            "Kerberoasting allows {source_type} {source} to request a Kerberos service "
+            "ticket (TGS-REP) for the service account {target}. Because the ticket is "
+            "encrypted with the target account's NTLM hash, an attacker can extract it "
+            "and mount an offline brute-force attack against weak passwords. "
+            "Once cracked, the attacker fully impersonates {target}."
+        ),
+        "remediation": (
+            "Enforce strong, random passwords (25+ chars) or migrate the account to a Group Managed Service Account (gMSA).",
+            "Enable AES-only encryption on the service account (msDS-SupportedEncryptionTypes) and disable RC4 where possible.",
+            "Monitor Windows Event ID 4769 with ticket_encryption_type=0x17 (RC4) to detect roasting attempts.",
+        ),
+    },
+    "asreproasting": {
+        "short": "ASREPRoasting: {target} has pre-authentication disabled, so {source} can request an AS-REP and crack it offline.",
+        "long": (
+            "ASREPRoasting targets accounts — in this path, {target} — that have "
+            "Kerberos pre-authentication disabled (DONT_REQ_PREAUTH flag). Any "
+            "unauthenticated attacker (including {source}) can request an AS-REP "
+            "message encrypted with the account's password-derived key and crack "
+            "it offline. Successful cracking yields full credentials for {target}."
+        ),
+        "remediation": (
+            "Enable Kerberos pre-authentication for {target} (clear DONT_REQ_PREAUTH in userAccountControl).",
+            "Enforce strong passwords on accounts that must keep pre-auth disabled.",
+            "Monitor Event ID 4768 with pre-authentication type 0 for anomalous requests.",
+        ),
+    },
+    "genericall": {
+        "short": "GenericAll: {source_type} {source} has full control over {target_type} {target}.",
+        "long": (
+            "GenericAll grants {source_type} {source} full read and write control "
+            "over {target_type} {target}. This allows the source to reset the "
+            "target's password, add Shadow Credentials (msDS-KeyCredentialLink), "
+            "set a Service Principal Name to enable Kerberoasting, or write a "
+            "logon script — any of which results in complete compromise of {target}."
+        ),
+        "remediation": (
+            "Remove the GenericAll ACE granting control from {source} over {target}.",
+            "Apply least privilege: replace with narrow rights (e.g. ReadProperty) if some access is still required.",
+            "Enable AD Protected Users / tier-0 protection on sensitive accounts.",
+        ),
+    },
+    "genericwrite": {
+        "short": "GenericWrite: {source} can modify most attributes of {target}, enabling takeover via Shadow Credentials or SPN.",
+        "long": (
+            "GenericWrite gives {source_type} {source} the ability to modify most "
+            "attributes of {target_type} {target}. Typical abuse paths include "
+            "writing msDS-KeyCredentialLink (Shadow Credentials) to obtain a PKINIT "
+            "certificate, setting a servicePrincipalName to enable Kerberoasting, "
+            "or modifying scriptPath / msDS-AllowedToActOnBehalfOfOtherIdentity. "
+            "Any of these leads to full compromise of {target}."
+        ),
+        "remediation": (
+            "Remove the GenericWrite ACE from {source} on {target}.",
+            "Audit msDS-KeyCredentialLink writes (Event 5136) to detect Shadow Credentials.",
+        ),
+    },
+    "writedacl": {
+        "short": "WriteDACL: {source} can rewrite the ACL of {target} and grant itself full control.",
+        "long": (
+            "WriteDACL lets {source} modify the discretionary access control list "
+            "(DACL) of {target}. An attacker simply adds a GenericAll (or DCSync) "
+            "ACE granting themselves full control, then escalates as if they owned "
+            "the object directly. This is a two-step takeover chain."
+        ),
+        "remediation": (
+            "Remove the WriteDACL ACE from {source} on {target}.",
+            "Monitor Event ID 5136 for ACL modifications on sensitive objects.",
+        ),
+    },
+    "writeowner": {
+        "short": "WriteOwner: {source} can take ownership of {target} and grant itself full control.",
+        "long": (
+            "WriteOwner allows {source} to take ownership of {target}. Once "
+            "ownership is seized, the attacker can rewrite the DACL at will, "
+            "effectively granting full control over the object."
+        ),
+        "remediation": (
+            "Remove the WriteOwner permission from {source} on {target}.",
+            "Re-own the object to its intended administrative group (e.g. Domain Admins).",
+        ),
+    },
+    "forcechangepassword": {
+        "short": "ForceChangePassword: {source} can reset the password of {target} without knowing the old one.",
+        "long": (
+            "The User-Force-Change-Password extended right lets {source} set a new "
+            "password on {target} without knowing the current password. The "
+            "attacker resets the password and authenticates as {target} directly, "
+            "completely taking over the account."
+        ),
+        "remediation": (
+            "Remove the User-Force-Change-Password extended right from {source} on {target}.",
+            "Review delegated password-reset rights — they should be granted only to helpdesk / tier-appropriate personnel.",
+        ),
+    },
+    "addmember": {
+        "short": "AddMember: {source} can add itself to {target}, inheriting all of the group's privileges.",
+        "long": (
+            "AddMember on the {target} group lets {source} add arbitrary principals "
+            "(including itself) as members. Any privilege granted to {target} — "
+            "often through nested group chains — is inherited immediately by the "
+            "attacker."
+        ),
+        "remediation": (
+            "Remove the AddMember extended right from {source} on {target}.",
+            "Audit recent group membership changes via Event ID 4728/4732/4756.",
+        ),
+    },
+    "addself": {
+        "short": "AddSelf: {source} can join the {target} group directly.",
+        "long": (
+            "AddSelf lets {source} add itself (but not others) to the {target} "
+            "group. After self-insertion, {source} inherits every privilege held "
+            "by {target} — often a fast path to tier-0 via nested group chains."
+        ),
+        "remediation": (
+            "Remove the AddSelf extended right from {source} on {target}.",
+        ),
+    },
+    "readlapspassword": {
+        "short": "ReadLAPSPassword: {source} can read the local administrator password of {target} from AD.",
+        "long": (
+            "The ReadLAPSPassword edge means {source} has the Control Access right "
+            "on the ms-Mcs-AdmPwd (or ms-LAPS-Password) attribute of {target}. "
+            "{source} simply queries the attribute via LDAP to retrieve the local "
+            "Administrator password in cleartext and pivots to {target}."
+        ),
+        "remediation": (
+            "Remove the Control Access ACE on ms-Mcs-AdmPwd / ms-LAPS-Password from {source} on {target}.",
+            "Audit LDAP reads of ms-LAPS-Password via Event ID 4662 with the LAPS GUID.",
+        ),
+    },
+    "readgmsapassword": {
+        "short": "ReadGMSAPassword: {source} can retrieve the managed password of gMSA {target}.",
+        "long": (
+            "ReadGMSAPassword lets {source} read the msDS-ManagedPassword attribute "
+            "of the group-Managed Service Account {target}, yielding the current "
+            "password blob. {source} then derives the NT hash and impersonates "
+            "{target} directly."
+        ),
+        "remediation": (
+            "Remove {source} from the msDS-GroupMSAMembership of {target}.",
+            "Minimize the gMSA password-retrieval principals to the service hosts that actually need them.",
+        ),
+    },
+    "allowedtodelegate": {
+        "short": "Constrained Delegation: {source} can impersonate any user (including Domain Admins) to {target}.",
+        "long": (
+            "{source} is configured for Kerberos constrained delegation to "
+            "services on {target} (msDS-AllowedToDelegateTo). An attacker who "
+            "controls {source} can request tickets as any user in the domain "
+            "(including tier-0 admins) to services on {target}, fully compromising "
+            "it."
+        ),
+        "remediation": (
+            "Remove services from msDS-AllowedToDelegateTo on {source}, or replace with Resource-Based Constrained Delegation.",
+            "Add sensitive accounts to the Protected Users group or flag them as 'Account is sensitive and cannot be delegated'.",
+        ),
+    },
+    "allowedtoact": {
+        "short": "Resource-Based Constrained Delegation: {source} can impersonate any user to {target}.",
+        "long": (
+            "Resource-Based Constrained Delegation (RBCD) on {target} lists "
+            "{source} in msDS-AllowedToActOnBehalfOfOtherIdentity. An attacker "
+            "with control of {source} can request S4U2Self + S4U2Proxy tickets "
+            "to impersonate any user (including Domain Admins) to {target}, "
+            "fully compromising the host."
+        ),
+        "remediation": (
+            "Clear msDS-AllowedToActOnBehalfOfOtherIdentity on {target} (or prune the offending entry).",
+            "Audit writes to msDS-AllowedToActOnBehalfOfOtherIdentity (Event 5136) as high-severity.",
+        ),
+    },
+    "addkeycredentiallink": {
+        "short": "Shadow Credentials: {source} can attach a certificate-backed key to {target} and authenticate as it via PKINIT.",
+        "long": (
+            "AddKeyCredentialLink lets {source} write a new "
+            "msDS-KeyCredentialLink entry on {target}. {source} then authenticates "
+            "as {target} via PKINIT using the attacker-controlled certificate, "
+            "obtaining a TGT and the NT hash of {target} without touching the "
+            "password."
+        ),
+        "remediation": (
+            "Remove the Write rights on msDS-KeyCredentialLink from {source} on {target}.",
+            "Deploy the KeyCredentialLink auditing rule and alert on Event ID 5136 with attribute msDS-KeyCredentialLink.",
+        ),
+    },
+    "dcsync": {
+        "short": "DCSync: {source} can replicate secrets from the domain and extract the krbtgt hash.",
+        "long": (
+            "{source} holds the Replicating Directory Changes and Replicating "
+            "Directory Changes All extended rights on the domain, meaning it can "
+            "pull password hashes for any account via the DRSUAPI protocol "
+            "(DCSync). Extracting the krbtgt hash yields persistent golden-ticket "
+            "capability and full domain compromise."
+        ),
+        "remediation": (
+            "Remove DS-Replication-Get-Changes and DS-Replication-Get-Changes-All extended rights from {source} on the domain.",
+            "Limit these rights to DCs and approved replication service accounts only.",
+            "Alert on DCSync via Event ID 4662 with the replication GUIDs from non-DC sources.",
+        ),
+    },
+    "memberof": {
+        "short": "Group membership: {source} is a member of {target} and inherits its privileges.",
+        "long": (
+            "{source} is a direct or nested member of {target}. All privileges "
+            "held by {target} — including any onward attack-path edges — are "
+            "inherited by {source}."
+        ),
+        "remediation": (
+            "Remove {source} from {target} if the membership is not strictly required.",
+            "Audit group membership periodically and enforce tiering boundaries.",
+        ),
+    },
+    "adcsesc1": {
+        "short": "ADCS ESC1: {source} can enroll in misconfigured certificate template {template} and impersonate any domain user.",
+        "long": (
+            "ADCS ESC1: the certificate template {template} allows {source_type} "
+            "{source} to request certificates where the subject alternative name "
+            "(SAN) is supplied by the requester. By specifying a privileged user "
+            "(e.g. Domain Admin) in the SAN, the attacker obtains a certificate "
+            "that authenticates as that user via PKINIT, fully compromising "
+            "{target}."
+        ),
+        "remediation": (
+            "Disable 'Enrollee supplies subject' on template {template}, or require manager approval for enrollment.",
+            "Restrict enrollment permissions on {template} to authorized identities only.",
+            "Apply the KB5014754 enforcement mode on the CA to block weak SAN mapping.",
+        ),
+    },
+    "unconstraineddelegation": {
+        "short": "Unconstrained Delegation: {source} can capture the TGT of any user that authenticates to it.",
+        "long": (
+            "{source} is marked TRUSTED_FOR_DELEGATION (unconstrained delegation). "
+            "Any user that authenticates to {source} — including Domain Admins "
+            "coerced via the Printer Bug / PetitPotam — deposits a forwardable "
+            "TGT in {source}'s LSASS. The attacker dumps the TGT and pivots as "
+            "that user to {target}."
+        ),
+        "remediation": (
+            "Remove TRUSTED_FOR_DELEGATION from {source} unless strictly required; prefer constrained or resource-based delegation.",
+            "Add tier-0 accounts to Protected Users or flag 'Account is sensitive and cannot be delegated'.",
+        ),
+    },
+}
+
+
+# Apply narrative overlays to the base catalog. We do this here (rather than
+# retyping 99 _entry() calls) so the overlay dict stays focused on narratives.
+_CATALOG_WITH_NARRATIVES: dict[str, AttackStepCatalogEntry] = {}
+for _rel, _entry_obj in ATTACK_STEP_CATALOG.items():
+    _overlay = _NARRATIVE_OVERLAYS.get(_rel)
+    if _overlay:
+        _CATALOG_WITH_NARRATIVES[_rel] = replace(
+            _entry_obj,
+            narrative_template=_overlay.get("long", _entry_obj.narrative_template),
+            short_narrative_template=_overlay.get("short", _entry_obj.short_narrative_template),
+            remediation_steps=tuple(_overlay.get("remediation", _entry_obj.remediation_steps)),
+        )
+    else:
+        _CATALOG_WITH_NARRATIVES[_rel] = _entry_obj
+ATTACK_STEP_CATALOG = _CATALOG_WITH_NARRATIVES  # type: ignore[assignment]
+
+
+def _infer_node_type(display: str) -> str:
+    """Infer a node type label from a display name. Heuristic, matches renderer logic."""
+    if not display:
+        return "principal"
+    name = display.strip()
+    lower = name.lower()
+    sam = name.split("@", 1)[0] if "@" in name else name
+    if "admin" in lower or "da@" in lower:
+        return "privileged account"
+    if sam.rstrip().endswith("$"):
+        return "computer"
+    if "@" not in name and "." in name:
+        return "domain"
+    # Heuristic for groups: common SAM suffixes
+    group_hints = ("admins", "operators", " users", "group")
+    if any(h in lower for h in group_hints):
+        return "group"
+    return "user"
+
+
+def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
+    """Extract placeholder values from a raw attack-path step dict."""
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+
+    def _get_display(primary_keys: tuple[str, ...], fallback_keys: tuple[str, ...]) -> str:
+        for k in primary_keys:
+            v = details.get(k) if isinstance(details, dict) else None
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for k in fallback_keys:
+            v = step.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    source = _get_display(("from", "source_username", "source"), ("source", "from"))
+    target = _get_display(
+        ("display_to", "to", "target_username", "target"),
+        ("target", "to", "display_to"),
+    )
+    if not source:
+        source = "the source principal"
+    if not target:
+        target = "the target object"
+
+    relation_raw = step.get("action") or step.get("relation") or step.get("type") or ""
+    # Human-formatted label (lazy import to avoid circular deps with reporting layer).
+    try:
+        from adscan_internal.pro.reporting.attack_path_narratives import (
+            format_relation_label,
+        )
+        relation_label = format_relation_label(str(relation_raw))
+    except Exception:
+        relation_label = str(relation_raw or "Step")
+
+    template = ""
+    if isinstance(details, dict):
+        tmpl = details.get("template")
+        if isinstance(tmpl, str):
+            template = tmpl.strip()
+
+    return {
+        "source": source,
+        "target": target,
+        "source_type": _infer_node_type(source),
+        "target_type": _infer_node_type(target),
+        "template": template,
+        "relation": relation_label,
+    }
+
+
+def render_step_narrative(
+    step: dict[str, Any],
+    *,
+    short: bool = False,
+) -> str:
+    """Render a narrative sentence for a single attack-path step.
+
+    Uses the step's relation to look up a catalog entry. If the entry has a
+    ``narrative_template`` (or ``short_narrative_template`` when ``short=True``),
+    placeholders are substituted from the step's details.
+
+    Args:
+        step: Raw step dict with at least ``action``/``relation`` and optional
+            ``details`` dict (from / to / display_to / template / etc.).
+        short: If True, prefer the short one-liner template.
+
+    Returns:
+        The rendered sentence, or an empty string when no template exists.
+        Callers may fall back to legacy :func:`describe_attack_step`.
+    """
+    if not isinstance(step, dict):
+        return ""
+    relation_raw = step.get("action") or step.get("relation") or step.get("type") or ""
+    entry = get_attack_step_entry(str(relation_raw))
+    if entry is None:
+        return ""
+    tmpl = entry.short_narrative_template if short else entry.narrative_template
+    if not tmpl:
+        return ""
+    placeholders = _extract_step_placeholders(step)
+    try:
+        return tmpl.format(**placeholders)
+    except (KeyError, IndexError):
+        # Missing placeholder — return template with as many substitutions as possible.
+        out = tmpl
+        for k, v in placeholders.items():
+            out = out.replace("{" + k + "}", v)
+        return out
+
+
+def render_step_remediation(step: dict[str, Any]) -> list[str]:
+    """Render structured remediation steps for one attack-path step."""
+    if not isinstance(step, dict):
+        return []
+    relation_raw = step.get("action") or step.get("relation") or step.get("type") or ""
+    entry = get_attack_step_entry(str(relation_raw))
+    if entry is None or not entry.remediation_steps:
+        return []
+    placeholders = _extract_step_placeholders(step)
+    rendered: list[str] = []
+    for item in entry.remediation_steps:
+        try:
+            rendered.append(item.format(**placeholders))
+        except (KeyError, IndexError):
+            out = item
+            for k, v in placeholders.items():
+                out = out.replace("{" + k + "}", v)
+            rendered.append(out)
+    return rendered
+
+
+_STATUS_PHRASE: dict[str, str] = {
+    "exploited": "was successfully exploited during active testing",
+    "attempted": "was probed but not fully executed in the engagement window",
+    "blocked": "was attempted but stopped by an existing control",
+    "unsupported": "is mapped but not actionable via ADscan's current toolkit",
+    "theoretical": "is a theoretical route derived from configuration analysis",
+}
+
+
+def render_path_summary(path: dict[str, Any]) -> str:
+    """Render a 2-3 sentence executive narrative for a full attack path.
+
+    Pulls source / target / steps from the path dict and synthesizes a
+    BloodHound-style one-paragraph narrative suitable for report headers or
+    web detail views. Works with any step sequence — no hardcoded relations.
+    """
+    if not isinstance(path, dict):
+        return ""
+
+    nodes = path.get("nodes") or []
+    steps = path.get("steps") or []
+    status_raw = str(path.get("status") or "theoretical").strip().lower()
+    if status_raw in {"success", "succeeded"}:
+        status_raw = "exploited"
+    elif status_raw in {"failed", "error", "partial"}:
+        status_raw = "attempted"
+
+    # Resolve display names for the endpoints
+    source = str(path.get("source") or "").strip()
+    target = str(path.get("target") or "").strip()
+    if not source and steps:
+        first = steps[0] if isinstance(steps[0], dict) else {}
+        details = first.get("details") if isinstance(first, dict) else {}
+        if isinstance(details, dict):
+            source = str(details.get("from") or "").strip()
+    if not target and steps:
+        last = steps[-1] if isinstance(steps[-1], dict) else {}
+        details = last.get("details") if isinstance(last, dict) else {}
+        if isinstance(details, dict):
+            target = str(details.get("display_to") or details.get("to") or "").strip()
+    source_is_placeholder = not source
+    target_is_placeholder = not target
+    if source_is_placeholder:
+        source = "an unprivileged foothold"
+    if target_is_placeholder:
+        target = "the target principal"
+
+    # Collect unique technique labels in path order
+    try:
+        from adscan_internal.pro.reporting.attack_path_narratives import (
+            format_relation_label,
+        )
+        label_fn = format_relation_label
+    except Exception:
+        def label_fn(s: str) -> str:  # type: ignore[misc]
+            return str(s)
+
+    seen: set[str] = set()
+    techniques: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        rel = step.get("action") or step.get("relation") or step.get("type")
+        if not rel:
+            continue
+        lbl = label_fn(str(rel))
+        if lbl.lower() in seen:
+            continue
+        seen.add(lbl.lower())
+        techniques.append(lbl)
+
+    step_count = len([s for s in steps if isinstance(s, (dict, str))])
+    step_word = "step" if step_count == 1 else "steps"
+    status_phrase = _STATUS_PHRASE.get(status_raw, _STATUS_PHRASE["theoretical"])
+
+    source_phrase = source if source_is_placeholder else source
+    target_phrase = target if target_is_placeholder else target
+
+    parts: list[str] = []
+    if len(nodes) >= 2:
+        parts.append(
+            f"Starting from {source_phrase}, an attacker can reach "
+            f"{target_phrase} in {step_count} {step_word}."
+        )
+    else:
+        parts.append(f"This path targets {target_phrase}.")
+
+    if techniques:
+        if len(techniques) == 1:
+            parts.append(f"The path abuses {techniques[0]}.")
+        elif len(techniques) == 2:
+            parts.append(f"The path chains {techniques[0]} and {techniques[1]}.")
+        else:
+            head = ", ".join(techniques[:-1])
+            parts.append(f"The path chains {head}, and {techniques[-1]}.")
+
+    parts.append(f"This attack path {status_phrase}.")
+    return " ".join(parts)

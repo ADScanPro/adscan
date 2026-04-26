@@ -7,6 +7,7 @@ wordlists used across the CLI (e.g. for cracking and spraying).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Any, Mapping, Optional, Tuple
 import os
 import shutil
@@ -56,6 +57,7 @@ class WordlistService(BaseService):
             wordlists_dir = str(adscan_home / "wordlists")
 
         self.wordlists_dir = wordlists_dir
+        self._repo_wordlists_dir = Path(__file__).resolve().parents[2] / "wordlists"
         self._definitions: Dict[str, WordlistDefinition] = {}
 
         raw_defs = definitions or {
@@ -106,6 +108,123 @@ class WordlistService(BaseService):
         final_name = definition.dest.replace(".xz", "").replace(".7z", "")
         return os.path.join(self.wordlists_dir, final_name)
 
+    @staticmethod
+    def _allows_insecure_tls_fallback(url: str) -> bool:
+        """Return True when a public download may retry with insecure TLS.
+
+        Weakpass-hosted wordlists are a best-effort public dependency and may
+        be intercepted by enterprise TLS inspection appliances. For those URLs
+        we allow a curl `-k` retry after a normal verified attempt fails.
+        """
+
+        return url.startswith("https://weakpass.com/")
+
+    def _download_wordlist(self, url: str, destination: str) -> None:
+        """Download a wordlist with a verified TLS attempt first.
+
+        Args:
+            url: Source URL to download.
+            destination: Local filesystem path for the downloaded archive/file.
+
+        Raises:
+            subprocess.CalledProcessError: If both the primary download and any
+                allowed fallback fail.
+        """
+
+        clean_env = get_clean_env_for_compilation()
+        primary_command = ["curl", "-fsSL", "-o", destination, url]
+        result = subprocess.run(
+            primary_command,
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+
+        if not self._allows_insecure_tls_fallback(url):
+            raise subprocess.CalledProcessError(
+                result.returncode, primary_command, result.stdout, result.stderr
+            )
+
+        insecure_command = ["curl", "-kfsSL", "-o", destination, url]
+        insecure_result = subprocess.run(
+            insecure_command,
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if insecure_result.returncode == 0:
+            return
+
+        raise subprocess.CalledProcessError(
+            insecure_result.returncode,
+            insecure_command,
+            insecure_result.stdout,
+            insecure_result.stderr,
+        )
+
+    def _repo_source_candidates(self, definition: WordlistDefinition) -> list[Path]:
+        """Return repo-local candidate paths for a wordlist."""
+
+        final_name = Path(self._final_path_for(definition)).name
+        candidates = [
+            self._repo_wordlists_dir / final_name,
+            self._repo_wordlists_dir / definition.dest,
+        ]
+        if definition.name == "hashmob_medium_2025":
+            candidates.extend(
+                [
+                    self._repo_wordlists_dir / "hashmob.net_2025.micro.found",
+                    self._repo_wordlists_dir / "hashmob.net_2025.micro.found.7z",
+                ]
+            )
+        return candidates
+
+    def _copy_or_extract_repo_wordlist(self, definition: WordlistDefinition, final_wl_path: str) -> bool:
+        """Populate a wordlist from the repo-local `wordlists/` directory if present."""
+
+        os.makedirs(self.wordlists_dir, exist_ok=True)
+
+        for candidate in self._repo_source_candidates(definition):
+            if not candidate.exists():
+                continue
+
+            if candidate.name == Path(final_wl_path).name:
+                shutil.copy2(candidate, final_wl_path)
+                return os.path.exists(final_wl_path)
+
+            clean_env = get_clean_env_for_compilation()
+            dl_wl_path = os.path.join(self.wordlists_dir, definition.dest)
+            shutil.copy2(candidate, dl_wl_path)
+
+            if definition.extract_xz:
+                subprocess.run(
+                    ["xz", "-d", "-f", dl_wl_path],
+                    env=clean_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            if definition.extract_7z:
+                subprocess.run(
+                    ["7z", "x", "-y", f"-o{self.wordlists_dir}", dl_wl_path],
+                    env=clean_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                try:
+                    os.remove(dl_wl_path)
+                except OSError:
+                    pass
+
+            return os.path.exists(final_wl_path)
+
+        return False
+
     def ensure_wordlist_installed(self, name: str, *, fix: bool) -> bool:
         """Ensure a configured wordlist exists under ``wordlists_dir``."""
 
@@ -139,7 +258,12 @@ class WordlistService(BaseService):
                     return os.path.exists(final_wl_path)
             except Exception:  # noqa: BLE001
                 return False
+            if self._copy_or_extract_repo_wordlist(definition, final_wl_path):
+                return True
             return False
+
+        if self._copy_or_extract_repo_wordlist(definition, final_wl_path):
+            return True
 
         if not fix:
             return False
@@ -147,15 +271,8 @@ class WordlistService(BaseService):
         try:
             os.makedirs(self.wordlists_dir, exist_ok=True)
             dl_wl_path = os.path.join(self.wordlists_dir, definition.dest)
+            self._download_wordlist(definition.url, dl_wl_path)
             clean_env = get_clean_env_for_compilation()
-
-            subprocess.run(
-                ["curl", "-L", "-o", dl_wl_path, definition.url],
-                env=clean_env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
             if definition.extract_xz:
                 subprocess.run(
                     ["xz", "-d", dl_wl_path],

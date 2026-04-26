@@ -40,6 +40,7 @@ from adscan_internal.services.enumeration.network import is_computer_dc_for_doma
 from adscan_internal.services.network_preflight_service import (
     assess_target_reachability,
 )
+from adscan_internal.services.dns_resolver_service import build_root_forwarders
 from rich.prompt import Prompt, Confirm
 from rich.text import Text
 
@@ -2392,35 +2393,11 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
     # Unbound root forwarders to avoid losing host DNS once resolv.conf is updated.
     local_ns = shell._get_existing_nameservers()
     domain_forwarders, existing_root = shell._read_unbound_adscan_forward_zones()
-    public_resolvers = {
-        "1.1.1.1",
-        "1.0.0.1",
-        "8.8.8.8",
-        "8.8.4.4",
-        "9.9.9.9",
-        "149.112.112.112",
-    }
-    allow_public_dns = (
-        str(os.environ.get("ADSCAN_ALLOW_PUBLIC_DNS", "1")).strip() == "1"
+    root_forwarders = build_root_forwarders(
+        existing_root=list(existing_root or []),
+        local_nameservers=list(local_ns or []),
+        is_loopback_ip=shell._is_loopback_ip,
     )
-    root_forwarders: list[str] = []
-    for ns in (existing_root or []):
-        if (
-            ns
-            and not shell._is_loopback_ip(ns)
-            and (allow_public_dns or ns not in public_resolvers)
-            and ns not in root_forwarders
-        ):
-            root_forwarders.append(ns)
-    for ns in (local_ns or []):
-        if (
-            ns
-            and not shell._is_loopback_ip(ns)
-            and (allow_public_dns or ns not in public_resolvers)
-            and ns not in root_forwarders
-        ):
-            root_forwarders.append(ns)
-    # Do not add public resolvers by default; ADscan targets internal domains.
     print_info_debug(
         "[dns] update_resolver_for_domain: "
         f"root_forwarders={len(root_forwarders)}, "

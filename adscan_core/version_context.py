@@ -18,8 +18,12 @@ from typing import Any
 
 from adscan_core.path_utils import get_adscan_home, get_effective_user_home
 
-VERSION = "7.2.0"
+VERSION = "8.0.0"
+RUNTIME_CONTRACT_VERSION = "1"
 _LAUNCHER_VERSION_ENV = "ADSCAN_LAUNCHER_VERSION"
+_LAUNCHER_RUNTIME_CONTRACT_VERSION_ENV = "ADSCAN_LAUNCHER_RUNTIME_CONTRACT_VERSION"
+_RUNTIME_CONTRACT_VERSION_ENV = "ADSCAN_RUNTIME_CONTRACT_VERSION"
+_RUNTIME_VERSION_ENV = "ADSCAN_RUNTIME_VERSION"
 _RUNTIME_IMAGE_ENV = "ADSCAN_RUNTIME_IMAGE"
 _SOURCE_TREE_VERSION_RE = re.compile(
     r'(?ms)^\[project\].*?^\s*version\s*=\s*"([^"]+)"\s*$'
@@ -106,6 +110,16 @@ def resolve_installed_version_info() -> dict[str, str]:
         "source": "fallback_constant",
         "detected_installer": installer,
     }
+
+    runtime_env_version = (os.environ.get(_RUNTIME_VERSION_ENV) or "").strip()
+    if runtime_env_version:
+        info["version"] = runtime_env_version
+        info["source"] = f"env:{_RUNTIME_VERSION_ENV}"
+        _print_info_debug(
+            "[version] resolved from runtime version environment: "
+            f"{info['version']}"
+        )
+        return info
 
     if installer == "pipx":
         pipx_home = os.environ.get(
@@ -196,13 +210,22 @@ def get_telemetry_version_fields() -> dict[str, Any]:
     if in_container_runtime:
         fields["runtime_version"] = installed_version
         fields["runtime_version_source"] = version_source
+        fields["runtime_contract_version"] = (
+            os.getenv(_RUNTIME_CONTRACT_VERSION_ENV) or RUNTIME_CONTRACT_VERSION
+        ).strip()
         launcher_version = (os.getenv(_LAUNCHER_VERSION_ENV) or "").strip()
         if launcher_version:
             fields["launcher_version"] = launcher_version
             fields["launcher_version_source"] = f"env:{_LAUNCHER_VERSION_ENV}"
+        launcher_contract_version = (
+            os.getenv(_LAUNCHER_RUNTIME_CONTRACT_VERSION_ENV) or ""
+        ).strip()
+        if launcher_contract_version:
+            fields["launcher_runtime_contract_version"] = launcher_contract_version
     else:
         fields["launcher_version"] = installed_version
         fields["launcher_version_source"] = version_source
+        fields["launcher_runtime_contract_version"] = RUNTIME_CONTRACT_VERSION
 
     _print_info_debug(
         "[version] telemetry fields: "
@@ -210,6 +233,8 @@ def get_telemetry_version_fields() -> dict[str, Any]:
         f"adscan_version_source={fields.get('adscan_version_source')!r}, "
         f"launcher_version={fields.get('launcher_version')!r}, "
         f"runtime_version={fields.get('runtime_version')!r}, "
+        f"launcher_runtime_contract_version={fields.get('launcher_runtime_contract_version')!r}, "
+        f"runtime_contract_version={fields.get('runtime_contract_version')!r}, "
         f"runtime_image={fields.get('runtime_image')!r}, "
         f"installer={fields.get('adscan_detected_installer')!r}, "
         f"mode={fields.get('version_context_mode')!r}"
@@ -226,6 +251,7 @@ def clear_version_context_caches() -> None:
 
 __all__ = [
     "VERSION",
+    "RUNTIME_CONTRACT_VERSION",
     "detect_installer",
     "resolve_installed_version_info",
     "get_installed_version",

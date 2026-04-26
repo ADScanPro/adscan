@@ -17,6 +17,7 @@ import sys
 import traceback
 
 from adscan_internal import telemetry
+from adscan_core.rich_output import strip_sensitive_markers
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_error_debug,
@@ -436,8 +437,8 @@ class BloodHoundService(BaseService):
         Returns:
             Node properties dict when found, otherwise None.
         """
-        domain_clean = (domain or "").strip()
-        user_clean = (username or "").strip()
+        domain_clean = strip_sensitive_markers(str(domain or "")).strip()
+        user_clean = strip_sensitive_markers(str(username or "")).strip()
         if not domain_clean or "." not in domain_clean or not user_clean:
             return None
 
@@ -902,9 +903,22 @@ class BloodHoundService(BaseService):
         *,
         user: Optional[str] = None,
         users: Optional[List[str]] = None,
+        enabled_only: bool = True,
         scan_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Get password last change data for one user or the full domain."""
+        """Get password last change data for one user or the full domain.
+
+        Args:
+            domain: Domain to query.
+            user: Optional single SAM account name to query.
+            users: Optional batch of SAM account names to query.
+            enabled_only: When true, restrict results to enabled users. Keep this
+                enabled for normal user workflows; krbtgt checks may disable it.
+            scan_id: Optional scan identifier for progress events.
+
+        Returns:
+            BloodHound password-last-change records.
+        """
         self._emit_progress(
             scan_id=scan_id,
             phase="bloodhound_user_enumeration",
@@ -917,6 +931,7 @@ class BloodHoundService(BaseService):
                 domain,
                 user=user,
                 users=users,
+                enabled_only=enabled_only,
             )
             self._emit_progress(
                 scan_id=scan_id,
@@ -930,6 +945,7 @@ class BloodHoundService(BaseService):
                     "domain": domain,
                     "user": user,
                     "users_count": len(users) if users else None,
+                    "enabled_only": enabled_only,
                     "count": len(records),
                 },
             )
@@ -1208,24 +1224,31 @@ class BloodHoundService(BaseService):
             scan_id=scan_id,
             phase="bloodhound_group_enumeration",
             progress=0.0,
-            message=f"Querying group memberships for {username}",
+            message=(
+                f"Querying group memberships for "
+                f"{strip_sensitive_markers(str(username or '')).strip()}"
+            ),
         )
 
         try:
-            groups = self.client.get_user_groups(domain, username, recursive)
+            domain_clean = strip_sensitive_markers(str(domain or "")).strip()
+            username_clean = strip_sensitive_markers(str(username or "")).strip()
+            groups = self.client.get_user_groups(
+                domain_clean, username_clean, recursive
+            )
 
             self._emit_progress(
                 scan_id=scan_id,
                 phase="bloodhound_group_enumeration",
                 progress=1.0,
-                message=f"User {username} belongs to {len(groups)} group(s)",
+                message=f"User {username_clean} belongs to {len(groups)} group(s)",
             )
 
             self.logger.info(
                 f"Retrieved {len(groups)} groups for user",
                 extra={
-                    "domain": domain,
-                    "username": username,
+                    "domain": domain_clean,
+                    "username": username_clean,
                     "recursive": recursive,
                     "count": len(groups),
                 },
@@ -1234,9 +1257,15 @@ class BloodHoundService(BaseService):
             return groups
 
         except Exception as e:
+            domain_clean = strip_sensitive_markers(str(domain or "")).strip()
+            username_clean = strip_sensitive_markers(str(username or "")).strip()
             self.logger.exception(
                 "Failed to get user groups from BloodHound",
-                extra={"domain": domain, "username": username, "error": str(e)},
+                extra={
+                    "domain": domain_clean,
+                    "username": username_clean,
+                    "error": str(e),
+                },
             )
             self._emit_progress(
                 scan_id=scan_id,
@@ -1246,7 +1275,11 @@ class BloodHoundService(BaseService):
             )
             raise BloodHoundServiceError(
                 "Failed to retrieve user groups from BloodHound",
-                details={"domain": domain, "username": username, "error": str(e)},
+                details={
+                    "domain": domain_clean,
+                    "username": username_clean,
+                    "error": str(e),
+                },
             ) from e
 
     def get_sessions(

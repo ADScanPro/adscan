@@ -84,13 +84,18 @@ ARG LIGOLO_NG_VERSION=0.8.3
 ARG MEDUSA_COMMIT=fef1e1f0ee91f6108a5a48d3b3c11dc4df40b122
 ARG FREERDP_VERSION=3.24.1
 ARG FREERDP_COMMIT=b6e770ccba87c58ffd0a55366fef33361798e39c
+ARG ADSCAN_RUNTIME_CONTRACT_VERSION="1"
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ENV ADSCAN_HOME=/opt/adscan \
     HOME=/opt/adscan \
+    ADSCAN_RUNTIME_CONTRACT_VERSION=${ADSCAN_RUNTIME_CONTRACT_VERSION} \
     XDG_CONFIG_HOME=/opt/adscan/.config \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/adscan/ms-playwright \
     PATH="/opt/adscan/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+RUN mkdir -p /opt/adscan
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -213,6 +218,33 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     && printf '%s\n' 'libnvidia-opencl.so.1' > /etc/OpenCL/vendors/nvidia.icd \
     && rm -rf /var/lib/apt/lists/*
 
+RUN printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if curl "$@"; then' \
+  '  exit 0' \
+  'else' \
+  '  status=$?' \
+  'fi' \
+  'if [[ "$status" -ne 60 ]]; then' \
+  '  exit "$status"' \
+  'fi' \
+  'echo "warning: curl TLS verification failed; retrying with insecure fallback (-k)" >&2' \
+  'exec curl -k "$@"' \
+  > /usr/local/bin/adscan-curl \
+  && chmod +x /usr/local/bin/adscan-curl
+
+# Install the browser revision expected by the Python Playwright package bundled
+# into the PRO binary. The Debian chromium package remains installed as a
+# fallback and for workflows that call Chromium directly.
+RUN set -eux; \
+  python3 -m venv /tmp/playwright-installer; \
+  /tmp/playwright-installer/bin/python -m pip install --no-cache-dir --upgrade pip; \
+  /tmp/playwright-installer/bin/python -m pip install --no-cache-dir playwright==1.57.0; \
+  PLAYWRIGHT_BROWSERS_PATH=/opt/adscan/ms-playwright \
+    /tmp/playwright-installer/bin/python -m playwright install chromium; \
+  rm -rf /tmp/playwright-installer
+
 # Codex CLI (official ChatGPT plan sign-in path for Plus/Pro subscriptions).
 # Installed globally so `ask login codex` and `ask` can use `codex` directly.
 RUN set -eux; \
@@ -223,6 +255,8 @@ RUN set -eux; \
 RUN mkdir -p /opt/adscan/{bin,tools,tool_venvs,wordlists,logs,fonts} /workspaces \
   && fc-cache -f \
   && chmod -R 0777 /opt/adscan /workspaces
+
+COPY wordlists/ /opt/adscan/wordlists/
 
 COPY --from=john_builder /opt/adscan/tools/john/run /opt/adscan/tools/john/run
 
@@ -248,7 +282,7 @@ RUN set -eux; \
   \
   python3 -m venv /opt/adscan/tool_venvs/netexec/venv; \
   pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python -U pip; \
-  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python "git+https://github.com/Pennyw0rth/NetExec.git@f187717"; \
+  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python "git+https://github.com/Pennyw0rth/NetExec.git@73ccf0d"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/certipy/venv; \
   pip_retry /opt/adscan/tool_venvs/certipy/venv/bin/python -U pip; \
@@ -261,10 +295,6 @@ RUN set -eux; \
   python3 -m venv /opt/adscan/tool_venvs/bloodhound-ce-py/venv; \
   pip_retry /opt/adscan/tool_venvs/bloodhound-ce-py/venv/bin/python -U pip; \
   pip_retry /opt/adscan/tool_venvs/bloodhound-ce-py/venv/bin/python "bloodhound-ce==1.9.1"; \
-  \
-  python3 -m venv /opt/adscan/tool_venvs/weakpass/venv; \
-  pip_retry /opt/adscan/tool_venvs/weakpass/venv/bin/python -U pip; \
-  pip_retry /opt/adscan/tool_venvs/weakpass/venv/bin/python "weakpass-lookup"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/enum-trusts/venv; \
   pip_retry /opt/adscan/tool_venvs/enum-trusts/venv/bin/python -U pip; \
@@ -291,7 +321,11 @@ RUN set -eux; \
 # External tools (git/curl)
 RUN set -eux; \
   mkdir -p /opt/adscan/tools; \
-  curl -fsSL "https://hashcat.net/files/hashcat-${HASHCAT_VERSION}.7z" -o /tmp/hashcat.7z; \
+  if ! adscan-curl -fsSL "https://hashcat.net/files/hashcat-${HASHCAT_VERSION}.7z" -o /tmp/hashcat.7z; then \
+    echo "warning: official hashcat download failed; falling back to SourceForge mirror" >&2; \
+    wget --max-redirect=10 --no-check-certificate -O /tmp/hashcat.7z \
+      "https://sourceforge.net/projects/hashcat.mirror/files/v${HASHCAT_VERSION}/hashcat-${HASHCAT_VERSION}.7z/download"; \
+  fi; \
   7z x /tmp/hashcat.7z -o/opt/adscan/tools >/dev/null; \
   test -x "/opt/adscan/tools/hashcat-${HASHCAT_VERSION}/hashcat.bin"; \
   ln -sf "/opt/adscan/tools/hashcat-${HASHCAT_VERSION}/hashcat.bin" /opt/adscan/bin/hashcat; \
@@ -300,8 +334,8 @@ RUN set -eux; \
   \
   git clone --depth 1 https://github.com/Greenwolf/ntlm_theft.git /opt/adscan/tools/ntlm_theft; \
   mkdir -p /opt/adscan/tools/firepwd; \
-  curl -fsSL https://raw.githubusercontent.com/lclevy/firepwd/refs/heads/master/firepwd.py -o /opt/adscan/tools/firepwd/firepwd.py; \
-  curl -fsSL https://raw.githubusercontent.com/lclevy/firepwd/refs/heads/master/requirements.txt -o /opt/adscan/tools/firepwd/requirements.txt; \
+  adscan-curl -fsSL https://raw.githubusercontent.com/lclevy/firepwd/refs/heads/master/firepwd.py -o /opt/adscan/tools/firepwd/firepwd.py; \
+  adscan-curl -fsSL https://raw.githubusercontent.com/lclevy/firepwd/refs/heads/master/requirements.txt -o /opt/adscan/tools/firepwd/requirements.txt; \
   python3 -m venv /opt/adscan/tool_venvs/firepwd/venv; \
   /opt/adscan/tool_venvs/firepwd/venv/bin/python -m pip install --no-cache-dir -U pip; \
   /opt/adscan/tool_venvs/firepwd/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/firepwd/requirements.txt; \
@@ -312,19 +346,19 @@ RUN set -eux; \
   /opt/adscan/tool_venvs/LSA-Reaper/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/LSA-Reaper/requirements.txt impacket; \
   \
   mkdir -p /opt/adscan/tools/PKINITtools; \
-  curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/gettgtpkinit.py -o /opt/adscan/tools/PKINITtools/gettgtpkinit.py; \
-  curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/getnthash.py -o /opt/adscan/tools/PKINITtools/getnthash.py; \
-  curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/requirements.txt -o /opt/adscan/tools/PKINITtools/requirements.txt; \
+  adscan-curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/gettgtpkinit.py -o /opt/adscan/tools/PKINITtools/gettgtpkinit.py; \
+  adscan-curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/getnthash.py -o /opt/adscan/tools/PKINITtools/getnthash.py; \
+  adscan-curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/requirements.txt -o /opt/adscan/tools/PKINITtools/requirements.txt; \
   python3 -m venv /opt/adscan/tool_venvs/PKINITtools/venv; \
   /opt/adscan/tool_venvs/PKINITtools/venv/bin/python -m pip install --no-cache-dir -U pip; \
   /opt/adscan/tool_venvs/PKINITtools/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/PKINITtools/requirements.txt; \
   \
   mkdir -p /opt/adscan/tools/kerbrute; \
-  curl -fsSL https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_amd64 -o /opt/adscan/tools/kerbrute/kerbrute; \
+  adscan-curl -fsSL https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_amd64 -o /opt/adscan/tools/kerbrute/kerbrute; \
   chmod +x /opt/adscan/tools/kerbrute/kerbrute; \
   \
   mkdir -p /opt/adscan/tools/ligolo-ng/proxy/linux-amd64; \
-  curl -fsSL \
+  adscan-curl -fsSL \
     "https://github.com/nicocha30/ligolo-ng/releases/download/v${LIGOLO_NG_VERSION}/ligolo-ng_proxy_${LIGOLO_NG_VERSION}_linux_amd64.tar.gz" \
     -o /tmp/ligolo_proxy.tar.gz; \
   tar -xzf /tmp/ligolo_proxy.tar.gz -C /opt/adscan/tools/ligolo-ng/proxy/linux-amd64 proxy; \
@@ -334,7 +368,7 @@ RUN set -eux; \
   rm -f /tmp/ligolo_proxy.tar.gz; \
   \
   mkdir -p /opt/adscan/tools/ligolo-ng/agent/windows-amd64; \
-  curl -fsSL \
+  adscan-curl -fsSL \
     "https://github.com/nicocha30/ligolo-ng/releases/download/v${LIGOLO_NG_VERSION}/ligolo-ng_agent_${LIGOLO_NG_VERSION}_windows_amd64.zip" \
     -o /tmp/ligolo_agent_windows_amd64.zip; \
   unzip -q /tmp/ligolo_agent_windows_amd64.zip agent.exe -d /opt/adscan/tools/ligolo-ng/agent/windows-amd64; \
@@ -447,7 +481,7 @@ RUN set -eux; \
     /opt/adscan/tools/windows-tools/runascs; \
   \
   # mimikatz – credential extraction (official gentilkiwi release ZIP)
-  curl -fsSL \
+  adscan-curl -fsSL \
     "https://github.com/gentilkiwi/mimikatz/releases/download/${MIMIKATZ_VERSION}/mimikatz_trunk.zip" \
     -o /tmp/mimikatz.zip; \
   unzip -p /tmp/mimikatz.zip x64/mimikatz.exe \
@@ -455,12 +489,12 @@ RUN set -eux; \
   rm /tmp/mimikatz.zip; \
   \
   # Rubeus – Kerberos attacks (Ghostpack compiled binaries mirror)
-  curl -fsSL \
+  adscan-curl -fsSL \
     "https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Rubeus.exe" \
     -o /opt/adscan/tools/windows-tools/rubeus/Rubeus.exe; \
   \
   # Certify – ADCS exploitation (Ghostpack compiled binaries mirror)
-  curl -fsSL \
+  adscan-curl -fsSL \
     "https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Certify.exe" \
     -o /opt/adscan/tools/windows-tools/certify/Certify.exe; \
   \
@@ -486,14 +520,14 @@ RUN set -eux; \
   rm -rf /tmp/Whisker; \
   \
   # Seatbelt – host security enumeration (Ghostpack compiled binaries mirror)
-  curl -fsSL \
+  adscan-curl -fsSL \
     "https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Seatbelt.exe" \
     -o /opt/adscan/tools/windows-tools/seatbelt/Seatbelt.exe; \
   \
   # SharpHound – BloodHound collection from inside the target.
   # Keep this aligned with the managed BloodHound CE version. For BH CE v8.7.0,
   # upstream pins SHARPHOUND_VERSION=v2.10.0 in their Dockerfiles.
-  curl -fsSL \
+  adscan-curl -fsSL \
     "https://github.com/SpecterOps/SharpHound/releases/download/${SHARPHOUND_VERSION}/SharpHound_${SHARPHOUND_VERSION}_windows_x86.zip" \
     -o /tmp/sharphound.zip; \
   unzip -p /tmp/sharphound.zip SharpHound.exe \
@@ -504,12 +538,12 @@ RUN set -eux; \
   # The historical GitHub release URL now returns 404 and the source tree
   # requires a larger Mono/xbuild compatibility patch set than we want inside
   # the runtime image, so use the maintained OffSec knowledge-base binary.
-  curl -fsSL "${KRBRELAYUP_URL}" \
+  adscan-curl -fsSL "${KRBRELAYUP_URL}" \
     -o /opt/adscan/tools/windows-tools/krbrelayup/KrbRelayUp.exe; \
   \
   # RunasCs – run as different user (official GitHub release ZIP)
   # Also symlinked to the legacy path so runascs_manager.py finds it.
-  curl -fsSL \
+  adscan-curl -fsSL \
     "https://github.com/antonioCoco/RunasCs/releases/download/v${RUNASCS_VERSION}/RunasCs.zip" \
     -o /tmp/runascs.zip; \
   unzip -p /tmp/runascs.zip RunasCs.exe \
@@ -524,19 +558,29 @@ RUN set -eux; \
 
 # Wordlists
 RUN set -eux; \
+  download_wordlist() { \
+    local url="$1"; \
+    local dest="$2"; \
+    if curl -fsSL "$url" -o "$dest"; then \
+      return 0; \
+    fi; \
+    case "$url" in \
+      https://weakpass.com/*) \
+        echo "warning: TLS verification failed for $url; retrying with insecure fallback (-k)" >&2; \
+        curl -kfsSL "$url" -o "$dest"; \
+        ;; \
+      *) \
+        return 1; \
+        ;; \
+    esac; \
+  }; \
   mkdir -p /opt/adscan/wordlists; \
-  curl -fsSL https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt -o /opt/adscan/wordlists/rockyou.txt; \
-  curl -fsSL https://gist.github.com/The-Viper-One/a1ee60d8b3607807cc387d794e809f0b/raw/b7d83af6a8bbb43013e04f78328687d19d0cf9a7/kerberoast_pws.xz -o /opt/adscan/wordlists/kerberoast_pws.xz; \
+  download_wordlist https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt /opt/adscan/wordlists/rockyou.txt; \
+  download_wordlist https://gist.github.com/The-Viper-One/a1ee60d8b3607807cc387d794e809f0b/raw/b7d83af6a8bbb43013e04f78328687d19d0cf9a7/kerberoast_pws.xz /opt/adscan/wordlists/kerberoast_pws.xz; \
   xz -d -c /opt/adscan/wordlists/kerberoast_pws.xz > /opt/adscan/wordlists/kerberoast_pws; \
-  curl -fsSL https://weakpass.com/download/2073/hashmob.net_2025.medium.found.7z -o /opt/adscan/wordlists/hashmob.net_2025.medium.found.7z; \
-  7z x -y -o/opt/adscan/wordlists /opt/adscan/wordlists/hashmob.net_2025.medium.found.7z; \
-  curl -fsSL https://weakpass.com/download/1938/kaonashi14M.txt.7z -o /opt/adscan/wordlists/kaonashi14M.txt.7z; \
-  7z x -y -o/opt/adscan/wordlists /opt/adscan/wordlists/kaonashi14M.txt.7z; \
   mkdir -p /usr/share/wordlists; \
   git clone --depth 1 https://github.com/insidetrust/statistically-likely-usernames.git /usr/share/wordlists/statistically-likely-usernames; \
   rm -f /opt/adscan/wordlists/kerberoast_pws.xz; \
-  rm -f /opt/adscan/wordlists/hashmob.net_2025.medium.found.7z; \
-  rm -f /opt/adscan/wordlists/kaonashi14M.txt.7z; \
   chmod -R 0777 /opt/adscan/wordlists /usr/share/wordlists/statistically-likely-usernames
 
 COPY adscan_internal/assets/wordlists/kerberos-format-inference.txt /opt/adscan/wordlists/kerberos-format-inference.txt
@@ -558,8 +602,23 @@ RUN chmod +x /usr/local/bin/adscan-entrypoint
 ###############################################################################
 FROM runtime-common AS runtime-pro
 
+ARG ADSCAN_RUNTIME_VERSION=""
+
+ENV ADSCAN_RUNTIME_LICENSE_MODE=PRO \
+    ADSCAN_RUNTIME_VERSION=${ADSCAN_RUNTIME_VERSION}
+
+# Partner tag baked at build time — identifies which partner this image was built for.
+# Passed via: docker build --build-arg ADSCAN_PARTNER_TAG=glenn-mssp-beta1
+# Empty in untagged builds (dev/CI). Used by telemetry for partner-level filtering.
+ARG ADSCAN_PARTNER_TAG=""
+ENV ADSCAN_PARTNER_TAG=${ADSCAN_PARTNER_TAG}
+
 COPY dist/adscan /usr/local/bin/adscan
-RUN chmod +x /usr/local/bin/adscan
+RUN set -eux; \
+  chmod +x /usr/local/bin/adscan; \
+  if [[ -n "${ADSCAN_RUNTIME_VERSION}" ]]; then \
+    printf '%s\n' "${ADSCAN_RUNTIME_VERSION}" > /opt/adscan/version; \
+  fi
 
 ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]
 
@@ -567,6 +626,11 @@ ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]
 # LITE target: source runtime (open-source)
 ###############################################################################
 FROM runtime-common AS runtime-lite
+
+ARG ADSCAN_RUNTIME_VERSION=""
+
+ENV ADSCAN_RUNTIME_LICENSE_MODE=LITE \
+    ADSCAN_RUNTIME_VERSION=${ADSCAN_RUNTIME_VERSION}
 
 # Runtime Python dependencies for source-mode ADscan CLI.
 RUN set -eux; \
@@ -609,6 +673,7 @@ RUN set -eux; \
     textual==0.80.1 \
     "redis>=5.0.0,<5.3.0" \
     weasyprint>=60.0 \
+    playwright==1.57.0 \
     jinja2>=3.0; \
   runtime_python="$(readlink -f /opt/adscan/venv/bin/python)"; \
   setcap cap_net_bind_service+ep "${runtime_python}"
@@ -639,5 +704,10 @@ RUN printf '%s\n' \
   'exec /opt/adscan/venv/bin/python /opt/adscan-src/adscan.py "$@"' \
   > /usr/local/bin/adscan \
   && chmod +x /usr/local/bin/adscan
+
+RUN set -eux; \
+  if [[ -n "${ADSCAN_RUNTIME_VERSION}" ]]; then \
+    printf '%s\n' "${ADSCAN_RUNTIME_VERSION}" > /opt/adscan/version; \
+  fi
 
 ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]

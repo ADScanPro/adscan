@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
+from adscan_core.version_context import RUNTIME_CONTRACT_VERSION
 from adscan_launcher.output import (
     print_info_debug,
     print_warning,
@@ -767,6 +768,8 @@ def build_adscan_run_command(
             "ADSCAN_CONTAINER_RUNTIME=1",
             "-e",
             "ADSCAN_OFFICIAL_LAUNCHER=1",
+            "-e",
+            f"ADSCAN_LAUNCHER_RUNTIME_CONTRACT_VERSION={RUNTIME_CONTRACT_VERSION}",
             "-e",
             f"ADSCAN_RUNTIME_IMAGE={cfg.image}",
             "-e",

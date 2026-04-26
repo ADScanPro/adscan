@@ -118,8 +118,8 @@ def _log_netexec_attempt_result(proc: subprocess.CompletedProcess[str]) -> None:
     failed Kerberos or NTLM attempt that triggered the retry.
     """
     try:
-        exit_code, stdout_count, stderr_count, duration_text = summarize_execution_result(
-            proc
+        exit_code, stdout_count, stderr_count, duration_text = (
+            summarize_execution_result(proc)
         )
         print_info_debug(
             "[netexec] Result: "
@@ -472,7 +472,10 @@ class NetExecRunner:
 
         effective_domain = domain or ctx.extract_domain(command) or ctx.default_domain
         current_timeout = timeout
-        effective_service = str(service or _extract_service_from_command(command) or "").strip().lower() or None
+        effective_service = (
+            str(service or _extract_service_from_command(command) or "").strip().lower()
+            or None
+        )
         effective_target_count = max(
             int(target_count or _infer_target_count_from_command(command) or 1),
             1,
@@ -694,7 +697,9 @@ class NetExecRunner:
                 and netexec_auth_decision is not None
                 and netexec_auth_decision.prefer_kerberos
                 and netexec_can_use_kerberos(current_command)
-                and not getattr(ctx.state_owner, "_netexec_kerberos_first_attempted", False)
+                and not getattr(
+                    ctx.state_owner, "_netexec_kerberos_first_attempted", False
+                )
             ):
                 kerberos_first_command = build_netexec_kerberos_command(current_command)
                 if kerberos_first_command and kerberos_first_command != current_command:
@@ -734,9 +739,7 @@ class NetExecRunner:
                     if not delegated_ticket_refresh_attempted:
                         current_env = kwargs.get("env")
                         normalized_env = (
-                            dict(current_env)
-                            if isinstance(current_env, dict)
-                            else None
+                            dict(current_env) if isinstance(current_env, dict) else None
                         )
                         refreshed, refreshed_command, refreshed_env = (
                             self._attempt_delegated_ticket_refresh(
@@ -829,7 +832,10 @@ class NetExecRunner:
                             "new_ntlm_status=likely_disabled "
                             "action=recorded"
                         )
-                        if posture_update is not None and posture_update.should_notify_user:
+                        if (
+                            posture_update is not None
+                            and posture_update.should_notify_user
+                        ):
                             _notify_ntlm_disabled_prioritize_kerberos(
                                 domain=effective_domain,
                                 protocol=effective_service,
@@ -856,7 +862,10 @@ class NetExecRunner:
                         kerberos_retry_command = build_netexec_kerberos_command(
                             current_command
                         )
-                        if kerberos_retry_command and kerberos_retry_command != current_command:
+                        if (
+                            kerberos_retry_command
+                            and kerberos_retry_command != current_command
+                        ):
                             setattr(
                                 ctx.state_owner,
                                 "_netexec_ntlm_disabled_kerberos_retry_attempted",
@@ -873,7 +882,12 @@ class NetExecRunner:
                             current_command = kerberos_retry_command
                             needs_retry = True
                             break
-                    if proc.returncode == 0 and combined_output.strip():
+                    if (
+                        proc.returncode == 0
+                        and combined_output.strip()
+                        and not output_indicates_ntlm_disabled(combined_output)
+                        and "[+]" in combined_output
+                    ):
                         record_ntlm_enabled_signal(
                             getattr(ctx.state_owner, "domains_data", None),
                             domain=effective_domain,
@@ -899,7 +913,9 @@ class NetExecRunner:
                 else:
                     has_clock_skew = "KRB_AP_ERR_SKEW" in combined_output
                     has_wrong_realm = "KDC_ERR_WRONG_REALM" in combined_output
-                    has_connection_reset = _has_connection_reset_by_peer(combined_output)
+                    has_connection_reset = _has_connection_reset_by_peer(
+                        combined_output
+                    )
                     kerberos_ntlm_fallback_attempted = getattr(
                         ctx.state_owner,
                         "_netexec_kerberos_first_ntlm_fallback_attempted",
@@ -915,8 +931,13 @@ class NetExecRunner:
                         )
                         and output_indicates_kerberos_auth_failure(combined_output)
                     ):
-                        ntlm_fallback_command = build_netexec_ntlm_command(current_command)
-                        if ntlm_fallback_command and ntlm_fallback_command != current_command:
+                        ntlm_fallback_command = build_netexec_ntlm_command(
+                            current_command
+                        )
+                        if (
+                            ntlm_fallback_command
+                            and ntlm_fallback_command != current_command
+                        ):
                             setattr(
                                 ctx.state_owner,
                                 "_netexec_kerberos_first_ntlm_fallback_attempted",
@@ -1250,10 +1271,7 @@ class NetExecRunner:
                     _log_attempt_once()
                     break
 
-                if (
-                    has_connection_reset
-                    and " -k" in f" {current_command} "
-                ):
+                if has_connection_reset and " -k" in f" {current_command} ":
                     connection_reset_fallback_attempted = getattr(
                         ctx.state_owner,
                         "_netexec_connection_reset_ntlm_fallback_attempted",

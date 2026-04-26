@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 import json
 
+from adscan_core.rich_output import strip_sensitive_markers
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services import attack_graph_core
 from adscan_internal.services.attack_step_support_registry import (
@@ -32,6 +33,7 @@ from adscan_internal.services.attack_step_support_registry import (
 # The graph + snapshot are sent to each worker once via the pool initializer;
 # only the per-task username string is pickled per dispatch.
 # ---------------------------------------------------------------------------
+
 
 def _read_principal_workers() -> int:
     try:
@@ -104,6 +106,7 @@ class SampledDebugLogger:
             f"{self.prefix} suppressed {self._suppressed} additional per-path "
             f"debug line(s) for {self.summary_label}"
         )
+
 
 # Per-worker state for principal parallelism.
 _PW_GRAPH: dict[str, Any] = {}
@@ -275,7 +278,10 @@ def _run_parallel_principals(
                 filter_shortest_paths,
             ),
         ) as pool:
-            futures = {pool.submit(_compute_paths_for_principal_worker, u): u for u in principals}
+            futures = {
+                pool.submit(_compute_paths_for_principal_worker, u): u
+                for u in principals
+            }
             for future in concurrent.futures.as_completed(futures):
                 records = future.result()
                 all_records.extend(records)
@@ -363,6 +369,7 @@ def prepare_membership_snapshot(
     user_to_groups: dict[str, set[str]] = {}
     computer_to_groups: dict[str, set[str]] = {}
     group_to_parents: dict[str, set[str]] = {}
+    group_labels: set[str] = set()
     label_to_sid: dict[str, str] = {}
     sid_to_label: dict[str, str] = {}
     domain_sid: str | None = None
@@ -376,6 +383,8 @@ def prepare_membership_snapshot(
         label = _canonical_membership_label(domain, _canonical_node_label(node))
         if not label:
             continue
+        if _node_kind(node) == "Group":
+            group_labels.add(label)
         props = (
             node.get("properties") if isinstance(node.get("properties"), dict) else {}
         )
@@ -409,9 +418,6 @@ def prepare_membership_snapshot(
                         }
                         if label_match and rid in preferred_rids:
                             preferred_domain_sid = candidate_sid
-        if _node_kind(node) == "User" and _node_is_high_value(node):
-            tier0_users.add(label)
-
     for edge in edges:
         if not isinstance(edge, dict):
             continue
@@ -458,6 +464,7 @@ def prepare_membership_snapshot(
             group: sorted(parents, key=str.lower)
             for group, parents in sorted(group_to_parents.items())
         },
+        "group_labels": sorted(group_labels, key=str.lower),
         "tier0_users": sorted(tier0_users, key=str.lower),
         "label_to_sid": label_to_sid,
         "sid_to_label": sid_to_label,
@@ -484,7 +491,7 @@ def _membership_label_to_name(label: str) -> str:
 
 
 def _normalize_account(value: str) -> str:
-    name = (value or "").strip()
+    name = strip_sensitive_markers(str(value or "")).strip()
     if "\\" in name:
         name = name.split("\\", 1)[1]
     if "@" in name:
@@ -849,7 +856,11 @@ def build_group_member_index(
     group_to_parents = snapshot.get("group_to_parents")
 
     has_users = isinstance(user_to_groups, dict) and bool(user_to_groups)
-    has_computers = include_computers and isinstance(computer_to_groups, dict) and bool(computer_to_groups)
+    has_computers = (
+        include_computers
+        and isinstance(computer_to_groups, dict)
+        and bool(computer_to_groups)
+    )
 
     if not has_users and not has_computers:
         return {}, {}, False
@@ -890,7 +901,9 @@ def build_group_member_index(
                 continue
             groups_to_add = {group_label}
             groups_to_add.update(
-                _expand_group_ancestors(domain, group_label, parents_map, ancestor_cache)
+                _expand_group_ancestors(
+                    domain, group_label, parents_map, ancestor_cache
+                )
             )
             for ancestor in groups_to_add:
                 index.setdefault(ancestor, set()).add(principal_label)
@@ -1152,8 +1165,10 @@ def apply_affected_user_metadata(
             if sid:
                 label_sid_map[canonical_label] = sid
 
-    user_group_members, computer_group_members, has_principals = build_group_member_index(
-        snapshot, domain, exclude_tier0=True, include_computers=True
+    user_group_members, computer_group_members, has_principals = (
+        build_group_member_index(
+            snapshot, domain, exclude_tier0=True, include_computers=True
+        )
     )
     if not has_principals:
         return records
@@ -1220,7 +1235,9 @@ def apply_affected_user_metadata(
                 # collapse heuristic: collapse only when the next group has multiple
                 # principals (avoid collapsing single-member groups).
                 next_user_count = len(user_group_members.get(group_label, set()))
-                next_computer_count = len(computer_group_members.get(group_label, set()))
+                next_computer_count = len(
+                    computer_group_members.get(group_label, set())
+                )
                 if next_user_count + next_computer_count > 1:
                     stripped_record, stripped_count = _strip_leading_relations(
                         current, relations_to_strip={"MemberOf"}
@@ -1325,7 +1342,9 @@ def minimize_display_paths(
         set(user_to_groups.keys()) if isinstance(user_to_groups, dict) else set()
     )
     computer_principal_labels = (
-        set(computer_to_groups.keys()) if isinstance(computer_to_groups, dict) else set()
+        set(computer_to_groups.keys())
+        if isinstance(computer_to_groups, dict)
+        else set()
     )
 
     def canonical_label(value: str) -> str:
@@ -1376,7 +1395,9 @@ def minimize_display_paths(
 
     def is_membership_principal(label: str) -> bool:
         canonical = canonical_label(label)
-        return canonical in user_principal_labels or canonical in computer_principal_labels
+        return (
+            canonical in user_principal_labels or canonical in computer_principal_labels
+        )
 
     # When scope is not explicitly supplied (legacy callers), default to an empty
     # string so that scope-gated minimizations (leading_memberof, domain-only) are
@@ -1632,7 +1653,9 @@ def _minimize_display_record_by_leading_memberof(
         and len(nodes) >= 3
         and str(rels[0] or "").strip().lower() == "memberof"
     ):
-        return _strip_display_record_prefix(record, start_node_index=1, reason="leading_memberof")
+        return _strip_display_record_prefix(
+            record, start_node_index=1, reason="leading_memberof"
+        )
     return record
 
 
@@ -1717,9 +1740,12 @@ def _inject_memberof_edges_from_snapshot(
         snapshot.get("group_to_parents") if isinstance(snapshot, dict) else {}
     )
     ancestor_cache: dict[str, set[str]] = {}
-    resolved_node_id_by_label = node_id_by_label or _build_node_id_index_by_canonical_label(
-        runtime_graph,
-        domain=domain,
+    resolved_node_id_by_label = (
+        node_id_by_label
+        or _build_node_id_index_by_canonical_label(
+            runtime_graph,
+            domain=domain,
+        )
     )
 
     injected = 0
@@ -1838,7 +1864,9 @@ def _build_attack_potential_node_ids(
 
     user_to_groups = snapshot.get("user_to_groups")
     computer_to_groups = snapshot.get("computer_to_groups")
-    if not isinstance(user_to_groups, dict) and not isinstance(computer_to_groups, dict):
+    if not isinstance(user_to_groups, dict) and not isinstance(
+        computer_to_groups, dict
+    ):
         return result
 
     for node_id, node in nodes_map.items():
@@ -2048,15 +2076,15 @@ def compute_display_paths_for_start_node(
                 _inject_memberof_edges_from_snapshot(
                     runtime_graph,
                     domain,
-                snapshot,
-                principal_node_ids={start_node_id},
-                recursive=False,
-                node_id_by_label=(
-                    materialized_artifacts.get("node_id_by_label")
-                    if isinstance(materialized_artifacts, dict)
-                    else None
-                ),
-            )
+                    snapshot,
+                    principal_node_ids={start_node_id},
+                    recursive=False,
+                    node_id_by_label=(
+                        materialized_artifacts.get("node_id_by_label")
+                        if isinstance(materialized_artifacts, dict)
+                        else None
+                    ),
+                )
         else:
             _inject_memberof_edges_from_snapshot(
                 runtime_graph,
@@ -2293,7 +2321,9 @@ def compute_display_paths_for_principals(
         if parallel_result is not None:
             all_records = parallel_result
         else:
-            print_info_debug("[principals-dfs] parallel failed, falling back to sequential")
+            print_info_debug(
+                "[principals-dfs] parallel failed, falling back to sequential"
+            )
             n_workers = 0  # fall through to sequential
 
     if n_workers < 2:

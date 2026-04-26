@@ -67,6 +67,7 @@ class BloodHoundClient(ABC):
         domain: str,
         user: Optional[str] = None,
         users: Optional[List[str]] = None,
+        enabled_only: bool = True,
     ) -> List[Dict]:
         """Get password last change information"""
         raise NotImplementedError

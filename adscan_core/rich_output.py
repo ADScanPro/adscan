@@ -1359,6 +1359,31 @@ def _log_to_file(level: int, message: str) -> None:
         logger.log(level, message)
 
 
+def _build_persisted_message(
+    message: Union[str, Text],
+    items: Optional[List[Union[str, Text]]] = None,
+) -> str:
+    """Build one plain-text file log message from Rich output inputs.
+
+    Normal operator-facing print helpers render directly to the console and
+    telemetry console. To keep workspace/global log files useful in normal mode,
+    we also persist a plain-text version of the same message to file-only
+    handlers without duplicating console output.
+
+    Args:
+        message: Primary message body.
+        items: Optional bullet items shown underneath the primary message.
+
+    Returns:
+        Plain-text representation suitable for file logging.
+    """
+    parts = [_extract_plain_text(message)]
+    if items:
+        for item in items:
+            parts.append(f"- {_extract_plain_text(item)}")
+    return "\n".join(part for part in parts if part)
+
+
 def _print_logger_format_fallback(
     level_name: str, message: Union[str, Text], level_color: str = "blue"
 ) -> None:
@@ -1508,6 +1533,8 @@ def print_info(
             if telemetry_console is not None:
                 telemetry_console.print()
 
+    _log_to_file(logging.INFO, _build_persisted_message(message, items))
+
 
 def print_info_verbose(message: Union[str, Text], panel: bool = False, icon: str = "ℹ"):
     """Print verbose informational message (only if verbose or debug mode enabled).
@@ -1570,7 +1597,7 @@ def print_info_verbose(message: Union[str, Text], panel: bool = False, icon: str
             f"verbose={_verbose_mode}, debug={_debug_mode}"
         )
         try:
-            from adscan_internal import logging_config as _logging_config  # type: ignore
+            from . import logging_config as _logging_config
 
             record = logger.makeRecord(
                 logger.name,
@@ -1861,7 +1888,7 @@ def print_cypher_query(query: str) -> None:
 
     # Always persist to file handlers regardless of debug mode
     try:
-        from adscan_internal import logging_config as _logging_config  # type: ignore
+        from . import logging_config as _logging_config
 
         _logger = _get_logger()
         record = _logger.makeRecord(
@@ -1999,6 +2026,8 @@ def print_success(
             if telemetry_console is not None:
                 telemetry_console.print()
 
+    _log_to_file(logging.INFO, _build_persisted_message(message, items))
+
 
 def print_success_verbose(
     message: Union[str, Text], panel: bool = False, icon: str = "✓"
@@ -2029,7 +2058,7 @@ def print_success_verbose(
             f"verbose={_verbose_mode}, debug={_debug_mode}"
         )
         try:
-            from adscan_internal import logging_config as _logging_config  # type: ignore
+            from . import logging_config as _logging_config
 
             record = logger.makeRecord(
                 logger.name,
@@ -2223,6 +2252,8 @@ def print_warning(
             if telemetry_console is not None:
                 telemetry_console.print()
 
+    _log_to_file(logging.WARNING, _build_persisted_message(message, items))
+
 
 def print_warning_verbose(
     message: Union[str, Text], panel: bool = False, icon: str = "⚠"
@@ -2249,7 +2280,7 @@ def print_warning_verbose(
     # We still want these messages persisted to the log files.
     if not (_verbose_mode or _debug_mode):
         try:
-            from adscan_internal import logging_config as _logging_config  # type: ignore
+            from . import logging_config as _logging_config
 
             record = logger.makeRecord(
                 logger.name,
@@ -2429,6 +2460,8 @@ def print_error(
             if telemetry_console is not None:
                 telemetry_console.print()
 
+    _log_to_file(logging.ERROR, _build_persisted_message(message, items))
+
 
 def print_error_verbose(
     message: Union[str, Text], panel: bool = False, icon: str = "✗"
@@ -2455,7 +2488,7 @@ def print_error_verbose(
     # We still want these messages persisted to the log files.
     if not (_verbose_mode or _debug_mode):
         try:
-            from adscan_internal import logging_config as _logging_config  # type: ignore
+            from . import logging_config as _logging_config
 
             record = logger.makeRecord(
                 logger.name,
@@ -2575,7 +2608,7 @@ def _log_exception_to_file(
 
     logger = _get_logger()
     try:
-        from adscan_internal import logging_config as _logging_config  # type: ignore
+        from . import logging_config as _logging_config
 
         record = logger.makeRecord(
             logger.name,
@@ -4283,8 +4316,8 @@ def create_domains_table(
 
     Example:
         >>> domains_data = {
-        ...     "example.local": {"pdc": "10.0.0.1", "auth": "password", "reachable": True},
-        ...     "test.local": {"pdc": "10.0.0.2", "auth": "hash", "reachable": False}
+        ...     "example.local": {"pdc": "10.0.0.1", "reachable": True},
+        ...     "test.local": {"pdc": "10.0.0.2", "reachable": False}
         ... }
         >>> table = create_domains_table(domains_data)
         >>> console.print(table)
@@ -4292,12 +4325,10 @@ def create_domains_table(
     table = create_styled_table(title=title)
     table.add_column("Domain", style=f"bold {ADSCAN_PRIMARY}", no_wrap=True)
     table.add_column("PDC", style="cyan")
-    table.add_column("Auth", justify="center")
     table.add_column("Reachable", justify="center")
 
     for domain, data in domains_data.items():
         pdc = data.get("pdc", "N/A")
-        auth = data.get("auth", "N/A")
 
         # Mark sensitive data
         marked_domain = mark_sensitive(domain, "domain")
@@ -4318,16 +4349,6 @@ def create_domains_table(
         else:
             marked_pdc = pdc
 
-        # Determine auth icon and color
-        if auth == "password":
-            auth_display = "[green]🔐 Password[/green]"
-        elif auth == "hash":
-            auth_display = "[yellow]🔑 Hash[/yellow]"
-        elif auth == "auth":
-            auth_display = "[green]✓ Authenticated[/green]"
-        else:
-            auth_display = "[dim]○ Unauthenticated[/dim]"
-
         reachable = data.get("reachable")
         if reachable is True:
             reachable_display = "[green]✓ Reachable[/green]"
@@ -4336,7 +4357,7 @@ def create_domains_table(
         else:
             reachable_display = "[dim]? Unknown[/dim]"
 
-        table.add_row(marked_domain, marked_pdc, auth_display, reachable_display)
+        table.add_row(marked_domain, marked_pdc, reachable_display)
 
     return table
 
@@ -5127,71 +5148,142 @@ def print_attack_paths_summary(
 ) -> None:
     """Render attack paths in a clear, compact summary.
 
-    When ``show_sections=True`` the table is split into Tier-0, High-Value,
-    and Pivot sections. Paths must already be grouped in that order by the
-    caller.
+    When ``show_sections=True`` the table is split into ADscan outcome
+    sections such as direct domain control, compromise enablers,
+    high-impact privileges, and pivots.
     """
     from rich.table import Table
     from rich.text import Text
     from adscan_internal.services.adcs_path_display import resolve_adcs_display_target
+    from adscan_internal.services.attack_step_support_registry import (
+        TARGET_OUTCOME_SECTION_ORDER,
+        TARGET_OUTCOME_SECTION_STYLES,
+        build_path_execution_priority_key,
+        describe_path_target_outcome,
+        get_path_target_outcome_class,
+    )
 
     if not paths:
         return
 
-    total = len(paths)
+    def _collect_path_choke_points(steps: list[object]) -> list[dict[str, object]]:
+        found: list[dict[str, object]] = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            details = step.get("details")
+            if not isinstance(details, dict):
+                continue
+            if not bool(details.get("is_choke_point")):
+                continue
+            found.append(details)
+        return found
+
+    def _choke_point_rank(details: dict[str, object]) -> tuple[int, int, int]:
+        directness = str(details.get("choke_point_directness") or "").strip().lower()
+        severity = str(details.get("severity") or "").strip().lower()
+        blast_radius = details.get("blast_radius")
+        severity_rank = (
+            3
+            if severity == "critical"
+            else 2
+            if severity == "high"
+            else 1
+            if severity == "medium"
+            else 0
+        )
+        directness_rank = 2 if directness == "direct" else 1 if directness == "indirect" else 0
+        blast_rank = blast_radius if isinstance(blast_radius, int) and blast_radius > 0 else 0
+        return severity_rank, directness_rank, blast_rank
+
+    def _path_choke_summary(path: Dict[str, object]) -> dict[str, object] | None:
+        steps = path.get("steps", [])
+        if not isinstance(steps, list):
+            return None
+        choke_points = _collect_path_choke_points(steps)
+        if not choke_points:
+            return None
+        ranked = sorted(
+            choke_points,
+            key=lambda details: _choke_point_rank(details),
+            reverse=True,
+        )
+        top = ranked[0]
+        blast_radius = top.get("blast_radius")
+        return {
+            "count": len(choke_points),
+            "top": top,
+            "severity_rank": _choke_point_rank(top)[0],
+            "directness_rank": _choke_point_rank(top)[1],
+            "blast_radius": blast_radius if isinstance(blast_radius, int) and blast_radius > 0 else 0,
+        }
+
+    def _path_sort_key(path: Dict[str, object]) -> tuple[int, ...]:
+        choke_summary = _path_choke_summary(path)
+        if choke_summary is None:
+            choke_presence = 0
+            severity_rank = 0
+            blast_radius = 0
+        else:
+            choke_presence = 1
+            severity_rank = int(choke_summary.get("severity_rank") or 0)
+            blast_radius = int(choke_summary.get("blast_radius") or 0)
+        path_length = path.get("length")
+        path_length_rank = path_length if isinstance(path_length, int) and path_length >= 0 else 0
+        base = build_path_execution_priority_key(path)
+        return (
+            *base[:5],
+            -choke_presence,
+            -severity_rank,
+            -blast_radius,
+            base[5],
+            base[6],
+            base[7],
+            path_length_rank,
+            base[9],
+            base[10],
+        )
+
+    ordered_paths = sorted(paths, key=_path_sort_key)
+    total = len(ordered_paths)
     show_count = min(max_display, total)
-
-    visible = paths[:show_count]
-
-    def _target_priority_class(path: Dict[str, object]) -> str:
-        value = str(path.get("target_priority_class") or "").strip().lower()
-        if value in {"tierzero", "highvalue", "pivot"}:
-            return value
-        if bool(path.get("is_tier_zero")):
-            return "tierzero"
-        if bool(path.get("target_is_high_value")):
-            return "highvalue"
-        return "pivot"
+    visible = ordered_paths[:show_count]
 
     total_by_class = (
         {
-            "tierzero": sum(1 for p in paths if _target_priority_class(p) == "tierzero"),
-            "highvalue": sum(1 for p in paths if _target_priority_class(p) == "highvalue"),
-            "pivot": sum(1 for p in paths if _target_priority_class(p) == "pivot"),
+            outcome: sum(
+                1 for p in ordered_paths if get_path_target_outcome_class(p) == outcome
+            )
+            for outcome in TARGET_OUTCOME_SECTION_ORDER
         }
         if show_sections
-        else {"tierzero": 0, "highvalue": 0, "pivot": 0}
+        else {outcome: 0 for outcome in TARGET_OUTCOME_SECTION_ORDER}
     )
     visible_by_class = (
         {
-            "tierzero": sum(1 for p in visible if _target_priority_class(p) == "tierzero"),
-            "highvalue": sum(1 for p in visible if _target_priority_class(p) == "highvalue"),
-            "pivot": sum(1 for p in visible if _target_priority_class(p) == "pivot"),
+            outcome: sum(
+                1 for p in visible if get_path_target_outcome_class(p) == outcome
+            )
+            for outcome in TARGET_OUTCOME_SECTION_ORDER
         }
         if show_sections
-        else {"tierzero": 0, "highvalue": 0, "pivot": 0}
+        else {outcome: 0 for outcome in TARGET_OUTCOME_SECTION_ORDER}
     )
     visible_classes = [
-        priority_class
-        for priority_class in ("tierzero", "highvalue", "pivot")
-        if visible_by_class[priority_class] > 0
+        outcome
+        for outcome in TARGET_OUTCOME_SECTION_ORDER
+        if visible_by_class[outcome] > 0
     ]
 
     summary_text = Text()
     if show_sections:
-        for idx, (label, icon, style_key) in enumerate(
-            (
-                ("Tier-0", "🔥", "error"),
-                ("High-Value", "🎯", "warning"),
-                ("Pivot", "⚠", "info"),
-            )
-        ):
-            priority_class = ("tierzero", "highvalue", "pivot")[idx]
+        for idx, outcome in enumerate(TARGET_OUTCOME_SECTION_ORDER):
+            label, icon, style_key = TARGET_OUTCOME_SECTION_STYLES[outcome]
             if idx > 0:
                 summary_text.append("   ", style="dim")
             summary_text.append(f"{icon} {label}: ", style="bold white")
-            visible_count = visible_by_class[priority_class]
-            total_count = total_by_class[priority_class]
+            visible_count = visible_by_class[outcome]
+            total_count = total_by_class[outcome]
             count_label = (
                 f"{visible_count}/{total_count}"
                 if 0 < visible_count < total_count
@@ -5238,6 +5330,109 @@ def print_attack_paths_summary(
             return mark_sensitive(name, "hostname")
         return mark_sensitive(name, "user")
 
+    def _format_choke_point_badge(details: dict[str, object]) -> Text:
+        directness = str(details.get("choke_point_directness") or "").strip().lower()
+        blast_radius = details.get("blast_radius")
+        badge = Text()
+        label = (
+            "CHOKE: Direct"
+            if directness == "direct"
+            else "CHOKE: Indirect"
+            if directness == "indirect"
+            else "CHOKE"
+        )
+        style = (
+            BRAND_COLORS["error"]
+            if directness == "direct"
+            else BRAND_COLORS["warning"]
+            if directness == "indirect"
+            else BRAND_COLORS["info"]
+        )
+        badge.append(label, style=f"bold {style}")
+        if isinstance(blast_radius, int) and blast_radius > 1:
+            badge.append(f" x{blast_radius}", style=f"bold {style}")
+        return badge
+
+    def _render_top_choke_points_panel(paths_to_render: list[Dict[str, object]]) -> None:
+        aggregate: dict[tuple[str, str, str], dict[str, object]] = {}
+        for path in paths_to_render:
+            steps = path.get("steps", [])
+            if not isinstance(steps, list):
+                continue
+            for details in _collect_path_choke_points(steps):
+                source = str(details.get("from") or "").strip()
+                target = str(details.get("to") or "").strip()
+                choke_type = str(details.get("choke_point_type") or "").strip().lower() or "transition"
+                if not source or not target:
+                    continue
+                key = (source, target, choke_type)
+                blast_radius = details.get("blast_radius")
+                blast_value = blast_radius if isinstance(blast_radius, int) and blast_radius > 0 else 0
+                ranked = _choke_point_rank(details)
+                current = aggregate.get(key)
+                if current is None:
+                    aggregate[key] = {
+                        "source": source,
+                        "target": target,
+                        "choke_type": choke_type,
+                        "details": details,
+                        "occurrences": 1,
+                        "max_blast_radius": blast_value,
+                        "rank": ranked,
+                    }
+                    continue
+                current["occurrences"] = int(current.get("occurrences") or 0) + 1
+                current["max_blast_radius"] = max(int(current.get("max_blast_radius") or 0), blast_value)
+                if ranked > tuple(current.get("rank") or (0, 0, 0)):
+                    current["details"] = details
+                    current["rank"] = ranked
+        if not aggregate:
+            return
+
+        ranked_items = sorted(
+            aggregate.values(),
+            key=lambda item: (
+                tuple(item.get("rank") or (0, 0, 0)),
+                int(item.get("max_blast_radius") or 0),
+                int(item.get("occurrences") or 0),
+            ),
+            reverse=True,
+        )
+        summary = Text()
+        summary.append("Top choke points: ", style="bold white")
+        for idx, item in enumerate(ranked_items[:3], start=1):
+            if idx > 1:
+                summary.append("   ", style="dim")
+            details = item["details"]
+            summary.append(f"{idx}. ", style="dim")
+            summary.append_text(_format_choke_point_badge(details))
+            summary.append("  ", style="dim")
+            summary.append(
+                _mark_path_node(str(item.get("source") or "")),
+                style=BRAND_COLORS["info"],
+            )
+            summary.append(" → ", style="dim")
+            summary.append(
+                _mark_path_node(str(item.get("target") or "")),
+                style=BRAND_COLORS["warning"],
+            )
+            blast_radius = int(item.get("max_blast_radius") or 0)
+            occurrences = int(item.get("occurrences") or 0)
+            if blast_radius > 0:
+                summary.append(f"  blast {blast_radius}", style=f"bold {BRAND_COLORS['warning']}")
+            if occurrences > 1:
+                summary.append(f"  seen in {occurrences} path(s)", style="dim")
+        print_panel(
+            summary,
+            title="⚠ Choke Point Priorities",
+            border_style=BRAND_COLORS["warning"],
+            padding=(0, 2),
+            expand=True,
+            spacing="after",
+        )
+
+    _render_top_choke_points_panel(visible)
+
     table = Table(
         title=f"Attack Paths ({show_count})",
         title_style=f"bold {BRAND_COLORS['success']}",
@@ -5258,10 +5453,6 @@ def print_attack_paths_summary(
     format_node_label, _, format_relation_display, _ = (
         _get_attack_path_narrative_formatters()
     )
-    from adscan_internal.services.attack_step_support_registry import (
-        describe_path_compromise_semantics,
-    )
-
     def _format_inline_chain(
         nodes: list[object],
         rels: list[object],
@@ -5374,7 +5565,7 @@ def print_attack_paths_summary(
             return Text("Disabled", style=BRAND_COLORS["error"])
         return Text("", style="dim")
 
-    for idx, path in enumerate(paths[:show_count], start=1):
+    for idx, path in enumerate(visible, start=1):
         nodes = path.get("nodes", [])
         rels = path.get("relations", [])
         steps = path.get("steps", [])
@@ -5390,14 +5581,19 @@ def print_attack_paths_summary(
         if basis_primary:
             path_str.append("\n", style="dim")
             path_str.append(basis_primary, style="dim")
+        choke_points = _collect_path_choke_points(steps)
+        if choke_points:
+            path_str.append("\n", style="dim")
+            for cp_idx, details in enumerate(choke_points[:2], start=1):
+                if cp_idx > 1:
+                    path_str.append("  ", style="dim")
+                path_str.append_text(_format_choke_point_badge(details))
         length = path.get("length", len(rels))
         status = str(path.get("status") or "theoretical")
 
         affected_cell = ""
         target_cell = ""
-        path_type_cell = describe_path_compromise_semantics(
-            [str(rel) for rel in rels if str(rel or "").strip()]
-        )
+        path_type_cell = describe_path_target_outcome(path)
         state_cell = Text("", style="dim")
         meta = path.get("meta") if isinstance(path, dict) else None
         if isinstance(meta, dict):
@@ -5414,13 +5610,13 @@ def print_attack_paths_summary(
             state_cell = _format_target_state_cell(meta)
         exec_cell = _format_exec_cell(meta if isinstance(meta, dict) else None)
 
-        priority_class = _target_priority_class(path)
-        row_style = "dim" if priority_class == "pivot" else ""
+        outcome_class = get_path_target_outcome_class(path)
+        row_style = "dim" if outcome_class == "pivot" else ""
         idx_style = (
             BRAND_COLORS["error"]
-            if priority_class == "tierzero"
+            if outcome_class == "direct_compromise"
             else BRAND_COLORS["warning"]
-            if priority_class == "highvalue"
+            if outcome_class == "followup_terminal"
             else None
         )
         idx_cell: str | Text = (
@@ -5440,8 +5636,8 @@ def print_attack_paths_summary(
         end_section = (
             show_sections
             and idx < show_count
-            and priority_class != _target_priority_class(paths[idx])
-            and priority_class in visible_classes
+            and outcome_class != get_path_target_outcome_class(visible[idx])
+            and outcome_class in visible_classes
         )
         table.add_row(*row, style=row_style, end_section=end_section)
 
@@ -5456,14 +5652,18 @@ def _fallback_format_attack_path_node_label(label: str, domain: str) -> str:
     value = str(label or "").strip()
     if not value:
         return "N/A"
+    domain_value = str(domain or "").strip().lower()
 
     if "\\" in value:
         value = value.split("\\", 1)[1].strip()
 
     if "@" in value:
         left, _, right = value.partition("@")
-        if right and right.strip().lower() == str(domain or "").strip().lower():
+        if right and right.strip().lower() == domain_value:
             return left.strip() or value
+    if domain_value and value.lower().endswith(f".{domain_value}"):
+        host = value[: -(len(domain_value) + 1)].split(".", 1)[0].strip()
+        return host or value
 
     return value
 
@@ -5766,6 +5966,31 @@ def print_attack_path_detail(
             return Text(status, style=f"bold {BRAND_COLORS['error']}")
         return Text(status, style="dim")
 
+    def _render_choke_point_summary(step_details: dict[str, object]) -> None:
+        if not bool(step_details.get("is_choke_point")):
+            return
+        summary = Text()
+        summary.append("Choke Point: ", style="bold white")
+        directness = str(step_details.get("choke_point_directness") or "").strip().lower()
+        if directness == "direct":
+            summary.append("Direct transition", style=BRAND_COLORS["error"])
+        elif directness == "indirect":
+            summary.append("Indirect transition", style=BRAND_COLORS["warning"])
+        else:
+            summary.append("Privilege transition", style=BRAND_COLORS["info"])
+        blast_radius = step_details.get("blast_radius")
+        if isinstance(blast_radius, int) and blast_radius > 0:
+            summary.append("  ", style="dim")
+            summary.append(
+                f"blast radius {blast_radius}",
+                style=BRAND_COLORS["warning"],
+            )
+        reason = str(step_details.get("choke_point_reason") or "").strip()
+        if reason:
+            summary.append("  ", style="dim")
+            summary.append(reason, style="dim")
+        _get_console().print(summary)
+
     header = Text()
     header.append("Attack Path", style="bold white")
     if index is not None:
@@ -5813,6 +6038,17 @@ def print_attack_path_detail(
             style=BRAND_COLORS["info"],
         )
         _get_console().print(effort_summary)
+
+    choke_step_details = [
+        step.get("details")
+        for step in path.get("steps", [])
+        if isinstance(step, dict)
+        and isinstance(step.get("details"), dict)
+        and bool(step.get("details", {}).get("is_choke_point"))
+    ]
+    for details in choke_step_details[:3]:
+        if isinstance(details, dict):
+            _render_choke_point_summary(details)
 
     meta = path.get("meta") if isinstance(path.get("meta"), dict) else {}
     if isinstance(meta, dict):
@@ -6294,6 +6530,19 @@ def _format_attack_step_details(step_details: object) -> str:
     if not isinstance(step_details, dict):
         return ""
     fields: list[str] = []
+    if bool(step_details.get("is_choke_point")):
+        directness = str(step_details.get("choke_point_directness") or "").strip().lower()
+        blast_radius = step_details.get("blast_radius")
+        choke_label = (
+            "choke=direct"
+            if directness == "direct"
+            else "choke=indirect"
+            if directness == "indirect"
+            else "choke=yes"
+        )
+        if isinstance(blast_radius, int) and blast_radius > 0:
+            choke_label += f" blast={blast_radius}"
+        fields.append(choke_label)
     from_node = step_details.get("from")
     if isinstance(from_node, str) and from_node:
         from_display = (
