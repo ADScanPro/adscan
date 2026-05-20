@@ -44,7 +44,7 @@ dependencies = [
 dev = [
     "badldap>=0.7.5,<0.8",
     "kerbad>=0.5.9",
-    "impacket==0.13.0",
+    "impacket==0.13.1",
     "pytest>=8.0,<9.0",
     # pytest-timeout converts hung tests into explicit failures with a
     # stack trace at the deadline instead of letting them stall CI for
@@ -65,7 +65,7 @@ dev = [
 cli = [
     "badldap>=0.7.5,<0.8",
     "kerbad>=0.5.9",
-    "impacket==0.13.0",
+    "impacket==0.13.1",
     "aiosmb>=0.4.9",
     "aardwolf>=0.2.13",
     "pypykatz>=0.6.10",
