@@ -32,7 +32,7 @@ classifiers = [
     "Topic :: System :: Networking",
 ]
 dependencies = [
-    "rich>=13.0,<14.0",
+    "rich>=13.0,<16.0",
     "requests>=2.31.0,<3.0",
     "packaging>=23.0,<26.0",
     "certifi>=2023.0.0",
