@@ -89,7 +89,7 @@ cli = [
     "pydantic-settings>=2.4.0",
     "selenium>=4.28.0,<5.0",
     "textual>=0.80.0",
-    "redis>=5.0.0,<5.3.0",
+    "redis>=5.0.0,<7.1.0",
     "winacl==0.1.9",
 ]
 
