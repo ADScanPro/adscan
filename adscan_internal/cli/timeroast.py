@@ -38,7 +38,15 @@ from adscan_internal.workspaces import domain_relpath, domain_subpath
 from adscan_internal.workspaces.computers import count_enabled_computer_accounts
 
 
-_MONTH_SECONDS = 30 * 24 * 60 * 60
+# Default machine-account password rotation interval. Microsoft default is 30
+# days. The real per-domain value is the GPO "Domain member: Maximum machine
+# account password age" (registry Netlogon\Parameters\MaximumPasswordAge) — a
+# MEMBER-side setting, NOT a domain LDAP attribute, so it cannot be read from the
+# DC the way the user-password maxPwdAge can. Almost no domain changes it, so the
+# 30-day default is used for all three rotation heuristics below (manual-early
+# window, rotation-stale threshold, and the missed-rotation deadline). If a future
+# collector ever recovers the GPO value, thread it in here as the single source.
+_MACHINE_PASSWORD_ROTATION_SECONDS = 30 * 24 * 60 * 60
 _MIN_MEANINGFUL_PASSWORD_CHANGE_GAP_SECONDS = 5 * 60
 _DEFAULT_MAX_RESULTS = 250
 _CANDIDATE_ARTIFACT = "timeroast_candidates.json"
@@ -142,6 +150,9 @@ class TimeroastCandidate:
     is_high_value: bool
     is_tier_zero: bool
     operating_system: str | None = None
+    lastlogon: int = 0  # epoch seconds of last authentication (0 = unknown)
+    confidence: str = "medium"  # high | medium: durability of the (crackable) password
+    signals: tuple[str, ...] = ()  # terse table tags (verbose explanations stay in `reasons`)
 
 
 def _classify_candidate_value(row: dict[str, Any]) -> tuple[str, bool, bool]:
@@ -188,13 +199,88 @@ def _format_epoch_utc(value: int | None) -> str:
         return str(value)
 
 
+def _ad_filetime_to_epoch(value: object) -> int | None:
+    """Convert an AD FILETIME (100ns since 1601) to epoch seconds.
+
+    ``lastLogonTimestamp`` reaches the candidate row as a raw FILETIME (unlike
+    pwdLastSet/whenCreated which the graph service pre-converts). A plausible
+    epoch value is passed through unchanged so the helper is idempotent.
+    """
+    try:
+        ft = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+    if ft <= 0:
+        return None
+    if ft >= 100_000_000_000_000:  # FILETIME magnitude (~1e17), not epoch seconds
+        return int(ft / 10_000_000 - 11_644_473_600)
+    return ft
+
+
+def _timeroast_confidence(
+    *,
+    cond_manual_early_change: bool,
+    cond_rotation_stale: bool,
+    lastlogon_epoch: int | None,
+    pwdlastset_epoch: int | None,
+    rotation_seconds: int = _MACHINE_PASSWORD_ROTATION_SECONDS,
+) -> tuple[str, str | None]:
+    """Confidence that the password is a DURABLE, crackable (non-rotating) one.
+
+    A manual/weak machine password only persists if the account does NOT
+    auto-rotate (an auto-rotating host re-randomises within ~30d). Crucially, an
+    active rotating host's pwdLastSet stays under ~30d (it rotates as soon as the
+    age crosses the interval). So merely "logged on recently + pwd >30d" is too
+    loose: a host last seen 40d ago is really off (frozen pwd), and a pwd 31d old
+    may just be mid-cycle. The rigorous test for "active but NOT rotating" is that
+    the host AUTHENTICATED after its rotation was due yet the password is still
+    the old one:
+
+    - ``high``  — manual-early set (non-default), OR ``lastLogon > pwdLastSet + 30d``
+      (the host was up past its rotation deadline and did not rotate → rotation
+      effectively disabled (legacy/manual) → the password persists → real target).
+    - ``medium`` — stale password but no PROOF of a missed rotation: the change is
+      recent (deadline not yet clearly passed) or the host has not been seen since
+      the deadline (may be an auto-rotated value frozen at power-off). Kept for
+      coverage, lower crack odds.
+
+    Never filters — coverage is preserved; this only ranks/annotates.
+    """
+    if cond_manual_early_change:
+        return "high", "Password set manually shortly after creation (non-default → likely crackable)"
+    # cond_rotation_stale path: HIGH only when the host proved it was up AFTER its
+    # monthly rotation was due (pwdLastSet + 30d) and still did not rotate.
+    if (
+        lastlogon_epoch is not None
+        and pwdlastset_epoch
+        and lastlogon_epoch > pwdlastset_epoch + rotation_seconds
+    ):
+        return "high", (
+            "Host authenticated AFTER its monthly rotation was due but the password "
+            "did not change — rotation effectively disabled (legacy/manual); the "
+            "password persists → durable crackable target"
+        )
+    return "medium", (
+        "Stale password but no proof of a missed rotation (recent change, or host "
+        "not seen since the rotation was due) — may be an auto-rotated value frozen "
+        "at power-off; kept for coverage, lower crack probability"
+    )
+
+
 def _build_timeroast_candidate(
     row: dict[str, Any],
     *,
     domain: str,
     current_epoch: int,
+    rotation_seconds: int = _MACHINE_PASSWORD_ROTATION_SECONDS,
 ) -> TimeroastCandidate | None:
-    """Normalize one BloodHound row into a Timeroast candidate."""
+    """Normalize one BloodHound row into a Timeroast candidate.
+
+    ``rotation_seconds`` is the domain's machine-password rotation interval — the
+    real GPO value when recovered from SYSVOL (stashed in domains_data), else the
+    30d default. It drives the manual-early window, the rotation-stale threshold,
+    and the missed-rotation deadline so a non-default domain is scored correctly.
+    """
     if not isinstance(row, dict):
         return None
 
@@ -208,14 +294,14 @@ def _build_timeroast_candidate(
         and pwdlastset > whencreated
         and (pwdlastset - whencreated)
         >= _MIN_MEANINGFUL_PASSWORD_CHANGE_GAP_SECONDS
-        and (pwdlastset - whencreated) < _MONTH_SECONDS
+        and (pwdlastset - whencreated) < rotation_seconds
     )
     has_post_creation_password_change = pwdlastset > whencreated
     cond_rotation_stale = (
         has_post_creation_password_change
         and (pwdlastset - whencreated)
         >= _MIN_MEANINGFUL_PASSWORD_CHANGE_GAP_SECONDS
-        and (current_epoch - pwdlastset) > _MONTH_SECONDS
+        and (current_epoch - pwdlastset) > rotation_seconds
     )
     if not cond_manual_early_change and not cond_rotation_stale:
         return None
@@ -253,6 +339,32 @@ def _build_timeroast_candidate(
         reasons.append("Password has not rotated in the last 30 days")
     value_tier, is_high_value, is_tier_zero = _classify_candidate_value(row)
 
+    # Score how DURABLE (and thus genuinely crackable) the password is, using the
+    # collected lastLogonTimestamp. Active-but-non-rotating ⇒ high; stale+inactive
+    # ⇒ medium (possibly a frozen auto-rotated value). Never filters — coverage
+    # preserved; this only ranks/annotates the candidate.
+    lastlogon_epoch = _ad_filetime_to_epoch(row.get("lastlogon"))
+    confidence, confidence_reason = _timeroast_confidence(
+        cond_manual_early_change=cond_manual_early_change,
+        cond_rotation_stale=cond_rotation_stale,
+        lastlogon_epoch=lastlogon_epoch,
+        pwdlastset_epoch=pwdlastset,
+        rotation_seconds=rotation_seconds,
+    )
+    if confidence_reason:
+        reasons.append(confidence_reason)
+
+    # Terse, scannable table tags (the verbose explanations stay in `reasons`,
+    # which the JSON artifact keeps). "host active" is shown only on the
+    # rotation-stale path — manual-early already implies a recent change.
+    signals: list[str] = []
+    if confidence == "high" and cond_rotation_stale and not cond_manual_early_change:
+        signals.append("host active")
+    if cond_manual_early_change:
+        signals.append("manual set post-create")
+    if cond_rotation_stale:
+        signals.append("no rotation >30d")
+
     change_gap_days = None
     if pwdlastset > whencreated:
         change_gap_days = (pwdlastset - whencreated) / 86400.0
@@ -271,7 +383,27 @@ def _build_timeroast_candidate(
         is_high_value=is_high_value,
         is_tier_zero=is_tier_zero,
         operating_system=str(row.get("operatingsystem") or "").strip() or None,
+        lastlogon=lastlogon_epoch or 0,
+        confidence=confidence,
+        signals=tuple(signals),
     )
+
+
+def _resolve_rotation_seconds(shell: TimeroastShell, domain: str) -> int:
+    """Return the domain's machine-password rotation interval in seconds.
+
+    Prefers the real GPO value recovered from SYSVOL (stashed by the collector in
+    ``domains_data[domain]['machine_pwd_rotation_days']``); falls back to the 30d
+    default. A disabled-rotation domain leaves the key unset on purpose, so the
+    default keeps the threshold low and every stale machine stays a candidate.
+    """
+    try:
+        days = (shell.domains_data.get(domain, {}) or {}).get("machine_pwd_rotation_days")
+        if isinstance(days, (int, float)) and days > 0:
+            return int(days) * 24 * 60 * 60
+    except Exception:  # noqa: BLE001 — best-effort, fall back to the default
+        pass
+    return _MACHINE_PASSWORD_ROTATION_SECONDS
 
 
 def _get_timeroast_candidates(
@@ -304,6 +436,7 @@ def _get_timeroast_candidates(
         return []
 
     current_epoch = int(time.time())
+    rotation_seconds = _resolve_rotation_seconds(shell, domain)
     candidates: list[TimeroastCandidate] = []
     seen_rids: set[int] = set()
     for row in raw_rows or []:
@@ -311,6 +444,7 @@ def _get_timeroast_candidates(
             row if isinstance(row, dict) else {},
             domain=domain,
             current_epoch=current_epoch,
+            rotation_seconds=rotation_seconds,
         )
         if candidate is None or candidate.rid in seen_rids:
             continue
@@ -320,7 +454,10 @@ def _get_timeroast_candidates(
     candidates.sort(
         key=lambda item: (
             0 if item.is_tier_zero else 1 if item.is_high_value else 2,
-            "Password has not rotated in the last 30 days" not in item.reasons,
+            # Durable (high-confidence) crackable passwords first within each tier —
+            # active non-rotating / manual-early beat inactive-stale (possibly frozen
+            # auto-rotated). All are kept; this only ranks (coverage preserved).
+            0 if item.confidence == "high" else 1,
             item.days_since_password_change * -1,
             item.fqdn.lower(),
         )
@@ -427,16 +564,30 @@ def _render_timeroast_candidates(
         expand=False,
     )
 
-    table = Table(show_header=True, header_style="bold cyan")
+    shown = candidates[:15]
+    show_os = any((candidate.operating_system or "").strip() for candidate in shown)
+
+    table = Table(
+        show_header=True,
+        header_style="bold cyan",
+        caption=(
+            "[dim]Priority HIGH = manual-set or active-but-not-rotating "
+            "(durable, crackable).  MED = stale but host inactive "
+            "(may be a frozen random value); kept for coverage.[/dim]"
+        ),
+        caption_justify="left",
+    )
     table.add_column("Computer", style="white")
     table.add_column("Value", style="red")
+    table.add_column("Priority", justify="center")
     table.add_column("RID", style="magenta", justify="right")
     table.add_column("Signals", style="yellow")
     table.add_column("PwdLastSet", style="cyan")
     table.add_column("Created", style="cyan")
-    table.add_column("OS", style="green")
+    if show_os:
+        table.add_column("OS", style="green")
 
-    for candidate in candidates[:15]:
+    for candidate in shown:
         value_style = (
             "[bold red]Tier Zero[/bold red]"
             if candidate.is_tier_zero
@@ -444,15 +595,25 @@ def _render_timeroast_candidates(
             if candidate.is_high_value
             else "[dim]Standard[/dim]"
         )
-        table.add_row(
+        priority = (
+            "[bold green]● HIGH[/bold green]"
+            if candidate.confidence == "high"
+            else "[dim]● MED[/dim]"
+        )
+        # Terse tags; fall back to the verbose reasons if (defensively) empty.
+        signals = " · ".join(candidate.signals) or "\n".join(candidate.reasons)
+        cells = [
             mark_sensitive(candidate.fqdn, "hostname"),
             value_style,
+            priority,
             str(candidate.rid),
-            "\n".join(candidate.reasons),
+            signals,
             _format_epoch_utc(candidate.pwdlastset),
             _format_epoch_utc(candidate.whencreated),
-            candidate.operating_system or "-",
-        )
+        ]
+        if show_os:
+            cells.append(candidate.operating_system or "-")
+        table.add_row(*cells)
 
     title = f"Timeroast Target Preview ({min(len(candidates), 15)} shown)"
     print_panel_with_table(

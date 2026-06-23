@@ -88,7 +88,22 @@ def _render_excluded_candidates_panel(
     )
 
 
-def resolve_privileged_target_user(
+def _bare_account_key(value: str) -> str:
+    """Normalize a principal to a bare lowercased account (drop DOMAIN\\, @realm).
+
+    Mirrors the logon-denied cache key normalization so caller-supplied exclusion
+    sets (stored as bare keys) match candidates returned as ``DOMAIN\\user`` or
+    ``user@realm`` sAMAccountNames. A trailing ``$`` is preserved (machine vs user).
+    """
+    v = str(value or "").strip().lower()
+    if "\\" in v:
+        v = v.rsplit("\\", 1)[-1]
+    if "@" in v:
+        v = v.split("@", 1)[0]
+    return v.strip()
+
+
+def resolve_privileged_target_candidates(
     shell: Any,
     *,
     domain: str,
@@ -96,19 +111,34 @@ def resolve_privileged_target_user(
     require_domain_admin: bool = True,
     exclude_not_delegated: bool = False,
     exclude_protected_users: bool = False,
-) -> str | None:
-    """Resolve a privileged target user and let the operator select the final account.
+    exclude_principals: set[str] | None = None,
+    exclude_principals_reason: str = "excluded",
+    render_excluded_panel: bool = True,
+) -> list[str]:
+    """Resolve the filtered privileged-target candidate list WITHOUT prompting.
+
+    Single source of the candidate enumeration + exclusion logic shared by
+    :func:`resolve_privileged_target_user` (which then prompts) and callers that
+    build their own selector — e.g. the RBCD-against-a-DC flow, which prepends
+    the DC machine account as the recommended option so the operator sees ONE
+    merged prompt instead of two (the generic DA picker followed by a separate
+    machine-account-vs-DA selector). Optionally renders the excluded-candidates
+    panel as a side effect (disable for fully silent resolution).
 
     Args:
         shell: Interactive shell object exposing optional LDAP helpers.
         domain: Target domain.
-        purpose: Short human-readable purpose shown in the selector.
+        purpose: Short human-readable purpose shown in the excluded panel.
         require_domain_admin: When True, candidates come from Domain Admins.
         exclude_not_delegated: Exclude users marked as sensitive/non-delegable.
         exclude_protected_users: Exclude members of the Protected Users group.
+        exclude_principals: Bare account keys to exclude unconditionally (e.g.
+            principals a target has already denied a network logon).
+        exclude_principals_reason: Reason shown in the excluded panel.
+        render_excluded_panel: When True, render the excluded-candidates panel.
 
     Returns:
-        Selected username, or ``None`` when no valid selection is made.
+        The filtered candidate usernames, in resolution order.
     """
     marked_domain = mark_sensitive(domain, "domain")
     candidates: list[str] = []
@@ -146,18 +176,72 @@ def resolve_privileged_target_user(
         for user in _resolve_protected_users(shell, domain):
             excluded_reasons.setdefault(user, []).append("member of Protected Users")
 
+    if exclude_principals:
+        _excluded_keys = {
+            _bare_account_key(p) for p in exclude_principals if _bare_account_key(p)
+        }
+        for candidate in candidates:
+            if _bare_account_key(candidate) in _excluded_keys:
+                excluded_reasons.setdefault(candidate, []).append(
+                    exclude_principals_reason
+                )
+
     filtered_candidates = [
         candidate
         for candidate in candidates
         if candidate.lower() not in {name.lower() for name in excluded_reasons}
     ]
 
-    if excluded_reasons:
+    if excluded_reasons and render_excluded_panel:
         _render_excluded_candidates_panel(
             domain=domain,
             purpose=purpose,
             excluded=excluded_reasons,
         )
+
+    return filtered_candidates
+
+
+def resolve_privileged_target_user(
+    shell: Any,
+    *,
+    domain: str,
+    purpose: str,
+    require_domain_admin: bool = True,
+    exclude_not_delegated: bool = False,
+    exclude_protected_users: bool = False,
+    exclude_principals: set[str] | None = None,
+    exclude_principals_reason: str = "excluded",
+) -> str | None:
+    """Resolve a privileged target user and let the operator select the final account.
+
+    Args:
+        shell: Interactive shell object exposing optional LDAP helpers.
+        domain: Target domain.
+        purpose: Short human-readable purpose shown in the selector.
+        require_domain_admin: When True, candidates come from Domain Admins.
+        exclude_not_delegated: Exclude users marked as sensitive/non-delegable.
+        exclude_protected_users: Exclude members of the Protected Users group.
+        exclude_principals: Bare account keys to exclude unconditionally (e.g.
+            principals a target has already denied a network logon — ground truth
+            from a prior ST probe, persisted so they are never re-offered).
+        exclude_principals_reason: Human-readable reason shown in the excluded
+            panel for ``exclude_principals`` entries.
+
+    Returns:
+        Selected username, or ``None`` when no valid selection is made.
+    """
+    marked_domain = mark_sensitive(domain, "domain")
+    filtered_candidates = resolve_privileged_target_candidates(
+        shell,
+        domain=domain,
+        purpose=purpose,
+        require_domain_admin=require_domain_admin,
+        exclude_not_delegated=exclude_not_delegated,
+        exclude_protected_users=exclude_protected_users,
+        exclude_principals=exclude_principals,
+        exclude_principals_reason=exclude_principals_reason,
+    )
 
     if not filtered_candidates:
         print_warning(

@@ -485,37 +485,6 @@ def _build_cifs_mount_args(
     raise HostHelperError("mount/mount.cifs not found")
 
 
-def _docker_compose_invocation() -> list[str] | None:
-    """Return the docker compose invocation prefix, or None if unavailable."""
-    if shutil_which("docker"):
-        try:
-            proc = subprocess.run(
-                ["docker", "compose", "version"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if proc.returncode == 0:
-                return ["docker", "compose"]
-        except Exception:
-            pass
-    if shutil_which("docker-compose"):
-        try:
-            proc = subprocess.run(
-                ["docker-compose", "version"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if proc.returncode == 0:
-                return ["docker-compose"]
-        except Exception:
-            pass
-    return None
-
-
 def _run_cmd(
     argv: list[str], *, timeout: int = _DEFAULT_TIMEOUT_SECONDS
 ) -> HostHelperResponse:

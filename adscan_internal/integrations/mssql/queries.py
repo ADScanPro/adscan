@@ -325,6 +325,68 @@ def xp_dirtree_unc(unc_path: str) -> str:
     return f"EXEC master..xp_dirtree '{safe_path}'"
 
 
+# ---------------------------------------------------------------------------
+# Authorization collector — read-only server-scope authorization facts
+# ---------------------------------------------------------------------------
+#
+# These three queries are the MSSQL equivalent of the ACEs the LDAP/SMB
+# collector materializes. They feed the eager ``mssql_collector`` which resolves
+# SQL-internal authorization (login -> role -> sysadmin, CONTROL SERVER) into
+# effective SQLAccess/SQLAdmin edges between AD principal/group nodes and the
+# instance host node. Derived (NOT verbatim) from
+# ``reference/MSSQLHound/internal/mssql/client.go`` (collectServerPrincipals,
+# collectServerRoleMemberships, collectServerPermissions). All three depend on
+# metadata visibility: a low-priv (CONNECT-only) login sees only its own rows;
+# ``VIEW ANY DEFINITION`` / sysadmin / securityadmin unlocks the full
+# cross-principal roster. The collector degrades by privilege accordingly.
+
+#: Full server-principal roster. ``CONVERT(VARCHAR(85), p.sid, 1)`` renders the
+#: binary SID as a ``0x...`` hex string the collector converts to ``S-1-5-...``
+#: for AD-node correlation. ``type``: S=SQL login, U=Windows user, G=Windows
+#: group, R=server role, C=cert-mapped, K=asymmetric-key-mapped, E/X=external.
+COLLECT_SERVER_PRINCIPALS = """
+SELECT
+    p.principal_id                              AS [principal_id],
+    CAST(p.name AS NVARCHAR(256))               AS [name],
+    CAST(p.type AS NVARCHAR(4))                 AS [type],
+    CAST(p.type_desc AS NVARCHAR(64))           AS [type_desc],
+    p.is_disabled                               AS [is_disabled],
+    p.is_fixed_role                             AS [is_fixed_role],
+    CONVERT(VARCHAR(85), p.sid, 1)              AS [sid]
+FROM sys.server_principals p
+WHERE p.type IN ('S', 'U', 'G', 'R', 'C', 'K', 'E', 'X')
+ORDER BY p.principal_id
+""".strip()
+
+
+#: Every server-role membership edge (member principal -> role principal). The
+#: collector walks these transitively to compute effective ``sysadmin``.
+COLLECT_SERVER_ROLE_MEMBERS = """
+SELECT
+    rm.member_principal_id                      AS [member_principal_id],
+    rm.role_principal_id                        AS [role_principal_id],
+    CAST(r.name AS NVARCHAR(256))               AS [role_name]
+FROM sys.server_role_members rm
+JOIN sys.server_principals r ON rm.role_principal_id = r.principal_id
+ORDER BY rm.member_principal_id
+""".strip()
+
+
+#: Explicit server-scope permission grants/denies. ``CONTROL SERVER`` (GRANT)
+#: is sysadmin-equivalent; the collector treats it as effective SQLAdmin.
+COLLECT_SERVER_PERMISSIONS = """
+SELECT
+    p.grantee_principal_id                      AS [grantee_principal_id],
+    CAST(p.permission_name AS NVARCHAR(128))    AS [permission_name],
+    CAST(p.state_desc AS NVARCHAR(64))          AS [state_desc],
+    CAST(p.class_desc AS NVARCHAR(64))          AS [class_desc],
+    p.major_id                                  AS [major_id]
+FROM sys.server_permissions p
+WHERE p.state_desc IN ('GRANT', 'GRANT_WITH_GRANT_OPTION', 'DENY')
+ORDER BY p.grantee_principal_id
+""".strip()
+
+
 __all__ = [
     "IDENTITY_FINGERPRINT",
     "IS_SYSADMIN",
@@ -348,4 +410,7 @@ __all__ = [
     "ENUM_SERVER_LOGINS",
     "SERVER_LEVEL_IMPERSONATION_MAP",
     "database_level_impersonation_map",
+    "COLLECT_SERVER_PRINCIPALS",
+    "COLLECT_SERVER_ROLE_MEMBERS",
+    "COLLECT_SERVER_PERMISSIONS",
 ]

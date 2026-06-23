@@ -1645,6 +1645,14 @@ class KerberosTicketService(BaseService):
     ) -> bool:
         """Synchronize local system clock with PDC.
 
+        DEPRECATED — do NOT call from new code. The single source of truth for
+        physical clock sync is ``ensure_clock_synced_fresh`` in
+        ``adscan_internal.services.dc_time`` (reached via the shell entry
+        ``do_sync_clock_with_pdc`` → ``cli.kerberos.sync_clock_with_pdc``). This
+        callback-based variant is retained only for backward compatibility and
+        has no remaining in-tree callers; route new physical-sync needs through
+        the SSOT so there is exactly one implementation.
+
         This method encapsulates the clock synchronization logic, accepting shell
         helpers as callbacks to maintain separation of concerns.
 

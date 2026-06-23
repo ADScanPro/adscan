@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from dataclasses import dataclass
@@ -144,17 +143,61 @@ def _prepare_native_kerberos_credential(
         return credential
 
     auth_domain_data = _domain_data(shell, auth_domain)
-    ccache_path = (
-        credential.ccache_path
-        or auth_domain_data.get("ccache_path")
-        or os.getenv("KRB5CCNAME", "").replace("FILE:", "").strip()
-        or None
-    )
+
+    # If the credential already carries its OWN ccache, use it directly.
+    if credential.ccache_path:
+        return CollectionCredential(
+            username=credential.username,
+            password=None,
+            use_kerberos=True,
+            ccache_path=credential.ccache_path,
+            aes_key=credential.aes_key or auth_domain_data.get("aes_key") or None,
+        )
+
+    # Otherwise mint/get a ccache for THIS EXACT principal from its stored secret
+    # (a password, or an NT hash / AES key recovered via DCSync), posture-aware
+    # (AES etype + correct salt when AES is enforced). Never fall back to another
+    # principal's active ccache (the domain's "active" ccache_path or KRB5CCNAME,
+    # which after a DA step is the DA's ticket) — doing so silently re-attributes
+    # the whole collection and its sessions to the wrong user. That was the
+    # daenerys-labelled refresh actually authenticating as administrator. This is
+    # the single-source-of-truth ensure_user_ccache exists to enforce.
+    from adscan_internal.services.kerberos_ticket_service import ensure_user_ccache
+
+    dc_ip = str(auth_domain_data.get("pdc") or "").strip() or None
+    user_ccache: str | None = None
+    try:
+        user_ccache = ensure_user_ccache(
+            shell,
+            user=credential.username,
+            domain=auth_domain,
+            credential=credential.password or None,  # None -> look up stored hash/AES
+            dc_ip=dc_ip,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "native collection: ensure_user_ccache failed for "
+            f"{mark_sensitive(credential.username, 'user')}: {exc}"
+        )
+
+    if not user_ccache:
+        # Could not mint a ccache for this exact principal. Do NOT hijack another
+        # principal's active ccache — return the original credential so the
+        # transport authenticates as THIS user via its own secret (inline TGT /
+        # NTLM), correctly attributed.
+        print_info_debug(
+            "native collection: no per-user ccache minted for "
+            f"{mark_sensitive(credential.username, 'user')}; using its own credential "
+            "(not another principal's active ccache)"
+        )
+        return credential
+
     return CollectionCredential(
         username=credential.username,
         password=None,
         use_kerberos=True,
-        ccache_path=ccache_path,
+        ccache_path=user_ccache,
         aes_key=credential.aes_key or auth_domain_data.get("aes_key") or None,
     )
 
@@ -240,6 +283,14 @@ def run_native_collection(
         )
 
         selection = prompt_collection_selection(shell, target_domain)
+        # Persist the MSSQL toggle for later re-collection triggers (e.g. the
+        # ask_for_user_privs followup re-running the collector for a new
+        # credential). The Phase-2 MSSQL collector below is gated directly on
+        # ``selection.collect_mssql``; the SMB toggles are consumed inline.
+        try:
+            domain_data["_collect_mssql"] = bool(selection.collect_mssql)
+        except Exception:  # noqa: BLE001 — selection persistence is best-effort
+            pass
 
         counters, collection_results, domain_timings = (
             CollectionOrchestrator().collect_scope(
@@ -278,11 +329,156 @@ def run_native_collection(
         _print_collection_summary_from_graph(shell, target_domain, elapsed)
         _print_collector_enrichment_panel(collector_result, target_domain)
         _persist_collector_findings(shell, target_domain, collector_result)
+        _persist_machine_pwd_rotation_interval(shell, target_domain, collector_result)
         _populate_adcs_metadata(shell, target_domain, collector_result)
+        # Unified Phase-2 reachability: now that the graph (and enabled_computers)
+        # exist, run the single nmap port scan that feeds every collector + the
+        # post-auth sweeps + the Phase-3 reachability UI. render=False (Phase 3
+        # presents from the persisted report), auto=True (no operator prompt).
+        # ADSCAN_NO_PORT_SCAN opts out → collectors keep their existing async
+        # floor and Phase 3 falls back to its legacy operator-prompted scan.
+        # Best-effort: a scan failure must never abort collection.
+        _run_phase2_port_scan(shell, target_domain)
+        # MSSQL authorization collector — Phase-2 peer that consumes the
+        # mssql/ips.txt the scan just produced. Uses the already-built
+        # CollectionCredential (incl. ccache) so the SSOT detects Kerberos
+        # correctly. Gated by the operator's collector selection.
+        if getattr(selection, "collect_mssql", True):
+            _run_phase2_mssql_collection(shell, target_domain, credential)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error(f"Native collection failed: {exc}")
     return []
+
+
+def _run_phase2_port_scan(shell: Any, target_domain: str) -> None:
+    """Run the unified Phase-2 nmap port scan that feeds every collector + sweep.
+
+    Writes ``enabled_computers.txt`` from the freshly built graph, then runs the
+    important-port scan producer (``render=False``, ``auto=True``) so every
+    ``{service}/ips.txt`` and ``network_reachability_report.json`` exist before
+    the MSSQL collector / post-auth sweeps / Phase-3 Host Inventory consume them.
+
+    The scan is additive — the SMB collector keeps its own async 445 floor inside
+    ``collect_scope`` (unchanged). Opt-out via ``ADSCAN_NO_PORT_SCAN``: the scan is
+    skipped entirely, collectors keep their existing async-connect behavior, and
+    Phase-3 Host Inventory falls back to its legacy operator-prompted scan.
+
+    Best-effort: any failure is captured and swallowed — it must never abort
+    collection.
+    """
+    import os
+
+    if os.getenv("ADSCAN_NO_PORT_SCAN"):
+        print_info_debug(
+            "[phase2-scan] ADSCAN_NO_PORT_SCAN set; skipping the unified nmap "
+            f"port scan for {mark_sensitive(target_domain, 'domain')} "
+            "(collectors fall back to their async-connect floor)."
+        )
+        return
+    try:
+        from adscan_internal.workspaces import DEFAULT_DOMAIN_LAYOUT, domain_subpath
+
+        graph = load_attack_graph(shell, target_domain)
+        hosts = [
+            _host_inventory_name(computer, target_domain)
+            for computer in get_enabled_computers(graph, target_domain)
+        ]
+        hosts = [host for host in hosts if host]
+        if not hosts:
+            print_info_debug(
+                "[phase2-scan] no enabled computers in the graph for "
+                f"{mark_sensitive(target_domain, 'domain')}; skipping port scan."
+            )
+            return
+
+        workspace_cwd = getattr(shell, "current_workspace_dir", None) or os.getcwd()
+        computers_file = domain_subpath(
+            workspace_cwd, shell.domains_dir, target_domain, "enabled_computers.txt"
+        )
+        nmap_dir = domain_subpath(
+            workspace_cwd,
+            shell.domains_dir,
+            target_domain,
+            DEFAULT_DOMAIN_LAYOUT.nmap,
+        )
+        os.makedirs(os.path.dirname(computers_file), exist_ok=True)
+        os.makedirs(nmap_dir, exist_ok=True)
+
+        # Write enabled_computers.txt directly (deduped) WITHOUT going through
+        # shell._process_computers_list, which would itself trigger the scan and
+        # the reachability render — we run the scan ourselves with render=False.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for host in hosts:
+            key = host.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(host.strip())
+        with open(computers_file, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(deduped) + "\n" if deduped else "")
+
+        print_info_debug(
+            "[phase2-scan] running unified important-port scan for "
+            f"{mark_sensitive(target_domain, 'domain')} "
+            f"({len(deduped)} enabled computers)."
+        )
+        # render=False: Phase-3 Host Inventory presents the summary from the
+        # persisted report. auto=True: no operator confirmation prompt.
+        shell.convert_hostnames_to_ips_and_scan(
+            target_domain, computers_file, nmap_dir, render=False, auto=True
+        )
+    except Exception as exc:  # noqa: BLE001 — scan failure must not abort collection
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[phase2-scan] unified port scan failed for "
+            f"{mark_sensitive(target_domain, 'domain')}: {exc}"
+        )
+
+
+def _run_phase2_mssql_collection(
+    shell: Any,
+    target_domain: str,
+    credential: "CollectionCredential",
+) -> None:
+    """Run the MSSQL authorization collector as a Phase-2 peer (after the scan).
+
+    Consumes ``mssql/ips.txt`` (produced by :func:`_run_phase2_port_scan`) and the
+    already-built :class:`CollectionCredential`. The secret is resolved
+    ccache-first (``ccache_path`` → ``password`` → ``aes_key``); the SSOT
+    (:func:`run_mssql_authorization_collection`) detects a ``.ccache`` path and
+    forces Kerberos. This fixes the prior bug where the Phase-3 wrapper read empty
+    ``shell.username`` / ``shell.password`` under ccache auth and skipped MSSQL.
+
+    Best-effort: any failure is captured and swallowed.
+    """
+    try:
+        username = (credential.username or "").strip()
+        secret = (
+            credential.ccache_path or credential.password or credential.aes_key or ""
+        )
+        if not username or not secret:
+            print_info_debug(
+                "[mssql-collector] no held credential for "
+                f"{mark_sensitive(target_domain, 'domain')}; skipping authorization "
+                "collection."
+            )
+            return
+        from adscan_internal.cli.privileges import run_mssql_authorization_collection
+
+        run_mssql_authorization_collection(
+            shell,
+            domain=target_domain,
+            username=username,
+            password=secret,
+        )
+    except Exception as exc:  # noqa: BLE001 — MSSQL collection must not abort the phase
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[mssql-collector] Phase-2 authorization collection failed for "
+            f"{mark_sensitive(target_domain, 'domain')}: {exc}"
+        )
 
 
 def _emit_collection_performance_telemetry(
@@ -371,6 +567,10 @@ def _persist_collector_findings(
         "krbtgt_age": "krbtgt_password_age",
         "machine_quota_risk": "machine_account_quota_risk",
         "obsolete_os": "obsolete_computers",
+        "stale_computer": "stale_enabled_computers",
+        "duplicate_dns_fqdn": "duplicate_computer_dns",
+        "machine_pwd_rotation_disabled": "machine_password_rotation_disabled",
+        "machine_pwd_rotation_relaxed": "machine_password_rotation_relaxed",
         "smb_v1_enabled": "smb_v1_enabled",
         "smb_signing_disabled": "smb_signing_disabled",
         "rc4_only": "rc4_only_accounts",
@@ -381,21 +581,56 @@ def _persist_collector_findings(
         vuln_key = _CAT_KEY.get(category)
         if not vuln_key:
             continue
+        details: dict[str, Any] = {
+            "count": len(findings),
+            "severity_summary": findings[0].severity if findings else "",
+            "accounts": [
+                {
+                    "samaccountname": f.samaccountname,
+                    "object_id": f.object_id,
+                    "detail": f.detail,
+                }
+                for f in findings
+            ],
+        }
+        # Surface the structured observed values (e.g. the concrete password
+        # policy knobs for ``weak_password_policy``) into the finding details
+        # so the report/web can compare observed-vs-recommended per knob.
+        # Findings without structured observation carry an empty dict.
+        observed = next(
+            (dict(f.observed) for f in findings if getattr(f, "observed", None)),
+            None,
+        )
+        if observed:
+            details["observed"] = observed
         _safe_record(
             key=vuln_key,
-            details={
-                "count": len(findings),
-                "severity_summary": findings[0].severity if findings else "",
-                "accounts": [
-                    {
-                        "samaccountname": f.samaccountname,
-                        "object_id": f.object_id,
-                        "detail": f.detail,
-                    }
-                    for f in findings
-                ],
-            },
+            details=details,
         )
+
+
+def _persist_machine_pwd_rotation_interval(shell: Any, domain: str, result: Any) -> None:
+    """Stash the recovered machine-password rotation interval into domains_data.
+
+    Lets the Timeroast threshold use the real GPO value instead of the 30d default.
+    Only stored when a GPO sets an explicit max age AND rotation is NOT disabled —
+    a disabled-rotation domain intentionally leaves it unset so the low default
+    keeps every stale machine a candidate (coverage). Best-effort.
+    """
+    try:
+        policy = getattr(result, "machine_password_policy", None)
+        if policy is None:
+            return
+        domain_data = shell.domains_data.setdefault(domain, {})
+        max_age = getattr(policy, "max_age_days", None)
+        disabled = bool(getattr(policy, "disable_password_change", False))
+        if isinstance(max_age, int) and max_age > 0 and not disabled:
+            domain_data["machine_pwd_rotation_days"] = max_age
+        else:
+            domain_data.pop("machine_pwd_rotation_days", None)
+        domain_data["machine_pwd_rotation_disabled"] = disabled
+    except Exception as exc:  # noqa: BLE001 — best-effort persistence
+        telemetry.capture_exception(exc)
 
 
 def _populate_adcs_metadata(shell: Any, domain: str, result: Any) -> None:
@@ -737,6 +972,7 @@ def _print_collector_enrichment_panel(
 
         category_labels = {
             "stale_user": "Stale enabled users (>90d no logon)",
+            "stale_computer": "Stale enabled computers (>90d no logon)",
             "pwd_never_expires": "Password never expires",
             "pwd_predates_policy": "Passwords older than current policy",
             "passwd_notreqd": "PASSWD_NOTREQD (no password required)",
@@ -745,13 +981,16 @@ def _print_collector_enrichment_panel(
             "obsolete_os": "Obsolete operating systems",
             "smb_v1_enabled": "SMBv1 protocol enabled",
             "smb_signing_disabled": "SMB signing not required",
+            "duplicate_dns_fqdn": "Duplicate computer DNS (multiple FQDNs → one IP)",
+            "machine_pwd_rotation_disabled": "Machine password rotation disabled (GPO)",
+            "machine_pwd_rotation_relaxed": "Machine password rotation relaxed (GPO)",
             "rc4_only": "RC4-only accounts",
             "weak_password_policy": "Weak password policy",
             "pwd_policy_never_modified": "Password policy never modified",
         }
         # Denominator sets for contextual X/total display.
         _USER_HYGIENE_CATS = {"stale_user", "pwd_never_expires", "pwd_predates_policy", "passwd_notreqd"}
-        _COMPUTER_HYGIENE_CATS = {"obsolete_os", "smb_signing_disabled", "smb_v1_enabled"}
+        _COMPUTER_HYGIENE_CATS = {"obsolete_os", "smb_signing_disabled", "smb_v1_enabled", "stale_computer"}
         total_enabled_users = sum(
             1 for n in result.nodes.values()
             if n.kind == "User" and n.enabled

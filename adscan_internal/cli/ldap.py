@@ -1868,6 +1868,7 @@ def _validate_ldap_anonymous_username_candidates(
         kerbrute_path=kerbrute_path,
         output_file=output_file,
         executor=executor,
+        spawn=shell._get_service_spawner(),
         scan_id=None,
         timeout=300,
     )
@@ -3244,6 +3245,7 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
         kerbrute_path=kerbrute_path,
         output_file=output_file,
         executor=executor,
+        spawn=shell._get_service_spawner(),
         scan_id=None,
         timeout=300,
     )
@@ -3478,7 +3480,7 @@ def _select_kerberos_wordlist_strategy(shell: LdapShell, domain: str) -> str | N
     strategy_rows = [
         (
             "[bold #1AA0AE]Detect format automatically[/bold #1AA0AE]",
-            "Runs a compact Kerberos probe (~30–90 s) to identify\n"
+            "Runs a Kerberos probe (may take a few minutes) to identify\n"
             "the naming convention, then generates a focused list.",
         ),
         (
@@ -3523,10 +3525,10 @@ def _select_kerberos_wordlist_strategy(shell: LdapShell, domain: str) -> str | N
 
 
 def _kerberos_auto_detect_then_build(shell: LdapShell, domain: str) -> str | None:
-    """Run the compact inference probe then build a focused wordlist from the result.
+    """Run the inference probe then build a focused wordlist from the result.
 
-    This is the "Detect format automatically" branch. It runs kerbrute with a
-    small inference wordlist, identifies the dominant naming pattern, and hands
+    This is the "Detect format automatically" branch. It runs kerbrute with an
+    inference wordlist, identifies the dominant naming pattern, and hands
     off to source selection. On failure it offers manual pattern selection or a
     custom file — never the slow general wordlist.
     """
@@ -3791,7 +3793,7 @@ def _infer_kerberos_username_pattern_via_runtime_probe(
     shell: LdapShell,
     domain: str,
 ) -> tuple[str, str | None]:
-    """Run a compact Kerberos probe to infer the dominant username format."""
+    """Run a Kerberos probe to infer the dominant username format."""
     wordlist_service = KerberosUsernameWordlistService()
     inference_wordlist = wordlist_service.get_format_inference_wordlist_path()
     metadata_path = wordlist_service.get_format_inference_metadata_path()
@@ -3836,8 +3838,10 @@ def _infer_kerberos_username_pattern_via_runtime_probe(
         kerbrute_path=kerbrute_path,
         output_file=output_file,
         executor=shell._get_service_executor(),
+        spawn=shell._get_service_spawner(),
         scan_id=None,
-        timeout=180,
+        timeout=600,
+        auth_mode=AuthMode.UNAUTHENTICATED,
     )
     ranked_patterns = wordlist_service.rank_inferred_patterns_from_candidates(users)
     if not ranked_patterns:
@@ -3849,7 +3853,7 @@ def _infer_kerberos_username_pattern_via_runtime_probe(
         else:
             print_warning(
                 f"Could not infer a username format for {marked_domain}: no valid usernames "
-                "were discovered with the compact inference list."
+                "were discovered with the inference list."
             )
         fallback_options = [
             "Choose the username format manually (Recommended)",

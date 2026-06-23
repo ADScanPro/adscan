@@ -2249,11 +2249,16 @@ def _execute_sweep_over_candidates(
         return ip
 
     if not listener.start():
+        error_code, error_detail = listener.describe_start_error()
         print_warning(
             f"[~] Skipping NTLM auth-type sweep in {marked_domain}: the shared SMB "
-            "capture listener failed to start (bind/privilege issue)."
+            f"capture listener could not start — {error_detail}"
+        )
+        print_info_debug(
+            f"NTLM sweep listener start failure: code={error_code} detail={error_detail}"
         )
         summary["sweep_skipped_reason"] = "listener_start_failed"
+        summary["listener_start_error_code"] = error_code
         return summary
 
     # Live dashboard gate. Only the "all reachable hosts" scope above the

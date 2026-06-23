@@ -88,17 +88,18 @@ class ReportShell(Protocol):
 # richer catalog provider here at import time via
 # :func:`set_finding_catalog_provider`. In LITE (PRO stripped) the provider is
 # never set and the default ``VULN_CATALOG_META`` builder is used.
-_FINDING_CATALOG_PROVIDER: Optional[Callable[[], dict[str, dict[str, str]]]] = None
+_FINDING_CATALOG_PROVIDER: Optional[Callable[[], dict[str, dict[str, Any]]]] = None
 
 
-def _build_technical_finding_catalog_from_meta() -> dict[str, dict[str, str]]:
+def _build_technical_finding_catalog_from_meta() -> dict[str, dict[str, Any]]:
     """Build the LITE-safe finding catalog from the meta slice.
 
     ``VULN_CATALOG_META`` carries ``title`` + ``severity`` for every key but no
     ``category``; the recorder defaults ``category`` to ``"General"`` (the
-    Navigator reader never consumes it).
+    Navigator reader never consumes it). The LITE slice has no rich
+    ``knowledge`` sub-object — the PRO provider supplies that when installed.
     """
-    catalog: dict[str, dict[str, str]] = {}
+    catalog: dict[str, dict[str, Any]] = {}
     for key, entry in VULN_CATALOG_META.items():
         catalog[key] = {
             "title": str(entry.get("title") or key.replace("_", " ").title()),
@@ -109,7 +110,7 @@ def _build_technical_finding_catalog_from_meta() -> dict[str, dict[str, str]]:
 
 
 def set_finding_catalog_provider(
-    provider: Optional[Callable[[], dict[str, dict[str, str]]]],
+    provider: Optional[Callable[[], dict[str, dict[str, Any]]]],
 ) -> None:
     """Install a richer finding-catalog provider (PRO-only injection seam).
 
@@ -122,7 +123,7 @@ def set_finding_catalog_provider(
     _FINDING_CATALOG_PROVIDER = provider
 
 
-def _finding_catalog() -> dict[str, dict[str, str]]:
+def _finding_catalog() -> dict[str, dict[str, Any]]:
     """Return the active finding catalog (PRO-injected if present, else meta)."""
     if _FINDING_CATALOG_PROVIDER is not None:
         try:
@@ -307,6 +308,13 @@ def record_technical_finding(
     catalog = _finding_catalog().get(key, {})
     summary = _summarize_value(value) if value is not None else {}
 
+    # Rich knowledge sub-object (description, impact, remediation, references,
+    # summary, recommended, applicable_tabs) supplied by the PRO catalog
+    # provider. Self-describing so the web (Phase 2) and report (Phase 3)
+    # consume the full per-finding knowledge directly from the artifact. LITE
+    # (meta-only catalog) yields no ``knowledge`` key — omitted cleanly.
+    knowledge = catalog.get("knowledge") if isinstance(catalog, dict) else None
+
     if finding is None:
         resolved_from_attack_graph = (
             bool(from_attack_graph) if from_attack_graph is not None else False
@@ -325,6 +333,8 @@ def record_technical_finding(
             "first_seen": now,
             "last_seen": now,
         }
+        if isinstance(knowledge, dict) and knowledge:
+            finding["knowledge"] = knowledge
         findings.append(finding)
     else:
         finding["status"] = status
@@ -335,6 +345,10 @@ def record_technical_finding(
             finding["from_attack_graph"] = bool(from_attack_graph)
         elif "from_attack_graph" not in finding:
             finding["from_attack_graph"] = False
+        # Refresh knowledge on existing findings so a catalog change reaches
+        # already-recorded findings on the next scan/replay.
+        if isinstance(knowledge, dict) and knowledge:
+            finding["knowledge"] = knowledge
 
     if summary:
         finding["details"].update(summary)
@@ -446,4 +460,52 @@ def record_exposure_score(
     report = _load_technical_report(shell)
     domain_entry = _ensure_technical_domain(report, domain)
     domain_entry["exposure_score"] = exposure
+    _save_technical_report(shell, report)
+
+
+def record_exposure_kpis(
+    shell: ReportShell,
+    domain: str,
+    *,
+    kpis: dict[str, Any],
+) -> None:
+    """Persist the exposure KPI block for *domain* into ``technical_report.json``.
+
+    Write-side single source of truth for the path-axis + user-axis blast-radius
+    KPIs (``exposure_score_service.compute_exposure_kpis``). Mirrors
+    :func:`record_exposure_score`: stamps the engine value so the JSON export
+    carries it and downstream consumers - the PDF report and ``adscan_web`` -
+    read ``domains[<domain>]["exposure_kpis"]`` instead of recomputing it.
+    Best-effort: ignores a missing/invalid payload and never raises.
+    """
+    if not domain or not isinstance(kpis, dict) or "path_axis" not in kpis:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry["exposure_kpis"] = kpis
+    _save_technical_report(shell, report)
+
+
+def record_compliance(
+    shell: ReportShell,
+    domain: str,
+    *,
+    compliance: dict[str, Any],
+) -> None:
+    """Persist the per-framework compliance coverage for *domain*.
+
+    Write-side single source of truth for the compliance block
+    (``compliance_artifact.build_compliance_artifact``). Mirrors
+    :func:`record_exposure_score`: stamps the engine value so the JSON export
+    carries it and ``adscan_web`` ingests ``domains[<domain>]["compliance"]``
+    verbatim instead of recomputing coverage from a forked catalog. The block
+    carries ``schema_version`` and a ``frameworks`` map keyed by the canonical
+    framework keys the engagement selected. Best-effort: ignores a
+    missing/invalid payload and never raises.
+    """
+    if not domain or not isinstance(compliance, dict) or "frameworks" not in compliance:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry["compliance"] = compliance
     _save_technical_report(shell, report)

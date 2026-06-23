@@ -123,7 +123,11 @@ class KerberosCredential:
 				return bytes.fromhex(self.kerberos_key_rc4)
 			if self.nt_hash:
 				return bytes.fromhex(self.nt_hash)
-			elif self.password:
+			elif self.password is not None:
+				# ``is not None`` (not truthiness): an EMPTY password ('') is a valid
+				# credential — MD4(utf-16-le('')) is the well-known empty NT hash
+				# 31d6...089c0. Treating '' as "no password" (the old ``elif
+				# self.password:``) made blank-password Kerberos auth impossible.
 				if isinstance(self.password, str):
 					pw = self.password.encode('utf-16-le')
 				elif isinstance(self.password, bytes):
@@ -137,7 +141,7 @@ class KerberosCredential:
 		elif etype == EncryptionType.DES3_CBC_SHA1:
 			if self.kerberos_key_des3:
 				return bytes.fromhex(self.kerberos_key_des3)
-			elif self.password:
+			elif self.password is not None:  # '' is a valid (empty) password
 				if not salt:
 					salt = (self.domain.upper() + self.username).encode()
 				return string_to_key(Enctype.DES3, self.password, salt).contents
@@ -147,7 +151,7 @@ class KerberosCredential:
 		elif etype == EncryptionType.DES_CBC_MD5: #etype == EncryptionType.DES_CBC_CRC or etype == EncryptionType.DES_CBC_MD4 or 
 			if self.kerberos_key_des:
 				return bytes.fromhex(self.kerberos_key_des)
-			elif self.password:
+			elif self.password is not None:  # '' is a valid (empty) password
 				if not salt:
 					salt = (self.domain.upper() + self.username).encode()
 				return string_to_key(Enctype.DES_MD5, self.password, salt).contents
@@ -159,7 +163,7 @@ class KerberosCredential:
 				return bytes.fromhex(self.kerberos_key_rc4)[:8]
 			if self.nt_hash:
 				return bytes.fromhex(self.nt_hash)[:8]
-			elif self.password:
+			elif self.password is not None:  # '' is a valid (empty) password
 				pw = self.password
 				if isinstance(self.password, str):
 					pw = self.password.encode('utf-16-le')
@@ -202,17 +206,28 @@ class KerberosCredential:
 			if self.kerberos_key_aes_128:
 				supp_enctypes[EncryptionType.AES128_CTS_HMAC_SHA1_96] = 1
 
-			if self.password:
-				supp_enctypes[EncryptionType.ARCFOUR_HMAC_MD5] = 1
+			if self.password is not None:  # '' (empty password) still derives keys
+				# AES-first ordering (ADscan vendor fix). This OrderedDict's insertion
+				# order is the client's etype PREFERENCE: get_preferred_enctype returns
+				# the first client etype that is also in the server's supported set. A
+				# plaintext password can derive AES keys (with the server salt), so AES
+				# must be preferred over RC4 here — modern KDCs enforce AES-only (RC4
+				# disabled by GPO) and reject an RC4 AS-REQ with KDC_ERR_ETYPE_NOTSUPP.
+				# Because get_preferred_enctype intersects with the server set, a legacy
+				# RC4-only DC still degrades to RC4 automatically; only the hardened
+				# AES-only case changes (RC4 -> AES), which is the whole point.
+				# (RC4 remains FIRST for the nopreauth/AS-REP-roast branch above on
+				# purpose — there the etype picks the crackable blob, not a real login.)
 				supp_enctypes[EncryptionType.AES256_CTS_HMAC_SHA1_96] = 1
 				supp_enctypes[EncryptionType.AES128_CTS_HMAC_SHA1_96] = 1
+				supp_enctypes[EncryptionType.ARCFOUR_HMAC_MD5] = 1
 				supp_enctypes[EncryptionType.DES3_CBC_SHA1] = 1
 				supp_enctypes[EncryptionType.DES_CBC_MD5] = 1
 				supp_enctypes[EncryptionType.ARCFOUR_MD4] = 1
 				#supp_enctypes[EncryptionType.DES_CBC_MD4] = 1
 				#supp_enctypes[EncryptionType.DES_CBC_CRC] = 1
 
-			if self.password or self.nt_hash or self.kerberos_key_rc4:
+			if self.password is not None or self.nt_hash or self.kerberos_key_rc4:
 				supp_enctypes[EncryptionType.ARCFOUR_HMAC_MD5] = 1
 				supp_enctypes[EncryptionType.ARCFOUR_MD4] = 1
 
@@ -260,6 +275,15 @@ class KerberosCredential:
 		k.username = principal
 		k.domain = realm
 		k.ccache = CCACHE.from_bytes(data)
+		# When the caller named a specific principal (+realm), get_tgt MUST NOT
+		# silently fall back to the "first available TGT" when that principal's
+		# TGT is absent from the ccache — that hands back a DIFFERENT principal's
+		# ticket (the $KRB5CCNAME / domain-active-ccache hijack class). Enable
+		# strict matching so get_tgt raises instead of substituting. Left False
+		# when no principal was named (principal=None means "use whatever TGT is
+		# in the ccache" — preserved for callers that intentionally do that).
+		if principal is not None and realm is not None:
+			k.ccache_spn_strict_check = True
 		return k
 
 	@staticmethod
@@ -274,7 +298,11 @@ class KerberosCredential:
 		cred.username = principal if principal is not None else kirbi.get_username()
 		cred.domain = realm if realm is not None else kirbi.kirbiobj.native['tickets'][0]['realm']
 		cred.ccache = CCACHE.from_kirbi(kirbi)
-		cred.ccache_spn_strict_check = False
+		# Strict only when the caller explicitly named a principal+realm (same
+		# anti-hijack rationale as from_ccache). When principal is None the
+		# username/domain are derived from the kirbi itself, so keep the lenient
+		# "use the kirbi's ticket" behaviour.
+		cred.ccache_spn_strict_check = principal is not None and realm is not None
 		return cred
 	
 	@staticmethod

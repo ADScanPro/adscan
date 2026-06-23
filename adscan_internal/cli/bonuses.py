@@ -26,7 +26,7 @@ real scan (``technical_report.json`` present), the playbook, checklist
 and coverage matrix re-rank their content to surface techniques actually
 observed in the engagement above the static reference catalog. The full
 catalog is preserved in a clearly-labelled "for reference" section at
-the end of each bonus, so procurement / compliance use-cases still get
+the end of each bonus, so audit / coverage use-cases still get
 the comprehensive view.
 
 When no workspace data is available, a visible warning is printed and
@@ -98,12 +98,19 @@ BONUSES: dict[str, dict[str, Any]] = {
         # Unified editorial skin — see the playbook entry above.
         "theme":    "editorial",
     },
+    # The Coverage Matrix bonus was folded into the AD Control Coverage Report:
+    # the verified-clear coverage view (sourced from the scan's
+    # ``control_evidence`` entries) IS the coverage matrix done right — it
+    # proves scope from what was actually tested, not from a static catalog.
+    # The kit slug stays ``coverage-matrix`` for back-compat (``deliver.py``
+    # ``_KIT``, ``--only coverage-matrix``, the web selection dict); only the
+    # rendered artifact changed.
     "coverage-matrix": {
-        "filename":   "Coverage_Matrix.pdf",
-        "title":      "ADscan Coverage Matrix",
-        "value":      0,  # Procurement utility — no value-stack tag.
-        "subtitle":   "Active Directory checks mapped to ATT&CK and compliance frameworks.",
-        "template":   "coverage_matrix/coverage_matrix.html",
+        "filename":   "AD_Control_Coverage_Report.pdf",
+        "title":      "AD Control Coverage Report",
+        "value":      0,  # Assurance utility — no value-stack tag.
+        "subtitle":   "The controls ADscan tested and confirmed clear in this engagement.",
+        "template":   "coverage_report/coverage_report.html",
         "theme":      "editorial",
         "is_bonus":   False,
     },
@@ -572,7 +579,7 @@ def _ctx_checklist(
 
     The template renders ``observed_groups`` (techniques actually surfaced
     by the scan, grouped by tactic) and ``reference_groups`` (the rest of
-    the catalog, for procurement / audit completeness). When no workspace
+    the catalog, for coverage / audit completeness). When no workspace
     signal is available, ``observed_groups`` is empty and the template
     falls back to rendering ``reference_groups`` only.
 
@@ -670,36 +677,28 @@ def _ctx_coverage_matrix(
     has_workspace_signal: bool = False,
     workspace_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Build the Jinja context for the ADscan Coverage Matrix.
+    """Build the Jinja context for the AD Control Coverage Report.
 
-    Produces two parallel row lists rendered by the template:
+    Sources the controls ADscan actively tested and confirmed clear from the
+    scan's ``control_evidence`` entries (``category == "Coverage"``), written
+    by ``update_report_field`` → ``record_control_evidence``. This folds the
+    legacy Coverage Matrix into a positive-assurance view driven by what was
+    actually tested, rather than a static ATT&CK reference catalog. The
+    ``observed`` / ``has_workspace_signal`` args are accepted for the uniform
+    dynamic-builder signature but unused — coverage state comes from the
+    report's control evidence, not the observed-technique set.
 
-    * ``observed_rows`` — techniques actually surfaced by the scan
-      (grouped by tactic, observed-first sort).
-    * ``reference_rows`` — the rest of the catalog for procurement /
-      compliance completeness.
-
-    The legacy ``rows`` / ``observed_rows`` / ``reference_rows`` /
-    ``frameworks`` / ``coverage_summary`` fields are preserved (strict
-    superset) so existing templates and tests keep working, plus the
-    scope-proof blocks (``scope``, ``framework_view``, ``tactic_groups``,
-    ``legend``) the upgraded "Audit Coverage & Scope Proof" template
-    consumes.
-
-    Delegates to ``coverage_databinding.build_coverage_databinding``,
-    which resolves observed techniques internally (via
-    ``bonus_workspace.get_observed_techniques``) from ``workspace_dir`` —
-    so unlike the playbook/checklist it never needs the pre-resolved
-    ``observed`` set. It ALWAYS returns a full context (never ``None``):
-    the Coverage Matrix is a valid procurement artifact even with no
-    scan (the no-scan case renders the full in-scope reference matrix).
+    Delegates to
+    ``coverage_report_databinding.build_coverage_report_databinding``, which
+    ALWAYS returns a full context (never ``None``): with no coverage evidence
+    the template renders an empty-state explainer rather than a misleading
+    empty table.
     """
-    from adscan_internal.pro.reporting.coverage_databinding import (
-        build_coverage_databinding,
+    from adscan_internal.pro.reporting.coverage_report_databinding import (
+        build_coverage_report_databinding,
     )
 
-    version = os.environ.get("ADSCAN_VERSION", "").strip() or "1.0"
-    return build_coverage_databinding(workspace_dir, version=version)
+    return build_coverage_report_databinding(workspace_dir)
 
 
 # Builders that consume workspace signal share a uniform signature

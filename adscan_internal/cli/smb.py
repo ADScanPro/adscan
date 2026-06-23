@@ -157,6 +157,7 @@ from adscan_internal.workspaces.computers import (
     resolve_domain_service_target_file,
 )
 from adscan_internal.workspaces.subpaths import domain_path, domain_relpath
+from adscan_core.output import print_empty_state
 from adscan_internal.cli.smb_shares_view import SharesViewMode, run_native_shares_view
 
 _SMB_HOST_IDENTITY_RE = re.compile(
@@ -2167,18 +2168,187 @@ def run_auth_shares(
         f"({host_count} target(s))"
     )
 
-    for host_ip in sorted(all_hosts):
+    ordered_hosts = sorted(all_hosts)
+    total_hosts = len(ordered_hosts)
+
+    # Liveness re-gate on 445 — skip hosts down since the port scan and avoid
+    # stalling the per-host loop on a hung host (mirrors the SMB privilege sweep).
+    if total_hosts > 1:
+        from adscan_internal.services.host_reachability_filter import (  # noqa: PLC0415
+            filter_reachable_hosts_sync,
+            print_reachability_summary,
+            render_no_reachable_panel,
+        )
+
+        share_reach = filter_reachable_hosts_sync(ordered_hosts, port=445)
+        print_reachability_summary(share_reach, service_label="SMB")
+        if not share_reach.reachable:
+            render_no_reachable_panel(
+                share_reach, operation_label="SMB Share Enumeration"
+            )
+            return
+        ordered_hosts = list(share_reach.reachable)
+        total_hosts = len(ordered_hosts)
+
+    # Pre-mint ONE TGT for the whole multi-host share sweep and reuse its ccache
+    # across hosts, so the secret touches the wire once instead of once per host
+    # (scale + domain-lockout protection). SSOT: sweep_credential.
+    # run_native_shares_view accepts a ``.ccache`` path in its ``credential`` slot.
+    creds = getattr(shell, "current_creds", None) or {}
+    share_auth_domain = creds.get("auth_domain") or domain
+    share_kdc_ip = ""
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+        share_kdc_ip = str(resolve_dc_ip(shell.domains_data.get(domain, {}) or {}) or "")
+    except Exception:  # noqa: BLE001
+        share_kdc_ip = ""
+    from adscan_internal.services.sweep_credential import (  # noqa: PLC0415
+        resolve_sweep_credential,
+    )
+
+    share_cred = resolve_sweep_credential(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+        auth_domain=share_auth_domain,
+        kdc_ip=share_kdc_ip or None,
+    )
+    if not share_cred.ok:
+        print_warning(
+            share_cred.abort_reason
+            or "SMB share enumeration aborted: credential pre-mint failed."
+        )
+        return
+    share_secret = share_cred.ccache_path or share_cred.password or password
+
+    # Collect every host's LIVE share view, then drive ONE consolidated premium
+    # surface (overview panel + Step 1 writable-capture + Step 2 readable-hunt)
+    # off the current user's effective access. The per-host inline action menu
+    # (``_offer_share_credential_hunt``) is replaced by the consolidated flow so
+    # the operator gets a single coherent surface across all hosts instead of a
+    # blocking per-host menu. This path is ALWAYS live per-user — it never reads
+    # the collector graph.
+    view_sets: list[Any] = []
+    for index, host_ip in enumerate(ordered_hosts, start=1):
+        # Per-host progress so the operator knows more hosts follow before the
+        # consolidated surface renders.
+        print_info(
+            f"SMB share enumeration host {index}/{total_hosts}: "
+            f"{mark_sensitive(host_ip, 'host')}"
+        )
         view_set = run_native_shares_view(
             shell,
             domain=domain,
             host=host_ip,
             mode=SharesViewMode.LIVE,
             username=username,
+            credential=share_secret,
+        )
+        if view_set is not None:
+            view_sets.append(view_set)
+
+    _render_live_share_exposure_surface(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+        view_sets=view_sets,
+    )
+
+
+def _render_live_share_exposure_surface(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    view_sets: list[Any],
+) -> None:
+    """Render the consolidated premium share-exposure surface (live per-user).
+
+    Builds renderer rows from the LIVE per-host :class:`ShareViewSet` objects
+    (current user's effective access, share ACL intersected with NTFS via SMB2
+    MaximalAccess — already computed by the native probe), renders the premium
+    overview panel with an "Effective for" column, then runs the shared Step 1
+    (writable-share capture) and Step 2 (readable-share credential hunt)
+    substeps. The substeps are source-agnostic: they operate on rows / explicit
+    targets and carry the audit/CTF capture defaults unchanged.
+    """
+    from adscan_internal.cli.smb_live_share_rows import build_live_share_rows  # noqa: PLC0415
+    from adscan_internal.cli.share_exposure_phase import (  # noqa: PLC0415
+        _run_readable_hunt_substep,
+        _run_writable_capture_substep,
+        _split_share_rows,
+    )
+    from adscan_core.output._attack_paths import (  # noqa: PLC0415
+        render_smb_exposed_resources_panel,
+    )
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {}) or {}
+    principal_label = mark_sensitive(f"{username}@{domain}", "user")
+
+    rows = build_live_share_rows(
+        view_sets,
+        domain_data=domain_data,
+        current_principal_label=principal_label,
+    )
+
+    if not rows:
+        print_empty_state(
+            "accessible shares",
+            cause=(
+                "No host in scope exposed a share readable or writable by "
+                f"{principal_label}."
+            ),
+            suggestions=[
+                "Try a different credential or a host with a wider share surface.",
+                "Verify reachability: nmap -p 445 <host>",
+            ],
+            icon="📂",
+        )
+        return
+
+    try:
+        render_smb_exposed_resources_panel(
+            rows,
+            domain=domain,
+            via_column_header="Effective for",
+            effective_note=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+    writable, readable = _split_share_rows(rows)
+
+    # Sub-steps are independent: a failure in one never aborts the other.
+    # Pin BOTH substeps to the principal this live surface was computed for
+    # (``username``/``password``) — NOT the domain's active credential. The
+    # surface proved this user's effective access via SMB2 MaximalAccess; the
+    # bait drop and credential loot must run as that same principal or they hit
+    # permission-denied on shares only this user can reach.
+    try:
+        _run_writable_capture_substep(
+            shell,
+            domain=domain,
+            writable=writable,
+            domain_data=domain_data,
+            username=username,
             credential=password,
         )
-        _offer_share_credential_hunt(
-            shell, domain=domain, username=username, credential=password, view_set=view_set
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+    try:
+        _run_readable_hunt_substep(
+            shell,
+            domain=domain,
+            readable=readable,
+            username=username,
+            credential=password,
         )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
 
 
 def run_rid_cycling(shell: Any, *, domain: str) -> None:
@@ -11731,6 +11901,166 @@ def _run_post_mapping_deterministic_share_scan_with_backend(
     )
 
 
+def _vm_disks_from_share_tree_map(
+    map_data: dict[str, Any],
+) -> list[tuple[str, str, str]]:
+    """Enumerate VM disk artifacts from a consolidated share-tree map.
+
+    Walks ``map_data["hosts"][host]["shares"][share]["files"][path]`` and returns
+    ``(host, share, relative_path)`` for every file whose extension is a VM disk
+    image (``classify_vm_artifact == "disk"``). Pure logic over an already-built
+    map — no enumeration, so it scales: the lsjson walk was paid once for the whole
+    scan (and is cache-reused across re-enumerations of the same share).
+    """
+    from adscan_internal.services.vm_artifact_service import classify_vm_artifact
+
+    results: list[tuple[str, str, str]] = []
+    hosts = map_data.get("hosts") if isinstance(map_data, dict) else None
+    if not isinstance(hosts, dict):
+        return results
+    for host, host_payload in hosts.items():
+        shares = host_payload.get("shares") if isinstance(host_payload, dict) else None
+        if not isinstance(shares, dict):
+            continue
+        for share, share_payload in shares.items():
+            files = share_payload.get("files") if isinstance(share_payload, dict) else None
+            if not isinstance(files, dict):
+                continue
+            for rel_path in files:
+                if classify_vm_artifact(str(rel_path)) == "disk":
+                    results.append((str(host), str(share), str(rel_path)))
+    return results
+
+
+def _vm_artifacts_from_share_tree_map(
+    map_data: dict[str, Any],
+) -> list[tuple[str, str, str, str]]:
+    """Enumerate disk AND memory VM artifacts: ``(host, share, relpath, kind)``.
+
+    ``kind`` is ``disk`` (cracked open with dissect, sparse/chain) or ``memory``
+    (raw RAM image carved with Volatility 3). Pure logic over the already-built map.
+    """
+    from adscan_internal.services.vm_artifact_service import classify_vm_artifact
+
+    results: list[tuple[str, str, str, str]] = []
+    hosts = map_data.get("hosts") if isinstance(map_data, dict) else None
+    if not isinstance(hosts, dict):
+        return results
+    for host, host_payload in hosts.items():
+        shares = host_payload.get("shares") if isinstance(host_payload, dict) else None
+        if not isinstance(shares, dict):
+            continue
+        for share, share_payload in shares.items():
+            files = share_payload.get("files") if isinstance(share_payload, dict) else None
+            if not isinstance(files, dict):
+                continue
+            for rel_path in files:
+                kind = classify_vm_artifact(str(rel_path))
+                if kind in ("disk", "memory"):
+                    results.append((str(host), str(share), str(rel_path), kind))
+    return results
+
+
+def _run_deterministic_vm_disk_scan(
+    shell: Any,
+    *,
+    domain: str,
+    shares: list[str],
+    hosts: list[str],
+    share_map: dict[str, dict[str, str]] | None,
+    username: str,
+    password: str,
+) -> int:
+    """Discover + extract credentials from VM disk artifacts on the shares.
+
+    Unified across CTF and audit: ensures the consolidated ``share_tree_map.json``
+    exists (reusing the SMB-mapping cache, building it once if absent — cheap and
+    cached), reads it to find VM disk images WITHOUT re-enumerating, and for each
+    reads it SPARSELY over native aiosmb (never downloading the multi-GB image),
+    then persists credentials DCSync-style (DC snapshot) / Backup-Operators-style
+    (member-server snapshot). Best-effort: never aborts the surrounding scan.
+    """
+    try:
+        from adscan_internal.cli.vm_artifact_credentials import (
+            persist_vm_disk_credentials,
+        )
+        from adscan_internal.services.vm_artifact_service import VMArtifactService
+        from adscan_internal.workspaces import read_json_file
+
+        map_abs = domain_path(
+            shell._get_workspace_cwd(),
+            shell.domains_dir,
+            domain,
+            shell.smb_dir,
+            "rclone",
+            "share_tree_map.json",
+        )
+        if not os.path.isfile(map_abs):
+            # CTF (rclone_direct) skips mapping; build the map once (cache-aware).
+            run_smb_share_tree_mapping_with_rclone(
+                shell,
+                domain=domain,
+                shares=shares,
+                username=username,
+                password=password,
+                hosts=hosts,
+                share_map=share_map,
+                run_post_mapping_workflow=False,
+            )
+        if not os.path.isfile(map_abs):
+            print_info_debug(
+                "VM disk scan: no share-tree map available; skipping VM disk artifacts."
+            )
+            return 0
+
+        map_data = read_json_file(map_abs) or {}
+        artifacts = _vm_artifacts_from_share_tree_map(map_data)
+        if not artifacts:
+            print_info_debug(
+                "VM artifact scan: no VM disk/memory artifacts found on mapped shares."
+            )
+            return 0
+
+        service = VMArtifactService()
+        stored_total = 0
+        for host, share, rel_path, kind in artifacts:
+            host_fqdn = _normalize_smb_host_for_resolution(host, domain) or host
+            if kind == "memory":
+                extraction = service.extract_from_smb_memory(
+                    shell=shell,
+                    domain=domain,
+                    host=host_fqdn,
+                    share=share,
+                    source_path=rel_path,
+                    auth_username=username,
+                    auth_password=password,
+                )
+            else:
+                extraction = service.extract_from_smb_disk(
+                    shell=shell,
+                    domain=domain,
+                    host=host_fqdn,
+                    share=share,
+                    source_path=rel_path,
+                    size=None,  # resolved via native aiosmb stat (map size is human-formatted)
+                    auth_username=username,
+                    auth_password=password,
+                )
+            persist_result = persist_vm_disk_credentials(
+                shell,
+                domain=domain,
+                host=host_fqdn,
+                source_label=f"\\\\{host}\\{share}\\{rel_path}",
+                extraction=extraction,
+            )
+            stored_total += int(getattr(persist_result, "stored", 0) or 0)
+        return stored_total
+    except Exception as exc:  # noqa: BLE001 - VM disk scan must never abort the share scan
+        telemetry.capture_exception(exc)
+        print_warning_debug(f"VM disk artifact scan failed (non-fatal): {exc}")
+        return 0
+
+
 def _run_post_mapping_deterministic_share_scan_sequence(
     shell: Any,
     *,
@@ -11748,7 +12078,7 @@ def _run_post_mapping_deterministic_share_scan_sequence(
     phase_sequence = get_production_sensitive_scan_phase_sequence()
     if not phase_sequence:
         return {"completed": False, "credential_findings": 0, "phases_run": []}
-    return _run_staged_smb_sensitive_scan(
+    staged_result = _run_staged_smb_sensitive_scan(
         shell,
         domain=domain,
         shares=shares,
@@ -11765,6 +12095,26 @@ def _run_post_mapping_deterministic_share_scan_sequence(
         should_run_phase=_should_run_credential_phase,
         should_run_heavy_phase=_should_continue_with_heavy_artifact_analysis,
     )
+
+    # VM disk artifacts (.vhd/.vmdk/.vhdx/.vdi/.avhdx): discovered from the same
+    # consolidated share-tree map (built once, cache-reused — unified for CTF and
+    # audit), read sparsely over native aiosmb, and persisted DCSync-style. Runs
+    # after the byte-based phases; never aborts the surrounding scan.
+    vm_disk_stored = _run_deterministic_vm_disk_scan(
+        shell,
+        domain=domain,
+        shares=shares,
+        hosts=hosts,
+        share_map=share_map,
+        username=username,
+        password=password,
+    )
+    if vm_disk_stored and isinstance(staged_result, dict):
+        staged_result["vm_disk_credentials"] = vm_disk_stored
+        staged_result["credential_findings"] = (
+            int(staged_result.get("credential_findings", 0) or 0) + vm_disk_stored
+        )
+    return staged_result
 
 
 def _normalize_smb_host_for_resolution(host: str, domain: str) -> str:
@@ -11793,6 +12143,8 @@ def run_smb_share_credential_hunt(
     *,
     domain: str,
     targets: list[dict[str, str]],
+    username: str | None = None,
+    credential: str | None = None,
 ) -> dict[str, Any]:
     """Scan selected SMB shares for credentials from the attack paths context.
 
@@ -11800,6 +12152,12 @@ def run_smb_share_credential_hunt(
         shell: ADscan shell context.
         domain: Target domain name.
         targets: List of {"host": "<host[@domain]>", "share": "<share>"} dicts.
+        username: Principal to loot AS — MUST be the one whose effective READ
+            access selected these shares (the assessed user), not the domain's
+            active credential. Falls back to ``domain_data`` only when absent
+            (the all-users Phase 7 path). Looting as a principal that lacks read
+            access yields permission-denied and silently misses embedded creds.
+        credential: That principal's secret (password). Falls back with username.
 
     Returns:
         Result dict with at least "completed" and "credential_findings" keys.
@@ -11809,8 +12167,8 @@ def run_smb_share_credential_hunt(
     )
 
     domain_data = getattr(shell, "domains_data", {}).get(domain, {})
-    username = str(domain_data.get("username") or "").strip()
-    password = str(domain_data.get("password") or "").strip()
+    username = str(username or domain_data.get("username") or "").strip()
+    password = str(credential or domain_data.get("password") or "").strip()
     if not username or not password:
         print_warning("No domain credentials available — cannot scan shares for credentials.")
         return {"completed": False, "credential_findings": 0, "phases_run": []}
@@ -13936,6 +14294,7 @@ def _run_ai_prioritized_file_analysis(
     from adscan_internal.services.share_credential_provenance_service import (
         ShareCredentialProvenanceService,
     )
+    from adscan_internal.services.vm_artifact_service import classify_vm_artifact
 
     reader_service = SMBFileByteReaderService()
     local_reader_service = LocalFileByteReaderService()
@@ -13980,6 +14339,93 @@ def _run_ai_prioritized_file_analysis(
         size_info = size_index.get(size_key)
         known_size_bytes = getattr(size_info, "size_bytes", None)
         known_size_text = str(getattr(size_info, "size_text", "") or "").strip()
+
+        # VM disk artifacts: extract credentials OFFLINE without reading the multi-GB
+        # image through the byte/oversized path. Inserted before the oversized gate so
+        # a large disk is not skipped. With a CIFS mount the file is local (dissect
+        # handles chains; CIFS reads sparsely); otherwise read sparsely over SMB.
+        # Gated on classify_vm_artifact -> zero effect on non-VM files.
+        vm_artifact_kind = classify_vm_artifact(path)
+        if vm_artifact_kind in ("disk", "memory"):
+            marked_host = mark_sensitive(host, "hostname")
+            marked_share = mark_sensitive(share, "service")
+            marked_path = mark_sensitive(path, "path")
+            kind_label = "VM disk artifact" if vm_artifact_kind == "disk" else "VM memory image"
+            print_info(
+                f"[{idx}/{len(prioritized_files)}] {kind_label} {marked_path} on "
+                f"{marked_host}/{marked_share} — offline credential extraction"
+            )
+            vm_local_path = ""
+            if read_backend == "cifs_local":
+                resolved_mount_root = str(
+                    cifs_mount_root or ""
+                ).strip() or _resolve_cifs_mount_root(shell=shell, domain=domain)
+                vm_local_path = (
+                    cifs_mapping_service.resolve_candidate_local_path(
+                        mount_root=resolved_mount_root,
+                        host=host,
+                        share=share,
+                        remote_path=path,
+                        allow_share_root_fallback=len(prioritized_files) <= 1,
+                    )
+                    or ""
+                )
+            from adscan_internal.services.vm_artifact_service import VMArtifactService
+
+            vm_service = VMArtifactService()
+            if vm_artifact_kind == "memory":
+                # Memory images are carved with Volatility 3 on a local copy: a CIFS
+                # mount exposes the file locally; otherwise it is fetched in full over
+                # one persistent SMB session (broad random access — sparse is pointless).
+                if vm_local_path:
+                    extraction = vm_service.extract_from_memory_source(source_path=vm_local_path)
+                else:
+                    extraction = vm_service.extract_from_smb_memory(
+                        shell=shell,
+                        domain=domain,
+                        host=host,
+                        share=share,
+                        source_path=path,
+                    )
+            elif vm_local_path:
+                extraction = vm_service.extract_from_disk_source(source_path=vm_local_path)
+            else:
+                # size=None → extract_from_smb_disk auto-resolves the exact size via a
+                # native aiosmb stat, then sparse-reads (or reconstructs a chain).
+                extraction = vm_service.extract_from_smb_disk(
+                    shell=shell,
+                    domain=domain,
+                    host=host,
+                    share=share,
+                    source_path=path,
+                    size=known_size_bytes if isinstance(known_size_bytes, int) and known_size_bytes > 0 else None,
+                )
+            # DCSync-style (DC snapshot) / Backup-Operators-style (member server)
+            # persistence + selector + premium UX lives in the dedicated handler.
+            from adscan_internal.cli.vm_artifact_credentials import (
+                persist_vm_disk_credentials,
+            )
+
+            persist_result = persist_vm_disk_credentials(
+                shell, domain=domain, host=host, source_label=path, extraction=extraction
+            )
+            if persist_result.stored:
+                deterministic_handled += 1
+                deterministic_findings += persist_result.stored
+                flagged_files += 1
+                flagged_credentials += persist_result.stored
+                if continue_after_findings is None:
+                    continue_after_findings = _confirm_continue_after_findings(shell=shell)
+                if continue_after_findings is False:
+                    print_info(
+                        "Stopping prioritized file analysis after credential findings "
+                        "by user choice."
+                    )
+                    break
+            else:
+                review_candidate_paths.append(f"{host}/{share}{path}")
+            continue
+
         per_file_max_bytes = max_bytes
         full_zip_limit = _resolve_ai_zip_full_read_max_bytes()
         if isinstance(known_size_bytes, int) and known_size_bytes > max_bytes:
@@ -14567,6 +15013,7 @@ def _handle_prioritized_findings_actions(
                     secret,
                     source_steps=source_steps,
                     prompt_for_user_privs_after=False,
+                    credential_origin="passwordinshares",
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)

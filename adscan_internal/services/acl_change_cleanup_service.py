@@ -49,6 +49,11 @@ _MANUAL_PASSWORD = (
     "  This account's previous credential has been permanently replaced."
 )
 
+_MANUAL_GROUP_MEMBERSHIP = (
+    "Remove the group member added by ADscan manually:\n"
+    "  Remove-ADGroupMember -Identity 'GROUP' -Members 'MEMBER' -Confirm:$false"
+)
+
 
 def _resolve_pdc(shell: Any, domain: str) -> str:
     """Resolve the PDC hostname/IP for a domain from shell.domains_data."""
@@ -304,6 +309,43 @@ def _execute_one_action(
                     ).replace("SPN", spn),
                 )
 
+    elif kind == "group_membership_changed":
+        target_group = str(action.get("target_group") or target).strip()
+        added_user = str(action.get("added_user") or "").strip()
+        if not target_group or not added_user:
+            print_warning(
+                f"Group membership cleanup needs manual review · {marked_target}"
+            )
+            if ledger is not None and change_id:
+                ledger.mark_operator_required(
+                    change_id,
+                    manual_cleanup_instructions=_manual_instructions(kind, action),
+                )
+            return
+        result = service.acl.remove_group_member(
+            pdc_host=pdc_host,
+            domain=domain,
+            username=exec_username,
+            password=exec_password,
+            target_group=target_group,
+            target_username=added_user,
+            kerberos=True,
+            target_domain=target_domain,
+            timeout=300,
+        )
+        if result.success:
+            print_info(f"Group membership reverted · {marked_target}")
+            if ledger is not None and change_id:
+                ledger.mark_reverted(change_id)
+        else:
+            print_warning(f"Group membership removal failed · {marked_target}")
+            if ledger is not None and change_id:
+                ledger.mark_failed(
+                    change_id,
+                    error=str(result.raw_output or "native LDAP returned non-zero"),
+                    manual_cleanup_instructions=_manual_instructions(kind, action),
+                )
+
     else:
         print_warning(f"Unknown ACL cleanup kind '{kind}' — skipping")
 
@@ -322,6 +364,12 @@ def _manual_instructions(kind: str, action: dict[str, Any]) -> str:
         return _MANUAL_SPN.replace("TARGET", target).replace("SPN", spn)
     if kind == "password_changed":
         return _MANUAL_PASSWORD.replace("TARGET", target)
+    if kind == "group_membership_changed":
+        group = str(action.get("target_group") or target)
+        member = str(action.get("added_user") or "MEMBER")
+        return _MANUAL_GROUP_MEMBERSHIP.replace("GROUP", group).replace(
+            "MEMBER", member
+        )
     return f"Manually revert the '{kind}' change on '{target}'."
 
 
@@ -377,6 +425,7 @@ def _cleanup_action_from_ledger_entry(entry: dict[str, Any]) -> dict[str, Any] |
         "owner_changed",
         "spn_added",
         "password_changed",
+        "group_membership_changed",
     }:
         return None
     detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
@@ -399,6 +448,8 @@ def _cleanup_action_from_ledger_entry(entry: dict[str, Any]) -> dict[str, Any] |
         "spn",
         "target_user",
         "added_key_credential_value",
+        "target_group",
+        "added_user",
     ):
         if key in detail:
             action[key] = detail[key]

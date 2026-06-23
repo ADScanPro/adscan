@@ -1538,15 +1538,24 @@ def check_dpapi(
             enriched=enriched,
             source_protocol="winrm",
         )
-        persisted = sum(1 for ev in enriched if ev.verify_status == "verified")
+        # Count what was actually persisted (store-first: every AD-candidate with
+        # a recovered secret), and report how many were domain-verified as a
+        # provenance annotation — not as a persistence gate.
+        persisted = sum(
+            1
+            for ev in enriched
+            if ev.kind == "ad_candidate" and (ev.verified_password or ev.raw.password)
+        )
+        verified = sum(1 for ev in enriched if ev.verify_status == "verified")
         if persisted == 0:
             print_info_verbose(
-                "No recovered DPAPI credential was domain-verified for persistence."
+                "No recovered DPAPI credential was eligible for persistence."
             )
         else:
             print_info_verbose(
-                f"Persisted {persisted} new credential"
-                f"{'s' if persisted != 1 else ''} into the workspace."
+                f"Persisted {persisted} recovered credential"
+                f"{'s' if persisted != 1 else ''} into the workspace "
+                f"({verified} domain-verified)."
             )
 
     except Exception as exc:  # pragma: no cover - defensive
@@ -1630,7 +1639,11 @@ def check_autologon(
             shell.console.print(f"   User: {user_autologon}")
             shell.console.print(f"   Password: {default_password}")
 
-            shell.add_credential(domain, user_autologon, default_password, credential_origin="winrm_creds")
+            # Autologon registry read (DefaultUserName/DefaultPassword) — this is
+            # an autologon credential, not a WinRM-session-derived one.
+            shell.add_credential(
+                domain, user_autologon, default_password, credential_origin="autologon"
+            )
         else:
             print_error("No autologon credentials found in the output.")
 

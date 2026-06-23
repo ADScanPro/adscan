@@ -59,6 +59,13 @@ from adscan_internal.cli.dns import (
     preflight_domain_pdc,
     prompt_known_domain_and_pdc_interactive,
 )
+from adscan_internal.services._kerberos_spn import is_ip_address
+from adscan_internal.cli.host_file_picker import (
+    is_full_container_runtime,
+    maybe_import_host_file_to_workspace,
+    select_host_file_via_gui,
+)
+from adscan_core.path_utils import get_effective_user_home
 from adscan_internal.services.network_preflight_service import (
     RouteAssessment,
     assess_target_reachability,
@@ -90,6 +97,11 @@ class _DcDiscoveryRecoveryDecision:
     action: Literal["retry_scope", "switch_context", "cancel"]
     hosts: str | None = None
 
+
+# IPv4-shaped token (four dot-separated 1-3 digit groups). Used to catch a
+# malformed IP typed into the domain field that ``is_ip_address`` rejects but
+# that is clearly not a DNS domain name.
+_IPV4_SHAPED_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 _LAB_STRONG_INFERENCE_THRESHOLD = 0.90
 _USER_CONFIRMED_LAB_STATES = {"manual", "accepted_inference"}
@@ -977,7 +989,13 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     .strip()
                     .lower()
                 )
-            if not domain or "." not in domain:
+            if not domain or is_ip_address(domain):
+                print_error(
+                    "That looks like an IP address, not a domain (FQDN). Provide the "
+                    "domain as a DNS name (e.g., contoso.local): `start_unauth <domain> <dc_ip>`."
+                )
+                return
+            if "." not in domain:
                 print_error(
                     "Domain must be a FQDN (e.g., contoso.local), not a NetBIOS name."
                 )
@@ -986,6 +1004,12 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
         # Case: `start_unauth <domain> [dc_ip]`
         if not is_first_ip:
             domain = first.strip().lower()
+            if is_ip_address(domain):
+                print_error(
+                    "That looks like an IP address, not a domain (FQDN). Provide the "
+                    "domain as a DNS name (e.g., contoso.local): `start_unauth <domain> <dc_ip>`."
+                )
+                return
             if "." not in domain:
                 print_error(
                     "Domain must be a FQDN (e.g., contoso.local), not a NetBIOS name."
@@ -2114,12 +2138,51 @@ def _ensure_unauth_target_list(
             return True
 
     if selected.startswith("Provide a file"):
+        in_container_runtime = is_full_container_runtime(shell)
         while True:
-            file_path = Prompt.ask(
-                Text("Enter path to file with IPs/targets", style="cyan")
-            ).strip()
+            file_path = ""
+            # Inside the FULL container runtime the file the operator wants lives on
+            # the HOST filesystem (host ~/.adscan ↔ container /opt/adscan); a raw path
+            # typed in the container view never resolves. Open the host GUI picker so
+            # the selection comes from the host filesystem, then import it into the
+            # mounted workspace so the path is container-visible. Fall back to a manual
+            # prompt if the picker is unavailable.
+            if in_container_runtime:
+                file_path = (
+                    select_host_file_via_gui(
+                        shell,
+                        title=(
+                            "Select the file with SMB target IPs/ranges for domain "
+                            f"{domain}"
+                        ),
+                        initial_dir=str(get_effective_user_home()),
+                        log_prefix="start",
+                    )
+                    or ""
+                ).strip()
+                if not file_path:
+                    print_info_debug(
+                        "[start] Host GUI picker not used/failed; "
+                        "falling back to manual path prompt"
+                    )
+
+            if not file_path:
+                file_path = Prompt.ask(
+                    Text("Enter path to file with SMB targets", style="cyan")
+                ).strip()
             if not file_path:
                 return False
+
+            # Import the host file into the mounted workspace so the path resolves
+            # inside the container before we check for its existence.
+            file_path = maybe_import_host_file_to_workspace(
+                shell,
+                domain=domain,
+                source_path=file_path,
+                dest_dir="smb_targets_custom",
+                log_prefix="start",
+            )
+
             if not os.path.exists(file_path):
                 print_warning("File not found. Please enter a valid path.")
                 continue
@@ -2213,6 +2276,20 @@ def _domain_context_wizard(
             )
             if not domain_input:
                 return None
+            if is_ip_address(domain_input):
+                print_warning(
+                    "[bold]⚠️  That looks like an IP address, not a domain (FQDN).[/bold]\n"
+                    "The domain name should be a DNS name like [yellow]contoso.local[/yellow], "
+                    f"not an IP like {mark_sensitive(domain_input, 'ip')}."
+                )
+                continue
+            if _IPV4_SHAPED_RE.match(domain_input):
+                print_warning(
+                    "[bold]⚠️  That looks like a malformed IP address, not a domain (FQDN).[/bold]\n"
+                    f"{mark_sensitive(domain_input, 'ip')} is not a valid IPv4 address. "
+                    "Enter a DNS domain name like [yellow]contoso.local[/yellow]."
+                )
+                continue
             if "." not in domain_input:
                 print_warning(
                     f"[bold]⚠️  Invalid domain format:[/bold] {mark_sensitive(domain_input, 'domain')}\n"
@@ -3267,6 +3344,14 @@ def _start_auth_with_params(
         pdc_ip=pdc_ip,
         force_authenticated_enumeration=True,
         prompt_when_already_authenticated=True,
+        # This is the scan's own STARTING credential (the INPUT to the
+        # authenticated scan), not a credential compromised during it. Tag its
+        # provenance ``authenticated_scan`` so the compromise SSOT excludes it
+        # from counters / panel / telemetry / PostHog (it stays a fully owned
+        # principal for attack-path discovery) — see
+        # session_compromise_state_service.NON_COMPROMISE_ORIGINS.
+        mark_user_compromised=False,
+        credential_origin="authenticated_scan",
     )
     mark_workspace_start_scan_completed(shell, "start_auth")
     if hasattr(shell, "save_workspace_data"):

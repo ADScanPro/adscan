@@ -29,6 +29,7 @@ import requests
 import sentry_sdk
 
 from .ssl_certificates import configure_ssl_certificates_for_requests
+from adscan_core.offline import offline_mode_enabled
 from adscan_core.lab_context import (
     build_lab_slug,
     build_lab_telemetry_fields,
@@ -106,6 +107,16 @@ except ImportError:
             "domain_compromised": status == _SESSION_COMPROMISE_STATUS_DOMAIN,
             "compromised_users_count": len(compromised_users),
         }
+
+try:
+    from adscan_internal.services.session_ad_scale_metadata import (
+        build_session_ad_scale_metadata,
+    )
+except ImportError:
+
+    def build_session_ad_scale_metadata(shell: Any) -> dict[str, Any]:
+        """Fallback when adscan_internal is unavailable (host/launcher context)."""
+        return {}
 
 if TYPE_CHECKING:
     from rich.text import Text
@@ -562,8 +573,13 @@ def _get_current_telemetry_level() -> tuple[bool, str, str]:
         Tuple of (enabled, level, source)
         - enabled: effective telemetry enabled state
         - level: one of {"enabled", "session_disabled", "cli_disabled"}
-        - source: one of {"env", "cli", "default"}
+        - source: one of {"offline", "env", "cli", "default"}
     """
+    # Offline / no-external kill switch: absolute, highest priority. Reported as
+    # source "offline" so the opt-out state-change POST is suppressed (a strict
+    # zero-egress engagement must not emit even a metadata packet).
+    if offline_mode_enabled():
+        return False, "session_disabled", "offline"
     env_val = os.getenv("ADSCAN_TELEMETRY", None)
     if env_val == "0":
         return False, "session_disabled", "env"
@@ -738,16 +754,22 @@ def sync_telemetry_state(
         _save_last_telemetry_state(current_state)
         return current_state
 
-    # Emit a state change event.
-    event = "telemetry_enabled" if enabled else "telemetry_disabled"
-    _send_telemetry_state_event(
-        event=event,
-        enabled=enabled,
-        level=level,
-        source=source,
-        context=context,
-        previous=prev if isinstance(prev, dict) else None,
-    )
+    # Emit a state change event — EXCEPT when telemetry was disabled by the
+    # env kill switch or offline mode. A strict air-gap / zero-egress engagement
+    # must not send even the metadata-only opt-out packet; we persist the state
+    # file only. An interactive in-session opt-out (source "cli") still emits,
+    # so the product keeps opt-out analytics for normal users.
+    suppress_optout_post = (not enabled) and source in {"env", "offline"}
+    if not suppress_optout_post:
+        event = "telemetry_enabled" if enabled else "telemetry_disabled"
+        _send_telemetry_state_event(
+            event=event,
+            enabled=enabled,
+            level=level,
+            source=source,
+            context=context,
+            previous=prev if isinstance(prev, dict) else None,
+        )
     _save_last_telemetry_state(current_state)
     return current_state
 
@@ -775,6 +797,13 @@ def _is_telemetry_enabled() -> bool:
     are automatically routed to different PostHog projects based on environment
     detection (see _get_posthog_proxy_url).
     """
+    # Offline / no-external kill switch: absolute, highest priority. An
+    # air-gapped or sovereignty-restricted engagement (ADSCAN_OFFLINE /
+    # ADSCAN_NO_EXTERNAL) must never send, persist, or drain telemetry — this
+    # one gate also governs the disk-queue writer and the queue drainer, so
+    # offline means off on all three axes (send / persist / flush).
+    if offline_mode_enabled():
+        return False
     # Explicit telemetry setting takes highest priority
     env_val = os.getenv("ADSCAN_TELEMETRY", None)
     if env_val == "0":
@@ -800,6 +829,10 @@ def _is_session_capture_enabled() -> bool:
     so pipelines can validate HTML uploads. Users can still opt out globally
     via ADSCAN_TELEMETRY=0 or specifically via ADSCAN_SESSION_CAPTURE=0.
     """
+    # Offline / no-external kill switch: absolute, highest priority (same as
+    # _is_telemetry_enabled). No session HTML may be uploaded when air-gapped.
+    if offline_mode_enabled():
+        return False
     if os.getenv("ADSCAN_TELEMETRY") == "0":
         return False
     capture_opt = os.getenv("ADSCAN_SESSION_CAPTURE")
@@ -1990,7 +2023,8 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
     Also adds environment property to all events for additional filtering.
     """
     if _telemetry_client and (
-        _is_telemetry_enabled() or event.startswith("telemetry_")
+        _is_telemetry_enabled()
+        or (event.startswith("telemetry_") and not offline_mode_enabled())
     ):
         try:
             # Get appropriate proxy URL for current environment
@@ -5431,6 +5465,10 @@ def _build_session_metadata(shell=None) -> Optional[dict]:
     if confirmation_state:
         metadata["lab_confirmation_state"] = str(confirmation_state)
     metadata.update(build_session_compromise_metadata(shell))
+    # Anonymous AD-scale fingerprint (counts only, no domain/principal names) so
+    # the session viewer can filter/sort by environment scale (multi-domain,
+    # host/user counts). Reads the cheap in-memory ``collection_stats``.
+    metadata.update(build_session_ad_scale_metadata(shell))
 
     # Workspace identity — privacy hard rule:
     #

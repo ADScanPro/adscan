@@ -36,6 +36,7 @@ from adscan_internal.services.share_credential_provenance_service import (
     ShareCredentialProvenanceService,
 )
 from adscan_internal.services.share_map_ai_triage_service import ShareMapAITriageService
+from adscan_internal.services.vm_artifact_service import classify_vm_artifact
 from adscan_internal.services.windows_artifact_acquisition_service import (
     WindowsArtifactAcquisitionResult,
     persist_fetch_report,
@@ -202,7 +203,15 @@ class WindowsAISensitiveAnalysisService:
         loot_dir = os.path.join(phase_root_abs, "loot")
         os.makedirs(loot_dir, exist_ok=True)
         fetch_started_at = time.perf_counter()
-        fetch_result = fetch_selected_entries(selected_entries, loot_dir)
+        # VM disk images are read SPARSELY over SMB (dissect over ranged reads — the
+        # multi-GB image is never downloaded), so they are excluded from the bulk
+        # fetch and handled via the dispatch chokepoint in the per-file loop below.
+        fetchable_entries = [
+            entry
+            for entry in selected_entries
+            if classify_vm_artifact(str(getattr(entry, "full_name", "") or "")) != "disk"
+        ]
+        fetch_result = fetch_selected_entries(fetchable_entries, loot_dir)
         fetch_duration_seconds = time.perf_counter() - fetch_started_at
         fetch_report_path = persist_fetch_report(
             phase_root_abs=phase_root_abs,
@@ -240,29 +249,83 @@ class WindowsAISensitiveAnalysisService:
         analysis_started_at = time.perf_counter()
         for candidate in prioritized_files:
             remote_path = str(getattr(candidate, "path", "") or "").strip()
-            local_path = os.path.join(
-                loot_dir,
-                WindowsFileMappingService.build_local_relative_path(remote_path),
-            )
-            if not os.path.isfile(local_path):
-                read_failures += 1
-                print_warning_debug(
-                    f"{workflow_label} AI prioritized file missing from fetched loot: "
-                    f"path={mark_sensitive(remote_path, 'path')}"
+            vm_artifact_kind = classify_vm_artifact(remote_path)
+            if vm_artifact_kind in ("disk", "memory"):
+                # VM disk OR memory artifact on the (WinRM/MSSQL-mapped) filesystem →
+                # offline credential extraction over SMB (disk: sparse/chain; memory:
+                # download + Volatility 3), then DCSync-style (DC snapshot) /
+                # Backup-Operators-style (local SAM) persistence in the dedicated
+                # handler. Does NOT flow through the byte-based handling below.
+                from adscan_internal.services.vm_artifact_service import (
+                    VMArtifactService,
+                    windows_path_to_admin_share,
                 )
+                from adscan_internal.cli.vm_artifact_credentials import (
+                    persist_vm_disk_credentials,
+                )
+
+                # WinRM/MSSQL maps yield absolute C:\ paths; translate to an SMB
+                # share + relative path so the native reader can address it.
+                vm_share, vm_relpath = windows_path_to_admin_share(remote_path)
+                vm_service = VMArtifactService()
+                if vm_artifact_kind == "memory":
+                    extraction = vm_service.extract_from_smb_memory(
+                        shell=shell,
+                        domain=domain,
+                        host=host,
+                        share=vm_share or source_share,
+                        source_path=vm_relpath or remote_path,
+                    )
+                else:
+                    vm_entry = entry_index.get(remote_path.lower())
+                    vm_size = int(getattr(vm_entry, "length", 0) or 0) if vm_entry else 0
+                    extraction = vm_service.extract_from_smb_disk(
+                        shell=shell,
+                        domain=domain,
+                        host=host,
+                        share=vm_share or source_share,
+                        source_path=vm_relpath or remote_path,
+                        size=vm_size or None,  # None -> resolved via native aiosmb stat
+                    )
+                persist_result = persist_vm_disk_credentials(
+                    shell,
+                    domain=domain,
+                    host=host,
+                    source_label=remote_path,
+                    extraction=extraction,
+                )
+                if persist_result.stored:
+                    deterministic_handled += 1
+                    deterministic_findings += persist_result.stored
+                    flagged_files += 1
+                    flagged_credentials += persist_result.stored
+                else:
+                    review_candidate_paths.append(f"{host}/{source_share}/{remote_path}")
                 continue
-            file_bytes = Path(local_path).read_bytes()
-            pipeline_result = pipeline_service.analyze_from_bytes(
-                domain=domain,
-                scope=scope,
-                candidate=candidate,
-                source_path=remote_path,
-                file_bytes=file_bytes,
-                truncated=False,
-                max_bytes=max_bytes,
-                triage_service=triage_service,
-                ai_service=ai_service,
-            )
+            else:
+                local_path = os.path.join(
+                    loot_dir,
+                    WindowsFileMappingService.build_local_relative_path(remote_path),
+                )
+                if not os.path.isfile(local_path):
+                    read_failures += 1
+                    print_warning_debug(
+                        f"{workflow_label} AI prioritized file missing from fetched loot: "
+                        f"path={mark_sensitive(remote_path, 'path')}"
+                    )
+                    continue
+                file_bytes = Path(local_path).read_bytes()
+                pipeline_result = pipeline_service.analyze_from_bytes(
+                    domain=domain,
+                    scope=scope,
+                    candidate=candidate,
+                    source_path=remote_path,
+                    file_bytes=file_bytes,
+                    truncated=False,
+                    max_bytes=max_bytes,
+                    triage_service=triage_service,
+                    ai_service=ai_service,
+                )
             if pipeline_result.deterministic_handled:
                 deterministic_handled += 1
                 if pipeline_result.deterministic_findings:

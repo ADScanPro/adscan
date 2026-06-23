@@ -641,6 +641,51 @@ def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfi
             "(a local SAM account cannot obtain a Kerberos TGT)"
         )
 
+    # --- Per-principal Kerberos credential resolution (anti-hijack) -------- #
+    # When Kerberos resolves true but no explicit ccache/aes is in scope, the
+    # SMB transport would otherwise fall back to the ambient $KRB5CCNAME — i.e.
+    # bind as whoever's TGT is active (the DA after a DCSync), NOT the requested
+    # principal. This is the daenerys-as-administrator hijack on the dump path,
+    # whose blast radius is DCSync / secretsdump / lateral / lsass. Resolve a
+    # ccache for THIS exact principal, scoped-ticket-first.
+    ccache_override = creds.get("ccache_path")
+    exec_username = str(creds.get("username") or "").strip()
+    cred_auth_domain = str(creds.get("auth_domain") or domain or "").strip()
+    if (
+        use_kerberos
+        and not str(ccache_override or "").strip()
+        and not str(creds.get("aes_key") or "").strip()
+        and exec_username
+        and cred_auth_domain
+    ):
+        ccache_override = _resolve_dump_kerberos_ccache(
+            shell,
+            domain=cred_auth_domain,
+            username=exec_username,
+            password=creds.get("password"),
+            target_host=host,
+            dc_ip=kdc_ip,
+        )
+        if not str(ccache_override or "").strip():
+            # No per-principal ccache could be produced (mint failed, no scoped
+            # ticket). Fall back to NTLM when we hold an NTLM-capable secret
+            # rather than letting the transport bind as the ambient principal.
+            if has_ntlm_cred:
+                use_kerberos = False
+                print_info_debug(
+                    f"[dump] no per-user ccache for "
+                    f"{mark_sensitive(exec_username, 'user')} on "
+                    f"{mark_sensitive(host, 'host')}; forcing NTLM (refusing the "
+                    "ambient $KRB5CCNAME principal)"
+                )
+            else:
+                print_warning(
+                    "Could not obtain a Kerberos ticket for "
+                    f"{mark_sensitive(exec_username, 'user')} and no NTLM secret "
+                    "is available; the dump may fail to authenticate as the "
+                    "intended principal."
+                )
+
     return SMBConfig(
         target_ip=host,
         target_hostname=spn_host,
@@ -650,12 +695,91 @@ def _build_smb_config_from_shell(shell: Any, host: str, domain: str) -> SMBConfi
         password=creds.get("password"),
         nt_hash=creds.get("nt_hash"),
         aes_key=creds.get("aes_key"),
-        ccache_path=creds.get("ccache_path"),
+        ccache_path=ccache_override,
         use_kerberos=use_kerberos,
         kdc_ip=kdc_ip,
         ip_hostname_inventory=inventory,
         posture_snapshot=posture_snapshot,
     )
+
+
+def _resolve_dump_kerberos_ccache(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str | None,
+    target_host: str,
+    dc_ip: str | None,
+) -> str | None:
+    """Resolve a per-principal Kerberos ccache for a dump, scoped-ticket-first.
+
+    Precedence (matches CLAUDE.md § "Credential storage" rule #2 + the
+    capability-bearing axis):
+
+    1. A scoped :class:`ServiceTicket` matching ``target_host`` (S4U2Proxy /
+       RBCD / constrained-delegation / silver). Used AS-IS — never re-minted;
+       its ``impersonated_user`` principal mismatch is intentional.
+    2. A capability-bearing ccache marked for ``username`` (ESC13 PAC-TGT with a
+       synthetic group SID). Used AS-IS — re-minting would drop the SID.
+    3. Otherwise mint a fresh per-user TGT via the SSOT ``ensure_user_ccache``.
+
+    Returns the ccache path, or ``None`` when nothing usable could be produced
+    (the caller then drops to NTLM rather than the ambient principal).
+    """
+    from adscan_internal.services.credential_store_service import (
+        get_capability_bearing_ccache,
+        resolve_scoped_ticket_for_host,
+    )
+
+    domains_data = getattr(shell, "domains_data", None) or {}
+
+    # 1) Scoped service ticket for THIS host — use as-is (do not mint).
+    try:
+        scoped = resolve_scoped_ticket_for_host(
+            shell, domain=domain, host=target_host, service="cifs"
+        )
+    except Exception:  # noqa: BLE001 — best-effort scoped lookup
+        scoped = None
+    if scoped:
+        _impersonated, scoped_ccache = scoped
+        if str(scoped_ccache or "").strip():
+            print_info_debug(
+                f"[dump] using scoped service ticket for "
+                f"{mark_sensitive(target_host, 'host')} (impersonation ticket — "
+                "not re-minted)"
+            )
+            return str(scoped_ccache).strip()
+
+    # 2) Capability-bearing ccache marked for this user — use as-is (do not mint).
+    capability_ccache = get_capability_bearing_ccache(
+        domains_data, domain=domain, username=username
+    )
+    if str(capability_ccache or "").strip():
+        print_info_debug(
+            f"[dump] using capability-bearing ccache for "
+            f"{mark_sensitive(username, 'user')} (ESC13 PAC-TGT — not re-minted)"
+        )
+        return str(capability_ccache).strip()
+
+    # 3) Generic principal — mint a fresh per-user TGT (SSOT).
+    from adscan_internal.services.kerberos_ticket_service import ensure_user_ccache
+
+    try:
+        return ensure_user_ccache(
+            shell,
+            user=username,
+            domain=domain,
+            credential=(str(password).strip() or None) if password is not None else None,
+            dc_ip=str(dc_ip or "").strip() or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[dump] ensure_user_ccache failed for "
+            f"{mark_sensitive(username, 'user')}: {exc}"
+        )
+        return None
 
 
 def _run_native_async(coro: Any) -> Any:
@@ -1594,27 +1718,39 @@ def _persist_dpapi_result(
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
 
-    # Credentials store: only newly verified AD credentials.
-    # Verified means we obtained a valid TGT with win_user + password.
-    # The win_user IS the AD account, and verified_password is the confirmed cred.
+    # Credentials store — STORE-FIRST: persist every recovered AD-candidate
+    # plaintext, regardless of whether an immediate TGT verification succeeded.
+    # A recovered plaintext domain credential is high-value evidence; losing it
+    # because we could not re-auth in the moment (no PDC reachable, lockout
+    # budget exhausted, transient KDC error) is a real loss — exactly the
+    # vintage\\c.neri_adm case the operator flagged. Verification is a PROVENANCE
+    # annotation (verified vs recovered-unverified), NOT a precondition for
+    # storing. Non-AD kinds (noise / service_token / personal_web) are NOT
+    # sprayable domain creds and stay excluded. The username is already a bare
+    # sAMAccountName (normalized at parse in dpapi_user_decrypt), so it matches
+    # its graph node and the generic ``credentials`` store key.
     if enriched:
         for ev in enriched:
             if not isinstance(ev, DpapiVerifiedCredential):
                 continue
-            if ev.verify_status != "verified" or not ev.verified_ad_user:
+            if ev.kind != "ad_candidate":
+                continue
+            principal = ev.verified_ad_user or ev.raw.username
+            secret = ev.verified_password or ev.raw.password
+            if not principal or not secret:
                 continue
             try:
                 shell.add_credential(
                     domain,
-                    ev.verified_ad_user,
-                    ev.verified_password or "",
+                    principal,
+                    secret,
                     source_steps=_build_dump_source_steps(
                         domain=domain,
                         dump_kind="DPAPI",
                         host=host,
                         auth_username=None,
-                        credential_username=ev.verified_ad_user,
-                        secret=ev.verified_password or "",
+                        credential_username=principal,
+                        secret=secret,
                         source_protocol=source_protocol,
                     ),
                     credential_origin="dpapi",
@@ -5480,7 +5616,7 @@ def run_ask_for_post_da_host_dumps(
 
     if not Confirm.ask(
         "Start the host dump campaign now?",
-        default=True,
+        default=False
     ):
         print_info("Skipping host dump campaign.")
         return

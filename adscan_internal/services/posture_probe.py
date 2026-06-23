@@ -245,7 +245,39 @@ ProbeProgressCallback = Callable[[ConstraintCategory, Optional[ProbeResult]], No
 #                      is available (Kerberos needs an FQDN for the ldap/ SPN).
 #                    Classification rules changed for LDAP_SIGNING, so bump to
 #                    re-probe stale caches.
-_PROBE_SCHEMA_VERSION: int = 6
+#   v7 (2026-06-09): Stopped INFERRING NTLM-disabled from an unauth bogus-cred
+#                    bind. A bogus-credential NTLM LDAP bind on a healthy,
+#                    NTLM-ENABLED DC returns SEC_E_LOGON_DENIED + invalidCredentials
+#                    (the data-52e / STATUS_LOGON_FAILURE token is stripped by the
+#                    vendor formatter) -- that PROVES NTLM is alive (the DC reached
+#                    the credential check and rejected the fake password), it does
+#                    NOT mean NTLM is disabled. Three classifiers were mis-reading
+#                    that pair as "NTLM unavailable/DISABLED":
+#                    * _ntlm_bind_unavailable_in_chain (U2 signing + U3 CBT): the
+#                      SEC_E_LOGON_DENIED+invalidCredentials branch is REMOVED. U2
+#                      now falls through to logon_failure -> LDAP_BIND_NO_SIGN_OK
+#                      (signing not required); U3 falls through to its step-2 CBT
+#                      verdict. Only the genuine SSP-collapse markers still defer.
+#                    * A3 (_probe_ntlm_authentication): the
+#                      invalidCredentials+SEC_E_LOGON_DENIED term is REMOVED from
+#                      the ntlm_disabled test; that ambiguous case now stays
+#                      non-DISABLED (UNKNOWN/no-emit) so auth_plan no longer prunes
+#                      NTLM. NTLM-disabled determination is left ONLY to the
+#                      credential-validated transport detector (Rule 3 in
+#                      ldap_transport_service), which has a concurrently-valid
+#                      Kerberos TGT to disambiguate.
+#                    Classification rules changed for LDAP_SIGNING,
+#                    LDAP_CHANNEL_BINDING and NTLM_AUTHENTICATION, so bump to
+#                    re-probe stale caches (incl. any false NTLM=DISABLED HIGH).
+# v8 (2026-06-10): A5 LDAP-signing probe is now KERBEROS-first (binds the
+#                    mechanism a Kerberos-first engagement uses) and is the
+#                    AUTHORITATIVE signing verdict — it runs even when the unauth
+#                    U2 NTLM probe already resolved signing, because sign/seal
+#                    enforcement is mechanism-specific on Samba/Heimdal AD
+#                    (`require strong auth=yes`). Busts stale U2-NTLM
+#                    LDAP_SIGNING=DISABLED HIGH verdicts that were false for the
+#                    Kerberos path.
+_PROBE_SCHEMA_VERSION: int = 8
 
 
 # --------------------------------------------------------------------------- #
@@ -1111,8 +1143,23 @@ def _ntlm_bind_unavailable_in_chain(exc: BaseException) -> bool:
     merely rejected the BOGUS credential also surfaces ``invalidCredentials``
     (``STATUS_LOGON_FAILURE`` / data 52e) -- that is the GOOD path that proves
     the transport policy passed. We only treat the bind as "NTLM unavailable"
-    when one of the NTLM-SSP-collapse markers is present (optionally alongside
-    ``sec_e_logon_denied``, which on these DCs accompanies the SSP refusal).
+    when one of the NTLM-SSP-collapse markers is present.
+
+    ``sec_e_logon_denied`` + ``invalidcredentials`` (with NO SSP-collapse
+    marker) is DELIBERATELY NOT treated as NTLM-unavailable here. On a healthy,
+    NTLM-ENABLED DC a bogus-credential bind returns exactly that pair: the DC
+    reached the credential check and rejected the fake password -- which PROVES
+    NTLM is alive, not disabled (the vendor formatter strips the ``data 52e`` /
+    ``STATUS_LOGON_FAILURE`` token, so the only surviving signal is the
+    ``invalidCredentials`` LDAP result code). Inferring NTLM-disabled from this
+    unauth, bogus-cred reject is ambiguous (wrong/expired cred vs disabled) and
+    used to make U2/U3 defer their real signing/CBT verdict. The ONLY reliable
+    NTLM-disabled discriminator needs a concurrently-valid credential (Kerberos
+    TGT), which the unauth probe path lacks; that determination is owned solely
+    by the credential-validated transport detector (Rule 3 in
+    ``ldap_transport_service``). So we let the bogus-cred reject fall through to
+    ``_classify_ldap_policy_response`` (``invalidcredentials`` ->
+    ``logon_failure``) and emit the real transport-policy verdict.
 
     This is the U3-context analogue of A3's classifier and is deliberately a
     distinct, local predicate (not a shared module constant): the same markers
@@ -1129,12 +1176,6 @@ def _ntlm_bind_unavailable_in_chain(exc: BaseException) -> bool:
         "status_ntlm_blocked",
     )
     if any(m in text for m in ntlm_ssp_collapse_markers):
-        return True
-    # SEC_E_LOGON_DENIED with invalidCredentials but NO data-52e / logon_failure
-    # text is the cross-realm "NTLM rejected outright" signature A3 maps to
-    # DISABLED -- in U3's bogus-cred context it likewise means the bind never
-    # reached transport-policy validation.
-    if "sec_e_logon_denied" in text and "invalidcredentials" in text:
         return True
     return False
 
@@ -1279,9 +1320,11 @@ async def _probe_ldap_signing(
         # ``sec_e_unsupported_function`` marker -- and a bare ``invalidcredentials``
         # would otherwise be (correctly, for the NTLM-available case) read as the
         # GOOD ``logon_failure`` "reached credential check -> signing not required"
-        # path. ``_ntlm_bind_unavailable_in_chain`` only fires on the SSP-collapse
-        # markers (or sec_e_logon_denied + invalidCredentials), so a genuine data
-        # 52e on an NTLM-enabled DC still flows to the not-required branch below.
+        # path. ``_ntlm_bind_unavailable_in_chain`` fires ONLY on the genuine
+        # SSP-collapse markers (NOT on a bare sec_e_logon_denied +
+        # invalidCredentials, which on an NTLM-enabled DC merely means the DC
+        # rejected the bogus password -> NTLM alive), so a genuine data 52e on an
+        # NTLM-enabled DC still flows to the not-required branch below.
         # Deferring here (no HIGH verdict) is what lets the authenticated A5
         # tiebreaker actually run instead of being short-circuited by a false U2
         # resolution. The Kerberos-capable A5 probe is the authoritative
@@ -1374,6 +1417,29 @@ async def _probe_ldap_signing(
         )
 
 
+def _resolve_ldap_signing_spn_host(
+    dc_fqdn: Optional[str], dc_ip: Optional[str]
+) -> Optional[str]:
+    """Resolve an FQDN usable as the ``ldap/`` SPN host for the A5 Kerberos probe.
+
+    A Kerberos SPN cannot target an IP (CLAUDE.md § Kerberos SPNs), so this
+    returns the caller-supplied ``dc_fqdn`` when present, else ``dc_ip`` only if
+    it is itself a hostname, else ``None`` (no Kerberos-capable SPN host).
+    Shared by ``_probe_ldap_signing_authenticated`` (A5) and the ``probe_auth``
+    gate so both agree on whether A5 can measure signing over Kerberos.
+    """
+    from adscan_internal.services._kerberos_spn import is_ip_address
+
+    host = str(dc_fqdn or "").strip().rstrip(".")
+    if not host:
+        candidate = str(dc_ip or "").strip().rstrip(".")
+        if candidate and not is_ip_address(candidate):
+            host = candidate
+    if not host or is_ip_address(host):
+        return None
+    return host
+
+
 async def _probe_ldap_signing_authenticated(
     *,
     domain: str,
@@ -1404,31 +1470,36 @@ async def _probe_ldap_signing_authenticated(
     the unauth path works with no creds and stays the default. See the
     ``_BOGUS_CRED_PASSWORD`` block comment for the layered-design rationale.
 
-    Auth-method selection (mirrors A6's NTLM-disabled-aware design):
-      * When NTLM is known-disabled (HIGH, fresh in the supplied in-flight
-        ``posture``), an NTLM/SIMPLE unsigned bind would itself collapse in the
-        SSP (``SEC_E_UNSUPPORTED_FUNCTION``) BEFORE the DC validates signing --
-        the SAME trap that made U2 defer (Part A). A5 would then be unable to
-        measure either. So on an NTLM-disabled DC A5 binds over KERBEROS
-        (password/aes_key/ccache) on port 389, provided a DC FQDN is available
-        for the ``ldap/`` SPN (an IP cannot target a Kerberos SPN -- CLAUDE.md
-        § Kerberos SPNs). The just-merged LDAP-transport FIX1 pre-mints a
-        salt-correct TGT via ``kerberos_transport.get_tgt`` for kerberos-password
-        binds, so this works on non-default-salt / AES-only KDCs (ping.htb).
-      * Otherwise (NTLM available, or no in-flight posture) A5 keeps the
-        original NTLM/SIMPLE unsigned bind with password/NT-hash.
+    Auth-method selection — KERBEROS-first (the mechanism operations use):
+      LDAP sign/seal enforcement is MECHANISM-SPECIFIC on some DCs. A Samba AD
+      DC with ``ldap server require strong auth = yes`` rejects a GSS-SPNEGO
+      (Kerberos) bind that negotiates no SASL security layer
+      (``strongerAuthRequired — SASL:[GSS-SPNEGO]: Sign or Seal are required``)
+      but lets an NTLM bind reach the credential check, because NTLMSSP
+      advertises signing intrinsically. So measuring signing over NTLM yields a
+      FALSE "not required" verdict for the Kerberos path (verified live against
+      a Samba 4 AD DC). ADscan is Kerberos-first, so A5 measures the Kerberos
+      path whenever it can:
+      * When a Kerberos credential (password/aes_key/ccache) AND an FQDN for the
+        ``ldap/`` SPN are available, A5 binds over KERBEROS on port 389 — this is
+        the AUTHORITATIVE signing verdict for the engagement, not just the
+        NTLM-disabled fallback. The LDAP-transport salt-correct-TGT pre-mint
+        makes this work on non-default-salt / AES-only KDCs.
+      * Otherwise (no Kerberos credential, or only an IP / no resolvable FQDN)
+        A5 falls back to the NTLM/SIMPLE unsigned bind with password/NT-hash.
+        An NTLM-disabled DC with only an IP cannot be measured either way (the
+        Kerberos SPN needs an FQDN) -> SKIP.
 
     Either way the bind is UNSIGNED (``sign=False`` + ``disable_self_heal=True``).
     ``disable_self_heal=True`` is load-bearing: it makes
     ``_apply_default_seal_to_plain_ldap`` SKIP the seal-by-default upgrade for
     authenticated plain-LDAP/389, so the bind stays unsigned (the measurement)
     and the reactive self-heal does not retry with sign+seal after a
-    signing-required rejection. LDAP signing (``LdapServerIntegrity``) is
-    enforced at the bind on plain LDAP/389, so the bind verdict is conclusive
-    regardless of NTLM vs Kerberos: ``strongerAuthRequired`` -> REQUIRED;
-    bind accepted / reached credential validation -> NOT_REQUIRED.
+    signing-required rejection. On plain LDAP/389 the verdict is conclusive FOR
+    THE BOUND MECHANISM: ``strongerAuthRequired`` -> REQUIRED; bind accepted /
+    reached credential validation -> NOT_REQUIRED. Measuring over Kerberos makes
+    that mechanism the engagement's actual path.
     """
-    from adscan_internal.services._kerberos_spn import is_ip_address
     from adscan_internal.services.ldap_transport_service import (
         ADscanLDAPConfig,
         async_connect_with_ldap_fallback,
@@ -1452,24 +1523,16 @@ async def _probe_ldap_signing_authenticated(
         or creds.aes_key is not None
         or creds.ccache_path is not None
     )
+    # KERBEROS-first: prefer the Kerberos path whenever we have a Kerberos
+    # credential AND a resolvable FQDN for the ldap/ SPN. The Kerberos GSS-SPNEGO
+    # bind is the mechanism a Kerberos-first engagement uses, and its signing
+    # requirement can differ from NTLM's on mechanism-specific DCs (Samba
+    # `require strong auth=yes`) — so this is the authoritative measurement, not
+    # only the NTLM-disabled fallback. ``_ntlm_disabled_known`` no longer gates
+    # this; it only decides the SKIP reason when no FQDN is available.
+    spn_host = _resolve_ldap_signing_spn_host(dc_fqdn, dc_ip)
 
-    if ntlm_disabled_known and has_kerberos_credential:
-        # KERBEROS unsigned bind on 389. Resolve an FQDN for the ldap/ SPN; an
-        # IP cannot target a Kerberos SPN correctly (CLAUDE.md § Kerberos SPNs).
-        spn_host = str(dc_fqdn or "").strip().rstrip(".")
-        if not spn_host:
-            candidate = str(dc_ip or "").strip().rstrip(".")
-            if candidate and not is_ip_address(candidate):
-                spn_host = candidate
-        if not spn_host or is_ip_address(spn_host):
-            return _make_skipped(
-                cat,
-                reason=(
-                    "Skipped: NTLM disabled and only an IP is available -- the "
-                    "Kerberos LDAP-signing tiebreaker needs a DC FQDN for the "
-                    "ldap/ SPN"
-                ),
-            )
+    if has_kerberos_credential and spn_host is not None:
         cfg = ADscanLDAPConfig(
             domain=domain,
             dc_ip=dc_ip,
@@ -1482,15 +1545,26 @@ async def _probe_ldap_signing_authenticated(
             kerberos_target_hostname=spn_host,
             # UNSIGNED on purpose (see docstring): sign=False + disable_self_heal
             # keeps the plain-LDAP/389 Kerberos bind off the seal-by-default
-            # upgrade, so an accepted bind proves signing NOT required.
+            # upgrade, so an accepted bind proves signing NOT required and a
+            # strongerAuthRequired proves it IS required.
             sign=False,
             disable_self_heal=True,
         )
         print_info_debug(
-            f"[posture_probe] A5 signing tiebreaker (NTLM disabled -> KERBEROS) "
+            f"[posture_probe] A5 signing probe (KERBEROS, authoritative) "
             f"opening LDAP/389 unsigned authenticated bind-only bind to {spn_host} "
             f"(dc_ip={dc_ip}) as {mark_sensitive(creds.username, 'user')} "
             f"(timeout={timeout}s)"
+        )
+    elif ntlm_disabled_known and has_kerberos_credential:
+        # NTLM disabled and Kerberos is the only usable mechanism, but no FQDN
+        # is available for the ldap/ SPN -> cannot measure signing either way.
+        return _make_skipped(
+            cat,
+            reason=(
+                "Skipped: NTLM disabled and only an IP is available -- the "
+                "Kerberos LDAP-signing probe needs a DC FQDN for the ldap/ SPN"
+            ),
         )
     else:
         # NTLM available (or no in-flight posture) -> original NTLM/SIMPLE
@@ -2540,10 +2614,19 @@ async def _probe_ntlm_authentication(
             "status_not_supported",
             "status_ntlm_blocked",
         )
-        ntlm_disabled = (
-            ("invalidcredentials" in text and "sec_e_logon_denied" in text)
-            or any(m in text for m in _NTLM_REFUSED_PLAIN_BIND_MARKERS)
-        )
+        # A bare ``invalidCredentials`` / ``SEC_E_LOGON_DENIED`` (no SSP-collapse
+        # marker) is AMBIGUOUS for a single bogus-cred bind: an NTLM-ENABLED DC
+        # returns it after rejecting the fake password (the DC reached the
+        # credential check -> NTLM is alive). The vendor formatter strips the
+        # ``data 52e`` token, so we cannot distinguish "wrong cred on a healthy
+        # DC" from "NTLM disabled" from this signal alone. The reliable
+        # NTLM-disabled discriminator requires a concurrently-valid credential
+        # (Kerberos TGT), which this unauth probe lacks; that determination is
+        # owned by the credential-validated transport detector (Rule 3 in
+        # ``ldap_transport_service``). So only the genuine SSP-collapse markers
+        # below (which mean the NTLM SSP refused the bind outright, NOT a
+        # credential rejection) emit DISABLED here.
+        ntlm_disabled = any(m in text for m in _NTLM_REFUSED_PLAIN_BIND_MARKERS)
         if ntlm_disabled:
             code = (
                 "NTLM_REJECTED_VIA_LDAP"
@@ -3450,7 +3533,26 @@ async def probe_auth(
             and signing_state.confidence == SignalConfidence.HIGH
             and not signing_state.is_stale
         )
-        if force or not signing_resolved:
+        # A5 over KERBEROS is the AUTHORITATIVE LDAP-signing measurement for a
+        # Kerberos-first engagement: LDAP sign/seal enforcement is mechanism-
+        # specific on some DCs (Samba `require strong auth=yes` requires it for
+        # the GSS-SPNEGO bind but lets an NTLM bind reach the credential check),
+        # so the unauth U2 NTLM verdict cannot speak for the Kerberos path. When
+        # A5 can bind over Kerberos (Kerberos credential + resolvable ldap/ SPN
+        # FQDN), run it even if U2 already resolved signing — the Kerberos-path
+        # verdict is the one operations depend on, and it overrides U2's via the
+        # most-recent-HIGH-wins merge. When A5 can only bind NTLM it stays a
+        # tiebreaker (runs only when U2 left signing UNKNOWN), unchanged.
+        has_kerberos_credential = (
+            creds.password is not None
+            or creds.aes_key is not None
+            or creds.ccache_path is not None
+        )
+        a5_can_measure_kerberos = (
+            has_kerberos_credential
+            and _resolve_ldap_signing_spn_host(dc_fqdn, dc_ip) is not None
+        )
+        if force or not signing_resolved or a5_can_measure_kerberos:
             async def _a5() -> ProbeResult:
                 return await _probe_ldap_signing_authenticated(
                     domain=domain,
@@ -3528,6 +3630,7 @@ async def probe_password_policy(
     *,
     domain: str,
     dc_ip: str,
+    dc_fqdn: "Optional[str]" = None,
     username: "Optional[str]" = None,
     password: "Optional[str]" = None,
     nt_hash: "Optional[str]" = None,
@@ -3573,6 +3676,24 @@ async def probe_password_policy(
         async_connect_with_ldap_fallback,
     )
 
+    # Kerberos LDAP binds bind the service ticket to the DC FQDN, not the IP
+    # (CLAUDE.md "Kerberos SPNs — always FQDN"). Mirror the sibling signing/CBT
+    # probes: thread the caller-resolved FQDN as the SPN host. Without it the
+    # config falls back to the DC IP and the SPN build raises
+    # KerberosSpnUnresolvedError — the exact failure that made the password
+    # policy read silently degrade to the strong-safe default.
+    spn_host = str(dc_fqdn or "").strip().rstrip(".")
+    if use_kerberos and not spn_host:
+        # Kerberos requested but no FQDN recoverable (IP-only domain_data) — a
+        # Kerberos LDAP bind cannot build a valid service SPN, so skip the live
+        # read cleanly (the caller falls back to the conservative default)
+        # rather than raising. Cache observations, never absences.
+        print_info_debug(
+            "[password-policy-probe] Kerberos requested but no DC FQDN available; "
+            "skipping live read (caller falls back to default)."
+        )
+        return None
+
     cfg = ADscanLDAPConfig(
         domain=domain,
         dc_ip=dc_ip,
@@ -3581,6 +3702,7 @@ async def probe_password_policy(
         username=username,
         password=password,
         ccache_path=ccache_path,
+        kerberos_target_hostname=spn_host or None,
     )
     if password is None and nt_hash is not None and not use_kerberos:
         # Pass NT hash via the password slot (badldap auto-detects via
@@ -3718,6 +3840,7 @@ async def get_password_policy(
     *,
     domain: str,
     dc_ip: str,
+    dc_fqdn: "Optional[str]" = None,
     domains_data: "Optional[dict[str, Any]]" = None,
     username: "Optional[str]" = None,
     password: "Optional[str]" = None,
@@ -3772,9 +3895,20 @@ async def get_password_policy(
         if cached is not None and not cached.is_stale():
             return cached
 
+    # Resolve the DC FQDN for the Kerberos service SPN when the caller did not
+    # thread one (CLAUDE.md "Kerberos SPNs — always FQDN"). Without it a
+    # Kerberos LDAP bind built from the DC IP raises KerberosSpnUnresolvedError.
+    if not dc_fqdn and domains_data is not None:
+        from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
+
+        dc_fqdn = resolve_dc_fqdn(
+            domains_data.get(domain) or {}, target_domain=domain
+        )
+
     snapshot = await probe_password_policy(
         domain=domain,
         dc_ip=dc_ip,
+        dc_fqdn=dc_fqdn,
         username=username,
         password=password,
         nt_hash=nt_hash,
@@ -4159,7 +4293,22 @@ async def resolve_resultant_password_policy(
         domain_default = _snapshot_to_resultant(snapshot, source="live_default_domain")
 
     # --- Leg 1b: live PSO read when a target user is supplied. ---
-    if target_user and domain_default is not None:
+    # Resolve the DC FQDN for the Kerberos service SPN (CLAUDE.md "Kerberos SPNs
+    # — always FQDN"); the PSO read builds its own LDAP config, so it needs the
+    # same FQDN threading Leg 1 gets via get_password_policy.
+    _pso_dc_fqdn = ""
+    if domains_data is not None:
+        from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
+
+        _pso_dc_fqdn = str(
+            resolve_dc_fqdn(domains_data.get(domain) or {}, target_domain=domain)
+            or ""
+        ).strip().rstrip(".")
+    if (
+        target_user
+        and domain_default is not None
+        and not (use_kerberos and not _pso_dc_fqdn)
+    ):
         cfg = ADscanLDAPConfig(
             domain=domain,
             dc_ip=dc_ip,
@@ -4168,6 +4317,7 @@ async def resolve_resultant_password_policy(
             username=username,
             password=password,
             ccache_path=ccache_path,
+            kerberos_target_hostname=_pso_dc_fqdn or None,
         )
         if password is None and nt_hash is not None and not use_kerberos:
             cfg.password = nt_hash

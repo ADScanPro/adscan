@@ -263,13 +263,25 @@ def _build_smb_url(config: SMBConfig) -> str:
         if kdc:
             params.append(f"dc={_quote(kdc)}")
 
-        ccache_value = str(
-            config.ccache_path or os.environ.get("KRB5CCNAME") or ""
-        ).strip()
+        # Ccache resolution order MUST mirror the hardened LDAP builder
+        # (ldap_transport_service.py:567-604): an explicitly-passed
+        # ``config.ccache_path`` wins (slot 1), but the bare ``$KRB5CCNAME``
+        # fallback drops to the LAST slot — it is only consulted when no
+        # aes_key / nt_hash / password was supplied. The previous order OR'd
+        # ``config.ccache_path`` with ``$KRB5CCNAME`` into slot 1, so a caller
+        # that passed explicit creds (fresh AS-REQ as a specific user) but no
+        # ccache_path silently bound as whatever TGT was sitting in the env
+        # ccache from a prior operation (e.g. the DA after a DA step) — the
+        # ambient-ccache principal hijack.
+        explicit_ccache = str(config.ccache_path or "").strip()
 
-        if ccache_value:
+        if explicit_ccache:
+            # Slot 1: caller explicitly passed ccache_path. EXEMPT from the
+            # principal guard — this is exactly where ESC13 capability-bearing
+            # PAC-TGTs and S4U/RBCD/silver service tickets flow, and their
+            # principal mismatch (impersonated/synthetic principal) is intended.
             auth_kind = "kerberos-ccache"
-            secret = _quote(ccache_value)
+            secret = _quote(explicit_ccache)
         elif config.aes_key:
             auth_kind = "kerberos-aes"
             secret = _quote(config.aes_key.strip())
@@ -286,8 +298,29 @@ def _build_smb_url(config: SMBConfig) -> str:
             auth_kind = "kerberos-password"
             secret = _quote(config.password)
         else:
-            auth_kind = "kerberos-password"
-            secret = ""
+            # Slot 5: legacy ``$KRB5CCNAME`` fallback (no explicit creds).
+            env_ccache = str(os.environ.get("KRB5CCNAME") or "").strip()
+            if env_ccache:
+                # Read-only principal guard: warn + record telemetry if the
+                # ambient ccache authenticates as a principal other than the
+                # one the caller asked for. Conservative (warn-only) for now.
+                if username:
+                    from adscan_internal.services._kerberos_ccache_guard import (
+                        assert_ccache_principal_matches,
+                    )
+
+                    assert_ccache_principal_matches(
+                        env_ccache,
+                        username,
+                        credential_domain,
+                        source="env",
+                        context="smb_transport",
+                    )
+                auth_kind = "kerberos-ccache"
+                secret = _quote(env_ccache)
+            else:
+                auth_kind = "kerberos-password"
+                secret = ""
     else:
         # NTLM branch
         if config.nt_hash:
@@ -339,6 +372,14 @@ _AUTH_MARKERS = (
     "krb_ap_err",
     "ticket",
     "pre-authentication",
+    # Kerberos AP-exchange processing failures (mutual-auth leg) — must classify
+    # as an AUTH error (not a connection error) so smb_machine_with_fallback
+    # catches them and retries with NTLM when the plan allows. See
+    # auth_error_classification.NATIVE_KERBEROS_INFRA_ERROR_MARKERS.
+    "asn1_structs.ap_rep",
+    "asn1_structs.ap_req",
+    "krb-error error-code",
+    "rejected the kerberos ap-req",
 )
 
 _ACCESS_DENIED_MARKERS = (
@@ -933,6 +974,52 @@ async def smb_machine_with_fallback(config: SMBConfig) -> AsyncIterator[Any]:
                 _is_kerberos_infra_error(exc) or is_soft or has_nt_hash
             ):
                 raise
+
+            # Stale-DNS self-heal (centralized for EVERY SMB-backed path —
+            # collector, sweeps, share-enum all flow through here): when the IP
+            # has more than one enabled computer FQDN (a decommissioned name
+            # sharing the IP with the live host, no reverse PTR), the KDC issues a
+            # TGS the live host rejects (Kerberos AP/KDC error). Retry with the
+            # next ranked live-first candidate FQDN for this IP BEFORE the NTLM
+            # fallback (which is unavailable in NTLM-disabled domains). The
+            # candidates come from the workspace inventory via the injected
+            # resolver; with none registered this is a no-op.
+            if isinstance(exc, SMBAuthError) and (
+                _is_kerberos_infra_error(exc) or is_soft
+            ):
+                from adscan_internal.services._kerberos_spn_candidates import (
+                    spn_candidates_for_ip,
+                )
+
+                current_spn = (effective_config.target_hostname or "").strip().lower()
+                alternates = [
+                    cand
+                    for cand in spn_candidates_for_ip(
+                        effective_config.target_ip, effective_config.domain
+                    )
+                    if "." in cand and cand.strip().lower() != current_spn
+                ]
+                for candidate in alternates[:3]:
+                    print_info_debug(
+                        "[smb_transport] Kerberos AP/KDC error on "
+                        f"{effective_config.target_ip} with SPN host "
+                        f"{current_spn!r}; retrying live candidate {candidate!r}"
+                    )
+                    alt_config = dataclasses.replace(
+                        effective_config, target_hostname=candidate
+                    )
+                    try:
+                        async with smb_machine_for(alt_config) as machine:
+                            yield machine
+                        return
+                    except (
+                        SMBAuthError,
+                        KerberosSpnUnresolvedError,
+                        AttributeError,
+                        TypeError,
+                    ):
+                        continue  # try the next candidate, then NTLM
+
             reason = (
                 "NT hash PTH fallback"
                 if has_nt_hash
@@ -1058,18 +1145,19 @@ async def download_admin_file_bytes(machine: Any, remote_win_path: str) -> bytes
 # ---------------------------------------------------------------------------
 
 
-async def download_unc_file_to_local(
-    machine: Any, remote_unc_path: str, local_path: str
-) -> int:
-    """Download a file from any UNC path to ``local_path``. Returns bytes written.
+async def read_unc_file_bytes(
+    machine: Any, remote_unc_path: str, *, max_bytes: int | None = None
+) -> bytes:
+    """Read a UNC file fully into memory and return its bytes.
 
-    ``remote_unc_path`` must be a full UNC such as ``\\\\host\\C$\\Windows\\Temp\\foo``.
+    ``remote_unc_path`` must be a full UNC such as ``\\\\host\\C$\\Windows\\Temp\\foo``
+    and its host must match ``machine``'s open connection. ``max_bytes`` caps the
+    read (extra chunks are discarded once the cap is reached) to bound memory for
+    untrusted/large files.
 
     Raises:
         SMBConnectionError: if the file cannot be opened or a chunk read fails.
     """
-    from pathlib import Path as _Path
-
     from aiosmb.commons.interfaces.file import SMBFile
 
     smb_file = SMBFile.from_uncpath(remote_unc_path)
@@ -1085,6 +1173,9 @@ async def download_unc_file_to_local(
             if not chunk:
                 break
             buf.extend(chunk)
+            if max_bytes is not None and len(buf) >= max_bytes:
+                del buf[max_bytes:]
+                break
     finally:
         try:
             await smb_file.close()
@@ -1092,9 +1183,25 @@ async def download_unc_file_to_local(
             telemetry.capture_exception(exc)
             print_info_debug(f"[smb-transport] close failed (ignored): {exc}")
 
+    return bytes(buf)
+
+
+async def download_unc_file_to_local(
+    machine: Any, remote_unc_path: str, local_path: str
+) -> int:
+    """Download a file from any UNC path to ``local_path``. Returns bytes written.
+
+    ``remote_unc_path`` must be a full UNC such as ``\\\\host\\C$\\Windows\\Temp\\foo``.
+
+    Raises:
+        SMBConnectionError: if the file cannot be opened or a chunk read fails.
+    """
+    from pathlib import Path as _Path
+
+    data = await read_unc_file_bytes(machine, remote_unc_path)
     _Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-    _Path(local_path).write_bytes(bytes(buf))
-    return len(buf)
+    _Path(local_path).write_bytes(data)
+    return len(data)
 
 
 # ---------------------------------------------------------------------------

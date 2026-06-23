@@ -24,6 +24,33 @@ from badauth.common.constants import asyauthProtocol
 from badauth.common.credentials import UniCredential
 from badauth.common.winapi.constants import ISC_REQ
 
+
+def _complete_ldap_message_length(buf):
+	"""Return the byte length of the leading LDAP message in ``buf`` iff a
+	COMPLETE message is present; otherwise ``None`` (need more bytes).
+
+	Unlike :func:`calcualte_length`, this NEVER decodes a truncated BER header
+	(which would yield a too-small length, or IndexError) — it returns ``None``
+	until both the full length header AND the full payload are buffered. This is
+	what lets the incoming path hold a message that is split across multiple
+	SASL/GSS-wrapped buffers until it is complete, instead of mis-parsing a
+	partial entry.
+	"""
+	if len(buf) < 2:
+		return None
+	if buf[1] <= 127:
+		header_len = 2
+	else:
+		bcount = buf[1] - 128
+		header_len = 2 + bcount
+		if len(buf) < header_len:
+			return None
+	msg_len = calcualte_length(buf)
+	if msg_len is None or len(buf) < msg_len:
+		return None
+	return msg_len
+
+
 class MSLDAPClientConnection:
 	def __init__(self, target:MSLDAPTarget, credential:UniCredential, auth=None):
 		self.target = target
@@ -38,6 +65,12 @@ class MSLDAPClientConnection:
 		self.is_anon = False
 		self.__sign_messages = False
 		self.__encrypt_messages = False
+		# Plaintext reassembly buffer for the incoming path. A single LDAP
+		# message can be larger than the server's GSS max-wrap size and arrive
+		# split across multiple sealed/signed SASL buffers; decrypted plaintext
+		# is accumulated here and only COMPLETE LDAP messages are emitted, with
+		# any partial remainder carried to the next buffer. See __handle_incoming.
+		self.__recv_buffer = b''
 		self.network = None
 		self.connection_closed_evt = None
 
@@ -105,25 +138,27 @@ class MSLDAPClientConnection:
 							raise
 				
 				
-				msg_len = calcualte_length(message_data)
-				msg_total_len = len(message_data)
+				# Reassemble across buffers. A single LDAP message can exceed the
+				# server's GSS max-wrap size and arrive split over multiple sealed/
+				# signed SASL buffers; equally, one buffer can carry several small
+				# messages. Append the (decrypted) plaintext to the persistent
+				# buffer and drain every COMPLETE LDAP message, holding any partial
+				# remainder for the next buffer. Framing each buffer in isolation
+				# broke on large entries (e.g. a binary nTSecurityDescriptor) with
+				# "Insufficient data - N bytes requested but only M available" and
+				# tore down the whole connection.
+				self.__recv_buffer += message_data
 				messages = []
-				if msg_len == msg_total_len:
-					message = LDAPMessage.load(message_data)
-					messages.append(message)
-				
-				else:
-					#print('multi-message!')
-					while len(message_data) > 0:
-						msg_len = calcualte_length(message_data)
-						message = LDAPMessage.load(message_data[:msg_len])
-						messages.append(message)
-						
-						message_data = message_data[msg_len:]
+				while True:
+					msg_len = _complete_ldap_message_length(self.__recv_buffer)
+					if msg_len is None:
+						break
+					messages.append(LDAPMessage.load(self.__recv_buffer[:msg_len]))
+					self.__recv_buffer = self.__recv_buffer[msg_len:]
 
-				###### EMERGENCY DEBUG ######
-				#print('DEBUG: Received message: %s' % messages)
-				###### EMERGENCY DEBUG ######
+				if len(messages) == 0:
+					# No complete message yet — wait for the next buffer.
+					continue
 
 				message_id = messages[0]['messageID'].native
 				if message_id not in self.message_table:

@@ -2601,6 +2601,7 @@ def compute_display_paths_for_domain(
     expand_terminal_memberships: bool = True,
     start_node_ids: set[str] | None = None,
     materialized_artifacts: dict[str, Any] | None = None,
+    keep_longest: bool = False,
 ) -> list[dict[str, Any]]:
     pipeline_started_at = time.monotonic()
     runtime_graph: dict[str, Any] = dict(graph)
@@ -2708,7 +2709,19 @@ def compute_display_paths_for_domain(
         records=deduped,
     )
     filtered_started_at = time.monotonic()
-    filtered, _ = attack_graph_core.filter_contained_paths_for_domain_listing(deduped)
+    # Domain scope returns the shortest HV-aware route to domain compromise by
+    # default (most direct kill chain) via the shared single-source-of-truth helper;
+    # keep_longest=True reverts to the legacy holistic longest view.
+    # label_to_node keyed by label only — matches path_to_display_record's label()
+    # and the principals pipeline's stamping (so tier classification is consistent).
+    _l2n = {
+        str(n.get("label") or nid): n
+        for nid, n in (runtime_graph.get("nodes") or {}).items()
+        if isinstance(n, dict)
+    }
+    filtered, _ = attack_graph_core.filter_domain_listing_paths(
+        deduped, label_to_node=_l2n, keep_longest=keep_longest
+    )
     _log_phase_timing(
         scope="domain",
         phase="filter_contained_paths_for_domain_listing",

@@ -151,6 +151,12 @@ class AuditFinding:
     detail: str
     severity: str  # critical | high | medium | low
     highvalue: bool = False  # admincount set or node.highvalue
+    # Structured observed values backing the finding (e.g. the concrete
+    # password-policy knobs read off the domain root for
+    # ``weak_password_policy``). Plain JSON-serializable scalars only — no
+    # LDAP types. Empty for findings with no structured observation. Compared
+    # against the catalog ``recommended`` block at report/web render time.
+    observed: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -224,6 +230,9 @@ class CollectionResult:
     password_compliance: "PasswordComplianceReport | None" = None
     collection_scope: str = "ctf"
     adcs_elapsed: float = 0.0
+    # Machine-account password rotation policy recovered from GPO SYSVOL templates
+    # (set by the orchestrator in audit scope). None = not inspected / unavailable.
+    machine_password_policy: Any | None = None
 
     def add_node(self, node: CollectorNode) -> None:
         if node.object_id:

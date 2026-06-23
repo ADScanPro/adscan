@@ -239,6 +239,51 @@ def _effective_from_mxac(
     )
 
 
+# SMB2 file MxAc (MAXIMUM_ALLOWED / query_maximal_access) returns the maximal
+# access against the OBJECT's NTFS security descriptor only. The share-level
+# permission (the tree-connect MaximalAccess) is enforced SEPARATELY, per
+# operation — so on a READ-ONLY share whose NTFS folder grants write, the file
+# MxAc reports write but an actual create is denied (STATUS_ACCESS_DENIED). The
+# true effective access is the INTERSECTION: file MxAc ∩ share MaximalAccess.
+# Empirically confirmed (HTB Checkpoint DevDrop): share_max=0x1200a9 (read-only)
+# ∩ file_mxac=0x1300af (write) = 0x1200a9 (read-only) — matching the live create
+# result and nxc. Without the intersection the collector emits a false
+# WriteShare edge (over-reports write on read-only shares).
+_SHARE_MAX_UNSET: Any = object()
+
+
+def _intersect_share_cap(file_mask: int, share_max: int) -> int:
+    """Effective access = file MxAc (NTFS object SD) ∩ share-level MaximalAccess.
+
+    The share-level (tree-connect) cap is exactly what the file-level MxAc
+    misses; the most-restrictive layer wins, so a read-only share gates an
+    NTFS folder that grants write. Pure bitwise AND — both inputs are resolved
+    (non-generic) access masks as returned by the server.
+    """
+    return int(file_mask) & int(share_max)
+
+
+async def _fetch_share_maximal_access(
+    connection: Any, host: str, share: str
+) -> Optional[int]:
+    """Return the share-level (tree-connect) ``MaximalAccess``, or ``None``.
+
+    The cap that file-level MxAc misses. Best-effort — a tree-connect failure
+    returns ``None`` so the caller falls back to the file MxAc alone (the
+    pre-fix behaviour, never worse). Never raises.
+    """
+    try:
+        from aiosmb.commons.interfaces.share import SMBShare
+
+        sh = SMBShare.from_unc(f"\\\\{host}\\{share}")
+        _ok, err = await sh.connect(connection)
+        if err is None and sh.maximal_access is not None:
+            return int(sh.maximal_access)
+    except Exception as exc:  # noqa: BLE001 — best-effort metadata probe
+        print_info_debug(f"[smb-effaccess] share-max fetch failed: {share}: {exc}")
+    return None
+
+
 async def _query_maximal_access_for_path(
     *,
     connection: Any,
@@ -246,6 +291,7 @@ async def _query_maximal_access_for_path(
     share: str,
     directory_path: str,
     auth_mode: str,
+    share_maximal_access: Any = _SHARE_MAX_UNSET,
 ) -> EffectiveAccess:
     """MxAc-probe one directory within a share, reusing an open ``connection``.
 
@@ -253,16 +299,36 @@ async def _query_maximal_access_for_path(
     ``directory_path`` ("" == root). The MxAc primitive itself is path-agnostic;
     we simply build the UNC for the target directory and let it compute the
     server-side effective access for that path.
+
+    ``share_maximal_access`` is the share-level (tree-connect) cap that file MxAc
+    does NOT account for; the file MxAc is intersected with it so a read-only
+    share is never reported as writable. Left unset, it is fetched here (one
+    tree-connect — correct for root-only callers); the per-directory enumeration
+    fetches it ONCE and threads it in to avoid a tree-connect per folder.
     """
     from aiosmb.commons.interfaces.directory import SMBDirectory
 
     rel = str(directory_path or "").strip().strip("\\")
     unc = f"\\\\{host}\\{share}" + (f"\\{rel}" if rel else "")
+    if share_maximal_access is _SHARE_MAX_UNSET:
+        share_maximal_access = await _fetch_share_maximal_access(
+            connection, host, share
+        )
     try:
         directory = SMBDirectory.from_uncpath(unc)
         mask, err = await directory.query_maximal_access(  # pylint: disable=no-member
             connection
         )
+        if mask is not None and share_maximal_access is not None:
+            effective = _intersect_share_cap(int(mask), int(share_maximal_access))
+            if effective != int(mask):
+                print_info_debug(
+                    f"[smb-effaccess] {share}\\{rel or '(root)'}: file_mxac="
+                    f"0x{int(mask):08x} ∩ share_max="
+                    f"0x{int(share_maximal_access):08x} = 0x{effective:08x} "
+                    "(share-level cap applied — read-only share gates NTFS write)"
+                )
+            mask = effective
         return _effective_from_mxac(
             mask=mask, err=err, share=share, host=host, auth_mode=auth_mode
         )
@@ -385,6 +451,10 @@ async def _async_enumerate_writable_directories(
     try:
         async with smb_machine_for(config) as machine:
             connection = machine.connection
+            # Fetch the share-level (tree-connect) maximal-access cap ONCE for the
+            # whole walk and thread it into every per-directory MxAc probe — the
+            # file MxAc alone over-reports write on a read-only share.
+            share_max = await _fetch_share_maximal_access(connection, host, share)
             # BFS queue of (relative_path, level). Root first so it is always
             # the first writable candidate when it qualifies.
             queue: list[tuple[str, int]] = [("", 0)]
@@ -411,6 +481,7 @@ async def _async_enumerate_writable_directories(
                     share=share,
                     directory_path=rel_path,
                     auth_mode=auth_mode,
+                    share_maximal_access=share_max,
                 )
                 out.dirs_probed += 1
                 # Mark the overall enumeration as succeeded once we get at least

@@ -141,7 +141,7 @@ def ensure_docker_daemon_running(
 
     print_warning_func(
         "Docker daemon appears to be stopped or not accessible. "
-        "BloodHound CE containers cannot start without a running Docker daemon."
+        "ADscan needs a running Docker daemon to pull and run the runtime image."
     )
     print_info_debug_func(f"[docker] Daemon diagnostic: {diagnostic}")
 
@@ -203,7 +203,7 @@ def ensure_docker_daemon_running(
                     "Docker service unit (`docker.service`) was not found on this host."
                 )
                 print_info_func(
-                    "Install Docker Engine + Docker Compose plugin, then rerun install/check."
+                    "Install Docker Engine, then retry."
                 )
                 return False
 

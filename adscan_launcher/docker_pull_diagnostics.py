@@ -263,27 +263,31 @@ class PullFailurePresentation:
 _PRESENTATION: dict[PullFailureKind, PullFailurePresentation] = {
     "auth_or_rate_limit": PullFailurePresentation(
         glyph="🔐",
-        title="Docker Hub rejected the pull (auth or rate limit)",
+        title="The registry rejected the pull (auth or rate limit)",
         border_style="yellow",
         what_lines=(
-            "Docker Hub returned `unauthorized: authentication required` "
-            "or `toomanyrequests` while pulling the image.",
+            "The registry returned `unauthorized: authentication required`, "
+            "`denied: requested access`, or `toomanyrequests` while pulling "
+            "the image.",
         ),
         why_lines=(
-            "Docker Hub uses the same error response for THREE different "
+            "A registry typically returns the same error response for several "
             "causes and does not tell the client which one:",
-            "  1. Anonymous rate limit hit (100 pulls per 6h per IP). "
-            "Common on VPN exit nodes, corporate NAT, shared CI runners.",
-            "  2. Bearer token expired during a slow pull (token TTL ~5 min).",
-            "  3. Transient Docker Hub backend hiccup.",
+            "  1. The image is in a private/partner repo and the daemon is not "
+            "logged in (or the token has no access to it).",
+            "  2. Anonymous rate limit hit (Docker Hub: 100 pulls per 6h per "
+            "IP). Common on VPN exit nodes, corporate NAT, shared CI runners.",
+            "  3. Bearer token expired during a slow pull (token TTL ~5 min).",
+            "  4. Transient registry backend hiccup.",
         ),
         fix_steps=(
-            "docker logout && docker login   # refreshes token, raises rate-limit ceiling",
+            "{login_command}   # refresh/establish credentials for this registry",
             "{retry_command}",
         ),
         followup=(
-            "If the image is in a private/partner repo, ensure your Docker "
-            "Hub account has been granted access first."
+            "If the image is in a private/partner repo (e.g. the PRO image on "
+            "ghcr.io), ensure your account/token has been granted read access "
+            "to it first."
         ),
     ),
     "manifest_not_found": PullFailurePresentation(
@@ -291,7 +295,7 @@ _PRESENTATION: dict[PullFailureKind, PullFailurePresentation] = {
         title="Image or tag does not exist on the registry",
         border_style="red",
         what_lines=(
-            "Docker Hub returned `manifest unknown` or `not found` — the "
+            "The registry returned `manifest unknown` or `not found` — the "
             "image:tag combination ADscan is asking for is not published.",
         ),
         why_lines=(

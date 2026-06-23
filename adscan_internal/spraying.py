@@ -12,7 +12,7 @@ import os
 import re
 import shlex
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -31,6 +31,26 @@ class ExcludedUser:
     reason: str
     badpwd_count: Optional[int] = None
     remaining_attempts: Optional[int] = None
+
+
+@dataclass(frozen=True, slots=True)
+class EligibleUser:
+    """An eligible (will-be-sprayed) user with its lockout headroom.
+
+    Mirror of :class:`ExcludedUser` for the accounts that WILL be sprayed, so the
+    eligibility panel can show their current BadPwdCount + remaining attempts and
+    not just the excluded ones. ``badpwd_count`` / ``remaining_attempts`` are
+    ``None`` when the user was included conservatively without policy data.
+    ``policy_note`` labels the lockout policy that produced the headroom — e.g.
+    ``"PSO 'TIER0' · thr 3"`` (readable PSO) or
+    ``"PSO 'TIER0' unreadable · thr 3"`` (conservative fallback) — and is ``None``
+    for the plain domain policy.
+    """
+
+    username: str
+    badpwd_count: Optional[int] = None
+    remaining_attempts: Optional[int] = None
+    policy_note: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +89,10 @@ class SprayEligibilityResult:
     used_policy_data: bool
     notes: list[str]
     no_lockout_enforced: bool = False
+    eligible_details: list["EligibleUser"] = field(default_factory=list)
+    """Per-eligible-user lockout headroom (username + BadPwdCount + remaining), for
+    the eligibility panel. Empty on legacy/no-policy paths; render falls back to the
+    plain ``eligible_users`` list when so."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +394,7 @@ def compute_spray_eligibility(
     assert lockout_threshold is not None
     assert badpwd_by_user is not None
     minimum_remaining_attempts: int | None = None
+    eligible_details: list[EligibleUser] = []
 
     for user in file_users:
         norm_user = normalize_username(user)
@@ -382,12 +407,18 @@ def compute_spray_eligibility(
                 )
             else:
                 eligible.append(user)
+                eligible_details.append(EligibleUser(username=user))
             continue
 
         badpwd = int(badpwd_by_user[norm_user])
         remaining = lockout_threshold - badpwd
         if remaining > safe_remaining_threshold:
             eligible.append(user)
+            eligible_details.append(
+                EligibleUser(
+                    username=user, badpwd_count=badpwd, remaining_attempts=remaining
+                )
+            )
             if minimum_remaining_attempts is None:
                 minimum_remaining_attempts = remaining
             else:
@@ -411,6 +442,7 @@ def compute_spray_eligibility(
         minimum_remaining_attempts=minimum_remaining_attempts,
         used_policy_data=True,
         notes=notes,
+        eligible_details=eligible_details,
     )
 
 
@@ -541,9 +573,15 @@ def build_kerbrute_command(
     Returns a shell-safe command string (caller typically executes with shell=True).
     """
     kerbrute_cmd = kerbrute_path or "kerbrute"
+    # ``-v`` makes kerbrute log ONE line per attempted login (valid AND
+    # invalid) -- empirically confirmed against lab.local (kerbrute v1.0.3) --
+    # so the live dashboard can drive a DETERMINATE ``tested / N`` bar. The
+    # authoritative hit parse is ``VALID LOGIN``-anchored, so the extra ``[!]``
+    # lines ``-v`` adds are ignored for credential capture.
     parts: list[str] = [
         kerbrute_cmd,
         "passwordspray",
+        "-v",
         "-d",
         domain,
         "--dc",
@@ -573,9 +611,12 @@ def build_kerbrute_bruteforce_command(
 ) -> str:
     """Build a kerbrute bruteforce command for username:password combos."""
     kerbrute_cmd = kerbrute_path or "kerbrute"
+    # ``-v``: one log line per attempted combo (valid AND invalid) for the
+    # determinate live bar; hit parse stays ``VALID LOGIN``-anchored.
     parts: list[str] = [
         kerbrute_cmd,
         "bruteforce",
+        "-v",
         "-d",
         domain,
         "--dc",

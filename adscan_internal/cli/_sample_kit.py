@@ -1,6 +1,6 @@
 """Locator for the bundled Client Deliverable Kit sample PDFs.
 
-The four sample PDFs ship inside the binary (``--add-data`` in
+The sample PDFs ship inside the binary (``--add-data`` in
 ``build_adscan.sh``) and inside the LITE source tree (``adscan_internal``
 is copied wholesale by ``Dockerfile.runtime``). They are also declared as
 package-data in :file:`pyproject.toml` so installed wheels carry them.
@@ -40,8 +40,7 @@ class SamplePDF:
 SAMPLES: tuple[SamplePDF, ...] = (
     SamplePDF("Security_Assessment_Report.pdf",    "Security Assessment Report"),
     SamplePDF("AD_Hardening_Playbook.pdf",         "AD Hardening Playbook"),
-    SamplePDF("MITRE_Remediation_Checklist.pdf",   "MITRE Remediation Checklist"),
-    SamplePDF("Coverage_Matrix.pdf",               "Coverage Matrix"),
+    SamplePDF("AD_Control_Coverage_Report.pdf",    "AD Control Coverage Report"),
 )
 
 

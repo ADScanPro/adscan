@@ -46,6 +46,7 @@ from adscan_core import telemetry
 from adscan_core.rich_output import (
     mark_sensitive,
     print_info_debug,
+    print_success_verbose,
     print_warning_debug,
 )
 
@@ -728,3 +729,451 @@ def is_plausible_reading(reading: DCTimeReading) -> tuple[bool, str | None]:
             f"reading may be stale; aborting clock sync.",
         )
     return (True, None)
+
+
+# ----- SSOT physical clock-sync freshness guard -----------------------------
+#
+# Mirrors ``ensure_posture_fresh`` (posture_orchestration.py): an idempotent,
+# per-domain, race-safe guard that the Kerberos-heavy entry points converge
+# through so the PHYSICAL host clock is fresh-synced (and host NTP held off)
+# before PKINIT / U2U / shadow-creds run. The per-request kerbad clock-skew
+# offset works for AS/TGS but is INSUFFICIENT for PKINIT (proven empirically:
+# shadow-creds failed KDC_ERR_CLIENT_NOT_TRUSTED on a 7h-skewed engagement until
+# the host clock was physically stepped). This guard is best-effort: on any
+# failure it returns a non-fatal result and the kerbad per-request skew remains
+# the fallback. It NEVER raises.
+
+# Step the host clock only when the measured offset exceeds this tolerance.
+# Below it we no-op (the kerbad per-request skew comfortably covers sub-2min
+# drift) — this is the no-skew / GOAD regression guard: a lab in sync must NOT
+# have its clock stepped, and host NTP must NOT be disabled.
+_CLOCK_TOLERANCE_SECONDS = 120
+
+# Default freshness TTL: once synced, treat the clock as fresh for this long so
+# back-to-back Kerberos steps in one attack chain do not re-read the DC clock.
+_CLOCK_FRESH_TTL_SECONDS = 180
+
+
+class ClockSyncOutcome(str, Enum):
+    """Outcome of an ``ensure_clock_synced_fresh`` call."""
+
+    ALREADY_FRESH = "already_fresh"
+    NOOP_IN_TOLERANCE = "noop_in_tolerance"
+    SYNCED = "synced"
+    FELL_BACK_TO_REQUEST_SKEW = "fell_back_to_request_skew"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class ClockSyncResult:
+    """Result of an ``ensure_clock_synced_fresh`` call.
+
+    Attributes:
+        outcome: One of :class:`ClockSyncOutcome`.
+        offset_seconds: Measured DC-vs-host offset before stepping, when known.
+        channel: DC-time channel that produced the reading, when known.
+        detail: Human-readable diagnostic suitable for a debug log.
+    """
+
+    outcome: ClockSyncOutcome
+    offset_seconds: float | None = None
+    channel: str | None = None
+    detail: str | None = None
+
+    @property
+    def stepped(self) -> bool:
+        """True when the host clock was physically stepped."""
+        return self.outcome is ClockSyncOutcome.SYNCED
+
+
+# Per-domain freshness memo + lock live on the ``shell`` (NOT in domains_data —
+# they must never be JSON-serialized into the workspace; per CLAUDE.md). The
+# lock dict is created lazily on first use.
+_CLOCK_SYNCED_ATTR = "_clock_synced_at"
+_CLOCK_LOCKS_ATTR = "_clock_sync_locks"
+
+
+def _clock_synced_at(shell: Any) -> dict:
+    """Return (lazily creating) the per-domain last-sync timestamp map."""
+    memo = getattr(shell, _CLOCK_SYNCED_ATTR, None)
+    if not isinstance(memo, dict):
+        memo = {}
+        try:
+            setattr(shell, _CLOCK_SYNCED_ATTR, memo)
+        except Exception:  # noqa: BLE001 — shell may be a stub in tests
+            pass
+    return memo
+
+
+def _clock_lock_for(shell: Any, domain_norm: str) -> "asyncio.Lock | None":
+    """Return (lazily creating) the per-domain asyncio lock, or None on failure."""
+    locks = getattr(shell, _CLOCK_LOCKS_ATTR, None)
+    if not isinstance(locks, dict):
+        locks = {}
+        try:
+            setattr(shell, _CLOCK_LOCKS_ATTR, locks)
+        except Exception:  # noqa: BLE001
+            return None
+    lock = locks.get(domain_norm)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[domain_norm] = lock
+    return lock
+
+
+def _host_helper_sock_path() -> str | None:
+    """Return the host-helper socket path, or None when unavailable.
+
+    The physical clock step requires the privileged host helper (container
+    runtime). When the socket is unset we cannot step the clock and must fall
+    back to the per-request kerbad skew.
+    """
+    import os
+
+    sock_path = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
+    return sock_path or None
+
+
+async def _read_offset_seconds(
+    dc_ip: str, sock_path: str | None
+) -> tuple[float | None, DCTimeReading | None]:
+    """Read DC time and compute the host-vs-DC offset in seconds.
+
+    Returns ``(offset_seconds, reading)``. On any read failure returns
+    ``(None, None)`` — never raises. ``offset_seconds`` is positive when the
+    DC clock is AHEAD of the host.
+    """
+    try:
+        reading = await get_dc_time(dc_ip, sock_path=sock_path)
+    except DCTimeUnavailable as exc:
+        print_info_debug(f"clock-sync-guard DC-time read failed: {exc}")
+        return (None, None)
+    except Exception as exc:  # noqa: BLE001 — guard must never raise
+        telemetry.capture_exception(exc)
+        print_info_debug(f"clock-sync-guard DC-time read raised: {exc}")
+        return (None, None)
+    now_utc = datetime.now(timezone.utc)
+    offset = (reading.when_utc - now_utc).total_seconds()
+    return (offset, reading)
+
+
+async def ensure_clock_synced_fresh(
+    shell: Any,
+    *,
+    domain: str,
+    dc_ip: str,
+    ttl_seconds: int = _CLOCK_FRESH_TTL_SECONDS,
+    force: bool = False,
+) -> ClockSyncResult:
+    """Idempotent physical-clock freshness guard. Safe to call from any consumer.
+
+    Mirrors ``ensure_posture_fresh``: cheap no-op when the clock was synced
+    within ``ttl_seconds``; otherwise measures the DC offset, holds host NTP
+    off (once per session), steps the host clock when the offset exceeds the
+    ±120s tolerance, and verifies the step landed.
+
+    Best-effort: NEVER raises. On any failure the per-request kerbad clock-skew
+    offset remains the fallback, so callers can invoke this without guarding.
+
+    Args:
+        shell: PentestShell instance (carries the per-domain freshness memo,
+            the lock map, and the ``_host_ntp_disabled_once`` once-flag).
+        domain: Target domain (used only as the freshness key).
+        dc_ip: PDC/KDC IP for the target domain (resolve via ``resolve_dc_ip``).
+        ttl_seconds: Freshness window. Within it the guard is a ~1ms no-op.
+        force: Force re-measure + re-step even if the clock is fresh.
+
+    Returns:
+        :class:`ClockSyncResult` describing the outcome.
+    """
+    domain_str = (domain or "").strip()
+    dc_ip_str = (dc_ip or "").strip()
+    if not domain_str or not dc_ip_str:
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.FELL_BACK_TO_REQUEST_SKEW,
+            detail="missing domain or dc_ip",
+        )
+
+    domain_norm = domain_str.lower()
+    lock = _clock_lock_for(shell, domain_norm)
+    if lock is None:
+        # Cannot create a lock (stub shell) — run without serialization.
+        return await _ensure_clock_synced_fresh_locked(
+            shell, domain_norm, dc_ip_str, ttl_seconds, force
+        )
+    async with lock:
+        return await _ensure_clock_synced_fresh_locked(
+            shell, domain_norm, dc_ip_str, ttl_seconds, force
+        )
+
+
+async def _ensure_clock_synced_fresh_locked(
+    shell: Any,
+    domain_norm: str,
+    dc_ip: str,
+    ttl_seconds: int,
+    force: bool,
+) -> ClockSyncResult:
+    """Core algorithm, executed under the per-domain lock."""
+    marked_dc = mark_sensitive(dc_ip, "ip")
+
+    # 1. Per-domain freshness check (monotonic clock — immune to the step we
+    #    are about to perform on the wall clock).
+    memo = _clock_synced_at(shell)
+    last = memo.get(domain_norm)
+    now_mono = time.monotonic()
+    if not force and isinstance(last, (int, float)) and (now_mono - last) < ttl_seconds:
+        print_info_debug(
+            f"clock-sync-guard fresh (synced {int(now_mono - last)}s ago, "
+            f"ttl={ttl_seconds}s) dc={marked_dc}"
+        )
+        return ClockSyncResult(outcome=ClockSyncOutcome.ALREADY_FRESH)
+
+    # 2. Measure the offset FIRST. No host helper → cannot step → fall back.
+    sock_path = _host_helper_sock_path()
+    offset, reading = await _read_offset_seconds(dc_ip, sock_path)
+    if offset is None or reading is None:
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.FELL_BACK_TO_REQUEST_SKEW,
+            detail="DC-time read unavailable",
+        )
+
+    # Within tolerance → stamp fresh and DO NOT step. This is the no-skew /
+    # GOAD regression guard: a lab in sync must keep host NTP on and its clock
+    # untouched.
+    if abs(offset) < _CLOCK_TOLERANCE_SECONDS:
+        memo[domain_norm] = now_mono
+        print_info_debug(
+            f"clock-sync-guard offset {offset:+.1f}s within tolerance "
+            f"(<{_CLOCK_TOLERANCE_SECONDS}s); no step dc={marked_dc} "
+            f"channel={reading.channel.value}"
+        )
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.NOOP_IN_TOLERANCE,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+        )
+
+    # Stepping the host clock requires the privileged host helper.
+    if not sock_path:
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.FELL_BACK_TO_REQUEST_SKEW,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+            detail="host helper socket unavailable; cannot step clock",
+        )
+
+    from adscan_internal.host_privileged_helper import (
+        HostHelperError,
+        host_helper_client_request,
+    )
+
+    # 3. Hold host NTP off — once per session (honour the existing flag so a
+    #    coarse caller that already disabled it does not toggle it again).
+    try:
+        if not getattr(shell, "_host_ntp_disabled_once", False):
+            ntp_off = await asyncio.to_thread(
+                host_helper_client_request,
+                sock_path,
+                op="timedatectl_set_ntp",
+                payload={"value": False},
+            )
+            if getattr(ntp_off, "returncode", None) == 127:
+                print_info_debug(
+                    "clock-sync-guard timedatectl not found on host; continuing"
+                )
+            elif not getattr(ntp_off, "ok", False):
+                print_warning_debug(
+                    "clock-sync-guard could not disable host NTP; "
+                    f"msg={getattr(ntp_off, 'message', None)!r}"
+                )
+            try:
+                setattr(shell, "_host_ntp_disabled_once", True)
+            except Exception:  # noqa: BLE001
+                pass
+    except (HostHelperError, OSError) as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(f"clock-sync-guard NTP-off host-helper error: {exc}")
+        # Continue: we can still try to step the clock.
+
+    # 4. Step the host clock — sanity-gate the reading first.
+    plausible, reason = is_plausible_reading(reading)
+    if not plausible:
+        print_warning_debug(reason or "clock-sync-guard reading failed sanity check")
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.FAILED,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+            detail=reason,
+        )
+    try:
+        set_resp = await asyncio.to_thread(
+            host_helper_client_request,
+            sock_path,
+            op="set_system_time",
+            payload={"datetime_iso": reading.when_utc.isoformat()},
+        )
+    except (HostHelperError, OSError) as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(f"clock-sync-guard set_system_time host-helper error: {exc}")
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.FAILED,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+            detail=str(exc),
+        )
+    if not getattr(set_resp, "ok", False):
+        print_warning_debug(
+            "clock-sync-guard set_system_time failed; "
+            f"rc={getattr(set_resp, 'returncode', None)} "
+            f"msg={getattr(set_resp, 'message', None)!r}"
+        )
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.FAILED,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+            detail="set_system_time not ok",
+        )
+
+    # 5. Verify the step landed (re-read; confirm we are now within tolerance).
+    new_offset, _ = await _read_offset_seconds(dc_ip, sock_path)
+    if new_offset is None:
+        # We stepped but cannot confirm. Stamp fresh optimistically: the step
+        # reported ok and a transient re-read failure must not undo it.
+        memo[domain_norm] = time.monotonic()
+        print_success_verbose(
+            f"Clock stepped to DC {marked_dc} (offset was {offset:+.1f}s; "
+            "post-step verification read unavailable)"
+        )
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.SYNCED,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+            detail="stepped; verification read unavailable",
+        )
+    if abs(new_offset) < _CLOCK_TOLERANCE_SECONDS:
+        memo[domain_norm] = time.monotonic()
+        print_success_verbose(
+            f"Clock synchronized with DC {marked_dc} via {reading.channel.value} "
+            f"(offset {offset:+.1f}s -> {new_offset:+.1f}s)"
+        )
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.SYNCED,
+            offset_seconds=offset,
+            channel=reading.channel.value,
+        )
+    print_warning_debug(
+        f"clock-sync-guard step did not converge: offset still {new_offset:+.1f}s "
+        f"after stepping dc={marked_dc}"
+    )
+    return ClockSyncResult(
+        outcome=ClockSyncOutcome.FAILED,
+        offset_seconds=offset,
+        channel=reading.channel.value,
+        detail=f"post-step offset still {new_offset:+.1f}s",
+    )
+
+
+def do_ensure_clock_synced_fresh(
+    shell: Any,
+    domain: str,
+    dc_ip: str,
+    *,
+    ttl_seconds: int = _CLOCK_FRESH_TTL_SECONDS,
+    force: bool = False,
+) -> ClockSyncResult:
+    """Synchronous wrapper around :func:`ensure_clock_synced_fresh`.
+
+    Drives the coroutine via the shared ``run_async_sync`` bridge so it works
+    whether or not the caller already owns an event loop. Best-effort: on any
+    failure to drive the coroutine it returns a ``FELL_BACK_TO_REQUEST_SKEW``
+    result and never raises.
+    """
+    from adscan_internal.services.async_bridge import run_async_sync
+
+    try:
+        return run_async_sync(
+            ensure_clock_synced_fresh(
+                shell,
+                domain=domain,
+                dc_ip=dc_ip,
+                ttl_seconds=ttl_seconds,
+                force=force,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — guard must never raise
+        telemetry.capture_exception(exc)
+        print_info_debug(f"clock-sync-guard sync wrapper failed: {exc}")
+        return ClockSyncResult(
+            outcome=ClockSyncOutcome.FELL_BACK_TO_REQUEST_SKEW,
+            detail=str(exc),
+        )
+
+
+# ---------------------------------------------------------------------------
+# PKINIT reactive backstop — register the physical clock-resync callback
+# ---------------------------------------------------------------------------
+
+
+def register_clock_resync_for_shell(shell: Any) -> None:
+    """Arm the PKINIT physical clock-resync backstop for this session.
+
+    Injects a shell-aware closure into ``_kerberos_recovery`` so that ANY PKINIT
+    primitive that slips past the proactive ``ensure_clock_synced_fresh`` guard
+    and fails ``KDC_ERR_CLIENT_NOT_TRUSTED`` (0x3E) self-heals at the transport
+    layer: the closure resolves the target domain's DC, physically steps the
+    host clock via the SSOT guard (``force=True``), and reports whether a step
+    occurred so the transport can retry the failed PKINIT call exactly once.
+
+    This is the ONLY adscan-aware part of the backstop — ``_kerberos_recovery``
+    itself never imports ``adscan_internal``; the dependency is inverted via this
+    injected callback. Call ONCE per session at shell setup, BEFORE the first
+    PKINIT, so the backstop is armed for the whole session. Idempotent:
+    re-registration simply replaces the previous closure.
+
+    Args:
+        shell: The active ``PentestShell`` (owns ``domains_data`` and the
+            host-helper clock step).
+    """
+
+    def _resync(realm: str) -> bool:
+        """Physically resync the host clock for *realm*'s DC. True iff stepped."""
+        try:
+            from adscan_internal.models.domain import resolve_dc_ip
+
+            domains_data = getattr(shell, "domains_data", None) or {}
+            # kerbad hands us an uppercased realm; domains_data is a
+            # CaseInsensitiveDict, but fall back to a case-insensitive scan when
+            # it is a plain dict (test stubs).
+            domain_data = domains_data.get(realm)
+            if domain_data is None:
+                for key, value in domains_data.items():
+                    if str(key).upper() == realm.upper():
+                        domain_data = value
+                        break
+            if not domain_data:
+                print_info_debug(
+                    f"clock-resync backstop: no domain data for realm {realm}; skipping."
+                )
+                return False
+            dc_ip = resolve_dc_ip(domain_data)
+            if not dc_ip:
+                print_info_debug(
+                    f"clock-resync backstop: no resolvable DC IP for realm {realm}; skipping."
+                )
+                return False
+            result = do_ensure_clock_synced_fresh(shell, realm, dc_ip, force=True)
+            return result.outcome is ClockSyncOutcome.SYNCED
+        except Exception as exc:  # noqa: BLE001 — backstop must never raise into kerbad
+            telemetry.capture_exception(exc)
+            print_info_debug(f"clock-resync backstop closure failed for {realm}: {exc}")
+            return False
+
+    try:
+        from adscan_internal.services import _kerberos_recovery
+
+        _kerberos_recovery.register_clock_resync_callback(_resync)
+        print_info_debug("PKINIT clock-resync backstop armed for the session.")
+    except Exception as exc:  # noqa: BLE001 — never break shell startup
+        telemetry.capture_exception(exc)
+        print_info_debug(f"failed to arm PKINIT clock-resync backstop: {exc}")

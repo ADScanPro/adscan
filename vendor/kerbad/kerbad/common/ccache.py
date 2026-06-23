@@ -653,6 +653,8 @@ class CCACHE:
 		# Couldn't find the correct TGS for the SPN, returning the first one
 		# the only valid reason this can happen is mismatching service tag in the SPN
 		# this is a hack...
+		if len(tgss) == 0:
+			return None, None, Exception('No TGS found in CCACHE file')
 		return tgss[0][0], tgss[0][1], None
 	
 	def get_tgt(self, username, domain = None, strict:bool=False):

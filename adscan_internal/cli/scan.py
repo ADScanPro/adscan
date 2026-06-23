@@ -1827,7 +1827,7 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
                 domain,
                 cred.samaccountname,
                 cred.raw_value,
-                credential_origin="user_description",
+                credential_origin="userdescription",
                 prompt_for_user_privs_after=False,
                 force_authenticated_enumeration=False,
             )

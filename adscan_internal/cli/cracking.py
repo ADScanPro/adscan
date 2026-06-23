@@ -69,7 +69,7 @@ except ImportError:
     KerberosTicketService = None  # type: ignore[assignment, misc]
 
 from adscan_internal.services.hashcat_service import HashcatCrackingService
-from adscan_internal.services.weakpass_service import WeakpassService
+from adscan_internal.services.weakpass_service import WeakpassService, weakpass_allowed
 from adscan_internal.services.cracking_history_service import (
     build_cracking_attempt,
     find_matching_attempt,
@@ -245,11 +245,16 @@ class CrackingShell(Protocol):
         self, host: str, *, domain: str | None = None
     ) -> bool: ...
 
+    def do_sync_clock_with_pdc(self, domain: str, verbose: bool = False) -> bool: ...
+
 
 class HashCrackingShell(Protocol):
     """Minimal shell surface required for weakpass hash cracking."""
 
     domains_data: dict
+    # Session type ("ctf" / "audit" / None) — read by ``weakpass_allowed`` to
+    # gate external egress.
+    type: str | None
 
     def run_command(
         self, command: str, *, timeout: int | None = None, **kwargs
@@ -1470,19 +1475,12 @@ def run_sync_clock(shell: CrackingShell, domain: str, *, verbose: bool = False) 
         icon="🕐",
     )
 
-    service = KerberosTicketService()
-    success = service.sync_clock_with_pdc(
-        pdc_ip=pdc_ip,
-        domain=domain,
-        is_full_container_runtime=shell._is_full_adscan_container_runtime,
-        sudo_validate=shell._sudo_validate,
-        is_ntp_service_available=shell._is_ntp_service_available,
-        is_tcp_port_open=shell._is_tcp_port_open,
-        run_command=shell.run_command,
-        sync_clock_via_net_time=shell._sync_clock_via_net_time,
-        scan_id=None,
-        verbose=verbose,
-    )
+    # Delegate to the single physical-sync implementation
+    # (``do_sync_clock_with_pdc`` → ``sync_clock_with_pdc`` → SSOT
+    # ``ensure_clock_synced_fresh``). This collapses the previously divergent
+    # ``KerberosTicketService.sync_clock_with_pdc`` callback variant so there is
+    # exactly one physical-sync code path.
+    success = bool(shell.do_sync_clock_with_pdc(domain, verbose=verbose))
 
     if success:
         print_success_verbose(f"Clock synchronized successfully with PDC {marked_pdc}")
@@ -1724,6 +1722,15 @@ def handle_hash_cracking(
         cracked password and False. On failure, returns original hash
         and True.
     """
+    if not weakpass_allowed(shell):
+        # Egress disabled for this context: keep the hash hashcat-ready, no
+        # external lookup. Local cracking (hashcat/John) is unaffected.
+        print_info_verbose(
+            f"weakpass lookup skipped for user '{mark_sensitive(user, 'user')}' "
+            "(external NT-hash lookup disabled for this session); hash saved."
+        )
+        return cred, True
+
     try:
         marked_cred = mark_sensitive(cred, "password")
         marked_user = mark_sensitive(user, "user")
@@ -1797,6 +1804,15 @@ def handle_hash_cracking_batch(
         valid_hashes.append(candidate)
 
     if not valid_hashes:
+        return {}
+
+    if not weakpass_allowed(shell):
+        # Egress disabled for this context: nothing cracked externally. The
+        # hashes remain hashcat-ready for local cracking.
+        print_info_verbose(
+            f"weakpass batch lookup skipped for {len(valid_hashes)} hash(es) "
+            "(external NT-hash lookup disabled for this session)."
+        )
         return {}
 
     cracked_by_hash: dict[str, str] = {}

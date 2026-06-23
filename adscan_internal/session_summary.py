@@ -40,18 +40,23 @@ class AttackPathSnapshotMetrics:
 
 
 def count_workspace_credentials(shell: object) -> int:
-    """Return total credentials currently stored across all loaded domains."""
+    """Return compromised credentials stored across all loaded domains.
+
+    Routes through the compromise SSOT (:func:`iter_compromised_credentials`)
+    so the scan's own STARTING credential — the INPUT to ``adscan ci auth`` —
+    is never counted as a compromise win.
+    """
     try:
+        from adscan_internal.services.session_compromise_state_service import (
+            iter_compromised_credentials,
+        )
+
         domains_data = getattr(shell, "domains_data", {}) or {}
         if not isinstance(domains_data, dict):
             return 0
         total = 0
-        for domain_data in domains_data.values():
-            if not isinstance(domain_data, dict):
-                continue
-            creds = domain_data.get("credentials")
-            if isinstance(creds, dict):
-                total += len(creds)
+        for domain in domains_data.keys():
+            total += len(iter_compromised_credentials(shell, domain))
         return max(0, total)
     except Exception as exc:  # pragma: no cover - defensive
         telemetry.capture_exception(exc)

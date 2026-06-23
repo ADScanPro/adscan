@@ -319,6 +319,14 @@ class KerbrosClient:
 				# If the server suggested encryption methods, we will use them
 				if e.krb_err_msg.get('e-data'):
 					srv_etype = self.select_preferred_encryption_method(e.krb_err_msg)
+					# ADscan vendor fix: respect an explicit caller etype restriction
+					# (see aioclient.get_TGT for the full rationale — without this an
+					# override_etype=[23] RC4-only request silently retries with the
+					# server's AES and falsely succeeds, e.g. the posture RC4 probe).
+					if override_etype is not None and srv_etype.value not in supported_etypes:
+						if etype_int == supported_etypes[-1]:
+							raise e
+						continue
 					logger.debug('Trying with supported suggested etype %s' % srv_etype.name)
 					preauth_rep = self.do_preauth(srv_etype, with_pac=with_pac)
 					break
@@ -424,19 +432,29 @@ class KerbrosClient:
 		authenticator_data['cusec'] = now.microsecond
 		authenticator_data['ctime'] = now.replace(microsecond=0)
 		
-		if is_linux:
-			ac = AuthenticatorChecksum()
-			ac.flags = 0
-			ac.channel_binding = b'\x00'*16
-			
-			chksum = {}
-			chksum['cksumtype'] = 0x8003
-			chksum['checksum'] = ac.to_bytes()
+		# RFC 4120 (3.3.2 / 7.5.1): the PA-TGS-REQ AP-REQ authenticator MUST carry
+		# a keyed checksum (key usage 6) over the KDC-REQ-BODY, using the checksum
+		# type that matches the TGT session-key enctype. Windows KDCs tolerate a
+		# missing authenticator checksum, but RFC-strict KDCs (MIT, Heimdal, Samba
+		# AD) reject it with KRB_AP_ERR_INAPP_CKSUM. Emit it unconditionally so we
+		# work against every compliant KDC, not just Windows. The GSSAPI 0x8003
+		# channel-binding checksum is NOT this checksum: it belongs in the AP-REQ
+		# sent to the application server (construct_apreq), never in the TGS-REQ.
+		from kerbad.protocol.encryption import make_checksum, Cksumtype, Enctype
+		_etype_to_authcksum = {
+			Enctype.DES3: Cksumtype.SHA1_DES3,
+			Enctype.AES128: Cksumtype.SHA1_AES128,
+			Enctype.AES256: Cksumtype.SHA1_AES256,
+			Enctype.RC4: Cksumtype.HMAC_MD5,
+		}
+		req_body_obj = KDC_REQ_BODY(kdc_req_body)
+		_auth_cksumtype = _etype_to_authcksum.get(self.kerberos_cipher_type)
+		if _auth_cksumtype is not None:
+			authenticator_data['cksum'] = Checksum({
+				'cksumtype': _auth_cksumtype,
+				'checksum': make_checksum(_auth_cksumtype, self.kerberos_session_key, 6, req_body_obj.dump()),
+			})
 
-
-			authenticator_data['cksum'] = Checksum(chksum)
-			authenticator_data['seq-number'] = 0
-		
 		authenticator_data_enc = self.kerberos_cipher.encrypt(self.kerberos_session_key, 7, Authenticator(authenticator_data).dump(), None)
 		
 		ap_req = {}
@@ -455,8 +473,8 @@ class KerbrosClient:
 		kdc_req['pvno'] = krb5_pvno
 		kdc_req['msg-type'] = MESSAGE_TYPE.KRB_TGS_REQ.value
 		kdc_req['padata'] = [pa_data_1]
-		kdc_req['req-body'] = KDC_REQ_BODY(kdc_req_body)
-	
+		kdc_req['req-body'] = req_body_obj
+
 		req = TGS_REQ(kdc_req)
 		logger.debug('Constructing TGS request to server')
 		rep = self.ksoc.sendrecv(req.dump())

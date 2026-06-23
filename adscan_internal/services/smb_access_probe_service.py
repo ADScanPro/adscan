@@ -183,6 +183,39 @@ async def run_smb_access_probe_sweep(
     if not resolved_targets:
         return []
 
+    # Liveness re-gate (445/tcp). smb/ips.txt was populated by the Phase-3 port
+    # scan, but minutes can have passed and hosts may have gone down since — a
+    # stale-dead host that still answers TCP (or hangs) would otherwise burn a
+    # worker and stall the sweep. This is a cheap one-port concurrent probe, NOT
+    # a re-scan. Gating HERE (in the service, not the caller) is the robust SSOT:
+    # the docstring's old "callers should pre-filter" contract was fragile — the
+    # SMB privilege path did not, which is how a single hung host blocked the
+    # whole sweep for >10min. The per-host wall-clock budget in
+    # check_smb_privilege_batch is the backstop for hosts that pass this gate
+    # (TCP-accept) but then hang the SMB negotiate / Kerberos.
+    from adscan_internal.services.host_reachability_filter import (
+        filter_reachable_hosts,
+    )
+
+    # Scale the gate fan-out with the fleet: a TCP connect is cheap (no auth), so
+    # high concurrency is safe and keeps the gate to a few seconds even at 1-2k
+    # hosts (vs ~60s at the default 50). Dead hosts cost only the 3s probe
+    # timeout, not the 45s auth budget they would burn without the gate.
+    gate_concurrency = max(50, min(len(resolved_targets), 256))
+    reach = await filter_reachable_hosts(
+        resolved_targets, 445, max_concurrency=gate_concurrency
+    )
+    if len(reach.reachable) != len(resolved_targets):
+        print_info_debug(
+            f"[smb_probe] 445 liveness gate: {len(reach.reachable)}/"
+            f"{len(resolved_targets)} reachable now "
+            f"({len(reach.offline)} down since the port scan, skipped; "
+            f"{reach.elapsed_ms:.0f}ms)"
+        )
+    resolved_targets = list(reach.reachable)
+    if not resolved_targets:
+        return []
+
     worker_count = max(
         1, min(max_workers or get_smb_probe_worker_count(), len(resolved_targets))
     )

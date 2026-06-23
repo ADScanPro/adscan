@@ -1504,6 +1504,20 @@ def execute_dcsync_native(
             except Exception as _ac_exc:  # noqa: BLE001
                 telemetry.capture_exception(_ac_exc)
 
+    # A full ("all") DRSUAPI walk just replicated the entire NTDS — record it
+    # (SSOT marker consumed by the CTF + audit post-compromise pipelines) so the
+    # full "all" dump runs EXACTLY ONCE. Set BEFORE the promote_to_pwned calls
+    # below fire the post-compromise hook, so that hook sees the flag and skips
+    # a redundant re-dump. A targeted dump (``target_users`` set, e.g. the
+    # ESC8→DC path extracting just the DA) never sets it, so post-compromise
+    # still replicates everything once a DA credential is in hand.
+    if not target_users and raw_credentials:
+        from adscan_internal.services.domain_compromise_promotion import (
+            mark_full_ntds_replicated,
+        )
+
+        mark_full_ntds_replicated(shell, domain)
+
     # Screenshot moment: krbtgt hash extracted = full domain compromise.
     # Augments (does not replace) the print_success above so logs stay
     # backwards-compatible.

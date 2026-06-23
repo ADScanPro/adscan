@@ -247,6 +247,10 @@ BENIGN_NATIVE_NOISE_MARKERS: tuple[str, ...] = (
     # torn down with pending writes (standard pattern for short-lived SMB).
     "socket.send() raised exception",
     "socket.sendto() raised exception",
+    # asyncio emits this at DEBUG every time a new event loop is created (each
+    # run_smb_operation / background reader loop). Pure lifecycle chatter — under
+    # --debug it floods when many short async operations run back-to-back.
+    "Using selector:",
 )
 
 

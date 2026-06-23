@@ -169,7 +169,11 @@ def _emit_pkinit_compromise(config: EscConfig, nt_hash: str | None) -> None:
                 target_principal,
                 nt_hash,
                 prompt_for_user_privs_after=False,
-                credential_origin="adcs",
+                # Per-ESC provenance slug aligned with the attack_step_catalog
+                # join key (``adcsesc1``..``adcsesc17``) so credential → attack
+                # step → KB is a single join. The enrollment path knows exactly
+                # which ESC/template it exploited via ``config.esc``.
+                credential_origin=f"adcsesc{config.esc}",
             )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)

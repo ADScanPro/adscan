@@ -18,6 +18,7 @@ import tempfile
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
+    confirm_ask,
     create_styled_table,
     mark_sensitive,
     print_error,
@@ -30,6 +31,7 @@ from adscan_internal.rich_output import (
     print_success,
     print_warning,
 )
+from adscan_internal.services._kerberos_spn import is_ip_address
 from adscan_internal.services.network_discovery import (
     extract_netbios,
     infer_domain_from_ldap_banner,
@@ -45,6 +47,11 @@ from adscan_internal.services.dns_discovery_service import (
 from adscan_internal.services.dns_resolver_service import build_root_forwarders
 from rich.prompt import Prompt, Confirm
 from rich.text import Text
+
+# Matches an IPv4-shaped token (four dot-separated 1-3 digit groups), used to
+# catch malformed IPs (e.g. an out-of-range octet) typed into the domain field
+# that ``is_ip_address`` would reject but that are clearly not a DNS domain name.
+_IPV4_SHAPED_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 
 class DNSShell(Protocol):
@@ -1889,8 +1896,14 @@ def prompt_pdc_ip_interactive(
     *,
     domain: str | None = None,
     prompt_text: str | None = None,
+    default_ip: str | None = None,
 ) -> str | None:
-    """Prompt for a DC/DNS IP address with validation."""
+    """Prompt for a DC/DNS IP address with validation.
+
+    When ``default_ip`` is supplied (e.g. an IP the user mistakenly typed into
+    the domain field and chose to reuse), it is offered as the prompt default so
+    the operator can accept it with Enter instead of retyping it.
+    """
     while True:
         default_prompt = (
             f"Enter a DC/DNS IP address for {domain} (e.g., 10.10.10.100)"
@@ -1899,7 +1912,7 @@ def prompt_pdc_ip_interactive(
         )
         ip_input = Prompt.ask(
             Text(prompt_text or default_prompt, style="cyan"),
-            default="",
+            default=default_ip or "",
         ).strip()
         if not ip_input:
             return None
@@ -1928,12 +1941,62 @@ def prompt_known_domain_and_pdc_interactive(
             .strip()
             .lower()
         )
-        if not domain_input or "." not in domain_input:
+        if not domain_input:
             print_warning(
                 f"[bold]⚠️  Invalid domain format:[/bold] {mark_sensitive(domain_input, 'domain')}\n"
                 "Domain must be a FQDN (e.g., [yellow]contoso.local[/yellow], not just [red]CONTOSO[/red])"
             )
             continue
+
+        # Carried-forward DC/DNS IP when the user typed an IP into the domain field.
+        carried_dc_ip: str | None = None
+        if is_ip_address(domain_input):
+            marked_ip = mark_sensitive(domain_input, "ip")
+            print_warning(
+                "[bold]⚠️  That looks like an IP address, not a domain (FQDN).[/bold]\n"
+                "The domain name should be a DNS name like [yellow]contoso.local[/yellow], "
+                f"not an IP like {marked_ip}."
+            )
+            if confirm_ask(
+                f"Use {domain_input} as the DC/DNS IP and just enter the domain name?",
+                default=True,
+            ):
+                carried_dc_ip = domain_input
+            continue_to_reprompt = True
+        elif _IPV4_SHAPED_RE.match(domain_input):
+            marked_ip = mark_sensitive(domain_input, "ip")
+            print_warning(
+                "[bold]⚠️  That looks like a malformed IP address, not a domain (FQDN).[/bold]\n"
+                f"{marked_ip} is not a valid IPv4 address. Enter a DNS domain name like "
+                "[yellow]contoso.local[/yellow], or a valid IP at the DC IP prompt."
+            )
+            continue_to_reprompt = True
+        elif "." not in domain_input:
+            print_warning(
+                f"[bold]⚠️  Invalid domain format:[/bold] {mark_sensitive(domain_input, 'domain')}\n"
+                "Domain must be a FQDN (e.g., [yellow]contoso.local[/yellow], not just [red]CONTOSO[/red])"
+            )
+            continue_to_reprompt = True
+        else:
+            continue_to_reprompt = False
+
+        if continue_to_reprompt and carried_dc_ip is None:
+            continue
+        if continue_to_reprompt and carried_dc_ip is not None:
+            # Re-prompt for the FQDN, then pre-fill the carried IP at the DC prompt.
+            domain_input = (
+                Prompt.ask(
+                    Text("Enter the domain name (e.g., contoso.local)", style="cyan")
+                )
+                .strip()
+                .lower()
+            )
+            if not domain_input or is_ip_address(domain_input) or "." not in domain_input:
+                print_warning(
+                    f"[bold]⚠️  Invalid domain format:[/bold] {mark_sensitive(domain_input, 'domain')}\n"
+                    "Domain must be a FQDN (e.g., [yellow]contoso.local[/yellow])"
+                )
+                continue
 
         print_panel(
             "[bold]PDC / Domain Controller[/bold]\n\n"
@@ -1946,7 +2009,9 @@ def prompt_known_domain_and_pdc_interactive(
             padding=(1, 2),
         )
 
-        ip_input = prompt_pdc_ip_interactive(domain=domain_input)
+        ip_input = prompt_pdc_ip_interactive(
+            domain=domain_input, default_ip=carried_dc_ip
+        )
         if not ip_input:
             continue
 

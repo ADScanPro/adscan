@@ -55,6 +55,14 @@ from adscan_internal.services.enumeration.smb_shares_native import (
     NativeSharesResult,
     enumerate_shares_native_sync,
 )
+from adscan_internal.models.domain import resolve_dc_ip
+from adscan_internal.services._kerberos_spn import is_ip_address
+from adscan_internal.services.kerberos_hostname_inventory import (
+    load_workspace_ip_hostname_inventory,
+)
+from adscan_internal.services.kerberos_spn_resolution import (
+    resolve_spn_or_decide_ntlm,
+)
 from adscan_internal.services.smb_transport import SMBConfig
 from adscan_internal.services.views._graph_share_reader import (
     GraphShareSnapshot,
@@ -629,6 +637,35 @@ class _NoCredentialsError(RuntimeError):
     """Raised when the shell has no credentials usable for the live probe."""
 
 
+def _load_ip_hostname_inventory(shell: Any, domain: str) -> Dict[str, List[str]]:
+    """Load the persisted workspace IP -> hostname candidate map for *domain*.
+
+    Mirrors the loader call used by other Kerberos-aware callers (e.g.
+    :mod:`credential_store_service`): the map bridges an IP target to its own
+    FQDN so the Kerberos SPN binds to the host we connect to. Best-effort — a
+    missing workspace or report yields an empty map (the resolver then falls
+    back to live PTR, and finally to NTLM).
+    """
+    try:
+        workspace_dir = (
+            shell._get_workspace_cwd()
+            if hasattr(shell, "_get_workspace_cwd")
+            else getattr(shell, "current_workspace_dir", "")
+        ) or ""
+        domains_dir = getattr(shell, "domains_dir", "domains") or "domains"
+        return (
+            load_workspace_ip_hostname_inventory(
+                workspace_dir=str(workspace_dir),
+                domains_dir=str(domains_dir),
+                domain=domain,
+            )
+            or {}
+        )
+    except Exception as exc:  # noqa: BLE001 — inventory is best-effort
+        telemetry.capture_exception(exc)
+        return {}
+
+
 def _build_smb_config_for_host(
     *,
     shell: Any,
@@ -698,9 +735,58 @@ def _build_smb_config_for_host(
         except Exception:  # noqa: BLE001
             posture_snapshot = None
 
+        # Kerberos SPN host — resolve the SPN for the host we ACTUALLY connect
+        # to, never the PDC's. The historic ``pdc_hostname or target_host``
+        # default requested ``cifs/<pdc-fqdn>`` against every host in the
+        # share-enum loop, so a non-DC host received a service ticket bound to
+        # the wrong SPN and rejected the AP-REQ (the client only ever sees a
+        # GSSAPI / AP-REP parse error -> "Live SMB share probe failed", no
+        # shares). Reuse the canonical resolver (single source of truth — the
+        # same path lsass.py uses) so a short label / IP is promoted to its OWN
+        # FQDN via the workspace inventory -> live PTR, and drop to NTLM when no
+        # FQDN is recoverable instead of fabricating one or reusing the PDC's.
+        inventory = _load_ip_hostname_inventory(shell, domain)
+        target = str(target_host or pdc_ip or "").strip()
+
+        spn_host: Optional[str]
+        if not cred_stripped:
+            # Guest / null session (empty credential): there is no secret to
+            # obtain a Kerberos TGT, and a Kerberos-first bind would crash while
+            # building the auth URL ('NoneType' object has no attribute 'native').
+            # Force the NTLM-anonymous/guest path. The per-host Kerberos SPN
+            # resolution below only applies when we hold a usable credential
+            # (password / NT hash / ccache).
+            spn_host = None
+            use_kerberos = False
+        else:
+            resolver_ip = resolve_dc_ip(domain_data) or (pdc_ip or None)
+            target_is_dc = bool(target) and bool(resolver_ip) and target == resolver_ip
+            resolution = resolve_spn_or_decide_ntlm(
+                target_host=target or None,
+                domain=domain,
+                domains_data=getattr(shell, "domains_data", {}),
+                ip_hostname_inventory=inventory or None,
+                resolver_ip=resolver_ip,
+                posture_snapshot=posture_snapshot,
+                is_dc_target=target_is_dc,
+            )
+            use_kerberos = True
+            if resolution.kerberos_viable and resolution.spn_host:
+                spn_host = resolution.spn_host
+            elif target and not is_ip_address(target):
+                # Already a hostname/FQDN the resolver could not promote further —
+                # keep it as the SPN host (e.g. a caller-supplied FQDN target).
+                spn_host = target
+            else:
+                # No FQDN is recoverable for this IP. Do NOT inject the PDC's name
+                # or request ``cifs/<ip>`` (the server rejects it). Drop to NTLM;
+                # the posture plan still honours an observed NTLM-disabled signal.
+                spn_host = None
+                use_kerberos = False
+
         return SMBConfig(
-            target_ip=target_host or pdc_ip,
-            target_hostname=pdc_hostname or target_host,
+            target_ip=target or pdc_ip,
+            target_hostname=spn_host or target or pdc_ip,
             domain=domain,
             username=username,
             password=None if (is_ccache or is_hash) else (cred_stripped or None),
@@ -708,6 +794,8 @@ def _build_smb_config_for_host(
             ccache_path=cred_stripped if is_ccache else None,
             auth_domain=domain,
             kdc_ip=pdc_ip or None,
+            use_kerberos=use_kerberos,
+            ip_hostname_inventory=inventory or None,
             timeout=timeout,
             posture_snapshot=posture_snapshot,
         )
@@ -732,6 +820,24 @@ def _build_smb_config_for_host(
 def _classify_error_cause(error_text: str) -> str:
     """Map an error string to a short human-readable probable cause."""
     upper = error_text.upper()
+    # Kerberos AP-REP / GSSAPI parse failure or an SPN mismatch surfaces as a
+    # generic auth/parse error: the service ticket was minted for a different
+    # host's SPN (e.g. the PDC's) than the one the AP-REQ is validated against,
+    # so the target rejects it. Recognise it explicitly so a genuine SPN issue
+    # is actionable instead of "Unknown SMB transport error".
+    if (
+        "KRB_AP_ERR_MODIFIED" in upper
+        or "AP_REP" in upper
+        or "AP-REP" in upper
+        or "GSSAPI" in upper
+        or "GSS-API" in upper
+        or "SPNEGO" in upper
+        or "SEC_E_LOGON_DENIED" in upper
+    ):
+        return (
+            "Kerberos service ticket was issued for a different host's SPN "
+            "(the target's own FQDN was not used)."
+        )
     if "ACCESS_DENIED" in upper or "LOGON_FAILURE" in upper:
         return "The credentials were rejected (wrong password, locked account, or auth method blocked)."
     if "SIGNING" in upper:

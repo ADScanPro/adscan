@@ -62,7 +62,10 @@ def ask_for_found_credentials(self, domain: str) -> None:
     passwd = Prompt.ask("Enter the possible password for the user", password=True)
     if user != "n" and passwd != "n":
         self.update_domain_data(domain, username=user, password=passwd)
-        self.add_credential(domain, user, passwd)
+        # Operator manually supplied this credential — a self-introduced
+        # (non-compromise) origin, excluded from the compromised-credential
+        # counters via NON_COMPROMISE_ORIGINS.
+        self.add_credential(domain, user, passwd, credential_origin="user_provided")
 
 
 def ask_for_enum_trusts(self, domain: str) -> None:

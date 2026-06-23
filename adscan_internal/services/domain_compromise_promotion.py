@@ -44,6 +44,34 @@ class CompromiseEvidence(StrEnum):
     NTDS_DUMP = "ntds_dump"
 
 
+def is_full_ntds_replicated(shell, domain: str) -> bool:
+    """True once a full DCSync ("all") has replicated this domain's NTDS.
+
+    Set by ``run_dcsync`` (via :func:`mark_full_ntds_replicated`) only on a
+    successful "all" run. The post-compromise pipeline (CTF *and* audit) reads
+    this to run the full replication EXACTLY ONCE: it dumps "all" when this is
+    False (the compromise was reached without a full dump — e.g. DA-group
+    membership, or an ESC8 DC-account targeted dump that only extracted the DA)
+    and skips it when True (an attack-path DCSync step already dumped "all").
+    """
+    dd = getattr(shell, "domains_data", {}) or {}
+    return bool((dd.get(domain) or {}).get("dcsync_all_done"))
+
+
+def mark_full_ntds_replicated(shell, domain: str) -> None:
+    """Record that the full NTDS ("all") has been replicated for ``domain``.
+
+    Single source of truth for the ``dcsync_all_done`` marker consumed by
+    :func:`is_full_ntds_replicated`. Best-effort: never raises.
+    """
+    dd = getattr(shell, "domains_data", None)
+    if isinstance(dd, dict):
+        try:
+            dd.setdefault(domain, {})["dcsync_all_done"] = True
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def promote_to_pwned(
     shell,
     *,
@@ -242,14 +270,19 @@ def promote_to_pwned(
     # evidence, evidence_ref)`` — and call it from here. For now the
     # graph is updated by the existing path-state machinery downstream.
 
-    # 5. CTF post-compromise hook.
+    # 5. Post-compromise hook. The caller's action set drives BOTH the CTF and
+    # the audit branch: "dcsync" requests a full DCSync ("all") of the domain
+    # credential database. It is set by paths that have NOT already dumped the
+    # NTDS (DA-group membership) and omitted by the secretsdump-driven paths
+    # (krbtgt / Tier-0 hash already extracted) so neither mode replicates twice.
+    post_compromise_actions = set(ctf_actions) if ctf_actions else {"flags"}
     if getattr(shell, "type", None) == "ctf":
         try:
             shell._ctf_queue_post_compromise_actions(
                 domain,
                 username,
                 credential or "",
-                actions=set(ctf_actions) if ctf_actions else {"flags"},
+                actions=post_compromise_actions,
                 compromise_summary=summary_text,
             )
             shell._ctf_execute_post_compromise_actions(domain)
@@ -281,6 +314,9 @@ def promote_to_pwned(
         # AS the obtained DA + host credential-harvesting campaign).
         if getattr(shell, "type", None) == "audit":
             try:
+                # DCSync-"all" is decided STATE-driven inside the executor
+                # (is_full_ntds_replicated), not by the caller — so it runs once
+                # regardless of which compromise path fired. See post_da.py.
                 shell._queue_audit_post_compromise_actions(
                     domain, username, credential or ""
                 )

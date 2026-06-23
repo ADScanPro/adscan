@@ -1718,8 +1718,14 @@ def run_show_attack_paths(
     allow_execution: bool = True,
     max_path_steps: int | None = None,
     no_cache: bool = False,
+    keep_longest: bool = False,
 ) -> None:
-    """Show attack paths and optionally a detailed path."""
+    """Show attack paths and optionally a detailed path.
+
+    ``keep_longest`` only affects the ``domain`` scope (no explicit start user /
+    ``owned``): when False (default) the listing shows the most direct route to
+    domain compromise; when True it shows the holistic longest kill chain.
+    """
     from adscan_internal.services.attack_graph_service import (
         get_attack_paths_cache_stats,
         get_attack_path_summaries,
@@ -2192,6 +2198,7 @@ def run_show_attack_paths(
             target_mode=target_mode,
             display_friendly=display_friendly,
             no_cache=no_cache,
+            keep_longest=keep_longest,
         )
         return _sort_paths(domain_paths)
 

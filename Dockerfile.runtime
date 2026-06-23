@@ -9,6 +9,17 @@
 # never drift when adding system packages or tooling.
 ###############################################################################
 
+# Global ARGs (usable in FROM): select where the John `run/` and FreeRDP
+# `install/` artifacts come from. The build scripts override these to the
+# `*_prebuilt` stage when they have seeded a host-cached, commit-keyed artifact
+# into the build context (see the *_prebuilt stages + scripts/lib_build_mirror.sh).
+# John's default `john_builder` fetches+compiles from GitHub. FreeRDP's default
+# is the EMPTY `freerdp_none` stage — the multi-minute cmake compile then runs
+# inline in runtime-common only when no prebuilt `install/` tree was seeded.
+ARG JOHN_SOURCE_STAGE=john_builder
+ARG FREERDP_SOURCE_STAGE=freerdp_none
+ARG SLU_SOURCE_STAGE=slu_none
+
 ###############################################################################
 # John the Ripper build stage (generic john binary + official converters)
 ###############################################################################
@@ -20,6 +31,7 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
       ca-certificates \
+      curl \
       git \
       build-essential \
       automake \
@@ -33,23 +45,57 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       libgmp-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Resilient source acquisition. GitHub's CDN intermittently throttles hard; under
+# that throttle a `git fetch` of the pinned commit transfers the pack slowly for
+# minutes and then CORRUPTS at the end ("fetch-pack: invalid index-pack output" /
+# over HTTP/2 "curl 92 stream CANCEL"), and git-pack cannot resume, so each retry
+# restarts from 0% — observed burning ~800s PER attempt.
+#
+# So the PRIMARY path is the source tarball over a plain HTTP GET (codeload): no
+# git-pack negotiation, so it does not corrupt under throttling — it is merely
+# slow, and `gzip -t` rejects a truncated/throttled download so the retry only
+# accepts a COMPLETE archive. git fetch (HTTP/1.1, low-speed abort) is the
+# fallback for the rare case codeload is unavailable but the git endpoint works.
+# git config is global so it also covers the converter build below.
 RUN set -eux; \
+  git config --global http.version HTTP/1.1; \
+  git config --global http.lowSpeedLimit 1000; \
+  git config --global http.lowSpeedTime 60; \
   mkdir -p /opt/adscan/tools/john; \
-  git -C /opt/adscan/tools/john init -q; \
-  git -C /opt/adscan/tools/john remote add origin https://github.com/openwall/john.git; \
+  fetched=0; \
   for attempt in 1 2 3 4 5; do \
-    if git -C /opt/adscan/tools/john -c protocol.version=2 fetch \
-         --depth=1 --no-tags \
-         origin "${JOHN_BLEEDING_JUMBO_COMMIT}"; then \
-      break; \
+    if curl --http1.1 -fSL --retry 3 --retry-all-errors --retry-delay 5 \
+         "https://github.com/openwall/john/archive/${JOHN_BLEEDING_JUMBO_COMMIT}.tar.gz" \
+         -o /tmp/john-src.tar.gz \
+       && gzip -t /tmp/john-src.tar.gz; then \
+      rm -rf /opt/adscan/tools/john; \
+      mkdir -p /opt/adscan/tools/john; \
+      tar -xzf /tmp/john-src.tar.gz -C /opt/adscan/tools/john --strip-components=1; \
+      rm -f /tmp/john-src.tar.gz; \
+      fetched=1; break; \
     fi; \
-    echo "[john_builder] fetch attempt ${attempt} failed, retrying in $((attempt * 5))s..." >&2; \
+    echo "[john_builder] tarball attempt ${attempt} failed (incomplete/throttled), retrying in $((attempt * 5))s..." >&2; \
+    rm -f /tmp/john-src.tar.gz; \
     sleep "$((attempt * 5))"; \
-    if [ "${attempt}" = "5" ]; then \
-      echo "[john_builder] giving up after 5 attempts" >&2; exit 1; \
-    fi; \
   done; \
-  git -C /opt/adscan/tools/john checkout -q FETCH_HEAD; \
+  if [ "${fetched}" != "1" ]; then \
+    echo "[john_builder] tarball exhausted; falling back to git fetch" >&2; \
+    rm -rf /opt/adscan/tools/john; \
+    mkdir -p /opt/adscan/tools/john; \
+    git -C /opt/adscan/tools/john init -q; \
+    git -C /opt/adscan/tools/john remote add origin https://github.com/openwall/john.git; \
+    for attempt in 1 2 3; do \
+      if git -C /opt/adscan/tools/john -c protocol.version=2 fetch \
+           --depth=1 --no-tags \
+           origin "${JOHN_BLEEDING_JUMBO_COMMIT}"; then \
+        git -C /opt/adscan/tools/john checkout -q FETCH_HEAD; \
+        fetched=1; break; \
+      fi; \
+      echo "[john_builder] git fetch attempt ${attempt} failed, retrying in $((attempt * 5))s..." >&2; \
+      sleep "$((attempt * 5))"; \
+    done; \
+  fi; \
+  [ "${fetched}" = "1" ] || { echo "[john_builder] giving up: both tarball and git fetch failed" >&2; exit 1; }; \
   ( \
     cd /opt/adscan/tools/john/src && \
     make -s -f Makefile.legacy clean && \
@@ -64,6 +110,76 @@ RUN set -eux; \
   chmod +x /opt/adscan/tools/john/run/john /opt/adscan/tools/john/run/john-generic
 
 ###############################################################################
+# John prebuilt-artifact stage (host-side build mirror — NO GitHub fetch)
+#
+# Selected via `--build-arg JOHN_SOURCE_STAGE=john_prebuilt` when the build
+# script has seeded a host-cached, commit-keyed `run/` dir into the build
+# context at `john-prebuilt/run/` (see scripts/build_docker_lite_image.sh).
+# This reuses a known-good John binary instead of fetching + compiling from
+# GitHub, which is the robust path when GitHub's CDN is degraded (it cannot even
+# serve the source tarball completely). The host cache is keyed by the pinned
+# commit, so a commit bump misses the cache and falls back to a real build.
+# Cold cache / new commit → JOHN_SOURCE_STAGE defaults to `john_builder`, this
+# stage is never referenced, and John is fetched + built from source as usual.
+###############################################################################
+FROM debian:trixie-slim AS john_prebuilt
+COPY john-prebuilt/run /opt/adscan/tools/john/run
+
+# Resolve the selected John source (john_builder | john_prebuilt) to a fixed
+# alias so the downstream COPY uses a static --from (no ARG in --from, which the
+# Dockerfile parser rejects). Only the selected stage is built; the other is
+# pruned from the graph — so john_prebuilt selection never triggers a GitHub
+# fetch, and john_builder selection never requires a seeded artifact.
+ARG JOHN_SOURCE_STAGE
+FROM ${JOHN_SOURCE_STAGE} AS john_source
+
+###############################################################################
+# FreeRDP source selector (host-side build mirror — skips the cmake compile)
+#
+# FreeRDP is a multi-minute cmake build whose dependencies are entangled with
+# runtime-common's apt (X11/Wayland/codec -dev libs that ALSO provide the
+# runtime libs xfreerdp links against). So instead of a self-contained builder
+# stage like John, the compile stays INLINE in runtime-common and is made
+# CONDITIONAL: runtime-common COPYs an `install/` tree from `freerdp_source`,
+# and the inline step compiles only when that tree is absent.
+#
+#   FREERDP_SOURCE_STAGE=freerdp_none      → empty install/ → compile inline (default)
+#   FREERDP_SOURCE_STAGE=freerdp_prebuilt  → COPY the host-seeded install/ → skip compile
+#
+# Only the selected stage is built; the other is pruned. So freerdp_prebuilt
+# selection never requires a seeded artifact to be absent, and freerdp_none
+# selection never requires the seeded dir to exist.
+###############################################################################
+FROM debian:trixie-slim AS freerdp_prebuilt
+COPY freerdp-prebuilt/install /opt/adscan/tools/freerdp/install
+
+FROM debian:trixie-slim AS freerdp_none
+RUN mkdir -p /opt/adscan/tools/freerdp/install
+
+ARG FREERDP_SOURCE_STAGE
+FROM ${FREERDP_SOURCE_STAGE} AS freerdp_source
+
+###############################################################################
+# statistically-likely-usernames source selector (host-side mirror)
+#
+# Same conditional pattern as FreeRDP: runtime-common COPYs a usernames/ dir
+# from slu_source and the Wordlists layer fetches the commit-pinned tarball only
+# when that dir is absent. A bare `git clone` of this repo corrupts under GitHub
+# throttle, so the mirror lets warm builds skip GitHub entirely.
+#
+#   SLU_SOURCE_STAGE=slu_none      → empty dir → tarball-fetch inline (default)
+#   SLU_SOURCE_STAGE=slu_prebuilt  → COPY the host-seeded dir → skip fetch
+###############################################################################
+FROM debian:trixie-slim AS slu_prebuilt
+COPY slu-prebuilt/usernames /usr/share/wordlists/statistically-likely-usernames
+
+FROM debian:trixie-slim AS slu_none
+RUN mkdir -p /usr/share/wordlists/statistically-likely-usernames
+
+ARG SLU_SOURCE_STAGE
+FROM ${SLU_SOURCE_STAGE} AS slu_source
+
+###############################################################################
 # Shared runtime base for both PRO and LITE images
 ###############################################################################
 FROM debian:trixie-slim AS runtime-common
@@ -75,6 +191,7 @@ ARG HASHCAT_VERSION=7.1.2
 ARG LIGOLO_NG_VERSION=0.8.3
 ARG FREERDP_VERSION=3.24.1
 ARG FREERDP_COMMIT=b6e770ccba87c58ffd0a55366fef33361798e39c
+ARG SLU_COMMIT=31132bd5da19787152a354e6adad18b2c8432e73
 ARG ADSCAN_RUNTIME_CONTRACT_VERSION="1"
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
@@ -88,7 +205,15 @@ ENV ADSCAN_HOME=/opt/adscan \
 
 RUN mkdir -p /opt/adscan
 
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
+# BuildKit apt cache mounts: keep downloaded .deb archives + apt lists in the
+# builder cache (NOT the image — image stays the same size), so when this layer
+# is invalidated (a package added/removed) apt reuses cached debs instead of
+# re-downloading hundreds of MB. Removing docker-clean stops apt from purging the
+# archive cache after install; the lists live in the mount so we do NOT rm them.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update -y && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       git \
@@ -99,6 +224,7 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
       gosu \
       sudo \
       libcap2-bin \
+      util-linux \
       net-tools \
       iputils-ping \
       iproute2 \
@@ -212,10 +338,15 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     && printf '%s\n' 'libnvidia-opencl.so.1' > /etc/OpenCL/vendors/nvidia.icd \
     && rm -rf /var/lib/apt/lists/*
 
+# --http1.1 is forced on every adscan-curl download: GitHub's CDN intermittently
+# cancels HTTP/2 streams mid-transfer under load ("curl 92 stream CANCEL"), which
+# kills release/raw downloads (mimikatz, Rubeus, kerbrute, ligolo, ...) the same
+# way it kills the John fetch. HTTP/1.1 avoids that failure class; it works on
+# every host we download from and the per-file perf cost is negligible.
 RUN printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
-  'if curl "$@"; then' \
+  'if curl --http1.1 "$@"; then' \
   '  exit 0' \
   'else' \
   '  status=$?' \
@@ -224,7 +355,7 @@ RUN printf '%s\n' \
   '  exit "$status"' \
   'fi' \
   'echo "warning: curl TLS verification failed; retrying with insecure fallback (-k)" >&2' \
-  'exec curl -k "$@"' \
+  'exec curl --http1.1 -k "$@"' \
   > /usr/local/bin/adscan-curl \
   && chmod +x /usr/local/bin/adscan-curl
 
@@ -254,15 +385,41 @@ COPY wordlists/ /opt/adscan/wordlists/
 # C# sources for Windows tool compilation (pss-dumper, rtlcp-dumper)
 COPY src/windows_tools/ /workspace_build/src/windows_tools/
 
-COPY --from=john_builder /opt/adscan/tools/john/run /opt/adscan/tools/john/run
+COPY --from=john_source /opt/adscan/tools/john/run /opt/adscan/tools/john/run
+
+# Prebuilt FreeRDP install tree (empty when building from source — see the
+# freerdp_source selector above). The External-tools RUN below compiles FreeRDP
+# only when this tree is absent (no xfreerdp binary present).
+COPY --from=freerdp_source /opt/adscan/tools/freerdp/install /opt/adscan/tools/freerdp/install
+
+# Prebuilt statistically-likely-usernames dir (empty when not seeded). The
+# Wordlists layer below tarball-fetches it only when this dir is empty.
+COPY --from=slu_source /usr/share/wordlists/statistically-likely-usernames /usr/share/wordlists/statistically-likely-usernames
 
 # Install Python tool environments (mirrors `PipToolsConfig` from adscan.py)
-RUN set -eux; \
+# BuildKit cache mount persists pip's wheel cache ACROSS builds (in the builder
+# cache, NOT the image — image stays small), so when this layer is invalidated
+# (a version bump, or an earlier-layer change cascading down) the re-install
+# reuses already-downloaded wheels instead of re-fetching from PyPI. pip resolves
+# versions itself, so a changed pin fetches only the new wheel — no manual cache
+# key needed. `--no-cache-dir` is dropped precisely so the mount is populated.
+RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
+  set -eux; \
+  export PIP_CACHE_DIR=/var/cache/adscan-pip; \
+  # Several tool deps are git+https clones from GitHub (NetExec, enum-trusts,
+  # MANSPIDER). This layer runs BEFORE the External-tools layer that sets the
+  # global git HTTP/1.1 config, so without this its clones default to HTTP/2 and
+  # hit the same "curl 92 stream CANCEL" / pack-corruption failures under GitHub
+  # throttle that plagued the John fetch — failing the layer so it never caches.
+  # Force HTTP/1.1 + abort a genuinely stalled transfer so pip_retry can retry.
+  git config --global http.version HTTP/1.1; \
+  git config --global http.lowSpeedLimit 1000; \
+  git config --global http.lowSpeedTime 60; \
   pip_retry() { \
     local python_bin="$1"; shift; \
     local attempt=1; \
     local max_attempts=4; \
-    until "$python_bin" -m pip install --no-cache-dir --retries 8 --timeout 120 "$@"; do \
+    until "$python_bin" -m pip install --retries 8 --timeout 120 "$@"; do \
       if [ "$attempt" -ge "$max_attempts" ]; then \
         echo "pip install failed after ${max_attempts} attempts: $*" >&2; \
         return 1; \
@@ -308,10 +465,29 @@ RUN set -eux; \
   pip_retry /opt/adscan/tool_venvs/lsassy/venv/bin/python -U pip; \
   pip_retry /opt/adscan/tool_venvs/lsassy/venv/bin/python "lsassy==3.1.16"; \
   \
+  # Volatility 3 — offline VM MEMORY-image credential carving (vm_artifact_service:
+  # .vmem/.vmrs → windows.registry.hashdump/lsadump/cachedump). Invoked as a
+  # subprocess tool (not bundled into the PRO PyInstaller binary). pycryptodome is
+  # REQUIRED or vol3's credential plugins silently fail to register. `vol` is
+  # symlinked onto PATH so vm_artifact_service._locate_volatility() finds it in
+  # both PRO and LITE. (Windows symbol tables are fetched from the Microsoft symbol
+  # server on first use and cached under ~/.cache/volatility3.)
+  python3 -m venv /opt/adscan/tool_venvs/volatility3/venv; \
+  pip_retry /opt/adscan/tool_venvs/volatility3/venv/bin/python -U pip; \
+  pip_retry /opt/adscan/tool_venvs/volatility3/venv/bin/python "volatility3>=2.5.0" "pycryptodome>=3.20"; \
+  ln -sf /opt/adscan/tool_venvs/volatility3/venv/bin/vol /opt/adscan/bin/vol; \
+  \
   chmod -R 0777 /opt/adscan/tool_venvs
 
 # External tools (git/curl)
+# Harden every git clone below against GitHub's intermittent HTTP/2 stream
+# CANCEL / CDN throttling (same failure class as the John builder): force
+# HTTP/1.1 and abort a genuinely stalled transfer in ~60s so it can retry.
+# git config is global, so it persists to all later RUN layers' clones too.
 RUN set -eux; \
+  git config --global http.version HTTP/1.1; \
+  git config --global http.lowSpeedLimit 1000; \
+  git config --global http.lowSpeedTime 60; \
   mkdir -p /opt/adscan/tools; \
   if ! adscan-curl -fsSL "https://hashcat.net/files/hashcat-${HASHCAT_VERSION}.7z" -o /tmp/hashcat.7z; then \
     echo "warning: official hashcat download failed; falling back to SourceForge mirror" >&2; \
@@ -371,17 +547,25 @@ RUN set -eux; \
   /opt/adscan/tool_venvs/coercer/venv/bin/python -m pip install --no-cache-dir -U pip; \
   /opt/adscan/tool_venvs/coercer/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/coercer/requirements.txt; \
   \
-  git clone --branch "${FREERDP_VERSION}" --depth 1 https://github.com/FreeRDP/FreeRDP.git /opt/adscan/tools/freerdp; \
-  test "$(git -C /opt/adscan/tools/freerdp rev-parse HEAD)" = "${FREERDP_COMMIT}"; \
-  cmake -S /opt/adscan/tools/freerdp -B /opt/adscan/tools/freerdp/build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=/opt/adscan/tools/freerdp/install \
-    -DBUILD_TESTING=OFF \
-    -DWITH_SERVER=OFF \
-    -DWITH_X11=ON \
-    -DWITH_WAYLAND=ON; \
-  cmake --build /opt/adscan/tools/freerdp/build --parallel "$(nproc)"; \
-  cmake --install /opt/adscan/tools/freerdp/build; \
+  # FreeRDP: reuse the host-seeded install/ tree when present (COPYed from
+  # freerdp_source above), else clone + cmake-build from source. The compile is
+  # the single most expensive step in this RUN (~minutes); the mirror skips it.
+  if [ -x /opt/adscan/tools/freerdp/install/bin/xfreerdp ]; then \
+    echo "using prebuilt FreeRDP from host mirror — skipping clone + cmake build"; \
+  else \
+    git clone --branch "${FREERDP_VERSION}" --depth 1 https://github.com/FreeRDP/FreeRDP.git /tmp/freerdp-src; \
+    test "$(git -C /tmp/freerdp-src rev-parse HEAD)" = "${FREERDP_COMMIT}"; \
+    cmake -S /tmp/freerdp-src -B /tmp/freerdp-build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/adscan/tools/freerdp/install \
+      -DBUILD_TESTING=OFF \
+      -DWITH_SERVER=OFF \
+      -DWITH_X11=ON \
+      -DWITH_WAYLAND=ON; \
+    cmake --build /tmp/freerdp-build --parallel "$(nproc)"; \
+    cmake --install /tmp/freerdp-build; \
+    rm -rf /tmp/freerdp-src /tmp/freerdp-build; \
+  fi; \
   ln -sf /opt/adscan/tools/freerdp/install/bin/xfreerdp /opt/adscan/bin/xfreerdp; \
   ln -sf /opt/adscan/tools/freerdp/install/bin/xfreerdp /opt/adscan/bin/xfreerdp3; \
   printf '%s\n' '/opt/adscan/tools/freerdp/install/lib' '/opt/adscan/tools/freerdp/install/lib64' \
@@ -634,13 +818,13 @@ RUN set -eux; \
   download_wordlist() { \
     local url="$1"; \
     local dest="$2"; \
-    if curl -fsSL "$url" -o "$dest"; then \
+    if curl --http1.1 -fsSL --retry 3 --retry-all-errors --retry-delay 5 "$url" -o "$dest"; then \
       return 0; \
     fi; \
     case "$url" in \
       https://weakpass.com/*) \
         echo "warning: TLS verification failed for $url; retrying with insecure fallback (-k)" >&2; \
-        curl -kfsSL "$url" -o "$dest"; \
+        curl --http1.1 -kfsSL --retry 3 --retry-all-errors --retry-delay 5 "$url" -o "$dest"; \
         ;; \
       *) \
         return 1; \
@@ -651,8 +835,33 @@ RUN set -eux; \
   download_wordlist https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt /opt/adscan/wordlists/rockyou.txt; \
   download_wordlist https://gist.github.com/The-Viper-One/a1ee60d8b3607807cc387d794e809f0b/raw/b7d83af6a8bbb43013e04f78328687d19d0cf9a7/kerberoast_pws.xz /opt/adscan/wordlists/kerberoast_pws.xz; \
   xz -d -c /opt/adscan/wordlists/kerberoast_pws.xz > /opt/adscan/wordlists/kerberoast_pws; \
-  mkdir -p /usr/share/wordlists; \
-  git clone --depth 1 https://github.com/insidetrust/statistically-likely-usernames.git /usr/share/wordlists/statistically-likely-usernames; \
+  mkdir -p /usr/share/wordlists/statistically-likely-usernames; \
+  # Reuse the host-seeded usernames dir when present (COPYed from slu_source
+  # above), else fetch the commit-pinned tarball. A bare `git clone` corrupts
+  # under GitHub throttle ("curl 18 transfer closed" / "fetch-pack: invalid
+  # index-pack output") and had no retry; a tarball does no pack negotiation,
+  # gzip -t rejects a truncated download, and the loop accepts only a COMPLETE
+  # archive. Same resilient pattern as the John builder; warm builds skip GitHub
+  # entirely via the mirror (scripts/lib_build_mirror.sh, build_mirror_spec_slu).
+  if [ -n "$(ls -A /usr/share/wordlists/statistically-likely-usernames 2>/dev/null)" ]; then \
+    echo "using prebuilt statistically-likely-usernames from host mirror — skipping GitHub fetch"; \
+  else \
+    slu_fetched=0; \
+    for attempt in 1 2 3 4 5; do \
+      if adscan-curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 \
+           "https://github.com/insidetrust/statistically-likely-usernames/archive/${SLU_COMMIT}.tar.gz" \
+           -o /tmp/slu.tar.gz \
+         && gzip -t /tmp/slu.tar.gz; then \
+        tar -xzf /tmp/slu.tar.gz -C /usr/share/wordlists/statistically-likely-usernames --strip-components=1; \
+        rm -f /tmp/slu.tar.gz; \
+        slu_fetched=1; break; \
+      fi; \
+      echo "statistically-likely-usernames tarball attempt ${attempt} failed (incomplete/throttled), retrying in $((attempt * 5))s..." >&2; \
+      rm -f /tmp/slu.tar.gz; \
+      sleep "$((attempt * 5))"; \
+    done; \
+    [ "${slu_fetched}" = "1" ] || { echo "statistically-likely-usernames: giving up after retries" >&2; exit 1; }; \
+  fi; \
   rm -f /opt/adscan/wordlists/kerberoast_pws.xz; \
   chmod -R 0777 /opt/adscan/wordlists /usr/share/wordlists/statistically-likely-usernames
 
@@ -724,10 +933,15 @@ FROM runtime-common AS runtime-lite
 ENV ADSCAN_RUNTIME_LICENSE_MODE=LITE
 
 # Runtime Python dependencies for source-mode ADscan CLI.
-RUN set -eux; \
+# Shares the same BuildKit pip wheel cache as the tool venvs above so a layer
+# invalidation re-installs from cached wheels instead of re-downloading from PyPI
+# (image stays small — the cache lives in the builder, not the image layer).
+RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
+  set -eux; \
+  export PIP_CACHE_DIR=/var/cache/adscan-pip; \
   python3 -m venv /opt/adscan/venv; \
-  /opt/adscan/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/venv/bin/python -m pip install --no-cache-dir \
+  /opt/adscan/venv/bin/python -m pip install -U pip; \
+  /opt/adscan/venv/bin/python -m pip install \
     prompt_toolkit==3.0.52 \
     psutil==7.2.2 \
     rich==15.0.0 \
@@ -753,6 +967,7 @@ RUN set -eux; \
     impacket==0.13.1 \
     pycryptodome==3.23.0 \
     pycryptodomex==3.23.0 \
+    "dissect.target==3.25.1" \
     gpp-decrypt==2.0.0 \
     requests==2.32.5 \
     matplotlib==3.10.8 \

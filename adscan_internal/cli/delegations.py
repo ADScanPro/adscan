@@ -798,6 +798,7 @@ def add_computer_to_domain(
                     ensure_fresh_kerberos_ticket=True,
                     force_authenticated_enumeration=False,
                     prompt_when_already_authenticated=False,
+                    credential_origin="machine_account",
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, List
+from typing import Any, Callable, Iterable, Optional, List
 import subprocess
 import shlex
 import re
@@ -69,6 +69,10 @@ from adscan_core.tui.progress_dashboard import (
     ProgressDashboard,
     ProgressDashboardConfig,
 )
+from adscan_core.tui.stream_runner import (
+    StreamedProcessResult,
+    stream_command_lines,
+)
 
 
 _UF_ACCOUNTDISABLE = 0x0002
@@ -76,6 +80,133 @@ _UF_DONT_REQUIRE_PREAUTH = 0x400000
 
 
 CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str]]
+
+
+# ``shell.spawn_command``-shaped callable: returns a text-mode Popen (or None).
+# Threaded in by the CLI so the userenum live counter can be driven from
+# kerbrute's STREAMING stdout instead of polling its buffered ``-o`` file.
+SpawnCommand = Callable[..., "subprocess.Popen[str] | None"]
+
+
+# Single source of truth for parsing kerbrute's live ``[+] VALID USERNAME``
+# stdout lines. kerbrute wraps each hit in ANSI colour codes and a leading
+# log prefix, e.g. (ESC shown literally):
+#   \x1b[32m2026/06/11 12:42:12 >  [+] VALID USERNAME:\t adscan@lab.local\x1b[0m
+# The marker text survives the colour codes, so a simple substring test is
+# robust; the user is extracted by the shared ``_parse_userenum_output`` regex.
+_KERBRUTE_VALID_USERNAME_MARKER = "VALID USERNAME"
+
+# Marker kerbrute prints (ONLY with ``-v``) for an ATTEMPTED-but-invalid user,
+# e.g. (ANSI/prefix omitted):
+#   [!] invalidxyz@lab.local - User does not exist
+#   [!] guest@lab.local - USER LOCKED OUT
+# Empirically confirmed against lab.local @ 10.99.0.1 (kerbrute v1.0.3): with
+# ``-v`` kerbrute emits ONE line per attempted username -- valid AND invalid --
+# so counting (valid + invalid) attempt lines yields a DETERMINATE tested/total
+# bar. Without ``-v`` only ``[+] VALID USERNAME`` lines appear (indeterminate).
+# These invalid markers carry a ``user@domain`` token too, which is exactly why
+# the username extractor below is ``VALID USERNAME``-anchored (see warning).
+_KERBRUTE_INVALID_USER_MARKER = "[!]"
+
+
+def _is_kerbrute_attempt_line(line: str, domain: str) -> bool:
+    """True if ``line`` is a kerbrute per-attempt log line (valid OR invalid).
+
+    Drives the DETERMINATE progress counter: with ``-v`` kerbrute logs one such
+    line for every username it tested, so counting them gives a true
+    ``tested / total`` bar. A line counts as an attempt when it carries an
+    ``@`` token AND is either a ``[+] VALID USERNAME`` hit or a
+    ``[!] ... - User does not exist`` / ``USER LOCKED OUT`` miss. Banner /
+    ``Using KDC(s)`` / ``Done!`` lines have no ``user@domain`` token and are
+    excluded, so the count never over-shoots ``total``.
+
+    Args:
+        line: One raw kerbrute output line (ANSI codes / prefix tolerated).
+        domain: Target domain (kept for signature symmetry / future anchoring).
+
+    Returns:
+        True when the line represents exactly one tested username.
+    """
+    text = str(line)
+    if "@" not in text:
+        return False
+    if _KERBRUTE_VALID_USERNAME_MARKER in text:
+        return True
+    if _KERBRUTE_INVALID_USER_MARKER in text:
+        # An invalid / locked-out attempt line (only emitted under ``-v``).
+        return True
+    return False
+
+
+def _parse_userenum_output_lines(lines: "list[str] | Iterable[str]", domain: str) -> list[str]:
+    """Extract unique VALID usernames from kerbrute ``userenum`` output lines.
+
+    Single source of truth for turning kerbrute output (whether stdout streamed
+    line-by-line or the on-disk ``-o`` file read whole) into the deduplicated,
+    lowercased, first-seen-ordered list of *valid* usernames. Used by the live
+    streaming parser, the success path, and the timeout / non-zero-exit recovery
+    paths so behaviour stays identical across all of them.
+
+    WARNING -- ``VALID USERNAME``-anchored on purpose. kerbrute run with ``-v``
+    (which the determinate live bar requires) ALSO logs invalid attempts as
+    ``[!] invalidxyz@lab.local - User does not exist`` -- to BOTH stdout and the
+    ``-o`` file. Those lines carry a ``user@domain`` token, so a parser that
+    accepted any ``@domain`` token would mis-report every invalid / locked user
+    as valid. We therefore only accept lines containing the ``VALID USERNAME``
+    marker. This keeps credential capture correct whether or not ``-v`` is set.
+
+    Args:
+        lines: Iterable of raw kerbrute output lines (any ANSI colour codes and
+            log prefixes are tolerated; the ``user@domain`` token is extracted).
+        domain: Target Active Directory domain, used to anchor the extraction
+            regex.
+
+    Returns:
+        List of unique valid usernames (lowercase), in first-seen order.
+    """
+    usernames: list[str] = []
+    seen: set[str] = set()
+
+    for raw_line in lines:
+        line = str(raw_line).strip()
+        if not line or "@" not in line:
+            continue
+
+        # Only a genuine ``[+] VALID USERNAME`` hit is a valid user. Invalid /
+        # locked attempt lines (``[!] ... - User does not exist``) emitted under
+        # ``-v`` also contain ``user@domain`` and MUST NOT be treated as valid.
+        if _KERBRUTE_VALID_USERNAME_MARKER not in line:
+            continue
+
+        # Kerbrute prints lines like:
+        #   [+] VALID USERNAME: user@domain.local
+        # We perform a best-effort extraction of the `user` part.
+        match = re.search(
+            rf"\b([A-Za-z0-9._$-]+)@{re.escape(domain)}\b", line, re.IGNORECASE
+        )
+        if not match:
+            # Fallback: look for any token containing '@'.
+            token_user: Optional[str] = None
+            for token in line.split():
+                if "@" in token:
+                    token_user = token.split("@", 1)[0]
+                    break
+            if not token_user:
+                continue
+            candidate = token_user
+        else:
+            candidate = match.group(1)
+
+        user = (candidate or "").strip().lower()
+        if not user or user == "ronnie":
+            # Preserve original behaviour that skipped the lab author user.
+            continue
+        if user in seen:
+            continue
+        seen.add(user)
+        usernames.append(user)
+
+    return usernames
 
 
 def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess[str]:
@@ -103,21 +234,170 @@ def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess
     )
 
 
-def _build_userenum_dashboard() -> ProgressDashboard:
-    """Indeterminate user-enumeration dashboard (kerbrute stdout is opaque).
+# Number of most-recent VALID usernames to show in the dashboard's bounded
+# "recent found" window. DISPLAY cap only (the -o file keeps every hit).
+_USERENUM_RECENT_HITS = 10
 
-    kerbrute's ``exec_fn`` contract is blocking and exposes no live stdout
-    stream, so a determinate X/N bar is impossible without a guessed (lying)
-    ETA. Indeterminate mode shows a spinner + elapsed + "found N so far",
-    refreshed by counting VALID lines in the ``-o`` output file.
+
+def _build_userenum_dashboard(total: "int | None" = None) -> ProgressDashboard:
+    """User-enumeration dashboard driven by kerbrute's streaming stdout.
+
+    kerbrute buffers its ``-o`` output file (Go ``bufio`` writer, flushed in
+    chunks / at close), so counting lines in that file reads 0 until the
+    process exits and then jumps. kerbrute's STDOUT, by contrast, flushes one
+    log line per ATTEMPTED username in real time (with ``-v``), so the streamer
+    can drive a true progress bar from what it parses.
+
+    Two modes, selected by ``total``:
+
+    * **Determinate** (``total`` is the userlist line count, the number of
+      usernames kerbrute will test): a real ``tested / N`` bar + rate + ETA,
+      ticked from the per-attempt lines kerbrute emits under ``-v``. This is
+      the preferred mode -- the operator sees how many of N have been tried.
+    * **Indeterminate** (``total is None``): spinner + elapsed + "found N so
+      far", ticked from ``[+] VALID USERNAME`` hits only. Used when the
+      userlist size is unknown or when ``-v`` per-attempt lines are absent.
+
+    Args:
+        total: Number of candidate usernames (userlist line count) for the
+            determinate bar, or ``None`` for the indeterminate spinner mode.
+
+    Returns:
+        A configured :class:`ProgressDashboard`.
     """
     return ProgressDashboard(
         ProgressDashboardConfig(
             title="Kerberos user enumeration",
-            total=None,  # indeterminate -- spinner + elapsed + "found N"
+            total=total if (total and total > 0) else None,
             unit="users",
             last_item_type="user",
+            # Bounded rolling list of the most-recent VALID usernames. The
+            # deque(maxlen=K) cap keeps the panel a fixed height even at scale
+            # (1000+ hits) so the LiveSession alt-screen never leaks ghost
+            # frames (CLAUDE.md stable-line-count rule). DISPLAY-ONLY: the
+            # authoritative capture stays the kerbrute ``-o`` file.
+            recent_max=_USERENUM_RECENT_HITS,
+            recent_item_type="user",
+            recent_label="found",
         )
+    )
+
+
+# Coalesce dashboard frames to at most one per this many attempt lines, so a
+# 100k-username run does not push 100k Rich renders (the LiveSession caps to
+# ~8 FPS, but skipping the render call entirely is cheaper still). A VALID hit
+# always forces an immediate frame regardless of this cap so "found N" never
+# lags. Tuned for a 100k list: ~200 frames total on the progress bar.
+_USERENUM_FRAME_EVERY_N_ATTEMPTS = 500
+
+
+def _stream_userenum_into_dashboard(
+    spawn: "SpawnCommand",
+    cmd: str,
+    timeout: int,
+    domain: str,
+    dashboard: "ProgressDashboard",
+    *,
+    total: "int | None" = None,
+) -> "StreamedProcessResult | None":
+    """Stream kerbrute ``userenum`` stdout, driving the live progress bar.
+
+    Spawns kerbrute through the shared :func:`stream_command_lines` streamer
+    (which uses ``shell.spawn_command`` -- preserving the PyInstaller clean-env
+    handling -- enforces its own wall-clock budget, and drains the remaining
+    output). The per-line callback parses each line as kerbrute flushes it:
+
+    * Every ATTEMPTED-username line (``[+] VALID USERNAME`` hit OR ``[!] ...``
+      miss, both emitted under ``-v``) increments ``tested`` and -- in
+      determinate mode (``total`` known) -- ticks the ``tested / N`` bar with
+      the current username, so the operator sees ``X/N · Y% · current user``
+      climbing DURING the run.
+    * Every ``[+] VALID USERNAME`` hit additionally bumps the ``found`` count
+      (rendered in the success-counter row) and forces an immediate frame.
+
+    Dashboard frames are coalesced (one per ``_USERENUM_FRAME_EVERY_N_ATTEMPTS``
+    attempts, plus one per valid hit) so a huge userlist does not thrash the
+    render. On clean stream close the bar is snapped to ``tested`` so the final
+    frame is honest even if the last batch was below the coalesce threshold.
+
+    The ``-o`` output file written by kerbrute itself (via the ``-o`` flag in
+    ``cmd``) is left untouched and remains the authoritative source for the
+    downstream credential-capture parsing; streaming only drives the counter.
+
+    Args:
+        spawn: ``shell.spawn_command``-shaped callable.
+        cmd: Fully-built kerbrute command string (already shell-quoted).
+        timeout: Wall-clock budget in seconds.
+        domain: Target domain, used to anchor the username-extraction regex.
+        dashboard: Live dashboard to drive.
+        total: Userlist line count for the determinate bar, or ``None`` for the
+            indeterminate "found N" mode.
+
+    Returns:
+        A :class:`StreamedProcessResult` on completion, or ``None`` if the
+        process could not be spawned (caller falls back to the blocking path).
+    """
+    determinate = bool(total and total > 0)
+    seen_valid: set[str] = set()
+    state = {"tested": 0}
+
+    def _push_frame(last: "str | None") -> None:
+        try:
+            if determinate:
+                # done = usernames tested so far (clamped to total by the bar);
+                # success = valid hits so far. last = the current username (raw;
+                # masked at render -- CLAUDE.md TeeConsole invariant).
+                dashboard.update(
+                    done=state["tested"],
+                    success=len(seen_valid),
+                    last=last,
+                )
+            else:
+                # Indeterminate: counter is the valid-hit count ("found N").
+                dashboard.update(done=len(seen_valid), last=last)
+        except Exception:  # noqa: BLE001 -- render must not abort the run
+            pass
+
+    def _on_line(line: str) -> None:
+        is_valid = _KERBRUTE_VALID_USERNAME_MARKER in line
+        is_attempt = _is_kerbrute_attempt_line(line, domain)
+
+        current_user: "str | None" = None
+        if is_valid:
+            # Reuse the canonical parser so streamed + on-disk parsing agree.
+            for user in _parse_userenum_output_lines([line], domain):
+                if user not in seen_valid:
+                    # Feed the RAW username into the bounded "recent found"
+                    # window (masked at render -- TeeConsole invariant). The
+                    # dashboard caps the displayed rows; this never drops a
+                    # hit from the authoritative -o file.
+                    try:
+                        dashboard.record_recent(user)
+                    except Exception:  # noqa: BLE001 -- render must not abort run
+                        pass
+                current_user = user
+                seen_valid.add(user)
+
+        if not is_attempt:
+            return
+        state["tested"] += 1
+
+        # A valid hit always forces an immediate frame (so "found N" never
+        # lags); otherwise coalesce to one frame per N attempts.
+        if is_valid or (state["tested"] % _USERENUM_FRAME_EVERY_N_ATTEMPTS == 0):
+            _push_frame(current_user)
+
+    def _on_drain() -> None:
+        # Snap the bar to the final tested count on clean close, so the last
+        # frame is honest even if the trailing batch was below the threshold.
+        _push_frame(None)
+
+    return stream_command_lines(
+        spawn,
+        command=cmd,
+        timeout_seconds=timeout,
+        on_line=_on_line,
+        on_drain=_on_drain,
     )
 
 
@@ -126,36 +406,75 @@ def _run_userenum_with_dashboard(
     cmd: str,
     timeout: int,
     count_found: Callable[[], int],
+    *,
+    spawn: "SpawnCommand | None" = None,
+    domain: str = "",
+    total: "int | None" = None,
 ) -> "subprocess.CompletedProcess[str]":
-    """Run the blocking kerbrute ``exec_fn`` under an indeterminate dashboard.
+    """Run kerbrute ``userenum`` under a live progress dashboard.
 
-    The blocking call runs in a single worker thread so the dashboard spinner
-    and "found N" line can tick while kerbrute blocks. The thread is always
-    joined (the ``with`` on the pool blocks until the future resolves), so it
-    never leaks. ``fut.result()`` re-raises any exception (including
-    ``subprocess.TimeoutExpired``) from the worker, preserving the caller's
-    existing error handling exactly.
+    Preferred path (``spawn`` provided): stream kerbrute's stdout via
+    :func:`_stream_userenum_into_dashboard`, parsing each per-attempt line as it
+    flushes. When ``total`` (the userlist line count) is known, this drives a
+    DETERMINATE ``tested / N`` bar -- the operator sees how many of N have been
+    tried plus how many were valid -- otherwise a "found N" spinner. kerbrute
+    still writes its ``-o`` file itself, which stays authoritative for
+    downstream parsing -- streaming only drives the counter.
 
-    FAIL-SAFE: if the dashboard cannot be built / driven, the blocking call is
-    still executed directly so user enumeration always runs and returns.
+    Fallback path (no ``spawn``, or streaming/dashboard setup fails): run the
+    blocking ``exec_fn`` in a worker thread and tick the counter by polling
+    ``count_found`` (the legacy ``-o``-file VALID-line count). The thread is
+    always joined, so it never leaks; ``fut.result()`` re-raises any exception
+    (including ``subprocess.TimeoutExpired``) so the caller's error handling is
+    preserved exactly.
 
     Args:
-        exec_fn: Blocking executor ``(cmd, timeout) -> CompletedProcess``.
+        exec_fn: Blocking executor ``(cmd, timeout) -> CompletedProcess`` used
+            as the fail-safe fallback.
         cmd: Fully-built kerbrute command string.
-        timeout: Subprocess timeout in seconds.
+        timeout: Subprocess / wall-clock timeout in seconds.
         count_found: Callable returning the current "found N" count from the
-            ``-o`` output file.
+            ``-o`` output file (used only by the blocking fallback).
+        spawn: Optional ``shell.spawn_command``-shaped callable enabling the
+            live-streaming path.
+        domain: Target domain, threaded to the streaming parser.
+        total: Userlist line count for the determinate ``tested / N`` bar, or
+            ``None`` for the indeterminate "found N" mode.
 
     Returns:
-        The :class:`subprocess.CompletedProcess` returned by ``exec_fn``.
+        The :class:`subprocess.CompletedProcess` (or
+        :class:`StreamedProcessResult`, which is CompletedProcess-shaped)
+        produced by the run.
     """
     import concurrent.futures
     import time as _time
 
     try:
-        dashboard = _build_userenum_dashboard()
+        dashboard = _build_userenum_dashboard(total)
     except Exception:  # noqa: BLE001 -- dashboard build must never block the scan
         return exec_fn(cmd, timeout)
+
+    # Preferred: stream kerbrute stdout so the counter advances during the run.
+    if spawn is not None:
+        try:
+            with dashboard.live_session():
+                streamed = _stream_userenum_into_dashboard(
+                    spawn, cmd, timeout, domain, dashboard, total=total
+                )
+            if streamed is not None:
+                if streamed.timed_out:
+                    # Mirror the blocking path's contract so the caller's
+                    # TimeoutExpired recovery branch fires identically.
+                    raise subprocess.TimeoutExpired(
+                        cmd=cmd, timeout=timeout, output=streamed.stdout
+                    )
+                return streamed
+            # spawn returned None -- fall through to the blocking fallback.
+        except subprocess.TimeoutExpired:
+            raise
+        except Exception:  # noqa: BLE001 -- streaming/LiveSession setup failed
+            # Fall through to the blocking fallback so enumeration still runs.
+            pass
 
     def _safe_update(dash: "ProgressDashboard") -> None:
         try:
@@ -163,10 +482,10 @@ def _run_userenum_with_dashboard(
         except Exception:  # noqa: BLE001 -- a render error must not abort the run
             pass
 
-    # Submit the blocking call to its own worker thread. ``call_started`` flips
-    # to True the instant the future is created, so we can tell a dashboard /
-    # LiveSession setup failure (fail-safe fallback) apart from a failure raised
-    # by ``exec_fn`` itself (must propagate to the caller -- never re-run it).
+    # Fallback: blocking call in a worker thread, counter polled from the -o
+    # file. ``call_started`` flips to True the instant the future is created,
+    # so we can tell a dashboard/LiveSession setup failure (fail-safe fallback)
+    # apart from a failure raised by ``exec_fn`` itself (must propagate).
     call_started = False
     try:
         with dashboard.live_session():
@@ -455,6 +774,85 @@ class KerberosEnumerationMixin:
             return name.split("@", 1)[0]
         return None
 
+    def _parse_userenum_output(self, text: str, domain: str) -> list[str]:
+        """Extract unique usernames from kerbrute ``userenum`` output text.
+
+        Kerbrute streams ``VALID USERNAME`` lines to both stdout and its ``-o``
+        output file, e.g.::
+
+            [+] VALID USERNAME: user@domain.local
+
+        This is the single source of truth for parsing those lines. It is used
+        by the success path (parsing the on-disk ``-o`` file) and by the
+        timeout / non-zero-returncode recovery paths (parsing partial stdout
+        and/or the partial ``-o`` file), so behaviour stays identical across
+        all of them.
+
+        Args:
+            text: Raw kerbrute output (stdout or ``-o`` file contents).
+            domain: Target Active Directory domain, used to anchor the
+                ``user@domain`` extraction regex.
+
+        Returns:
+            List of unique usernames (lowercase), in first-seen order.
+        """
+        return _parse_userenum_output_lines(text.splitlines(), domain)
+
+    def _recover_partial_userenum(
+        self,
+        stdout: object,
+        output_file: Path,
+        domain: str,
+    ) -> list[str]:
+        """Recover usernames found before a timeout / non-zero exit.
+
+        Unions the usernames parsed from the (partial) process ``stdout`` and
+        the (partial, possibly locked) on-disk ``-o`` file, deduplicating by
+        the canonical user identity via :meth:`_parse_userenum_output`. Reads
+        are fully defensive: any failure degrades to whatever was recovered so
+        far (ultimately ``[]``), never raising into the caller's error branch.
+
+        Args:
+            stdout: The process/exception ``stdout`` (may be ``None`` or bytes).
+            output_file: Path to the kerbrute ``-o`` output file.
+            domain: Target Active Directory domain.
+
+        Returns:
+            List of unique usernames (lowercase), in first-seen order, unioned
+            across both sources.
+        """
+        recovered: list[str] = []
+        seen: set[str] = set()
+
+        def _ingest(text: str) -> None:
+            for user in self._parse_userenum_output(text, domain):
+                if user in seen:
+                    continue
+                seen.add(user)
+                recovered.append(user)
+
+        # Source 1: partial stdout captured on the process / exception.
+        try:
+            if stdout:
+                if isinstance(stdout, bytes):
+                    stdout_text = stdout.decode("utf-8", errors="ignore")
+                else:
+                    stdout_text = str(stdout)
+                _ingest(stdout_text)
+        except Exception:  # noqa: BLE001 -- recovery must never raise.
+            pass
+
+        # Source 2: the on-disk -o file (same file _count_found reads live).
+        try:
+            file_text = output_file.read_text(encoding="utf-8", errors="ignore")
+            _ingest(file_text)
+        except OSError:
+            pass
+        except Exception:  # noqa: BLE001 -- recovery must never raise.
+            pass
+
+        return recovered
+
     @requires_auth(AuthMode.UNAUTHENTICATED)
     def enumerate_users_kerberos(
         self,
@@ -465,8 +863,10 @@ class KerberosEnumerationMixin:
         kerbrute_path: str,
         output_file: Path,
         executor: CommandExecutor | None = None,
+        spawn: "SpawnCommand | None" = None,
         scan_id: Optional[str] = None,
         timeout: int = 300,
+        auth_mode: AuthMode = AuthMode.UNAUTHENTICATED,
     ) -> List[str]:
         """Enumerate users via Kerberos without LDAP access.
 
@@ -483,9 +883,19 @@ class KerberosEnumerationMixin:
             wordlist: Path to the username wordlist.
             kerbrute_path: Full path to the ``kerbrute`` binary.
             output_file: Path where kerbrute should write its log/output.
-            executor: Optional command executor, mainly for testing.
+            executor: Optional command executor, mainly for testing and as the
+                blocking fail-safe fallback when ``spawn`` is unavailable.
+            spawn: Optional ``shell.spawn_command``-shaped callable. When
+                provided, kerbrute's stdout is STREAMED so the live "found N"
+                counter advances during the run (the reliable source --
+                kerbrute buffers its ``-o`` file). Threaded in by the CLI.
             scan_id: Optional scan identifier for progress emission.
             timeout: Command timeout in seconds.
+            auth_mode: Authentication mode for the @requires_auth gate. This
+                operation needs no credential, so it defaults to
+                ``UNAUTHENTICATED``; callers on the unauth path pass it
+                explicitly to suppress the decorator's "assuming authenticated"
+                debug line.
 
         Returns:
             List of unique usernames (lowercase) discovered.
@@ -498,9 +908,16 @@ class KerberosEnumerationMixin:
             message=f"Enumerating users via Kerberos on {domain}",
         )
 
-        # Build kerbrute command.
+        # Build kerbrute command. ``-v`` makes kerbrute log ONE line per
+        # ATTEMPTED username (valid AND invalid) -- empirically confirmed
+        # against lab.local @ 10.99.0.1 (kerbrute v1.0.3). Counting those lines
+        # drives a DETERMINATE ``tested / N`` progress bar (N = userlist size)
+        # instead of an opaque "found N" spinner. The downstream username parse
+        # is ``VALID USERNAME``-anchored (see _parse_userenum_output_lines), so
+        # the invalid lines ``-v`` adds to BOTH stdout and the ``-o`` file are
+        # ignored for credential capture and never mis-reported as valid.
         cmd = (
-            f"{shlex.quote(kerbrute_path)} userenum "
+            f"{shlex.quote(kerbrute_path)} userenum -v "
             f"-d {shlex.quote(domain)} "
             f"--dc {shlex.quote(pdc)} "
             f"{shlex.quote(wordlist)} "
@@ -539,14 +956,20 @@ class KerberosEnumerationMixin:
             pass
 
         def _count_found() -> int:
-            """Count VALID-USERNAME lines kerbrute streams into the -o file."""
+            """Count VALID-USERNAME lines kerbrute streams into the -o file.
+
+            ``VALID USERNAME``-anchored: with ``-v`` the ``-o`` file also holds
+            ``[!] ... - User does not exist`` lines (which contain ``@domain``),
+            so a bare ``@`` test would over-count. Used only by the blocking
+            fallback's "found N" poll.
+            """
             try:
                 return sum(
                     1
                     for line in output_file.read_text(
                         encoding="utf-8", errors="ignore"
                     ).splitlines()
-                    if "@" in line
+                    if _KERBRUTE_VALID_USERNAME_MARKER in line
                 )
             except OSError:
                 return 0
@@ -558,20 +981,40 @@ class KerberosEnumerationMixin:
             # FAIL-SAFE: a dashboard render/update error must never abort the
             # enumeration -- the helper falls back to a direct blocking call.
             result = _run_userenum_with_dashboard(
-                exec_fn, cmd, timeout, _count_found
+                exec_fn,
+                cmd,
+                timeout,
+                _count_found,
+                spawn=spawn,
+                domain=domain,
+                total=candidate_count or None,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            # Recover users found before the timeout fired. kerbrute streams
+            # VALID-USERNAME lines to stdout AND the -o file; on timeout we
+            # union both partial sources instead of discarding everything (the
+            # old behaviour falsely reported "no valid usernames").
+            recovered = self._recover_partial_userenum(
+                getattr(exc, "stdout", None) or getattr(exc, "output", None),
+                output_file,
+                domain,
+            )
             self.logger.error(
                 "Kerberos user enumeration timed out",
-                extra={"domain": domain, "pdc": pdc},
+                extra={"domain": domain, "pdc": pdc, "recovered": len(recovered)},
             )
             self.parent._emit_progress(
                 scan_id=scan_id,
                 phase="kerberos_user_enumeration",
                 progress=1.0,
-                message="Kerberos user enumeration timed out",
+                message=(
+                    "Kerberos user enumeration timed out "
+                    f"({len(recovered)} user(s) recovered before timeout)"
+                    if recovered
+                    else "Kerberos user enumeration timed out"
+                ),
             )
-            return []
+            return recovered
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
             self.logger.exception(
@@ -587,6 +1030,14 @@ class KerberosEnumerationMixin:
             return []
 
         if result.returncode != 0:
+            # A non-zero exit can still follow a partially populated -o file
+            # (kerbrute found valid users, then died). Recover them from
+            # stdout + the -o file rather than discarding everything.
+            recovered = self._recover_partial_userenum(
+                getattr(result, "stdout", None),
+                output_file,
+                domain,
+            )
             self.logger.warning(
                 "Kerberos user enumeration command failed",
                 extra={
@@ -595,75 +1046,34 @@ class KerberosEnumerationMixin:
                     "returncode": result.returncode,
                     "stdout": result.stdout,
                     "stderr": result.stderr,
+                    "recovered": len(recovered),
                 },
             )
             self.parent._emit_progress(
                 scan_id=scan_id,
                 phase="kerberos_user_enumeration",
                 progress=1.0,
-                message="Kerberos user enumeration failed",
+                message=(
+                    "Kerberos user enumeration failed "
+                    f"({len(recovered)} user(s) recovered)"
+                    if recovered
+                    else "Kerberos user enumeration failed"
+                ),
             )
-            return []
+            return recovered
 
-        # Parse kerbrute output file for discovered usernames.
-        if not output_file.exists():
-            self.logger.warning(
-                "Kerberos user enumeration output file not found",
-                extra={"domain": domain, "output_file": str(output_file)},
-            )
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="kerberos_user_enumeration",
-                progress=1.0,
-                message="Kerberos user enumeration completed with no results",
-            )
-            return []
-
-        usernames: list[str] = []
-        seen: set[str] = set()
-
-        try:
-            for raw_line in output_file.read_text(
-                encoding="utf-8", errors="ignore"
-            ).splitlines():
-                line = raw_line.strip()
-                if not line or "@" not in line:
-                    continue
-
-                # Kerbrute commonly prints lines like:
-                #   [*] VALID USERNAME: user@domain.local
-                # We perform a best-effort extraction of the `user` part.
-                match = re.search(
-                    rf"\b([A-Za-z0-9._$-]+)@{re.escape(domain)}\b", line, re.IGNORECASE
-                )
-                if not match:
-                    # Fallback: look for any token containing '@'.
-                    token_user: Optional[str] = None
-                    for token in line.split():
-                        if "@" in token:
-                            token_user = token.split("@", 1)[0]
-                            break
-                    if not token_user:
-                        continue
-                    candidate = token_user
-                else:
-                    candidate = match.group(1)
-
-                user = (candidate or "").strip().lower()
-                if not user or user == "ronnie":
-                    # Preserve original behaviour that skipped the lab author user.
-                    continue
-                if user in seen:
-                    continue
-                seen.add(user)
-                usernames.append(user)
-        except OSError as exc:
-            telemetry.capture_exception(exc)
-            self.logger.exception(
-                "Failed to read Kerberos enumeration output file",
-                extra={"domain": domain, "output_file": str(output_file)},
-            )
-            return []
+        # Parse discovered usernames. The kerbrute ``-o`` file is the on-disk
+        # record and stays authoritative, but we UNION it with the process
+        # stdout (which the streaming path captured live) via the shared
+        # recovery helper. When both agree the result is identical to parsing
+        # the file alone; the union only adds robustness when one source is
+        # missing or partial (e.g. a buffered ``-o`` file that never flushed a
+        # late hit before exit). Reads are fully defensive.
+        usernames = self._recover_partial_userenum(
+            getattr(result, "stdout", None),
+            output_file,
+            domain,
+        )
 
         self.parent._emit_progress(
             scan_id=scan_id,

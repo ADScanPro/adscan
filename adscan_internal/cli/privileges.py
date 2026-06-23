@@ -52,7 +52,6 @@ from adscan_internal.services.smb_access_probe_service import (
 from adscan_internal.services.mssql_access_probe_service import (
     DEFAULT_MSSQL_PORT,
     MSSQL_ACCESS_PROBE_BACKEND,
-    finding_is_sysadmin,
     get_mssql_probe_worker_count,
     run_mssql_access_probe_sweep,
 )
@@ -184,10 +183,40 @@ def _run_winrm_psrp_service_access_sweep(
             return False
         targets = list(winrm_reach.reachable)
 
-    findings = run_winrm_access_probe_sweep(
+    # Pre-mint ONE TGT for the whole WinRM sweep and reuse it across hosts, so
+    # the secret touches the wire once instead of once per host (scale +
+    # domain-lockout protection). SSOT: sweep_credential. The probe accepts a
+    # ``.ccache`` path in its ``password`` slot and uses it directly.
+    creds = getattr(shell, "current_creds", None) or {}
+    winrm_auth_domain = creds.get("auth_domain") or domain
+    winrm_kdc_ip = ""
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip
+
+        winrm_kdc_ip = str(resolve_dc_ip(shell.domains_data.get(domain, {}) or {}) or "")
+    except Exception:  # noqa: BLE001
+        winrm_kdc_ip = ""
+    from adscan_internal.services.sweep_credential import resolve_sweep_credential
+
+    winrm_cred = resolve_sweep_credential(
+        shell,
         domain=domain,
         username=username,
         password=password,
+        auth_domain=winrm_auth_domain,
+        kdc_ip=winrm_kdc_ip or None,
+    )
+    if not winrm_cred.ok:
+        print_warning(
+            winrm_cred.abort_reason or "WinRM sweep aborted: credential pre-mint failed."
+        )
+        return False
+    winrm_secret = winrm_cred.ccache_path or winrm_cred.password or password
+
+    findings = run_winrm_access_probe_sweep(
+        domain=domain,
+        username=username,
+        password=winrm_secret,
         targets=targets,
         workspace_dir=workspace_dir,
         domains_dir=domains_dir,
@@ -413,14 +442,33 @@ def _run_native_smb_service_access_sweep(
     target_hostnames = _build_service_target_hostname_map(
         shell, domain=domain, targets=targets
     )
-    is_ccache = str(password or "").strip().lower().endswith(".ccache")
+    # Resolve the credential ONCE for the whole sweep: pre-mint a single TGT and
+    # reuse it across every host, so the secret touches the wire once instead of
+    # once per host (scale + domain-lockout protection). SSOT: sweep_credential.
+    from adscan_internal.services.sweep_credential import resolve_sweep_credential
+
+    sweep_cred = resolve_sweep_credential(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
+        auth_domain=auth_domain,
+        kdc_ip=dc_ip or None,
+    )
+    if not sweep_cred.ok:
+        print_warning(
+            sweep_cred.abort_reason or "SMB sweep aborted: credential pre-mint failed."
+        )
+        return False
 
     findings = run_async_sync(
         run_smb_access_probe_sweep(
             domain=domain,
             username=username,
-            password=None if is_ccache else password,
-            ccache_path=password if is_ccache else None,
+            password=sweep_cred.password,
+            nt_hash=sweep_cred.nt_hash,
+            aes_key=sweep_cred.aes_key,
+            ccache_path=sweep_cred.ccache_path,
             targets=targets,
             auth_domain=auth_domain,
             kdc_ip=dc_ip or None,
@@ -494,6 +542,89 @@ def _run_native_smb_service_access_sweep(
     return bool(confirmed_findings)
 
 
+def run_mssql_authorization_collection(
+    shell,
+    *,
+    domain,
+    username,
+    password,
+    instances=None,
+):
+    """Materialize MSSQL authorization facts into the attack graph (SSOT).
+
+    Single source of truth for "enumerate MSSQL authorization as credential X".
+    Delegates to :func:`collect_mssql_authorization_sync`, which discovers
+    instances (``MSSQLSvc`` SPNs ∩ ``mssql/ips.txt``), connects via the existing
+    native TDS path, enumerates ``sys.server_principals`` / ``server_role_members``
+    / ``server_permissions`` at the depth the connecting login allows, correlates
+    SQL principals to AD graph nodes by SID (group login → group node for the
+    blast radius), and upserts effective ``SQLAccess`` / ``SQLAdmin`` edges with
+    raw evidence. Posture-aware Kerberos/NTLM is handled by the TDS backend.
+
+    Returns the :class:`MSSQLCollectionSummary`. Never raises.
+    """
+    from adscan_internal.services.collector.mssql_collector import (
+        MSSQLCollectionSummary,
+        MSSQLCollectorConfig,
+        collect_mssql_authorization_sync,
+    )
+    from adscan_internal.models.domain import resolve_dc_ip
+
+    _ensure_service_sweep_posture_fresh(shell, domain=domain)
+
+    domain_data = shell.domains_data.get(domain, {}) or {}
+    kdc_host = resolve_dc_ip(domain_data)
+    secret = str(password or "")
+    is_ccache = secret.strip().lower().endswith(".ccache")
+    use_kerberos = bool(
+        is_ccache or str(domain_data.get("auth") or "").strip().lower() == "kerberos"
+    )
+
+    # Pre-mint ONE TGT and reuse its ccache across every discovered instance, so
+    # the secret touches the wire once instead of once per instance (scale +
+    # domain-lockout protection). SSOT: sweep_credential. Only on the Kerberos /
+    # Windows-auth branch — a SQL-auth login has no domain TGT, so pre-minting
+    # would (wrongly) abort it; the TDS backend keeps NTLM/SQL auth unchanged.
+    if use_kerberos and not is_ccache:
+        from adscan_internal.services.sweep_credential import resolve_sweep_credential
+
+        mssql_cred = resolve_sweep_credential(
+            shell,
+            domain=domain,
+            username=username,
+            password=secret,
+            kdc_ip=str(kdc_host) if kdc_host else None,
+        )
+        if not mssql_cred.ok:
+            print_warning(
+                mssql_cred.abort_reason
+                or "MSSQL authorization collection aborted: credential pre-mint failed."
+            )
+            return MSSQLCollectionSummary()
+        if mssql_cred.ccache_path:
+            secret = mssql_cred.ccache_path
+            is_ccache = True
+
+    config = MSSQLCollectorConfig(
+        domain=domain,
+        username=username,
+        secret=secret,
+        use_kerberos=use_kerberos,
+        kdc_host=str(kdc_host) if kdc_host else None,
+    )
+    summary = collect_mssql_authorization_sync(
+        shell, domain, config, instances=instances
+    )
+    print_info_debug(
+        "[service-access] MSSQL authorization collection: "
+        f"user={mark_sensitive(username, 'user')} "
+        f"instances={summary.instances_discovered} "
+        f"connected={summary.instances_connected} "
+        f"SQLAccess={summary.sqlaccess_edges} SQLAdmin={summary.sqladmin_edges}"
+    )
+    return summary
+
+
 def _run_native_mssql_service_access_sweep(
     shell,
     *,
@@ -505,12 +636,15 @@ def _run_native_mssql_service_access_sweep(
     targets,
     prompt,
 ) -> bool:
-    """Run a native impacket MSSQL login sweep and persist the results.
+    """Run a native impacket MSSQL login sweep and trigger the followups.
 
-    Mirrors :func:`_run_native_smb_service_access_sweep`: posture-aware, TCP
-    pre-filter on 1433, normalized findings, probe history, and attack-graph
-    edges. A confirmed sysadmin login records ``SQLAdmin``; a confirmed
-    non-sysadmin login records ``SQLAccess`` — matching the netexec parity.
+    Discovery + edge materialization are delegated to the shared collector
+    (:func:`run_mssql_authorization_collection`) — the single source of truth
+    that resolves SQL principals to AD nodes by SID and emits effective
+    ``SQLAccess`` / ``SQLAdmin`` edges with evidence. This function keeps only
+    the **trigger + execution** role: the login sweep that confirms which hosts
+    the current credential can reach (posture-aware, TCP pre-filter on 1433,
+    normalized findings, probe history) and the confirmed-access followup UX.
     """
     from adscan_internal.services.async_bridge import run_async_sync
 
@@ -536,11 +670,39 @@ def _run_native_mssql_service_access_sweep(
 
     kdc_host = resolve_dc_ip(shell.domains_data.get(domain) or {})
 
+    # Pre-mint ONCE for Kerberos/Windows auth and reuse the ccache across hosts
+    # (scale + domain-lockout protection). SSOT: sweep_credential. SQL-auth logins
+    # have no domain TGT → skip the pre-mint (preserves NTLM/SQL behavior); the
+    # service auto-forces Kerberos when ``secret`` is a ``.ccache`` path.
+    mssql_secret = password
+    mssql_domain_data = shell.domains_data.get(domain) or {}
+    mssql_is_ccache = str(password or "").strip().lower().endswith(".ccache")
+    mssql_use_kerberos = mssql_is_ccache or (
+        str(mssql_domain_data.get("auth") or "").strip().lower() == "kerberos"
+    )
+    if mssql_use_kerberos and not mssql_is_ccache:
+        from adscan_internal.services.sweep_credential import resolve_sweep_credential
+
+        mssql_cred = resolve_sweep_credential(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
+            kdc_ip=str(kdc_host) if kdc_host else None,
+        )
+        if not mssql_cred.ok:
+            print_warning(
+                mssql_cred.abort_reason
+                or "MSSQL access sweep aborted: credential pre-mint failed."
+            )
+            return False
+        mssql_secret = mssql_cred.ccache_path or password
+
     findings = run_async_sync(
         run_mssql_access_probe_sweep(
             domain=domain,
             username=username,
-            secret=password,
+            secret=mssql_secret,
             targets=targets,
             target_hostnames=target_hostnames,
             kdc_host=kdc_host,
@@ -582,24 +744,22 @@ def _run_native_mssql_service_access_sweep(
             f"[service-access] failed to persist native MSSQL probe history: {exc}"
         )
 
-    if confirmed_findings:
-        for finding in confirmed_findings:
-            try:
-                from adscan_internal.services.attack_graph_service import (
-                    upsert_netexec_privilege_edge,
-                )
+    # Edge materialization — delegate to the SSOT collector for this credential
+    # (proper SID correlation + group blast-radius + evidence). This replaces the
+    # legacy per-host ``upsert_netexec_privilege_edge`` loop so there is exactly
+    # one MSSQL discovery/edge path. Best-effort: a collector failure never
+    # blocks the confirmed-access followups below.
+    try:
+        run_mssql_authorization_collection(
+            shell, domain=domain, username=username, password=password
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[service-access] MSSQL authorization collection skipped (non-fatal): {exc}"
+        )
 
-                relation = "SQLAdmin" if finding_is_sysadmin(finding) else "SQLAccess"
-                upsert_netexec_privilege_edge(
-                    shell,
-                    domain,
-                    username=username,
-                    relation=relation,
-                    target_ip=finding.host,
-                    target_hostname=target_hostnames.get(finding.host),
-                )
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
+    if confirmed_findings:
         _handle_confirmed_service_followups(
             shell,
             domain=domain,

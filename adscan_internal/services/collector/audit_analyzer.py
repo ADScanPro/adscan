@@ -12,6 +12,7 @@ from typing import Any
 from adscan_internal.services.collector.models import (
     AuditFinding,
     CollectionResult,
+    CollectorNode,
     DomainPolicy,
 )
 
@@ -207,6 +208,39 @@ def analyze_audit_findings(
                 )
 
         if node.kind == "Computer":
+            # Stale enabled computer — the machine analogue of stale_user. An
+            # enabled computer account with no recent logon is typically a
+            # decommissioned/renamed host that was never disabled. Beyond the
+            # account-hygiene risk, its leftover DNS A-record can still resolve
+            # to a now-reused IP and misdirect Kerberos SPN resolution (observed
+            # on Cyberzaintza: stale CZN007$ shared an IP with the live CZN012$).
+            # Staleness MUST key off lastLogonTimestamp (real authentication
+            # activity), NOT pwdLastSet. pwdLastSet is a false proxy: legacy /
+            # pre-Win2000-compat / manually-set machine passwords (the Timeroast
+            # targets) keep an old pwdLastSet for years while the host is still
+            # actively logging on. lastLogonTimestamp reflects activity regardless
+            # of password rotation. When it is unavailable (0/None — e.g. a domain
+            # that disabled lastLogonTimestamp updates) we DO NOT flag, to avoid
+            # false positives; better to miss than to mislabel a live legacy host.
+            if bool(node.enabled):
+                days_ago = _days_since_filetime(node.properties.get("lastlogon"))
+                if days_ago is not None and days_ago > stale_days:
+                    findings.append(
+                        AuditFinding(
+                            category="stale_computer",
+                            samaccountname=node.samaccountname,
+                            object_id=node.object_id,
+                            detail=(
+                                f"Enabled computer, last logon {int(days_ago)} days "
+                                "ago — host inactive but the account was never "
+                                "disabled (stale account; a leftover DNS record can "
+                                "misdirect Kerberos SPNs to a now-reused IP)"
+                            ),
+                            severity="medium" if bool(node.highvalue) else "low",
+                            highvalue=bool(node.highvalue),
+                        )
+                    )
+
             os_str = str(node.properties.get("os") or "")
             if os_str and _is_obsolete_os(os_str):
                 findings.append(
@@ -351,12 +385,29 @@ def _analyze_weak_password_policy(
 
     detail = "Weak Default Domain Password Policy — " + " · ".join(sub_issues)
 
+    # Capture the concrete observed knobs (structured) alongside the human
+    # ``detail`` string. Keys mirror the ``recommended`` block in the
+    # ``weak_password_policy`` catalog entry exactly so report/web can compare
+    # observed-vs-recommended per knob. ``reversible_encryption_enabled`` is
+    # intentionally NOT captured here — it requires an additional LDAP probe
+    # (pwdProperties bit 0x10 / per-PSO attribute) the domain-root collection
+    # does not currently read; deferred as a follow-up.
+    observed: dict[str, Any] = {
+        "min_pwd_length": domain_policy.min_pwd_length,
+        "complexity_enabled": domain_policy.complexity_enabled,
+        "lockout_threshold": domain_policy.lockout_threshold,
+        "lockout_window_minutes": domain_policy.lockout_window_minutes,
+        "max_pwd_age_days": domain_policy.max_pwd_age_days,
+        "pwd_history_length": domain_policy.pwd_history_length,
+    }
+
     return AuditFinding(
         category="weak_password_policy",
         samaccountname="(domain)",
         object_id="",
         detail=detail,
         severity=severity,
+        observed=observed,
     )
 
 
@@ -420,4 +471,120 @@ def analyze_host_audit_findings(result: CollectionResult) -> list[AuditFinding]:
     return findings
 
 
-__all__ = ["analyze_audit_findings", "analyze_host_audit_findings"]
+def analyze_duplicate_dns_findings(result: CollectionResult) -> list[AuditFinding]:
+    """Flag IPs that more than one ENABLED computer resolves to.
+
+    A stale forward A-record left behind by a renamed/decommissioned machine
+    (or genuine IP reuse) makes two enabled computer FQDNs point at one IP with
+    no reverse PTR to disambiguate. This silently breaks Kerberos SPN targeting:
+    the resolver may pick the stale name, the KDC mints a TGS for it, and the
+    LIVE host at the IP rejects it (KRB_ERR_GENERIC). It also misleads any
+    IP-based targeting. Requires ``resolve_computer_nodes`` to have populated
+    ``node.properties['ip_address']`` (Phase 2 DNS), so it only fires when SMB/
+    share collection ran. Best-effort: nodes without a resolved IP are skipped.
+    """
+    if getattr(result, "collection_scope", None) == "ctf":
+        return []
+
+    by_ip: dict[str, list[CollectorNode]] = {}
+    for node in result.nodes.values():
+        if node.kind != "Computer" or not bool(node.enabled):
+            continue
+        ip = str(node.properties.get("ip_address") or "").strip()
+        if ip:
+            by_ip.setdefault(ip, []).append(node)
+
+    findings: list[AuditFinding] = []
+    for ip, nodes in by_ip.items():
+        if len(nodes) < 2:
+            continue
+        names = sorted(
+            str(
+                node.properties.get("dnshostname")
+                or node.samaccountname
+                or node.name
+                or ""
+            )
+            .split("@")[0]
+            .strip()
+            for node in nodes
+        )
+        findings.append(
+            AuditFinding(
+                category="duplicate_dns_fqdn",
+                samaccountname=ip,
+                object_id="",
+                detail=(
+                    f"{len(nodes)} enabled computers resolve to {ip}: "
+                    f"{', '.join(n for n in names if n)} — stale DNS A-record or "
+                    "IP reuse. Kerberos SPN targeting may hit the wrong host "
+                    "(KRB_ERR_GENERIC); remove the obsolete record / disable the "
+                    "dead computer account."
+                ),
+                # MEDIUM: an operational + targeting hazard (and an audit-trail
+                # red flag) rather than a direct privilege issue.
+                severity="medium",
+                highvalue=any(bool(node.highvalue) for node in nodes),
+            )
+        )
+    return findings
+
+
+def analyze_machine_rotation_finding(result: CollectionResult) -> list[AuditFinding]:
+    """Flag disabled / relaxed machine-account password rotation from GPO policy.
+
+    Consumes ``result.machine_password_policy`` (recovered from SYSVOL GptTmpl.inf
+    by the orchestrator). When members do not rotate their computer passwords,
+    every machine password is static → a durable, domain-wide Timeroast / cracking
+    surface. Emitted once at domain level. No policy / default-and-enabled → no
+    finding.
+    """
+    if getattr(result, "collection_scope", None) == "ctf":
+        return []
+    policy = getattr(result, "machine_password_policy", None)
+    if policy is None:
+        return []
+
+    if getattr(policy, "disable_password_change", False):
+        gpos = ", ".join(getattr(policy, "source_gpos", ()) or ()) or "a linked GPO"
+        return [
+            AuditFinding(
+                category="machine_pwd_rotation_disabled",
+                samaccountname="(domain)",
+                object_id="",
+                detail=(
+                    f"Machine-account password rotation is DISABLED by GPO ({gpos}). "
+                    "Domain members never change their computer passwords, so every "
+                    "machine password is static and crackable (Timeroast / silver "
+                    "ticket). Re-enable 'Domain member: Disable machine account "
+                    "password changes' = Disabled."
+                ),
+                # HIGH: domain-wide enabler that makes every machine a durable target.
+                severity="high",
+            )
+        ]
+
+    max_age = getattr(policy, "max_age_days", None)
+    if isinstance(max_age, int) and max_age > 60:
+        return [
+            AuditFinding(
+                category="machine_pwd_rotation_relaxed",
+                samaccountname="(domain)",
+                object_id="",
+                detail=(
+                    f"Machine-account password max age is relaxed to {max_age} days "
+                    "by GPO (default 30). Longer-lived machine passwords widen the "
+                    "Timeroast / cracking window."
+                ),
+                severity="medium",
+            )
+        ]
+    return []
+
+
+__all__ = [
+    "analyze_audit_findings",
+    "analyze_host_audit_findings",
+    "analyze_duplicate_dns_findings",
+    "analyze_machine_rotation_finding",
+]

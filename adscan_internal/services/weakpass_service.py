@@ -1,20 +1,126 @@
-"""Weakpass API client with ADscan-specific TLS fallback behavior."""
+"""Weakpass API client and the single egress guard that gates its use.
+
+weakpass.com is an EXTERNAL service: looking up an NT hash there sends that
+hash out of the customer's network. ADscan sells a "no data leaves your
+network" guarantee to sovereignty-restricted customers (banking, public
+sector). To honour that guarantee without removing the feature (it is part of
+the free community/CTF value), every weakpass call MUST pass through
+``weakpass_allowed(shell)`` before any request is made.
+"""
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
-import json
-import shutil
-import subprocess
 import threading
 
 import requests
 
+from adscan_core.rich_output import (
+    print_info_debug,
+    print_info_verbose,
+    print_warning,
+)
+from adscan_core.interaction import is_non_interactive
+
+# The offline / no-external kill switch is now defined once in
+# adscan_core.offline (the dependency-light base layer) so this guard AND
+# adscan_core.telemetry consume one definition. Re-exported here for
+# backwards-compatible importers (e.g. adscan.py imports offline_mode_enabled
+# from this module).
+from adscan_core.offline import offline_mode_enabled
+from adscan_core.offline import OFFLINE_ENV_VARS as _OFFLINE_ENV_VARS  # noqa: F401
+
 
 _DEFAULT_TIMEOUT = (5, 20)
 _USER_AGENT = "adscan-weakpass/1.0"
+
+def weakpass_allowed(shell: object | None) -> bool:
+    """Single decision point governing whether weakpass.com may be queried.
+
+    Every weakpass call site MUST pass through this guard before issuing any
+    request. The guiding principle is *fail-safe*: when in doubt, no egress.
+
+    Priority order:
+
+    1. Global kill switch (highest priority): if ``ADSCAN_OFFLINE`` /
+       ``ADSCAN_NO_EXTERNAL`` is truthy, weakpass is ALWAYS disabled, with no
+       prompt, no matter what.
+    2. By ``shell.type``:
+       - ``ctf``  -> ON automatically (lab / public data; keeps the fast
+         lead-magnet UX).
+       - ``audit`` -> default OFF. In an interactive (TTY) session, show an
+         explicit opt-in prompt (default ``False``) that spells out the egress.
+       - any other / unknown / unreadable type -> fail-safe OFF.
+    3. Non-interactive / CI (no TTY): never prompt and never auto-enable via a
+       prompt. Falls back to the type default, so the Enterprise platform (CI)
+       never uses weakpass by construction (only ``ctf`` stays ON in CI).
+
+    Args:
+        shell: The active shell. Read defensively; an unreadable shell -> OFF.
+
+    Returns:
+        True only when weakpass.com may be queried in this context.
+    """
+    # 1) Global kill switch — absolute, no prompt.
+    if offline_mode_enabled():
+        print_info_debug(
+            "weakpass disabled: offline kill switch active "
+            "(ADSCAN_OFFLINE / ADSCAN_NO_EXTERNAL)."
+        )
+        return False
+
+    # 2) Decide by session type (fail-safe default OFF for anything unknown).
+    try:
+        shell_type = str(getattr(shell, "type", "") or "").strip().lower()
+    except Exception:  # noqa: BLE001 - unreadable shell must fail safe
+        print_info_debug("weakpass disabled: shell type unreadable (fail-safe).")
+        return False
+
+    if shell_type == "ctf":
+        return True
+
+    if shell_type != "audit":
+        # Unknown / ambiguous / unset session type -> never egress.
+        print_info_debug(
+            f"weakpass disabled: session type '{shell_type or 'unset'}' "
+            "is not opt-in eligible (fail-safe)."
+        )
+        return False
+
+    # 3) audit: default OFF; only an explicit interactive opt-in turns it ON.
+    if is_non_interactive(shell):
+        print_info_verbose(
+            "weakpass disabled: non-interactive/CI audit session "
+            "(default OFF, no external NT-hash lookup)."
+        )
+        return False
+
+    return _prompt_weakpass_opt_in()
+
+
+def _prompt_weakpass_opt_in() -> bool:
+    """Interactive, explicit opt-in for weakpass in an audit session.
+
+    Spells out the egress and defaults to ``False``. Any failure to render the
+    prompt resolves to ``False`` (fail-safe — never egress on error).
+    """
+    prompt = (
+        "weakpass.com is an EXTERNAL service: sending the NT hash there takes it "
+        "OUT of the network. Do NOT use it for customers with data-sovereignty "
+        "restrictions (banking, etc.). Use weakpass to crack NTLM?"
+    )
+    try:
+        from adscan_core.rich_output import confirm_ask
+
+        return bool(confirm_ask(prompt, default=False))
+    except Exception as exc:  # noqa: BLE001 - any prompt failure -> no egress
+        print_info_debug(
+            f"weakpass disabled: opt-in prompt unavailable ({type(exc).__name__}); "
+            "defaulting to OFF (fail-safe)."
+        )
+        return False
 
 
 @dataclass(frozen=True)
@@ -40,54 +146,33 @@ class WeakpassService:
         self._fallback_warning_emitted = False
 
     def lookup_hash(self, hash_value: str) -> WeakpassLookupResult:
-        """Query the Weakpass search endpoint for one hash."""
+        """Query the Weakpass search endpoint for one hash over verified TLS.
+
+        TLS verification is always enforced. If the verified handshake fails we
+        return a clean no-result instead of retrying over an unverified
+        connection — sending an NT hash over unverified TLS is a due-diligence
+        finding and is intentionally not supported.
+        """
         url = f"https://weakpass.com/api/v1/search/{hash_value}.json"
-        tls_verification_failed = False
 
         try:
             response = self._session.get(url, timeout=_DEFAULT_TIMEOUT, verify=True)
             return self._build_result(hash_value, response)
         except requests.exceptions.SSLError as exc:
-            tls_verification_failed = True
-            try:
-                response = self._session.get(
-                    url, timeout=_DEFAULT_TIMEOUT, verify=False
-                )
-                result = self._build_result(hash_value, response)
-                return WeakpassLookupResult(
-                    hash_value=result.hash_value,
-                    password=result.password,
-                    used_insecure_tls_fallback=True,
-                    tls_verification_failed=True,
-                    error=str(exc),
-                )
-            except Exception as fallback_exc:  # noqa: BLE001
-                curl_result = self._lookup_hash_with_curl(hash_value, url)
-                if curl_result is not None:
-                    error_message = (
-                        str(exc)
-                        if curl_result.password
-                        else str(curl_result.error or fallback_exc)
-                    )
-                    return WeakpassLookupResult(
-                        hash_value=curl_result.hash_value,
-                        password=curl_result.password,
-                        used_insecure_tls_fallback=True,
-                        tls_verification_failed=True,
-                        error=error_message,
-                    )
-                return WeakpassLookupResult(
-                    hash_value=hash_value,
-                    password=None,
-                    used_insecure_tls_fallback=False,
-                    tls_verification_failed=True,
-                    error=str(fallback_exc),
-                )
+            print_warning(
+                "Weakpass TLS verification failed; aborting the lookup. ADscan does "
+                "not fall back to an unverified connection for external hash lookups."
+            )
+            return WeakpassLookupResult(
+                hash_value=hash_value,
+                password=None,
+                tls_verification_failed=True,
+                error=str(exc),
+            )
         except Exception as exc:  # noqa: BLE001
             return WeakpassLookupResult(
                 hash_value=hash_value,
                 password=None,
-                tls_verification_failed=tls_verification_failed,
                 error=str(exc),
             )
 
@@ -139,71 +224,6 @@ class WeakpassService:
             text_payload = (response.text or "").strip()
             if text_payload in {"", "0", "[]"}:
                 return WeakpassLookupResult(hash_value=hash_value, password=None)
-            return WeakpassLookupResult(
-                hash_value=hash_value,
-                password=None,
-                error="invalid_json_response",
-            )
-
-        return WeakpassService._build_result_from_payload(hash_value, payload)
-
-    @staticmethod
-    def _lookup_hash_with_curl(
-        hash_value: str, url: str
-    ) -> WeakpassLookupResult | None:
-        """Best-effort curl fallback for hosts where Python TLS negotiation fails."""
-        curl_path = shutil.which("curl")
-        if not curl_path:
-            return WeakpassLookupResult(
-                hash_value=hash_value,
-                password=None,
-                error="curl_fallback_unavailable",
-            )
-
-        try:
-            completed = subprocess.run(
-                [
-                    curl_path,
-                    "-k",
-                    "--silent",
-                    "--show-error",
-                    "--connect-timeout",
-                    "8",
-                    "--max-time",
-                    "30",
-                    "--header",
-                    f"User-Agent: {_USER_AGENT}",
-                    "--header",
-                    "Accept: application/json",
-                    url,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=35,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return WeakpassLookupResult(
-                hash_value=hash_value,
-                password=None,
-                error=f"curl_fallback_exception={exc}",
-            )
-
-        if completed.returncode != 0:
-            stderr = (completed.stderr or "").strip()
-            return WeakpassLookupResult(
-                hash_value=hash_value,
-                password=None,
-                error=f"curl_fallback_exit={completed.returncode} stderr={stderr}",
-            )
-
-        text_payload = (completed.stdout or "").strip()
-        if text_payload in {"", "0", "[]"}:
-            return WeakpassLookupResult(hash_value=hash_value, password=None)
-
-        try:
-            payload = json.loads(text_payload)
-        except ValueError:
             return WeakpassLookupResult(
                 hash_value=hash_value,
                 password=None,

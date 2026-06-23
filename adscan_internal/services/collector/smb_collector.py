@@ -15,6 +15,8 @@ falls back to ``dnshostname`` for hosts where no ``ip_address`` was stored.
 from __future__ import annotations
 
 import asyncio
+import functools
+import socket
 import struct
 from dataclasses import dataclass
 from typing import Any, Optional, TYPE_CHECKING
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     from adscan_internal.services.posture_sink import PostureSink
 
 from adscan_internal import print_info_debug
+from adscan_internal.rich_output import mark_sensitive
 
 
 # ---------------------------------------------------------------------------
@@ -167,12 +170,128 @@ async def negotiate_only(ip: str, port: int, timeout: int) -> dict[str, Any]:
         return {}
 
 
-async def collect_sessions(machine: Any) -> tuple[list[tuple[str, str]], str | None]:
-    """Return ``(sessions, error_reason)`` — (username, ip_addr) active sessions
-    via SRVSVC. ``error_reason`` is ``None`` on success, else the failure string
-    (denial vs connection drop), surfaced for per-stage outcome telemetry."""
+# --- Session filtering --------------------------------------------------------
+# SRVSVC NetSessEnum returns the collector's OWN authenticated session, so a
+# naive collector mints a bogus ``HasSession`` edge for its own principal — and
+# a privileged refresh makes the host falsely advertise a live Domain Admin
+# session to impersonate. We filter the collector's own session + noise HERE,
+# the single point where the (username, origin) tuple is first available, so the
+# edge builder can trust the output. Mirrors the filter set every BloodHound
+# collector applies (BloodHound.py computer.py:494-521).
+
+# Account names that are never a genuine interactive third-party session.
+_NON_SESSION_USERNAMES: frozenset[str] = frozenset(
+    {"anonymous logon", "system", "local service", "network service"}
+)
+_LOOPBACK_ORIGINS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+@functools.lru_cache(maxsize=1)
+def _collector_local_ips() -> frozenset[str]:
+    """Best-effort set of THIS host's own non-loopback IPs.
+
+    Used to drop the collector's own NetSessEnum session by origin, as defense
+    in depth behind the authoritative self-user filter. Best-effort: an empty
+    set simply means only the self-user / loopback filters apply.
+    """
+    ips: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            addr = info[4][0]
+            if isinstance(addr, str):
+                ips.add(addr.lower())
+    except Exception:  # noqa: BLE001 -- detection is best-effort, never fatal
+        pass
+    return frozenset(ips - {"127.0.0.1", "::1"})
+
+
+def _source_ip_toward(target_ip: str) -> str | None:
+    """Return the local source IP the kernel routes to ``target_ip``.
+
+    Uses a connected UDP socket (no packets are sent) so ``getsockname`` reflects
+    the routing decision — this is EXACTLY the origin IP the target's NetSessEnum
+    reports for the collector's own session. Being username-agnostic, it filters
+    the collector's own session even when the authenticating principal differs
+    from ``self_user`` (e.g. a privileged refresh whose ccache principal is not
+    the labelled user). Best-effort: ``None`` on any error (falls back to the
+    local-IP set + self-user filter).
+    """
+    if not target_ip:
+        return None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((str(target_ip), 9))
+            src = probe.getsockname()[0]
+            return str(src).lower() if src else None
+    except Exception:  # noqa: BLE001 - best-effort source-IP probe
+        return None
+
+
+def _normalize_session_username(username: str) -> str:
+    """Strip ``DOMAIN\\`` prefix and ``@domain`` suffix; return lowercased sAM."""
+    name = (username or "").strip()
+    if "\\" in name:
+        name = name.split("\\", 1)[1]
+    if "@" in name:
+        name = name.split("@", 1)[0]
+    return name.lower()
+
+
+def keep_session(
+    username: str,
+    origin: str,
+    *,
+    self_user: str | None,
+    own_ips: frozenset[str] = frozenset(),
+) -> bool:
+    """Return True only for a genuine third-party SMB session worth a HasSession edge.
+
+    Drops the collector's OWN session and noise: blank / ``\\``-prefixed, machine
+    accounts (``$``), anonymous / well-known service principals, the authenticating
+    (self) user, and loopback / own-host origins. Single source of truth for
+    session sanitisation — the edge builder trusts its output.
+    """
+    raw = (username or "").strip()
+    if not raw or raw.startswith("\\"):
+        return False
+    norm = _normalize_session_username(raw)
+    if not norm or norm.endswith("$"):  # machine account
+        return False
+    if norm in _NON_SESSION_USERNAMES:
+        return False
+    if self_user and norm == _normalize_session_username(self_user):
+        return False  # the collector's own authenticated session — the core fix
+    origin_norm = (origin or "").strip().lstrip("\\").strip("[]").lower()
+    if origin_norm and (origin_norm in _LOOPBACK_ORIGINS or origin_norm in own_ips):
+        return False
+    return True
+
+
+async def collect_sessions(
+    machine: Any,
+    *,
+    self_user: str | None = None,
+    target_ip: str | None = None,
+) -> tuple[list[tuple[str, str]], str | None]:
+    """Return ``(sessions, error_reason)`` — (username, origin) third-party SMB
+    sessions via SRVSVC NetSessEnum, with the collector's OWN session and noise
+    filtered out (see :func:`keep_session`). ``error_reason`` is ``None`` on
+    success, else the failure string (denial vs connection drop), surfaced for
+    per-stage outcome telemetry.
+
+    ``self_user`` filters by the collector's authenticating principal; ``target_ip``
+    additionally filters by the collector's SOURCE IP toward that target (the
+    origin NetSessEnum reports for our own session) — username-agnostic, so it
+    drops the collector's own session even when the real authenticating principal
+    differs from ``self_user`` (e.g. a privileged refresh using a ccache whose
+    principal is not the labelled user)."""
     sessions: list[tuple[str, str]] = []
     error_reason: str | None = None
+    own_ips = _collector_local_ips()
+    src_ip = _source_ip_toward(target_ip) if target_ip else None
+    if src_ip:
+        own_ips = own_ips | {src_ip}
+    dropped = 0
     try:
         async for sess, err in machine.list_sessions(level=10):
             if err is not None:
@@ -181,11 +300,22 @@ async def collect_sessions(machine: Any) -> tuple[list[tuple[str, str]], str | N
             if sess is not None:
                 uname = str(getattr(sess, "username", "") or "").strip()
                 ip = str(getattr(sess, "ip_addr", "") or "").strip()
-                if uname and not uname.startswith("\\"):
+                if keep_session(uname, ip, self_user=self_user, own_ips=own_ips):
                     sessions.append((uname, ip))
+                else:
+                    dropped += 1
+                    print_info_debug(
+                        "session dropped (self/noise): user="
+                        f"{mark_sensitive(uname or '-', 'user')} origin={ip or '-'}"
+                    )
     except Exception as exc:
         error_reason = f"{type(exc).__name__}: {exc}"
-        print_info_debug(f"[smb-collector] sessions error: {exc}")
+        print_info_debug(f"sessions enum error: {exc}")
+    print_info_debug(
+        f"sessions: kept={len(sessions)} dropped={dropped} "
+        f"self_user={mark_sensitive(self_user or '-', 'user')} "
+        f"own_ips={','.join(sorted(own_ips)) or '-'}"
+    )
     return sessions, error_reason
 
 

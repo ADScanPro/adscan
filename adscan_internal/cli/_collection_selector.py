@@ -8,9 +8,16 @@ mandatory row purely for visibility. The two SMB sub-collections are optional:
 
 - "SMB: sessions & local admins (SAMR)" -> ``collect_samr``
 - "SMB: shares & share ACLs (SRVSVC)" -> ``collect_shares``
+- "MSSQL: server authorization (logins, roles, sysadmin)" -> ``collect_mssql``
 
 When both SMB options are unchecked, the orchestrator's host phase is skipped
 entirely (LDAP-only fast pass).
+
+The MSSQL collector is a peer collector for selection purposes but runs as a
+Domain Intelligence sub-step AFTER Host Inventory (reusing the ``mssql/ips.txt``
+port-scan result as the single source of truth for reachable MSSQL hosts — no
+separate preflight). ``collect_mssql`` only gates whether that step runs; the
+checkbox lives here so the operator picks all collectors in one place.
 
 The prompt is rendered through the centralized ``questionary_checkbox_values``
 helper, which auto-resolves to ``default_values`` in non-interactive / CI mode.
@@ -30,8 +37,9 @@ from adscan_internal.rich_output import mark_sensitive, print_info_debug
 _OPT_LDAP = "LDAP graph, ACLs, memberships & ADCS/PKI"
 _OPT_SAMR = "SMB: sessions & local admins (SAMR)"
 _OPT_SHARES = "SMB: shares & share ACLs (SRVSVC)"
+_OPT_MSSQL = "MSSQL: server authorization (logins, roles, sysadmin)"
 
-_OPTIONS = [_OPT_LDAP, _OPT_SAMR, _OPT_SHARES]
+_OPTIONS = [_OPT_LDAP, _OPT_SAMR, _OPT_SHARES, _OPT_MSSQL]
 
 
 @dataclass(frozen=True)
@@ -40,6 +48,7 @@ class CollectionSelection:
 
     collect_samr: bool
     collect_shares: bool
+    collect_mssql: bool = True
 
     @property
     def host_phase_enabled(self) -> bool:
@@ -80,10 +89,13 @@ def prompt_collection_selection(
 
     collect_samr = _OPT_SAMR in selected
     collect_shares = _OPT_SHARES in selected
+    collect_mssql = _OPT_MSSQL in selected
     print_info_debug(
         "[collection-selector] resolved selection "
-        f"samr={collect_samr} shares={collect_shares}"
+        f"samr={collect_samr} shares={collect_shares} mssql={collect_mssql}"
     )
     return CollectionSelection(
-        collect_samr=collect_samr, collect_shares=collect_shares
+        collect_samr=collect_samr,
+        collect_shares=collect_shares,
+        collect_mssql=collect_mssql,
     )

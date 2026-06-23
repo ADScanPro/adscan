@@ -49,7 +49,7 @@ from adscan_internal.services import _kerberos_recovery  # noqa: F401
 from adscan_internal.services.auth_error_classification import (
     exception_chain_text,
 )
-from adscan_internal.services.async_bridge import run_sync_off_loop
+from adscan_internal.services.async_bridge import run_async_sync, run_sync_off_loop
 
 
 SD_FLAGS_DACL_CONTROL: str = "sd_flags_dacl"
@@ -398,6 +398,27 @@ def _build_sd_flags_control(flags: int) -> list[Any]:
     return [("1.2.840.113556.1.4.801", True, request_value.dump())]
 
 
+# LDAP_SERVER_SHOW_DELETED_OID — required to enumerate/modify tombstoned objects in
+# CN=Deleted Objects (a normal search never returns them).
+SHOW_DELETED_CONTROL_OID: str = "1.2.840.113556.1.4.417"
+
+
+def build_show_deleted_controls(with_sd_flags: bool = True) -> list[Any]:
+    """Controls for enumerating tombstones (AD Recycle Bin discovery).
+
+    Combines the Show Deleted Objects control with (optionally) SD_FLAGS_ALL so the
+    DC computes ``allowedAttributesEffective`` / ``sDRightsEffective`` on each
+    deleted object — i.e. what the authenticated principal can write (and therefore
+    whether it can reanimate the tombstone). Returned as a raw control-tuple list,
+    which the search path passes straight through to badldap.
+    """
+    controls: list[Any] = []
+    if with_sd_flags:
+        controls.extend(_build_sd_flags_control(_SD_FLAGS_ALL_CONTROL_VALUE))
+    controls.append((SHOW_DELETED_CONTROL_OID, True, None))
+    return controls
+
+
 def _resolve_sd_flags_control(controls: Any) -> Any:
     """Translate ADscan SD flag sentinels to badldap control tuples."""
     if controls == SD_FLAGS_DACL_CONTROL:
@@ -594,6 +615,24 @@ def _build_ldap_connection_url(config: "ADscanLDAPConfig") -> tuple[str, bool]:
                     "want a specific principal must pass ccache_path or "
                     "username+password explicitly."
                 )
+                # Read-only principal guard: warn + record telemetry if the
+                # ambient ccache authenticates as a principal other than the
+                # one the caller asked for. Only runs on this env-fallback
+                # branch (the explicit ccache_path branch above is EXEMPT —
+                # ESC13 capability-bearing TGTs / S4U / RBCD service tickets
+                # flow there and their principal mismatch is intentional).
+                if username:
+                    from adscan_internal.services._kerberos_ccache_guard import (
+                        assert_ccache_principal_matches,
+                    )
+
+                    assert_ccache_principal_matches(
+                        env_ccache,
+                        username,
+                        auth_domain,
+                        source="env",
+                        context="ldap_transport",
+                    )
                 auth_kind = "kerberos-ccache"
                 secret_part = _quote_url_component(env_ccache)
             else:
@@ -1887,12 +1926,43 @@ def _classify_recoverable_bind_failure(
         "strongerauthrequired",
         "error_ds_strong_auth_required",
         "0x00002028",
+        # Samba/Heimdal AD with `ldap server require strong auth = yes` rejects a
+        # GSS-SPNEGO bind that negotiates no SASL security layer with this phrasing
+        # — and it does so even over LDAPS/StartTLS (TLS does NOT satisfy it).
+        "sign or seal",
     )
-    if (
-        not transport_was_ldaps
-        and not cfg.sign
-        and any(sig in chain_text for sig in signing_signatures)
-    ):
+    _signing_required = any(sig in chain_text for sig in signing_signatures)
+    _on_tls = transport_was_ldaps or getattr(cfg, "use_starttls", False)
+    if _signing_required and (_on_tls or not cfg.sign):
+        if _on_tls:
+            # The DC demands a SASL sign+seal security layer that a TLS-protected
+            # channel cannot carry: RFC 4513 / MS-ADTS forbid negotiating a SASL
+            # security layer once TLS is active (Windows rejects it; over LDAPS
+            # ``sign`` is a documented no-op). Retrying signing on the SAME TLS
+            # transport therefore loops to the identical rejection. Descend to
+            # PLAIN LDAP/389 and negotiate GSS sign+seal there — the only rung
+            # that satisfies `require strong auth = yes`. Verified against a live
+            # Samba 4 AD DC: plain-LDAP + sign+seal binds where LDAPS-without-seal
+            # is rejected with this exact error. Zero Windows regression: a
+            # standard Windows DC accepts the LDAPS bind, so this path never runs
+            # there; if a hardened Windows DC ever returned it, plain+seal also
+            # satisfies Windows.
+            print_info_debug(
+                "[ldap_transport] self-heal: TLS rung rejected with sign/seal-"
+                "required; descending to plain LDAP + SASL sign+seal"
+            )
+            # Clear channel_binding too: CBT is a TLS-only token (the vendor
+            # derives it only on a true-LDAPS connection), so carrying it onto
+            # the plain-LDAP descent is meaningless and just wastes a self-heal
+            # hop. Dropping it lets the descent converge to SASL sign+seal in a
+            # single retry.
+            return _dc.replace(
+                cfg,
+                sign=True,
+                use_ldaps=False,
+                use_starttls=False,
+                channel_binding=False,
+            )
         print_info_debug(
             "[ldap_transport] self-heal: bind failed with signing-required "
             "signature, queuing retry with sign=True"
@@ -2485,6 +2555,124 @@ async def _premint_kerberos_ccache_for_ldap(
     return rewritten
 
 
+def _ldap_credential_context_can_remint(cred_ctx: Any) -> bool:
+    """True when *cred_ctx* carries secret material for a generic re-mint.
+
+    Capability-bearing ESC13 PAC-TGTs and scoped S4U/RBCD/silver ServiceTickets
+    flow through the explicit ``ccache_path`` branch WITHOUT a CredentialContext,
+    so they never reach this gate — re-minting them would destroy the synthetic
+    group SID / impersonated principal. We additionally require at least one
+    re-mintable secret (password / NT hash / AES key) so a context with nothing
+    to re-issue from does not register a no-op reminter.
+    """
+    if cred_ctx is None:
+        return False
+    for attr in ("password", "nt_hash", "aes_key"):
+        if getattr(cred_ctx, attr, None):
+            return True
+    return False
+
+
+def _make_ldap_expiry_reminter(cred_ctx: Any) -> "Callable[[], str | None]":
+    """Build the realm reminter closure used by the Kerberos expiry recovery.
+
+    The closure is SYNCHRONOUS (the recovery layer calls it from inside an
+    active event loop) so it drives the async ``refresh_if_stale(force=True)``
+    on a private off-loop thread via :func:`run_async_sync`. Returns the path to
+    the freshly minted ccache, or ``None`` when the re-mint produced nothing.
+    """
+
+    def _reminter() -> str | None:
+        try:
+            run_async_sync(cred_ctx.refresh_if_stale(force=True))
+        except Exception as exc:  # noqa: BLE001 — never mask the original expiry error
+            print_info_debug(
+                "[ldap_transport] expiry reminter re-mint raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+        return getattr(cred_ctx, "ccache_path", None)
+
+    return _reminter
+
+
+async def _premint_via_credential_context(
+    config: "ADscanLDAPConfig",
+    cred_ctx: Any,
+) -> "ADscanLDAPConfig":
+    """Salt-correct pre-mint routed through the bound CredentialContext.
+
+    SSOT reconciliation (B1): when a :class:`CredentialContext` is present and
+    the bind would otherwise mint a FRESH TGT (no ``ccache_path``), do NOT spin
+    up a separate ``/tmp/adscan_ldap_tgt_*.ccache`` via
+    :func:`_premint_kerberos_ccache_for_ldap`. Instead drive the mint through
+    the context's own ``refresh_if_stale(force=True)``, then point
+    ``config.ccache_path`` at the context's canonical *workspace* ccache.
+
+    Why this is correct AND salt-correct:
+      * ``CredentialContext.refresh_if_stale`` -> ``KerberosTicketService.
+        auto_generate_tgt`` -> ``kerberos_transport.get_tgt`` — the SAME
+        salt-probing (ETYPE-INFO2), posture-aware path the /tmp pre-mint used.
+        AES-only KDCs with a non-default salt derive the correct key either way.
+      * The result is ONE canonical per-user ccache shared by: this pre-mint,
+        the pre-bind ``refresh_if_stale()`` (which now no-ops — the ccache it
+        just wrote is not stale), the expiry reminter (``refresh_if_stale
+        (force=True)`` writes the SAME workspace path), and the live bind. No
+        orphaned /tmp temp, no redundant double re-mint to a file the bind
+        never reads.
+
+    Best-effort: if the context could not produce a ccache (no re-mintable
+    secret, missing ``workspace_dir``, mint failure) we fall back to the
+    standalone /tmp pre-mint so the salt-correct behaviour is never lost. The
+    capability-bearing / scoped-ticket axis never reaches here: those flow
+    through the explicit ``ccache_path`` branch with no CredentialContext, so
+    ``_ldap_config_would_mint_fresh_tgt`` already returned False upstream.
+    """
+    import dataclasses as _dc_ctx_premint
+
+    try:
+        # force=True: the bind is about to fire and we have nothing cached on
+        # this config (no ccache_path), so mint unconditionally rather than let
+        # the staleness heuristic skip it and leave the bind credential-less.
+        await cred_ctx.refresh_if_stale(force=True)
+    except Exception as exc:  # noqa: BLE001 — never mask the real bind error
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[ldap_transport] CredentialContext pre-mint raised "
+            f"{type(exc).__name__}: {exc}; falling back to the standalone "
+            "/tmp salt-correct pre-mint"
+        )
+        return await _premint_kerberos_ccache_for_ldap(config)
+
+    ctx_path = str(getattr(cred_ctx, "ccache_path", None) or "").strip()
+    if not ctx_path:
+        # The context had no re-mintable secret or could not persist a ccache.
+        # Preserve salt-correctness via the standalone /tmp pre-mint path.
+        print_info_debug(
+            "[ldap_transport] CredentialContext produced no ccache; falling "
+            "back to the standalone /tmp salt-correct pre-mint"
+        )
+        return await _premint_kerberos_ccache_for_ldap(config)
+
+    # Switch to kerberos-ccache on the SHARED workspace ccache. Clear the
+    # fresh-mint secrets so the URL builder selects ``kerberos-ccache`` (slot 1)
+    # and reuses this one salt-correct ticket — identical to the /tmp path,
+    # except the path is the context's canonical per-user ccache, so the
+    # pre-bind refresh and the expiry reminter all converge on the same file.
+    rewritten = _dc_ctx_premint.replace(
+        config,
+        ccache_path=ctx_path,
+        password=None,
+        aes_key=None,
+    )
+    print_info_debug(
+        "[ldap_transport] pre-minted salt-correct TGT via CredentialContext; "
+        "LDAP bind, pre-bind refresh, and expiry reminter share the canonical "
+        f"workspace ccache {mark_sensitive(ctx_path, 'path')} (no /tmp temp)"
+    )
+    return rewritten
+
+
 async def async_connect_with_ldap_fallback(
     config: "ADscanLDAPConfig",
     *,
@@ -2545,7 +2733,21 @@ async def async_connect_with_ldap_fallback(
     # ``kerberos-ccache`` so EVERY rung of the ladder below reuses one
     # salt-correct ticket. ccache-based and non-Kerberos binds are untouched.
     if _ldap_config_would_mint_fresh_tgt(config):
-        config = await _premint_kerberos_ccache_for_ldap(config)
+        # SSOT reconciliation (B1): when a CredentialContext is bound, route the
+        # salt-correct pre-mint THROUGH it so the resulting ccache is the
+        # context's canonical per-user workspace ccache — shared by the bind,
+        # the pre-bind ``refresh_if_stale()`` below, and the expiry reminter. No
+        # orphaned /tmp temp and no redundant double re-mint. The standalone
+        # /tmp pre-mint is kept for the no-context case (and as a fallback when
+        # the context cannot mint). Capability-bearing ESC13 PAC-TGTs and scoped
+        # S4U/RBCD/silver ServiceTickets never reach here: they carry an
+        # explicit ``ccache_path`` (slot 1) with no CredentialContext, so
+        # ``_ldap_config_would_mint_fresh_tgt`` already returned False.
+        _premint_cred_ctx = getattr(config, "credential_context", None)
+        if _ldap_credential_context_can_remint(_premint_cred_ctx):
+            config = await _premint_via_credential_context(config, _premint_cred_ctx)
+        else:
+            config = await _premint_kerberos_ccache_for_ldap(config)
     # ------------------------------------------------------------------------
 
     # ---- Build the confidentiality ladder (per LDAP connection) -------------
@@ -2786,290 +2988,334 @@ async def async_connect_with_ldap_fallback(
         configs_to_try = sealed_configs
     # ---------------------------------------------------------------------------
 
-    last_exc: Exception | None = None
-    last_attempt_was_ldaps: bool = False
-    ldaps_disabled_emitted: bool = False
-
-    # Self-healing retry budget. For each recoverable posture category
-    # (CBT, LDAP signing) we allow EXACTLY ONE injected retry per
-    # ``async_connect_with_ldap_fallback`` invocation. The budget is
-    # global to the loop so a CBT failure cannot cascade into a CBT
-    # retry that ALSO fails with CBT and triggers a third attempt. The
-    # bound is intentional: anything beyond "fail once, learn, fix
-    # once" is a sign that posture inference is broken and we want a
-    # loud error, not an infinite loop.
-    _self_heal_used: set[str] = set()
-    # Separate one-shot budget for the seal-by-default DEGRADE retry
-    # (sealed authenticated plain-LDAP -> unsealed) so it can never
-    # interact with or exhaust the signing/CBT self-heal budget above.
-    _seal_degrade_used: bool = False
-    # We iterate with an index so that injected attempts (appended to
-    # ``configs_to_try`` mid-iteration) participate naturally in the
-    # loop instead of needing a recursive call.
-    cfg_index = 0
-    while cfg_index < len(configs_to_try):
-        cfg, is_ldaps = configs_to_try[cfg_index]
-        cfg_index += 1
-        transport_label = "LDAPS" if is_ldaps else "LDAP"
-        last_attempt_was_ldaps = is_ldaps
-        try:
-            url, requires_cross_target = _build_ldap_connection_url(cfg)
-            if cfg.use_kerberos:
-                _host_for_spn = str(
-                    cfg.tls_sni or cfg.kerberos_target_hostname or cfg.dc_ip or ""
-                ).strip()
-                _is_ip_spn = bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", _host_for_spn))
-                print_info_debug(
-                    f"[ldap_transport][diag] kerberos SPN host={_host_for_spn!r} "
-                    f"is_ip={_is_ip_spn} kerberos_target_hostname="
-                    f"{cfg.kerberos_target_hostname!r} tls_sni={cfg.tls_sni!r} "
-                    f"dc_ip={cfg.dc_ip!r}"
-                )
-            factory = LDAPConnectionFactory.from_url(url)
-
-            if cfg.use_kerberos:
-                target_host = str(
-                    cfg.tls_sni or cfg.kerberos_target_hostname or ""
-                ).strip()
-                conn = factory.get_client_newtarget(
-                    hostname_or_ip=target_host,
-                    ip=cfg.dc_ip,
-                    new_domain=cfg.domain if requires_cross_target else None,
-                    old_target_ip=str(cfg.auth_kdc or cfg.dc_ip or "").strip() or None,
-                )
-            elif requires_cross_target:
-                target_host = str(
-                    cfg.kerberos_target_hostname or cfg.dc_ip or ""
-                ).strip()
-                conn = factory.get_client_newtarget(
-                    hostname_or_ip=target_host,
-                    ip=cfg.dc_ip,
-                    new_domain=cfg.domain,
-                    old_target_ip=str(cfg.auth_kdc or cfg.dc_ip or "").strip() or None,
-                )
-            else:
-                conn = factory.get_client()
-
-            if hasattr(conn, "_disable_signing"):
-                conn._disable_signing = not cfg.sign
-            if hasattr(conn, "_disable_channel_binding"):
-                # CBT is driven solely by ``cfg.channel_binding`` so an explicit
-                # CBT requirement (e.g. a SEC_E_BAD_BINDINGS self-heal retry, or
-                # the operational LDAPS default-on set by
-                # ``_apply_default_cbt_to_authenticated_ldaps``) is never silently
-                # dropped. On a StartTLS rung the vendor cb_data computation is
-                # gated on ``protocol == CLIENT_SSL_TCP`` (true LDAPS only), so a
-                # non-LDAPS StartTLS connection never derives a token regardless
-                # of this flag -- meaning we do NOT need to force-disable CBT for
-                # StartTLS here, and doing so would defeat an explicit CBT-required
-                # retry that lands on an LDAPS rung. ``channel_binding`` is left at
-                # its False default for StartTLS/plain rungs (see
-                # ``_apply_default_cbt_to_authenticated_ldaps``, which skips them),
-                # so this stays a no-op there.
-                conn._disable_channel_binding = not cfg.channel_binding
-            if hasattr(conn, "_null_channel_binding"):
-                conn._null_channel_binding = cfg.null_channel_binding
-            if hasattr(conn, "_use_starttls"):
-                # Tell badldap to upgrade the plain 389 session to TLS via
-                # StartTLS BEFORE bind when this rung requested it.
-                conn._use_starttls = bool(cfg.use_starttls)
-            if bind_only and hasattr(conn, "_bind_only"):
-                # BIND-ONLY mode: stop after the LDAP bind, skip the
-                # post-bind rootDSE discovery. Used by the posture probes so
-                # they read the raw bind result code (strongerAuthRequired vs
-                # success) instead of a downstream rootDSE search that a
-                # RestrictAnonymous DC answers with operationsError
-                # (ERROR_NOT_AUTHENTICATED), which would mask the policy
-                # answer. See vendor/badldap/badldap/client.py bind_only.
-                conn._bind_only = True
-
-            if connect_timeout is not None:
-                ok, err = await asyncio.wait_for(
-                    conn.connect(), timeout=connect_timeout
-                )
-            else:
-                ok, err = await conn.connect()
-            if not ok:
-                raise err or RuntimeError(
-                    f"{transport_label} connect returned ok=False"
-                )
-
-            # Determine which confidentiality mechanism sealed this channel.
-            #   LDAPS (636) ......... TLS transport
-            #   StartTLS (389) ...... TLS post-upgrade (RFC 2830)
-            #   SASL sign+seal (389)  GSS app-layer (``sign=True`` on 389)
-            #   cleartext (389) ..... none (unsealed plain bind)
-            if is_ldaps:
-                mechanism = ConfidentialityMechanism.LDAPS
-            elif getattr(cfg, "use_starttls", False):
-                mechanism = ConfidentialityMechanism.STARTTLS
-            elif cfg.sign:
-                mechanism = ConfidentialityMechanism.SASL_SEAL
-            else:
-                mechanism = ConfidentialityMechanism.CLEARTEXT
-            conn_label = (
-                "LDAP+StartTLS"
-                if (not is_ldaps and getattr(cfg, "use_starttls", False))
-                else transport_label
+    # Register a realm-scoped expiry reminter so a mid-bind
+    # KRB_AP_ERR_TKT_EXPIRED on a ccache-only Kerberos bind can be re-minted
+    # transparently (real 12h ticket expiry, not clock skew). Only the GENERIC
+    # shell-aware branch qualifies: a CredentialContext carrying re-mintable
+    # secret material. Capability-bearing ESC13 PAC-TGTs and scoped S4U/RBCD
+    # ServiceTickets flow without a CredentialContext, so they are never
+    # registered (re-minting would destroy their synthetic SID / impersonation).
+    # Always deregistered in the finally so it never leaks across operations or
+    # principals.
+    _expiry_reminter_realm: str | None = None
+    if _ldap_credential_context_can_remint(cred_ctx):
+        _expiry_reminter_realm = str(
+            getattr(cred_ctx, "auth_domain", None) or config.domain or ""
+        ).strip()
+        if _expiry_reminter_realm:
+            _kerberos_recovery.register_expiry_reminter(
+                _expiry_reminter_realm, _make_ldap_expiry_reminter(cred_ctx)
             )
-            print_info_debug(
-                f"[ldap_transport] async connect: {conn_label} on {cfg.dc_ip} "
-                f"(confidentiality={mechanism.value})"
-            )
-            _emit_ldap_success_posture(
-                config,
-                used_kerberos_auth=cfg.use_kerberos,
-                used_ldaps=is_ldaps,
-                mechanism=mechanism,
-            )
-            return LDAPConnectResult(client=conn, mechanism=mechanism)
+    try:
+        last_exc: Exception | None = None
+        last_attempt_was_ldaps: bool = False
+        ldaps_disabled_emitted: bool = False
 
-        except Exception as exc:
-            last_exc = exc
-            _diag_dump_bind_exception(exc)
-            if is_ldaps and is_ldaps_transport_failure(exc):
-                if not ldaps_disabled_emitted:
-                    _emit_posture_signal(
-                        config,
-                        category=ConstraintCategory.LDAPS_AVAILABLE,
-                        state=TriState.DISABLED,
-                        confidence=SignalConfidence.HIGH,
-                        signal_code="LDAPS_TRANSPORT_FAILURE",
-                        message=(
-                            "LDAPS port unreachable or TLS handshake failed — "
-                            "domain does not expose LDAPS"
-                        ),
-                    )
-                    ldaps_disabled_emitted = True
-                print_info_debug(
-                    f"[ldap_transport] LDAPS unavailable on {config.dc_ip}, retrying on plain LDAP"
-                )
-                continue
-
-            # StartTLS rung fall-through. When THIS attempt requested StartTLS
-            # on plain 389 and the upgrade was refused / no usable DC cert is
-            # present (``_is_starttls_unavailable``), fall THROUGH to the next
-            # rung — the SASL sign+seal rung (authenticated) or the cleartext
-            # last-resort — instead of emitting a failure or raising. A bare
-            # TCP/389 failure is NOT a StartTLS-availability signal and is
-            # handled by the normal failure path below. This is purely a
-            # confidentiality-mechanism fallback, not an auth failure, so it
-            # must not emit ``_emit_ldap_failure_posture``.
-            if (
-                not is_ldaps
-                and getattr(cfg, "use_starttls", False)
-                and _is_starttls_unavailable(exc)
-            ):
-                print_info_debug(
-                    f"[ldap_transport] StartTLS unavailable on {config.dc_ip} "
-                    f"(no DC cert on 389 / not supported); falling through to "
-                    f"the next confidentiality rung"
-                )
-                continue
-
-            if last_exc is not None:
-                _emit_ldap_failure_posture(
-                    config,
-                    exc=last_exc,
-                    used_kerberos_auth=config.use_kerberos,
-                    transport_was_ldaps=last_attempt_was_ldaps,
-                )
-
-            # Seal-by-default DEGRADE hook. When THIS attempt was a
-            # transport-applied default seal (authenticated plain-LDAP we
-            # upgraded to sign+seal, marked ``_default_seal_applied``) and it
-            # failed specifically because sealing could not be negotiated
-            # against a server that cannot provide it (a non-Windows / legacy
-            # LDAP server) -- NOT an auth/credential failure -- retry once
-            # unsealed so we degrade gracefully instead of hanging or failing
-            # hard against a DC that genuinely cannot seal. Budget-gated to a
-            # single shot. A bad-creds rejection is excluded by
-            # ``_is_seal_negotiation_failure`` and propagates unchanged.
-            if (
-                not is_ldaps
-                and getattr(cfg, "_default_seal_applied", False)
-                and not getattr(config, "require_confidential", False)
-                and not _seal_degrade_used
-                and _is_seal_negotiation_failure(exc)
-            ):
-                _seal_degrade_used = True
-                import dataclasses as _dc_degrade
-
-                unsealed_cfg = _dc_degrade.replace(
-                    cfg, sign=False, _default_seal_applied=False
-                )
-                configs_to_try.append((unsealed_cfg, is_ldaps))
-                print_warning_debug(
-                    "[ldap_transport] seal-by-default: authenticated plain-LDAP "
-                    "bind could not negotiate GSS sign+seal against this DC; "
-                    "degrading to an UNSEALED plain-LDAP retry. Queries/results "
-                    "on this connection will travel in cleartext -- the DC does "
-                    "not support LDAP sealing on port 389."
-                )
-                continue
-
-            # Self-healing retry hook. The failure posture above already
-            # taught the bus what the DC requires; here we synthesise the
-            # corresponding transport config and append it to the
-            # iteration queue. The next ``while`` iteration picks it up.
-            #
-            # Budget-gated by ``_self_heal_used`` so a misclassified
-            # recovery cannot loop. The synth uses ``_dc.replace(cfg, …)``
-            # so the new attempt carries the same credentials, posture
-            # snapshot, kerberos target hostname, etc. — only the single
-            # offending flag flips.
-            #
-            # Disabled by ``config.disable_self_heal`` for failure-
-            # eliciting consumers (posture probes) — they need the raw
-            # rejection to propagate so they can classify it instead of
-            # the transport silently "fixing" the call. See the field
-            # docstring on ``ADscanLDAPConfig.disable_self_heal``.
-            recovered_cfg = (
-                None
-                if config.disable_self_heal
-                else _classify_recoverable_bind_failure(
-                    exc, cfg=cfg, transport_was_ldaps=is_ldaps
-                )
-            )
-            if recovered_cfg is not None:
-                recovery_key = (
-                    f"cbt={recovered_cfg.channel_binding}|"
-                    f"sign={recovered_cfg.sign}|"
-                    f"ldaps={is_ldaps}"
-                )
-                if recovery_key not in _self_heal_used:
-                    _self_heal_used.add(recovery_key)
-                    configs_to_try.append((recovered_cfg, is_ldaps))
+        # Self-healing retry budget. For each recoverable posture category
+        # (CBT, LDAP signing) we allow EXACTLY ONE injected retry per
+        # ``async_connect_with_ldap_fallback`` invocation. The budget is
+        # global to the loop so a CBT failure cannot cascade into a CBT
+        # retry that ALSO fails with CBT and triggers a third attempt. The
+        # bound is intentional: anything beyond "fail once, learn, fix
+        # once" is a sign that posture inference is broken and we want a
+        # loud error, not an infinite loop.
+        _self_heal_used: set[str] = set()
+        # Separate one-shot budget for the seal-by-default DEGRADE retry
+        # (sealed authenticated plain-LDAP -> unsealed) so it can never
+        # interact with or exhaust the signing/CBT self-heal budget above.
+        _seal_degrade_used: bool = False
+        # We iterate with an index so that injected attempts (appended to
+        # ``configs_to_try`` mid-iteration) participate naturally in the
+        # loop instead of needing a recursive call.
+        cfg_index = 0
+        while cfg_index < len(configs_to_try):
+            cfg, is_ldaps = configs_to_try[cfg_index]
+            cfg_index += 1
+            transport_label = "LDAPS" if is_ldaps else "LDAP"
+            last_attempt_was_ldaps = is_ldaps
+            try:
+                url, requires_cross_target = _build_ldap_connection_url(cfg)
+                if cfg.use_kerberos:
+                    _host_for_spn = str(
+                        cfg.tls_sni or cfg.kerberos_target_hostname or cfg.dc_ip or ""
+                    ).strip()
+                    _is_ip_spn = bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", _host_for_spn))
                     print_info_debug(
-                        f"[ldap_transport] self-heal: queued retry "
-                        f"{recovery_key} after recoverable bind failure on "
-                        f"{transport_label}"
+                        f"[ldap_transport][diag] kerberos SPN host={_host_for_spn!r} "
+                        f"is_ip={_is_ip_spn} kerberos_target_hostname="
+                        f"{cfg.kerberos_target_hostname!r} tls_sni={cfg.tls_sni!r} "
+                        f"dc_ip={cfg.dc_ip!r}"
+                    )
+                factory = LDAPConnectionFactory.from_url(url)
+
+                if cfg.use_kerberos:
+                    target_host = str(
+                        cfg.tls_sni or cfg.kerberos_target_hostname or ""
+                    ).strip()
+                    conn = factory.get_client_newtarget(
+                        hostname_or_ip=target_host,
+                        ip=cfg.dc_ip,
+                        new_domain=cfg.domain if requires_cross_target else None,
+                        old_target_ip=str(cfg.auth_kdc or cfg.dc_ip or "").strip() or None,
+                    )
+                elif requires_cross_target:
+                    target_host = str(
+                        cfg.kerberos_target_hostname or cfg.dc_ip or ""
+                    ).strip()
+                    conn = factory.get_client_newtarget(
+                        hostname_or_ip=target_host,
+                        ip=cfg.dc_ip,
+                        new_domain=cfg.domain,
+                        old_target_ip=str(cfg.auth_kdc or cfg.dc_ip or "").strip() or None,
+                    )
+                else:
+                    conn = factory.get_client()
+
+                if hasattr(conn, "_disable_signing"):
+                    conn._disable_signing = not cfg.sign
+                if hasattr(conn, "_disable_channel_binding"):
+                    # CBT is driven solely by ``cfg.channel_binding`` so an explicit
+                    # CBT requirement (e.g. a SEC_E_BAD_BINDINGS self-heal retry, or
+                    # the operational LDAPS default-on set by
+                    # ``_apply_default_cbt_to_authenticated_ldaps``) is never silently
+                    # dropped. On a StartTLS rung the vendor cb_data computation is
+                    # gated on ``protocol == CLIENT_SSL_TCP`` (true LDAPS only), so a
+                    # non-LDAPS StartTLS connection never derives a token regardless
+                    # of this flag -- meaning we do NOT need to force-disable CBT for
+                    # StartTLS here, and doing so would defeat an explicit CBT-required
+                    # retry that lands on an LDAPS rung. ``channel_binding`` is left at
+                    # its False default for StartTLS/plain rungs (see
+                    # ``_apply_default_cbt_to_authenticated_ldaps``, which skips them),
+                    # so this stays a no-op there.
+                    conn._disable_channel_binding = not cfg.channel_binding
+                if hasattr(conn, "_null_channel_binding"):
+                    conn._null_channel_binding = cfg.null_channel_binding
+                if hasattr(conn, "_use_starttls"):
+                    # Tell badldap to upgrade the plain 389 session to TLS via
+                    # StartTLS BEFORE bind when this rung requested it.
+                    conn._use_starttls = bool(cfg.use_starttls)
+                if bind_only and hasattr(conn, "_bind_only"):
+                    # BIND-ONLY mode: stop after the LDAP bind, skip the
+                    # post-bind rootDSE discovery. Used by the posture probes so
+                    # they read the raw bind result code (strongerAuthRequired vs
+                    # success) instead of a downstream rootDSE search that a
+                    # RestrictAnonymous DC answers with operationsError
+                    # (ERROR_NOT_AUTHENTICATED), which would mask the policy
+                    # answer. See vendor/badldap/badldap/client.py bind_only.
+                    conn._bind_only = True
+
+                if connect_timeout is not None:
+                    ok, err = await asyncio.wait_for(
+                        conn.connect(), timeout=connect_timeout
+                    )
+                else:
+                    ok, err = await conn.connect()
+                if not ok:
+                    raise err or RuntimeError(
+                        f"{transport_label} connect returned ok=False"
+                    )
+
+                # Determine which confidentiality mechanism sealed this channel.
+                #   LDAPS (636) ......... TLS transport
+                #   StartTLS (389) ...... TLS post-upgrade (RFC 2830)
+                #   SASL sign+seal (389)  GSS app-layer (``sign=True`` on 389)
+                #   cleartext (389) ..... none (unsealed plain bind)
+                if is_ldaps:
+                    mechanism = ConfidentialityMechanism.LDAPS
+                elif getattr(cfg, "use_starttls", False):
+                    mechanism = ConfidentialityMechanism.STARTTLS
+                elif cfg.sign:
+                    mechanism = ConfidentialityMechanism.SASL_SEAL
+                else:
+                    mechanism = ConfidentialityMechanism.CLEARTEXT
+                conn_label = (
+                    "LDAP+StartTLS"
+                    if (not is_ldaps and getattr(cfg, "use_starttls", False))
+                    else transport_label
+                )
+                print_info_debug(
+                    f"[ldap_transport] async connect: {conn_label} on {cfg.dc_ip} "
+                    f"(confidentiality={mechanism.value})"
+                )
+                _emit_ldap_success_posture(
+                    config,
+                    used_kerberos_auth=cfg.use_kerberos,
+                    used_ldaps=is_ldaps,
+                    mechanism=mechanism,
+                )
+                return LDAPConnectResult(client=conn, mechanism=mechanism)
+
+            except Exception as exc:
+                last_exc = exc
+                _diag_dump_bind_exception(exc)
+                if is_ldaps and is_ldaps_transport_failure(exc):
+                    if not ldaps_disabled_emitted:
+                        _emit_posture_signal(
+                            config,
+                            category=ConstraintCategory.LDAPS_AVAILABLE,
+                            state=TriState.DISABLED,
+                            confidence=SignalConfidence.HIGH,
+                            signal_code="LDAPS_TRANSPORT_FAILURE",
+                            message=(
+                                "LDAPS port unreachable or TLS handshake failed — "
+                                "domain does not expose LDAPS"
+                            ),
+                        )
+                        ldaps_disabled_emitted = True
+                    print_info_debug(
+                        f"[ldap_transport] LDAPS unavailable on {config.dc_ip}, retrying on plain LDAP"
                     )
                     continue
-            raise
 
-    if last_exc is not None:
-        _emit_ldap_failure_posture(
-            config,
-            exc=last_exc,
-            used_kerberos_auth=config.use_kerberos,
-            transport_was_ldaps=last_attempt_was_ldaps,
+                # StartTLS rung fall-through. When THIS attempt requested StartTLS
+                # on plain 389 and the upgrade was refused / no usable DC cert is
+                # present (``_is_starttls_unavailable``), fall THROUGH to the next
+                # rung — the SASL sign+seal rung (authenticated) or the cleartext
+                # last-resort — instead of emitting a failure or raising. A bare
+                # TCP/389 failure is NOT a StartTLS-availability signal and is
+                # handled by the normal failure path below. This is purely a
+                # confidentiality-mechanism fallback, not an auth failure, so it
+                # must not emit ``_emit_ldap_failure_posture``.
+                if (
+                    not is_ldaps
+                    and getattr(cfg, "use_starttls", False)
+                    and _is_starttls_unavailable(exc)
+                ):
+                    print_info_debug(
+                        f"[ldap_transport] StartTLS unavailable on {config.dc_ip} "
+                        f"(no DC cert on 389 / not supported); falling through to "
+                        f"the next confidentiality rung"
+                    )
+                    continue
+
+                if last_exc is not None:
+                    _emit_ldap_failure_posture(
+                        config,
+                        exc=last_exc,
+                        used_kerberos_auth=config.use_kerberos,
+                        transport_was_ldaps=last_attempt_was_ldaps,
+                    )
+
+                # Seal-by-default DEGRADE hook. When THIS attempt was a
+                # transport-applied default seal (authenticated plain-LDAP we
+                # upgraded to sign+seal, marked ``_default_seal_applied``) and it
+                # failed specifically because sealing could not be negotiated
+                # against a server that cannot provide it (a non-Windows / legacy
+                # LDAP server) -- NOT an auth/credential failure -- retry once
+                # unsealed so we degrade gracefully instead of hanging or failing
+                # hard against a DC that genuinely cannot seal. Budget-gated to a
+                # single shot. A bad-creds rejection is excluded by
+                # ``_is_seal_negotiation_failure`` and propagates unchanged.
+                if (
+                    not is_ldaps
+                    and getattr(cfg, "_default_seal_applied", False)
+                    and not getattr(config, "require_confidential", False)
+                    and not _seal_degrade_used
+                    and _is_seal_negotiation_failure(exc)
+                ):
+                    _seal_degrade_used = True
+                    import dataclasses as _dc_degrade
+
+                    unsealed_cfg = _dc_degrade.replace(
+                        cfg, sign=False, _default_seal_applied=False
+                    )
+                    configs_to_try.append((unsealed_cfg, is_ldaps))
+                    print_warning_debug(
+                        "[ldap_transport] seal-by-default: authenticated plain-LDAP "
+                        "bind could not negotiate GSS sign+seal against this DC; "
+                        "degrading to an UNSEALED plain-LDAP retry. Queries/results "
+                        "on this connection will travel in cleartext -- the DC does "
+                        "not support LDAP sealing on port 389."
+                    )
+                    continue
+
+                # Self-healing retry hook. The failure posture above already
+                # taught the bus what the DC requires; here we synthesise the
+                # corresponding transport config and append it to the
+                # iteration queue. The next ``while`` iteration picks it up.
+                #
+                # Budget-gated by ``_self_heal_used`` so a misclassified
+                # recovery cannot loop. The synth uses ``_dc.replace(cfg, …)``
+                # so the new attempt carries the same credentials, posture
+                # snapshot, kerberos target hostname, etc. — only the single
+                # offending flag flips.
+                #
+                # Disabled by ``config.disable_self_heal`` for failure-
+                # eliciting consumers (posture probes) — they need the raw
+                # rejection to propagate so they can classify it instead of
+                # the transport silently "fixing" the call. See the field
+                # docstring on ``ADscanLDAPConfig.disable_self_heal``.
+                recovered_cfg = (
+                    None
+                    if config.disable_self_heal
+                    else _classify_recoverable_bind_failure(
+                        exc, cfg=cfg, transport_was_ldaps=is_ldaps
+                    )
+                )
+                if recovered_cfg is not None:
+                    # A recovery may switch transport (e.g. a sign/seal-required
+                    # rejection on LDAPS descends to plain LDAP/389), so the queued
+                    # attempt's LDAPS flag must follow the recovered config — NOT the
+                    # transport that just failed. Reusing the old ``is_ldaps`` here
+                    # would re-queue the SAME TLS rung where ``sign`` is a no-op and
+                    # loop to the identical rejection.
+                    recovered_is_ldaps = bool(
+                        getattr(recovered_cfg, "use_ldaps", is_ldaps)
+                    )
+                    recovery_key = (
+                        f"cbt={recovered_cfg.channel_binding}|"
+                        f"sign={recovered_cfg.sign}|"
+                        f"ldaps={recovered_is_ldaps}"
+                    )
+                    if recovery_key not in _self_heal_used:
+                        _self_heal_used.add(recovery_key)
+                        configs_to_try.append((recovered_cfg, recovered_is_ldaps))
+                        print_info_debug(
+                            f"[ldap_transport] self-heal: queued retry "
+                            f"{recovery_key} after recoverable bind failure on "
+                            f"{transport_label}"
+                        )
+                    else:
+                        # The identical recovery was ALREADY queued by a prior failed
+                        # rung — e.g. both the LDAPS and StartTLS rungs descend to the
+                        # same plain-LDAP sign+seal rung. The fix is already pending in
+                        # configs_to_try, so do NOT raise here: continue so the loop
+                        # reaches that queued rung instead of aborting before it runs.
+                        # (Bad-creds / non-recoverable failures have recovered_cfg=None
+                        # and still fast-fail via the raise below — no extra binds, so
+                        # this does not add account-lockout risk.)
+                        print_info_debug(
+                            f"[ldap_transport] self-heal: recovery {recovery_key} "
+                            f"already queued by a prior rung; continuing to it"
+                        )
+                    continue
+                raise
+
+        if last_exc is not None:
+            _emit_ldap_failure_posture(
+                config,
+                exc=last_exc,
+                used_kerberos_auth=config.use_kerberos,
+                transport_was_ldaps=last_attempt_was_ldaps,
+            )
+        if confidential_dropped_unsealed:
+            # The only sealed option (LDAPS) failed and the plain-LDAP fallback was
+            # dropped because it could not seal. Surface the actionable confidential
+            # error rather than the raw LDAPS transport exception.
+            raise ConfidentialChannelUnavailableError(
+                "gMSA / confidential-attribute read requires a sealed channel, but "
+                "none succeeded: LDAPS (port 636) failed to connect and the plain-LDAP "
+                "(port 389) fallback was skipped because the configured bind "
+                "(anonymous / SIMPLE) cannot negotiate LDAP sign+seal. The managed "
+                "password cannot be read over an unsealed channel. Provide credentials "
+                "for an authenticated bind, or restore LDAPS reachability to the DC."
+            ) from last_exc
+        raise last_exc or RuntimeError(
+            "Both LDAPS and plain LDAP connection attempts failed"
         )
-    if confidential_dropped_unsealed:
-        # The only sealed option (LDAPS) failed and the plain-LDAP fallback was
-        # dropped because it could not seal. Surface the actionable confidential
-        # error rather than the raw LDAPS transport exception.
-        raise ConfidentialChannelUnavailableError(
-            "gMSA / confidential-attribute read requires a sealed channel, but "
-            "none succeeded: LDAPS (port 636) failed to connect and the plain-LDAP "
-            "(port 389) fallback was skipped because the configured bind "
-            "(anonymous / SIMPLE) cannot negotiate LDAP sign+seal. The managed "
-            "password cannot be read over an unsealed channel. Provide credentials "
-            "for an authenticated bind, or restore LDAPS reachability to the DC."
-        ) from last_exc
-    raise last_exc or RuntimeError(
-        "Both LDAPS and plain LDAP connection attempts failed"
-    )
+    finally:
+        if _expiry_reminter_realm:
+            _kerberos_recovery.unregister_expiry_reminter(_expiry_reminter_realm)
 
 
 def execute_with_ldap_fallback(

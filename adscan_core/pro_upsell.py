@@ -28,12 +28,14 @@ _BRAND_CYAN = "bright_cyan"
 
 _FEATURE_DISPLAY_NAMES: dict[str, str] = {
     "playbook": "AD Hardening Playbook",
-    "checklist": "MITRE Remediation Checklist",
-    "coverage_matrix": "Coverage Matrix",
+    # ``coverage_matrix`` is the kept slug; the deliverable it renders is the
+    # AD Control Coverage Report (the old Coverage Matrix folded into a
+    # positive-assurance, control-evidence view).
+    "coverage_matrix": "AD Control Coverage Report",
     "deliver": "Client Deliverable Kit",
     # ``generate_report`` is the REPL verb that renders the standalone
     # Security Assessment Report (one PDF, the headline artefact in the
-    # 4-PDF Kit). LITE users who type it land on the same upsell panel
+    # 3-PDF Kit). LITE users who type it land on the same upsell panel
     # as the ones who type ``deliver`` — single source of truth for the
     # PRO ask, same brand, same CTA.
     "generate_report": "Security Assessment Report",
@@ -42,8 +44,7 @@ _FEATURE_DISPLAY_NAMES: dict[str, str] = {
 _PDFS = (
     "Security Assessment Report",
     "AD Hardening Playbook",
-    "MITRE Remediation Checklist",
-    "Coverage Matrix",
+    "AD Control Coverage Report",
 )
 
 
@@ -66,8 +67,7 @@ def render_pro_upsell_panel(feature: str, context: UpsellContext) -> Panel:
 
     Args:
         feature: PRO verb being promoted (e.g. ``"playbook"``,
-            ``"checklist"``, ``"coverage_matrix"``, ``"deliver"``,
-            ``"generate_report"``).
+            ``"coverage_matrix"``, ``"deliver"``, ``"generate_report"``).
         context: Where the panel is being rendered. Drives the secondary
             CTA: ``direct_invocation`` shows ``adscan demo`` as zero-risk
             preview, ``post_scan`` invites rendering against the user's
@@ -88,7 +88,7 @@ def render_pro_upsell_panel(feature: str, context: UpsellContext) -> Panel:
 
     # The default headline construction ("<X> is part of the Client
     # Deliverable Kit — …") works for components (Security Assessment
-    # Report, Playbook, Checklist, Coverage Matrix). When the feature IS
+    # Report, Playbook, AD Control Coverage Report). When the feature IS
     # the Kit itself (``deliver``), it collapses into a tautology
     # ("Client Deliverable Kit is part of the Client Deliverable Kit").
     # Branch on the feature name to keep the copy clean.
@@ -96,12 +96,12 @@ def render_pro_upsell_panel(feature: str, context: UpsellContext) -> Panel:
     if feature == "deliver":
         headline.append("The Client Deliverable Kit", style="bold")
         headline.append(
-            " is the 4 PDFs you hand to the customer after every engagement.",
+            " is the 3 PDFs you hand to the customer after every engagement.",
         )
     else:
         headline.append(display, style="bold")
         headline.append(
-            " is part of the Client Deliverable Kit — the 4 PDFs you "
+            " is part of the Client Deliverable Kit — the 3 PDFs you "
             "hand to the customer after every engagement.",
         )
 

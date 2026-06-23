@@ -143,6 +143,9 @@ from adscan_internal.services.session_compromise_state_service import (
     SESSION_COMPROMISE_STATUS_UNKNOWN,
     build_session_compromise_metadata,
 )
+from adscan_internal.services.session_ad_scale_metadata import (
+    build_session_ad_scale_metadata,
+)
 from adscan_internal.version import get_version, get_version_tag
 from adscan_internal.workspaces import (
     DEFAULT_DOMAIN_LAYOUT,
@@ -190,6 +193,7 @@ from adscan_internal.rich_output import (
 from adscan_internal.interactive_requests import (
     is_remote_interaction_enabled,
     request_confirm as request_remote_confirm,
+    request_multiselect as request_remote_multiselect,
     request_select as request_remote_select,
 )
 from adscan_internal.update_manager import (
@@ -2654,6 +2658,18 @@ def _ensure_wordlist_installed(
         return False
 
     if not fix:
+        return False
+
+    # Offline kill switch: never reach an external service to fetch a wordlist
+    # (weakpass.com hashmob/kaonashi, naive-hashcat rockyou, ...). Degrade
+    # gracefully — local copies above (e.g. system rockyou) are still honoured.
+    from adscan_internal.services.weakpass_service import offline_mode_enabled
+
+    if offline_mode_enabled():
+        print_info(
+            f"Offline mode (ADSCAN_OFFLINE/ADSCAN_NO_EXTERNAL): skipping download of "
+            f"'{wl_name}'. Use wordlists pre-loaded in {WORDLISTS_INSTALL_DIR}."
+        )
         return False
 
     try:
@@ -8711,6 +8727,27 @@ def run_with_timeout(timeout):
     return decorator
 
 
+def _is_positive_report_metric(value) -> bool:
+    """Return whether a non-catalog report metric represents a real hit.
+
+    Used by :meth:`PentestShell.update_report_field` to decide whether a
+    posture/coverage metric routed to ``control_evidence`` is "verified clear"
+    (nothing found) or "observed" (something found). Unlike the generic
+    ``_is_positive_value`` recorder helper, a numeric count is treated as a
+    metric: ``0`` is clear, any positive count is a hit.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    if value is None:
+        return False
+    # Any other truthy scalar (e.g. a non-empty string) counts as observed.
+    return bool(value)
+
+
 class CaseInsensitiveDict(dict):
     """A dictionary that uses case-insensitive keys."""
 
@@ -8930,6 +8967,62 @@ class PentestShell:
         # account is not a local admin on the DC. The picker filters
         # disabled accounts and routes the right secret_kind so hash /
         # password / AES key all work natively.
+        # Flags host (the DC) — used to peek logon-capability and for the flag
+        # collector's credential pick.
+        pdc_host = (
+            self.domains_data.get(domain, {}).get("pdc_hostname")
+            or self.domains_data.get(domain, {}).get("pdc")
+        )
+
+        # DCSync runs BEFORE flags. A full "All" DCSync (scoped-ticket-first /
+        # logon-capable via ask_for_dcsync) harvests every DA + krbtgt, so the
+        # flag collector that follows inherits a complete, logon-capable
+        # credential set. Trigger it when explicitly queued, OR when flags is
+        # queued but its best credential is missing or known-DENIED a network
+        # logon on the DC (e.g. the compromise dumped only Administrator, which
+        # the DC denies via SeDenyNetworkLogonRight) — without the extra dump,
+        # flags would lead with that dead principal and fail.
+        _need_dcsync_for_flags = False
+        if "flags" in actions:
+            try:
+                from adscan_internal.services.credentials import (
+                    pick_credential_for_local_admin,
+                )
+                from adscan_internal.services.credential_store_service import (
+                    is_logon_denied,
+                )
+
+                _peek = pick_credential_for_local_admin(
+                    self, domain=domain, target_host=pdc_host
+                )
+                if _peek is None or (
+                    bool(pdc_host)
+                    and is_logon_denied(
+                        self.domains_data, domain, principal=_peek[0], host=pdc_host
+                    )
+                ):
+                    _need_dcsync_for_flags = True
+            except Exception as _exc:  # noqa: BLE001
+                telemetry.capture_exception(_exc)
+
+        # STATE-driven: run the full "all" replication unless an attack-path
+        # DCSync step already did it (is_full_ntds_replicated) — so it happens
+        # exactly once regardless of the compromise path. The flags branch can
+        # still force it when its best credential is missing / network-logon
+        # denied on the DC (_need_dcsync_for_flags).
+        from adscan_internal.services.domain_compromise_promotion import (
+            is_full_ntds_replicated,
+        )
+
+        if not is_full_ntds_replicated(self, domain) or _need_dcsync_for_flags:
+            self.ask_for_dcsync(domain, username, password)
+
+        # FLAGS SECOND. Pick the highest-tier admin credential currently known
+        # (now logon-capability-aware: a DA the DC denies a network logon is
+        # demoted in favour of a logon-capable one harvested by the DCSync above).
+        # The queued (username, password) that triggered the post-compromise flow
+        # may belong to a low-priv account (e.g. svc_tgs on HTB Active); the
+        # picker filters disabled accounts and routes the right secret_kind.
         if "flags" in actions:
             picked_user, picked_secret, picked_kind = username, password, None
             try:
@@ -8937,10 +9030,6 @@ class PentestShell:
                     pick_credential_for_local_admin,
                 )
 
-                pdc_host = (
-                    self.domains_data.get(domain, {}).get("pdc_hostname")
-                    or self.domains_data.get(domain, {}).get("pdc")
-                )
                 best = pick_credential_for_local_admin(
                     self, domain=domain, target_host=pdc_host
                 )
@@ -8990,8 +9079,6 @@ class PentestShell:
             self.ask_for_flags(
                 domain, picked_user, picked_secret, secret_kind=picked_kind
             )
-        if "dcsync" in actions:
-            self.ask_for_dcsync(domain, username, password)
 
     def _get_domain_post_da_state(self, domain: str) -> dict[str, object]:
         """Return the mutable post-DA state bucket for a domain."""
@@ -9031,7 +9118,9 @@ class PentestShell:
 
         Drained at a safe (non-re-entrant) checkpoint by
         :meth:`_execute_audit_post_compromise_actions`. Mirror of the CTF
-        ``_ctf_queue_post_compromise_actions`` mechanism.
+        ``_ctf_queue_post_compromise_actions`` mechanism. Whether the drained
+        pipeline runs a full DCSync ("all") is decided STATE-driven at drain
+        time (``is_full_ntds_replicated``), not here.
         """
         from adscan_internal.cli.post_da import queue_audit_post_compromise
 
@@ -9304,6 +9393,80 @@ class PentestShell:
             shell=self,
         )
 
+    def _questionary_multiselect(
+        self,
+        title: str,
+        options: list[str],
+        default_values: list[str] | None = None,
+        timeout_values: list[str] | None = None,
+        context: dict[str, object] | None = None,
+    ) -> list[str] | None:
+        """Multi-select that can be delegated to a remote orchestrator.
+
+        Like :meth:`_questionary_checkbox`, but with the same ``remote_interaction``
+        branch as :meth:`_questionary_select`: when the remote bridge is enabled
+        (web platform scan) and the caller opts in via ``context["remote_interaction"]``,
+        the prompt is published to the orchestrator and resolves to the operator's
+        chosen *values*. Falls back to the centralized local checkbox helper when
+        the bridge is off or the session is non-interactive.
+
+        Args:
+            title: Prompt text.
+            options: Selectable option values (also their labels).
+            default_values: Values checked by default.
+            timeout_values: Values to resolve to if the remote request times out
+                or the bridge is unavailable mid-flight. Defaults to
+                ``default_values`` so a hung/abandoned session resolves safely
+                instead of returning an empty selection.
+            context: Extra remote payload. Pop-key ``remote_interaction`` (bool)
+                opts this prompt into remote delegation.
+
+        Returns:
+            Selected option values, or ``None`` if cancelled locally.
+        """
+        remote_context = dict(context or {})
+        allow_remote_interaction = bool(remote_context.pop("remote_interaction", False))
+        if allow_remote_interaction:
+            default_indices = [
+                options.index(value) for value in (default_values or []) if value in options
+            ]
+            timeout_source = timeout_values if timeout_values is not None else default_values
+            timeout_indices = [
+                options.index(value)
+                for value in (timeout_source or [])
+                if value in options
+            ]
+            remote_selection = request_remote_multiselect(
+                title=title,
+                options=options,
+                default_indices=default_indices,
+                timeout_result=timeout_indices,
+                context={
+                    "source": "prompt",
+                    "prompt_kind": "multiselect",
+                    "session_command_type": getattr(self, "session_command_type", None),
+                    **remote_context,
+                },
+            )
+            if remote_selection is not None:
+                return [
+                    options[idx] for idx in remote_selection if 0 <= idx < len(options)
+                ]
+            if is_remote_interaction_enabled():
+                # Bridge is on but resolution failed (no timeout default provided):
+                # do not block the headless scan — resolve to the timeout values.
+                return [
+                    options[idx] for idx in timeout_indices if 0 <= idx < len(options)
+                ]
+
+        print()
+        return questionary_checkbox_values(
+            title=title,
+            options=options,
+            default_values=default_values,
+            shell=self,
+        )
+
     def _track_non_whitelisted_lab(self, lab_provider: str, lab_name: str):
         """Track non-whitelisted lab names for analytics and future whitelist additions.
 
@@ -9515,6 +9678,21 @@ class PentestShell:
             return result
 
         return _executor
+
+    def _get_service_spawner(self):
+        """Build a non-blocking spawner for service-layer streaming operations.
+
+        Mirrors :meth:`_get_service_executor` but returns the ``spawn_command``
+        bound method so a service can read a tool's stdout line-by-line (live
+        dashboards) while still inheriting the clean-env / PyInstaller handling
+        ``spawn_command`` applies. Threaded into ``enumerate_users_kerberos`` so
+        the kerbrute userenum counter advances DURING the run (kerbrute buffers
+        its ``-o`` file; its stdout streams per hit).
+
+        Returns:
+            The shell's ``spawn_command`` callable.
+        """
+        return self.spawn_command
 
     def _is_lab_whitelisted(self, lab_provider: str, lab_name: str) -> bool:
         """Check whether a lab is whitelisted for telemetry.
@@ -10381,6 +10559,41 @@ class PentestShell:
         self._credsweeper_service: Optional[Any] = None
         self._spidering_service: Optional[Any] = None
         self._ai_service: Optional[Any] = None
+
+        # Arm the PKINIT reactive clock-resync backstop ONCE per session,
+        # before any operation runs. If a PKINIT path (shadow creds, PtC,
+        # ESC) slips past the proactive ensure_clock_synced_fresh guard and
+        # fails KDC_ERR_CLIENT_NOT_TRUSTED on a drifted host clock, the
+        # transport layer self-heals by physically stepping the clock and
+        # retrying once. Best-effort: never blocks shell startup.
+        try:
+            from adscan_internal.services.dc_time import (
+                register_clock_resync_for_shell,
+            )
+
+            register_clock_resync_for_shell(self)
+        except Exception as exc:  # noqa: BLE001 — backstop arming must not break startup
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"(clock-resync-backstop) arming failed: {type(exc).__name__}: {exc}"
+            )
+
+        # Arm the stale-DNS SPN self-heal (dependency-inversion): inject a
+        # shell-aware IP→live-FQDN-candidates resolver so the SMB transport can
+        # retry a Kerberos AP/KDC failure caused by a stale-DNS wrong-host SPN
+        # with the live candidate, before NTLM fallback. Centralized for every
+        # SMB-backed path (collector, sweeps, share-enum). Best-effort.
+        try:
+            from adscan_internal.services.kerberos_hostname_inventory import (
+                register_spn_candidate_resolver_for_shell,
+            )
+
+            register_spn_candidate_resolver_for_shell(self)
+        except Exception as exc:  # noqa: BLE001 — arming must not break startup
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"(spn-candidate-resolver) arming failed: {type(exc).__name__}: {exc}"
+            )
 
         ACTIVE_SHELL = self
 
@@ -14306,6 +14519,15 @@ class PentestShell:
                     credential=cred,
                 )
                 trusted_manual_validation = pending_manual_validation is not None
+            # A manual ``creds save`` / ``creds add`` is a SELF-INTRODUCED
+            # credential: the operator provided it, it was not compromised
+            # during the scan, so tag ``user_provided`` so the compromise SSOT
+            # excludes it from counters / telemetry. The exception is a
+            # WriteLogonScript manual validation, where the credential really
+            # is the product of that technique — keep its technique origin.
+            manual_credential_origin = (
+                "writelogonscript" if trusted_manual_validation else "user_provided"
+            )
             add_credential(
                 self,
                 domain,
@@ -14315,6 +14537,7 @@ class PentestShell:
                 service,
                 trusted_manual_validation=trusted_manual_validation,
                 mark_user_compromised=False,
+                credential_origin=manual_credential_origin,
             )
             if trusted_manual_validation and isinstance(
                 pending_manual_validation, dict
@@ -14651,6 +14874,7 @@ class PentestShell:
         ui_silent: bool = False,
         ensure_fresh_kerberos_ticket: bool = True,
         metadata_by_user=None,
+        credential_origin: str | None = None,
     ):
         """Add multiple domain credentials via the shared CLI batch helper."""
         from adscan_internal.cli.creds import add_credentials_batch
@@ -14668,6 +14892,7 @@ class PentestShell:
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
             metadata_by_user=metadata_by_user,
+            credential_origin=credential_origin,
         )
 
     def add_local_credentials_batch(
@@ -14680,6 +14905,7 @@ class PentestShell:
         verify_local_credential=True,
         prompt_local_reuse_after=False,
         ui_silent=False,
+        credential_origin: str | None = None,
     ):
         """Add multiple local credentials via the shared CLI batch helper."""
         from adscan_internal.cli.creds import add_local_credentials_batch
@@ -14693,6 +14919,7 @@ class PentestShell:
             verify_local_credential=verify_local_credential,
             prompt_local_reuse_after=prompt_local_reuse_after,
             ui_silent=ui_silent,
+            credential_origin=credential_origin,
         )
 
     def _handle_hash_cracking(self, domain, user, cred):
@@ -15136,6 +15363,7 @@ class PentestShell:
                     resolved_user,
                     cred_value,
                     source_steps=source_steps,
+                    credential_origin="credential_recovery",
                 )
 
             def _spray() -> None:
@@ -15178,6 +15406,7 @@ class PentestShell:
                     confirm_spray=_confirm_spray,
                     prompt_manual_username=_prompt_manual_username,
                     source_steps=source_steps,
+                    credential_origin="credential_recovery",
                 )
             except Exception as exc_recovery:  # noqa: BLE001
                 telemetry.capture_exception(exc_recovery)
@@ -15897,6 +16126,13 @@ class PentestShell:
             except Exception as exc:  # pragma: no cover - best effort
                 telemetry.capture_exception(exc)
 
+        # MSSQL Authorization collection now runs as a Phase-2 (Domain Collection)
+        # peer inside run_native_collection — AFTER the unified nmap port scan
+        # produces mssql/ips.txt and using the already-built CollectionCredential
+        # (incl. ccache, which fixes the prior ccache-skip bug). The redundant
+        # Phase-3 sub-step was removed; effective SQLAccess/SQLAdmin edges are
+        # already materialized in the graph by the time paths compute here.
+
         if stop_after_phase == 1:
             return
 
@@ -16011,18 +16247,12 @@ class PentestShell:
             total_steps=1,
         ):
             return
-        try:
-            from adscan_internal.cli.spraying import (
-                maybe_offer_ctf_pre2k_followup,
-            )
-
-            maybe_offer_ctf_pre2k_followup(
-                self,
-                domain,
-                reason="phase_4_completed",
-            )
-        except Exception as exc:  # pragma: no cover - best-effort UX hint
-            telemetry.capture_exception(exc)
+        # NOTE: no post-phase pre2k follow-up here. Pre2k is now Step 1 of the
+        # spray phase itself (run_spray_coverage -> _run_pre2k_step, with its own
+        # education panel + default-yes prompt), so re-offering it after the phase
+        # completed was redundant. The decline path (operator says No to the whole
+        # spray phase) still offers pre2k from inside ask_for_spraying, where Step 1
+        # never ran.
 
         if stop_after_phase == 4:
             return
@@ -18792,27 +19022,58 @@ class PentestShell:
 
     def do_spraying(self, domain):
         """
-        Performs password spraying on the specified domain.
+        Run the coverage-aware password spraying selector for a domain.
 
-        This method displays a menu to select the type of spraying to perform on the specified domain.
-        The available options are:
+        Usage:
+            spraying <domain>
 
-        1. Username as password in lowercase
-        2. Username as password (First letter uppercase)
-        3. Username with a specific password
-
-        If the domain uses credential-based authentication, the user's credentials will be requested.
-        If the domain uses Kerberos authentication, the domain's PDC will be used for spraying.
-
-        After selecting an option, the method executes the corresponding command and
-        saves the result to a log file in the domain directory.
+        Drives the same coverage selector loop as the scan's Password Spraying
+        phase (user-as-password / owned-credential reuse / blank / custom), with
+        the eligibility panel (owned + locked-out + near-lockout exclusions) and
+        per-(user, password) coverage de-dup. The pre2k computer-account check is a
+        separate command (``pre2k``), so this manual entry point is selector-only.
 
         Args:
-            domain (str): The domain in which to perform spraying.
+            domain (str): Target domain (defaults to the current domain).
         """
-        from adscan_internal.cli.spraying import do_spraying
+        from adscan_internal.cli.spraying import run_spray_coverage
+        from adscan_internal.interaction import is_non_interactive
 
-        do_spraying(self, domain)
+        domain = (domain or "").strip() or (self.current_domain or "")
+        if not domain:
+            print_error("No domain specified. Usage: spraying <domain>")
+            return
+
+        run_spray_coverage(
+            self, domain, interactive=not is_non_interactive(self), include_pre2k=False
+        )
+
+    def do_pre2k(self, domain):
+        """
+        Run the pre-Windows 2000 computer-account spray for a domain.
+
+        Usage:
+            pre2k <domain>
+
+        Sprays the hostname-as-password pattern across enabled computer accounts
+        (never locks out a user — computer accounts are not governed by the user
+        lockout policy). Already-owned machines and prior attempts are skipped;
+        a successful hit is an authenticated computer foothold (LDAP/SMB, often
+        RBCD/delegation). This is the standalone counterpart to Step 1 of the
+        scan's Password Spraying phase.
+
+        Args:
+            domain (str): Target domain (defaults to the current domain).
+        """
+        from adscan_internal.cli.spraying import _run_pre2k_step
+        from adscan_internal.interaction import is_non_interactive
+
+        domain = (domain or "").strip() or (self.current_domain or "")
+        if not domain:
+            print_error("No domain specified. Usage: pre2k <domain>")
+            return
+
+        _run_pre2k_step(self, domain, interactive=not is_non_interactive(self))
 
     def execute_password_spray_attack_step(
         self,
@@ -19982,13 +20243,55 @@ class PentestShell:
             if not self.do_check_dns(domain, pdc_ip):
                 if pdc_ip:
                     self.do_update_resolv_conf(f"{domain} {pdc_ip}")
-            self.convert_hostnames_to_ips_and_scan(domain, computers_file, nmap_dir)
+            # Phase 2 (Domain Collection) already runs the unified nmap port scan
+            # and persists network_reachability_report.json + {service}/ips.txt.
+            # When those artifacts are present, Phase-3 Host Inventory is
+            # RENDER-ONLY: re-show the reachability summary from the persisted
+            # report and SKIP the (otherwise re-running) scan. When the report is
+            # missing (ADSCAN_NO_PORT_SCAN opt-out, or Phase 2 produced nothing),
+            # fall through to the legacy scan path — exactly as before.
+            from adscan_internal.cli.nmap import (
+                _load_network_reachability_report,
+                _show_network_reachability_summary,
+            )
 
-    def convert_hostnames_to_ips_and_scan(self, domain, computers_file, nmap_dir):
+            reachability_report_file = domain_subpath(
+                workspace_cwd,
+                self.domains_dir,
+                domain,
+                "network_reachability_report.json",
+            )
+            phase2_payload = _load_network_reachability_report(reachability_report_file)
+            if phase2_payload:
+                print_info_debug(
+                    "[host-inventory] Phase-2 reachability artifacts present for "
+                    f"{mark_sensitive(domain, 'domain')}; rendering summary "
+                    "from the persisted report (skipping re-scan)."
+                )
+                _show_network_reachability_summary(
+                    self,
+                    payload=phase2_payload,
+                    report_file=reachability_report_file,
+                )
+            else:
+                self.convert_hostnames_to_ips_and_scan(
+                    domain, computers_file, nmap_dir
+                )
+
+    def convert_hostnames_to_ips_and_scan(
+        self, domain, computers_file, nmap_dir, *, render=True, auto=False
+    ):
         """Convert hostnames to IPs and scan ports.
 
         This is a thin wrapper around :mod:`adscan_internal.cli.nmap` so that
         the core logic can be reused by other UX layers.
+
+        Args:
+            render: Forward to the core function. When False the scan still
+                produces all artifacts but suppresses the reachability summary UI
+                (Phase-2 producer; Phase-3 renders from the persisted report).
+            auto: Forward to the core function. When True the important-port scan
+                runs without the confirmation prompt (Phase-2 automatic producer).
         """
         from adscan_internal.cli.nmap import convert_hostnames_to_ips_and_scan
 
@@ -20000,6 +20303,8 @@ class PentestShell:
             _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
             _sudo_validate=_sudo_validate,
             verbose_mode=VERBOSE_MODE,
+            render=render,
+            auto=auto,
         )
 
     def execute_laps(
@@ -22761,6 +23066,14 @@ class PentestShell:
         def _offer_attack_paths() -> None:
             # Reuse the centralized UX: show paths, allow inspecting details, and
             # optionally execute one (step mapping is handled by the helper).
+            #
+            # target_mode="object": terminate at the exact domain object so the
+            # full kill-chain to Domain Compromise renders (e.g.
+            # ...→ AllowedToAct → DC01$ → DCSync → DOMAIN). The default tier0 mode
+            # subsumes the tail at the Tier-0 class node (DC01$), hiding the
+            # DCSync→domain extension. Object is the canonical CLI default
+            # (do_attack_paths, post-pivot, and cross-domain offers all use it);
+            # this post-credential auto-offer must match them.
             offer_attack_paths_with_non_high_value_fallback(
                 self,
                 domain,
@@ -22768,6 +23081,7 @@ class PentestShell:
                 max_depth=ATTACK_PATHS_MAX_DEPTH_USER,
                 max_display=20,
                 target="all",
+                target_mode="object",
                 context_username=username,
                 context_password=password,
             )
@@ -22787,6 +23101,17 @@ class PentestShell:
                     f"[user-privs] Privilege check returned None for {marked_username}"
                 )
                 return
+            # The credential is valid and enumeration is proceeding: mark this
+            # user as privs-assessed THIS SESSION. Centralized here so EVERY entry
+            # point (attack-path loop, `privs`, ADCS, spraying follow-ups) marks it
+            # — the re-enumerate OFFER keys off ACTUAL enumeration, not mere
+            # credential storage (spraying persists creds without enumerating).
+            try:
+                from adscan_internal.cli.creds import mark_user_privs_assessed
+
+                mark_user_privs_assessed(self, domain, username)
+            except Exception:  # noqa: BLE001 — the marker is a best-effort hint
+                pass
             if has_admin_privs:
                 # Check privileged groups and execute corresponding actions
                 privileged_groups = self.check_privileged_groups(
@@ -23241,6 +23566,49 @@ class PentestShell:
         except Exception as e:
             telemetry.capture_exception(e)
             print_error(f"Error enabling user {marked_target}: {e}")
+            return False
+
+    def restore_deleted_object(self, domain, username, password, deleted_dn):
+        """Reanimate a tombstoned object (AD Recycle Bin) via native LDAP.
+
+        The lifecycle transition deleted→live, mirroring :meth:`enable_user`. Used by
+        the ACE-step executor as a restore-first preparatory transform before running
+        a GenericWrite/GenericAll technique against a tombstoned target.
+        """
+        from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.services.exploitation import ExploitationService
+
+        marked_target = mark_sensitive(deleted_dn, "path")
+        try:
+            pdc_ip = self.domains_data[domain]["pdc"]
+            pdc_hostname = self.domains_data[domain].get("pdc_hostname") or pdc_ip
+            pdc_host = (
+                f"{pdc_hostname}.{domain}" if pdc_hostname and "." not in pdc_hostname
+                else pdc_hostname
+            ) or pdc_ip
+            print_info_verbose(
+                f"Restoring deleted object {marked_target} via LDAP on "
+                f"{mark_sensitive(pdc_host, 'ip')}"
+            )
+            service = ExploitationService()
+            success, info = service.acl.restore_deleted_object(
+                pdc_host=pdc_host,
+                username=username,
+                password=password,
+                domain=domain,
+                deleted_dn=deleted_dn,
+                kerberos=True,
+            )
+            if success:
+                print_success(
+                    f"Restored deleted object to {mark_sensitive(str(info), 'path')}"
+                )
+            else:
+                print_error(f"Failed to restore {marked_target}: {info}")
+            return success
+        except Exception as e:
+            telemetry.capture_exception(e)
+            print_error(f"Error restoring {marked_target}: {e}")
             return False
 
     def enable_computer(self, domain, username, password, target_computer):
@@ -23868,6 +24236,7 @@ class PentestShell:
         prompt_for_password_fallback: bool = True,
         prompt_for_user_privs_after: bool = True,
         prompt_for_method_choice: bool = True,
+        allow_force_change_password: bool = True,
     ) -> bool:
         """Wrapper for exploit_generic_all_user operation."""
         from adscan_internal.cli.exploits import run_exploit_generic_all_user
@@ -23882,6 +24251,7 @@ class PentestShell:
             prompt_for_password_fallback=prompt_for_password_fallback,
             prompt_for_user_privs_after=prompt_for_user_privs_after,
             prompt_for_method_choice=prompt_for_method_choice,
+            allow_force_change_password=allow_force_change_password,
         )
 
     def exploit_control_computer_object(
@@ -25291,7 +25661,7 @@ class PentestShell:
         only paths to non-high-value targets (pivot opportunities, lateral movement).
 
         Usage:
-            attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv]
+            attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv] [--keep-longest]
 
         Args:
             domain: Target domain (e.g. `north.sevenkingdoms.local`)
@@ -25308,12 +25678,16 @@ class PentestShell:
             --tier0-only: Restrict paths to Tier-0 targets only
             --all: Include paths whose target is not high value
             --lowpriv: Show only paths to non-high-value targets (pivot/lateral-movement opportunities)
+            --keep-longest: Domain scope only. By default the domain listing shows the
+                most direct route to domain compromise; with this flag it shows the
+                full holistic kill chain instead.
 
         Examples:
             attack_paths north.sevenkingdoms.local
             attack_paths north.sevenkingdoms.local --tier0-only
             attack_paths north.sevenkingdoms.local --all
             attack_paths north.sevenkingdoms.local --lowpriv
+            attack_paths north.sevenkingdoms.local --keep-longest
             attack_paths north.sevenkingdoms.local --max 20 --depth 6
             attack_paths north.sevenkingdoms.local --path-steps 2
             attack_paths north.sevenkingdoms.local jon.snow
@@ -25332,7 +25706,7 @@ class PentestShell:
         if not domain:
             print_instruction(
                 "Usage: attack_paths <domain> [user|owned|user1 user2 ...] [index] [--max N] [--depth N] "
-                "[--path-steps N] [--tier0-only] [--all] [--lowpriv] [--no-cache]"
+                "[--path-steps N] [--tier0-only] [--all] [--lowpriv] [--no-cache] [--keep-longest]"
             )
             return
 
@@ -25345,6 +25719,7 @@ class PentestShell:
         lowpriv = False
         target_mode = "object"
         no_cache = False
+        keep_longest = False
 
         # Parse flags first: --max N, --depth N (and remove them from positional parsing).
         positionals: list[str] = []
@@ -25414,6 +25789,10 @@ class PentestShell:
                 no_cache = True
                 i += 1
                 continue
+            if token in {"--keep-longest", "--keep_longest"}:
+                keep_longest = True
+                i += 1
+                continue
             positionals.append(token)
             i += 1
 
@@ -25457,6 +25836,7 @@ class PentestShell:
             target_mode=target_mode,
             allow_execution=True,
             no_cache=no_cache,
+            keep_longest=keep_longest,
         )
 
     def do_attack_steps(self, args):
@@ -26261,12 +26641,35 @@ class PentestShell:
         # Update the requested field in the in-memory cache
         self.report[domain]["vulnerabilities"][key] = value
 
+        # SSOT gate: only real catalog findings are mirrored as technical
+        # findings. Non-catalog keys (posture/coverage metrics like ``*_count``)
+        # are NOT findings -- recording them under ``findings[]`` polluted the
+        # report and fabricated empty cards in the bonus playbook / web, while
+        # the catalog-gated main PDF silently dropped them. Route those metrics
+        # to ``control_evidence`` instead: a zero-valued metric is positive
+        # "verified clear" coverage; a non-zero metric is neutral observed
+        # coverage. Either way it never becomes a finding.
         try:
+            from adscan_core.reporting.finding_vuln_map import (
+                is_catalog_finding_key,
+            )
             from adscan_core.reporting.technical_report import (
+                record_control_evidence,
                 record_technical_finding,
             )
 
-            record_technical_finding(self, domain, key=key, value=value)
+            if is_catalog_finding_key(key):
+                record_technical_finding(self, domain, key=key, value=value)
+            else:
+                checked_clear = not _is_positive_report_metric(value)
+                record_control_evidence(
+                    self,
+                    domain,
+                    key=key,
+                    category="Coverage",
+                    status="verified_clear" if checked_clear else "observed",
+                    details={"value": value, "checked_clear": checked_clear},
+                )
         except Exception as e:
             if self._handle_optional_report_service_exception(
                 e, action="Technical report sync"
@@ -26384,13 +26787,16 @@ class PentestShell:
         # ── Framework selection ───────────────────────────────────────
         # Parse from args if provided as 3rd arg (e.g. "ens,iso27001,dora").
         # Otherwise prompt interactively with questionary checkbox.
+        # Keep in parity with adscan_internal/cli/deliver.py::_FRAMEWORK_KEY_MAP.
+        # ENS and NIS2 are distinct, independently-selectable frameworks.
         _FRAMEWORK_KEY_MAP = {
-            "ENS Alto + NIS2 — Spain / CCN-CERT (recommended)": "ens",
+            "ENS Alto — Spain / CCN-CERT (recommended)": "ens",
+            "NIS2 — EU Directive (EU) 2022/2555 (critical infrastructure)": "nis2",
             "ISO 27001:2022 — International ISMS standard": "iso27001",
             "DORA — EU 2022/2554 (financial sector)": "dora",
             "PCI DSS v4.0 — Payment Card Industry": "pci_dss",
         }
-        _VALID_FRAMEWORK_KEYS = {"ens", "iso27001", "dora", "pci_dss"}
+        _VALID_FRAMEWORK_KEYS = {"ens", "nis2", "iso27001", "dora", "pci_dss"}
 
         frameworks_arg: list[str] | None = None
         frameworks_index = profile_index + 1
@@ -26403,7 +26809,7 @@ class PentestShell:
             if not frameworks_arg:
                 print_error(
                     f"Invalid frameworks '{args_parts[frameworks_index]}'. "
-                    f"Valid values: ens, iso27001, dora, pci_dss"
+                    f"Valid values: ens, nis2, iso27001, dora, pci_dss"
                 )
                 return None
         else:
@@ -28688,6 +29094,7 @@ class PentestShell:
                 "hashes_count": getattr(self, "_session_hashes_count", 0),
             }
             session_summary.update(build_session_compromise_metadata(self))
+            session_summary.update(build_session_ad_scale_metadata(self))
             telemetry.capture("session_end", session_summary)
 
         _SESSION_CAPTURE_FINALIZED = True
@@ -29888,7 +30295,7 @@ if __name__ == "__main__":
     ci_parser.add_argument(
         "--frameworks",
         default=None,
-        help="Comma-separated compliance frameworks: ens,iso27001,dora,pci_dss (default: ens).",
+        help="Comma-separated compliance frameworks: ens,nis2,iso27001,dora,pci_dss (default: ens).",
     )
     ci_parser.add_argument(
         "--report-engine",

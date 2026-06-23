@@ -97,6 +97,327 @@ _TIER0_COMPROMISE_CLASSES: frozenset[str] = frozenset(
     {"domain_breaker", "tier0_foothold"}
 )
 
+#: Canonical, single-source-of-truth mapping from the engine's per-path
+#: ``compromise_class`` to the three report exposure tiers (the report renderer
+#: AND any exposure logic MUST import this — never re-derive the split):
+#:
+#: * ``domain_breaker``        → ``"T1"`` — Full domain compromise. The path
+#:   proves (or theoretically reaches) total control of the domain. This
+#:   intentionally folds together paths that end at the domain object via
+#:   DCSync AND paths that end at DOMAIN ADMINS but stopped at the depth cap:
+#:   both ARE full domain compromise; the ``domain_compromise_tier`` 3-vs-4
+#:   difference there is a depth-cap artifact, not a risk difference.
+#: * ``tier0_foothold``        → ``"T2"`` — Tier-0 host foothold. Access to a
+#:   Tier-0 HOST (e.g. CanRDP to a DC) where post-exploitation is still
+#:   required; takeover is NOT yet proven.
+#: * ``privileged_escalator``  → ``"T3"`` — Privilege-escalation enabler.
+#:   Reaches a privileged asset (e.g. an issuance-policy group via ESC13, or a
+#:   server via LSA dump) but does not constitute domain takeover on its own.
+#:
+#: Any other / unknown class maps to ``None`` and is NOT counted in these three
+#: tiers (it is neither domain compromise nor a tracked enabler tier here).
+_COMPROMISE_CLASS_TO_REPORT_TIER: dict[str, str] = {
+    "domain_breaker": "T1",
+    "tier0_foothold": "T2",
+    "privileged_escalator": "T3",
+}
+
+#: Legacy fallback ONLY — for records that predate ``compromise_class`` stamping
+#: and carry just an ``outcome_class``. Mirrors the fallback already used by
+#: :func:`_is_tier0_target`. Current engine records always carry
+#: ``compromise_class``, so this is never consulted for live scans; it keeps the
+#: predicate correct for legacy/synthetic records (and report fixtures).
+_OUTCOME_CLASS_TO_REPORT_TIER: dict[str, str] = {
+    "direct_domain_control": "T1",
+    "direct_compromise": "T1",
+    "tier0_foothold": "T2",
+    "domain_compromise_enabler": "T3",
+    "followup_terminal": "T3",
+    "high_impact_privilege": "T3",
+}
+
+
+def report_tier_for_class(compromise_class: str | None) -> str | None:
+    """Map a path ``compromise_class`` to its report tier (``T1``/``T2``/``T3``).
+
+    This is the single source of truth for the report's 3-tier exposure
+    breakdown. Returns ``None`` for any class outside the three tracked tiers
+    (e.g. ``compromise_enabler``, ``unauthenticated_principal``, ``""``), so
+    callers can count only the three canonical tiers.
+
+    Args:
+        compromise_class: The engine's per-path ``compromise_class`` value.
+
+    Returns:
+        ``"T1"`` (full domain compromise), ``"T2"`` (Tier-0 host foothold),
+        ``"T3"`` (privilege-escalation enabler), or ``None`` if not tracked.
+    """
+    return _COMPROMISE_CLASS_TO_REPORT_TIER.get(
+        (compromise_class or "").strip().lower()
+    )
+
+
+def report_tier_for_record(record: Mapping[str, Any]) -> str | None:
+    """Resolve the report tier for a single attack-path record.
+
+    Prefers the canonical ``compromise_class``; falls back to ``outcome_class``
+    only when the class is absent (legacy/synthetic records). This is the
+    record-level single source of truth used by the report renderer and
+    :func:`count_report_tiers`.
+
+    Args:
+        record: An attack-path record mapping.
+
+    Returns:
+        ``"T1"`` / ``"T2"`` / ``"T3"`` or ``None`` when untracked.
+    """
+    tier = report_tier_for_class(record.get("compromise_class"))
+    if tier is not None:
+        return tier
+    return _OUTCOME_CLASS_TO_REPORT_TIER.get(
+        str(record.get("outcome_class") or "").strip().lower()
+    )
+
+
+def count_report_tiers(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Tally attack-path records into the three canonical report tiers.
+
+    Reads each record's ``compromise_class`` and routes it through
+    :func:`report_tier_for_class`. Records whose class is outside the three
+    tracked tiers are ignored (not counted in any bucket).
+
+    Args:
+        records: Attack-path records, each a mapping carrying
+            ``compromise_class`` (as produced by ``get_attack_path_summaries``
+            and threaded onto the report path dicts).
+
+    Returns:
+        ``{"T1": <full domain compromise>, "T2": <Tier-0 footholds>,
+        "T3": <privilege-escalation enablers>}``.
+    """
+    counts = {"T1": 0, "T2": 0, "T3": 0}
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        tier = report_tier_for_record(record)
+        if tier is not None:
+            counts[tier] += 1
+    return counts
+
+
+# --------------------------------------------------------------------------- #
+# Exposure KPIs - path-axis + user-axis (blast-radius) aggregation
+# --------------------------------------------------------------------------- #
+
+#: Compromise classes the KPI engine tracks, in the canonical report order. Any
+#: path whose class is outside this set contributes to NO axis (it is neither a
+#: tracked terminal nor an enabler tier here).
+_KPI_COMPROMISE_CLASSES: tuple[str, ...] = (
+    "domain_breaker",
+    "tier0_foothold",
+    "privileged_escalator",
+    "compromise_enabler",
+)
+
+#: ``affected_users_source`` markers that mean the user set is a BROAD-GROUP
+#: all-users expansion (Domain Users / Authenticated Users / Everyone -> every
+#: domain user), as emitted by ``_classify_broad_group_scope`` /
+#: ``fallback_domain_users_source`` in ``attack_graph_service``. When any
+#: contributing path carries one of these, the (class, status) user count is the
+#: WHOLE domain (``all_users=True``, ``pct_of_domain`` saturates at 100).
+_BROAD_GROUP_USER_SOURCES: frozenset[str] = frozenset(
+    {"enabled_users", "users", "snapshot"}
+)
+
+#: Canonical reconciliation of any sidecar ``path_state`` value (which may use
+#: the legacy ``execution_failed`` token) onto the canonical :class:`PathState`
+#: vocabulary used as KPI status keys.
+_SIDECAR_STATE_TO_PATH_STATE: dict[str, str] = {
+    "execution_failed": PathState.POST_EX_FAILED.value,
+}
+
+
+def _normalize_user(value: Any) -> str:
+    """Return a case-folded user key for cross-path union dedupe (``""`` skipped)."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _record_affected_users(record: Mapping[str, Any]) -> tuple[set[str], bool]:
+    """Return ``(normalized_user_set, is_broad_group_all_users)`` for a record.
+
+    Reads ``meta.affected_users`` (the resolved per-path principal set, already
+    broad-group-expanded by ``attack_graph_service``) and inspects
+    ``meta.affected_users_source`` to decide whether the set represents an
+    all-domain-users blast radius.
+    """
+    meta = record.get("meta")
+    if not isinstance(meta, Mapping):
+        return set(), False
+    users = {
+        norm
+        for raw in (meta.get("affected_users") or [])
+        if (norm := _normalize_user(raw))
+    }
+    source = str(meta.get("affected_users_source") or "").strip().lower()
+    return users, source in _BROAD_GROUP_USER_SOURCES
+
+
+def _reconcile_status(record: Mapping[str, Any], has_execution: bool) -> str:
+    """Return the single canonical status for a path.
+
+    PathState from a post-exploitation execution wins over the display
+    ``status`` whenever a real execution row exists for the path; otherwise the
+    LDAP-derived display ``status`` stands. Sidecar ``execution_failed`` is
+    folded onto the canonical ``post_ex_failed`` token.
+    """
+    if has_execution:
+        state = str(record.get("path_state") or "").strip().lower()
+        state = _SIDECAR_STATE_TO_PATH_STATE.get(state, state)
+        if state:
+            return state
+    return str(record.get("status") or "theoretical").strip().lower()
+
+
+def compute_exposure_kpis(
+    summaries: Sequence[Mapping[str, Any]],
+    *,
+    domain_user_count: int | None,
+    executions: Sequence[Mapping[str, Any]] | None = None,
+    computed_at: str | None = None,
+) -> dict[str, Any]:
+    """Compute the exposure KPI block (path-axis + user-axis blast radius).
+
+    Single source of truth feeding BOTH the PDF report and (phase 3) the web
+    dashboard. It is a pure aggregation over already-computed attack-path
+    summaries - it never recomputes paths. The user-axis is the blast-radius
+    spine: per ``(compromise_class, status)`` it reports how many DISTINCT
+    domain users can reach that terminal, deduped across every contributing
+    path (a user reachable by two paths counts once).
+
+    Args:
+        summaries: Attack-path summary records (as produced by
+            ``get_attack_path_summaries``), each carrying ``compromise_class``,
+            ``status``, ``length`` and ``meta.affected_users[]`` /
+            ``meta.affected_users_source``.
+        domain_user_count: Total enabled domain users (for ``pct_of_domain``).
+            ``None`` or ``<=0`` disables the percentage (reported as ``0.0``).
+        executions: Optional raw path-execution sidecar rows. When supplied, a
+            path's reconciled status is its executed :class:`PathState` (via the
+            canonical :func:`enrich_paths_with_executions` merge) instead of the
+            display ``status``.
+        computed_at: Provenance timestamp (ISO-8601). Pure / deterministic - the
+            caller passes it; this function NEVER calls ``datetime.now``.
+
+    Returns:
+        The ``exposure_kpis`` dict persisted verbatim under
+        ``domains[<domain>]["exposure_kpis"]`` (schema_version 1).
+    """
+    user_total = (
+        int(domain_user_count)
+        if isinstance(domain_user_count, int) and domain_user_count > 0
+        else 0
+    )
+
+    # Reconcile a single status per path. When executions are supplied, fold the
+    # executed PathState in via the canonical SSOT merge so the status reflects
+    # reality (foothold_obtained / domain_compromised / post_ex_failed) rather
+    # than the LDAP-derived display status.
+    records: list[Mapping[str, Any]] = [r for r in summaries if isinstance(r, Mapping)]
+    has_exec_by_index: list[bool] = [False] * len(records)
+    if executions:
+        try:
+            from adscan_internal.services.post_exploitation.path_promotion import (  # noqa: PLC0415
+                enrich_paths_with_executions,
+            )
+
+            merged = enrich_paths_with_executions(
+                [dict(r) for r in records], list(executions)
+            )
+            # `enrich_paths_with_executions` sets the "executions" key ONLY when a
+            # real run touched the path; that is our "has_execution" signal.
+            records = merged
+            has_exec_by_index = [bool(r.get("executions")) for r in merged]
+        except Exception:  # noqa: BLE001 - pure aggregator never breaks the report
+            records = [r for r in summaries if isinstance(r, Mapping)]
+            has_exec_by_index = [False] * len(records)
+
+    # path_axis[class][status] = count ; path_axis[class]["total"] = all in class.
+    path_axis: dict[str, dict[str, int]] = {cls: {} for cls in _KPI_COMPROMISE_CLASSES}
+    # user_axis accumulators: per (class, status) -> (user_set, all_users_flag);
+    # per class -> (any_user_set, any_all_users_flag, distinct_path_count).
+    per_status_users: dict[str, dict[str, set[str]]] = {
+        cls: {} for cls in _KPI_COMPROMISE_CLASSES
+    }
+    per_status_all_users: dict[str, dict[str, bool]] = {
+        cls: {} for cls in _KPI_COMPROMISE_CLASSES
+    }
+    any_users: dict[str, set[str]] = {cls: set() for cls in _KPI_COMPROMISE_CLASSES}
+    any_all_users: dict[str, bool] = {cls: False for cls in _KPI_COMPROMISE_CLASSES}
+    distinct_paths: dict[str, int] = {cls: 0 for cls in _KPI_COMPROMISE_CLASSES}
+
+    for index, record in enumerate(records):
+        cls = str(record.get("compromise_class") or "").strip().lower()
+        if cls not in path_axis:
+            continue
+        status = _reconcile_status(record, has_exec_by_index[index])
+
+        path_axis[cls][status] = path_axis[cls].get(status, 0) + 1
+        path_axis[cls]["total"] = path_axis[cls].get("total", 0) + 1
+        distinct_paths[cls] += 1
+
+        users, is_broad = _record_affected_users(record)
+        per_status_users[cls].setdefault(status, set()).update(users)
+        per_status_all_users[cls][status] = (
+            per_status_all_users[cls].get(status, False) or is_broad
+        )
+        any_users[cls].update(users)
+        any_all_users[cls] = any_all_users[cls] or is_broad
+
+    def _pct(count: int, all_users: bool) -> float:
+        if all_users:
+            return 100.0
+        if user_total <= 0:
+            return 0.0
+        return min(100.0, round(count / user_total * 100.0, 1))
+
+    def _count(users: set[str], all_users: bool) -> int:
+        # A broad-group path means the whole domain is in scope; the union of
+        # explicit users is a lower bound, so saturate to the domain size.
+        if all_users and user_total > 0:
+            return user_total
+        return len(users)
+
+    user_axis: dict[str, dict[str, Any]] = {}
+    for cls in _KPI_COMPROMISE_CLASSES:
+        per_status: dict[str, Any] = {}
+        for status, users in per_status_users[cls].items():
+            all_flag = per_status_all_users[cls].get(status, False)
+            per_status[status] = {
+                "count": _count(users, all_flag),
+                "all_users": all_flag,
+            }
+        any_count = _count(any_users[cls], any_all_users[cls])
+        per_status["any"] = {
+            "count": any_count,
+            "all_users": any_all_users[cls],
+            "pct_of_domain": _pct(any_count, any_all_users[cls]),
+        }
+        per_status["distinct_paths"] = distinct_paths[cls]
+        user_axis[cls] = per_status
+
+    return {
+        "schema_version": 1,
+        "computed_at": computed_at or "",
+        "domain_user_count": user_total,
+        "path_axis": path_axis,
+        "user_axis": user_axis,
+    }
+
+
 #: How many top contributing paths to surface for explainability.
 _TOP_CONTRIBUTORS: int = 8
 
@@ -406,5 +727,6 @@ __all__ = [
     "ExposureScore",
     "ExposureContributor",
     "compute_exposure_score",
+    "compute_exposure_kpis",
     "EASE_ALPHA",
 ]

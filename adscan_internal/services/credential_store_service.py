@@ -833,6 +833,205 @@ def hosts_match(a: str, b: str) -> bool:
     return bool(keys_a and keys_b and (keys_a & keys_b))
 
 
+# ---------------------------------------------------------------------------
+# Logon-capability negative cache — "principal X cannot <logon_type> on host Y".
+#
+# Some principals hold a privilege (e.g. a Domain Admin has replication rights)
+# yet the TARGET denies them the LOGON TYPE needed to use it — the DC returns
+# STATUS_LOGON_TYPE_NOT_GRANTED at SMB session_setup (a SeDenyNetworkLogonRight /
+# "Deny access to this computer from the network" hardening). This is NOT
+# readable from a simple LDAP attribute (it lives in User Rights Assignment —
+# local policy or GPO/SYSVOL), so the ground truth is the logon attempt itself.
+#
+# When an ST flow (RBCD/AllowedToAct, KCD/SPNJack, silver) or a consuming step
+# (DCSync, DumpLSA) observes a logon-type denial for an impersonated principal,
+# it records it here so that principal is never re-selected for an ST against
+# that host in ANY flow — mirrors how Protected Users are excluded, but learned
+# reactively from ground truth. Alias-aware on the host (IP <-> short <-> FQDN
+# <-> HOST$). Persisted JSON-safe in ``domains_data[domain]["logon_denied"]``.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_LOGON_TYPE = "network"
+
+
+def _logon_principal_key(value: str) -> str:
+    """Normalize a principal to a bare, lowercased account name for matching.
+
+    Strips ``DOMAIN\\`` prefix and ``@realm`` suffix; PRESERVES a trailing ``$``
+    (it distinguishes a machine account like ``dc01$`` from a user).
+    """
+    v = str(value or "").strip().lower()
+    if "\\" in v:
+        v = v.rsplit("\\", 1)[-1]
+    if "@" in v:
+        v = v.split("@", 1)[0]
+    return v.strip()
+
+
+def is_logon_denied(
+    domains_data: dict,
+    domain: str,
+    *,
+    principal: str,
+    host: str,
+    logon_type: str = _DEFAULT_LOGON_TYPE,
+) -> bool:
+    """Return True when ``principal`` is known-denied ``logon_type`` on ``host``.
+
+    Alias-aware on the host; principal matched on its bare account name.
+    """
+    bucket = (domains_data.get(domain) or {}).get("logon_denied") or []
+    if not isinstance(bucket, list):
+        return False
+    want_p = _logon_principal_key(principal)
+    if not want_p or not str(host or "").strip():
+        return False
+    for rec in bucket:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("logon_type") or _DEFAULT_LOGON_TYPE) != logon_type:
+            continue
+        if _logon_principal_key(rec.get("principal") or "") != want_p:
+            continue
+        if hosts_match(str(rec.get("host") or ""), host):
+            return True
+    return False
+
+
+def logon_denied_principals_for_host(
+    domains_data: dict,
+    domain: str,
+    *,
+    host: str,
+    logon_type: str = _DEFAULT_LOGON_TYPE,
+) -> set[str]:
+    """Return the bare account keys known-denied ``logon_type`` on ``host``.
+
+    Alias-aware on the host. Lets a selector exclude every principal that the
+    target has already refused (ground truth from a prior probe), so a re-run
+    never re-offers a dead principal for an ST flow against that host.
+    """
+    denied: set[str] = set()
+    bucket = (domains_data.get(domain) or {}).get("logon_denied") or []
+    if not isinstance(bucket, list) or not str(host or "").strip():
+        return denied
+    for rec in bucket:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("logon_type") or _DEFAULT_LOGON_TYPE) != logon_type:
+            continue
+        key = _logon_principal_key(rec.get("principal") or "")
+        if key and hosts_match(str(rec.get("host") or ""), host):
+            denied.add(key)
+    return denied
+
+
+def filter_logon_capable_principals(
+    domains_data: dict,
+    domain: str,
+    *,
+    host: str,
+    candidates: list[str],
+    logon_type: str = _DEFAULT_LOGON_TYPE,
+) -> list[str]:
+    """Drop principals known-denied ``logon_type`` on ``host`` (order preserved).
+
+    Use at a principal-selection seam for a NETWORK-authenticating step (SMB /
+    WinRM / RDP) that has a clear fallback and can afford to drop dead principals
+    entirely. Alias-aware on host and principal. Returns a NEW list. Do NOT use
+    for TGT/AS-REQ or scoped-ticket flows — the denial is network-logon-specific.
+    """
+    denied = logon_denied_principals_for_host(
+        domains_data, domain, host=host, logon_type=logon_type
+    )
+    if not denied:
+        return list(candidates)
+    return [c for c in candidates if _logon_principal_key(c) not in denied]
+
+
+def order_logon_capable_first(
+    domains_data: dict,
+    domain: str,
+    *,
+    host: str,
+    candidates: list[str],
+    logon_type: str = _DEFAULT_LOGON_TYPE,
+) -> list[str]:
+    """Reorder so known-denied principals sink to the end (kept as last resort).
+
+    The safe primitive for auto-pick steps that must NEVER end with zero
+    candidates: a principal the host has already refused a network logon is
+    deprioritized (so a logon-capable one is tried first) but retained at the
+    tail, so the step still has something to try if every candidate is denied.
+    Order is otherwise preserved; relative order within each bucket is stable.
+    Alias-aware. Network-logon steps only — never gate TGT/AS-REQ/scoped-ticket.
+    """
+    denied = logon_denied_principals_for_host(
+        domains_data, domain, host=host, logon_type=logon_type
+    )
+    if not denied:
+        return list(candidates)
+    capable = [c for c in candidates if _logon_principal_key(c) not in denied]
+    blocked = [c for c in candidates if _logon_principal_key(c) in denied]
+    return capable + blocked
+
+
+def mark_logon_denied(
+    domains_data: dict,
+    domain: str,
+    *,
+    principal: str,
+    host: str,
+    logon_type: str = _DEFAULT_LOGON_TYPE,
+    reason: str | None = None,
+) -> bool:
+    """Record that ``principal`` is denied ``logon_type`` on ``host`` (ground truth).
+
+    Idempotent (alias-aware dedup). Returns True when a new record was added.
+    No-op for blank principal/host. The record is JSON-safe for persistence.
+    """
+    if not _logon_principal_key(principal) or not str(host or "").strip():
+        return False
+    if is_logon_denied(
+        domains_data, domain, principal=principal, host=host, logon_type=logon_type
+    ):
+        return False
+    domain_entry = domains_data.setdefault(domain, {})
+    if not isinstance(domain_entry, dict):
+        return False
+    bucket = domain_entry.setdefault("logon_denied", [])
+    if not isinstance(bucket, list):
+        bucket = []
+        domain_entry["logon_denied"] = bucket
+    bucket.append(
+        {
+            "principal": _logon_principal_key(principal),
+            "host": str(host).strip(),
+            "logon_type": logon_type,
+            "reason": str(reason) if reason else None,
+        }
+    )
+    return True
+
+
+def status_is_logon_type_denied(status_text: str) -> bool:
+    """Classify an auth-failure string as a LOGON-TYPE denial (worth caching).
+
+    Distinguishes a deterministic logon-rights refusal (the principal will keep
+    being refused → cache it) from a transient/connectivity error (do NOT cache).
+    """
+    s = str(status_text or "").lower()
+    return any(
+        marker in s
+        for marker in (
+            "logon_type_not_granted",
+            "logon type not granted",
+            "0xc000015b",
+            "1385",  # ERROR_LOGON_TYPE_NOT_GRANTED (Win32)
+        )
+    )
+
+
 def resolve_scoped_ticket_for_host(
     shell: Any,
     *,
@@ -1185,6 +1384,12 @@ __all__ = [
     "RELATION_TO_KERBEROS_SERVICE",
     "host_match_keys",
     "hosts_match",
+    "filter_logon_capable_principals",
+    "is_logon_denied",
+    "logon_denied_principals_for_host",
+    "mark_logon_denied",
+    "order_logon_capable_first",
+    "status_is_logon_type_denied",
     "mark_capability_bearing_ccache",
     "get_capability_bearing_ccache",
 ]

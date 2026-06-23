@@ -27,6 +27,39 @@ from typing import Any, Mapping
 from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
 
 
+def is_catalog_finding_key(
+    key: Any,
+    *,
+    catalog_meta: Mapping[str, dict[str, Any]] = VULN_CATALOG_META,
+) -> bool:
+    """Return whether *key* names a real vulnerability finding.
+
+    The single gate every report surface shares. A key is a genuine finding
+    only when it exists in the finding catalog (``VULN_CATALOG_META``, kept
+    drift-locked to the PRO ``VULN_CATALOG``). Anything else -- posture/coverage
+    metrics like ``*_count``, ad-hoc keys recorded directly into
+    ``technical_report.json`` with no catalog entry -- is NOT a finding and must
+    not reach any finding-rendering surface.
+
+    Centralising the gate here is what keeps the three consumers (main PDF
+    builder via :func:`build_vuln_map_from_findings`, the bonus playbook
+    databinding, and the ``adscan_web`` ingestion) from diverging: a non-catalog
+    key can no longer render as an empty card in one surface while the main PDF
+    silently drops it.
+
+    Args:
+        key: Candidate finding key (any type; non-strings are rejected).
+        catalog_meta: The finding-key catalog to gate against. Defaults to the
+            LITE-safe :data:`VULN_CATALOG_META`.
+
+    Returns:
+        ``True`` iff ``key`` is a non-empty string present in ``catalog_meta``.
+    """
+    if not isinstance(key, str):
+        return False
+    return key.strip() in catalog_meta
+
+
 def build_vuln_map_from_findings(
     findings: list[dict[str, Any]] | None,
     *,
@@ -67,7 +100,7 @@ def build_vuln_map_from_findings(
         key = str(finding.get("key") or "").strip()
         if not key:
             continue
-        if key not in catalog_meta:
+        if not is_catalog_finding_key(key, catalog_meta=catalog_meta):
             # Skip non-vulnerability findings (keeps the report focused).
             continue
         details = finding.get("details")
@@ -83,4 +116,4 @@ def build_vuln_map_from_findings(
     return vuln_map
 
 
-__all__ = ("build_vuln_map_from_findings",)
+__all__ = ("build_vuln_map_from_findings", "is_catalog_finding_key")

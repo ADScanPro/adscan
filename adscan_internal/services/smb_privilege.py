@@ -21,6 +21,7 @@ Admin detection method:
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Optional, Sequence
@@ -262,19 +263,80 @@ async def check_smb_privilege_batch(
     configs: Sequence[SMBPrivilegeConfig],
     *,
     max_concurrency: int = 10,
+    per_host_budget: float | None = None,
 ) -> list[SMBPrivilegeResult]:
     """Run multiple SMB privilege checks concurrently with bounded parallelism.
 
     Returns results in the same order as configs.
     max_concurrency controls simultaneous SMB connections (default 10).
+
+    ``per_host_budget`` is a wall-clock bound (seconds) on the WHOLE per-host
+    probe — connect + Kerberos pre-mint + the ADMIN$/C$ tree_connects — NOT just
+    the aiosmb connection timeout. A host that TCP-accepts 445 but then hangs the
+    SMB negotiate or Kerberos (a host stale-dead since the port scan, or a kerbad
+    AP_REP parse error) is recorded UNREACHABLE instead of blocking the gather
+    indefinitely (the >10min stall this fixes). ``None`` derives it per-config
+    from the connection timeout.
     """
     semaphore = asyncio.Semaphore(max_concurrency)
+    # Per-host probe timings (host, elapsed_s, status) — debug-only diagnostics so
+    # we can see WHICH host makes the sweep feel "stuck at the end" (the gather
+    # waits for the slowest probe). Zero cost in non-debug runs (print_info_debug
+    # is a no-op). The collector has the same per-phase timing discipline.
+    timings: list[tuple[str, float, str]] = []
+    #: A probe slower than this is called out individually at debug level.
+    slow_host_threshold_s = 8.0
 
     async def _bounded(cfg: SMBPrivilegeConfig) -> SMBPrivilegeResult:
+        budget = (
+            per_host_budget
+            if per_host_budget is not None
+            else max(float(cfg.timeout) * 3.0, 45.0)
+        )
         async with semaphore:
-            return await check_smb_privilege(cfg)
+            started = time.monotonic()
+            try:
+                result = await asyncio.wait_for(
+                    check_smb_privilege(cfg), timeout=budget
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                result = SMBPrivilegeResult(
+                    target_ip=cfg.target_ip,
+                    target_hostname=cfg.target_hostname,
+                    username=cfg.username,
+                    domain=cfg.domain,
+                    status=SMBPrivilegeStatus.UNREACHABLE,
+                    error=(
+                        f"per-host budget exceeded ({budget:.0f}s) — host accepted "
+                        "TCP but hung the SMB negotiate / Kerberos"
+                    ),
+                )
+            elapsed = time.monotonic() - started
+        host_label = cfg.target_hostname or cfg.target_ip
+        timings.append((host_label, elapsed, result.status.value))
+        if elapsed >= slow_host_threshold_s:
+            print_info_debug(
+                f"[smb_privilege] slow host {host_label}: {elapsed:.1f}s "
+                f"(status={result.status.value}) — this is what holds up the sweep"
+            )
+        return result
 
-    return list(await asyncio.gather(*(_bounded(c) for c in configs)))
+    sweep_started = time.monotonic()
+    results = list(await asyncio.gather(*(_bounded(c) for c in configs)))
+    sweep_elapsed = time.monotonic() - sweep_started
+
+    if timings:
+        slowest = sorted(timings, key=lambda item: item[1], reverse=True)[:3]
+        slow_summary = ", ".join(
+            f"{host}={elapsed:.1f}s({status})" for host, elapsed, status in slowest
+        )
+        print_info_debug(
+            f"[smb_privilege] batch timing: {len(timings)} hosts in "
+            f"{sweep_elapsed:.1f}s wall (concurrency={max_concurrency}); "
+            f"slowest: {slow_summary}"
+        )
+
+    return results
 
 
 # ---------------------------------------------------------------------------

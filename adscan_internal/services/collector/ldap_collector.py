@@ -679,6 +679,15 @@ def _entry_to_node(entry: Any, domain: str) -> CollectorNode | None:
                 "allowedtodelegate": _str_values(attrs, "msDS-AllowedToDelegateTo"),
                 "hasspn": _has_spn(spns),
                 "pwdlastset": pwdlastset,
+                # lastLogonTimestamp is the RELIABLE staleness/activity signal for
+                # a computer — independent of password rotation. pwdLastSet is NOT
+                # a valid staleness proxy: legacy / pre-Win2000-compat / manual-
+                # password machines (the Timeroast targets) keep an old pwdLastSet
+                # while still actively logging on, so they would false-positive.
+                # The User builder already maps this; the Computer builder omitted
+                # it (computers came back 0/86 → stale-computer detection blind).
+                "lastlogon": _int_attr(attrs, "lastLogonTimestamp")
+                or _int_attr(attrs, "lastLogon"),
                 "whencreated": _first_str(attrs, "whenCreated") or None,
                 "unconstraineddelegation": bool(
                     uac and (uac & _UAC_TRUSTED_FOR_DELEGATION)
@@ -763,6 +772,56 @@ def _entry_to_node(entry: Any, domain: str) -> CollectorNode | None:
         )
 
     return None
+
+
+def _deleted_entry_to_node(entry: Any, domain: str) -> CollectorNode | None:
+    """Build a User node for a tombstoned (deleted) account.
+
+    The object's SID is preserved across deletion (AD Recycle Bin), so this node
+    keys on the SAME object_id it will have once restored — its ACL edges (parsed
+    from the tombstone's nTSecurityDescriptor) therefore land on the right
+    principal. The node carries ``tombstoned``/``deleted_dn``/``restore_dn`` so the
+    execution layer reanimates it before running the technique the right allows.
+    """
+    attrs = _attrs(entry)
+    raw_sid = _first(attrs, "objectSid")
+    sid = _decode_sid(raw_sid).upper() if raw_sid else ""
+    if not sid:
+        return None
+
+    deleted_dn = _first_str(attrs, "distinguishedName")
+    sam = _first_str(attrs, "sAMAccountName")
+    last_known_rdn = _first_str(attrs, "msDS-LastKnownRDN")
+    last_known_parent = _first_str(attrs, "lastKnownParent")
+    uac = _int_attr(attrs, "userAccountControl")
+    display = sam or last_known_rdn or "DELETED"
+    name = f"{display.upper()}@{domain.upper()}"
+    restore_dn = (
+        f"CN={last_known_rdn},{last_known_parent}"
+        if last_known_rdn and last_known_parent
+        else ""
+    )
+
+    props = _account_common_properties(attrs, include_user_flags=True, uac=uac)
+    props["primarygroupid"] = _int_attr(attrs, "primaryGroupID")
+    props["tombstoned"] = True
+    props["deleted_dn"] = deleted_dn
+    if restore_dn:
+        props["restore_dn"] = restore_dn
+    if last_known_rdn:
+        props["last_known_rdn"] = last_known_rdn
+
+    return CollectorNode(
+        object_id=sid,
+        kind="User",
+        name=name,
+        domain=domain,
+        samaccountname=sam,
+        distinguished_name=deleted_dn,
+        enabled=_uac_enabled(uac),
+        highvalue=_is_tier_zero_user_sid(sid),
+        properties=props,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +966,14 @@ class ADscanLDAPCollector:
                     self._collect_psos(conn, config, result)
                 if scope.collects_objects:
                     self._collect_objects(conn, config, result, acl_parser)
+                    # Tombstoned (AD Recycle Bin) accounts: a deleted object with a
+                    # writable ACE is a restore→foothold path neither this collector
+                    # (it filters live objects) nor BloodHound surfaces. Reuses the
+                    # SAME ACL parsing so a writable tombstone yields its real
+                    # GenericWrite/GenericAll edge, with the node flagged tombstoned —
+                    # the execution layer then restores it first (mirrors enable-first).
+                    if scope.acls:
+                        self._collect_deleted_objects(conn, config, result, acl_parser)
                 if scope.group_memberships:
                     self._collect_group_memberships(conn, config, result)
                 if scope.gpo_links:
@@ -1401,6 +1468,61 @@ class ADscanLDAPCollector:
             except Exception as exc:
                 telemetry.capture_exception(exc)
                 print_info_debug(f"[ldap-collector] entry processing failed: {exc}")
+
+    def _collect_deleted_objects(
+        self,
+        conn: ADscanLDAPConnection,
+        config: ADscanLDAPConfig,
+        result: CollectionResult,
+        acl_parser: ACLParser,
+    ) -> None:
+        """Enumerate tombstoned accounts in CN=Deleted Objects (AD Recycle Bin).
+
+        Searches with the Show Deleted Objects control so the DC returns deleted
+        objects (a normal search never does), reusing the SAME ACL parsing as live
+        objects: a writable ACE over a tombstone yields its real GenericWrite/
+        GenericAll edge, with the target node flagged ``tombstoned`` so execution
+        reanimates it first. Best-effort: never aborts the sweep.
+        """
+        from adscan_internal.services.ldap_transport_service import (
+            build_show_deleted_controls,
+        )
+
+        try:
+            conn.search(
+                search_base=f"CN=Deleted Objects,{config.domain_dn}",
+                search_filter="(&(isDeleted=TRUE)(objectClass=user))",
+                attributes=[*_COLLECT_ATTRS, "msDS-LastKnownRDN", "lastKnownParent"],
+                search_scope="SUBTREE",
+                controls=build_show_deleted_controls(with_sd_flags=True),
+            )
+        except Exception as exc:  # noqa: BLE001 - never abort the sweep
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"[ldap-collector] _collect_deleted_objects search failed: {exc}"
+            )
+            return
+
+        domain_sid_prefix = self._domain_sid_prefix(result)
+        for entry in conn.entries:
+            try:
+                node = _deleted_entry_to_node(entry, config.domain)
+                if not node:
+                    continue
+                result.add_node(node)
+                sd_bytes = _raw_bytes(entry, "nTSecurityDescriptor")
+                if not sd_bytes:
+                    continue
+                for edge in acl_parser.parse_sd(sd_bytes, node.object_id, node.kind):
+                    result.add_edge(edge)
+                    trustee_sid = edge.source_object_id.upper()
+                    if not self._sid_in_domain(trustee_sid, domain_sid_prefix):
+                        result.add_fsp_placeholder(trustee_sid, "unknown")
+            except Exception as exc:  # noqa: BLE001 - one bad tombstone is non-fatal
+                telemetry.capture_exception(exc)
+                print_info_debug(
+                    f"[ldap-collector] deleted-entry processing failed: {exc}"
+                )
 
     def _collect_group_memberships(
         self,

@@ -565,7 +565,8 @@ def _prompt_scope_selection(
 
     Domains with Phase 1 already completed are shown with a re-run label so the
     operator understands only the attack graph is rebuilt, not the full BH collection.
-    In non-interactive environments the full list is returned unchanged.
+    In non-interactive environments only the source (origin) domain is returned —
+    trusted domains are not auto-enumerated unless the operator opts in.
 
     Args:
         candidates: All reachable domains to offer (including source).
@@ -575,6 +576,13 @@ def _prompt_scope_selection(
     Returns:
         Subset of candidates selected by the user, preserving original order.
     """
+    # A single candidate is no choice — auto-select it and never prompt. Mirrors the
+    # remote bridge's `len(candidates) <= 1` short-circuit, and also covers the
+    # interactive-local path so a one-item checkbox never appears for a single-domain
+    # environment (the common client case).
+    if len(candidates) <= 1:
+        return candidates
+
     done = phase1_complete_domains or set()
     new_domains = [d for d in candidates if d not in done]
     rerun_domains = [d for d in candidates if d in done]
@@ -586,7 +594,11 @@ def _prompt_scope_selection(
 
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
     if _is_non_interactive():
-        return candidates
+        # Default scope = the origin domain only. Trusted domains are NOT auto-
+        # enumerated unless the operator explicitly opts in (a client often does not
+        # authorize enumerating trusted domains). The platform surfaces an interactive
+        # trust-scope selection for opt-in; headless ci stays origin-only.
+        return [source_domain] if source_domain in candidates else candidates[:1]
 
     try:
         from adscan_core import prompting
@@ -636,17 +648,187 @@ def _prompt_scope_selection(
         selected = prompting.questionary_checkbox_values_raw(
             title="Select domains to include in scope:",
             options=options,
-            default_values=options,
+            default_values=[source_domain] if source_domain in options else options[:1],
             labels_by_value=labels_by_value,
         )
 
         if selected is None:
-            # Ctrl-C / cancelled — fall back to full list to avoid silent data loss
-            return candidates
+            # Ctrl-C / cancelled — fall back to the origin domain only (the safe
+            # default: never silently enumerate trusted domains on a cancel).
+            return [source_domain] if source_domain in candidates else candidates[:1]
 
         return [d for d in candidates if d in set(selected)]
     except Exception:
-        return candidates
+        return [source_domain] if source_domain in candidates else candidates[:1]
+
+
+def _build_trust_scope_context(
+    shell: DomainShell,
+    *,
+    candidates: list[str],
+    source_domain: str,
+    phase1_complete_domains: set[str],
+    trusts: list[Any],
+    domain_pdc_mapping: dict[str, str],
+) -> dict[str, Any]:
+    """Build the trust-topology decision payload for the remote picker.
+
+    Shapes the in-memory trust enumeration result + ``shell.domains_data`` into
+    the ``context`` the web platform renders: the origin domain, a trust matrix
+    (source/partner/direction/type edges) and a per-domain node list with PDC,
+    reachability and trust count. Everything here is read-only metadata; the
+    actual scope decision is the operator's multiselect answer.
+    """
+    source_lower = source_domain.strip().lower()
+
+    def _pdc_for(domain_name: str) -> str:
+        candidate_data = (
+            shell.domains_data.get(domain_name, {})
+            if isinstance(getattr(shell, "domains_data", {}), dict)
+            else {}
+        )
+        if not isinstance(candidate_data, dict):
+            candidate_data = {}
+        summary_pdc = ""
+        connectivity = candidate_data.get("connectivity")
+        if isinstance(connectivity, dict):
+            summary = connectivity.get("summary")
+            if isinstance(summary, dict):
+                summary_pdc = str(summary.get("pdc_ip") or "")
+        return str(
+            candidate_data.get("pdc")
+            or domain_pdc_mapping.get(domain_name)
+            or summary_pdc
+            or ""
+        )
+
+    # Trust matrix from the in-memory TrustRelationship records.
+    trust_matrix: list[dict[str, str]] = []
+    trust_count_by_domain: dict[str, int] = {}
+    for trust in trusts or []:
+        source = str(getattr(trust, "source_domain", "") or "").strip().lower()
+        partner = str(getattr(trust, "target_domain", "") or "").strip().lower()
+        if not source or not partner:
+            continue
+        direction = str(getattr(trust, "trust_direction", "") or "Unknown").lower()
+        trust_type = str(getattr(trust, "trust_type", "") or "Unknown")
+        trust_matrix.append(
+            {
+                "source": source,
+                "partner": partner,
+                "direction": direction,
+                "type": trust_type,
+            }
+        )
+        trust_count_by_domain[source] = trust_count_by_domain.get(source, 0) + 1
+        trust_count_by_domain[partner] = trust_count_by_domain.get(partner, 0) + 1
+
+    discovered_domains: list[dict[str, Any]] = []
+    for candidate in candidates:
+        candidate_lower = candidate.strip().lower()
+        candidate_data = (
+            shell.domains_data.get(candidate, {})
+            if isinstance(getattr(shell, "domains_data", {}), dict)
+            else {}
+        )
+        if not isinstance(candidate_data, dict):
+            candidate_data = {}
+        connectivity = candidate_data.get("connectivity", {})
+        summary = (
+            connectivity.get("summary", {})
+            if isinstance(connectivity, dict)
+            and isinstance(connectivity.get("summary", {}), dict)
+            else {}
+        )
+        latency_value = summary.get("latency_ms") if isinstance(summary, dict) else None
+        discovered_domains.append(
+            {
+                "domain": candidate_lower,
+                "pdc": _pdc_for(candidate),
+                "reachable": True,  # candidates are pre-filtered to reachable only
+                "trust_count": trust_count_by_domain.get(candidate_lower, 0),
+                "latency": latency_value,
+                "is_origin": candidate_lower == source_lower,
+                "phase1_complete": candidate in phase1_complete_domains,
+            }
+        )
+
+    return {
+        "category": "trust_scope",
+        "origin_domain": source_lower,
+        "candidate_count": len(candidates),
+        "trust_matrix": trust_matrix,
+        "discovered_domains": discovered_domains,
+    }
+
+
+def _remote_trust_scope_selection(
+    shell: DomainShell,
+    *,
+    candidates: list[str],
+    source_domain: str,
+    phase1_complete_domains: set[str] | None = None,
+    trusts: list[Any],
+    domain_pdc_mapping: dict[str, str],
+) -> list[str] | None:
+    """Offer the trust-scope decision over the remote interaction bridge.
+
+    Returns the operator-selected domains (order-preserved, origin always kept)
+    on a platform scan with >1 reachable domain. Returns ``None`` when the bridge
+    is disabled or there is a single reachable domain, so the caller falls back
+    to the local prompt (which keeps the origin-only default for headless ``ci``).
+
+    The multiselect default and the timeout result are both origin-only, so a
+    hung/abandoned/timed-out session never blocks past the request timeout and
+    never silently enumerates trusted domains.
+    """
+    try:
+        from adscan_internal.interactive_requests import is_remote_interaction_enabled
+    except Exception:  # noqa: BLE001
+        return None
+
+    if not is_remote_interaction_enabled() or len(candidates) <= 1:
+        return None
+
+    selector = getattr(shell, "_questionary_multiselect", None)
+    if not callable(selector):
+        return None
+
+    done = phase1_complete_domains or set()
+    origin_default = (
+        [source_domain] if source_domain in candidates else candidates[:1]
+    )
+    context = _build_trust_scope_context(
+        shell,
+        candidates=candidates,
+        source_domain=source_domain,
+        phase1_complete_domains=done,
+        trusts=trusts,
+        domain_pdc_mapping=domain_pdc_mapping,
+    )
+    context["remote_interaction"] = True
+
+    try:
+        selected_values = selector(
+            "Select trusted domains to include in enumeration scope:",
+            candidates,
+            default_values=origin_default,
+            timeout_values=origin_default,
+            context=context,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return origin_default
+
+    if not selected_values:
+        # Empty selection from a remote operator is coerced to origin-only — the
+        # client opted out of enumerating trusted domains, never an empty scope.
+        return origin_default
+    chosen = {value.strip().lower() for value in selected_values}
+    resolved = [d for d in candidates if d.strip().lower() in chosen]
+    if source_domain in candidates and source_domain not in resolved:
+        resolved.insert(0, source_domain)
+    return resolved or origin_default
 
 
 def _persist_scope_selection(
@@ -1025,11 +1207,25 @@ def _handle_trust_enumeration_result(
                 )
                 return
 
-            selected_domains = _prompt_scope_selection(
-                all_reachable,
+            # On a platform-launched scan with >1 reachable domain, delegate the
+            # trust-scope decision to the operator via the remote interaction
+            # bridge (premium domain-topology picker). Returns None when the
+            # bridge is off / single-domain — then the local prompt is used,
+            # which keeps the origin-only default for headless ci.
+            selected_domains = _remote_trust_scope_selection(
+                shell,
+                candidates=all_reachable,
                 source_domain=domain,
                 phase1_complete_domains=phase1_complete_set,
+                trusts=trusts,
+                domain_pdc_mapping=domain_pdc_mapping,
             )
+            if selected_domains is None:
+                selected_domains = _prompt_scope_selection(
+                    all_reachable,
+                    source_domain=domain,
+                    phase1_complete_domains=phase1_complete_set,
+                )
             _persist_scope_selection(
                 shell,
                 source_domain=domain,

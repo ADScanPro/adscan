@@ -135,20 +135,34 @@ class NoViableLDAPAuthError(Exception):
 def _select_primary_auth_scheme(config: "ADscanLDAPConfig") -> LDAPAuthScheme:
     """Pick the primary auth scheme from a config, mirroring URL-build priority.
 
-    Priority order matches ``_build_ldap_connection_url``:
-    ccache_path > aes_key > nt_hash > password.
+    Priority order matches ``_build_ldap_connection_url`` AFTER the 2026-05
+    hardening: an explicitly-passed ``config.ccache_path`` wins, but the bare
+    ``$KRB5CCNAME`` fallback drops to the LAST slot — it only selects the ccache
+    scheme when no aes_key / nt_hash / password was supplied. Reading
+    ``$KRB5CCNAME`` ahead of explicit creds here (the old behaviour) made the
+    planner pick ``KERBEROS_CCACHE`` even when the caller passed an explicit
+    password/hash, mirroring the ambient-ccache principal-hijack at the URL
+    builder. Final order: ccache_path > aes_key > nt_hash > password >
+    $KRB5CCNAME.
     """
     import os as _os
 
     if config.use_kerberos:
-        ccache = (config.ccache_path or _os.environ.get("KRB5CCNAME") or "").strip()
-        if ccache:
+        explicit_ccache = str(config.ccache_path or "").strip()
+        if explicit_ccache:
             return LDAPAuthScheme.KERBEROS_CCACHE
         if config.aes_key:
             return LDAPAuthScheme.KERBEROS_AES
         password = str(config.password or "")
         if _looks_like_nt_hash(password):
             return LDAPAuthScheme.KERBEROS_RC4
+        if password:
+            return LDAPAuthScheme.KERBEROS_PASSWORD
+        # No explicit credential material: only now consider the ambient
+        # $KRB5CCNAME. When present, the URL builder will guard the principal
+        # (see _kerberos_ccache_guard); the scheme is still ccache.
+        if str(_os.environ.get("KRB5CCNAME") or "").strip():
+            return LDAPAuthScheme.KERBEROS_CCACHE
         return LDAPAuthScheme.KERBEROS_PASSWORD
 
     password = str(config.password or "")
@@ -735,19 +749,30 @@ def build_smb_plan(
             "Kerberos-first policy selected SMB Kerberos; NTLM fallback allowed only on Kerberos infra errors."
         )
 
-    # Rule 1: NTLM_AUTHENTICATION=DISABLED HIGH → force Kerberos from the start.
+    # Rule 1: NTLM_AUTHENTICATION=DISABLED HIGH → force Kerberos from the start,
+    # but ONLY when Kerberos is actually viable. For a credential-less session
+    # (no principal/secret/ccache) Kerberos cannot be attempted; forcing it would
+    # build a doomed auth URL that crashes downstream with
+    # ``'NoneType' object has no attribute 'native'`` instead of cleanly skipping.
+    # In that case keep the anonymous/NTLM attempt and record why.
     if ntlm_disabled_high:
-        if not use_kerberos:
-            # We are changing the caller's default — that is a prune.
-            use_kerberos = True
-            pruned = True
-        ntlm_fallback_allowed = False
-        rationale = (
-            "posture: NTLM_AUTHENTICATION=DISABLED — starting with Kerberos auth"
-        )
-        notes.append(
-            "NTLM disabled by posture — Kerberos auth used from the first attempt."
-        )
+        if kerberos_viable:
+            if not use_kerberos:
+                # We are changing the caller's default — that is a prune.
+                use_kerberos = True
+                pruned = True
+            ntlm_fallback_allowed = False
+            rationale = (
+                "posture: NTLM_AUTHENTICATION=DISABLED — starting with Kerberos auth"
+            )
+            notes.append(
+                "NTLM disabled by posture — Kerberos auth used from the first attempt."
+            )
+        else:
+            notes.append(
+                "NTLM disabled by posture but no credential material — cannot use "
+                "Kerberos; anonymous/NTLM attempted."
+            )
 
     # Rule 2: NTLM_AUTHENTICATION=ENABLED HIGH — caller's Kerberos intent is preserved.
     elif (

@@ -30,6 +30,16 @@ SESSION_COMPROMISE_STATUS_VALUES = frozenset(
     }
 )
 
+# Credential-provenance origins that identify a SELF-INTRODUCED credential —
+# the scan's own STARTING credential (the INPUT to ``adscan ci auth`` /
+# ``start_auth``) and a manually entered one (``creds save`` / ``creds add``).
+# Neither was compromised DURING the scan, so they are excluded from the
+# compromised-credential counters, the live scan panel, telemetry, and PostHog
+# while remaining fully owned principals for attack-path discovery. The origin
+# is the existing ``credentials_meta[user]["credential_origin"]`` provenance
+# field — there is no parallel flag.
+NON_COMPROMISE_ORIGINS = frozenset({"authenticated_scan", "user_provided"})
+
 
 def _ensure_session_compromise_state(shell: Any) -> None:
     """Ensure shell compromise tracking attributes exist with safe defaults."""
@@ -83,6 +93,70 @@ def mark_session_domain_compromised(shell: Any) -> None:
     """Record that full domain compromise was achieved during the session."""
     _ensure_session_compromise_state(shell)
     setattr(shell, "_session_compromise_status", SESSION_COMPROMISE_STATUS_DOMAIN)
+
+
+def is_self_introduced_credential(shell: Any, domain: str, username: str) -> bool:
+    """Return True when ``username``'s credential was self-introduced.
+
+    "Self-introduced" means its recorded provenance origin is in
+    :data:`NON_COMPROMISE_ORIGINS` — the scan's own STARTING credential
+    (``authenticated_scan``, the INPUT to ``adscan ci auth`` / ``start_auth``)
+    or a manually entered one (``user_provided``, via ``creds save`` /
+    ``creds add``). Reads the existing
+    ``credentials_meta[username]["credential_origin"]`` provenance field.
+    Pure read; never raises.
+    """
+    try:
+        domains_data = getattr(shell, "domains_data", None)
+        if not isinstance(domains_data, dict):
+            return False
+        domain_data = domains_data.get(domain)
+        if not isinstance(domain_data, dict):
+            return False
+        meta_map = domain_data.get("credentials_meta")
+        if not isinstance(meta_map, dict):
+            return False
+        key = str(username or "").strip().lower()
+        meta = meta_map.get(key)
+        if not isinstance(meta, dict):
+            return False
+        origin = str(meta.get("credential_origin") or "").strip().lower()
+        return origin in NON_COMPROMISE_ORIGINS
+    except Exception:  # noqa: BLE001 - pure read, never breaks callers
+        return False
+
+
+def iter_compromised_credentials(shell: Any, domain: str) -> dict[str, str]:
+    """Return the domain ``credentials`` map MINUS self-introduced ones.
+
+    This is the single source of truth for "credentials compromised during
+    the scan" — every counter, table, and panel that wants to show
+    *compromised* (as opposed to *all stored*) credentials must route
+    through here. Credentials whose provenance origin is in
+    :data:`NON_COMPROMISE_ORIGINS` (the scan's own starting credential or a
+    manually entered one) are excluded so they are never double-counted as a
+    win. Pure read; never raises (returns ``{}`` on any error).
+    """
+    out: dict[str, str] = {}
+    try:
+        domains_data = getattr(shell, "domains_data", None)
+        if not isinstance(domains_data, dict):
+            return out
+        domain_data = domains_data.get(domain)
+        if not isinstance(domain_data, dict):
+            return out
+        creds = domain_data.get("credentials")
+        if not isinstance(creds, dict):
+            return out
+        for user, secret in creds.items():
+            if not isinstance(user, str) or not isinstance(secret, str):
+                continue
+            if is_self_introduced_credential(shell, domain, user):
+                continue
+            out[user] = secret
+        return out
+    except Exception:  # noqa: BLE001 - pure read, never breaks callers
+        return out
 
 
 def build_session_compromise_metadata(shell: Any) -> dict[str, Any]:

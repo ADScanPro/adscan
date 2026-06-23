@@ -435,6 +435,11 @@ class NativeListenerCapture:
         # consume queue so the final ``wait_for_capture`` still drains normally.
         self._observed_lock = threading.Lock()
         self._observed: list[NtlmCaptureObservation] = []
+        # Exception captured from a failed start() bind. The background loop
+        # swallows it, so this is the ONLY place the real reason (EACCES
+        # privileged-port denial vs EADDRINUSE conflict) is recoverable;
+        # describe_start_error() classifies it for the caller.
+        self._start_error: BaseException | None = None
 
     def connection_stats(self) -> InboundConnectionSummary:
         """Return the inbound-connection tally observed by the listener.
@@ -515,8 +520,54 @@ class NativeListenerCapture:
         self._thread.start()
         ready_event.wait(timeout=5.0)
         if error_holder:
+            self._start_error = error_holder[0]
             return False
         return True
+
+    def describe_start_error(self) -> tuple[str, str]:
+        """Classify why :meth:`start` failed into ``(code, operator_message)``.
+
+        ``code`` is a short, host/secret-free tag suitable for telemetry
+        (``eacces`` / ``eaddrinuse`` / ``eaddrnotavail`` / ``other`` / ``none``);
+        the message is a Rich-safe operator string. Returns ``("none", "")`` when
+        :meth:`start` did not fail. Walks the exception cause chain for an
+        ``OSError`` errno so a wrapped bind error is still classified.
+        """
+        import errno as _errno  # noqa: PLC0415
+
+        exc = self._start_error
+        if exc is None:
+            return "none", ""
+        host, port = self.listen_host, self.listen_port
+        found: int | None = None
+        seen: set[int] = set()
+        cur: BaseException | None = exc
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if isinstance(cur, OSError) and cur.errno is not None:
+                found = cur.errno
+                break
+            cur = cur.__cause__ or cur.__context__
+        if found == _errno.EACCES:
+            return "eacces", (
+                f"permission denied binding privileged port {port} on {host} "
+                f"(EACCES). The runtime runs as a non-root container user and "
+                f"lacks privileged-port access; it needs CAP_NET_BIND_SERVICE so "
+                f"the coercion-based NTLM capture listener can bind."
+            )
+        if found == _errno.EADDRINUSE:
+            return "eaddrinuse", (
+                f"port {port} on {host} is already in use (EADDRINUSE) — another "
+                f"service or a stale listener holds it; free it and retry."
+            )
+        if found == _errno.EADDRNOTAVAIL:
+            return "eaddrnotavail", (
+                f"listener IP {host} is not available inside the runtime "
+                f"(EADDRNOTAVAIL) — the interface is missing in the container."
+            )
+        from rich.markup import escape  # noqa: PLC0415
+
+        return "other", escape(f"{type(exc).__name__}: {exc}")
 
     async def _async_main(
         self,

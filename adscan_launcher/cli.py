@@ -4,7 +4,7 @@ This CLI is intended for PyPI/GitHub distribution as open source.
 It orchestrates Docker to run the real ADscan CLI inside the container image.
 
 Supported commands (host-side):
-- install: pull image + bootstrap BloodHound CE
+- install: pull the ADscan runtime image
 - check: sanity checks for Docker mode
 - start: run interactive container session
 - ci: run CI mode inside container
@@ -271,7 +271,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pull-timeout",
         type=int,
         default=3600,
-        help="Docker pull timeout in seconds for ADscan and BloodHound CE image pulls (0 disables). Default: 3600.",
+        help="Docker pull timeout in seconds for the ADscan runtime image pull (0 disables). Default: 3600.",
     )
     install.add_argument(
         "--allow-low-memory",
@@ -336,7 +336,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pull-timeout",
         type=int,
         default=3600,
-        help="Docker pull timeout in seconds for ADscan and BloodHound CE image pulls (0 disables). Default: 3600.",
+        help="Docker pull timeout in seconds for the ADscan runtime image pull (0 disables). Default: 3600.",
     )
     start.add_argument(
         "--allow-low-memory",
@@ -411,7 +411,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pull-timeout",
         type=int,
         default=3600,
-        help="Docker pull timeout in seconds for ADscan and BloodHound CE image pulls (0 disables). Default: 3600.",
+        help="Docker pull timeout in seconds for the ADscan runtime image pull (0 disables). Default: 3600.",
     )
     ci.add_argument(
         "--allow-low-memory",
@@ -419,6 +419,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow CI preflight to continue when available RAM is critically low "
             "(below 1.0 GB). Place this before CI passthrough args."
+        ),
+    )
+    # Engagement-posture toggles. These are translated into container environment
+    # variables at the launcher seam (see run_adscan_passthrough_docker), NOT
+    # forwarded verbatim as `adscan ci` args, because the internal runtime honours
+    # them through env (ADSCAN_OFFLINE for the weakpass/no-external guard,
+    # ADSCAN_TELEMETRY=0 for the telemetry opt-out). They are the CLI half of the
+    # web Settings tab's two toggles; the Celery builder appends them for the
+    # matching scan-config booleans. Place them BEFORE the CI passthrough args
+    # (argparse.REMAINDER stops parsing flags at the first positional); the seam
+    # also rescues them if they appear later in the passthrough, so order is
+    # forgiving for operators.
+    ci.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Offline mode: disable every external lookup (weakpass / no-external "
+            "guard) for air-gapped or sovereign engagements. Sets ADSCAN_OFFLINE=1 "
+            "inside the scan container."
+        ),
+    )
+    ci.add_argument(
+        "--no-telemetry",
+        action="store_true",
+        dest="no_telemetry",
+        help=(
+            "Disable anonymous usage telemetry for this run (sensitive "
+            "engagements). Sets ADSCAN_TELEMETRY=0 inside the scan container."
         ),
     )
     ci.add_argument(
@@ -563,7 +591,8 @@ def _build_parser() -> argparse.ArgumentParser:
                 "--frameworks", dest="ws_frameworks", default=None,
                 help=(
                     "Comma-separated compliance frameworks: "
-                    "ens, iso27001, dora, pci_dss. Default: ens (non-interactive)."
+                    "ens, nis2, iso27001, dora, pci_dss. "
+                    "Default: none — pick the regimes that apply."
                 ),
             )
             _deliv_p.add_argument(
@@ -734,6 +763,80 @@ def _consume_ci_remainder_global_flags(ns: argparse.Namespace) -> None:
         return
 
     setattr(ns, "args", _consume_trailing_global_flags(ns, remainder))
+
+
+def _ci_posture_env_from_flags(
+    ns: argparse.Namespace, passthrough: list[str]
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Translate the `ci` engagement-posture flags into container env vars.
+
+    The two Settings-tab toggles (``--offline`` / ``--no-telemetry``) are
+    interpreted at the launcher seam rather than forwarded as `adscan ci`
+    arguments, because the internal runtime honours them via environment:
+
+    - ``--offline``      -> ``ADSCAN_OFFLINE=1`` (weakpass / no-external guard,
+      ``weakpass_service.offline_mode_enabled``).
+    - ``--no-telemetry`` -> ``ADSCAN_TELEMETRY=0`` (telemetry opt-out,
+      ``adscan_core.telemetry``).
+
+    Both the parsed namespace attributes (set when the flag precedes the
+    auth/unauth positional) AND the raw passthrough list are inspected, so a
+    token that landed after the positional (past ``argparse.REMAINDER``'s
+    flag cut-off) still takes effect. Recognised tokens are removed from the
+    returned passthrough so they never reach the container's own parser.
+
+    Returns:
+        A ``(extra_env, cleaned_passthrough)`` tuple. ``extra_env`` is a list
+        of ``(key, value)`` pairs suitable for ``DockerRunConfig.extra_env``;
+        empty when neither toggle is active (default behaviour unchanged).
+    """
+    offline = bool(getattr(ns, "offline", False))
+    no_telemetry = bool(getattr(ns, "no_telemetry", False))
+
+    cleaned: list[str] = []
+    for token in passthrough:
+        if token == "--offline":
+            offline = True
+            continue
+        if token == "--no-telemetry":
+            no_telemetry = True
+            continue
+        cleaned.append(token)
+
+    extra_env: list[tuple[str, str]] = []
+    if offline:
+        extra_env.append(("ADSCAN_OFFLINE", "1"))
+    if no_telemetry:
+        extra_env.append(("ADSCAN_TELEMETRY", "0"))
+
+    return extra_env, cleaned
+
+
+def _apply_host_posture_env(ns: argparse.Namespace, raw_argv: list[str]) -> None:
+    """Gate the LAUNCHER's OWN telemetry when a ``ci`` run opts out.
+
+    ``_ci_posture_env_from_flags`` configures the scan CONTAINER, but the host
+    launcher independently drains the telemetry queue and uploads its own
+    preflight recording (both gated by the launcher process's environment, not
+    the container's). Without this, ``adscan ci --no-telemetry`` / ``--offline``
+    from a plain CLI host would still replay queued telemetry and upload the
+    launcher session. We therefore set the launcher process environment BEFORE
+    the queue drain runs, so ``adscan_core.offline.offline_mode_enabled`` and
+    ``_is_telemetry_enabled`` observe the opt-out.
+
+    Flags are read from both the parsed namespace and the raw argv (a token can
+    land past ``argparse.REMAINDER``'s flag cut-off). Offline implies no
+    telemetry (``ADSCAN_OFFLINE=1`` disables telemetry via the adscan_core
+    offline SSOT), so it is sufficient on its own.
+    """
+    offline = bool(getattr(ns, "offline", False)) or "--offline" in raw_argv
+    no_telemetry = (
+        bool(getattr(ns, "no_telemetry", False)) or "--no-telemetry" in raw_argv
+    )
+    if offline:
+        os.environ["ADSCAN_OFFLINE"] = "1"
+    if no_telemetry:
+        os.environ["ADSCAN_TELEMETRY"] = "0"
 
 
 def _should_print_debug_enabled_banner(command: str | None) -> bool:
@@ -1453,6 +1556,12 @@ def main(argv: list[str] | None = None) -> None:
     _seed_session_trace_id()
     _emit_launcher_system_context(cmd)
 
+    # A ci --offline / --no-telemetry run must gate the launcher's OWN telemetry
+    # (the queue drain below + the preflight recording upload), not just the
+    # scan container. Apply the opt-out to this process's environment BEFORE the
+    # drain so the gate sees it. (See _apply_host_posture_env.)
+    _apply_host_posture_env(ns, raw_argv)
+
     # Best-effort drain of any telemetry sessions that failed to upload
     # in previous CLI invocations (network blip, crash mid-flight,
     # oversize payload, etc.). Runs on a background thread; the launcher
@@ -1592,6 +1701,14 @@ def main(argv: list[str] | None = None) -> None:
         # argparse.REMAINDER keeps leading --, but may start with a "--" separator.
         if passthrough and passthrough[0] == "--":
             passthrough = passthrough[1:]
+        # Translate the engagement-posture toggles (--offline / --no-telemetry)
+        # into container environment variables. The flags are consumed here, NOT
+        # forwarded into the container as `ci` args, because the internal runtime
+        # honours them via env. ``_ci_posture_env_from_flags`` also strips the
+        # tokens out of the passthrough so a token that landed after the
+        # auth/unauth positional (past argparse.REMAINDER's flag cut-off) still
+        # takes effect and never reaches the container parser.
+        posture_env, passthrough = _ci_posture_env_from_flags(ns, passthrough)
         raise SystemExit(
             _run_host_command_with_session_capture(
                 command_type="ci",
@@ -1602,6 +1719,7 @@ def main(argv: list[str] | None = None) -> None:
                     debug=bool(getattr(ns, "debug", False)),
                     pull_timeout_seconds=int(ns.pull_timeout),
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
+                    extra_env=posture_env,
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),

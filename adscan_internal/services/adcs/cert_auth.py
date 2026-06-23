@@ -193,7 +193,16 @@ async def _extract_nt_hash_u2u(kcomm) -> Optional[str]:
 async def _do_authenticate_with_cert(
     config: CertAuthConfig, output_dir: Path
 ) -> CertAuthResult:
-    """Core async PKINIT implementation."""
+    """Core async PKINIT implementation.
+
+    Clock contract: this is shell-free transport and carries no ``shell``, so
+    it cannot run the physical clock-sync guard. PKINIT/U2U is highly sensitive
+    to clock skew (the per-request kerbad offset is insufficient — a skewed
+    clock yields KDC_ERR_CLIENT_NOT_TRUSTED). The shell-bearing CALLER MUST
+    ensure the host clock is fresh first via ``ensure_clock_synced_fresh`` /
+    ``do_ensure_clock_synced_fresh``. Do NOT thread ``shell`` through
+    ``CertAuthConfig`` to fix this here.
+    """
     from kerbad.aioclient import AIOKerberosClient
     from kerbad.common.creds import KerberosCredential
     from kerbad.common.target import KerberosTarget

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "9.1.1"
+version = "9.2.0"
 description = "Free Active Directory pentesting CLI for AD enumeration, attack paths, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
@@ -61,6 +61,15 @@ dev = [
     "pytest-html",
     "jinja2",
     "winacl==0.1.9",
+    # Pure-Python forensic stack for offline VM disk-image credential extraction
+    # (vm_artifact_service): dissect.target follows VMware sparse / Hyper-V VHDX
+    # chains and walks NTFS in userspace (no root, no mount, no subprocess).
+    "dissect.target>=3.20,<4.0",
+    # Offline VM MEMORY-image credential extraction (vm_artifact_service): Volatility 3
+    # carves raw guest RAM (.vmem/.vmrs) for SAM/LSA/cached creds. pycryptodome is
+    # REQUIRED or vol3's credential plugins silently fail to register.
+    "volatility3>=2.5.0",
+    "pycryptodome>=3.20",
 ]
 cli = [
     "badldap>=0.7.5,<0.8",
@@ -98,6 +107,15 @@ cli = [
     "textual>=0.80.0",
     "redis>=5.0.0,<7.1.0",
     "winacl==0.1.9",
+    # Offline VM disk-image credential extraction (vm_artifact_service): dissect
+    # reads VMware/Hyper-V disk-image containers + NTFS in pure Python (userspace,
+    # no root/mount/subprocess) to pull ntds.dit + registry hives out of a guest.
+    "dissect.target>=3.20,<4.0",
+    # Offline VM MEMORY-image credential extraction (vm_artifact_service): Volatility 3
+    # carves raw guest RAM (.vmem/.vmrs) for SAM/LSA/cached creds (the HTB-Checkpoint
+    # root step). pycryptodome is REQUIRED or vol3's credential plugins don't register.
+    "volatility3>=2.5.0",
+    "pycryptodome>=3.20",
 ]
 
 [project.urls]

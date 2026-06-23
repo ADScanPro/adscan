@@ -250,7 +250,12 @@ def _build_kerberos_url(config: KerberosConfig, *, use_auth_kdc: bool = False) -
         return f"kerberos+aes://{user_part}:{_encode(config.aes_key)}@{kdc}"
     if config.nt_hash:
         return f"kerberos+nt://{user_part}:{_encode(config.nt_hash)}@{kdc}"
-    if config.password:
+    if config.password is not None:
+        # ``is not None`` (not truthiness): an EMPTY password ('') is a valid
+        # credential (a genuinely blank-password account — found by the native
+        # blank spray — must verify/authenticate). The URL carries no secret for
+        # an empty password (the factory parses '' as None); ``get_tgt`` restores
+        # the empty password on the credential after the client is built.
         return f"kerberos+password://{user_part}:{_encode(config.password)}@{kdc}"
     raise KerberosTransportError(
         "KerberosConfig has no usable credential (ccache/kirbi/aes/nt/password)"
@@ -559,9 +564,21 @@ def _classify_recoverable_kerberos_failure(
     if code != KerberosErrorCode.KDC_ERR_ETYPE_NOTSUPP:
         return None
 
-    # The set we actually sent to the KDC. ``None`` means "library
-    # default" which is usually [18, 17, 23] (AES first, then RC4).
+    # The set we actually sent to the KDC. ``None``/empty means "library
+    # default" — we did not pin an explicit etype list, so we cannot see
+    # which etype kerbad actually offered.
     sent = list(attempted_etypes or [])
+
+    # Empty/None == library default. With kerbad's AES-first credential
+    # ordering (vendor get_supported_enctypes) a password default already
+    # picks AES, so this branch should rarely fire. But if a default attempt
+    # STILL drew KDC_ERR_ETYPE_NOTSUPP, the overwhelmingly common cause is an
+    # AES-only KDC rejecting an RC4 offer (e.g. an nt_hash-only credential, or
+    # a stale vendor). Force AES once. If the credential genuinely cannot
+    # derive AES keys (nt_hash only), the retry fails cleanly — no worse off,
+    # and the posture signal we emit teaches the planner for next time.
+    if not sent:
+        return [18, 17]
 
     # Heuristic: classify the attempt by the FIRST etype offered.
     # KDC_ERR_ETYPE_NOTSUPP is returned when the intersection of our set
@@ -615,6 +632,16 @@ async def get_tgt(config: KerberosConfig) -> bytes:
     try:
         cu = KerberosClientFactory.from_url(url)
         client = cu.get_client()
+
+        # Empty-password (blank) credential: the URL carries no secret, so the
+        # factory leaves the credential password as None. Restore the EMPTY
+        # password on the built credential so AS-REQ key derivation runs (kerbad's
+        # creds.py treats '' as valid — RC4 = empty NT hash, AES = string_to_key('')).
+        # This is what makes verifying/authenticating a genuinely blank account work
+        # through the standard transport, not just the native blank-spray helper.
+        if config.password == "" and getattr(client, "credential", None) is not None:
+            client.credential.password = ""
+            client.credential.nt_hash = None
 
         # PR9: Build posture-driven Kerberos plan.
         plan = build_kerberos_plan(config=config, posture=config.posture_snapshot)
@@ -926,6 +953,14 @@ async def get_nt_from_pkinit(config: KerberosConfig) -> list[tuple[str, str]]:
     Requires ``config.cert_pfx_path`` (and optionally ``cert_pfx_password``).
     Uses ``kerbad/examples/getNT.py`` pattern: PKINIT TGT → U2U → extract PAC.
 
+    Clock contract: this function is shell-free transport and does NOT carry a
+    ``shell``, so it cannot run the physical clock-sync guard itself. PKINIT/U2U
+    is far more sensitive to clock skew than AS/TGS (the per-request kerbad skew
+    offset is insufficient — a skewed clock yields KDC_ERR_CLIENT_NOT_TRUSTED).
+    The shell-bearing CALLER MUST ensure the host clock is fresh before invoking
+    this (via ``ensure_clock_synced_fresh`` / ``do_ensure_clock_synced_fresh``).
+    Do NOT thread ``shell`` through ``KerberosConfig`` to fix this here.
+
     Returns:
         List of (label, nt_hash_hex) pairs from the PAC.
 
@@ -1000,12 +1035,13 @@ async def kerberoast_users(
 
     url = _build_kerberos_url(config, use_auth_kdc=True)
     domain = target_domain or config.domain
-    # override_etype controls BOTH the TGT AS-REQ and each TGS-REQ in kerbad's
-    # kerberoast generator.  Keep AES-first so the TGT authentication succeeds
-    # when the probe has derived an AES-only credential.  In practice, service
-    # accounts without AES keys (the common case) return RC4 tickets regardless
-    # of the requested etype order.
-    override_etype = etypes or config.etypes or [18, 17, 23]
+    # override_etype now controls ONLY the TGS-REQ (the roasted service ticket) —
+    # kerbad's kerberoast generator decouples the TGT (which uses the credential's
+    # own AES-first preference so it authenticates against AES-only KDCs) from the
+    # TGS. So request RC4-first here: an RC4 service ticket ($krb5tgs$23$) cracks
+    # ~10x faster than AES, and the KDC degrades to AES automatically for AES-only
+    # service accounts. (Matches the asreproast default and impacket/Rubeus.)
+    override_etype = etypes or config.etypes or [23, 17, 18]
     cross_domain = bool(
         target_domain and target_domain.lower() != config.domain.lower()
     )

@@ -44,26 +44,56 @@ _DOCKER_PERMISSION_DENIED_RE = re.compile(
     r"permission denied.*docker\.sock|got permission denied", re.IGNORECASE
 )
 _DOCKER_PULL_DNS_FAILURE_RE = re.compile(
-    r"(lookup\s+registry-1\.docker\.io.*no such host|temporary failure in name resolution|server misbehaving)",
+    # Registry-agnostic: matches ``lookup <any-host>: no such host`` (Docker Hub
+    # ``registry-1.docker.io`` AND ``ghcr.io`` / private registries), plus the
+    # generic resolver-failure strings Docker/Go surface.
+    r"(lookup\s+\S+.*no such host|temporary failure in name resolution|server misbehaving)",
     re.IGNORECASE,
 )
 _DOCKER_PERMISSION_WARNING_SHOWN = False
+
+
+_DOCKER_PULL_DNS_LOOKUP_HOST_RE = re.compile(
+    r"lookup\s+(?P<host>[A-Za-z0-9._-]+)", re.IGNORECASE
+)
+
+
+def _extract_dns_failure_host(diagnostic: str) -> str | None:
+    """Best-effort extraction of the registry host from a DNS-failure diagnostic.
+
+    Docker/Go surface ``lookup <host>: no such host`` on resolution failure;
+    the host is whichever registry the pull contacted (Docker Hub's
+    ``registry-1.docker.io``, ``ghcr.io``, or a private registry). Returns the
+    host so the guidance hint targets the right name, or ``None`` when the
+    diagnostic does not name a host.
+    """
+    match = _DOCKER_PULL_DNS_LOOKUP_HOST_RE.search(diagnostic or "")
+    if not match:
+        return None
+    host = match.group("host").strip().rstrip(".")
+    return host or None
 
 
 def _emit_pull_failure_dns_guidance(*, diagnostic: str) -> None:
     """Emit targeted guidance when docker pull fails due to DNS resolution."""
     if not _DOCKER_PULL_DNS_FAILURE_RE.search(diagnostic or ""):
         return
+    resolved_host = _extract_dns_failure_host(diagnostic)
     print_warning("Docker registry DNS resolution failed while pulling images.")
     print_instruction("Verify host DNS settings and internet connectivity, then retry.")
-    print_instruction(
-        "If needed, test resolver health with: getent hosts registry-1.docker.io"
-    )
+    if resolved_host:
+        print_instruction(
+            f"If needed, test resolver health with: getent hosts {resolved_host}"
+        )
+    else:
+        print_instruction(
+            "If needed, test resolver health with: getent hosts <registry host>"
+        )
     print_instruction(
         "If DNS is unstable, switch to a reliable resolver (for example 1.1.1.1 / 8.8.8.8)."
     )
     print_warning_verbose(
-        "Pull failure diagnostic indicates name-resolution issues for Docker Hub."
+        "Pull failure diagnostic indicates name-resolution issues for the Docker registry."
     )
 
 
@@ -874,6 +904,16 @@ def build_adscan_run_command(
     # This is intentionally narrower than `--privileged` but still grants the
     # ability to change the system time (CAP_SYS_TIME).
     cmd.extend(["--cap-add", "SYS_TIME"])
+    # Coercion-based NTLM capture / relay listeners (NTLM auth-type sweep, ESC8
+    # relay) bind PRIVILEGED ports inbound (SMB 445, HTTP 80, LDAP 389). The
+    # runtime runs as a non-root --user, so without this it gets EACCES binding
+    # <1024 and those features skip with "listener failed to start". CAP_NET_BIND_
+    # SERVICE is the minimal capability for this (far narrower than --privileged);
+    # Docker 20.10+ also propagates --cap-add to the ambient set so the non-root
+    # user can actually use it. --sysctl net.ipv4.ip_unprivileged_port_start is
+    # NOT an option here because the runtime uses --network host, which forbids
+    # namespaced net sysctls.
+    cmd.extend(["--cap-add", "NET_BIND_SERVICE"])
     host_tun_device = Path("/dev/net/tun")
     if host_tun_device.exists():
         cmd.extend(["--cap-add", "NET_ADMIN"])
@@ -1077,6 +1117,16 @@ def build_adscan_run_command(
         "ADSCAN_ENV",
         "ADSCAN_TELEMETRY",
         "ADSCAN_ALLOW_PUBLIC_DNS",
+        # Offline / no-external kill switch (PoV appliance). Without forwarding
+        # these, an ``ADSCAN_OFFLINE=1`` set on the host (e.g. by the appliance
+        # cloud-init / Celery unit) never reaches the scan container, so the
+        # weakpass egress guard and telemetry opt-out inside the runtime stay
+        # off — the "zero bytes leave the appliance" promise would rest solely
+        # on nftables. Opt-in: only forwarded when set, so the default runtime
+        # behaviour is unchanged. ``ADSCAN_NO_EXTERNAL`` is the documented alias
+        # (see weakpass_service._OFFLINE_ENV_VARS).
+        "ADSCAN_OFFLINE",
+        "ADSCAN_NO_EXTERNAL",
         # CI event pipeline: forward the structured-event sink config so the container
         # emits JSON events to stderr (read by the Celery worker via PIPE).
         "ADSCAN_EVENT_SINK",

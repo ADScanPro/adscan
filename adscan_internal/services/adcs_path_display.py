@@ -4,6 +4,107 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from adscan_internal.services.compromise_class import is_direct_domain_breaker_target
+
+
+# Well-known high-privilege principals that are never genuine *escalating actors*
+# for a principal-first ESC. SYSTEM / LOCAL SYSTEM / NT AUTHORITY do not "escalate
+# via ESC1" — listing them as an ESC source is noise, not a finding. Matched by
+# bare name (case-insensitive, @domain suffix stripped) and by well-known SID.
+_WELL_KNOWN_NON_ACTOR_NAMES: frozenset[str] = frozenset(
+    name.lower()
+    for name in (
+        "SYSTEM",
+        "LOCAL SYSTEM",
+        "NT AUTHORITY",
+        "NT AUTHORITY\\SYSTEM",
+        "LOCAL SERVICE",
+        "NETWORK SERVICE",
+    )
+)
+_WELL_KNOWN_NON_ACTOR_SIDS: frozenset[str] = frozenset(
+    {
+        "S-1-5-18",  # LOCAL SYSTEM
+        "S-1-5-19",  # LOCAL SERVICE
+        "S-1-5-20",  # NETWORK SERVICE
+    }
+)
+
+# Node kinds that are CA / abuse-infrastructure, not escalating principals. A CA
+# or computer object appearing as the *source* of a principal-first ESC (ESC1/2/3,
+# …) is the abuse target's infrastructure, not an actor. The genuinely CA-targeted
+# ESCs (6/8/11/…) are modelled separately and do not flow through this predicate as
+# "sources" that need rendering as escalating actors.
+_CA_INFRA_SOURCE_KINDS: frozenset[str] = frozenset(
+    {
+        "computer",
+        "enterpriseca",
+        "aiaca",
+        "rootca",
+        "certtemplate",
+        "certauthority",
+        "ntauthstore",
+    }
+)
+
+
+def is_meaningful_esc_source(
+    source_name: str, source_kind: str | None = None
+) -> bool:
+    """Return ``True`` when *source* is a genuine escalating actor for an ESC.
+
+    The ``/adcs`` "Detected AD CS paths" list reads raw, pre-derivation
+    collector edges — one per principal holding an enrollment ACE on a
+    vulnerable template — with no source filtering. That surfaces meaningless
+    "sources": domain-breakers (Domain Admins, Enterprise Admins, BUILTIN
+    Administrators, krbtgt, DCs) that do not *escalate* via ESC, well-known
+    SIDs (SYSTEM / LOCAL SYSTEM / NT AUTHORITY) that are not actors, and CA /
+    computer abuse-infrastructure that is the target's plumbing, not a
+    principal.
+
+    This is the same source-pruning the rest of the platform applies — the
+    attack-graph engine prunes breaker *sources*
+    (``attack_graph_service._prune_tier0_source_attack_edges``) and the
+    affected-assets registry drops breaker *targets*
+    (``compromise_class.is_direct_domain_breaker_target``). This predicate
+    reuses that SSOT breaker check so the ``/adcs`` dashboard, the engine and
+    the report agree on what counts as an ESC actor.
+
+    Args:
+        source_name: The edge's ``source_name`` (label / sAMAccountName / SID).
+        source_kind: The edge's ``source_kind`` (node kind), if known.
+
+    Returns:
+        ``False`` to filter the source OUT (breaker / well-known SID /
+        CA-infra), ``True`` for a genuine — typically low-privilege —
+        principal (Domain Users, Authenticated Users, Domain Computers as a
+        group, normal users/groups).
+    """
+    name = str(source_name or "").strip()
+    kind = str(source_kind or "").strip().lower()
+
+    # CA / computer abuse-infrastructure is never an escalating actor.
+    if kind in _CA_INFRA_SOURCE_KINDS:
+        return False
+
+    bare = name.split("@", 1)[0].strip()
+    lowered = bare.lower()
+    upper = bare.upper()
+
+    # Well-known non-actor principals (SYSTEM family), by name or SID.
+    if lowered in _WELL_KNOWN_NON_ACTOR_NAMES:
+        return False
+    if upper in _WELL_KNOWN_NON_ACTOR_SIDS:
+        return False
+
+    # Direct domain-breaker sources (DA/EA/BUILTIN Administrators/krbtgt/DCs):
+    # reuse the SSOT predicate so we never drift from the engine/report.
+    node = {"name": name, "kind": kind} if name or kind else None
+    if is_direct_domain_breaker_target(node):
+        return False
+
+    return True
+
 
 _ADCS_RELATIONS = {
     "adcsesc1",

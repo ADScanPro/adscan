@@ -28,7 +28,11 @@ from adscan_internal.services.credentials.privilege_role import (
     get_credential_meta,
     pick_credential_for_local_admin,
     set_credential_kerberos_material,
+    set_credential_origin,
     set_credential_secret_kind,
+)
+from adscan_internal.services.credentials.credential_origin import (
+    origin_display_label,
 )
 
 __all__ = [
@@ -37,7 +41,9 @@ __all__ = [
     "CredentialMetadata",
     "CredentialPrivilegeRole",
     "get_credential_meta",
+    "origin_display_label",
     "pick_credential_for_local_admin",
     "set_credential_kerberos_material",
+    "set_credential_origin",
     "set_credential_secret_kind",
 ]

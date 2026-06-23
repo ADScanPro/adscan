@@ -7,11 +7,37 @@ from typing import Any
 
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.share_file_analyzer_service import (
+    ShareFileAnalyzerFinding,
     ShareFileAnalyzerService,
 )
 from adscan_internal.services.share_file_content_extraction_service import (
     ShareFileContentExtractionService,
 )
+
+
+def _vm_credentials_to_findings(credentials: list[Any]) -> list[ShareFileAnalyzerFinding]:
+    """Map recovered VM-artifact credentials to deterministic finding records."""
+    findings: list[ShareFileAnalyzerFinding] = []
+    for cred in credentials:
+        nt_hash = getattr(cred, "nt_hash", None)
+        plaintext = getattr(cred, "secret", None)
+        kind = str(getattr(cred, "kind", "") or "unknown")
+        rid = getattr(cred, "rid", None)
+        secret = nt_hash or plaintext or "-"
+        credential_type = f"vm_{kind}_hash" if nt_hash else f"vm_{kind}_secret"
+        evidence = f"VM artifact ({getattr(cred, 'source', '') or 'disk'})"
+        if rid is not None:
+            evidence = f"{evidence} RID {rid}"
+        findings.append(
+            ShareFileAnalyzerFinding(
+                credential_type=credential_type,
+                username=str(getattr(cred, "principal", "") or "-"),
+                secret=str(secret),
+                confidence="high",
+                evidence=evidence,
+            )
+        )
+    return findings
 
 
 @dataclass(frozen=True)
@@ -45,6 +71,115 @@ class ShareFileAnalysisPipelineService(BaseService):
         super().__init__()
         self._analyzer = analyzer_service or ShareFileAnalyzerService()
         self._extractor = extraction_service or ShareFileContentExtractionService()
+
+    def analyze_vm_disk_candidate(
+        self,
+        *,
+        shell: Any,
+        domain: str,
+        host: str,
+        share: str,
+        source_path: str,
+        size: int,
+        vm_service: Any = None,
+    ) -> ShareFilePipelineAnalysisResult | None:
+        """Sparse-extract credentials from a self-contained VM disk on a share.
+
+        This is the single dispatch chokepoint for VM disk/memory artifacts: every
+        share-analysis flow should call it FIRST, before the byte-based path, and
+        only fall back to ``analyze_from_bytes`` when this returns ``None``.
+
+        Returns ``None`` when ``source_path`` is not a VM disk image (caller uses the
+        bytes path). When it IS, dissect reads the remote disk SPARSELY over aiosmb
+        ranged reads — the multi-GB image is never downloaded — and recovered
+        credentials are returned as deterministic findings, shaped exactly like
+        :meth:`analyze_from_bytes` so the caller's findings handling is unchanged.
+
+        Only self-contained disks (monolithic ``.vhdx``/``.vhd``/``.vmdk``) are
+        handled here; split/snapshot-chain VMware disks need their sibling files and
+        must be fetched locally by the caller.
+        """
+        from adscan_internal.services.vm_artifact_service import (
+            VMArtifactService,
+            classify_vm_artifact,
+        )
+
+        if classify_vm_artifact(source_path) != "disk":
+            return None
+
+        service = vm_service or VMArtifactService()
+        extraction = service.extract_from_smb_disk(
+            shell=shell,
+            domain=domain,
+            host=host,
+            share=share,
+            source_path=source_path,
+            size=size,
+        )
+        return self._vm_extraction_to_result(
+            extraction=extraction,
+            source_path=source_path,
+            extraction_mode="vm_disk_sparse",
+        )
+
+    def analyze_vm_disk_local(
+        self,
+        *,
+        source_path: str,
+        local_path: str,
+        vm_service: Any = None,
+    ) -> ShareFilePipelineAnalysisResult | None:
+        """Extract credentials from a VM disk already present on the LOCAL filesystem.
+
+        For the CIFS-mounted-share backend the artifact is a local path, so dissect
+        opens it directly — this also handles split/snapshot-chain VMware disks
+        (all sibling files are visible under the mount) and the CIFS layer reads
+        sparsely over SMB underneath. Returns ``None`` when ``source_path`` is not a
+        VM disk image (caller uses the bytes path).
+        """
+        from adscan_internal.services.vm_artifact_service import (
+            VMArtifactService,
+            classify_vm_artifact,
+        )
+
+        if classify_vm_artifact(source_path) != "disk":
+            return None
+        service = vm_service or VMArtifactService()
+        extraction = service.extract_from_disk_source(source_path=local_path)
+        return self._vm_extraction_to_result(
+            extraction=extraction,
+            source_path=source_path,
+            extraction_mode="vm_disk_local",
+        )
+
+    @staticmethod
+    def _vm_extraction_to_result(
+        *,
+        extraction: Any,
+        source_path: str,
+        extraction_mode: str,
+    ) -> ShareFilePipelineAnalysisResult:
+        """Shape a VM artifact extraction result like an analyze_from_bytes result."""
+        findings = _vm_credentials_to_findings(extraction.credentials)
+        summary = (
+            f"VM disk artifact yielded {len(findings)} credential(s)."
+            if findings
+            else "VM disk artifact analysis recovered no credentials."
+        )
+        return ShareFilePipelineAnalysisResult(
+            source_path=source_path,
+            deterministic_handled=bool(extraction.handled),
+            deterministic_summary=summary,
+            deterministic_notes=list(extraction.notes),
+            deterministic_findings=findings,
+            ai_attempted=False,
+            ai_summary="",
+            ai_findings=[],
+            extraction_mode=extraction_mode,
+            extraction_notes=[],
+            extraction_chars=0,
+            error_message=extraction.error_message,
+        )
 
     def analyze_from_bytes(
         self,

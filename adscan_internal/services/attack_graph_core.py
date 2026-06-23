@@ -19,7 +19,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from adscan_internal.services.domain_controller_classifier import (
@@ -54,6 +54,8 @@ from adscan_internal.services.tier_lattice import (
     attack_core_signature,
     domain_compromise_tier_from_record,
     edge_grants_local_admin_session as _edge_grants_local_admin_session,
+    stamp_records_domain_compromise_tier,
+    stamp_records_target_tier,
 )
 
 _LOCAL_REUSE_RELATION_KEY = "localadminpassreuse"
@@ -1113,10 +1115,12 @@ def filter_contained_paths_for_domain_listing(
         # influences the legacy literal mode; on the attack core a prefix and a
         # same-terminal suffix coincide because context hops are already stripped.
         kept_entries: list[tuple[AttackCore | None, dict[str, Any]]] = []
+        kept_terminal_by_id: dict[int, str | None] = {}
         removed_multi = 0
         for nodes_t, rels_t, record in normalized:
             cand_core = cores_by_id[id(record)]
             cand_tier = tiers_by_id[id(record)]
+            cand_terminal = nodes_t[-1] if nodes_t else None
             is_super_path = False
             if cand_core is not None:
                 for kept_core, kept_rec in kept_entries:
@@ -1127,9 +1131,26 @@ def filter_contained_paths_for_domain_listing(
                     ) or attack_core_is_subsequence(kept_core, cand_core)
                     if not contained:
                         continue
+                    kept_tier = tiers_by_id[id(kept_rec)]
                     # Keep the longer candidate when it reaches a strictly higher
                     # domain-compromise tier than the kept sub-path.
-                    if cand_tier > tiers_by_id[id(kept_rec)]:
+                    if cand_tier > kept_tier:
+                        continue
+                    # Keep the longer candidate when it reaches a DISTINCT terminal
+                    # of EQUAL domain-compromise tier: it is a separately
+                    # compromisable target, not merely a longer route to the same
+                    # place.  (Vintage: ``FS01$→…→GMSA01$`` is a prefix of three
+                    # distinct equal-tier service-account terminals SVC_ARK /
+                    # SVC_LDAP / SVC_SQL — all three must survive, not collapse into
+                    # the bare GMSA01$ prefix.)  The redundant bare prefix is
+                    # dropped in Pass 2 instead.  Same-terminal longer routes still
+                    # collapse here, and a lower-tier wander past the kept terminal
+                    # (cand_tier < kept_tier) still collapses as noise.
+                    if (
+                        cand_tier == kept_tier
+                        and cand_terminal is not None
+                        and cand_terminal != kept_terminal_by_id.get(id(kept_rec))
+                    ):
                         continue
                     is_super_path = True
                     break
@@ -1137,6 +1158,7 @@ def filter_contained_paths_for_domain_listing(
                 removed_multi += 1
             else:
                 kept_entries.append((cand_core, record))
+                kept_terminal_by_id[id(record)] = cand_terminal
 
         # Pass 2 — remove a kept path A when a kept super-path B strictly contains
         # A's attack core as a prefix/sub-sequence AND B's domain-compromise tier is
@@ -1171,6 +1193,76 @@ def filter_contained_paths_for_domain_listing(
                 pass2_kept.append(record)
 
         return pass2_kept, removed_multi + pass2_removed
+
+
+# ── Domain-scope listing shortest/longest mode ─────────────────────────────────
+# Product decision (2026-06): the ``domain`` scope listing returns the MOST DIRECT
+# HV-aware route to domain compromise (``keep_shortest``) by default, instead of the
+# legacy holistic longest kill chain. The old keep_longest behaviour buried the
+# signal under many long ``theoretical`` paths. The behaviour is selected by the
+# threaded ``keep_longest`` parameter (default shortest); callers opt into the
+# holistic view via the ``--keep-longest`` flag wired through
+# ``get_attack_path_summaries``.
+
+
+def filter_domain_listing_paths(
+    records: list[dict[str, Any]],
+    *,
+    label_to_node: Mapping[str, Mapping[str, Any]],
+    keep_longest: bool = False,
+) -> tuple[list[dict[str, Any]], int]:
+    """Apply the domain-scope listing filter, shortest HV-aware by default.
+
+    Single source of truth shared by BOTH domain-scope pipelines (the active
+    compute pipeline in ``attack_paths_core`` and the display/report pipeline in
+    ``attack_graph_service``). Stamps the per-record target tier and the 4-tier
+    domain-compromise rank on ``records`` in place (the ``keep_shortest`` branch
+    of :func:`filter_contained_paths_for_domain_listing` reads both stamps), then
+    runs the containment filter:
+
+    * Default (``keep_longest=False``): ``keep_shortest=True`` with an
+      ``is_hv_terminal`` predicate and ``preserve_prefix_paths=True`` — the most
+      direct route to each distinct domain-compromise terminal. The terminal
+      protection (an HV terminal is never dropped, a higher domain-compromise tier
+      is never collapsed into a lower one) keeps the short ``…→DCSync→DOMAIN`` /
+      ``…→Domain Admins`` kill chains alive while pruning the long theoretical
+      wanders that previously dominated the listing.
+    * ``keep_longest=True``: ``keep_shortest=False`` — the holistic longest kill
+      chain, reproducing the pre-2026-06 behaviour for rollback / a whole-domain
+      exposure view.
+
+    Args:
+        records: Display path records for the domain scope (modified in place by
+            the tier stamping).
+        label_to_node: Label-to-node index used to resolve each terminal's tier and
+            high-value classification. Required so the Domain object is recognised
+            as the top domain-compromise tier and HV terminals are protected.
+        keep_longest: When True, select the legacy holistic longest kill chain
+            instead of the default shortest HV-aware route.
+
+    Returns:
+        ``(kept_records, removed_count)`` from the containment filter.
+    """
+    if keep_longest:
+        # Legacy holistic view: collapse sub-paths into the longest kill chain.
+        return filter_contained_paths_for_domain_listing(records, keep_shortest=False)
+    # Shortest HV-aware: stamp the tiers the keep_shortest branch consumes, then
+    # keep the most direct route while protecting HV / domain-object terminals.
+    stamp_records_target_tier(records, label_to_node=label_to_node)
+    stamp_records_domain_compromise_tier(records, label_to_node=label_to_node)
+    resolve = label_to_node or {}
+
+    def _is_hv_terminal(record: dict[str, Any]) -> bool:
+        """Return True when the record's terminal node is high-value / tier-0."""
+        target_node = resolve.get(str(record.get("target") or "")) or {}
+        return _node_target_priority_class(target_node) != "pivot"
+
+    return filter_contained_paths_for_domain_listing(
+        records,
+        keep_shortest=True,
+        is_hv_terminal=_is_hv_terminal,
+        preserve_prefix_paths=True,
+    )
 
 
 # Outcome-class priority ranking — higher value = more severe / more complete.

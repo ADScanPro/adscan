@@ -55,6 +55,11 @@ from adscan_core.tui.progress_dashboard import (
     ProgressDashboard,
     ProgressDashboardConfig,
 )
+from adscan_core.tui.stream_runner import (
+    SpawnFailed,
+    StreamedProcessResult,
+    stream_command_lines,
+)
 
 NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS = 7200
 NMAP_DC_DISCOVERY_LARGE_RANGE_THRESHOLD = 4096
@@ -88,6 +93,7 @@ class NmapShell(Protocol):
     console: any
 
     def run_command(self, command: str, timeout: int | None = None) -> any: ...
+    def spawn_command(self, command, **kwargs) -> any: ...
     def consolidate_service_ips(self, service: str) -> None: ...
     def consolidate_domain_computers(self, args: str) -> None: ...
     def ask_for_unauth_scan(self, domain: str) -> None: ...
@@ -1188,82 +1194,350 @@ def _run_nmap_command_with_optional_sudo_retry(
     )
 
 
+# Single source of truth for parsing Nmap's live stdout (-vvv emits one
+# "Discovered open port <port>/tcp on <ip>" line per open port; --stats-every
+# plus -vvv emit periodic "... Timing: About <pct>% done; ETC: <hh:mm> (<rem>
+# remaining)" lines). Used by both the streaming important-port monitor and the
+# legacy monitor_nmap/monitor_nmap_domain loops so the regex lives in one place.
+_NMAP_DISCOVERED_PORT_RE = re.compile(
+    r"Discovered open port (?P<port>\d+)/tcp on (?P<ip>\d+\.\d+\.\d+\.\d+)"
+)
+_NMAP_TIMING_PERCENT_RE = re.compile(r"About\s+([\d.]+)%\s+done")
+_NMAP_TIMING_REMAINING_RE = re.compile(
+    r"\((?:(\d+):)?(\d{1,2}):(\d{2})\s+remaining\)"
+)
+
+
+def _parse_nmap_discovered_port(line: str) -> tuple[str, int] | None:
+    """Parse a single Nmap ``-vvv`` stdout line for a discovered open TCP port.
+
+    Args:
+        line: One decoded line of Nmap stdout.
+
+    Returns:
+        ``(host_ip, port)`` when the line reports a discovered open TCP port,
+        otherwise ``None``.
+    """
+    match = _NMAP_DISCOVERED_PORT_RE.search(line or "")
+    if not match:
+        return None
+    try:
+        return match.group("ip"), int(match.group("port"))
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_nmap_timing_progress(line: str) -> tuple[float | None, float | None]:
+    """Parse Nmap timing/stats output for completion percent and remaining time.
+
+    Nmap with ``-vvv --stats-every`` periodically prints lines such as::
+
+        SYN Stealth Scan Timing: About 45.23% done; ETC: 14:32 (0:00:15 remaining)
+
+    Args:
+        line: One decoded line of Nmap stdout.
+
+    Returns:
+        ``(percent, eta_seconds)`` where each element is ``None`` when that
+        signal is absent from the line.
+    """
+    text = line or ""
+    percent: float | None = None
+    eta_seconds: float | None = None
+    pct_match = _NMAP_TIMING_PERCENT_RE.search(text)
+    if pct_match:
+        try:
+            percent = float(pct_match.group(1))
+        except ValueError:
+            percent = None
+    rem_match = _NMAP_TIMING_REMAINING_RE.search(text)
+    if rem_match:
+        try:
+            hours = int(rem_match.group(1) or 0)
+            minutes = int(rem_match.group(2))
+            seconds = int(rem_match.group(3))
+            eta_seconds = float(hours * 3600 + minutes * 60 + seconds)
+        except ValueError:
+            eta_seconds = None
+    return percent, eta_seconds
+
+
+# Terse service annotations for the live "top open ports" ranking. Keyed by the
+# same ``<port>/tcp`` string the breakdown records, so a ranked entry reads
+# ``445/tcp SMB 42``. Only the well-known AD ports the scan targets are named;
+# unlisted ports render the bare ``<port>/tcp <count>`` with no annotation.
+_IMPORTANT_PORT_SERVICE_LABELS: dict[str, str] = {
+    "21/tcp": "FTP",
+    "22/tcp": "SSH",
+    "53/tcp": "DNS",
+    "80/tcp": "HTTP",
+    "88/tcp": "Kerberos",
+    "389/tcp": "LDAP",
+    "443/tcp": "HTTPS",
+    "445/tcp": "SMB",
+    "1433/tcp": "MSSQL",
+    "3389/tcp": "RDP",
+    "5900/tcp": "VNC",
+    "5985/tcp": "WinRM",
+}
+
+
 def _build_important_port_scan_dashboard() -> ProgressDashboard:
     """Indeterminate important-port-scan dashboard (Nmap stdout is opaque).
 
-    The Nmap subprocess is blocking and exposes no parseable live progress
-    stream, so a determinate X/N bar would require a guessed (lying) ETA.
-    Indeterminate mode shows a spinner + elapsed so the operator can see the
-    scan is alive and avoid Ctrl+C-ing a working long scan.
+    Scope is indeterminate (the resolved-IP count is not the host-with-open-
+    ports count), so ``total`` stays ``None``. But Nmap's own ``-vvv
+    --stats-every`` output IS parseable: the streaming runner feeds discovered
+    hosts into the "found N" counter AND Nmap's reported percent / ETA into
+    :meth:`ProgressDashboard.set_reported_progress`, so the panel shows honest
+    forward motion during the scan instead of sitting at "found 0".
     """
     return ProgressDashboard(
         ProgressDashboardConfig(
             title="Important Port Scan",
-            total=None,  # indeterminate -- spinner + elapsed (no per-host stream)
+            total=None,  # indeterminate scope; live percent driven by Nmap stats
             unit="hosts",
+            last_item_type="ip",
+            # A single Nmap subprocess has no per-host success/error/in-flight to
+            # track, so the counter row would render a meaningless "✓ hosts 0"
+            # next to the live "N found" count. Suppress it for this scan.
+            show_counters=False,
+            # Live "top open ports" leaderboard: ranked by the count of DISTINCT
+            # hosts on which each port was discovered open, descending, bounded
+            # to the busiest K of the 12 scanned ports so the panel line count
+            # stays stable. The operator watches the service landscape form.
+            breakdown_max=8,
+            breakdown_label="top open ports",
+            breakdown_annotations=_IMPORTANT_PORT_SERVICE_LABELS,
         )
     )
 
 
-def _run_important_port_scan_with_dashboard(
-    run_scan: "callable",
-) -> any:
-    """Run the blocking important-port Nmap scan under an indeterminate dashboard.
+# Streaming primitives live in the shared, dependency-light core module so
+# nmap.py and the kerbrute live flows (services/enumeration/kerberos.py,
+# spraying.py) drive their dashboards through ONE budget-enforcing,
+# timeout-signalling stdout streamer rather than each shipping a copy.
+_StreamingScanResult = StreamedProcessResult
+_StreamingSpawnFailed = SpawnFailed
 
-    ``run_scan`` is a zero-arg callable that executes the (already configured)
-    blocking Nmap invocation -- including its sudo-retry and timeout-recovery
-    logic -- and returns its result. It runs in a single worker thread so the
-    dashboard spinner + elapsed can tick while Nmap blocks. The thread is always
-    joined (the ``with`` on the pool blocks until the future resolves), so it
-    never leaks; ``fut.result()`` re-raises any worker exception, preserving the
-    caller's error handling exactly.
 
-    FAIL-SAFE: if the dashboard cannot be built / driven, the blocking call is
-    still executed directly so the scan always runs and the result handling is
-    never skipped. ``call_started`` distinguishes a dashboard/LiveSession setup
-    failure (fall back to a plain call) from a failure raised by ``run_scan``
-    itself (must propagate -- never re-run the scan).
+def _stream_nmap_scan_into_dashboard(
+    shell: NmapShell,
+    *,
+    command: str,
+    timeout_seconds: int | None,
+    dashboard: "ProgressDashboard",
+) -> _StreamingScanResult | None:
+    """Spawn an Nmap scan and drive the dashboard from its live stdout.
+
+    Reads stdout line-by-line via the shared :func:`stream_command_lines`
+    streamer (which spawns through ``shell.spawn_command`` -- preserving the
+    PyInstaller clean-env handling -- enforces its own wall-clock budget, and
+    drains the remaining output). The per-line callback feeds discovered
+    open-port hosts into the dashboard's "found N" counter and Nmap's own
+    ``Timing: About X% done`` / remaining-time into its reported-progress
+    surface.
 
     Args:
-        run_scan: Zero-arg callable performing the blocking Nmap scan.
+        shell: Active shell exposing ``spawn_command``.
+        command: Full Nmap command string (already shell-quoted).
+        timeout_seconds: Wall-clock budget, or ``None`` for no limit.
+        dashboard: Live dashboard to drive.
 
     Returns:
-        Whatever ``run_scan`` returns (the completed scan process or ``None``).
+        A :class:`_StreamingScanResult` on completion, or ``None`` if the
+        process could not be spawned (caller falls back to the buffered path).
     """
-    import concurrent.futures
-    import time as _time
+    # Clear any stale timeout marker so the recovery prompt only fires for a
+    # timeout produced by THIS run, never a leftover from an earlier command.
+    setattr(shell, "_last_run_command_error", None)
 
+    hosts_with_open_ports: set[str] = set()
+
+    def _on_line(line: str) -> None:
+        parsed = _parse_nmap_discovered_port(line)
+        if parsed is not None:
+            host_ip, port = parsed
+            # Feed the live "top open ports" ranking on EVERY discovery (the
+            # dashboard de-duplicates distinct hosts per port internally via a
+            # set, so re-seen (host, port) pairs never double-count).
+            try:
+                dashboard.record_breakdown(f"{port}/tcp", member=host_ip)
+            except Exception:  # noqa: BLE001 -- render must not abort scan
+                pass
+            if host_ip not in hosts_with_open_ports:
+                hosts_with_open_ports.add(host_ip)
+                try:
+                    # last_item_type is fixed in the dashboard config ("ip");
+                    # feed the raw IP -- masking happens at render time.
+                    dashboard.update(done=len(hosts_with_open_ports), last=host_ip)
+                except Exception:  # noqa: BLE001 -- render must not abort scan
+                    pass
+
+        percent, eta_seconds = _parse_nmap_timing_progress(line)
+        if percent is not None or eta_seconds is not None:
+            try:
+                dashboard.set_reported_progress(
+                    percent=percent, eta_seconds=eta_seconds
+                )
+            except Exception:  # noqa: BLE001 -- render must not abort scan
+                pass
+
+    def _on_timeout() -> None:
+        # Mirror run_command's timeout signalling so the recovery prompt fires.
+        setattr(shell, "_last_run_command_error", ("timeout", command))
+
+    return stream_command_lines(
+        shell.spawn_command,
+        command=command,
+        timeout_seconds=timeout_seconds,
+        on_line=_on_line,
+        on_timeout=_on_timeout,
+    )
+
+
+def _run_important_port_scan_with_dashboard(
+    shell: NmapShell,
+    *,
+    command: str,
+    domain: str,
+    timeout_seconds: int,
+    run_scan_fallback: "callable",
+    _is_full_adscan_container_runtime: "callable | None" = None,
+    _sudo_validate: "callable | None" = None,
+) -> any:
+    """Run the important-port Nmap scan LIVE under a streaming dashboard.
+
+    Streams the scan via ``shell.spawn_command`` and parses its stdout in real
+    time so the dashboard's host counter and percent advance DURING the scan
+    (not just at completion). All the robustness of the buffered path is
+    preserved:
+
+    * **Sudo retry** -- a privilege-denied first attempt re-spawns under sudo.
+    * **Timeout recovery** -- the streaming loop enforces its own wall-clock
+      budget (``Popen.readline`` has none); on overrun it offers the same
+      "retry without timeout" prompt, gated by ``is_non_interactive``.
+    * **Clean env** -- inherited from ``spawn_command``.
+    * **Non-TTY / CI** -- handled by ``LiveSession`` itself.
+
+    FAIL-SAFE: if the dashboard cannot be built or the process cannot be
+    spawned, it falls back to ``run_scan_fallback`` (the buffered path) so the
+    scan always completes and the result handling is never skipped.
+
+    Args:
+        shell: Active shell exposing ``spawn_command`` + ``run_command``.
+        command: Full Nmap command string.
+        domain: Domain for timeout-recovery messaging.
+        timeout_seconds: Wall-clock budget for the streaming scan.
+        run_scan_fallback: Zero-arg buffered-path callable used when streaming
+            cannot be set up.
+        _is_full_adscan_container_runtime: Optional container runtime detector
+            (forwarded to the sudo-retry logic).
+        _sudo_validate: Optional sudo validation callback.
+
+    Returns:
+        A :class:`_StreamingScanResult` (CompletedProcess-shaped) or whatever
+        the fallback returns; ``None`` on unrecoverable failure.
+    """
     try:
         dashboard = _build_important_port_scan_dashboard()
     except Exception:  # noqa: BLE001 -- dashboard build must never block the scan
-        return run_scan()
+        return run_scan_fallback()
 
-    def _safe_update(dash: "ProgressDashboard") -> None:
-        try:
-            dash.update()
-        except Exception:  # noqa: BLE001 -- a render error must not abort the scan
-            pass
+    def _stream_once(
+        cmd: str, budget: int | None, dash: "ProgressDashboard"
+    ) -> _StreamingScanResult | None:
+        return _stream_nmap_scan_into_dashboard(
+            shell, command=cmd, timeout_seconds=budget, dashboard=dash
+        )
 
-    call_started = False
+    def _maybe_sudo_retry(
+        result: _StreamingScanResult, budget: int | None, dash: "ProgressDashboard"
+    ) -> _StreamingScanResult:
+        """Re-spawn under sudo when the attempt was privilege-denied."""
+        if result.returncode == 0:
+            return result
+        combined = (result.stdout or "") + "\n" + (result.stderr or "")
+        needs_priv = _nmap_output_indicates_missing_privileges(combined)
+        can_escalate = os.geteuid() != 0 and shutil.which("sudo") is not None
+        if not needs_priv or not can_escalate:
+            return result
+        if _is_full_adscan_container_runtime and _is_full_adscan_container_runtime():
+            print_info_debug(
+                "Nmap important port scan requires privileges in container "
+                "runtime; retrying via sudo -n."
+            )
+            retry = _stream_once(f"sudo -n {command}", budget, dash)
+            return retry if retry is not None else result
+        if _sudo_validate is None or _sudo_validate():
+            print_info_debug(
+                "Nmap important port scan requires privileges; retrying via sudo."
+            )
+            retry = _stream_once(f"sudo {command}", budget, dash)
+            return retry if retry is not None else result
+        return result
+
+    def _streamed_out() -> bool:
+        last_error = getattr(shell, "_last_run_command_error", None)
+        return (
+            isinstance(last_error, tuple)
+            and len(last_error) >= 1
+            and str(last_error[0]).strip().lower() == "timeout"
+        )
+
     try:
         with dashboard.live_session():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                fut = pool.submit(run_scan)
-                call_started = True
-                while not fut.done():
-                    _safe_update(dashboard)
-                    _time.sleep(0.25)
-                result = fut.result()  # re-raises worker exceptions here
-                _safe_update(dashboard)
-                return result
-    except Exception:  # noqa: BLE001
-        if call_started:
-            # ``run_scan`` (or its worker plumbing) raised -- propagate to the
-            # caller's existing try/except. Do NOT re-run the scan.
-            raise
-        # Dashboard / LiveSession failed before the call started -- fall back to
-        # a plain blocking call so the scan still completes.
-        return run_scan()
+            result = _stream_once(command, timeout_seconds, dashboard)
+            if result is None:
+                # spawn failed -- leave the live session, fall back below.
+                raise _StreamingSpawnFailed()
+            result = _maybe_sudo_retry(result, timeout_seconds, dashboard)
+    except _StreamingSpawnFailed:
+        # Could not spawn -- buffered fallback (no live session was entered).
+        return run_scan_fallback()
+    except Exception:  # noqa: BLE001 -- LiveSession / setup failure
+        return run_scan_fallback()
+
+    # Timeout recovery is handled OUTSIDE the alt-screen Live (a confirm prompt
+    # inside an alt-screen buffer would be invisible). The streaming loop marks
+    # `_last_run_command_error = ("timeout", ...)` on wall-clock overrun.
+    if result.returncode != 0 and _streamed_out():
+        marked_domain = mark_sensitive(domain, "domain")
+        print_warning(
+            f"Nmap port scan for domain {marked_domain} timed out after "
+            f"{timeout_seconds} seconds."
+        )
+        print_info("This is common on very large domains or slow VPN links.")
+        if is_non_interactive(shell):
+            print_warning("Non-interactive mode detected; skipping retry without timeout.")
+            return result
+        retry_without_timeout = Confirm.ask(
+            "Do you want to retry the same Nmap scan without timeout?",
+            default=False,
+        )
+        if not retry_without_timeout:
+            return result
+        print_info(
+            f"Retrying Nmap port scan for domain {marked_domain} without timeout. "
+            "This may take a long time."
+        )
+        try:
+            retry_dashboard = _build_important_port_scan_dashboard()
+        except Exception:  # noqa: BLE001
+            return run_scan_fallback()
+        try:
+            with retry_dashboard.live_session():
+                retry_result = _stream_once(command, None, retry_dashboard)
+                if retry_result is None:
+                    raise _StreamingSpawnFailed()
+                retry_result = _maybe_sudo_retry(retry_result, None, retry_dashboard)
+            return retry_result
+        except _StreamingSpawnFailed:
+            return run_scan_fallback()
+        except Exception:  # noqa: BLE001
+            return run_scan_fallback()
+
+    return result
 
 
 def _parse_gnmap_open_ports(text: str) -> dict[str, set[int]]:
@@ -1976,6 +2250,8 @@ def convert_hostnames_to_ips_and_scan(
     _is_full_adscan_container_runtime: callable | None = None,
     _sudo_validate: callable | None = None,
     verbose_mode: bool = False,
+    render: bool = True,
+    auto: bool = False,
 ) -> None:
     """Convert hostnames to IP addresses using massdns, write enabled_computers_ips.txt,
     and then execute the port scan.
@@ -1988,6 +2264,18 @@ def convert_hostnames_to_ips_and_scan(
         _is_full_adscan_container_runtime: Function to check if running in container.
         _sudo_validate: Function to validate sudo access.
         verbose_mode: Whether verbose mode is enabled.
+        render: When True (default), render the reachability/unreachable-subnet
+            summary UI after the scan. When False, the scan still produces every
+            artifact (``{service}/ips.txt``, ``network_reachability_report.json``,
+            reachable/no-response IP files) but suppresses the UI — used by the
+            Phase-2 (Domain Collection) producer so the rich summary renders once
+            in Phase 3 from the persisted report (scan/produce in P2, present in P3).
+        auto: When True, run the important-port scan automatically without the
+            "Recommended/Optional/High-Noise Important Port Scan" confirmation
+            prompt (and without the skip-confirmation follow-up) — used by the
+            automatic Phase-2 (Domain Collection) producer so collection is not
+            blocked on operator input. Non-interactive runs already auto-resolve
+            the prompt; ``auto`` additionally suppresses it for interactive runs.
     """
     ip_file = os.path.join(
         shell.current_workspace_dir or "",
@@ -2320,7 +2608,10 @@ def convert_hostnames_to_ips_and_scan(
             expand=False,
         )
         should_run_port_scan = True
-        if not auto_run_small_scope:
+        # ``auto`` (Phase-2 automatic producer) runs the scan unconditionally with
+        # no operator prompt; ``auto_run_small_scope`` (small CTF scope) is the
+        # pre-existing automatic path. Both bypass the confirmation flow.
+        if not auto and not auto_run_small_scope:
             should_run_port_scan = bool(
                 Confirm.ask(
                     prompt_text,
@@ -2350,7 +2641,7 @@ def convert_hostnames_to_ips_and_scan(
                 f"nmap -sS -PS{important_ports_csv} "
                 f"-PA{important_ports_csv} "
                 f"-p{important_ports_csv} "
-                f"-n -vvv -iL {shlex.quote(str(ip_file))} "
+                f"-n -vvv --stats-every 2s -iL {shlex.quote(str(ip_file))} "
                 f"-oN {shlex.quote(str(scan_output_path))} "
                 f"-oG {shlex.quote(str(scan_output_path))}.gnmap"
             )
@@ -2377,13 +2668,15 @@ def convert_hostnames_to_ips_and_scan(
             except Exception:  # noqa: BLE001 -- notice must never abort the scan
                 pass
 
-            # Indeterminate live dashboard. The blocking Nmap call (incl. its
-            # sudo-retry + timeout-recovery logic) runs in a worker thread so
-            # the spinner + elapsed tick while Nmap blocks; LiveSession falls
-            # back to inline logging on non-TTY/CI itself. FAIL-SAFE: a render
-            # error never aborts the scan -- the helper falls back to a direct
-            # blocking call and the result handling below is unchanged.
-            def _run_port_scan() -> any:
+            # Streaming live dashboard. Nmap is launched non-blocking via
+            # spawn_command and its -vvv --stats-every stdout is parsed in real
+            # time, so the host counter + percent advance DURING the scan. The
+            # streaming runner owns its own wall-clock timeout (Popen.readline
+            # has none), sudo-retry, and the timeout-recovery prompt; LiveSession
+            # handles the non-TTY/CI fallback. FAIL-SAFE: if streaming can't be
+            # set up it falls back to the buffered path (run_scan_fallback), and
+            # the authoritative post-scan .gnmap parse below is unchanged.
+            def _run_port_scan_buffered() -> any:
                 return _run_nmap_command_with_optional_sudo_retry(
                     shell,
                     command=port_scan_command,
@@ -2395,7 +2688,13 @@ def convert_hostnames_to_ips_and_scan(
                 )
 
             completed_scan_process = _run_important_port_scan_with_dashboard(
-                _run_port_scan
+                shell,
+                command=port_scan_command,
+                domain=domain,
+                timeout_seconds=NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS,
+                run_scan_fallback=_run_port_scan_buffered,
+                _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
+                _sudo_validate=_sudo_validate,
             )
 
             if completed_scan_process is None:
@@ -2491,19 +2790,18 @@ def convert_hostnames_to_ips_and_scan(
                     port_scan_output_file=gnmap_path,
                     generated_at=generated_at,
                 )
-                if _write_network_reachability_report(
+                wrote_report = _write_network_reachability_report(
                     reachability_report_file,
                     reachability_payload,
-                ):
+                )
+                # Produce always; render only when not deferred to Phase 3.
+                if render:
                     _show_network_reachability_summary(
                         shell,
                         payload=reachability_payload,
-                        report_file=reachability_report_file,
-                    )
-                else:
-                    _show_network_reachability_summary(
-                        shell,
-                        payload=reachability_payload,
+                        report_file=(
+                            reachability_report_file if wrote_report else None
+                        ),
                     )
                 services = [
                     "smb",
@@ -2553,7 +2851,8 @@ def monitor_nmap_domain(shell: NmapShell, proc: any, domain: str) -> None:
         proc: Nmap subprocess object with stdout.
         domain: Domain name being scanned.
     """
-    ip_regex = re.compile(r"Discovered open port \d+/tcp on (\d+\.\d+\.\d+\.\d+)")
+    # Single source of truth: shared discovered-port regex.
+    ip_regex = _NMAP_DISCOVERED_PORT_RE
     process_completed = False
 
     while True:
@@ -2569,7 +2868,7 @@ def monitor_nmap_domain(shell: NmapShell, proc: any, domain: str) -> None:
 
         match = ip_regex.search(line.decode("utf-8"))
         if match:
-            host_ip = match.group(1)
+            host_ip = match.group("ip")
 
             # Port 445/tcp - SMB
             if b"445/tcp" in line:
@@ -2632,7 +2931,8 @@ def monitor_nmap(shell: NmapShell, proc: any) -> None:
         shell: The active shell instance with workspace data.
         proc: Nmap subprocess object with stdout.
     """
-    ip_regex = re.compile(r"Discovered open port \d+/tcp on (\d+\.\d+\.\d+\.\d+)")
+    # Single source of truth: shared discovered-port regex.
+    ip_regex = _NMAP_DISCOVERED_PORT_RE
     process_completed = False
 
     while True:
@@ -2669,7 +2969,7 @@ def monitor_nmap(shell: NmapShell, proc: any) -> None:
         # Attempt to extract the host IP from the nmap output
         match = ip_regex.search(line.decode("utf-8"))
         if match:
-            host_ip = match.group(1)  # Capture the IP
+            host_ip = match.group("ip")  # Capture the IP
 
             # Port 445/tcp - SMB
             if b"445/tcp" in line:

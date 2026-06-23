@@ -27,6 +27,7 @@ from adscan_internal import (
     print_info_table,
     print_info_verbose,
     print_instruction,
+    print_success,
     print_warning,
     print_warning_debug,
     print_warning_verbose,
@@ -34,6 +35,7 @@ from adscan_internal import (
 )
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.rich_output import (
+    confirm_ask,
     mark_sensitive,
     print_exception,
     print_panel,
@@ -43,6 +45,11 @@ from adscan_internal.subprocess_env import command_string_needs_clean_env
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.workspaces import domain_relpath, domain_subpath
 from adscan_core.theme import ADSCAN_PRIMARY
+from adscan_core.tui.progress_dashboard import (
+    ProgressDashboard,
+    ProgressDashboardConfig,
+)
+from adscan_core.tui.stream_runner import stream_command_lines
 from adscan_internal.workspaces.computers import (
     count_enabled_computer_accounts,
     has_enabled_computer_list,
@@ -50,6 +57,17 @@ from adscan_internal.workspaces.computers import (
 )
 from adscan_internal.integrations.netexec.parsers import (
     parse_netexec_computer_badpwd,
+)
+from adscan_internal.services.credentials.privilege_role import (
+    set_credential_origin as _set_credential_origin,
+)
+from adscan_internal.services.credentials.credential_origin import (
+    ORIGIN_BLANK_PASSWORD,
+    ORIGIN_COMPUTER_PRE2K,
+    ORIGIN_CREDENTIAL_REUSE,
+    ORIGIN_PASSWORD_SPRAY,
+    ORIGIN_SPRAY,
+    ORIGIN_USERNAME_AS_PASSWORD,
 )
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
@@ -156,12 +174,20 @@ def handle_validated_domain_hits_followup(
     hits: list[dict[str, object]],
     source_steps: list[object] | None = None,
     discovery_label: str = "validated",
+    credential_origin: str = ORIGIN_SPRAY,
 ) -> bool:
     """Handle post-validation UX for confirmed domain credentials.
 
     This centralizes the post-hit flow shared by spraying and SAM->Domain reuse:
     store credentials, classify Tier-0/high-value users, offer attack paths, and
     optionally enumerate selected users when no path is available.
+
+    Args:
+        credential_origin: Specific provenance slug for the validated hits
+            (e.g. ``useraspass``, ``blankpassword``, ``credential_reuse``).
+            Defaults to the generic ``spray`` slug; spray callers pass the
+            mode-specific origin so the Provenance column differentiates by
+            spray type.
     """
     from adscan_internal.cli.attack_path_execution import (
         offer_attack_paths_for_execution_for_principals,
@@ -195,6 +221,11 @@ def handle_validated_domain_hits_followup(
             username=user,
             credential=credential,
             is_hash=bool(hit.get("is_hash")),
+        )
+        # The store bypasses add_credential's provenance API, so tag the origin
+        # explicitly to keep the Provenance column off "via unknown".
+        _set_credential_origin(
+            shell, domain=domain, username=user, origin=credential_origin
         )
 
     # Persist credentials to disk immediately so downstream attack-path execution
@@ -356,7 +387,7 @@ def handle_validated_domain_hits_followup(
                 str(selected.get("username") or ""),
                 str(selected.get("credential") or ""),
                 source_steps=source_steps,
-                credential_origin="spray",
+                credential_origin=credential_origin,
             )
             return True
 
@@ -371,6 +402,12 @@ def handle_validated_domain_hits_followup(
         principals=principals,
         max_depth=10,
         target=_spray_target,
+        # Canonical CLI/client mode: terminate at the domain object
+        # ("Domain Compromised") and preserve relevant paths. ``tier0`` (the
+        # function default) collapses short paths into kill-chains and can hide
+        # them — object mode is the standard for the post-hit display (shared by
+        # spraying and SAM->Domain reuse). See skill adscan-attack-paths-debug.
+        target_mode="object",
     )
     if executed:
         return True
@@ -393,7 +430,7 @@ def handle_validated_domain_hits_followup(
                 str(first_hit.get("credential") or ""),
                 source_steps=source_steps,
                 prompt_for_user_privs_after=False,
-                credential_origin="spray",
+                credential_origin=credential_origin,
             )
             return True
         return False
@@ -495,7 +532,7 @@ def handle_validated_domain_hits_followup(
                 str(hit.get("credential") or ""),
                 source_steps=source_steps,
                 prompt_for_user_privs_after=True,
-                credential_origin="spray",
+                credential_origin=credential_origin,
             )
         return True
 
@@ -508,7 +545,7 @@ def handle_validated_domain_hits_followup(
             str(first_hit.get("credential") or ""),
             source_steps=source_steps,
             prompt_for_user_privs_after=False,
-            credential_origin="spray",
+            credential_origin=credential_origin,
         )
         return True
     return False
@@ -559,6 +596,8 @@ class SprayShell(Protocol):
     def run_command(
         self, command: str, *, timeout: int | None = None, **kwargs
     ) -> subprocess.CompletedProcess[str] | None: ...
+
+    def spawn_command(self, command, **kwargs) -> subprocess.Popen[str] | None: ...
 
     def add_credential(
         self,
@@ -787,6 +826,22 @@ def _has_recommended_spraying_attempt(shell: SprayShell, domain: str) -> bool:
     return any(str(item) in _RECOMMENDED_SPRAY_CATEGORIES for item in attempted)
 
 
+def _pre2k_already_attempted(shell: SprayShell, domain: str) -> bool:
+    """True when a computer-pre2k spray was already attempted in THIS workspace.
+
+    pre2k is intentionally excluded from the unified per-(user, password) spray
+    history (one trivial credential per machine — not worth per-combo dedup), so
+    its "attempted" state lives as a domain-level marker in the spraying UX state
+    (``recommended_attempted_categories``), which is persisted in ``domains_data``
+    and therefore survives leaving and re-entering the workspace. This is the
+    single source of truth both the Step-1 pre2k runner and the pre2k follow-up
+    consult so pre2k is never silently re-offered/re-sprayed across sessions.
+    """
+    ux_state = _get_spraying_ux_state(shell, domain)
+    attempted = ux_state.get("recommended_attempted_categories")
+    return isinstance(attempted, list) and "computer_pre2k" in attempted
+
+
 def _get_enabled_computer_account_count(shell: SprayShell, domain: str) -> int | None:
     """Return the enabled computer count for the domain, or None when unavailable."""
 
@@ -831,6 +886,47 @@ def _should_recommend_pre2k_for_ctf(shell: SprayShell, domain: str) -> bool:
     return True
 
 
+def _pre2k_followup_is_actionable(shell: SprayShell, domain: str) -> bool:
+    """Return True only when a pre2k computer follow-up can actually run.
+
+    This is STRICTER than ``_should_recommend_pre2k_for_ctf`` (which gates the
+    general spraying hint that also covers username-as-password and is valid
+    unauthenticated). The pre2k computer check has two hard preconditions in
+    ``do_computer_pre2k_spraying``: an authenticated session, and known enabled
+    computer accounts to spray. Mirror both here so the follow-up is never
+    offered when it cannot possibly succeed.
+
+    - No authenticated session (e.g. a ``start_unauth`` flow) -> suppress; pre2k
+      would immediately fail with "requires an authenticated session".
+    - Enabled-computer count UNAVAILABLE (no ``enabled_computers.txt`` because
+      nothing was collected) -> suppress. "Unavailable" means "no computers
+      known", not "probably many" — do NOT fail open here.
+    - One or zero enabled computers -> suppress (nothing meaningful to spray).
+    """
+
+    if shell.domains_data.get(domain, {}).get("auth") != "auth":
+        print_info_debug(
+            "[spray] pre2k follow-up gate: disabled because there is no "
+            "authenticated session (pre2k computer checks require auth)."
+        )
+        return False
+
+    count = _get_enabled_computer_account_count(shell, domain)
+    if count is None:
+        print_info_debug(
+            "[spray] pre2k follow-up gate: disabled because the enabled computer "
+            "count is unavailable (no computers collected)."
+        )
+        return False
+    if count <= 1:
+        print_info_debug(
+            "[spray] pre2k follow-up gate: disabled because there is "
+            f"only {count} enabled computer account."
+        )
+        return False
+    return True
+
+
 def maybe_offer_ctf_pre2k_followup(
     shell: SprayShell, domain: str, *, reason: str
 ) -> None:
@@ -838,12 +934,13 @@ def maybe_offer_ctf_pre2k_followup(
 
     if shell.domains_data.get(domain, {}).get("auth") == "pwned":
         return
-    if not _should_recommend_pre2k_for_ctf(shell, domain):
+    if not _pre2k_followup_is_actionable(shell, domain):
         return
 
-    history = get_password_spraying_history(shell)
-    domain_history = history.get(domain, {})
-    if isinstance(domain_history.get("computer_pre2k"), dict):
+    if _pre2k_already_attempted(shell, domain):
+        # Persisted across workspace re-entry (UX-state marker — pre2k is excluded
+        # from the per-(user, password) history on purpose). This is the store
+        # do_computer_pre2k_spraying actually writes to, so the dedup is real.
         print_info_debug(
             "[spray] premium pre2k follow-up skipped because computer_pre2k "
             "was already attempted."
@@ -1054,6 +1151,194 @@ def _build_domain_reuse_eligibility(
         )
         return None
     return eligibility
+
+
+def _parse_kerbrute_valid_login_line(line: str) -> tuple[str, str] | None:
+    """Extract ``(username, password)`` from one kerbrute ``VALID LOGIN`` line.
+
+    Single source of truth for parsing kerbrute ``passwordspray`` /
+    ``bruteforce`` hits, used by BOTH the live streaming counter and the
+    authoritative end-of-run hit collection so they never diverge. kerbrute
+    wraps the line in ANSI colour codes and a log prefix, e.g. (ESC literal):
+        \x1b[32m2026/... >  [+] VALID LOGIN:\t user@domain.local:Password1\x1b[0m
+    The ``VALID LOGIN:`` marker survives the colour codes; the trailing
+    ``user@domain:password`` is split off it.
+
+    Args:
+        line: One kerbrute output line (ANSI codes tolerated).
+
+    Returns:
+        ``(username, password)`` when the line is a VALID LOGIN with a
+        non-empty username, else ``None``.
+    """
+    stripped = strip_ansi_codes(line).strip()
+    if "VALID LOGIN" not in stripped:
+        return None
+    try:
+        creds = stripped.split("VALID LOGIN:")[1].strip()
+        user_domain, password = creds.split(":", 1)
+        username = user_domain.split("@")[0].strip()
+    except (IndexError, ValueError):
+        return None
+    if not username:
+        return None
+    return username, password
+
+
+# kerbrute prints (with ``-v``) one ``[!] user@domain:pw - reason`` line per
+# attempted-but-failed login and one ``[+] VALID LOGIN`` line per hit. Counting
+# both gives a DETERMINATE ``tested / N`` bar. The ``:`` after the ``user@dom``
+# token (the password) plus the ``@`` distinguish a login attempt line from
+# banner / ``Done!`` noise.
+_KERBRUTE_INVALID_LOGIN_MARKER = "[!]"
+_KERBRUTE_VALID_LOGIN_MARKER = "VALID LOGIN"
+
+
+def _is_kerbrute_login_attempt_line(line: str) -> bool:
+    """True if ``line`` is one attempted-login log line (valid OR invalid).
+
+    Drives the determinate spray ``tested / N`` counter. An attempt line is a
+    ``[+] VALID LOGIN`` hit or a ``[!] user@domain:pw - <reason>`` miss (both
+    emitted under ``-v``); both carry an ``@`` token. Banner / ``Using KDC(s)``
+    / ``Done!`` lines have no ``@`` token and are excluded.
+
+    Args:
+        line: One raw kerbrute output line (ANSI codes tolerated).
+
+    Returns:
+        True when the line represents exactly one tested login.
+    """
+    text = strip_ansi_codes(line)
+    if "@" not in text:
+        return False
+    if _KERBRUTE_VALID_LOGIN_MARKER in text:
+        return True
+    if _KERBRUTE_INVALID_LOGIN_MARKER in text:
+        return True
+    return False
+
+
+def _count_spray_attempt_total(command: str) -> int | None:
+    """Best-effort count of the logins a kerbrute spray will attempt.
+
+    Used as the determinate bar's ``total``. kerbrute spray commands carry the
+    input file (userlist for ``passwordspray``, ``user:pass`` combos for
+    ``bruteforce``, or the userlist after ``--user-as-pass``) as a positional
+    token; its line count is exactly how many logins kerbrute will try. We
+    shlex-split the command and count the lines of the first existing-file
+    token that is not the ``-o`` output file. Fully defensive: any failure
+    returns ``None`` so the dashboard degrades to the indeterminate "found N"
+    spinner rather than showing a wrong total.
+
+    Args:
+        command: The full kerbrute spray command string.
+
+    Returns:
+        The attempt count (>0), or ``None`` when it cannot be determined.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+
+    # kerbrute spray flags that take a VALUE -- the token after each is an
+    # argument, never the positional input file (so it must be skipped). ``-o``
+    # is the output file; ``-d``/``--dc``/``-t``/``--delay`` are config values.
+    _value_flags = {"-o", "-d", "--dc", "-t", "--delay", "--downgrade"}
+    skip_next = False
+    # Token 0 is the kerbrute executable (an existing file on disk!) and token 1
+    # is the subcommand -- never the input wordlist. Start scanning after them.
+    for idx in range(2, len(tokens)):
+        tok = tokens[idx]
+        if skip_next:
+            skip_next = False
+            continue
+        if not tok:
+            continue
+        if tok.startswith("-"):
+            if tok in _value_flags:
+                skip_next = True
+            continue
+        # A positional token: candidate input file. Count its non-blank lines,
+        # but only if it actually looks like a text wordlist (the FIRST 4KB
+        # decode cleanly as UTF-8) -- this rejects a binary mis-token and the
+        # password positional (which is not a path).
+        try:
+            if not os.path.isfile(tok):
+                continue
+            with open(tok, "rb") as bf:
+                head = bf.read(4096)
+            try:
+                head.decode("utf-8")
+            except UnicodeDecodeError:
+                continue  # binary file (e.g. mis-tokenised) -- not a wordlist.
+            with open(tok, encoding="utf-8", errors="strict") as fh:
+                n = sum(1 for line in fh if line.strip())
+            if n > 0:
+                return n
+        except (OSError, UnicodeDecodeError):
+            continue
+    return None
+
+
+# Number of most-recent VALID logins to show in the spray dashboard's
+# bounded "recent found" window. DISPLAY cap only -- every hit is still
+# parsed from the full stdout and persisted to the credential store.
+_SPRAY_RECENT_HITS = 15
+# Bounded concurrency for the native (kerbad) blank-password spray. Each eligible
+# user gets ONE empty-password AS-REQ; the cap keeps big user bases fast without
+# flooding the KDC. Matches the conservative sweep concurrency used elsewhere.
+_BLANK_SPRAY_CONCURRENCY = 16
+# Max rows shown per eligibility table (eligible / excluded) so a 1-2k-user domain
+# does not flood the panel. The full counts are in the header; overflow is noted.
+_ELIGIBILITY_TABLE_LIMIT = 20
+# Conservative lockout threshold assumed for a user whose PSO is assigned but whose
+# PSO OBJECT cannot be read (no access to the Password Settings Container). With the
+# 2-attempt safety margin this caps such users at a SINGLE spray attempt — safe even
+# if their real (unknown) PSO threshold is as low as 3. Privileged Tier-0 accounts
+# are exactly the ones behind unreadable PSOs, so erring safe here is mandatory.
+_UNREADABLE_PSO_FALLBACK_THRESHOLD = 3
+
+
+def _build_spray_dashboard(spray_label: str, total: int | None = None) -> ProgressDashboard:
+    """Spray dashboard driven by kerbrute's streaming stdout.
+
+    kerbrute buffers its ``-o`` file but flushes one log line per attempted
+    login to stdout in real time (with ``-v``), so streaming stdout drives a
+    live counter. Two modes, selected by ``total``:
+
+    * **Determinate** (``total`` = number of logins kerbrute will attempt): a
+      real ``tested / N`` bar + rate + ETA, ticked from the per-attempt lines,
+      with valid hits surfaced in the success-counter row.
+    * **Indeterminate** (``total is None``): spinner + elapsed + "found N
+      logins", ticked from ``[+] VALID LOGIN`` hits only.
+
+    Args:
+        spray_label: Human-readable label for the panel title.
+        total: Login-attempt count for the determinate bar, or ``None``.
+
+    Returns:
+        A configured :class:`ProgressDashboard`.
+    """
+    return ProgressDashboard(
+        ProgressDashboardConfig(
+            title=f"Password Spraying · {spray_label}",
+            total=total if (total and total > 0) else None,
+            unit="logins",
+            last_item_type="user",
+            # Bounded rolling list of the most-recent VALID logins -- a valid
+            # user+password is the high-value spray finding, so surface them
+            # LIVE. The deque(maxlen=K) cap holds the panel at a fixed height
+            # even with hundreds of hits (CLAUDE.md stable-line-count rule).
+            # DISPLAY-ONLY: every hit is still parsed + persisted to the
+            # credential store below.
+            recent_max=_SPRAY_RECENT_HITS,
+            recent_item_type="user",
+            recent_label="found",
+        )
+    )
 
 
 def _summarize_domain_spray_outcomes(log_text: str) -> tuple[list[str], dict[str, int]]:
@@ -1622,6 +1907,11 @@ def _persist_and_record_spray_hits(
         # demand, just without the per-user ccache reuse benefit.
         pass
 
+    # Differentiate the persisted provenance by spray TYPE so the Provenance
+    # column shows the specific mode (username-as-password / blank / pre2k /
+    # custom) instead of a generic "spray".
+    spray_credential_origin = _spray_origin_for_type(spray_type)
+
     if persist_via_add_credential:
         for hit in hits_sorted:
             username = str(hit.get("username") or "").strip()
@@ -1635,7 +1925,7 @@ def _persist_and_record_spray_hits(
                 source_steps=source_steps,
                 prompt_for_user_privs_after=True,
                 allow_empty_credential=allow_empty_credential,
-                credential_origin="spray",
+                credential_origin=spray_credential_origin,
             )
         return
 
@@ -1653,6 +1943,7 @@ def _persist_and_record_spray_hits(
             ],
             source_steps=source_steps,
             discovery_label="sprayed",
+            credential_origin=spray_credential_origin,
         )
 
 
@@ -1758,6 +2049,10 @@ def validate_domain_reuse_with_ntlm_hash(
                 username=username,
                 credential=normalized_hash,
                 is_hash=True,
+            )
+            # NTLM-hash reuse spray bypasses add_credential; tag the provenance.
+            _set_credential_origin(
+                shell, domain=domain, username=username, origin=ORIGIN_CREDENTIAL_REUSE
             )
 
         result["status"] = "success" if hits else "no_hits"
@@ -1887,6 +2182,11 @@ def validate_domain_reuse_with_password(
                 username=username,
                 credential=clear_password,
                 is_hash=False,
+            )
+            # Cleartext SAM->domain reuse bypasses add_credential; tag the
+            # provenance as credential reuse (not a generic spray).
+            _set_credential_origin(
+                shell, domain=domain, username=username, origin=ORIGIN_CREDENTIAL_REUSE
             )
         result["status"] = "success" if deduped_hits else "no_hits"
         return result
@@ -2197,6 +2497,35 @@ def find_already_attempted_combos(
         return {}
 
 
+# Blank-password sprays cannot be tracked by the granular (user, password)
+# history because ``register_user_spray_attempts`` skips empty passwords. Store
+# them under a reserved sentinel password so blank coverage de-dups uniformly
+# through the SAME history dict (no parallel store).
+BLANK_PASSWORD_SENTINEL = "\x00<blank>"
+
+
+def register_blank_spray_attempts(shell: SprayShell, *, domain: str, users: list[str]) -> None:
+    """Record blank-password sprays via the sentinel so blank coverage is tracked."""
+    register_user_spray_attempts(
+        shell,
+        domain=domain,
+        combos=[(u, BLANK_PASSWORD_SENTINEL) for u in users if u],
+        mode="blank",
+    )
+
+
+def blank_already_attempted(
+    shell: SprayShell, *, domain: str, users: list[str]
+) -> set[str]:
+    """Return the casefolded usernames already sprayed with a blank password."""
+    found = find_already_attempted_combos(
+        shell,
+        domain=domain,
+        combos=[(u, BLANK_PASSWORD_SENTINEL) for u in users if u],
+    )
+    return {str(u).casefold() for (u, _p) in found}
+
+
 def confirm_with_history_check(
     shell: SprayShell,
     *,
@@ -2313,17 +2642,30 @@ def _compute_spray_eligibility_pso_aware(
     pso_threshold_by_user: dict[str, int | None],
     safe_remaining_threshold: int,
     no_lockout_enforced: bool,
+    locked_users: set[str] | None = None,
+    pso_source_by_user: dict[str, str] | None = None,
 ) -> SprayEligibilityResult:
     """Compute spray eligibility using per-user PSO-effective lockout thresholds.
 
     For users with a PSO assigned, the PSO's lockoutThreshold overrides the
     domain default.  Users without a PSO fall back to the domain default.
+    ``pso_source_by_user`` maps a user to a human-readable lockout-policy source
+    (e.g. ``"PSO 'TIER0'"`` or ``"PSO 'TIER0' unreadable"``) for the eligibility UX.
     """
-    from adscan_internal.spraying import ExcludedUser  # noqa: PLC0415
+    from adscan_internal.spraying import EligibleUser, ExcludedUser  # noqa: PLC0415
 
     notes: list[str] = []
     eligible: list[str] = []
     excluded: list[ExcludedUser] = []
+    eligible_details: list[EligibleUser] = []
+    pso_source = pso_source_by_user or {}
+
+    def _policy_note(norm: str, threshold: "int | None") -> "str | None":
+        """Per-user lockout-policy label for the eligibility panel (None = domain)."""
+        source = pso_source.get(norm)
+        if not source or source == "domain":
+            return None
+        return f"{source} · thr {threshold}" if threshold is not None else source
 
     if no_lockout_enforced:
         notes.append("No lockout enforced (threshold=0 or None). All users eligible.")
@@ -2337,6 +2679,7 @@ def _compute_spray_eligibility_pso_aware(
             used_policy_data=False,
             notes=notes,
             no_lockout_enforced=True,
+            eligible_details=[EligibleUser(username=u) for u in file_users],
         )
 
     pso_users = sum(1 for u in pso_threshold_by_user if u in badpwd_by_user)
@@ -2345,15 +2688,49 @@ def _compute_spray_eligibility_pso_aware(
             f"PSO-aware eligibility: {pso_users} user(s) have a fine-grained "
             "password policy that overrides the domain default."
         )
+    n_unreadable_pso = sum(
+        1
+        for u in file_users
+        if "unreadable" in (pso_source.get(u.strip().lower()) or "")
+    )
+    if n_unreadable_pso:
+        notes.append(
+            f"{n_unreadable_pso} user(s) have a PSO whose object could not be read "
+            f"(no access to the Password Settings Container) — a conservative "
+            f"lockout threshold of {_UNREADABLE_PSO_FALLBACK_THRESHOLD} was assumed "
+            "so they are capped at a single attempt (cannot accidentally lock a "
+            "stricter Tier-0 account)."
+        )
 
     minimum_remaining: int | None = None
+    locked_lower = locked_users or set()
+    if locked_lower:
+        notes.append(
+            f"{sum(1 for u in file_users if u.strip().lower() in locked_lower)} "
+            "account(s) excluded as currently LOCKED OUT (lockoutTime set)."
+        )
 
     for user in file_users:
         norm = user.strip().lower()
+        # Currently locked-out accounts reset badPwdCount to 0, so they look
+        # 'eligible' — but spraying them is pointless and extends the lockout.
+        if norm in locked_lower:
+            excluded.append(
+                ExcludedUser(
+                    username=user,
+                    reason="Account locked out",
+                    badpwd_count=badpwd_by_user.get(norm),
+                    remaining_attempts=0,
+                )
+            )
+            continue
         effective_threshold = pso_threshold_by_user.get(norm, default_threshold)
         if effective_threshold is None:
             # No threshold data — include conservatively
             eligible.append(user)
+            eligible_details.append(
+                EligibleUser(username=user, policy_note=_policy_note(norm, None))
+            )
             continue
 
         badpwd = badpwd_by_user.get(norm)
@@ -2365,9 +2742,18 @@ def _compute_spray_eligibility_pso_aware(
             )
             continue
 
+        src = pso_source.get(norm) or "domain"
         remaining = effective_threshold - badpwd
         if remaining > safe_remaining_threshold:
             eligible.append(user)
+            eligible_details.append(
+                EligibleUser(
+                    username=user,
+                    badpwd_count=badpwd,
+                    remaining_attempts=remaining,
+                    policy_note=_policy_note(norm, effective_threshold),
+                )
+            )
             minimum_remaining = (
                 remaining
                 if minimum_remaining is None
@@ -2377,8 +2763,10 @@ def _compute_spray_eligibility_pso_aware(
             excluded.append(
                 ExcludedUser(
                     username=user,
-                    reason=f"Too close to lockout (remaining={remaining}, "
-                    f"threshold={'PSO' if norm in pso_threshold_by_user else 'domain'}={effective_threshold})",
+                    reason=(
+                        f"Too close to lockout (remaining={remaining}, "
+                        f"{src} threshold={effective_threshold})"
+                    ),
                     badpwd_count=badpwd,
                     remaining_attempts=remaining,
                 )
@@ -2393,6 +2781,51 @@ def _compute_spray_eligibility_pso_aware(
         minimum_remaining_attempts=minimum_remaining,
         used_policy_data=True,
         notes=notes,
+        eligible_details=eligible_details,
+    )
+
+
+def _exclude_locked_from_result(
+    result: "SprayEligibilityResult | None", locked_users: set[str]
+) -> "SprayEligibilityResult | None":
+    """Move currently locked-out accounts from eligible -> excluded on a result.
+
+    Universal post-step so the locked exclusion applies regardless of which
+    eligibility split produced the result (the PSO-aware path is only taken when
+    PSO objects are readable; when ``pso_count`` is 0 — e.g. the spray user cannot
+    read the PSO container — the non-PSO core split runs instead). Idempotent: a
+    locked user already in ``excluded`` is left as-is.
+    """
+    if not locked_users or result is None:
+        return result
+    from dataclasses import replace  # noqa: PLC0415
+
+    from adscan_internal.spraying import ExcludedUser  # noqa: PLC0415
+
+    locked = {str(u).casefold() for u in locked_users}
+    kept = [u for u in result.eligible_users if str(u).casefold() not in locked]
+    if len(kept) == len(result.eligible_users):
+        return result  # none of the eligible are locked
+    newly_excluded = [
+        ExcludedUser(
+            username=u,
+            reason="Account locked out",
+            badpwd_count=None,
+            remaining_attempts=0,
+        )
+        for u in result.eligible_users
+        if str(u).casefold() in locked
+    ]
+    # SprayEligibilityResult is frozen — rebuild via replace().
+    return replace(
+        result,
+        eligible_users=kept,
+        eligible_details=[
+            e
+            for e in result.eligible_details
+            if str(e.username).casefold() not in locked
+        ],
+        excluded_users=list(result.excluded_users) + newly_excluded,
     )
 
 
@@ -2427,6 +2860,14 @@ def compute_spraying_eligibility(
     pdc_ip = shell.domains_data[domain]["pdc"]
     marked_domain = mark_sensitive(domain, "domain")
 
+    # Exclude already-owned principals from the spray set: spraying an account we
+    # already control yields no new access, adds badPwdCount noise, and — because
+    # authenticating as that account (e.g. password-policy enumeration) resets its
+    # badPwdCount — would otherwise keep it perpetually "eligible" and re-sprayed.
+    # Centralized here (the eligibility SSOT) so the spray, the coverage
+    # denominator, and the selector all exclude owned users consistently.
+    file_users = _drop_owned(shell, domain, file_users, context="eligibility")
+
     lockout_threshold = None
     badpwd_by_user = None
     no_lockout_enforced = False
@@ -2435,6 +2876,12 @@ def compute_spraying_eligibility(
         f"Starting spray eligibility computation for {marked_domain} "
         f"(safe remaining threshold={safe_threshold}, users in list={len(file_users)})."
     )
+
+    # Captured once the native policy fetch succeeds; applied as a universal
+    # post-step to whichever eligibility split runs (the PSO-aware split is only
+    # reached when PSO objects are readable, so the non-PSO core split must exclude
+    # locked accounts too). Empty for the NetExec fallback / no-policy paths.
+    locked_users_for_result: set[str] = set()
 
     if is_auth:
         auth_domain: str | None = None
@@ -2488,6 +2935,7 @@ def compute_spraying_eligibility(
             )
 
             if not spray_policy.fetch_errors:
+                locked_users_for_result = spray_policy.locked_users
                 dp = spray_policy.default_policy
                 lockout_threshold = dp.lockout_threshold
                 no_lockout_enforced = dp.no_lockout_enforced or lockout_threshold == 0
@@ -2534,14 +2982,26 @@ def compute_spraying_eligibility(
                             + "."
                         )
 
-                        # Store PSO data on eligibility result via custom compute path
-                        if pso_assigned and pso_count:
-                            # Build per-user effective lockout threshold for PSO users
+                        # Per-user PSO-aware eligibility. Gated on pso_assigned (NOT
+                        # pso_count): when a user has a PSO whose OBJECT we cannot
+                        # read (no access to the Password Settings Container), we
+                        # must NOT silently fall back to the domain threshold — a
+                        # stricter PSO would be over-estimated and a spray could lock
+                        # the account. lockout_threshold_with_source() returns the
+                        # readable PSO threshold, or a conservative fallback for
+                        # unreadable PSOs, plus a human-readable source for the UX.
+                        if pso_assigned:
                             pso_effective: dict[str, int | None] = {}
+                            pso_source: dict[str, str] = {}
                             for u in spray_policy.pso_dn_by_user:
-                                pso_effective[u] = (
-                                    spray_policy.effective_lockout_threshold(u)
+                                thr, source, _is_fallback = (
+                                    spray_policy.lockout_threshold_with_source(
+                                        u,
+                                        unreadable_pso_fallback=_UNREADABLE_PSO_FALLBACK_THRESHOLD,
+                                    )
                                 )
+                                pso_effective[u] = thr
+                                pso_source[u] = source
 
                             return _compute_spray_eligibility_pso_aware(
                                 file_users=file_users,
@@ -2550,6 +3010,8 @@ def compute_spraying_eligibility(
                                 pso_threshold_by_user=pso_effective,
                                 safe_remaining_threshold=safe_threshold,
                                 no_lockout_enforced=no_lockout_enforced,
+                                locked_users=spray_policy.locked_users,
+                                pso_source_by_user=pso_source,
                             )
                     else:
                         print_warning_verbose(
@@ -2667,13 +3129,16 @@ def compute_spraying_eligibility(
                 "current domain context is not authenticated."
             )
 
-    return compute_spray_eligibility(
-        file_users=file_users,
-        lockout_threshold=lockout_threshold,
-        badpwd_by_user=badpwd_by_user,
-        safe_remaining_threshold=safe_threshold,
-        no_lockout_enforced=no_lockout_enforced,
-        strict_missing_badpwd=True,
+    return _exclude_locked_from_result(
+        compute_spray_eligibility(
+            file_users=file_users,
+            lockout_threshold=lockout_threshold,
+            badpwd_by_user=badpwd_by_user,
+            safe_remaining_threshold=safe_threshold,
+            no_lockout_enforced=no_lockout_enforced,
+            strict_missing_badpwd=True,
+        ),
+        locked_users_for_result,
     )
 
 
@@ -2925,6 +3390,9 @@ def print_spraying_eligibility(
     n_eligible = len(eligibility.eligible_users)
     n_excluded = len(eligibility.excluded_users)
     n_total = len(eligibility.input_users)
+    n_locked = sum(
+        1 for e in eligibility.excluded_users if e.reason == "Account locked out"
+    )
 
     eligible_text = Text()
     eligible_text.append("  Domain: ", style="dim")
@@ -2936,8 +3404,12 @@ def print_spraying_eligibility(
     )
     eligible_text.append(f" / {n_total} total", style="dim")
     if n_excluded > 0:
+        if n_locked > 0:
+            breakdown = f"{n_locked} locked out, {n_excluded - n_locked} near lockout"
+        else:
+            breakdown = "see table below"
         eligible_text.append(
-            f"  ({n_excluded} excluded — see table below)",
+            f"  ({n_excluded} excluded — {breakdown})",
             style=f" {COLOR_AMBER}",
         )
     eligible_text.append("\n")
@@ -3007,6 +3479,64 @@ def print_spraying_eligibility(
             )
             return False
 
+    # ── Eligible accounts table (these WILL be sprayed) ──────────────────────
+    # Surfaced with the same shape as the excluded table so the operator can see
+    # exactly which accounts get sprayed and their current lockout headroom — not
+    # just the excluded ones. Capped + colour-coded (green) to distinguish from
+    # the excluded (amber) table.
+    if eligibility.eligible_users:
+        from rich.box import MINIMAL as _BOX_MINIMAL
+        from adscan_internal.spraying import EligibleUser as _EligibleUser
+
+        elig_table = Table(
+            title=Text(
+                f"Eligible accounts ({n_eligible}) — these WILL be sprayed",
+                style=f"dim {COLOR_SAGE}",
+            ),
+            show_lines=False,
+            box=_BOX_MINIMAL,
+            header_style="dim",
+        )
+        elig_table.add_column("User", style=COLOR_SAGE)
+        elig_table.add_column("BadPwdCount", justify="right", style="dim")
+        elig_table.add_column("Remaining", justify="right", style="dim")
+        elig_table.add_column("Lockout policy", style="dim")
+
+        elig_details = eligibility.eligible_details or [
+            _EligibleUser(username=u) for u in eligibility.eligible_users
+        ]
+        elig_preview = elig_details[:_ELIGIBILITY_TABLE_LIMIT]
+        for elig in elig_preview:
+            marked_user = mark_sensitive(elig.username, "user")
+            badpwd_str = (
+                str(elig.badpwd_count) if elig.badpwd_count is not None else "-"
+            )
+            remaining_str = (
+                str(elig.remaining_attempts)
+                if elig.remaining_attempts is not None
+                else "-"
+            )
+            # Non-domain (PSO) policy is highlighted; an unreadable PSO using the
+            # conservative fallback is amber so it stands out as a safety estimate.
+            policy = getattr(elig, "policy_note", None) or "domain"
+            policy_style = (
+                COLOR_AMBER
+                if "unreadable" in policy
+                else (COLOR_MUTED if policy == "domain" else COLOR_SAGE)
+            )
+            elig_table.add_row(
+                marked_user,
+                badpwd_str,
+                remaining_str,
+                Text(policy, style=policy_style),
+            )
+        print_table(elig_table)
+        if len(elig_details) > len(elig_preview):
+            print_info_verbose(
+                f"Eligible users total: {len(elig_details)} "
+                f"(showing first {len(elig_preview)})."
+            )
+
     if eligibility.excluded_users:
         from rich.box import MINIMAL as _BOX_MINIMAL
 
@@ -3024,7 +3554,7 @@ def print_spraying_eligibility(
         excl_table.add_column("BadPwdCount", justify="right", style="dim")
         excl_table.add_column("Remaining", justify="right", style="dim")
 
-        preview = eligibility.excluded_users[:20]
+        preview = eligibility.excluded_users[:_ELIGIBILITY_TABLE_LIMIT]
         for excluded in preview:
             marked_user = mark_sensitive(excluded.username, "user")
             badpwd_str = (
@@ -3044,6 +3574,15 @@ def print_spraying_eligibility(
             )
         if not eligibility.eligible_users:
             return True
+        # Locked accounts are auto-excluded (they cannot be sprayed at all) — that
+        # is not a decision the operator needs to confirm, so it must not trigger
+        # the "continue?" prompt. Only prompt when accounts were held back for
+        # SAFETY (near lockout / no policy data) — i.e. non-locked exclusions.
+        non_locked_excluded = [
+            e for e in eligibility.excluded_users if e.reason != "Account locked out"
+        ]
+        if not non_locked_excluded:
+            return True
         if getattr(shell, "auto", False):
             print_info_debug(
                 "[eligibility] Auto mode detected; continuing without excluded-user confirmation."
@@ -3051,7 +3590,8 @@ def print_spraying_eligibility(
             return True
         return bool(
             Confirm.ask(
-                "Some accounts were excluded from this spray attempt. Continue with the eligible users only?",
+                f"{len(non_locked_excluded)} account(s) were held back for safety "
+                "(near lockout). Continue with the eligible users only?",
                 default=True,
             )
         )
@@ -3849,7 +4389,14 @@ def ask_for_spraying(shell: SprayShell, domain: str) -> None:
     if wants_spraying:
         if shell.domains_data[domain]["auth"] == "auth":
             shell.ask_for_pass_policy(domain)
-        do_spraying(shell, domain)
+        # Phase 4 uses the coverage-driven continue-loop (maximum coverage for ci,
+        # default-yes guided flow for interactive start). The legacy do_spraying
+        # menu stays available for manual / power-user invocation.
+        from adscan_internal.interaction import is_non_interactive
+
+        run_spray_coverage(
+            shell, domain, interactive=not is_non_interactive(shell)
+        )
         return
 
     ux_state["initial_declined"] = True
@@ -5680,14 +6227,23 @@ def spraying_with_blank_password(
     source_steps: list[object] | None = None,
     entry_label: str | None = None,
 ) -> None:
-    """Perform a blank-password spray against the selected domain."""
-    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
+    """Native (kerbad) blank-password spray over the eligible user base.
 
-    if not getattr(shell, "netexec_path", None):
-        print_error(
-            "NetExec is not installed or configured. Please run 'adscan install'."
-        )
-        return
+    Migrated off NetExec/SMB to the native Kerberos stack (kerbad AS-REQ with an
+    empty password). Validated against GOAD/Essos: detects a genuinely blank
+    account AND does NOT false-positive a DONT_REQ_PREAUTH account (kerbrute/gokrb5
+    cannot test blank at all — it rejects an empty password client-side). Drives
+    the SAME centralized live dashboard the kerbrute sprays use, so big user bases
+    show live progress / rate / ETA / found-hits. Bounded concurrency keeps it fast
+    at scale; each eligible user gets exactly ONE empty-password attempt, within the
+    2-attempt lockout margin the eligibility computation already enforces.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+    from adscan_internal.services.blank_password_native import (  # noqa: PLC0415
+        check_blank_password,
+    )
 
     eligibility = _prepare_password_spraying_eligibility(
         shell,
@@ -5699,47 +6255,107 @@ def spraying_with_blank_password(
     )
     if eligibility is None:
         return
-    if not eligibility.eligible_users:
+    users = list(eligibility.eligible_users)
+    if not users:
         print_warning(
             "No eligible users available for spraying with the current safety rules."
         )
         return
 
-    auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
-    is_auth = auth_state in {"auth", "pwned"}
-    kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
-    temp_users_path = write_temp_users_file(
-        list(eligibility.eligible_users), directory=kerberos_output_dir
-    )
+    domain_data = shell.domains_data.get(domain, {}) or {}
+    kdc_ip = resolve_dc_ip(domain_data) or domain_data.get("pdc")
+    if not kdc_ip:
+        print_error("No KDC/DC IP resolved for blank-password spraying.")
+        return
+
+    posture_snapshot = None
     try:
-        output_file = os.path.join(
-            "domains",
-            domain,
-            "smb",
-            "auth_spray_blank.log" if is_auth else "unauth_spray_blank.log",
-        )
-        netexec_cmd = build_netexec_password_spray_command(
-            nxc_path=shell.netexec_path,
-            dc_ip=shell.domains_data[domain]["pdc"],
-            users_file=temp_users_path,
-            password="",
-            domain=domain,
-            log_file=output_file,
-        )
-        netexec_spraying_command(
+        from adscan_internal.services.domain_posture import get_posture  # noqa: PLC0415
+
+        posture_snapshot = get_posture(shell.domains_data, domain=domain)
+    except Exception:  # noqa: BLE001 — posture is optional
+        posture_snapshot = None
+
+    dashboard = _build_spray_dashboard("Blank Password (Kerberos)", total=len(users))
+    hits: list[str] = []
+    state = {"tested": 0, "errors": 0, "in_flight": 0}
+    sem = asyncio.Semaphore(_BLANK_SPRAY_CONCURRENCY)
+
+    async def _check_one(user: str) -> None:
+        async with sem:
+            state["in_flight"] += 1
+            try:
+                result = await check_blank_password(
+                    domain=domain,
+                    username=user,
+                    kdc_ip=kdc_ip,
+                    posture_snapshot=posture_snapshot,
+                )
+            finally:
+                state["in_flight"] -= 1
+        state["tested"] += 1
+        if result is True:
+            hits.append(user)
+            try:
+                dashboard.record_recent(user, push_frame=True)  # masked at render
+            except Exception:  # noqa: BLE001 — render must not abort the spray
+                pass
+        elif result is None:
+            state["errors"] += 1
+        # A hit forces an immediate frame; otherwise coalesce to ~every 20 to
+        # avoid thrashing the render on big user bases.
+        if result is True or state["tested"] % 20 == 0 or state["tested"] == len(users):
+            try:
+                dashboard.update(
+                    done=state["tested"],
+                    success=len(hits),
+                    error=state["errors"],
+                    in_flight=max(0, state["in_flight"]),
+                    last=user,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _run() -> None:
+        await asyncio.gather(*[_check_one(u) for u in users], return_exceptions=True)
+
+    try:
+        with dashboard.live_session():
+            asyncio.run(_run())
+            try:
+                dashboard.update(
+                    done=state["tested"], success=len(hits), error=state["errors"], in_flight=0
+                )
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as exc:  # noqa: BLE001 — streaming/LiveSession setup failed
+        telemetry.capture_exception(exc)
+
+    # Persist hits through the centralized path (credential store + TGT mint +
+    # attack-graph provenance), then record the blank sentinel for coverage de-dup.
+    if hits:
+        _persist_and_record_spray_hits(
             shell,
-            netexec_cmd,
-            domain,
+            domain=domain,
+            hits=[{"username": u, "password": ""} for u in hits],
             spray_type="Blank Password",
             entry_label=entry_label,
             source_context=source_context,
             source_steps=source_steps,
+            persist_via_add_credential=True,
+            allow_empty_credential=True,
         )
-    finally:
-        try:
-            os.remove(temp_users_path)
-        except OSError:
-            pass
+    register_blank_spray_attempts(shell, domain=domain, users=users)
+
+    if hits:
+        marked = ", ".join(mark_sensitive(u, "user") for u in hits[:_SPRAY_RECENT_HITS])
+        print_success(
+            f"Blank-password spray: {len(hits)} account(s) with an EMPTY password — {marked}"
+        )
+    else:
+        print_info(
+            "Blank-password spray complete: no accounts with an empty password."
+        )
 
 
 def _normalize_spray_type_key(spray_type: str | None) -> str:
@@ -5757,6 +6373,42 @@ def _normalize_spray_type_key(spray_type: str | None) -> str:
         "computer pre2k": "computer_pre2k",
     }
     return aliases.get(normalized, normalized)
+
+
+def _spray_origin_for_type(spray_type: str | None) -> str:
+    """Map a spray-type label to its specific credential-origin slug.
+
+    The slug equals the matching ``attack_step_catalog`` entry-vector join key
+    where one exists (``useraspass`` / ``blankpassword`` / ``computerpre2k`` /
+    ``passwordspray``) so provenance and the attack step share a single join.
+    Any unrecognized / non-determinable mode falls back to the generic
+    ``spray`` origin rather than guessing.
+
+    Args:
+        spray_type: Human-readable spray method label (e.g. ``"Blank Password"``,
+            ``"Username as Password (lowercase)"``, ``"Computer Pre2k"``).
+
+    Returns:
+        Canonical origin slug for that spray mode.
+    """
+    mode_key = _normalize_spray_type_key(spray_type)
+    if mode_key in {"useraspass", "useraspass_lower", "useraspass_upper"}:
+        return ORIGIN_USERNAME_AS_PASSWORD
+    if mode_key == "blank_password":
+        return ORIGIN_BLANK_PASSWORD
+    if mode_key == "computer_pre2k":
+        return ORIGIN_COMPUTER_PRE2K
+    if mode_key in {
+        "custom_password",
+        "combined password spray",
+        "adaptive year password",
+        "batch password",
+        "bruteforce",
+        "near-threshold",
+    }:
+        return ORIGIN_PASSWORD_SPRAY
+    # Determinable nothing else — keep the generic spray origin.
+    return ORIGIN_SPRAY
 
 
 def execute_password_spray_attack_step(
@@ -6373,6 +7025,7 @@ def retry_pending_domain_reuse_validation(shell: SprayShell, domain: str) -> lis
             domain=domain,
             hits=validated_domain_hits,
             discovery_label="validated",
+            credential_origin=ORIGIN_CREDENTIAL_REUSE,
         )
     pending_path = _remove_pending_domain_reuse_candidates(
         shell,
@@ -6475,6 +7128,139 @@ def netexec_spraying_command(
     )
 
 
+def _run_spray_with_dashboard(
+    shell: SprayShell,
+    *,
+    command: str,
+    spray_label: str,
+    use_clean_env: bool,
+) -> "subprocess.CompletedProcess[str] | None":
+    """Run a kerbrute spray LIVE under a streaming progress dashboard.
+
+    Streams kerbrute's stdout via the shared :func:`stream_command_lines`
+    (which spawns through ``shell.spawn_command`` -- preserving the PyInstaller
+    clean-env handling -- and drains the remaining output). When the number of
+    logins to attempt can be derived from the command's input file, this drives
+    a DETERMINATE ``tested / N`` bar (ticked from every ``[!]``/``[+] VALID
+    LOGIN`` per-attempt line kerbrute emits under ``-v``, with valid hits in the
+    success-counter row); otherwise it degrades to a "found N logins" spinner.
+    Spray has no timeout (it can run long), so ``timeout_seconds=None``.
+
+    FAIL-SAFE: if the dashboard cannot be built or the process cannot be
+    spawned, falls back to the buffered ``shell.run_command`` path so the
+    spray always completes and downstream result handling is never skipped.
+
+    Args:
+        shell: Active shell exposing ``spawn_command`` + ``run_command``.
+        command: Full kerbrute command string (already shell-quoted).
+        spray_label: Human-readable label for the dashboard title.
+        use_clean_env: Whether the command needs a clean env (buffered path).
+
+    Returns:
+        A CompletedProcess-shaped result (``StreamedProcessResult`` on the
+        streaming path, ``subprocess.CompletedProcess`` on the fallback), or
+        ``None`` if even the fallback could not execute.
+    """
+
+    def _buffered() -> "subprocess.CompletedProcess[str] | None":
+        # Heartbeat spinner so a non-streaming run still shows it is alive
+        # (tui-design Anti-Pattern #8). No-op on non-TTY per rich.Console.
+        from adscan_core.output._state import _get_console
+        _console = _get_console()
+        with _console.status(
+            f"[bold {ADSCAN_PRIMARY}]Spraying {spray_label} …[/bold {ADSCAN_PRIMARY}] "
+            "[dim](kerbrute streaming, results render when complete)[/dim]",
+            spinner="dots",
+        ):
+            return shell.run_command(
+                command,
+                timeout=None,  # No timeout for spraying (can take a long time)
+                shell=True,
+                capture_output=True,
+                text=True,
+                use_clean_env=use_clean_env,
+            )
+
+    # Determinate total = number of logins kerbrute will attempt (input-file
+    # line count). None -> the dashboard degrades to the "found N" spinner.
+    total = _count_spray_attempt_total(command)
+
+    try:
+        dashboard = _build_spray_dashboard(spray_label, total)
+    except Exception:  # noqa: BLE001 -- dashboard build must never block spray
+        return _buffered()
+
+    determinate = bool(total and total > 0)
+    hits_seen: set[str] = set()
+    state = {"tested": 0}
+
+    def _on_line(line: str) -> None:
+        if not _is_kerbrute_login_attempt_line(line):
+            return
+        state["tested"] += 1
+
+        current_user: str | None = None
+        parsed_login = _parse_kerbrute_valid_login_line(line)
+        if parsed_login is not None:
+            username, _password = parsed_login
+            current_user = username
+            if username.lower() not in hits_seen:
+                # Feed the RAW username into the bounded "recent found" window
+                # (masked at render -- TeeConsole invariant) and force an
+                # immediate frame: a valid login is the headline finding. The
+                # dashboard caps the displayed rows; the authoritative capture
+                # is the full-stdout re-parse + credential store downstream.
+                try:
+                    dashboard.record_recent(username, push_frame=True)
+                except Exception:  # noqa: BLE001 -- render must not abort spray
+                    pass
+            hits_seen.add(username.lower())
+
+        # Coalesce frames to one per 100 attempts so a huge spray does not
+        # thrash the render; a valid hit always forces an immediate frame so
+        # "found N" never lags.
+        if not (parsed_login is not None or state["tested"] % 100 == 0):
+            return
+        try:
+            # Feed the RAW username (masked at render -- CLAUDE.md TeeConsole).
+            if determinate:
+                dashboard.update(
+                    done=state["tested"],
+                    success=len(hits_seen),
+                    last=current_user,
+                )
+            else:
+                dashboard.update(done=len(hits_seen), last=current_user)
+        except Exception:  # noqa: BLE001 -- render must not abort the spray
+            pass
+
+    def _on_drain() -> None:
+        # Snap the bar to the final tested count on clean close.
+        try:
+            if determinate:
+                dashboard.update(done=state["tested"], success=len(hits_seen))
+            else:
+                dashboard.update(done=len(hits_seen))
+        except Exception:  # noqa: BLE001 -- final frame is best-effort
+            pass
+
+    try:
+        with dashboard.live_session():
+            streamed = stream_command_lines(
+                shell.spawn_command,
+                command=command,
+                timeout_seconds=None,
+                on_line=_on_line,
+                on_drain=_on_drain,
+            )
+        if streamed is not None:
+            return streamed
+        # spawn returned None -- fall back to the buffered path.
+        return _buffered()
+    except Exception:  # noqa: BLE001 -- streaming/LiveSession setup failed
+        return _buffered()
+
+
 def execute_spraying_command(
     shell: SprayShell,
     command: str,
@@ -6502,8 +7288,6 @@ def execute_spraying_command(
     _spinner_label = " ".join(_spinner_label_parts)
 
     try:
-        # Use run_command instead of spawn_command to avoid output interleaving
-        # run_command automatically handles clean_env and provides better error handling
         use_clean_env = command_string_needs_clean_env(command)
         marked_domain = mark_sensitive(domain, "domain")
         print_info_debug(
@@ -6511,25 +7295,20 @@ def execute_spraying_command(
             f"use_clean_env={use_clean_env} on domain {marked_domain}"
         )
 
-        # Heartbeat spinner so the operator sees progress, not a frozen TTY
-        # (tui-design Anti-Pattern #8: Blocking UI during operations). The
-        # spinner is a no-op on non-TTY (CI, piped output) per rich.Console.
-        from adscan_core.output._state import _get_console
-        _console = _get_console()
-        _status_cm = _console.status(
-            f"[bold {ADSCAN_PRIMARY}]Spraying {_spinner_label} …[/bold {ADSCAN_PRIMARY}] "
-            "[dim](kerbrute streaming, results render when complete)[/dim]",
-            spinner="dots",
+        # Stream kerbrute's stdout so the "found N logins" counter advances
+        # DURING the spray. kerbrute buffers its ``-o`` file but flushes one
+        # ``[+] VALID LOGIN`` line per hit to stdout in real time (confirmed in
+        # lab), so streaming stdout is the reliable live source. The full
+        # stdout is still drained and re-parsed below so the authoritative hit
+        # collection + returncode handling are byte-for-byte unchanged.
+        # FAIL-SAFE: if the dashboard or spawn fails, fall back to the buffered
+        # run_command path so the spray always completes.
+        completed_process = _run_spray_with_dashboard(
+            shell,
+            command=command,
+            spray_label=_spinner_label,
+            use_clean_env=use_clean_env,
         )
-        with _status_cm:
-            completed_process = shell.run_command(
-                command,
-                timeout=None,  # No timeout for spraying (can take a long time)
-                shell=True,
-                capture_output=True,
-                text=True,
-                use_clean_env=use_clean_env,
-            )
 
         if completed_process is None:
             print_error("Failed to execute password spraying command")
@@ -6543,7 +7322,9 @@ def execute_spraying_command(
         output_lines = output.splitlines() if output else []
 
         hits_by_user: dict[str, dict[str, str]] = {}
-        # Process output to find valid logins (batch).
+        # Authoritative hit collection: re-parse the full streamed stdout via
+        # the shared single-source parser (identical to the pre-streaming
+        # batch parse, so persisted hits are unchanged).
         for line in output_lines:
             line_stripped = line.strip()
             if not line_stripped:
@@ -6553,11 +7334,10 @@ def execute_spraying_command(
                 continue
 
             try:
-                creds = line_stripped.split("VALID LOGIN:")[1].strip()
-                user_domain, password = creds.split(":", 1)
-                username = user_domain.split("@")[0].strip()
-                if not username:
+                parsed_login = _parse_kerbrute_valid_login_line(line_stripped)
+                if parsed_login is None:
                     continue
+                username, password = parsed_login
                 key = username.lower()
                 hits_by_user.setdefault(
                     key, {"username": username, "password": password}
@@ -6779,6 +7559,10 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
     )
 
     computer_sams = _load_enabled_computer_sams(shell, domain)
+    # Exclude machine accounts we already own (e.g. a previously-cracked pre2k
+    # computer): re-spraying an owned machine account is pointless. Same
+    # centralized owned-exclusion as the user sprays, tolerant of the '$' suffix.
+    computer_sams = _drop_owned(shell, domain, computer_sams, context="pre2k")
     if not computer_sams:
         print_warning("No enabled computers available for pre2k checks.")
         return
@@ -6862,3 +7646,519 @@ def should_proceed_with_repeated_spraying(
 ) -> bool:
     """Public wrapper for checking if repeated spraying should proceed."""
     return not _has_recommended_spraying_attempt(shell, domain)
+
+
+# ── Spray phase orchestration (two-step, lockout-aware, coverage-driven) ───────
+# Phase 6 runs in TWO steps:
+#   Step 1 — pre2k computer-account spray, behind an educational panel + confirm
+#            (default yes; ci auto-yes). Computer accounts never lock, so it leads
+#            the phase, but the operator always sees what it is and why first.
+#   Step 2 — a coverage-aware spray SELECTOR loop over the three ci spray types
+#            (user-as-password -> owned-credential reuse -> blank), each showing
+#            live coverage %. Interactive: the operator picks from the selector,
+#            which re-appears after each spray (full control). ci: an auto-pick
+#            walks the priority order, SKIPPING fully-covered types and types with
+#            zero eligible users, and exits when none remain (deterministic; the
+#            iteration cap is a hard backstop against any loop). Two extra
+#            interactive-only entries (custom password, retry found/share passwords)
+#            never enter the ci auto-pick. Per-type eligibility + the 2-attempt
+#            lockout margin + per-combo de-dup are still owned by the executors.
+_SPRAY_CI_TYPES: tuple[str, ...] = ("useraspass", "reuse", "blank")
+_SPRAY_TYPE_LABEL: dict[str, str] = {
+    "useraspass": "user-as-password",
+    "reuse": "owned-credential reuse",
+    "blank": "blank password",
+}
+_SPRAY_SELECTOR_MAX_ITER = 16  # hard backstop against any selector loop
+
+
+def _owned_cleartext_passwords(
+    shell: "SprayShell", domain: str
+) -> list[tuple[str, str]]:
+    """Distinct cleartext owned credentials as ``(owner_user, password)``.
+
+    NT hashes are skipped (not reused as cleartext); duplicates are collapsed by
+    password so the same secret is sprayed once across the user base.
+    """
+    creds = (shell.domains_data.get(domain, {}) or {}).get("credentials", {}) or {}
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for user, secret in (creds.items() if isinstance(creds, dict) else []):
+        pwd = str(secret or "")
+        if not pwd or pwd in seen:
+            continue
+        try:
+            if shell.is_hash(pwd):
+                continue
+        except Exception:  # noqa: BLE001 — is_hash is best-effort
+            pass
+        seen.add(pwd)
+        out.append((str(user), pwd))
+    return out
+
+
+def _owned_usernames(shell: "SprayShell", domain: str) -> set[str]:
+    """Casefolded set of principals we already hold a domain credential for.
+
+    Spraying an account we already own is pointless (no new access), adds
+    badPwdCount noise, and — because authenticating as that account (e.g.
+    password-policy enumeration) resets its badPwdCount to 0 — would keep it
+    perpetually "eligible" and re-sprayed across cycles. ANY stored secret
+    (cleartext OR NT hash) means the account is owned, so the presence of the
+    credential key is what counts.
+    """
+    creds = (shell.domains_data.get(domain, {}) or {}).get("credentials", {}) or {}
+    if not isinstance(creds, dict):
+        return set()
+    return {str(user).casefold() for user in creds}
+
+
+def _drop_owned(
+    shell: "SprayShell", domain: str, names, *, context: str
+) -> list[str]:
+    """Return ``names`` minus already-owned principals — the SINGLE owned-exclusion
+    point for EVERY spray path (user sprays AND pre2k computer-account sprays).
+
+    Matching is case-insensitive and tolerant of the trailing ``$`` on machine
+    accounts, so a cracked ``WS01$`` in the credential store excludes both
+    ``WS01$`` (pre2k list) and ``WS01``. ``context`` only labels the debug line.
+    """
+    items = list(names)
+    owned = _owned_usernames(shell, domain)
+    if not owned:
+        return items
+    owned_bare = {name.rstrip("$") for name in owned}
+    kept = [
+        name
+        for name in items
+        if str(name).casefold() not in owned
+        and str(name).casefold().rstrip("$") not in owned_bare
+    ]
+    skipped = len(items) - len(kept)
+    if skipped:
+        print_info_debug(
+            f"[spray] {context}: excluded {skipped} already-owned principal(s) "
+            f"from the spray set for {mark_sensitive(domain, 'domain')}"
+        )
+    return kept
+
+
+def _eligible_remaining_count(eligible_users, covered_lower: set[str]) -> int:
+    """Eligible users not yet covered for a type (covered_lower is casefolded)."""
+    return sum(1 for u in eligible_users if u.casefold() not in covered_lower)
+
+
+def _coverage_row(spray_type: str, *, planned: int, covered: int, eligible: int) -> dict:
+    pct = int(round(covered / planned * 100)) if planned else 100
+    return {
+        "type": spray_type,
+        "planned": int(planned),
+        "covered": int(covered),
+        "pct": max(0, min(100, pct)),
+        "eligible": int(eligible),
+    }
+
+
+def _compute_spray_coverage_overview(shell: "SprayShell", domain: str):
+    """Compute per-type coverage rows + live eligibility. Read-only; None on failure.
+
+    Coverage is measured against the granular per-(user,password) spray history:
+      * user-as-password — covered for a user if ANY case mode (normal / lower /
+        upper) was already tried (one mode suffices, per the design).
+      * owned-credential reuse — only present when a cleartext credential is held;
+        a user is covered only when EVERY owned password was tried.
+      * blank — covered when the blank sentinel was tried for the user.
+    ``eligible`` is the count of lockout-safe users still uncovered for that type.
+    """
+    try:
+        auth_state = str(shell.domains_data.get(domain, {}).get("auth", "")).strip().lower()
+        requires_auth = auth_state in {"auth", "pwned"}
+        user_list = get_spraying_user_list_path(shell, domain, requires_auth)
+        if not user_list:
+            return None
+        eligibility = compute_spraying_eligibility(
+            shell,
+            domain=domain,
+            user_list_file=user_list,
+            safe_threshold=2 if requires_auth else 0,
+        )
+        if eligibility is None:
+            return None
+
+        eligible_users = list(eligibility.eligible_users)
+        # Locked-out accounts can NEVER be sprayed, so they must not inflate the
+        # coverage denominator (a locked account would make a type un-completable)
+        # nor count as "near lockout". Near-lockout / no-data exclusions DO stay in
+        # the denominator — they are coverable once their window resets.
+        non_locked_excluded = [
+            e for e in eligibility.excluded_users if e.reason != "Account locked out"
+        ]
+        all_users = eligible_users + [e.username for e in non_locked_excluded]
+        owned = _owned_cleartext_passwords(shell, domain)
+        owned_pwds = [pwd for (_owner, pwd) in owned]
+        threshold = eligibility.lockout_threshold
+        lockout_disabled = (not threshold) or int(threshold) <= 0
+        near_lockout = len(non_locked_excluded)
+
+        rows: list[dict] = []
+
+        # user-as-password — any case variant counts as covered for that user.
+        uap_combos: list[tuple[str, str]] = []
+        for user in all_users:
+            uap_combos += [(user, user), (user, user.lower()), (user, user.capitalize())]
+        uap_hist = find_already_attempted_combos(shell, domain=domain, combos=uap_combos)
+        uap_covered = {ku.casefold() for (ku, _p) in uap_hist}
+        rows.append(
+            _coverage_row(
+                "useraspass",
+                planned=len(all_users),
+                covered=len(uap_covered),
+                eligible=_eligible_remaining_count(eligible_users, uap_covered),
+            )
+        )
+
+        # owned-credential reuse — only when we actually hold a cleartext credential.
+        if owned_pwds:
+            owned_combos = [(u, p) for u in all_users for p in owned_pwds]
+            owned_hist = find_already_attempted_combos(
+                shell, domain=domain, combos=owned_combos
+            )
+            owned_covered_users = {
+                u.casefold()
+                for u in all_users
+                if all((u, p) in owned_hist for p in owned_pwds)
+            }
+            rows.append(
+                _coverage_row(
+                    "reuse",
+                    planned=len(all_users) * len(owned_pwds),
+                    covered=len(owned_hist),
+                    eligible=_eligible_remaining_count(eligible_users, owned_covered_users),
+                )
+            )
+
+        # blank password
+        blank_covered = blank_already_attempted(shell, domain=domain, users=all_users)
+        rows.append(
+            _coverage_row(
+                "blank",
+                planned=len(all_users),
+                covered=len(blank_covered),
+                eligible=_eligible_remaining_count(eligible_users, blank_covered),
+            )
+        )
+
+        return {
+            "rows": rows,
+            "eligibility": eligibility,
+            "owned": owned,
+            "owned_pwds": owned_pwds,
+            "threshold": threshold,
+            "margin": 2,
+            "near_lockout": near_lockout,
+            "lockout_disabled": lockout_disabled,
+        }
+    except Exception as exc:  # noqa: BLE001 — overview must never block spraying
+        telemetry.capture_exception(exc)
+        return None
+
+
+def _run_pre2k_step(shell: "SprayShell", domain: str, *, interactive: bool) -> None:
+    """Step 1 — educational pre2k computer-account spray (gated, default yes).
+
+    Deduped persistently: once pre2k has been attempted in this workspace
+    (``_pre2k_already_attempted`` — survives re-entry), it is not auto-re-offered.
+    In ci it is skipped as covered; interactively the operator can still force a
+    re-run, but the prompt defaults to NO so a re-entered scan does not silently
+    re-spray.
+    """
+    workspace_cwd = shell.current_workspace_dir or os.getcwd()
+    if not has_enabled_computer_list(workspace_cwd, shell.domains_dir, domain):
+        return  # nothing to pre2k against
+
+    if _pre2k_already_attempted(shell, domain):
+        if not interactive:
+            print_info_debug(
+                "[spray] pre2k already attempted in this workspace — skipping Step 1 (ci, covered)."
+            )
+            return
+        if not confirm_ask(
+            "Pre2k computer-account spray was already attempted in this workspace — run it again?",
+            default=False,
+        ):
+            print_info(
+                "Pre2k computer-account spray skipped (already attempted this engagement)."
+            )
+            return
+        do_computer_pre2k_spraying(shell, domain)
+        return
+
+    try:
+        count = count_enabled_computer_accounts(
+            workspace_cwd, shell.domains_dir, domain
+        )
+    except Exception:  # noqa: BLE001
+        count = 0
+    try:
+        from adscan_internal import get_console
+        from adscan_internal.cli.widgets.spray_coverage_live import (
+            render_pre2k_education_panel,
+        )
+
+        get_console().print(render_pre2k_education_panel(domain, computer_count=count))
+    except Exception as exc:  # noqa: BLE001 — panel must never block the spray
+        telemetry.capture_exception(exc)
+    if interactive and not confirm_ask(
+        "Run the pre2k computer-account spray now?", default=True
+    ):
+        print_info("Pre2k computer-account spray skipped by operator.")
+        return
+    do_computer_pre2k_spraying(shell, domain)
+
+
+def _ci_pick_spray(rows: list[dict], done: set[str]) -> "str | None":
+    """ci auto-pick: highest-priority type not yet run, not 100% covered, eligible>0."""
+    priority = {t: i for i, t in enumerate(_SPRAY_CI_TYPES)}
+    candidates = sorted(
+        (r for r in rows if r["type"] in priority),
+        key=lambda r: priority[r["type"]],
+    )
+    for row in candidates:
+        if row["type"] in done:
+            continue
+        if row["pct"] >= 100 or row["eligible"] <= 0:
+            continue
+        return row["type"]
+    return None
+
+
+def _select_useraspass_transform(shell: "SprayShell", *, interactive: bool) -> "str | None":
+    """Sub-selector for the username-as-password mode. ci default = lowercase."""
+    options = ["Normal (as-is)", "lowercase", "uppercase (capitalize)"]
+    idx = shell._questionary_select(
+        "Username-as-password mode:", options, default_idx=1
+    )
+    if idx is None:
+        return "lower"
+    return {0: None, 1: "lower", 2: "capitalize"}.get(idx, "lower")
+
+
+def _select_owned_passwords(
+    shell: "SprayShell", owned: list[tuple[str, str]], *, interactive: bool
+) -> list[str]:
+    """Sub-selector for which owned credentials to spray. ci/non-interactive = ALL."""
+    if not owned:
+        return []
+    if not interactive:
+        return [pwd for (_owner, pwd) in owned]
+    from adscan_core.output._prompts import questionary_checkbox_values
+
+    labels = [
+        f"{mark_sensitive(owner, 'user')} → {mark_sensitive(pwd, 'password')}"
+        for (owner, pwd) in owned
+    ]
+    selected = questionary_checkbox_values(
+        title="Select owned credentials to spray:",
+        options=labels,
+        default_values=labels,
+        shell=shell,
+    )
+    if not selected:
+        return [pwd for (_owner, pwd) in owned]
+    by_label = {labels[i]: owned[i][1] for i in range(len(labels))}
+    return [by_label[s] for s in selected if s in by_label]
+
+
+def _interactive_select_spray(
+    shell: "SprayShell",
+    domain: str,
+    overview: dict,
+    *,
+    has_pending: bool,
+    has_reuse: bool,
+) -> "str | None":
+    """Render the coverage panel + spray selector. Returns a choice key or None (done)."""
+    rows = overview["rows"]
+    try:
+        from adscan_internal import get_console
+        from adscan_internal.cli.widgets.spray_coverage_live import (
+            render_coverage_selector_panel,
+        )
+
+        get_console().print(
+            render_coverage_selector_panel(
+                rows,
+                domain=domain,
+                threshold=overview["threshold"],
+                margin=overview["margin"],
+                near_lockout=overview["near_lockout"],
+                lockout_disabled=overview["lockout_disabled"],
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — panel must never block the selector
+        telemetry.capture_exception(exc)
+
+    keys: list[str] = []
+    labels: list[str] = []
+    for row in rows:
+        keys.append(row["type"])
+        labels.append(
+            f"{_SPRAY_TYPE_LABEL.get(row['type'], row['type'])} "
+            f"— {row['pct']}% covered · {row['eligible']} eligible"
+        )
+    keys.append("custom")
+    labels.append("Custom password (type a password to spray)")
+    if has_pending:
+        keys.append("retry_found")
+        labels.append("Retry passwords found in shares")
+    if has_reuse:
+        keys.append("retry_reuse")
+        labels.append("Retry SAM → domain password reuse")
+    keys.append("__done__")
+    labels.append("Done (finish spraying)")
+
+    idx = shell._questionary_select(
+        f"Select a spray to run on {domain}:", labels, default_idx=0
+    )
+    if idx is None:
+        return None
+    choice = keys[idx] if 0 <= idx < len(keys) else "__done__"
+    return None if choice == "__done__" else choice
+
+
+def _dispatch_spray_choice(
+    shell: "SprayShell", domain: str, choice: str, *, overview: dict, interactive: bool
+) -> None:
+    """Execute one selected spray via the existing per-type executors."""
+    if choice == "useraspass":
+        transform = _select_useraspass_transform(shell, interactive=interactive)
+        spraying_with_username_as_password(shell, domain, transform=transform)
+    elif choice == "reuse":
+        for pwd in _select_owned_passwords(
+            shell, overview.get("owned", []), interactive=interactive
+        ):
+            spraying_with_password(
+                shell, domain, pwd, entry_label="owned-credential reuse"
+            )
+    elif choice == "blank":
+        spraying_with_blank_password(shell, domain)
+    elif choice == "custom":
+        pwd = Prompt.ask("Enter the password to spray")
+        if pwd:
+            spraying_with_password(shell, domain, pwd)
+    elif choice == "retry_found":
+        retry_pending_password_spraying(shell, domain)
+    elif choice == "retry_reuse":
+        retry_pending_domain_reuse_validation(shell, domain)
+
+
+def run_spray_coverage(
+    shell: "SprayShell", domain: str, *, interactive: bool, include_pre2k: bool = True
+):
+    """Run the two-step spray phase (pre2k step + coverage-aware selector loop).
+
+    Returns the :class:`DeferredSprayQueue` of near-threshold combos held back for
+    reconciliation. The orchestration never sprays an account within the 2-attempt
+    lockout margin (the executors enforce it), and the ci path terminates
+    deterministically once every spray type is covered or has no eligible users.
+
+    Args:
+        shell: Active spray-capable shell.
+        domain: Target domain.
+        interactive: True for ``adscan start`` (operator-driven selector); False for
+            ``adscan ci`` (priority auto-pick, no prompts, full coverage).
+        include_pre2k: Run the pre2k computer-account step first (the full phase
+            flow). The manual ``spraying`` REPL command sets this False — pre2k is
+            its own command (``pre2k``) there, so the manual flow is just the
+            coverage selector loop.
+    """
+    from adscan_internal.services.spray_deferred_queue import (
+        DeferredSprayCombo,
+        DeferredSprayQueue,
+    )
+
+    queue = DeferredSprayQueue()
+    if shell.domains_data.get(domain, {}).get("auth") == "pwned":
+        return queue
+
+    # Step 1 — pre2k (educational, gated). Skipped for the manual selector-only flow.
+    if include_pre2k:
+        _run_pre2k_step(shell, domain, interactive=interactive)
+    if shell.domains_data.get(domain, {}).get("auth") == "pwned":
+        return queue
+
+    # Step 2 — coverage-aware selector loop.
+    ci_done: set[str] = set()
+    last_overview: "dict | None" = None
+    for _iteration in range(_SPRAY_SELECTOR_MAX_ITER):
+        if shell.domains_data.get(domain, {}).get("auth") == "pwned":
+            break
+        overview = _compute_spray_coverage_overview(shell, domain)
+        if overview is None:
+            # Coverage could not be computed (no user list / policy). Interactive
+            # falls back to the legacy menu once; ci has nothing safe to do.
+            if interactive:
+                do_spraying(shell, domain)
+            break
+        last_overview = overview
+        rows = overview["rows"]
+
+        # Nothing sprayable right now — every account is locked, near lockout, or
+        # owned. Re-prompting an empty selector is noise; finish the phase. (ci
+        # already terminates here because _ci_pick_spray finds no eligible type;
+        # this makes the interactive path stop too instead of looping on "Done".)
+        if not overview["eligibility"].eligible_users:
+            print_info(
+                "No eligible users remain (all locked, near lockout, or owned) — "
+                "password spraying complete."
+            )
+            break
+
+        if interactive:
+            has_pending = bool(
+                _load_pending_spraying_password_candidates(shell, domain=domain)
+            )
+            has_reuse = bool(
+                _load_pending_domain_reuse_candidates(shell, domain=domain)
+            )
+            choice = _interactive_select_spray(
+                shell, domain, overview, has_pending=has_pending, has_reuse=has_reuse
+            )
+            if choice is None:
+                break
+            row = next((r for r in rows if r["type"] == choice), None)
+            if row is not None and row["pct"] < 100 and row["eligible"] <= 0:
+                print_warning(
+                    "No users are currently eligible for this spray — all are within "
+                    "the lockout safety margin. Re-run after the observation window resets."
+                )
+                continue
+        else:
+            choice = _ci_pick_spray(rows, ci_done)
+            if choice is None:
+                break  # every type covered or no eligible users -> phase done
+            ci_done.add(choice)
+
+        try:
+            _dispatch_spray_choice(
+                shell, domain, choice, overview=overview, interactive=interactive
+            )
+        except Exception as exc:  # noqa: BLE001 — one spray must not abort the loop
+            telemetry.capture_exception(exc)
+            print_error(f"Spray '{choice}' failed; continuing.")
+
+    # Seed the deferred queue from the final near-threshold exclusions (best-effort).
+    try:
+        eligibility = (last_overview or {}).get("eligibility")
+        for entry in getattr(eligibility, "excluded_users", []) or []:
+            queue.upsert(
+                DeferredSprayCombo(
+                    user=str(getattr(entry, "username", "") or ""),
+                    password=BLANK_PASSWORD_SENTINEL,
+                    spray_type="near-threshold",
+                    earliest_safe_epoch=None,
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+    return queue

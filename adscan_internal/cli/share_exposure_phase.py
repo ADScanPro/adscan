@@ -26,12 +26,15 @@ _WRITE_ACCESS = {"Write", "Full Control"}
 #: A share is a READ (loot) target when effective access includes any of these
 #: — WRITE implies READ on Windows, so writable shares are also loot candidates.
 _READ_ACCESS = {"Read", "Write", "Full Control"}
-#: In audit non-interactive (adscan ci) runs the readable-share credential hunt
-#: is bounded to the top-N highest-risk shares to keep unattended runtime and
-#: OPSEC exposure predictable on large client environments. CTF CI scans all
-#: (small envs + autonomy); interactive uses the picker. ``rows`` are already
-#: risk-ranked, so ``rows[:N]`` is the top-N by risk.
-_AUDIT_CI_HUNT_SHARE_LIMIT = 25
+#: For ``type == "audit"`` engagements the readable-share credential hunt is
+#: bounded to the top-N highest-risk shares to keep runtime and OPSEC exposure
+#: predictable on large client environments. The cap is a function of the
+#: engagement type (audit), not of CI mode: it applies in both ``adscan ci``
+#: (auto-selects the top-N) and the interactive picker (pre-selects the top-N as
+#: the default while still offering every share). CTF engagements scan all
+#: (small envs + autonomy). ``rows`` are already risk-ranked, so ``rows[:N]`` is
+#: the top-N by risk.
+_AUDIT_HUNT_SHARE_LIMIT = 25
 
 
 def _row_access(row: dict[str, Any]) -> set[str]:
@@ -100,23 +103,36 @@ def _select_shares_for_hunt(
         if is_ctf:
             return rows
         # Audit CI: bound to the top-N highest-risk readable shares (rows are
-        # already risk-ranked). Not a silent cap — log what was bounded.
-        if len(rows) > _AUDIT_CI_HUNT_SHARE_LIMIT:
+        # already risk-ranked). Not a silent cap; log what was bounded.
+        if len(rows) > _AUDIT_HUNT_SHARE_LIMIT:
             print_info(
-                f"Audit CI: credential hunt bounded to the top "
-                f"{_AUDIT_CI_HUNT_SHARE_LIMIT} of {len(rows)} readable shares by "
+                f"Audit: credential hunt bounded to the top "
+                f"{_AUDIT_HUNT_SHARE_LIMIT} of {len(rows)} readable shares by "
                 "risk; re-run interactively to scan more."
             )
-            return rows[:_AUDIT_CI_HUNT_SHARE_LIMIT]
+            return rows[:_AUDIT_HUNT_SHARE_LIMIT]
         return rows
     checkbox = getattr(shell, "_questionary_checkbox", None)
     if not callable(checkbox):
         return rows
     options = [_hunt_option_label(r) for r in rows]
+    # Audit pre-selects only the top-N highest-risk shares as the default (rows
+    # are already risk-ranked) while still listing every share so the operator
+    # can widen the selection. CTF pre-selects all. The cap is a function of the
+    # engagement type, not of CI mode.
+    is_ctf = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    if not is_ctf and len(options) > _AUDIT_HUNT_SHARE_LIMIT:
+        default_values = options[:_AUDIT_HUNT_SHARE_LIMIT]
+        print_info(
+            f"Audit: pre-selected the top {_AUDIT_HUNT_SHARE_LIMIT} of "
+            f"{len(options)} readable shares by risk; select more to widen the hunt."
+        )
+    else:
+        default_values = options
     chosen = checkbox(
         "Select readable shares to scan for credentials:",
         options,
-        default_values=options,
+        default_values=default_values,
     )
     if not chosen:
         return []
@@ -125,17 +141,31 @@ def _select_shares_for_hunt(
 
 
 def _run_writable_capture_substep(
-    shell: Any, *, domain: str, writable: list[dict[str, Any]], domain_data: dict[str, Any]
+    shell: Any,
+    *,
+    domain: str,
+    writable: list[dict[str, Any]],
+    domain_data: dict[str, Any],
+    username: str | None = None,
+    credential: str | None = None,
 ) -> None:
-    """Step 1/2 — drop NTLMv2 bait on writable shares (per host)."""
+    """Step 1/2 — drop NTLMv2 bait on writable shares (per host).
+
+    ``username``/``credential`` pin the principal to drop bait AS — this MUST be
+    the principal whose effective access the surface was computed for (the user
+    being assessed), not the domain's active credential. The live per-user
+    surface passes them explicitly; only when absent do we fall back to
+    ``domain_data`` (the all-users Phase 7 overview path). Dropping bait as the
+    wrong principal yields ACCESS_DENIED on shares the assessed user can write.
+    """
     from adscan_internal.cli.smb import run_ntlmv2_capture_for_writable_shares  # noqa: PLC0415
 
     by_host = _group_writable_share_names_by_host(writable)
     if not by_host:
         print_info_verbose("No writable shares — skipping Step 1/2 (writable-share capture).")
         return
-    username = str(domain_data.get("username") or "").strip()
-    credential = str(domain_data.get("password") or "").strip()
+    username = str(username or domain_data.get("username") or "").strip()
+    credential = str(credential or domain_data.get("password") or "").strip()
     if not username or not credential:
         print_info_verbose("No domain credentials — skipping Step 1/2 (writable-share capture).")
         return
@@ -156,9 +186,23 @@ def _run_writable_capture_substep(
 
 
 def _run_readable_hunt_substep(
-    shell: Any, *, domain: str, readable: list[dict[str, Any]]
+    shell: Any,
+    *,
+    domain: str,
+    readable: list[dict[str, Any]],
+    username: str | None = None,
+    credential: str | None = None,
 ) -> None:
-    """Step 2/2 — loot readable shares for embedded credentials."""
+    """Step 2/2 — loot readable shares for embedded credentials.
+
+    ``username``/``credential`` pin the principal to loot AS — this MUST be the
+    principal whose effective READ access the surface was computed for (the user
+    being assessed), not the domain's active credential. The live per-user
+    surface passes them explicitly; absent them the hunt falls back to
+    ``domain_data`` (the all-users Phase 7 path). Looting as the wrong principal
+    yields permission-denied on shares only the assessed user can read, silently
+    missing the embedded credentials inside them.
+    """
     from adscan_internal.cli.smb import run_smb_share_credential_hunt  # noqa: PLC0415
 
     if not readable:
@@ -180,6 +224,8 @@ def _run_readable_hunt_substep(
             for r in selected
             if str(r.get("host") or "").strip() and str(r.get("share") or "").strip()
         ],
+        username=username,
+        credential=credential,
     )
 
 

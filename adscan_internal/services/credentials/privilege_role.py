@@ -268,6 +268,51 @@ def set_credential_secret_kind(
         telemetry.capture_exception(exc)
 
 
+def set_credential_origin(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    origin: str,
+) -> None:
+    """Record the provenance ``origin`` for ``username``'s credential.
+
+    ``origin`` is the machine-readable source label for how this credential
+    entered the store (for example ``kerberoast``, ``dcsync``, ``spray``,
+    ``authenticated_scan`` for the scan's own STARTING credential, or
+    ``user_provided`` for a manual ``creds save``). It is persisted into
+    ``credentials_meta[username]["credential_origin"]`` so the ``creds show``
+    Provenance column and the compromise SSOT can read it back.
+
+    Two of these origins identify a self-introduced credential — the scan
+    input or a manually entered one — and are excluded from the
+    compromised-credential counters via
+    :data:`adscan_internal.services.session_compromise_state_service.NON_COMPROMISE_ORIGINS`,
+    while the credential remains a fully owned principal for attack-path
+    discovery.
+
+    Writes a JSON-safe string. Idempotent (last-write-wins); never raises.
+    """
+    try:
+        normalized_origin = str(origin or "").strip()
+        if not normalized_origin:
+            return
+        domain_data = _domain_data(shell, domain)
+        if domain_data is None:
+            return
+        meta_map = _meta_bucket(domain_data)
+        key = _normalize_user(username)
+        if not key:
+            return
+        current = meta_map.get(key)
+        if not isinstance(current, dict):
+            current = _default_meta()
+        current["credential_origin"] = normalized_origin
+        meta_map[key] = current
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+
 # ---------------------------------------------------------------------------
 # Graph-driven role resolvers (canonical AD source of truth)
 # ---------------------------------------------------------------------------
@@ -688,7 +733,36 @@ def pick_credential_for_local_admin(
     if not candidates:
         return None
 
-    candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    # Demote principals the target host has already denied a NETWORK logon
+    # (ground truth from a prior probe) so a logon-capable credential is
+    # auto-picked over a known-dead one — e.g. a DA denied network logon on the
+    # DC (SeDenyNetworkLogonRight) no longer wins over another logon-capable DA /
+    # local admin. The denied principal is RETAINED (last resort), so flags never
+    # ends with zero candidates. The flags SMB byte-read is a network logon, so
+    # the "network" denial bucket applies. host=None → order unchanged.
+    if target_host:
+        from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+            is_logon_denied,
+        )
+
+        domains_data = getattr(shell, "domains_data", {}) or {}
+
+        def _capable(row: tuple) -> int:
+            return (
+                0
+                if is_logon_denied(
+                    domains_data, domain, principal=row[2], host=target_host
+                )
+                else 1
+            )
+
+    else:
+
+        def _capable(row: tuple) -> int:  # noqa: ARG001
+            return 1
+
+    # capable first (1 > 0), then priority, then kind preference — all descending.
+    candidates.sort(key=lambda row: (_capable(row), row[0], row[1]), reverse=True)
     _prio, _kscore, user, secret, kind = candidates[0]
     return user, secret, kind
 
@@ -699,6 +773,7 @@ __all__ = [
     "ROLE_PRIORITY",
     "get_credential_meta",
     "set_credential_kerberos_material",
+    "set_credential_origin",
     "set_credential_secret_kind",
     "pick_credential_for_local_admin",
 ]

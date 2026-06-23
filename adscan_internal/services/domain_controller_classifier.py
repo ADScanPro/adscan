@@ -215,7 +215,7 @@ def _node_identities(node: dict[str, Any]) -> list[str]:
     return tokens
 
 
-def _expand_host_aliases(
+def expand_host_aliases(
     host: str,
     *,
     ip_hostname_inventory: dict[str, Any] | None,
@@ -226,6 +226,13 @@ def _expand_host_aliases(
     inventory maps to one or more hostnames (or vice versa), the returned key
     set includes the aliased identifiers so a DC supplied as an IP still
     matches a DC identifier stored as an FQDN, and conversely.
+
+    Canonical alias expander reused by :func:`is_dc_host` and other call sites
+    (e.g. the MSSQL S4U2self SPN-ownership gate) that must answer "does this
+    host token refer to the same machine as that identifier?" over the
+    workspace's resolved IP <-> hostname map. ``host_match_keys`` alone is
+    deliberately string-only (IPs kept verbatim); this helper layers the
+    DNS/inventory bridge on top.
     """
     from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
         host_match_keys,
@@ -247,6 +254,11 @@ def _expand_host_aliases(
             # host is a hostname mapped to this IP -> add the IP key too.
             keys |= host_match_keys(ip_norm)
     return keys
+
+
+
+# Backward-compatible private alias (kept for existing call sites/imports).
+_expand_host_aliases = expand_host_aliases
 
 
 def is_dc_host(
@@ -319,7 +331,7 @@ def is_dc_host(
             # Caller passed the per-domain entry directly.
             domain_data = domains_data
 
-    host_keys = _expand_host_aliases(
+    host_keys = expand_host_aliases(
         host_text, ip_hostname_inventory=ip_hostname_inventory
     )
 
@@ -366,7 +378,7 @@ def is_dc_host(
         identifiers.extend(str(entry).strip() for entry in dcs if str(entry or "").strip())
 
     for identifier in identifiers:
-        identifier_keys = _expand_host_aliases(
+        identifier_keys = expand_host_aliases(
             identifier, ip_hostname_inventory=ip_hostname_inventory
         )
         if host_keys & identifier_keys:

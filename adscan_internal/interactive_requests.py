@@ -91,6 +91,74 @@ def request_select(
     return timeout_result
 
 
+def request_multiselect(
+    *,
+    title: str,
+    options: list[str],
+    default_indices: list[int] | None = None,
+    timeout_result: list[int] | None = None,
+    context: dict[str, object] | None = None,
+) -> list[int] | None:
+    """Request one remote multi-selection from a compatible external orchestrator.
+
+    Mirrors :func:`request_select` but resolves to a *set* of chosen option
+    indices instead of a single one. Used for the web trust-scope picker, where
+    the operator selects N domains to keep in enumeration scope.
+
+    Args:
+        title: Prompt text shown to the operator.
+        options: Selectable option labels (index-aligned with the returned list).
+        default_indices: Indices checked by default (e.g. the origin domain).
+        timeout_result: Indices to resolve to when the request times out or the
+            bridge is unavailable. Kept distinct from "operator picked nothing"
+            so a hung/abandoned session resolves to a safe default (origin-only)
+            instead of an empty scope.
+        context: Arbitrary decision payload (the trust-topology data rides here).
+
+    Returns:
+        The operator's chosen indices, ``timeout_result`` on timeout, or ``None``
+        when the bridge is disabled (caller falls back to the local prompt).
+    """
+    if not is_remote_interaction_enabled() or not options:
+        return None
+
+    valid_defaults = sorted(
+        {idx for idx in (default_indices or []) if 0 <= idx < len(options)}
+    )
+    request_id = str(uuid.uuid4())
+    request_payload: dict[str, Any] = {
+        "request_id": request_id,
+        "scan_id": _SCAN_ID,
+        "kind": "multiselect",
+        "title": title,
+        "default_indices": valid_defaults,
+        "options": [
+            {
+                "index": index,
+                "label": label,
+            }
+            for index, label in enumerate(options)
+        ],
+        "context": dict(context or {}),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    response = _dispatch_request(
+        request_payload=request_payload,
+        timeout_result={"selected_indices": timeout_result},
+    )
+    selected_indices = response.get("selected_indices")
+    if isinstance(selected_indices, list):
+        normalized = sorted(
+            {
+                idx
+                for idx in selected_indices
+                if isinstance(idx, int) and 0 <= idx < len(options)
+            }
+        )
+        return normalized
+    return timeout_result
+
+
 def request_confirm(
     *,
     prompt: str,

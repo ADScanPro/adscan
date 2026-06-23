@@ -15,6 +15,10 @@ from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.current_vantage_reachability_service import (
     load_current_vantage_reachability_report,
 )
+from adscan_internal.services.kerberos_hostname_inventory import (
+    choose_hostname_for_kerberos_spn,
+    load_workspace_ip_hostname_inventory,
+)
 from adscan_internal.services.service_access_results import (
     ServiceAccessCategory,
     ServiceAccessFinding,
@@ -151,13 +155,18 @@ def _reason_has_clock_skew(reason: str) -> bool:
     return is_clock_skew_error(RuntimeError(reason))
 
 
-def _build_ip_hostname_map(
+def _build_ip_hostname_map_from_reachability(
     *,
     workspace_dir: str,
     domains_dir: str,
     domain: str,
 ) -> dict[str, str]:
-    """Build an IP to preferred FQDN map from current-vantage inventory."""
+    """Build an IP to preferred FQDN map from the current-vantage report.
+
+    Fallback path used only when the ranked inventory is empty/unavailable.
+    The candidate order here is NOT liveness-ranked, so a stale DNS A-record
+    sharing an IP with the live host may win — see ``_build_ip_hostname_map``.
+    """
     payload, _report_path = load_current_vantage_reachability_report(
         workspace_dir,
         domains_dir,
@@ -199,6 +208,61 @@ def _build_ip_hostname_map(
                 if ip_value and ip_value.lower() not in mapping:
                     mapping[ip_value.lower()] = hostname
     return mapping
+
+
+def _build_ip_hostname_map(
+    *,
+    workspace_dir: str,
+    domains_dir: str,
+    domain: str,
+) -> dict[str, str]:
+    """Build an IP to preferred FQDN map for WinRM Kerberos SPN targeting.
+
+    Prefers the liveness-RANKED workspace inventory
+    (``load_workspace_ip_hostname_inventory``) so that, when two enabled
+    computers share an IP (stale DNS A-record / IP reuse), the SPN binds to the
+    host that is ACTUALLY live at that IP (most-recently-authenticated first).
+    This keeps the WinRM sweep consistent with the MSSQL collector and the SMB
+    share path. Falls back to the (unranked) current-vantage reachability report
+    when the ranked inventory is empty or unavailable, so a working sweep never
+    regresses. Best-effort: never raises.
+    """
+    mapping: dict[str, str] = {}
+    try:
+        inventory = load_workspace_ip_hostname_inventory(
+            workspace_dir=workspace_dir,
+            domains_dir=domains_dir,
+            domain=domain,
+        )
+    except Exception:  # noqa: BLE001 - best-effort; fall back below
+        inventory = {}
+
+    if isinstance(inventory, dict):
+        for ip_value in inventory:
+            normalized_ip = _normalize_target(ip_value)
+            if not normalized_ip:
+                continue
+            best = choose_hostname_for_kerberos_spn(
+                ip=normalized_ip,
+                domain=domain,
+                inventory=inventory,
+            )
+            fqdn = _fqdn_or_domain_host(str(best or ""), domain)
+            if fqdn:
+                mapping[normalized_ip.lower()] = fqdn
+
+    if mapping:
+        return mapping
+
+    # Ranked inventory empty/unavailable — fall back to the previous behavior.
+    try:
+        return _build_ip_hostname_map_from_reachability(
+            workspace_dir=workspace_dir,
+            domains_dir=domains_dir,
+            domain=domain,
+        )
+    except Exception:  # noqa: BLE001 - best-effort; never regress the sweep
+        return {}
 
 
 def resolve_winrm_probe_targets(

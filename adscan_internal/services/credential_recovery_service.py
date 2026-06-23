@@ -46,6 +46,7 @@ from adscan_core.rich_output import (
 )
 
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.credentials.privilege_role import set_credential_origin
 
 # OPSEC: at most this many DISTINCT accounts are tested with one auth attempt
 # each during the fuzzy fast path. One attempt per account keeps the fast path
@@ -255,6 +256,7 @@ def recover_user_not_found(
     confirm_spray: Callable[[], bool],
     prompt_manual_username: Callable[[], str | None],
     source_steps: list[object] | None = None,
+    credential_origin: str = "credential_recovery",
 ) -> RecoveryResult:
     """Run the locked USER_NOT_FOUND recovery cascade.
 
@@ -289,6 +291,10 @@ def recover_user_not_found(
         prompt_manual_username: Prompts for a manual username or skip; returns
             the entered name, or None to skip.
         source_steps: Provenance steps threaded through to persistence/spray.
+        credential_origin: Machine-readable provenance slug recorded for the
+            resolved/manual credential so the Provenance column attributes the
+            recovery technique instead of degrading to "via unknown". Applied
+            as a backstop after the injected ``add_credential`` callback runs.
 
     Returns:
         A :class:`RecoveryResult` describing whether a credential was resolved.
@@ -347,6 +353,12 @@ def recover_user_not_found(
                 # Auto-adopt: this is proof, not a guess. Persist silently.
                 try:
                     add_credential(candidate.username)
+                    set_credential_origin(
+                        shell,
+                        domain=domain,
+                        username=candidate.username,
+                        origin=credential_origin,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
                     print_info_debug(
@@ -424,6 +436,9 @@ def recover_user_not_found(
         marked_manual = mark_sensitive(manual_name, "user")
         try:
             add_credential(manual_name)
+            set_credential_origin(
+                shell, domain=domain, username=manual_name, origin=credential_origin
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_info_debug(

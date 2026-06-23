@@ -30,6 +30,7 @@ from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.ldap_transport_service import (
     ADscanLDAPConnection,
     SD_FLAGS_ALL_CONTROL,
+    build_show_deleted_controls,
     execute_with_ldap_fallback,
 )
 
@@ -53,6 +54,25 @@ class WritableObjectBlock:
 
     distinguished_name: str
     writable_attributes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RestorableTombstone:
+    """One deleted (tombstoned) object the authenticated principal can reanimate.
+
+    ``live_dn`` is where the object would be restored
+    (``CN=<last_known_rdn>,<last_known_parent>``). Neither ADscan's other collectors
+    nor BloodHound enumerate the Recycle Bin, so this is the only point that surfaces
+    a restore→foothold path (the HTB-Checkpoint first move).
+    """
+
+    deleted_dn: str
+    sam_account_name: str
+    last_known_rdn: str
+    last_known_parent: str
+    live_dn: str
+    writable_attributes: tuple[str, ...]
+    object_sid: str = ""
 
 
 def sanitize_report_username(value: str) -> str:
@@ -255,6 +275,67 @@ class WritableAttributeDiscoveryService(BaseService):
             "findings": findings,
         }
 
+    def build_restorable_tombstone_report(
+        self,
+        *,
+        dc_address: str,
+        target_domain: str,
+        auth_domain: str,
+        auth_username: str,
+        auth_password: str,
+        kerberos: bool,
+    ) -> dict[str, Any] | None:
+        """Discover deleted accounts the principal can reanimate (Recycle Bin).
+
+        Returns a normalized report whose findings carry relation
+        ``CanRestoreDeletedObject`` — each a restore→foothold attack step the
+        graph/execution layer can chain (restore → re-evaluate lifecycle → enable if
+        disabled → run the technique the right allows).
+        """
+        try:
+            tombstones, _used_ldaps = execute_with_ldap_fallback(
+                operation_name="Restorable-tombstone discovery",
+                target_domain=target_domain,
+                dc_address=dc_address,
+                callback=_collect_restorable_tombstones,
+                username=auth_username,
+                password=auth_password,
+                use_kerberos=kerberos,
+                prefer_ldaps=True,
+                allow_password_fallback_on_kerberos_failure=bool(
+                    str(auth_username or "").strip() and str(auth_password or "").strip()
+                ),
+                auth_domain=auth_domain if auth_domain != target_domain else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning_debug(
+                f"[tombstones] Native LDAP collection failed: {type(exc).__name__}: {exc}"
+            )
+            return None
+
+        findings = [
+            {
+                "relation": "CanRestoreDeletedObject",
+                "deleted_dn": tombstone.deleted_dn,
+                "restored_dn": tombstone.live_dn,
+                "target_username": tombstone.sam_account_name,
+                "target_object_id": tombstone.object_sid,
+                "last_known_rdn": tombstone.last_known_rdn,
+                "last_known_parent": tombstone.last_known_parent,
+                "raw_writable_attributes": list(tombstone.writable_attributes),
+            }
+            for tombstone in (tombstones or [])
+        ]
+        return {
+            "schema_version": "restorable-tombstones-1.0",
+            "detector": "native_ldap",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "actor_username": auth_username,
+            "actor_domain": auth_domain,
+            "findings": findings,
+        }
+
     def _resolve_target_object(
         self,
         *,
@@ -352,6 +433,82 @@ def _collect_writable_user_objects(
         )
 
     return blocks
+
+
+def _collect_restorable_tombstones(
+    connection: ADscanLDAPConnection,
+) -> list[RestorableTombstone]:
+    """Enumerate deleted account objects the principal can reanimate.
+
+    Searches ``CN=Deleted Objects`` with the Show Deleted Objects + SD_FLAGS_ALL
+    controls so AD returns each tombstone's ``allowedAttributesEffective`` /
+    ``sDRightsEffective``. A tombstone is restorable when the principal can write its
+    attributes (GenericWrite/GenericAll surface a non-empty effective set — the same
+    "WRITE" bloodyAD reports) or owns it / can rewrite its DACL.
+    """
+    domain_dn = _get_domain_dn(connection)
+    if not domain_dn:
+        print_warning_debug("[tombstones] Could not determine domain DN; skipping search")
+        return []
+
+    connection.search(
+        search_base=f"CN=Deleted Objects,{domain_dn}",
+        search_filter="(&(isDeleted=TRUE)(objectClass=user))",
+        attributes=[
+            "distinguishedName",
+            "sAMAccountName",
+            "msDS-LastKnownRDN",
+            "lastKnownParent",
+            "objectSid",
+            "allowedAttributesEffective",
+            "sDRightsEffective",
+        ],
+        search_scope="SUBTREE",
+        controls=build_show_deleted_controls(with_sd_flags=True),
+    )
+
+    tombstones: list[RestorableTombstone] = []
+    for entry in _get_connection_entries(connection):
+        attrs = entry._raw_attrs
+        writable_attrs = _extract_string_list(attrs.get("allowedAttributesEffective") or [])
+        try:
+            sd_rights = int(_decode_first(attrs.get("sDRightsEffective") or []) or "0")
+        except (TypeError, ValueError):
+            sd_rights = 0
+        # Precise reanimation gate (validated against a real GenericWrite ACE: AD does
+        # surface isDeleted + distinguishedName in allowedAttributesEffective when
+        # writable): can write the lifecycle attributes the restore modify touches, OR
+        # owns it / can rewrite its DACL (sDRightsEffective OWNER 0x01 | DACL 0x04 →
+        # self-grant). Avoids flagging a harmless WriteProperty on an unrelated attr.
+        writable_lower = {attr.casefold() for attr in writable_attrs}
+        can_reanimate = bool(writable_lower & {"isdeleted", "distinguishedname"})
+        can_own_or_write_dacl = bool(sd_rights & 0x05)
+        if not can_reanimate and not can_own_or_write_dacl:
+            continue
+
+        deleted_dn = str(entry.dn or "").strip() or _decode_first(
+            attrs.get("distinguishedName") or []
+        )
+        rdn = _decode_first(attrs.get("msDS-LastKnownRDN") or [])
+        parent = _decode_first(attrs.get("lastKnownParent") or [])
+        live_dn = f"CN={rdn},{parent}" if rdn and parent else ""
+        tombstones.append(
+            RestorableTombstone(
+                deleted_dn=deleted_dn,
+                sam_account_name=_decode_first(attrs.get("sAMAccountName") or []),
+                last_known_rdn=rdn,
+                last_known_parent=parent,
+                live_dn=live_dn,
+                writable_attributes=tuple(writable_attrs),
+                object_sid=_sid_bytes_to_str(
+                    (attrs.get("objectSid") or [None])[0]
+                    if isinstance(attrs.get("objectSid"), list)
+                    else attrs.get("objectSid")
+                ),
+            )
+        )
+
+    return tombstones
 
 
 def _fetch_object_identity(

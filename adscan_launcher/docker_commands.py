@@ -46,7 +46,6 @@ from adscan_launcher.docker_runtime import (
 )
 from adscan_launcher.docker_status import (
     ensure_docker_daemon_running as _ensure_docker_daemon_running_internal,
-    is_docker_compose_plugin_available,
     is_docker_daemon_running as _is_docker_daemon_running_internal,
 )
 from adscan_launcher.output import (
@@ -559,6 +558,75 @@ def _image_reference_has_registry(image: str) -> bool:
     return "." in head or ":" in head or head == "localhost"
 
 
+def _registry_host_for_image(image: str) -> str:
+    """Derive the network registry host for a Docker image reference.
+
+    The launcher runs DNS / connectivity preflights and renders troubleshooting
+    hints before pulling. Both must point at the host the daemon will actually
+    contact, otherwise (for example) a ``ghcr.io/...`` image would be checked
+    against Docker Hub's ``registry-1.docker.io`` — the wrong host.
+
+    Mapping:
+      * No explicit registry (Docker Hub short name, e.g. ``adscan/adscan-pro``)
+        → ``registry-1.docker.io`` (the Docker Hub registry endpoint; the
+        ``docker.io`` namespace alias resolves there).
+      * Explicit ``docker.io/...`` → ``registry-1.docker.io`` (same endpoint).
+      * Any other explicit registry host (``ghcr.io/...``, ``localhost:5000/...``,
+        ``myregistry.example.com/...``) → that host verbatim (port stripped, the
+        DNS/TCP preflight always targets :443).
+
+    Args:
+        image: Docker image reference selected by the launcher.
+
+    Returns:
+        The hostname the launcher should resolve / probe for this image.
+    """
+    token = _strip_default_docker_io_prefix(str(image or "")).strip()
+    if not token:
+        return _DOCKER_PULL_DNS_PREFLIGHT_HOST
+    head = token.split("/", 1)[0]
+    if not _image_reference_has_registry(token):
+        # Docker Hub short name (``namespace/repo[:tag]``) — the daemon pulls
+        # from the Docker Hub registry endpoint.
+        return _DOCKER_PULL_DNS_PREFLIGHT_HOST
+    if head.lower() in ("docker.io", "index.docker.io", "registry-1.docker.io"):
+        return _DOCKER_PULL_DNS_PREFLIGHT_HOST
+    # Explicit registry host (e.g. ``ghcr.io``, ``localhost:5000``). Strip any
+    # ``:port`` so the host is suitable for a :443 DNS/TCP preflight.
+    return head.split(":", 1)[0]
+
+
+def _registry_label_for_host(host: str) -> str:
+    """Return a human-friendly registry label for diagnostic messages.
+
+    Keeps the long-standing ``Docker Hub`` wording for the Docker Hub endpoint
+    so existing UX is unchanged, and shows the bare host for any other registry
+    (e.g. ``ghcr.io``) so the operator sees the registry the pull actually used.
+    """
+    normalized = str(host or "").strip().lower()
+    if normalized in ("", _DOCKER_PULL_DNS_PREFLIGHT_HOST, "docker.io", "index.docker.io"):
+        return "Docker Hub"
+    if normalized == "ghcr.io":
+        return "GitHub Container Registry (ghcr.io)"
+    return str(host).strip()
+
+
+def _docker_login_command_for_image(image: str) -> str:
+    """Return the copy-pasteable ``docker login`` command for an image's registry.
+
+    * Docker Hub images keep the long-standing ``docker logout && docker login``
+      (no host argument — that is the Docker Hub default endpoint).
+    * Any other registry (e.g. a private ``ghcr.io/...`` PRO image) gets an
+      explicit ``docker login <host>`` so the operator authenticates against the
+      registry the pull actually contacts — this is what unblocks a private
+      GHCR pull (the partner's GHCR read token via ``docker login ghcr.io``).
+    """
+    host = _registry_host_for_image(image)
+    if str(host or "").strip().lower() == _DOCKER_PULL_DNS_PREFLIGHT_HOST:
+        return "docker logout && docker login"
+    return f"docker login {host}"
+
+
 def _strip_default_docker_io_prefix(image: str) -> str:
     """Strip docker.io prefix to compare semantic image identity."""
     token = str(image or "").strip()
@@ -618,123 +686,6 @@ def _warn_using_legacy_image(*, selected_image: str, preferred_image: str) -> No
         f"{_ALLOW_LEGACY_IMAGE_FALLBACK_ENV} when stable tags recover."
     )
     _LEGACY_IMAGE_WARNING_SHOWN = True
-
-
-def _emit_docker_compose_missing_diagnostics(*, command_name: str) -> None:
-    """Emit debug/telemetry diagnostics when compose detection reports missing."""
-    docker_bin = shutil.which("docker") or ""
-    compose_v1_bin = shutil.which("docker-compose") or ""
-    docker_pkg = _detect_linux_package_owner(docker_bin)
-    compose_v1_pkg = _detect_linux_package_owner(compose_v1_bin)
-
-    compose_v2_rc: int | None = None
-    compose_v2_first_line = ""
-    compose_v2_error_line = ""
-    if docker_bin:
-        try:
-            proc = run_docker(
-                ["docker", "compose", "version"],
-                check=False,
-                capture_output=True,
-                timeout=10,
-            )
-            compose_v2_rc = int(proc.returncode)
-            compose_v2_first_line = _extract_first_nonempty_line(proc.stdout or "")
-            compose_v2_error_line = _extract_first_nonempty_line(proc.stderr or "")
-        except Exception as exc:  # pragma: no cover - best effort only
-            telemetry.capture_exception(exc)
-            compose_v2_error_line = str(exc)
-
-    compose_v1_rc: int | None = None
-    compose_v1_first_line = ""
-    compose_v1_error_line = ""
-    if compose_v1_bin:
-        try:
-            proc = run_docker(
-                ["docker-compose", "version"],
-                check=False,
-                capture_output=True,
-                timeout=10,
-            )
-            compose_v1_rc = int(proc.returncode)
-            compose_v1_first_line = _extract_first_nonempty_line(proc.stdout or "")
-            compose_v1_error_line = _extract_first_nonempty_line(proc.stderr or "")
-        except Exception as exc:  # pragma: no cover - best effort only
-            telemetry.capture_exception(exc)
-            compose_v1_error_line = str(exc)
-
-    payload: dict[str, Any] = {
-        "command_name": command_name,
-        "docker_bin_present": bool(docker_bin),
-        "docker_pkg_hint": docker_pkg,
-        "compose_v1_bin_present": bool(compose_v1_bin),
-        "compose_v1_pkg_hint": compose_v1_pkg,
-        "compose_v2_returncode": compose_v2_rc,
-        "compose_v2_stdout_head": compose_v2_first_line,
-        "compose_v2_stderr_head": compose_v2_error_line,
-        "compose_v1_returncode": compose_v1_rc,
-        "compose_v1_stdout_head": compose_v1_first_line,
-        "compose_v1_stderr_head": compose_v1_error_line,
-    }
-    print_info_debug(
-        "[docker] compose missing diagnostics: "
-        f"command={mark_sensitive(command_name, 'status')} "
-        f"docker_bin={mark_sensitive(docker_bin or 'missing', 'detail')} "
-        f"docker_pkg={mark_sensitive(docker_pkg or 'unknown', 'status')} "
-        f"compose_v2_rc={mark_sensitive(str(compose_v2_rc), 'status')} "
-        f"compose_v2_out={mark_sensitive(compose_v2_first_line or '(empty)', 'detail')} "
-        f"compose_v2_err={mark_sensitive(compose_v2_error_line or '(empty)', 'detail')} "
-        f"compose_v1_bin={mark_sensitive(compose_v1_bin or 'missing', 'detail')} "
-        f"compose_v1_pkg={mark_sensitive(compose_v1_pkg or 'unknown', 'status')} "
-        f"compose_v1_rc={mark_sensitive(str(compose_v1_rc), 'status')} "
-        f"compose_v1_out={mark_sensitive(compose_v1_first_line or '(empty)', 'detail')} "
-        f"compose_v1_err={mark_sensitive(compose_v1_error_line or '(empty)', 'detail')}"
-    )
-    telemetry.capture("docker_compose_missing_diagnostics", payload)
-
-
-def _ensure_docker_compose_prerequisites(*, command_name: str) -> bool:
-    """Validate Docker + Docker Compose prerequisites with combined UX.
-
-    Returns ``True`` when both prerequisites are available. When they are not,
-    emits a single actionable guidance block so users can fix everything in one
-    pass instead of hitting sequential errors.
-    """
-    has_docker = docker_available()
-    has_compose = is_docker_compose_plugin_available()[0] if has_docker else False
-    if has_docker and has_compose:
-        return True
-
-    print_error("Docker prerequisites are incomplete for this command.")
-    lines = [
-        f"Docker CLI/Engine: {'OK' if has_docker else 'MISSING'}",
-        f"Docker Compose: {'OK' if has_compose else 'MISSING'}",
-    ]
-    if has_docker and not has_compose:
-        _emit_docker_compose_missing_diagnostics(command_name=command_name)
-        lines.append("Detected Docker but Compose plugin is unavailable.")
-        lines.append(
-            "Install Compose plugin (for example on Debian/Ubuntu): "
-            "sudo apt install docker-compose-plugin"
-        )
-    elif not has_docker:
-        lines.append(
-            "Docker is not installed or not in PATH. Compose cannot work without Docker."
-        )
-    print_panel(
-        "\n".join(lines),
-        title="Docker Prerequisites Required",
-        border_style="yellow",
-    )
-    retry_hint = (
-        "adscan start (or rerun your original command)"
-        if command_name == "passthrough"
-        else f"adscan {command_name}"
-    )
-    print_instruction(
-        f"Install Docker + Docker Compose, then retry: {retry_hint}. Guide: {_DOCKER_INSTALL_DOCS_URL}"
-    )
-    return False
 
 
 def _extract_first_nonempty_line(text: str) -> str:
@@ -1115,10 +1066,11 @@ def _run_docker_pull_dns_preflight(
         )
         return True
     except socket.gaierror as exc:
+        registry_label = _registry_label_for_host(host)
         print_warning(
-            "DNS preflight could not resolve Docker Hub. Image pull may fail."
+            f"DNS preflight could not resolve {registry_label}. Image pull may fail."
         )
-        print_instruction("Check resolver health: getent hosts registry-1.docker.io")
+        print_instruction(f"Check resolver health: getent hosts {host}")
         print_instruction(
             "If DNS is unstable, switch to a reliable resolver and retry."
         )
@@ -1215,8 +1167,9 @@ def _run_docker_pull_network_preflight(
         ":" not in ip and ("timed out" in err.lower() or "timeout" in err.lower())
         for ip, err in failures
     )
+    registry_label = _registry_label_for_host(host)
     print_warning(
-        "Network preflight could not reach Docker Hub over HTTPS. Image pull may fail."
+        f"Network preflight could not reach {registry_label} over HTTPS. Image pull may fail."
     )
     print_instruction(
         "Verify host internet connectivity, VPN/proxy, and firewall policy."
@@ -1227,9 +1180,10 @@ def _run_docker_pull_network_preflight(
         )
     if ipv6_unreachable and ipv4_timed_out:
         print_instruction(
-            "IPv4 connections also timed out. Network path to Docker Hub is unstable; retry on a cleaner network."
+            f"IPv4 connections also timed out. Network path to {registry_label} is "
+            "unstable; retry on a cleaner network."
         )
-        print_instruction("Quick check: curl -4 -I https://registry-1.docker.io/v2/")
+        print_instruction(f"Quick check: curl -4 -I https://{host}/v2/")
     print_info_debug(
         "[docker] pull network preflight failed: "
         f"host={mark_sensitive(host, 'detail')} "
@@ -1326,8 +1280,14 @@ def _ensure_image_pulled_with_legacy_fallback(
     """
     if not _ensure_docker_daemon_available_for_pull(stage="pre_pull"):
         return None
-    dns_preflight_ok = _run_docker_pull_dns_preflight()
-    network_preflight_ok = _run_docker_pull_network_preflight()
+    # Derive the preflight host from the image that will actually be pulled so
+    # the DNS/TCP checks and any troubleshooting hints target the right
+    # registry (Docker Hub → registry-1.docker.io; ghcr.io/... → ghcr.io; any
+    # explicit registry → that host). Falls back to Docker Hub for short names.
+    preflight_image = _get_docker_image_candidates()[0]
+    preflight_host = _registry_host_for_image(preflight_image)
+    dns_preflight_ok = _run_docker_pull_dns_preflight(host=preflight_host)
+    network_preflight_ok = _run_docker_pull_network_preflight(host=preflight_host)
     preflight_ok = bool(dns_preflight_ok and network_preflight_ok)
 
     def _on_pull_success(
@@ -1598,7 +1558,7 @@ def _emit_docker_daemon_troubleshooting_snapshot(*, stage: str) -> None:
         print_error(
             "Docker service unit (`docker.service`) was not found on this host."
         )
-        print_instruction("Install Docker Engine + Docker Compose plugin, then retry.")
+        print_instruction("Install Docker Engine, then retry.")
         print_instruction(f"Installation guide: {_DOCKER_INSTALL_DOCS_URL}")
 
 
@@ -1621,6 +1581,7 @@ def _render_premium_pull_failure_panel(
     presentation = get_presentation(diagnosis.kind)
     suggested_timeout = 7200 if pull_timeout is None else max(pull_timeout, 7200)
     retry_command = f"adscan {command_name}"
+    login_command = _docker_login_command_for_image(image)
 
     body_lines: list[str] = []
     if presentation.what_lines:
@@ -1634,7 +1595,11 @@ def _render_premium_pull_failure_panel(
     if presentation.fix_steps:
         body_lines.append("[bold]Fix[/bold]")
         for step in presentation.fix_steps:
-            rendered = step.format(retry_command=retry_command, image_name=image)
+            rendered = step.format(
+                retry_command=retry_command,
+                image_name=image,
+                login_command=login_command,
+            )
             body_lines.append(f"  [cyan]$[/cyan] {rendered}")
         body_lines.append("")
     if diagnosis.evidence:
@@ -2060,6 +2025,15 @@ def _attempt_start_user_podman_socket() -> bool:
 def _ensure_docker_daemon_available_for_pull(*, stage: str) -> bool:
     """Ensure Docker daemon is reachable before/after image pull attempts."""
     if not _ensure_supported_container_runtime(stage=stage):
+        return False
+
+    # An absent Docker CLI cannot have a daemon to start. Short-circuit before
+    # the offer-to-start + systemctl recovery dance so we never attempt to
+    # manage a daemon that cannot exist; surface a clear install message instead.
+    if not docker_available():
+        print_error("Docker is not installed or not in PATH.")
+        print_instruction("Install Docker Engine, then retry.")
+        print_instruction(f"Installation guide: {_DOCKER_INSTALL_DOCS_URL}")
         return False
 
     running, diagnostic = _is_docker_daemon_running_internal(
@@ -3093,19 +3067,7 @@ def _do_install_docker(*, pull_timeout_seconds: int | None) -> bool:
         )
         print_error("Docker is not installed or not in PATH.")
         print_instruction(
-            f"Install Docker + Docker Compose, then retry. Guide: {_DOCKER_INSTALL_DOCS_URL}"
-        )
-        return False
-
-    if not _ensure_docker_compose_prerequisites(command_name="install"):
-        telemetry.capture(
-            "docker_install_failed",
-            {
-                "success": False,
-                "total_duration_seconds": time.monotonic() - start_time,
-                "failure_stage": "docker_prerequisites",
-                "failure_reason": "docker_or_compose_missing",
-            },
+            f"Install Docker Engine, then retry. Guide: {_DOCKER_INSTALL_DOCS_URL}"
         )
         return False
 
@@ -3314,8 +3276,6 @@ def handle_start_docker(
         if not docker_available():
             print_error("Docker is not installed or not in PATH.")
             return 1
-        if not _ensure_docker_compose_prerequisites(command_name="start"):
-            return 1
         resolved_image = _ensure_runtime_image_available(
             image=image,
             pull_timeout_seconds=pull_timeout_seconds,
@@ -3446,8 +3406,6 @@ def handle_ci_docker(
 
         if not docker_available():
             print_error("Docker is not installed or not in PATH.")
-            return 1
-        if not _ensure_docker_compose_prerequisites(command_name="ci"):
             return 1
         resolved_image = _ensure_runtime_image_available(
             image=image,
@@ -3605,6 +3563,7 @@ def run_adscan_passthrough_docker(
     debug: bool,
     pull_timeout_seconds: int | None = None,
     allow_low_memory: bool = False,
+    extra_env: list[tuple[str, str]] | None = None,
 ) -> int:
     """Run an arbitrary `adscan ...` command inside the container (host-side).
 
@@ -3632,8 +3591,6 @@ def run_adscan_passthrough_docker(
 
         if not docker_available():
             print_error("Docker is not installed or not in PATH.")
-            return 1
-        if not _ensure_docker_compose_prerequisites(command_name="passthrough"):
             return 1
         resolved_image = _ensure_runtime_image_available(
             image=image,
@@ -3692,6 +3649,11 @@ def run_adscan_passthrough_docker(
                     ("ADSCAN_LOCAL_RESOLVER_IP", local_resolver_ip),
                     ("ADSCAN_DIAG_LOGGING", os.getenv("ADSCAN_DIAG_LOGGING", "")),
                 ]
+                # Engagement-posture toggles translated from the `ci` flags
+                # (--offline -> ADSCAN_OFFLINE=1, --no-telemetry ->
+                # ADSCAN_TELEMETRY=0). Appended last so an explicit toggle wins
+                # over any inherited value; empty by default (behaviour unchanged).
+                + list(extra_env or [])
             ),
             run_host_dir=acq.session_dir,
         )

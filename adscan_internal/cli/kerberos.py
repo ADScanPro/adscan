@@ -73,16 +73,30 @@ from adscan_internal.workspaces import (
 )
 
 
-def _resolve_dcsync_target_user(shell: Any, *, domain: str) -> str | None:
+def _resolve_dcsync_target_user(
+    shell: Any, *, domain: str, username: str | None = None
+) -> str | None:
     """Resolve the target user for interactive DCSync execution.
 
     Keeps ``All`` as a first-class option while still guiding the operator with
     known privileged accounts when available.
+
+    Default-to-"All" policy (the priority is: get a DA credential first, THEN
+    replicate everything — a full "All" can be slow/fragile at 10k-user scale):
+    default to "All" when we ALREADY hold a Domain Admin credential — either the
+    domain is already pwned, OR ``username`` (the principal running THIS DCSync)
+    is itself a DA (e.g. ESC1 just minted administrator). When the executor is
+    NOT a DA (e.g. an ESC8 DC machine account replicating to EXTRACT a DA),
+    default to the single DA member so we get the DA first; the post-compromise
+    pipeline then runs the full "All" once that DA credential is in hand.
     """
     admins = shell.get_domain_admins(domain)
+    da_set = {str(a or "").strip().casefold() for a in admins if str(a or "").strip()}
+    executor_is_da = bool(username) and str(username).strip().casefold() in da_set
+    already_pwned = (shell.domains_data.get(domain, {}) or {}).get("auth") in ["pwned"]
     default_user = (
         "All"
-        if shell.domains_data[domain]["auth"] in ["pwned"]
+        if (already_pwned or executor_is_da)
         else (admins[0] if admins else "Administrator")
     )
     selector = getattr(shell, "_questionary_select", None)
@@ -1821,6 +1835,43 @@ def sync_clock_with_pdc(
         )
         return False
 
+    # SSOT physical clock-sync: route the primary physical step through the
+    # single source of truth ``ensure_clock_synced_fresh`` (force=True so this
+    # coarse caller always re-measures + re-steps when needed). This is the ONE
+    # physical-sync implementation. The legacy ntpdate / RPC / net-time machinery
+    # below is retained ONLY as a fallback for environments where the SSOT guard
+    # cannot step the clock (no host helper, read unavailable) — it returns
+    # FELL_BACK / FAILED in those cases and we drop through to legacy.
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip
+        from adscan_internal.services.dc_time import (
+            ClockSyncOutcome,
+            do_ensure_clock_synced_fresh,
+        )
+
+        _ssot_domain_data = (shell.domains_data or {}).get(domain) or {}
+        _ssot_dc_ip = resolve_dc_ip(_ssot_domain_data)
+        if _ssot_dc_ip:
+            _ssot_result = do_ensure_clock_synced_fresh(
+                shell, domain, _ssot_dc_ip, force=True
+            )
+            if _ssot_result.outcome in (
+                ClockSyncOutcome.SYNCED,
+                ClockSyncOutcome.NOOP_IN_TOLERANCE,
+                ClockSyncOutcome.ALREADY_FRESH,
+            ):
+                return True
+            # FELL_BACK_TO_REQUEST_SKEW / FAILED → fall through to legacy paths.
+            print_info_debug(
+                "[kerberos] SSOT clock guard did not converge "
+                f"(outcome={_ssot_result.outcome.value}); trying legacy paths"
+            )
+    except Exception as _ssot_exc:  # noqa: BLE001 — never block legacy fallback
+        telemetry.capture_exception(_ssot_exc)
+        print_info_debug(
+            f"[kerberos] SSOT clock guard raised; trying legacy paths: {_ssot_exc}"
+        )
+
     pdc_ip = shell.domains_data[domain]["pdc"]
 
     if _is_full_adscan_container_runtime():
@@ -2370,7 +2421,21 @@ def run_dcsync(
     else:
         domain = resolved_auth
 
-    target_user_raw = _resolve_dcsync_target_user(shell, domain=domain)
+    # SSOT physical clock-sync guard before DCSync. DRSUAPI rides Kerberos and
+    # a skewed host clock breaks the bind; the per-request kerbad skew is the
+    # fallback. Idempotent + best-effort: never blocks the dump on failure.
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip
+        from adscan_internal.services.dc_time import do_ensure_clock_synced_fresh
+
+        _dcsync_domain_data = (shell.domains_data or {}).get(domain) or {}
+        _dcsync_dc_ip = resolve_dc_ip(_dcsync_domain_data)
+        if _dcsync_dc_ip:
+            do_ensure_clock_synced_fresh(shell, domain, _dcsync_dc_ip)
+    except Exception:  # noqa: BLE001 — clock guard must never block DCSync
+        pass
+
+    target_user_raw = _resolve_dcsync_target_user(shell, domain=domain, username=username)
     target_user = _normalize_interactive_text(target_user_raw)
     if not target_user:
         print_warning("No target user specified. Aborting DCSync.")
@@ -2427,7 +2492,89 @@ def run_dcsync(
         )
     finally:
         shell._current_dcsync_context = previous_context
+    # NOTE: the ``dcsync_all_done`` marker for a full ("all") replication is set
+    # inside execute_dcsync_native (the common native-DRSUAPI point), so EVERY
+    # full-dump path — this one, secretsdump, attack-path steps — records it
+    # uniformly. Do not duplicate the marker here.
     return result
+
+
+def _resolve_logon_capable_dcsync_credential(
+    shell: KerberosShell, *, domain: str, username: str, password: str
+) -> tuple[str, str]:
+    """Pick a credential that can NETWORK-logon to the DC for DRSUAPI.
+
+    DCSync replicates over an SMB session to the DC, so the principal needs a
+    network logon there. The queued credential (the one that achieved the
+    compromise) may be a Domain Admin the DC DENIES a network logon
+    (SeDenyNetworkLogonRight). Prefer, in order:
+
+      1. A host-scoped service ticket for the DC (e.g. minted + probed
+         logon-capable by a prior AllowedToAct / SPNJack step) — reused via the
+         same ``resolve_execution_credential`` chokepoint the attack-path DCSync
+         uses, so both entry points behave identically.
+      2. The queued credential as-is — but if it is known-denied a network logon
+         on the DC and no scoped ticket exists, warn loudly (DRSUAPI will fail;
+         no silent failure).
+
+    Returns ``(username, secret)`` — ``secret`` may be a ccache path (the ST).
+    """
+    domain_data = shell.domains_data.get(domain, {}) or {}
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+        dc_host = (
+            domain_data.get("dc_fqdn")
+            or domain_data.get("pdc_hostname_fqdn")
+            or domain_data.get("pdc_hostname")
+            or resolve_dc_ip(domain_data)
+            or ""
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        dc_host = ""
+    if not dc_host:
+        return username, password
+
+    # 1. Scoped-ticket-first (logon-capable by construction — the ST was probed).
+    try:
+        from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+            resolve_execution_credential,
+        )
+
+        scoped = resolve_execution_credential(
+            shell, domain=domain, host=dc_host, relation="dcsync"
+        )
+        if scoped is not None:
+            su, sp = scoped
+            print_info_debug(
+                f"[dcsync] reusing host-scoped service ticket for "
+                f"{mark_sensitive(dc_host, 'hostname')} as {mark_sensitive(su, 'user')} "
+                "(logon-capable; avoids a DA the DC may deny a network logon)"
+            )
+            return su, sp
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+
+    # 2. No scoped ticket — warn if the queued principal is known-denied (no
+    #    silent failure; the operator/CI sees exactly why DRSUAPI will fail).
+    try:
+        from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+            is_logon_denied,
+        )
+
+        if username and is_logon_denied(
+            shell.domains_data, domain, principal=username, host=dc_host
+        ):
+            print_warning(
+                f"DCSync principal {mark_sensitive(username, 'user')} is known-denied "
+                f"a network logon on {mark_sensitive(dc_host, 'hostname')} "
+                "(SeDenyNetworkLogonRight); DRSUAPI will likely fail and no "
+                "host-scoped ticket is available to reuse."
+            )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+    return username, password
 
 
 def ask_for_dcsync(
@@ -2442,6 +2589,12 @@ def ask_for_dcsync(
         password: Password or hash for authentication.
     """
     from adscan_internal.rich_output import confirm_operation
+
+    # Prefer a logon-capable principal (scoped ticket first) — the queued DA may
+    # be denied a network logon on the DC, which DRSUAPI needs.
+    username, password = _resolve_logon_capable_dcsync_credential(
+        shell, domain=domain, username=username, password=password
+    )
 
     pdc = shell.domains_data.get(domain, {}).get("pdc", "N/A")
 

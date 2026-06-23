@@ -206,6 +206,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="low",
         remediation_effort="Remove the principal from the privileged control group.",
         can_fully_mitigate=True,
+        mitre_technique_id="T1098",
+        mitre_technique_name="Account Manipulation",
     ),
     _entry(
         "backupoperatorescalation",
@@ -237,6 +239,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="medium",
         remediation_effort="Remove unnecessary membership from Print Operators and restrict DC local execution paths.",
         can_fully_mitigate=True,
+        mitre_technique_id="T1547.006",
+        mitre_technique_name="Boot or Logon Autostart Execution: Kernel Modules and Extensions",
     ),
     _entry(
         "dnsadminabuse",
@@ -249,6 +253,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="medium",
         remediation_effort="Remove unnecessary DNSAdmins membership and harden DNS administration workflows.",
         can_fully_mitigate=True,
+        mitre_technique_id="T1543.003",
+        mitre_technique_name="Create or Modify System Process: Windows Service",
     ),
     _entry(
         "preparerodccredentialcaching",
@@ -261,6 +267,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="high",
         remediation_effort="Remove unnecessary RODC PRP delegation and review all principals allowed to modify RODC password-replication policy.",
         can_fully_mitigate=True,
+        mitre_technique_id="T1098",
+        mitre_technique_name="Account Manipulation",
     ),
     _entry(
         "extractrodckrbtgtsecret",
@@ -273,6 +281,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="high",
         remediation_effort="Prevent unauthorized RODC host access and monitor RODC memory/LSA extraction activity closely.",
         can_fully_mitigate=False,
+        mitre_technique_id="T1003",
+        mitre_technique_name="OS Credential Dumping",
     ),
     _entry(
         "forgerodcgoldenticket",
@@ -285,6 +295,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="high",
         remediation_effort="Rotate affected per-RODC krbtgt material and investigate unauthorized Kerberos ticket creation.",
         can_fully_mitigate=False,
+        mitre_technique_id="T1558.001",
+        mitre_technique_name="Steal or Forge Kerberos Tickets: Golden Ticket",
     ),
     _entry(
         "kerberoskeylist",
@@ -297,6 +309,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="high",
         remediation_effort="Review and reset replicated target credentials, rotate per-RODC krbtgt material, and investigate Key List abuse activity.",
         can_fully_mitigate=False,
+        mitre_technique_id="T1558",
+        mitre_technique_name="Steal or Forge Kerberos Tickets",
     ),
     _entry(
         "localadminpassreuse",
@@ -553,8 +567,18 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     ),
     _entry(
         "allowedtoact",
-        support_kind="unsupported",
-        support_reason="Not implemented yet in ADscan",
+        support_kind="supported",
+        support_reason=(
+            "Resource-based constrained delegation (inbound RBCD). The target "
+            "computer's msDS-AllowedToActOnBehalfOfOtherIdentity grants delegation "
+            "to a trustee (often a group). With a controlled SPN-bearing principal "
+            "that is, or can be added, a member of that trustee, S4U2Self+S4U2Proxy "
+            "as that principal mints a service ticket against the target impersonating "
+            "a privileged user (e.g. a Domain Admin), then an altservice sname rewrite "
+            "yields the cifs/http/ldap family. Deterministic. No offline crack."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="low",
         source_context_requirement="machine_credential",
         category="delegation",
         description="Resource-based constrained delegation attack path",
@@ -570,6 +594,9 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         detection_event_ids=("4769", "5136"),
         bh_native=True,
         bh_cypher_names=("AllowedToAct",),
+        is_acl_edge=False,
+        requires_execution_context=True,
+        execution_target_access_requirement="computer_reachable",
     ),
     _entry(
         "addallowedtoact",
@@ -673,7 +700,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "HasShadowCredentials",
         support_kind="supported",
         support_reason=(
-            "Object already has msDS-KeyCredentialLink — authenticate via PKINIT "
+            "Object already has msDS-KeyCredentialLink. Authenticate via PKINIT "
             "to retrieve NT hash without knowing the account password"
         ),
         compromise_semantics="direct_target_compromise",
@@ -703,7 +730,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "Set-ADObject -Identity <DN> -Clear msDS-KeyCredentialLink",
             "Enable DS Access auditing on msDS-KeyCredentialLink (Event ID 5136) "
             "in Default Domain Controller Policy.",
-            "Legitimate WHfB entries are created by the DC — entries from "
+            "Legitimate WHfB entries are created by the DC. Entries from "
             "non-DC principals are suspicious.",
         ),
     ),
@@ -799,7 +826,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "Remove SeImpersonatePrivilege from the SQL Server service account "
             "(configure the service to run as a least-privilege named account rather than "
             "NETWORK SERVICE or LocalSystem). Note: even after removal, the token theft "
-            "technique (MssqlTokenTheftEscalation) may still apply — see that step."
+            "technique (MssqlTokenTheftEscalation) may still apply. See that step."
         ),
         can_fully_mitigate=True,
         mitre_technique_id="T1134.001",
@@ -827,7 +854,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "(a common hardening measure), the original service startup token stored in LSASS "
             "retains the privilege. A CLR stored procedure recovers this token via SMB loopback "
             "named pipe authentication (Forshaw shared logon session technique) and escalates "
-            "to NT AUTHORITY\\SYSTEM. This bypass is architectural — removing the privilege from "
+            "to NT AUTHORITY\\SYSTEM. This bypass is architectural. Removing the privilege from "
             "the process token is insufficient."
         ),
         remediation_complexity="high",
@@ -898,7 +925,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "higher-privileged login (e.g. 'sa') can assume that identity within the "
             "SQL Server session using EXECUTE AS LOGIN. This effectively grants sysadmin "
             "access, enabling xp_cmdshell execution, CLR assembly loading, and all other "
-            "sysadmin capabilities — without knowing the target login's password."
+            "sysadmin capabilities, without knowing the target login's password."
         ),
         remediation_complexity="low",
         remediation_effort=(
@@ -933,7 +960,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "db_owner rights (or EXECUTE AS USER='dbo') to escalate to effective sysadmin "
             "server-wide. When EXECUTE AS USER impersonates the database owner context "
             "inside a TRUSTWORTHY database, SQL Server grants server-level permissions "
-            "equivalent to the database owner's server role — giving sysadmin access to "
+            "equivalent to the database owner's server role, giving sysadmin access to "
             "any db_owner in that database."
         ),
         remediation_complexity="low",
@@ -1183,7 +1210,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="high",
         remediation_effort=(
             "Remove EDITF_ATTRIBUTESUBJECTALTNAME2 flag from the CA via certutil. "
-            "Requires CA service restart and testing — may break applications using this flag."
+            "Requires CA service restart and testing. May break applications using this flag."
         ),
         can_fully_mitigate=True,
         mitre_technique_id="T1649",
@@ -1433,7 +1460,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description="Certificate authority compromise persistence path",
         remediation_complexity="very_high",
         remediation_effort=(
-            "Prevention: Deploy an HSM (Hardware Security Module) to store the CA private key — "
+            "Prevention: Deploy an HSM (Hardware Security Module) to store the CA private key. "
             "this makes the key non-exportable even with admin access to the CA server. "
             "Treat the CA server as Tier-0 (same level as DCs). "
             "If the CA private key is already compromised: revoke the CA certificate, "
@@ -1737,7 +1764,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "relocates its delegated SPN onto the target (delspn from the current "
             "owner, addspn onto the target), then S4U2Self+S4U2Proxy and an "
             "altservice sname rewrite to obtain a service ticket against the target "
-            "as any user (e.g. Administrator). Deterministic — no offline crack."
+            "as any user (e.g. Administrator). Deterministic. No offline crack."
         ),
         compromise_semantics="direct_target_compromise",
         compromise_effort="low",
@@ -1960,13 +1987,20 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description="Credential extraction from LSA secrets",
         remediation_complexity="medium",
         remediation_effort=(
-            "Restrict local admin access to servers. Enable LSA Protection (RunAsPPL). "
-            "Deploy EDR with credential dump detection."
+            "Restrict local admin / SYSTEM access to the host — LSA secrets live in the "
+            "HKLM\\SECURITY registry hive, so any SYSTEM-level principal can read them and "
+            "RunAsPPL/LSA Protection does NOT apply here (it guards LSASS process memory, not "
+            "the registry). Devalue what is stored: use gMSA instead of privileged service "
+            "accounts, lower cached logons (CachedLogonsCount), and rotate machine/service/krbtgt "
+            "secrets after suspected compromise; disable Remote Registry where it is not needed. "
+            "The read itself cannot be fully prevented, so detection is essential: audit reg "
+            "save/export of HKLM\\SECURITY and object access to HKLM\\SECURITY\\Policy\\Secrets, "
+            "and deploy EDR credential-dump detection."
         ),
         can_fully_mitigate=True,
         mitre_technique_id="T1003.004",
         mitre_technique_name="OS Credential Dumping: LSA Secrets",
-        detection_event_ids=("4656", "4663"),
+        detection_event_ids=("4663", "4688", "4656"),
         bh_cypher_names=("DumpLSA",),
     ),
     _entry(
@@ -1991,7 +2025,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "dumplsass",
         support_kind="supported",
         support_reason=(
-            "Execute LSASS minidump via native async stack — ppldump (KnownDlls PPL bypass), "
+            "Execute LSASS minidump via native async stack: ppldump (KnownDlls PPL bypass), "
             "wsass (WerFaultSecure PPL bypass with Defender evasion), comsvcs, nanodump, "
             "procdump, pss, rtlcp. Method selection is fingerprint-driven."
         ),
@@ -2093,7 +2127,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_complexity="medium",
         remediation_effort=(
             "Disable the Print Spooler service on all DCs and servers that do not require it. "
-            "May break networked printing from DCs — evaluate impact before applying."
+            "May break networked printing from DCs. Evaluate impact before applying."
         ),
         can_fully_mitigate=True,
         mitre_technique_id="T1187",
@@ -2256,7 +2290,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "ReadShare",
         support_kind="supported",
-        support_reason="Principal has GENERIC_READ on a network share — can access share contents",
+        support_reason="Principal has GENERIC_READ on a network share, can access share contents",
         compromise_semantics="access_capability_only",
         compromise_effort="low",
         category="credential_access",
@@ -2275,7 +2309,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "WriteShare",
         support_kind="supported",
-        support_reason="Principal has GENERIC_WRITE on a network share — can write to share",
+        support_reason="Principal has GENERIC_WRITE on a network share, can write to share",
         compromise_semantics="access_capability_only",
         compromise_effort="low",
         category="lateral_movement",
@@ -2294,7 +2328,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "FullControlShare",
         support_kind="supported",
-        support_reason="Principal has GENERIC_ALL on a network share — full share control",
+        support_reason="Principal has GENERIC_ALL on a network share, full share control",
         compromise_semantics="access_capability_only",
         compromise_effort="low",
         category="lateral_movement",
@@ -2337,7 +2371,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "Ntlmv1Enabled",
         support_kind="context",
         support_reason=(
-            "NTLMv1 authentication is enabled on this host — its challenge/response "
+            "NTLMv1 authentication is enabled on this host. Its challenge/response "
             "is trivially crackable and relayable; a discovered misconfiguration."
         ),
         compromise_semantics="context_only",
@@ -2466,7 +2500,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
             "ADscan captures the NetNTLMv1 challenge/response from the coerced host "
             "but does NOT perform the offline crack: there is no crack.sh / DES "
             "rainbow-table / GPU (hashcat 14000) integration to recover the machine "
-            "account NT hash. Capture-only — the operator must run the offline crack "
+            "account NT hash. Capture-only. The operator must run the offline crack "
             "out-of-band to obtain the credential."
         ),
         compromise_semantics="credential_access_only",
@@ -2475,7 +2509,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         description=(
             "NTLMv1 offline crack: a domain user coerces the victim computer, captures "
             "its NTLMv1 response, and cracks it offline to recover the victim's machine "
-            "account NT hash. The most universal NTLMv1 avenue — independent of relay "
+            "account NT hash. The most universal NTLMv1 avenue, independent of relay "
             "viability, LDAP signing, channel binding, ADCS, or DC count."
         ),
         vuln_key="ntlmv1_crack",
@@ -2483,7 +2517,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         remediation_effort=(
             "Disable NTLMv1 (LmCompatibilityLevel ≥ 3) via GPO and remove "
             "authentication-coercion vectors. Unlike the relay avenues, LDAP signing "
-            "and channel binding do NOT mitigate this — only disabling NTLMv1 itself "
+            "and channel binding do NOT mitigate this. Only disabling NTLMv1 itself "
             "closes it (the crack is offline)."
         ),
         can_fully_mitigate=True,
@@ -2572,6 +2606,7 @@ _RELATIONS_REQUIRING_EXECUTION_CONTEXT: frozenset[str] = frozenset(
         "canpsremote",
         "hassession",
         "allowedtodelegate",
+        "allowedtoact",
         "adcsesc1",
         "adcsesc3",
         "adcsesc4",
@@ -2886,7 +2921,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
     "asreproasting": {
         "short": "ASREPRoasting: {target} has pre-authentication disabled, so {source} can request an AS-REP and crack it offline.",
         "long": (
-            "ASREPRoasting targets accounts — in this path, {target} — that have "
+            "ASREPRoasting targets accounts, in this path {target}, that have "
             "Kerberos pre-authentication disabled (DONT_REQ_PREAUTH flag). Any "
             "unauthenticated attacker (including {source}) can request an AS-REP "
             "message encrypted with the account's password-derived key and crack "
@@ -2905,7 +2940,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "over {target_type} {target}. This allows the source to reset the "
             "target's password, add Shadow Credentials (msDS-KeyCredentialLink), "
             "set a Service Principal Name to enable Kerberoasting, or write a "
-            "logon script — any of which results in complete compromise of {target}."
+            "logon script, any of which results in complete compromise of {target}."
         ),
         "remediation": (
             "Remove the GenericAll ACE granting control from {source} over {target}.",
@@ -2963,15 +2998,15 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "remediation": (
             "Remove the User-Force-Change-Password extended right from {source} on {target}.",
-            "Review delegated password-reset rights — they should be granted only to helpdesk / tier-appropriate personnel.",
+            "Review delegated password-reset rights. They should be granted only to helpdesk / tier-appropriate personnel.",
         ),
     },
     "addmember": {
         "short": "AddMember: {source} can add itself to {target}, inheriting all of the group's privileges.",
         "long": (
             "AddMember on the {target} group lets {source} add arbitrary principals "
-            "(including itself) as members. Any privilege granted to {target} — "
-            "often through nested group chains — is inherited immediately by the "
+            "(including itself) as members. Any privilege granted to {target}, "
+            "often through nested group chains, is inherited immediately by the "
             "attacker."
         ),
         "remediation": (
@@ -2984,7 +3019,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "long": (
             "AddSelf lets {source} add itself (but not others) to the {target} "
             "group. After self-insertion, {source} inherits every privilege held "
-            "by {target} — often a fast path to tier-0 via nested group chains."
+            "by {target}, often a fast path to tier-0 via nested group chains."
         ),
         "remediation": (
             "Remove the AddSelf extended right from {source} on {target}.",
@@ -3077,7 +3112,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "short": "Group membership: {source} is a member of {target} and inherits its privileges.",
         "long": (
             "{source} is a direct or nested member of {target}. All privileges "
-            "held by {target} — including any onward attack-path edges — are "
+            "held by {target}, including any onward attack-path edges, are "
             "inherited by {source}."
         ),
         "remediation": (
@@ -3105,8 +3140,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "short": "Unconstrained Delegation: {source} can capture the TGT of any user that authenticates to it.",
         "long": (
             "{source} is marked TRUSTED_FOR_DELEGATION (unconstrained delegation). "
-            "Any user that authenticates to {source} — including Domain Admins "
-            "coerced via the Printer Bug / PetitPotam — deposits a forwardable "
+            "Any user that authenticates to {source}, including Domain Admins "
+            "coerced via the Printer Bug / PetitPotam, deposits a forwardable "
             "TGT in {source}'s LSASS. The attacker dumps the TGT and pivots as "
             "that user to {target}."
         ),
@@ -3254,24 +3289,175 @@ def render_step_narrative(
 
 
 def render_step_remediation(step: dict[str, Any]) -> list[str]:
-    """Render structured remediation steps for one attack-path step."""
+    """Render structured remediation steps for one attack-path step.
+
+    Prefers the edge-specific, templated ``remediation_steps`` on the catalog
+    entry (rendered against the step's source/target). When an entry has none —
+    e.g. the ADCS ESC1-16 entries, which intentionally keep their remediation
+    only in ``VULN_CATALOG`` (the technique-prose SSOT), not as per-edge steps —
+    it falls back to the canonical static ``remediation`` from ``VULN_CATALOG``
+    via the entry's ``vuln_key`` join, so NO vulnerability step in the report
+    ever renders without remediation.
+    """
     if not isinstance(step, dict):
         return []
     relation_raw = step.get("action") or step.get("relation") or step.get("type") or ""
     entry = get_attack_step_entry(str(relation_raw))
-    if entry is None or not entry.remediation_steps:
+    if entry is None:
         return []
-    placeholders = _extract_step_placeholders(step)
-    rendered: list[str] = []
-    for item in entry.remediation_steps:
-        try:
-            rendered.append(item.format(**placeholders))
-        except (KeyError, IndexError):
-            out = item
-            for k, v in placeholders.items():
-                out = out.replace("{" + k + "}", v)
-            rendered.append(out)
-    return rendered
+    if entry.remediation_steps:
+        placeholders = _extract_step_placeholders(step)
+        rendered: list[str] = []
+        for item in entry.remediation_steps:
+            try:
+                rendered.append(item.format(**placeholders))
+            except (KeyError, IndexError):
+                out = item
+                for k, v in placeholders.items():
+                    out = out.replace("{" + k + "}", v)
+                rendered.append(out)
+        return rendered
+    # Fallback: pull the canonical static remediation from VULN_CATALOG via the
+    # vuln_key join (ADCS ESC* and any vuln-bearing edge without per-edge steps).
+    prose = resolve_technique_prose(getattr(entry, "vuln_key", None))
+    remediation = prose.get("remediation")
+
+    def _clean_bullet(value: Any) -> str:
+        # VULN_CATALOG remediation lines carry a literal "[bullet] " marker; the
+        # step renderer emits its own bullet, so strip the marker for parity
+        # with the edge-specific remediation_steps.
+        text = str(value).strip()
+        if text.lower().startswith("[bullet]"):
+            text = text[len("[bullet]"):].strip()
+        return text
+
+    if isinstance(remediation, (list, tuple)):
+        return [cleaned for item in remediation if (cleaned := _clean_bullet(item))]
+    if isinstance(remediation, str) and _clean_bullet(remediation):
+        return [_clean_bullet(remediation)]
+    return []
+
+
+def resolve_technique_prose(vuln_key: str | None) -> dict[str, Any]:
+    """Resolve canonical technique prose for a step from ``VULN_CATALOG``.
+
+    ``VULN_CATALOG`` is the single source of truth for *technique* prose —
+    the long-form description, impact, static remediation, structured
+    remediation_options, and references. An attack-step entry joins to it via
+    its ``vuln_key``; this function performs that join so the per-step
+    ``knowledge`` object carries the same canonical prose the finding-level
+    report uses, instead of re-authoring it on the attack-step side.
+
+    The import is lazy + best-effort: ``VULN_CATALOG`` lives in the PRO
+    reporting tree and may be absent in a LITE/runtime-only context, so a
+    missing module yields an empty dict and the caller falls back to the
+    edge-summary already present on the catalog entry.
+
+    Args:
+        vuln_key: The catalog join key (``AttackStepCatalogEntry.vuln_key``),
+            or ``None`` for an edge that does not represent a vulnerability.
+
+    Returns:
+        A dict with whichever of ``description``, ``impact``, ``remediation``,
+        ``remediation_options``, ``references`` ``VULN_CATALOG`` carries for
+        the key. Empty when no key, no entry, or the catalog is unavailable.
+    """
+    if not vuln_key:
+        return {}
+    try:
+        from adscan_internal.pro.reporting.vuln_catalog import VULN_CATALOG
+    except Exception:
+        return {}
+    entry = VULN_CATALOG.get(vuln_key)
+    if not isinstance(entry, dict):
+        return {}
+    prose: dict[str, Any] = {}
+    for field_name in (
+        "description",
+        "impact",
+        "remediation",
+        "remediation_options",
+        "references",
+    ):
+        value = entry.get(field_name)
+        if value:
+            prose[field_name] = value
+    return prose
+
+
+def build_step_knowledge(step: dict[str, Any]) -> dict[str, Any] | None:
+    """Build the rich ``knowledge`` sub-object for one attack-path step.
+
+    Resolves the step's relation to its catalog entry and bundles the
+    human-facing knowledge so it travels into ``attack_paths_snapshot.json``
+    for the web (Phase 2) and report (Phase 3). The narrative and remediation
+    steps are RENDERED against the step's own details (source/target/template)
+    so they are concrete, not templated.
+
+    Technique prose (the long-form ``description``, ``impact``, static
+    ``remediation``, structured ``remediation_options``, ``references``) is
+    pulled from ``VULN_CATALOG`` via the ``vuln_key`` join — that catalog is
+    the single source of truth for technique prose, so it is not duplicated on
+    the attack-step side. Only the genuinely edge-specific bits are authored
+    here: the rendered ``narrative``, the rendered (templated) per-edge
+    ``remediation_steps``, the MITRE technique mapping, the concise
+    ``step_summary`` edge label, and the ``vuln_key`` join itself.
+
+    When no ``vuln_key`` resolves (an edge with no matching finding, or a
+    LITE context without the PRO catalog), the canonical ``description`` falls
+    back to the edge summary so the shape never loses its description.
+
+    The emitted shape (self-describing — Phase 2/3 depend on it):
+        {
+            "description": str,                 # canonical technique prose (VULN_CATALOG)
+            "impact": str,                      # from VULN_CATALOG (omitted if absent)
+            "remediation": list[str],           # static, from VULN_CATALOG (omitted if absent)
+            "remediation_options": list[dict],  # structured, from VULN_CATALOG (omitted if absent)
+            "references": list[str],            # from VULN_CATALOG (omitted if absent)
+            "step_summary": str,                # concise edge-specific summary label
+            "remediation_steps": list[str],     # rendered, ordered, edge-specific
+            "narrative": str,                   # rendered long-form sentence
+            "mitre_technique_id": str | None,
+            "mitre_technique_name": str | None,
+            "vuln_key": str | None,             # the unification join to a finding
+        }
+
+    Args:
+        step: Raw attack-path step dict with at least ``action``/``relation``
+            and an optional ``details`` dict.
+
+    Returns:
+        The knowledge dict, or ``None`` when the relation has no catalog entry.
+    """
+    if not isinstance(step, dict):
+        return None
+    relation_raw = (
+        step.get("action") or step.get("relation") or step.get("type") or ""
+    )
+    entry = get_attack_step_entry(str(relation_raw))
+    if entry is None:
+        return None
+    narrative = render_step_narrative(step) or (entry.narrative_template or "")
+    edge_summary = entry.description or ""
+    prose = resolve_technique_prose(entry.vuln_key)
+    knowledge: dict[str, Any] = {
+        # Canonical technique prose from VULN_CATALOG; falls back to the edge
+        # summary when no vuln_key resolves so the field is never empty.
+        "description": prose.get("description") or edge_summary,
+        "step_summary": edge_summary,
+        "remediation_steps": render_step_remediation(step),
+        "narrative": narrative,
+        "mitre_technique_id": entry.mitre_technique_id,
+        "mitre_technique_name": entry.mitre_technique_name,
+        "vuln_key": entry.vuln_key,
+    }
+    # Surface the remaining canonical prose fields when VULN_CATALOG carries
+    # them — absent fields are omitted so the shape stays clean.
+    for field_name in ("impact", "remediation", "remediation_options", "references"):
+        value = prose.get(field_name)
+        if value:
+            knowledge[field_name] = value
+    return knowledge
 
 
 _STATUS_PHRASE: dict[str, str] = {

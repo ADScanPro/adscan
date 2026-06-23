@@ -676,5 +676,38 @@ if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]' /proc/self/uid_map 2>/dev
   fi
 fi
 
+# Drop to the run user. In a ROOTFUL run we additionally raise the network
+# capabilities Docker granted (--cap-add NET_BIND_SERVICE / NET_ADMIN / NET_RAW)
+# into the INHERITABLE + AMBIENT sets so they survive BOTH the setuid drop and any
+# later execve (the PyInstaller onefile bootloader re-exec). Without this, gosu's
+# setuid-from-root wipes permitted+effective (Docker leaves CapAmb empty), so the
+# PRO frozen binary runs with zero caps and cannot bind privileged ports (445/80/
+# 389) for NTLM capture / relay / ESC8. LITE only survived via `setcap …+ep` fcaps
+# on its venv python — which the PRO binary lacks. Ambient caps are gated to those
+# actually present in the bounding set (so a missing --cap-add degrades cleanly),
+# and skipped entirely in the rootless path above (caps stripped, cannot be
+# honoured → plain uid drop, reduced network mode). If setpriv/capsh are absent we
+# fall back to gosu so the container ALWAYS starts.
 # Run ADscan in the foreground so it keeps a functional TTY (Prompts, selection UIs).
-gosu "${uid}:${gid}" /usr/local/bin/adscan "$@"
+_amb_caps=""
+if grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]' /proc/self/uid_map 2>/dev/null \
+   && command -v setpriv >/dev/null 2>&1 && command -v capsh >/dev/null 2>&1; then
+  _bnd_hex="$(grep -m1 '^CapBnd:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+  if [[ -n "${_bnd_hex}" ]]; then
+    _bnd_names="$(capsh --decode="0x${_bnd_hex}" 2>/dev/null || true)"
+    for _c in net_bind_service net_admin net_raw; do
+      if printf '%s' "${_bnd_names}" | grep -q "cap_${_c}"; then
+        _amb_caps="${_amb_caps:+${_amb_caps},}+${_c}"
+      fi
+    done
+  fi
+fi
+
+if [[ -n "${_amb_caps}" ]]; then
+  _ep_log "raising ambient network caps for run user (${_amb_caps}) so privileged-port listeners (NTLM capture / relay / ESC8) work"
+  setpriv --reuid "${uid}" --regid "${gid}" --clear-groups \
+    --inh-caps "${_amb_caps}" --ambient-caps "${_amb_caps}" \
+    -- /usr/local/bin/adscan "$@"
+else
+  gosu "${uid}:${gid}" /usr/local/bin/adscan "$@"
+fi

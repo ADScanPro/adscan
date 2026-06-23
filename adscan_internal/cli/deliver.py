@@ -1,19 +1,23 @@
 """``adscan deliver`` — render the full Client Deliverable Kit.
 
-Generates the four PRO PDFs in parallel and packages them into a single
+Generates the PRO PDFs in parallel and packages them into a single
 ZIP under ``<workspace>/deliverables/<YYYY-MM-DD>-adscan-kit.zip``:
 
-* Executive Assessment Report  (live engagement assessment)
-* AD Hardening Playbook        (bonus, value-stack)
-* MITRE Remediation Checklist  (bonus, value-stack)
-* Coverage Matrix              (procurement / RFP companion)
+* Security Assessment Report     (live engagement assessment)
+* AD Hardening Playbook          (bonus, value-stack)
+* AD Control Coverage Report     (proof-of-coverage / board-ready control assurance)
+
+The standalone MITRE Remediation Checklist was retired — its ATT&CK lens
+is now folded into the Security Assessment Report. ``--only checklist``
+still resolves (aliased to the main report) so pinned customer scripts do
+not break.
 
 This command is **PRO only**. In LITE, the canonical PRO upsell panel
 is rendered via :func:`adscan_core.pro_upsell.render_pro_upsell_panel`
 and the function returns ``2`` (matches argparse "usage error" so the
 shell does not treat it as a crash).
 
-The four generators run concurrently (``asyncio.gather`` over a thread
+The generators run concurrently (``asyncio.gather`` over a thread
 pool) — sequential rendering would Time-Delay the operator without any
 quality gain.
 """
@@ -36,6 +40,7 @@ from adscan_core.paths import get_workspaces_dir
 from adscan_core.rich_output import (
     print_error,
     print_info,
+    print_info_debug,
     print_panel,
     print_success,
     print_warning,
@@ -82,14 +87,19 @@ _KIT: tuple[_KitItem, ...] = (
     _KitItem(
         "playbook", "AD_Hardening_Playbook.pdf", "AD Hardening Playbook", "playbook"
     ),
+    # The standalone MITRE Remediation Checklist (slug ``checklist``) was
+    # retired in e6e0355c — its ATT&CK lens is now folded into the main
+    # Security Assessment Report, so a separate PDF was redundant. The
+    # ``checklist`` slug is kept resolving via ``_ONLY_ALIASES`` (→ the main
+    # report) so pinned ``--only checklist`` scripts do not error.
+    # Slug stays ``coverage-matrix`` for back-compat (``--only coverage-matrix``,
+    # the web Celery task selection, customer scripts); the artefact it renders
+    # is the AD Control Coverage Report (sourced from control_evidence).
     _KitItem(
-        "checklist",
-        "MITRE_Remediation_Checklist.pdf",
-        "MITRE Remediation Checklist",
-        "checklist",
-    ),
-    _KitItem(
-        "coverage-matrix", "Coverage_Matrix.pdf", "Coverage Matrix", "coverage-matrix"
+        "coverage-matrix",
+        "AD_Control_Coverage_Report.pdf",
+        "AD Control Coverage Report",
+        "coverage-matrix",
     ),
 )
 
@@ -102,7 +112,10 @@ _VALID_SLUGS: tuple[str, ...] = tuple(item.slug for item in _KIT)
 # semantically correct alias we direct users to. Add new aliases here when
 # the public vocabulary drifts ahead of the internal slug — never rename
 # the slug itself in this codebase.
-_ONLY_ALIASES: dict[str, str] = {"report": "executive"}
+# ``checklist`` → ``executive``: the standalone MITRE Remediation Checklist was
+# retired (folded into the main report). A pinned ``--only checklist`` now renders
+# the Security Assessment Report (which carries the ATT&CK lens) instead of erroring.
+_ONLY_ALIASES: dict[str, str] = {"report": "executive", "checklist": "executive"}
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +127,27 @@ _ONLY_ALIASES: dict[str, str] = {"report": "executive"}
 # parity. Adding a new framework requires the orchestrator + Coverage
 # Matrix bonus to know about it — do not add a label here in isolation.
 
+# ENS and NIS2 are DISTINCT compliance regimes (ENS = Spanish public sector /
+# CCN-CERT; NIS2 = EU critical-infrastructure directive) and are selectable
+# independently — a client may need NIS2 but not ENS. They share findings/
+# attack-path semantics, which is modularized in the content layer, not by
+# collapsing them into one key.
 _FRAMEWORK_KEY_MAP: dict[str, str] = {
-    "ENS Alto + NIS2 — Spain / CCN-CERT (recommended)": "ens",
+    "ENS Alto — Spain / CCN-CERT (recommended)": "ens",
+    "NIS2 — EU Directive (EU) 2022/2555 (critical infrastructure)": "nis2",
     "ISO 27001:2022 — International ISMS standard": "iso27001",
     "DORA — EU 2022/2554 (financial sector)": "dora",
-    "PCI DSS v4.0 — Payment Card Industry": "pci_dss",
+    "PCI DSS v4.0.1 — Payment Card Industry": "pci_dss",
 }
 _VALID_FRAMEWORK_KEYS: tuple[str, ...] = tuple(_FRAMEWORK_KEY_MAP.values())
-_DEFAULT_FRAMEWORKS: tuple[str, ...] = ("ens",)
+# Default selection when the caller does not choose any framework: NONE. The
+# client must explicitly pick the regimes that apply to them (e.g. PCI DSS +
+# ISO 27001), so no compliance regime is forced onto a report that did not
+# request it. Kept in lockstep with the web SSOT
+# (``app.schemas.report_config.DEFAULT_FRAMEWORKS``); the cross-boundary
+# contract test ``tests/unit/test_cli_web_framework_contract.py`` asserts the
+# two defaults match.
+_DEFAULT_FRAMEWORKS: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -291,12 +317,12 @@ def _resolve_frameworks(args: argparse.Namespace) -> list[str]:
     Order:
         1. ``--frameworks`` flag value, validated via :func:`_parse_frameworks`.
         2. Interactive questionary checkbox in TTY contexts.
-        3. Default :data:`_DEFAULT_FRAMEWORKS` (``ens``) in non-interactive
+        3. Default :data:`_DEFAULT_FRAMEWORKS` (NONE) in non-interactive
            contexts or when the user cancels / deselects everything.
 
-    The function never raises for empty selection — the kit always ships
-    with at least one framework so the Compliance Snapshot and Coverage
-    Matrix render coherently.
+    The function never raises for empty selection. An empty result is valid
+    and intended: no framework was selected, so the report omits the compliance
+    sections entirely rather than forcing a regime the client did not request.
     """
     raw = getattr(args, "frameworks", None)
     parsed = _parse_frameworks(raw)
@@ -458,8 +484,9 @@ async def _render_assessment_async(
     if report_theme not in _VALID_REPORT_THEMES:
         report_theme = _DEFAULT_REPORT_THEME
 
-    # Final guard: never let an empty / None framework list reach the
-    # orchestrator. Compliance Snapshot would render blank rows.
+    # Resolve the selected frameworks. An empty/None selection stays empty
+    # (default none): the kit omits the compliance sections rather than forcing
+    # a regime the client did not request.
     fw: list[str] = list(frameworks) if frameworks else list(_DEFAULT_FRAMEWORKS)
 
     def _run() -> int:
@@ -493,7 +520,10 @@ async def _render_assessment_async(
         # them empty (computed on demand), so without this the kit report
         # shipped with ZERO attack paths -- the "deliver is suspiciously fast"
         # symptom. Single source of truth shared with report_service.
-        ensure_report_attack_paths(report_data, workspace_dir)
+        # Also emits the per-framework compliance block into
+        # technical_report.json for the selected frameworks (verbatim ingest by
+        # the web) — same SSOT engine as the PDF compliance sections.
+        ensure_report_attack_paths(report_data, workspace_dir, frameworks=fw)
         pdf_bytes = generate_report_pdf(
             report_data,
             metadata=metadata,
@@ -563,6 +593,57 @@ async def _render_kit(
     return {item.filename: size for item, size in zip(items, sizes)}
 
 
+def _generate_affected_assets_appendix(
+    *,
+    staging_dir: Path,
+    workspace_dir: Path,
+) -> tuple[str, ...]:
+    """Write the consolidated affected-assets appendix into ``staging_dir``.
+
+    Emits ``affected_assets_appendix.csv`` and ``affected_assets_appendix.json``
+    carrying the COMPLETE, untruncated affected-asset set for every finding —
+    the full machine-readable record the capped inline PDF lists point at. The
+    data is sourced from the SAME affected-assets SSOT the PDFs use (loaded the
+    same way as the assessment report), so the appendix and the PDF inline lists
+    cannot diverge. Best-effort: a failure here never aborts the kit.
+
+    Returns the bundled filenames (added flat to the kit ZIP), or ``()`` when
+    the appendix could not be produced.
+    """
+    try:
+        from adscan_internal.pro.reporting.affected_assets_exports import (
+            write_affected_assets_appendix,
+        )
+        from adscan_internal.pro.reporting.report_builder import (
+            build_report_data_from_raw,
+        )
+        from adscan_internal.pro.services.report_service import (
+            ensure_report_attack_paths,
+        )
+
+        report_json = workspace_dir / "technical_report.json"
+        if not report_json.is_file():
+            print_warning(
+                "Affected-assets appendix skipped: technical_report.json not found."
+            )
+            return ()
+        raw = json.loads(report_json.read_text(encoding="utf-8"))
+        report_data = build_report_data_from_raw(raw) if isinstance(raw, dict) else {}
+        # Compute + inject attack paths the same way the assessment report does,
+        # so the appendix's correlated assets match the PDF exactly.
+        ensure_report_attack_paths(report_data, workspace_dir)
+        result = write_affected_assets_appendix(report_data, output_dir=staging_dir)
+        print_info_debug(
+            f"Affected-assets appendix: {int(result['row_count'])} rows "
+            f"→ {result['csv_filename']}, {result['json_filename']}"
+        )
+        return (str(result["csv_filename"]), str(result["json_filename"]))
+    except Exception as exc:  # noqa: BLE001 — appendix is best-effort but logged
+        telemetry.capture_exception(exc)
+        print_warning(f"Affected-assets appendix skipped: {exc}")
+        return ()
+
+
 # ---------------------------------------------------------------------------
 # Packaging + presentation
 # ---------------------------------------------------------------------------
@@ -573,6 +654,7 @@ def _package_zip(
     zip_path: Path,
     items: tuple[_KitItem, ...],
     extras: tuple[str, ...] = (),
+    appendix: tuple[str, ...] = (),
 ) -> None:
     """Bundle the selected PDFs (and optional extras) into ``zip_path``.
 
@@ -581,6 +663,10 @@ def _package_zip(
     the MITRE ATT&CK Navigator JSON layer and the interactive HTML
     bundle. Extras are written into the ZIP under a top-level
     ``mitre/`` folder so the kit stays tidy when the client unzips it.
+
+    ``appendix`` is a tuple of filenames (the consolidated affected-assets
+    appendix CSV/JSON) bundled FLAT at the top level next to the PDFs — the
+    PDFs reference the CSV by its bare name, so it must not be nested.
     """
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -588,6 +674,10 @@ def _package_zip(
             src = staging_dir / item.filename
             if src.is_file():
                 zf.write(src, arcname=item.filename)
+        for name in appendix:
+            src = staging_dir / name
+            if src.is_file():
+                zf.write(src, arcname=name)
         for extra in extras:
             src = staging_dir / extra
             if src.is_file():
@@ -602,12 +692,17 @@ def _write_manifest(
     items: tuple[_KitItem, ...],
     workspace_dir: Path,
     extras: tuple[str, ...] = (),
+    appendix: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Write ``manifest.json`` next to the ZIP describing the deliverable.
 
     The manifest is the contract consumed by the web/Celery task in the
     next batch — keep its shape stable. Returns the dict that was written
     so callers (and tests) can assert against it without re-reading.
+
+    The affected-assets appendix files are listed under the existing
+    ``extras`` key with a flat (top-level) ``arcname``, so the web ingestion —
+    which already enumerates ``extras`` — picks them up with no schema change.
     """
     selection = {slug: (slug in {it.slug for it in items}) for slug in _VALID_SLUGS}
 
@@ -626,6 +721,17 @@ def _write_manifest(
         )
 
     extra_files: list[dict[str, Any]] = []
+    for name in appendix:
+        path = staging_dir / name
+        size = path.stat().st_size if path.is_file() else 0
+        extra_files.append(
+            {
+                "name": name,
+                "size": size,
+                "path": str(path),
+                "arcname": name,
+            }
+        )
     for extra in extras:
         path = staging_dir / extra
         size = path.stat().st_size if path.is_file() else 0
@@ -1040,8 +1146,16 @@ async def run_deliver(args: argparse.Namespace) -> int:
             engagement=engagement,
         )
 
+    # Consolidated affected-assets appendix (CSV + JSON) — the complete,
+    # untruncated record of every finding's affected assets, bundled flat next
+    # to the PDFs. Always generated; the PDFs' overflow lines name the CSV.
+    appendix = _generate_affected_assets_appendix(
+        staging_dir=staging_dir,
+        workspace_dir=workspace_dir,
+    )
+
     try:
-        _package_zip(staging_dir, zip_path, items, extras)
+        _package_zip(staging_dir, zip_path, items, extras, appendix)
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_error(f"Could not package ZIP: {exc}")
@@ -1055,6 +1169,7 @@ async def run_deliver(args: argparse.Namespace) -> int:
             items=items,
             workspace_dir=workspace_dir,
             extras=extras,
+            appendix=appendix,
         )
     except Exception as exc:  # noqa: BLE001 — manifest is best-effort but logged
         telemetry.capture_exception(exc)
@@ -1137,7 +1252,8 @@ def add_deliver_subparser(
             "Comma-separated compliance frameworks to render in the kit. "
             f"Choices: {', '.join(_VALID_FRAMEWORK_KEYS)}. "
             "When omitted, an interactive checkbox prompts in TTY contexts; "
-            f"non-interactive runs default to '{_DEFAULT_FRAMEWORKS[0]}'."
+            "non-interactive runs include no compliance section unless one is "
+            "selected explicitly."
         ),
     )
     parser.add_argument(

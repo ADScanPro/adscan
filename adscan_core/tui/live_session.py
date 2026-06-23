@@ -164,6 +164,30 @@ def _is_no_live_env() -> bool:
     return os.environ.get(_NO_LIVE_ENV, "") == "1"
 
 
+def _is_noninteractive_env() -> bool:
+    """True when the session is non-interactive (CI / ``adscan ci`` / pipeline).
+
+    ``console.is_terminal`` (≈ ``isatty()``) is NOT a reliable gate for Live:
+    ``adscan ci`` runs under Docker ``-it`` and the CI workflow exports
+    ``FORCE_COLOR=1`` / ``TERM=xterm-256color``, so Rich reports a terminal even
+    though stdout is captured to a non-interactive log. Rendering Live there
+    emits alt-screen / cursor escapes the log cannot interpret, so every refresh
+    STACKS the full panel instead of overwriting it — flooding the CI output.
+
+    Keyed on the EXPLICIT non-interactive markers ``adscan ci`` sets
+    (``ADSCAN_NONINTERACTIVE=1`` — adscan.py entry point — and ``ADSCAN_SESSION_ENV=ci``),
+    NOT on the bare ``CI`` / ``GITHUB_ACTIONS`` markers. The flood is driven by
+    ``adscan ci`` (which sets these), and keying narrowly avoids a footgun: the
+    unit-test suite itself runs under ``GITHUB_ACTIONS=true`` and must still be
+    able to exercise real Live mode. Kept dependency-light — ``adscan_core`` must
+    not import ``adscan_internal.interaction.is_non_interactive``; this mirrors
+    its explicit-marker branch.
+    """
+    if os.environ.get("ADSCAN_NONINTERACTIVE", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    return os.environ.get("ADSCAN_SESSION_ENV", "").strip().lower() == "ci"
+
+
 def _renderable_summary_text(renderable: "RenderableType", console: Console) -> str:
     """Best-effort one-line digest of a Rich renderable for non-TTY logs.
 
@@ -248,6 +272,9 @@ class LiveSession:
         # of the lifecycle never has to re-check sys.stdout / env vars.
         self._is_live: bool = False
         self._entered: bool = False
+        # Last line emitted by the inline (non-Live) fallback — used to collapse
+        # consecutive identical progress digests so CI logs stay tight.
+        self._last_inline_line: Optional[str] = None
         # Token for the deferred live-log buffer pushed in __enter__ (only
         # in the alt-screen + redirect_io case). ``None`` means no buffer
         # was pushed and __exit__ has nothing to flush.
@@ -277,7 +304,11 @@ class LiveSession:
     def __enter__(self) -> "LiveSession":
         """Enter Live (TTY) or set up inline-logging fallback (non-TTY)."""
         self._entered = True
-        self._is_live = bool(self._console.is_terminal) and not _is_no_live_env()
+        self._is_live = (
+            bool(self._console.is_terminal)
+            and not _is_no_live_env()
+            and not _is_noninteractive_env()
+        )
         if not self._is_live:
             # Non-TTY: emit the initial frame as a single digest line so
             # the operator at least sees what the dashboard would have
@@ -667,10 +698,17 @@ class LiveSession:
                     self._live.refresh()
 
     def _inline_log(self, renderable: "RenderableType") -> None:
-        """Emit a single readable line for non-TTY consumers."""
+        """Emit a single readable line for non-TTY consumers.
+
+        Consecutive identical digests are collapsed (a progress widget that
+        ``update()``s on every tick would otherwise print the same line dozens
+        of times in a CI log).
+        """
         line = _renderable_summary_text(renderable, self._console)
-        if line:
-            # ``file=sys.stderr`` would split the stream from
-            # ``print_*`` output; we keep stdout to match the rest of
-            # ADscan's logging conventions.
-            print(line, file=sys.stdout, flush=True)
+        if not line or line == self._last_inline_line:
+            return
+        self._last_inline_line = line
+        # ``file=sys.stderr`` would split the stream from
+        # ``print_*`` output; we keep stdout to match the rest of
+        # ADscan's logging conventions.
+        print(line, file=sys.stdout, flush=True)

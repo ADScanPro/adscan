@@ -14,6 +14,22 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from adscan_internal.services.collector.models import CollectionResult, CollectorNode
 
+# Non-grantee well-known SIDs: owner/creator ABSTRACTIONS, not fixed principals.
+# An ACE for one of these does NOT grant a usable principal access to the object —
+# it is an inheritance/owner template resolved at runtime (Creator Owner = whoever
+# creates a child object and the rights they get ON THAT CHILD; Owner Rights =
+# whatever the current owner is granted). You cannot authenticate as them, so an
+# access edge (share-access, ACL control) sourced FROM these is a false capability
+# — e.g. a "Creator Owner: Full Control" ACE on a read-only share must NOT yield a
+# WriteShare edge. Edge emission excludes them.
+NON_GRANTEE_SIDS: frozenset[str] = frozenset(
+    {
+        "S-1-3-0",  # Creator Owner
+        "S-1-3-1",  # Creator Group
+        "S-1-3-4",  # Owner Rights
+    }
+)
+
 # Well-known SID → (display_name, kind)
 # Stable across all Windows/AD environments — no LDAP lookup needed.
 _WELL_KNOWN: dict[str, tuple[str, str]] = {

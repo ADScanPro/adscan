@@ -37,6 +37,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive, print_panel
+from adscan_core.rich_output import confirm_ask
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.cli.ci_events import emit_event, emit_phase
 from adscan_internal.cli.common import build_lab_event_fields
@@ -45,7 +46,11 @@ from adscan_internal.cli.cracking import (
     handle_hash_cracking_batch,
 )
 from adscan_internal.services.session_compromise_state_service import (
+    NON_COMPROMISE_ORIGINS,
     mark_session_user_compromised,
+)
+from adscan_internal.services.credentials.credential_origin import (
+    origin_display_label,
 )
 from adscan_internal.models.domain import resolve_dc_ip
 from adscan_core.theme import (
@@ -255,41 +260,13 @@ def _resolve_credential_provenance_label(
     if isinstance(user_meta, dict):
         origin = str(user_meta.get("credential_origin") or "").strip()
         if origin:
-            normalized = origin.lower()
-            mapping = {
-                "readlapspassword": "LAPS read",
-                "synclapspassword": "LAPS sync",
-                "gpppassword": "GPP cpassword",
-                "gpp_cpassword": "GPP cpassword",
-                "gpp_autologon": "GPP autologon",
-                "userdescription": "user description",
-                "user_description": "user description",
-                "kerberoast": "kerberoast",
-                "asreproast": "AS-REP roast",
-                "timeroast": "timeroast",
-                "dcsync": "DCSync",
-                "backup_operators": "Backup Operators",
-                "adcs_esc1": "ADCS ESC1",
-                "adcs_esc4": "ADCS ESC4",
-                "adcs": "ADCS",
-                "spray": "password spray",
-                "manual": "manual save",
-                "force_change_password": "ForceChangePassword",
-                "shadow_credentials": "shadow credentials",
-                "lsass_dump": "LSASS dump",
-                "sam_dump": "SAM dump",
-                "lsa_secrets": "LSA secrets",
-                "dpapi": "DPAPI",
-                "gmsa": "gMSA",
-                "rodc_key_list": "RODC key list",
-                "writelogonscript": "WriteLogonScript",
-                "winrm_creds": "WinRM session",
-                "rdp_creds": "RDP session",
-            }
-            for key, label in mapping.items():
-                if key in normalized:
-                    return label
-            return origin
+            # EXACT-match resolution via the SSOT origin label map. Substring
+            # matching was a bug: ``adcs_esc1`` matched ``adcs_esc10``.. and
+            # mislabeled them. The resolver also degrades unmapped slugs to a
+            # title-cased rendering rather than the raw slug.
+            label = origin_display_label(origin)
+            if label:
+                return label
 
     # Fall back to scanning the attack graph provenance edges when available.
     try:
@@ -671,36 +648,11 @@ def select_cred(shell: Any, domain: str) -> None:
 
     cred_value = credentials[selected_user]
 
-    # Verify domain credentials using the correctly scoped 'selected_user'
+    # Verify domain credentials using the correctly scoped 'selected_user'.
+    # On failure the disposition (keep valid-but-unusable / confirm-then-delete a
+    # genuinely invalid one) is centralised in _purge_failed_domain_credential.
     if not shell.verify_domain_credentials(domain, selected_user, cred_value):
-        from adscan_internal.services.credential_store_service import (
-            CredentialStoreService,
-        )
-
-        marked_domain = mark_sensitive(domain, "domain")
-        print_error(
-            f"Incorrect credentials for user '[bold]{selected_user}[/bold]' in domain [bold]{marked_domain}[/bold]."
-        )
-        # Remove the invalid credential using the service
-        store_service = CredentialStoreService()
-        deleted = store_service.delete_domain_credential(
-            domains_data=shell.domains_data, domain=domain, username=selected_user
-        )
-        if deleted:
-            marked_domain = mark_sensitive(domain, "domain")
-            print_warning(
-                f"Existing invalid credential for '[bold]{selected_user}[/bold]' in domain [bold]{marked_domain}[/bold] has been deleted."
-            )
-            # Persist changes after deleting invalid credential
-            if shell.current_workspace_dir:
-                if shell.save_workspace_data():
-                    print_info(
-                        "Workspace data saved after removing invalid credential."
-                    )
-                else:
-                    print_error(
-                        "Failed to save workspace data after removing invalid credential."
-                    )
+        _purge_failed_domain_credential(shell, domain=domain, user=selected_user)
         return
 
     marked_domain = mark_sensitive(domain, "domain")
@@ -935,6 +887,57 @@ def _ensure_verified_domain_credential_ticket(
         )
 
 
+def _privs_assessed_users_set(shell: Any, domain: str) -> set:
+    """Return the per-domain session set of users whose privileges were assessed.
+
+    SSOT for "was this user actually ENUMERATED this session" (ask_for_user_privs
+    ran: privileges, attack paths, service privileges, shares). Lives as a shell
+    attribute, NOT in domains_data, so it is never serialized to workspace JSON
+    (resets on restart only) — see the dedup guard in handle_auth_and_optional_privs.
+    """
+    by_domain = getattr(shell, "_privs_assessed_users_by_domain", None)
+    if not isinstance(by_domain, dict):
+        by_domain = {}
+        setattr(shell, "_privs_assessed_users_by_domain", by_domain)
+    return by_domain.setdefault(domain, set())
+
+
+def _assessed_user_key(user: str) -> str:
+    """Canonical key for the assessed-set (matches the legacy dedup guard)."""
+    from adscan_internal.services.high_value import normalize_samaccountname
+
+    return normalize_samaccountname(user).lower()
+
+
+def mark_user_privs_assessed(shell: Any, domain: str, user: str) -> None:
+    """Record that ``user``'s privileges were assessed this session.
+
+    Call this wherever enumeration actually runs (centralized in
+    ``ask_for_user_privs``) so EVERY entry point marks the user — not only the
+    attack-path credential loop. Best-effort; never raises.
+    """
+    try:
+        _privs_assessed_users_set(shell, domain).add(_assessed_user_key(user))
+    except Exception:  # noqa: BLE001 — the marker is a best-effort dedup hint
+        pass
+
+
+def user_privs_assessed_this_session(shell: Any, domain: str, user: str) -> bool:
+    """True iff ``user``'s privileges were already assessed this session.
+
+    The robust replacement for the old credential-PRESENCE heuristic: a stored
+    credential does NOT imply the user was enumerated (e.g. spraying persists the
+    credential via ``update_domain_credential`` without ever running
+    ask_for_user_privs). Gating the re-enumerate offer on this marker means a
+    stored-but-unenumerated user is enumerated normally instead of being prompted
+    (and skipped in CI).
+    """
+    try:
+        return _assessed_user_key(user) in _privs_assessed_users_set(shell, domain)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def handle_auth_and_optional_privs(
     shell: Any,
     domain: str,
@@ -968,6 +971,10 @@ def handle_auth_and_optional_privs(
             already assessed" dedup guard so a user whose privileges just changed
             (for example: an existing account that was just promoted to Domain
             Admins) is re-enumerated even if it was assessed earlier this session.
+
+    The re-enumerate offer is gated on whether the user was already ASSESSED this
+    session (``user_privs_assessed_this_session``), NOT on credential presence — a
+    stored-but-unenumerated user (e.g. a sprayed credential) is enumerated normally.
     """
     marked_domain = mark_sensitive(domain, "domain")
     current_auth_status = shell.domains_data.get(domain, {}).get("auth", "")
@@ -982,6 +989,57 @@ def handle_auth_and_optional_privs(
     has_non_empty_credential = any(
         user and (cred is not None) and cred != "" for user, cred in users_with_creds
     )
+
+    # When this user's privileges were ALREADY ASSESSED this session
+    # (ask_for_user_privs actually ran: privileges, attack paths from this user,
+    # service privileges, shares), OFFER to re-enumerate the PER-USER assessment —
+    # NOT a full domain re-scan; it reuses the already-collected domain data.
+    #
+    # We key on the ENUMERATION marker, NOT on credential presence: a stored
+    # credential does NOT imply the user was enumerated. Spraying (and other paths)
+    # persist a credential via update_domain_credential WITHOUT running
+    # ask_for_user_privs, so the old credential-pre-existence heuristic
+    # false-positived — it prompted "re-enumerate?" (default No → skipped in CI) for
+    # a user that was never assessed, silently dropping its enumeration. Keying on
+    # the assessed-marker means a stored-but-unenumerated user (and a brand-new
+    # credential) is enumerated normally with no prompt; only a genuinely
+    # already-assessed user gets the re-enumerate offer.
+    #
+    # Default No keeps the skip, so CI / non-interactive runs auto-resolve to No
+    # (confirm_ask's auto-mode fallback). A Yes answer drives ONLY
+    # force_recheck_user_privs (the per-session assessed-set discard so the
+    # privilege check re-runs); it deliberately does NOT set
+    # force_authenticated_enumeration — forcing a full scan would re-enumerate the
+    # whole domain AND disable the standard ask_for_user_privs path (a full scan is
+    # treated as already covering user privs at :1620), the opposite of the intent.
+    # Scoped to the interactive credential-selection intent: not during attack-path
+    # execution (steps run unattended), not when the caller already forces a scan,
+    # and not when the richer prompt_when_already_authenticated flow owns the case.
+    try:
+        from adscan_internal.services.attack_graph_runtime_service import (
+            is_attack_path_execution_active as _is_attack_path_execution_active,
+        )
+    except Exception:  # noqa: BLE001
+        def _is_attack_path_execution_active(_shell: Any) -> bool:
+            return False
+    _reassess_user = next(
+        (user for user, _cred in users_with_creds if user), None
+    )
+    if (
+        _reassess_user is not None
+        and user_privs_assessed_this_session(shell, domain, _reassess_user)
+        and prompt_for_user_privs_after
+        and not force_authenticated_enumeration
+        and not prompt_when_already_authenticated
+        and has_non_empty_credential
+        and not _is_attack_path_execution_active(shell)
+    ):
+        if confirm_ask(
+            f"{mark_sensitive(_reassess_user, 'user')}'s privileges were already "
+            "assessed this session; re-enumerate it (privileges and attack paths)?",
+            default=False,
+        ):
+            force_recheck_user_privs = True
 
     def _choose_authenticated_enumeration_action() -> str:
         """Return how to proceed when start_auth targets an already-auth domain."""
@@ -2126,8 +2184,20 @@ def add_credential(
             should count as a compromised-user milestone for the current
             session. Manual/import flows such as ``creds save`` must override
             this to False.
-        credential_origin: Optional machine-readable source label for policy
-            decisions, for example ``ReadLAPSPassword``.
+        credential_origin: Optional machine-readable provenance label for this
+            credential (for example ``kerberoast``, ``dcsync``, ``spray``,
+            ``ReadLAPSPassword``). Persisted into
+            ``credentials_meta[user]["credential_origin"]`` so the ``creds show``
+            Provenance column can attribute the source. Two origins identify a
+            SELF-INTRODUCED credential and are excluded from the
+            compromised-credential side-effects (the ``first_cred_found``
+            capture, the ``credential`` identity-compromise event, and the
+            session-compromised milestone): ``authenticated_scan`` (the scan's
+            own STARTING credential supplied to ``adscan ci auth`` /
+            ``start_auth``) and ``user_provided`` (a manual ``creds save`` /
+            ``creds add``). Such a credential remains a fully owned principal
+            for attack-path discovery. See
+            ``session_compromise_state_service.NON_COMPROMISE_ORIGINS``.
         local_account_rid: Optional RID for local-account credentials. RID 500
             combined with LAPS provenance suppresses local reuse prompts because
             LAPS-managed built-in Administrator passwords are per-host secrets.
@@ -2172,6 +2242,16 @@ def add_credential(
     credential_persisted = False
     store_update_skipped = False
 
+    # A SELF-INTRODUCED credential (the scan's own starting credential or a
+    # manually entered one) is the INPUT to the scan, not something compromised
+    # during it. Its provenance origin is in ``NON_COMPROMISE_ORIGINS`` — it is
+    # excluded from the compromise side-effects below (first_cred_found capture,
+    # the identity-compromise event, the session-compromised milestone) while
+    # remaining a fully owned principal for attack-path discovery.
+    is_self_introduced_credential = (
+        str(credential_origin or "").strip().lower() in NON_COMPROMISE_ORIGINS
+    )
+
     import os
     import time
 
@@ -2209,21 +2289,9 @@ def add_credential(
                 )
                 credential_verified = True
             else:
-                if _should_delete_failed_domain_credential(shell):
-                    deleted = store_service.delete_domain_credential(
-                        domains_data=shell.domains_data, domain=domain, username=user
-                    )
-                    if deleted:
-                        marked_user = mark_sensitive(user, "user")
-                        marked_domain = mark_sensitive(domain, "domain")
-                        if not ui_silent:
-                            print_error(
-                                f"Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
-                            )
-                        else:
-                            print_info_verbose(
-                                f"[ui_silent] Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
-                            )
+                _purge_failed_domain_credential(
+                    shell, domain=domain, user=user, ui_silent=ui_silent
+                )
                 return
         if trusted_manual_validation:
             credential_verified = True
@@ -2420,21 +2488,9 @@ def add_credential(
                 )
                 credential_verified = True
             else:
-                if _should_delete_failed_domain_credential(shell):
-                    deleted = store_service.delete_domain_credential(
-                        domains_data=shell.domains_data, domain=domain, username=user
-                    )
-                    if deleted:
-                        marked_user = mark_sensitive(user, "user")
-                        marked_domain = mark_sensitive(domain, "domain")
-                        if not ui_silent:
-                            print_error(
-                                f"Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
-                            )
-                        else:
-                            print_info_verbose(
-                                f"[ui_silent] Existing credential for '{marked_user}' in domain {marked_domain} has been deleted."
-                            )
+                _purge_failed_domain_credential(
+                    shell, domain=domain, user=user, ui_silent=ui_silent
+                )
                 return
 
         if (cred is not None) and (allow_empty_credential or cred != "") and not skip_store_update:
@@ -2450,6 +2506,19 @@ def add_credential(
             _apply_credential_metadata(
                 shell, domain=domain, user=user, metadata=metadata
             )
+            if credential_origin:
+                # Persist provenance into ``credentials_meta`` so the
+                # ``creds show`` Provenance column can attribute the source and
+                # the compromise SSOT can exclude self-introduced credentials
+                # (``authenticated_scan`` / ``user_provided``) from counters,
+                # panel, telemetry, and PostHog.
+                from adscan_internal.services.credentials import (  # noqa: PLC0415
+                    set_credential_origin,
+                )
+
+                set_credential_origin(
+                    shell, domain=domain, username=user, origin=credential_origin
+                )
             # Respect store precedence rules (e.g. keep existing plaintext over new hash).
             is_hash = update_result.is_hash
             if is_hash:
@@ -2479,7 +2548,11 @@ def add_credential(
                     target_index = 1 if shell.scan_mode == "unauth" else 2
                     new_count = count + 1
                     shell.domain_validated_cred_counts[domain] = new_count
-                    if new_count == target_index:
+                    # A self-introduced credential (scan starting credential
+                    # or a manual ``creds save``) is the INPUT, not a compromise
+                    # win — never fire the first_cred_found PostHog capture /
+                    # victory hint for it.
+                    if new_count == target_index and not is_self_introduced_credential:
                         duration = None
                         try:
                             if (
@@ -2581,30 +2654,31 @@ def add_credential(
                 telemetry.capture_exception(e)
                 # Telemetry failures shouldn't break the credential addition flow
 
-            try:
-                emit_event(
-                    "credential",
-                    phase="credential_analysis",
-                    phase_label="Credential Analysis",
-                    category="identity_compromise",
-                    username=user,
-                    domain=domain,
-                    credential_type="hash" if is_hash else "password",
-                    scope="domain",
-                    verification_status=(
-                        "manually_validated"
-                        if trusted_manual_validation
-                        else "verified"
-                        if verify_credential or credential_verified
-                        else "trusted_import"
-                    ),
-                    message=f"Access established for {user}@{domain}.",
-                )
-            except Exception as exc:  # pragma: no cover - best effort eventing
-                telemetry.capture_exception(exc)
+            if not is_self_introduced_credential:
+                try:
+                    emit_event(
+                        "credential",
+                        phase="credential_analysis",
+                        phase_label="Credential Analysis",
+                        category="identity_compromise",
+                        username=user,
+                        domain=domain,
+                        credential_type="hash" if is_hash else "password",
+                        scope="domain",
+                        verification_status=(
+                            "manually_validated"
+                            if trusted_manual_validation
+                            else "verified"
+                            if verify_credential or credential_verified
+                            else "trusted_import"
+                        ),
+                        message=f"Access established for {user}@{domain}.",
+                    )
+                except Exception as exc:  # pragma: no cover - best effort eventing
+                    telemetry.capture_exception(exc)
 
-            if mark_user_compromised:
-                mark_session_user_compromised(shell, user)
+                if mark_user_compromised:
+                    mark_session_user_compromised(shell, user)
 
         if source_steps and (credential_verified or credential_source_verified):
             try:
@@ -2796,6 +2870,7 @@ def add_credentials_batch(
     ui_silent: bool = False,
     ensure_fresh_kerberos_ticket: bool = True,
     metadata_by_user: "dict[str, CredentialMetadata] | None" = None,
+    credential_origin: str | None = None,
 ) -> list[tuple[str, str]]:
     """Persist multiple domain credentials with optional batch hash cracking.
 
@@ -2811,6 +2886,9 @@ def add_credentials_batch(
         verify_credential: Forwarded to add_credential.
         ui_silent: Forwarded to add_credential.
         ensure_fresh_kerberos_ticket: Forwarded to add_credential.
+        credential_origin: Machine-readable provenance label (e.g. ``"spray"``)
+            forwarded to each ``add_credential`` so the Provenance column never
+            degrades to "via unknown" on the batch path.
 
     Returns:
         List of persisted candidates ``[(username, resolved_credential), ...]``.
@@ -2845,6 +2923,7 @@ def add_credentials_batch(
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=ensure_fresh_kerberos_ticket,
             metadata=per_user_metadata,
+            credential_origin=credential_origin,
         )
 
     return resolved_credentials
@@ -2923,6 +3002,7 @@ def add_local_credentials_batch(
     verify_local_credential: bool = True,
     prompt_local_reuse_after: bool = False,
     ui_silent: bool = False,
+    credential_origin: str | None = None,
 ) -> list[tuple[str, str, str, str]]:
     """Persist multiple local (host/service) credentials with shared batch logic.
 
@@ -2935,6 +3015,9 @@ def add_local_credentials_batch(
         verify_local_credential: Forwarded to ``add_credential``.
         prompt_local_reuse_after: Forwarded to ``add_credential``.
         ui_silent: Forwarded to ``add_credential``.
+        credential_origin: Machine-readable provenance label forwarded to each
+            ``add_credential`` so the Provenance column never degrades to "via
+            unknown" on the local batch path.
 
     Returns:
         Persisted local credentials as ``[(host, service, username, resolved_cred)]``.
@@ -2990,6 +3073,7 @@ def add_local_credentials_batch(
             prompt_local_reuse_after=prompt_local_reuse_after,
             ui_silent=ui_silent,
             ensure_fresh_kerberos_ticket=False,
+            credential_origin=credential_origin,
         )
         persisted.append((host, service, resolved_username, resolved_credential))
 
@@ -3037,6 +3121,80 @@ def _should_delete_failed_domain_credential(shell: Any) -> bool:
         CredentialStatus.INVALID,
         CredentialStatus.USER_NOT_FOUND,
     }
+
+
+def _purge_failed_domain_credential(
+    shell: Any, *, domain: str, user: str, ui_silent: bool = False
+) -> bool:
+    """Dispose of a credential that FAILED verification — SSOT for the policy.
+
+    Shared by ``select_cred`` and the authenticated-enumeration flow so the
+    keep/delete decision lives in exactly one place:
+
+    * A credential that is valid-but-unusable (PASSWORD_MUST_CHANGE /
+      PASSWORD_EXPIRED) or whose failure was transient/unclassified is NEVER
+      purged — only genuinely INVALID / USER_NOT_FOUND credentials are deletion
+      candidates (gated by :func:`_should_delete_failed_domain_credential`).
+    * Even then the operator confirms before the irreversible delete
+      (default yes). ``ui_silent`` (internal recovery sub-calls) and
+      non-interactive runs auto-resolve to the default, preserving the prior
+      auto-purge behaviour for batch/CI.
+
+    Returns ``True`` iff the credential was deleted.
+    """
+    from adscan_internal.services.credential_store_service import (
+        CredentialStoreService,
+    )
+
+    marked_user = mark_sensitive(user, "user")
+    marked_domain = mark_sensitive(domain, "domain")
+
+    if not _should_delete_failed_domain_credential(shell):
+        # Valid but not usable as-is (e.g. password change required), expired, or
+        # a transient/unclassified failure — keep a non-invalid credential.
+        if not ui_silent:
+            print_warning(
+                f"Credential for '[bold]{marked_user}[/bold]' in domain "
+                f"[bold]{marked_domain}[/bold] is KEPT — valid but not usable as-is "
+                "(e.g. a password change is required before logon)."
+            )
+        return False
+
+    if not ui_silent:
+        print_error(
+            f"Incorrect credentials for user '[bold]{marked_user}[/bold]' in "
+            f"domain [bold]{marked_domain}[/bold]."
+        )
+        if not confirm_ask(
+            f"Delete the invalid stored credential for '{user}'?", default=True
+        ):
+            print_info(
+                f"Kept the credential for '{user}' in domain {domain} (not deleted)."
+            )
+            return False
+
+    deleted = CredentialStoreService().delete_domain_credential(
+        domains_data=shell.domains_data, domain=domain, username=user
+    )
+    if deleted:
+        if not ui_silent:
+            print_warning(
+                f"Existing invalid credential for '[bold]{marked_user}[/bold]' in "
+                f"domain [bold]{marked_domain}[/bold] has been deleted."
+            )
+        else:
+            print_info_verbose(
+                f"[ui_silent] Existing credential for '{marked_user}' in domain "
+                f"{marked_domain} has been deleted."
+            )
+        if getattr(shell, "current_workspace_dir", None) and hasattr(
+            shell, "save_workspace_data"
+        ):
+            try:
+                shell.save_workspace_data()
+            except Exception:  # noqa: BLE001
+                pass
+    return deleted
 
 
 def _resolve_verified_domain_credential(
@@ -3354,7 +3512,10 @@ def check_local_creds(
             "Incorrect credentials."
         )
         print_info("Trying with domain credentials instead...")
-        shell.add_credential(domain_name, username, cred_value)
+        # Local-account credential failed; retried as a domain credential.
+        shell.add_credential(
+            domain_name, username, cred_value, credential_origin="local_cred_retry"
+        )
         return False
 
     if status == CredentialStatus.ACCOUNT_LOCKED:
@@ -3572,7 +3733,8 @@ def extract_credentials(shell: Any, output_str: str, domain: str) -> None:
     if match:
         user = match.group(1)
         credential = match.group(2)
-        shell.add_credential(domain, user, credential)
+        # ``user:rid:lm:nt:`` is the secretsdump (DRSUAPI/NTDS) dump format.
+        shell.add_credential(domain, user, credential, credential_origin="secretsdump")
         marked_user = mark_sensitive(user, "user")
         marked_credential = mark_sensitive(credential, "password")
         print_success(
@@ -3884,10 +4046,17 @@ def process_cpassword_text(
                     normalized_user,
                     plaintext_password,
                     source_steps=source_steps,
+                    credential_origin="gpp_cpassword",
                 )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
-                add_credential(shell, domain, normalized_user, plaintext_password)
+                add_credential(
+                    shell,
+                    domain,
+                    normalized_user,
+                    plaintext_password,
+                    credential_origin="gpp_cpassword",
+                )
         else:
             print_success(f"Decrypted password{source_label}: {plaintext_password}")
 
@@ -5004,6 +5173,7 @@ def _run_ai_follow_up_actions(
                     username,
                     secret,
                     prompt_for_user_privs_after=False,
+                    credential_origin="passwordinshares",
                 )
 
     if local_smb_candidates:
@@ -5019,6 +5189,7 @@ def _run_ai_follow_up_actions(
                     host=host,
                     service="smb",
                     prompt_for_user_privs_after=False,
+                    credential_origin="passwordinshares",
                 )
 
     if local_mssql_candidates:
@@ -5034,6 +5205,7 @@ def _run_ai_follow_up_actions(
                     host=host,
                     service="mssql",
                     prompt_for_user_privs_after=False,
+                    credential_origin="mssql_creds",
                 )
 
     if spray_candidates and domain in getattr(shell, "domains", []):

@@ -57,6 +57,7 @@ from adscan_internal.services.attack_step_support_registry import (
     classify_relation_support,
 )
 from adscan_internal.services.attack_step_catalog import (
+    build_step_knowledge,
     get_exploitation_relation_vuln_keys,
     normalize_execution_relation,
 )
@@ -6539,9 +6540,62 @@ def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None
         domains_data = getattr(shell, "domains_data", None)
         if isinstance(domains_data, dict):
             domains_data.setdefault(domain, {})["attack_graph_file"] = path
+            # Persist a compact, ANONYMOUS AD-scale fingerprint (counts only, no
+            # principal names) so session telemetry can report per-domain scale
+            # (computers/users/groups + enabled) cheaply at session time without
+            # re-reading the (potentially large) attack_graph.json. Read back by
+            # build_session_ad_scale_metadata(). Plain JSON ints -> safe for
+            # save_workspace_data. Best-effort: never break the graph save.
+            stats = _compute_ad_scale_stats(graph)
+            if stats:
+                domains_data[domain]["collection_stats"] = stats
     except Exception:
         pass
     _sync_attack_graph_findings_best_effort(shell, domain, graph)
+
+
+def _compute_ad_scale_stats(graph: dict[str, Any]) -> dict[str, int]:
+    """Count attack-graph nodes by kind + enabled state for telemetry.
+
+    ANONYMOUS by construction — returns only integer counts, never labels/SIDs.
+    ``enabled`` is fail-open: a node with unknown (``None``) enabled state counts
+    as enabled (mirrors ``is_collectable_computer_host``), so ``*_enabled`` is
+    "total minus the explicitly-disabled".
+    """
+    nodes = graph.get("nodes")
+    if isinstance(nodes, dict):
+        node_iter = nodes.values()
+    elif isinstance(nodes, list):
+        node_iter = nodes
+    else:
+        return {}
+    counts: dict[str, int] = {
+        "computers": 0, "enabled_computers": 0,
+        "users": 0, "enabled_users": 0,
+        "groups": 0, "ous": 0, "gpos": 0,
+    }
+    for node in node_iter:
+        if not isinstance(node, dict):
+            continue
+        kind = str(node.get("kind") or node.get("type") or "")
+        enabled = node.get("enabled")
+        if enabled is None and isinstance(node.get("properties"), dict):
+            enabled = node["properties"].get("enabled")
+        if kind == "Computer":
+            counts["computers"] += 1
+            if enabled is not False:
+                counts["enabled_computers"] += 1
+        elif kind == "User":
+            counts["users"] += 1
+            if enabled is not False:
+                counts["enabled_users"] += 1
+        elif kind == "Group":
+            counts["groups"] += 1
+        elif kind == "OU":
+            counts["ous"] += 1
+        elif kind == "GPO":
+            counts["gpos"] += 1
+    return counts
 
 
 def _sync_attack_graph_findings_best_effort(
@@ -6999,6 +7053,86 @@ def _edge_matches_upsert_identity(
     return True
 
 
+# Per-relation cache of the baked technique-knowledge object. The prose is
+# pure (a function of the relation + the static VULN_CATALOG), so resolving it
+# once per relation per process avoids re-running the catalog join on every
+# ``upsert_edge`` call at 1-2k-host scale.
+_EDGE_KNOWLEDGE_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _bake_edge_technique_knowledge(relation_norm: str) -> dict[str, Any] | None:
+    """Resolve the rich technique-knowledge object for one edge relation.
+
+    The persisted attack-graph artifact (``attack_graph.json``) is ingested by
+    the paid web, which must NOT import the PRO ``VULN_CATALOG``. So the CLI
+    engine (which HAS the catalog) bakes the per-edge technique prose here and
+    the web reads it straight from the ingested edge — mirroring how findings
+    carry their ``knowledge`` block (commit ``fdf34348``).
+
+    Reuses ``build_step_knowledge`` (the single source of truth for per-step
+    technique prose that already feeds ``attack_paths_snapshot.json``) so the
+    edge card and the path-step card read identical prose. The join is lazy +
+    best-effort: an edge whose relation has no catalog entry, or a LITE/runtime
+    context without the PRO catalog, yields ``None`` and no ``knowledge`` is
+    stamped (the panel then falls back to its generic blurb).
+
+    Args:
+        relation_norm: The already-normalized edge relation.
+
+    Returns:
+        The technique-knowledge dict (``description``, ``impact``,
+        ``remediation``, ``references``, ``mitre_technique_id/name``,
+        ``vuln_key``), or ``None`` when the relation maps to no technique.
+    """
+    if not relation_norm:
+        return None
+    cached = _EDGE_KNOWLEDGE_CACHE.get(relation_norm)
+    if cached is not None:
+        return cached or None
+    try:
+        knowledge = build_step_knowledge({"relation": relation_norm})
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        knowledge = None
+
+    baked: dict[str, Any] | None = None
+    # Only TECHNIQUE edges carry baked knowledge — those that resolve to a
+    # ``vuln_key`` (ESC1, DCSync, Kerberoast, ...). Structural edges (MemberOf,
+    # Contains, GpLink) resolve generic prose with no ``vuln_key``; they stay
+    # clean so the web panel shows them as plain relations, not techniques.
+    catalog_key = (
+        str(knowledge.get("vuln_key") or "").strip()
+        if isinstance(knowledge, dict)
+        else ""
+    )
+    if isinstance(knowledge, dict) and knowledge and catalog_key:
+        baked = knowledge
+        # Enrich with the catalog's title + severity so the web edge panel can
+        # render a contextual severity band without the PRO catalog. Lazy +
+        # best-effort: a LITE/runtime context without the catalog keeps the
+        # base prose ``build_step_knowledge`` already resolved. Only the edge
+        # artifact carries these — the shared path-step knowledge shape (which
+        # also feeds the report) is intentionally left unchanged.
+        try:
+            from adscan_internal.pro.reporting.vuln_catalog import VULN_CATALOG
+
+            catalog_entry = VULN_CATALOG.get(catalog_key)
+        except Exception:  # noqa: BLE001
+            catalog_entry = None
+        if isinstance(catalog_entry, dict):
+            title = str(catalog_entry.get("title") or "").strip()
+            severity = str(catalog_entry.get("severity") or "").strip()
+            if title:
+                baked["title"] = title
+            if severity:
+                baked["severity"] = severity
+    # Cache the resolved value (even a no-technique resolution, stored as ``{}``)
+    # so a relation without a technique mapping is not re-resolved on every
+    # upsert at scale.
+    _EDGE_KNOWLEDGE_CACHE[relation_norm] = baked if isinstance(baked, dict) else {}
+    return baked
+
+
 def upsert_edge(
     graph: dict[str, Any],
     *,
@@ -7093,6 +7227,15 @@ def upsert_edge(
             edge["vuln_key"] = edge_vuln_key
             # Phase 2: keep canonical EdgeKind in sync with current catalog.
             edge["kind"] = classify_edge_kind(relation_norm).value
+            # Bake the technique-knowledge prose so the paid web edge panel can
+            # render it without importing the PRO catalog. Healed on re-sync:
+            # stamp when present, drop a stale block if the relation no longer
+            # maps to a technique.
+            baked_knowledge = _bake_edge_technique_knowledge(relation_norm)
+            if baked_knowledge:
+                edge["knowledge"] = baked_knowledge
+            elif "knowledge" in edge:
+                edge.pop("knowledge", None)
             current = str(edge.get("status") or "discovered")
             status_changed = _status_rank(desired_status) > _status_rank(current)
             if status_changed:
@@ -7133,6 +7276,13 @@ def upsert_edge(
         "first_seen": now,
         "last_seen": now,
     }
+    # Bake the rich technique-knowledge prose onto the edge so the paid web edge
+    # panel renders a high-level + technical brief without importing the PRO
+    # catalog. Only technique edges (those with a resolvable catalog entry)
+    # carry it; structural edges (MemberOf, Contains, ...) stay clean.
+    baked_knowledge = _bake_edge_technique_knowledge(relation_norm)
+    if baked_knowledge:
+        entry["knowledge"] = baked_knowledge
     edges.append(entry)
     if log_creation:
         try:
@@ -12287,6 +12437,7 @@ def _apply_local_postprocessing_pipeline(
     allow_owned_terminal_target: bool = False,
     target_mode: str = "object",
     display_friendly: bool | None = None,
+    keep_longest: bool = False,
 ) -> list[dict[str, Any]]:
     """Apply the shared post-processing pipeline to local DFS results.
 
@@ -12693,22 +12844,26 @@ def _apply_local_postprocessing_pipeline(
             ),
         )
     else:
-        result, n_contained = (
-            attack_graph_core.filter_contained_paths_for_domain_listing(
-                records, keep_shortest=False
-            )
+        # Domain scope (display/report). Shared single-source-of-truth helper:
+        # shortest HV-aware route to domain compromise by default, legacy holistic
+        # keep_longest only when the threaded keep_longest flag is set. Tiers are
+        # already stamped above; the helper re-stamps idempotently so both pipelines
+        # agree.
+        _mode_label = "keep_longest" if keep_longest else "shortest-hv-aware"
+        result, n_contained = attack_graph_core.filter_domain_listing_paths(
+            records, label_to_node=_label_to_node, keep_longest=keep_longest
         )
         if n_contained:
             print_info_debug(
-                f"[local-pipeline] contained filter [keep_longest, domain]: "
-                f"removed {n_contained} sub-path(s) → {len(result)} remain"
+                f"[local-pipeline] contained filter [{_mode_label}, domain]: "
+                f"removed {n_contained} path(s) → {len(result)} remain"
             )
         records = result
         _maybe_print_attack_paths_summary_debug(
             domain,
             records,
             stage_label=(
-                f"6/6 · after contained filter [keep_longest, domain] ({n_contained} removed)"
+                f"6/6 · after contained filter [{_mode_label}, domain] ({n_contained} removed)"
             ),
         )
     _stage_done("contained-filter", records)
@@ -13014,6 +13169,7 @@ def compute_display_paths_for_domain(
     no_cache: bool = False,
     allow_owned_terminal_target: bool = False,
     display_friendly: bool | None = None,
+    keep_longest: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain with optional high-value promotion.
 
@@ -13041,6 +13197,10 @@ def compute_display_paths_for_domain(
             target,
             str(target_mode or "object").strip().lower(),
             bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
+            # keep_longest changes the domain-listing output (shortest HV-aware vs
+            # holistic longest), so it MUST be part of the cache key — otherwise
+            # alternating modes in one process returns stale results.
+            bool(keep_longest),
         ),
     )
     cached = _attack_paths_cache_get(
@@ -13132,6 +13292,7 @@ def compute_display_paths_for_domain(
                 if materialized_artifacts is not None
                 else None
             ),
+            keep_longest=keep_longest,
         )
     )
     _dfs_elapsed = time.monotonic() - _dfs_t0
@@ -13150,6 +13311,7 @@ def compute_display_paths_for_domain(
         allow_owned_terminal_target=allow_owned_terminal_target,
         target_mode=target_mode,
         display_friendly=display_friendly,
+        keep_longest=keep_longest,
     )
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
@@ -13726,6 +13888,7 @@ def _compute_rustworkx_display_paths(
     target: str = "highvalue",
     target_mode: str = "object",
     membership_sample_max: int = 3,
+    keep_longest: bool = False,
 ) -> list[dict[str, Any]]:
     """Run the full local-DFS pipeline with rustworkx as the graph engine.
 
@@ -13770,6 +13933,7 @@ def _compute_rustworkx_display_paths(
                 target=target,
                 target_mode=target_mode,
                 no_cache=True,
+                keep_longest=keep_longest,
             )
         elif scope_norm == "user":
             if not str(username or "").strip():
@@ -13841,6 +14005,7 @@ def get_attack_path_summaries(
     dev_workers_override: int | None = None,
     render_debug_tables: bool = True,
     display_friendly: bool | None = None,
+    keep_longest: bool = False,
 ) -> list[dict[str, Any]]:
     """Return user-facing attack-path summaries through the shell-aware layer.
 
@@ -13852,6 +14017,11 @@ def get_attack_path_summaries(
     When BloodHound CE is available, prompts the user interactively to choose
     between the BloodHound Cypher engine and the local Python DFS engine.
     The choice is cached on the shell for the duration of the session.
+
+    ``keep_longest`` only affects the ``domain`` scope: when False (default) the
+    listing returns the most direct route to domain compromise; when True it
+    returns the holistic longest kill chain. It is part of the domain-scope cache
+    key, so alternating modes in one process does not return stale results.
     """
     scope_norm = str(scope or "domain").strip().lower()
 
@@ -13891,6 +14061,7 @@ def get_attack_path_summaries(
                 membership_sample_max=membership_sample_max,
                 no_cache=no_cache,
                 display_friendly=display_friendly,
+                keep_longest=keep_longest,
             )
     finally:
         attack_graph_core._ATTACK_PATH_WORKERS = _prev_graph_workers  # noqa: SLF001
@@ -14131,6 +14302,7 @@ def _compute_attack_path_summaries_inner(
     membership_sample_max: int,
     no_cache: bool,
     display_friendly: bool | None = None,
+    keep_longest: bool = False,
 ) -> list[dict[str, Any]]:
     """Inner implementation of compute_attack_path_summaries, engine-dispatched."""
     allow_owned_terminal_target = bool(
@@ -14150,6 +14322,7 @@ def _compute_attack_path_summaries_inner(
                 target=target,
                 target_mode=target_mode,
                 membership_sample_max=membership_sample_max,
+                keep_longest=keep_longest,
             ),
             filters=summary_filters,
         )
@@ -14167,6 +14340,7 @@ def _compute_attack_path_summaries_inner(
             no_cache=no_cache,
             allow_owned_terminal_target=allow_owned_terminal_target,
             display_friendly=display_friendly,
+            keep_longest=keep_longest,
         )
     elif scope_norm == "user":
         if not str(username or "").strip():

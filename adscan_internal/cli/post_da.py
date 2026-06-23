@@ -42,6 +42,8 @@ class PostDAShell(Protocol):
         self, domain: str, username: str, password: str
     ) -> None: ...
 
+    def ask_for_dcsync(self, domain: str, username: str, password: str) -> None: ...
+
 
 def get_domain_post_da_state(shell: PostDAShell, domain: str) -> dict[str, object]:
     """Return mutable post-DA state bucket for a domain."""
@@ -318,7 +320,8 @@ def queue_audit_post_compromise(
 
     No-op outside audit mode and for a domain already dispatched. Drained later
     by :func:`execute_audit_post_compromise` at a safe (non-re-entrant)
-    checkpoint.
+    checkpoint. Whether the pipeline runs a full DCSync ("all") is decided
+    STATE-driven at drain time (``is_full_ntds_replicated``), not here.
     """
     if getattr(shell, "type", None) != "audit":
         return
@@ -390,6 +393,28 @@ def execute_audit_post_compromise(
         f"{mark_sensitive(domain, 'domain')} as "
         f"{mark_sensitive(picked_user or resolved_user, 'user')}"
     )
+
+    # 0) DCSync the FULL domain credential database FIRST (symmetric with CTF).
+    # Validating a client's AD exposure means demonstrating that, once Domain
+    # Admin is reached, every credential is replicable — and the dumped hashes
+    # feed the graph refresh and host campaign below (e.g. logon-capable
+    # principals the DC denies a network logon get a usable secret). STATE-aware
+    # via is_full_ntds_replicated: skipped when an attack-path DCSync step
+    # already replicated "all", run otherwise — so it happens exactly once
+    # regardless of which compromise path fired (DA membership, ESC8→DC, etc.).
+    from adscan_internal.services.domain_compromise_promotion import (
+        is_full_ntds_replicated,
+    )
+
+    if not is_full_ntds_replicated(shell, domain):
+        try:
+            shell.ask_for_dcsync(domain, picked_user, picked_secret)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_warning(
+                "Audit post-compromise DCSync failed. "
+                "Continuing with the graph refresh and host dump campaign."
+            )
 
     # 1) Re-collect the relationship graph AS the obtained DA + re-run analysis.
     try:

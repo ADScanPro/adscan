@@ -246,6 +246,7 @@ async def arun_posture_probe(
                 policy_snapshot = await probe_password_policy(
                     domain=domain,
                     dc_ip=dc_ip,
+                    dc_fqdn=dc_fqdn,
                     username=username,
                     password=password,
                     nt_hash=nt_hash,

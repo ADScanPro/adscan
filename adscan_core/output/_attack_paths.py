@@ -456,6 +456,9 @@ def _render_share_resources_panel(rows: list[dict[str, object]]) -> None:
 def render_smb_exposed_resources_panel(
     rows: list[dict[str, object]],
     domain: str = "",
+    *,
+    via_column_header: str = "Granted via",
+    effective_note: bool = False,
 ) -> None:
     """Render the SMB exposed-resources surface for Phase 7: SMB Share Exposure.
 
@@ -483,6 +486,13 @@ def render_smb_exposed_resources_panel(
             ``access`` (set[str]), and ``principals`` (set[str]).
             Optional: ``impact_rank`` (int), ``admin_share`` (bool).
         domain: Target domain name — shown in the operation-header context.
+        via_column_header: Header for the 3rd column. Defaults to
+            ``"Granted via"`` (the Phase-7 graph caller). The live per-user
+            caller passes ``"Effective for"`` so the column reads as the
+            credential whose effective access is shown.
+        effective_note: When ``True``, render a single dim footer line under
+            the table clarifying that access is this credential's effective
+            access (share ACL intersected with NTFS, via SMB2 MaximalAccess).
     """
     from collections import defaultdict
     from rich.box import ROUNDED
@@ -590,7 +600,7 @@ def render_smb_exposed_resources_panel(
     )
     table.add_column("Host / Share", style="white", no_wrap=True)
     table.add_column("Access", no_wrap=True)
-    table.add_column("Granted via", style="dim", no_wrap=False, overflow="fold")
+    table.add_column(via_column_header, style="dim", no_wrap=False, overflow="fold")
 
     for host_idx, (host, host_rows) in enumerate(sorted_hosts):
         is_tier0 = any(int(r.get("impact_rank") or 0) >= 3 for r in host_rows)
@@ -627,6 +637,13 @@ def render_smb_exposed_resources_panel(
             )
 
     console.print(table)
+
+    if effective_note:
+        console.print(
+            "Access shown is this credential's effective access "
+            "(share ACL ∩ NTFS, SMB2 MaximalAccess).",
+            style="dim",
+        )
 
 
 def _collect_path_choke_points(
@@ -2257,7 +2274,26 @@ def _format_attack_step_details(step_details: object) -> str:
     edge_type = step_details.get("edge_type")
     if isinstance(edge_type, str) and edge_type:
         fields.append(f"edge={edge_type}")
+    # The cracked wordlist is recorded per-attempt under ``details.attempts``
+    # (``[{"wordlist": ..., "status": ..., "at": ...}, ...]``), NOT as a flat
+    # ``details.wordlist`` key. Prefer the last successful attempt's wordlist;
+    # fall back to the last attempt that named a wordlist.
     wordlist = step_details.get("wordlist")
+    if not (isinstance(wordlist, str) and wordlist):
+        attempts = step_details.get("attempts")
+        if isinstance(attempts, list):
+            cracked = ""
+            last_named = ""
+            for attempt in attempts:
+                if not isinstance(attempt, dict):
+                    continue
+                attempt_wordlist = attempt.get("wordlist")
+                if isinstance(attempt_wordlist, str) and attempt_wordlist:
+                    last_named = attempt_wordlist
+                    status = str(attempt.get("status") or "").strip().lower()
+                    if status in {"success", "cracked", "ok", "found"}:
+                        cracked = attempt_wordlist
+            wordlist = cracked or last_named
     if isinstance(wordlist, str) and wordlist:
         fields.append(f"wordlist={wordlist}")
     notes = step_details.get("notes")

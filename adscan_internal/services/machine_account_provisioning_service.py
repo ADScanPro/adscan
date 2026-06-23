@@ -59,29 +59,43 @@ def generate_machine_account_name(prefix: str = "ADSCAN") -> str:
     return normalize_machine_account(f"{prefix}{token}")
 
 
-def generate_machine_account_password(length: int = 18) -> str:
+def generate_machine_account_password(
+    length: int = 18, *, policy: "Any | None" = None
+) -> str:
     """Return a strong random password suitable for a computer account.
 
     Routed through the unified policy-driven generator
     (:func:`adscan_internal.passwords.generate_compliant_password` in machine
     mode) so machine passwords are CLI-safe and satisfy AD complexity even
-    against a strict domain policy. With no resolved policy in hand (callers
-    that have one will pass it explicitly once Gate-1 wiring lands in Phase 2),
-    this uses the strong safe default. ``length`` acts as a floor: the result
-    is at least ``max(length, 18)`` characters.
-    """
-    from datetime import datetime, timezone
+    against a strict domain policy.
 
+    Args:
+        length: Length floor; the result is at least ``max(length, 18)`` chars
+            when no ``policy`` is supplied.
+        policy: Optional resolved
+            :class:`~adscan_internal.services.domain_posture.ResultantPasswordPolicy`.
+            When a caller has a live domain context it should resolve the policy
+            (via :func:`adscan_internal.services.posture_probe.resolve_resultant_password_policy`)
+            and pass it here so the machine password honours ``minPwdLength`` /
+            complexity even against a strict policy. When ``None`` (no domain
+            context), the strong safe default is used — backward-compatible with
+            every existing caller.
+
+    Returns:
+        A generated machine-account password guaranteed to pass
+        :func:`adscan_internal.passwords.validate_against_policy` in machine mode.
+    """
     from adscan_internal.passwords import generate_compliant_password
     from adscan_internal.services.domain_posture import ResultantPasswordPolicy
 
-    policy = ResultantPasswordPolicy(
-        min_length=max(int(length or 0), 18),
-        require_complexity=True,
-        required_classes=3,
-        source="default_assumed",
-        detected_at=datetime.now(timezone.utc),
-    )
+    if policy is None:
+        policy = ResultantPasswordPolicy(
+            min_length=max(int(length or 0), 18),
+            require_complexity=True,
+            required_classes=3,
+            source="default_assumed",
+            detected_at=datetime.now(timezone.utc),
+        )
     return generate_compliant_password(policy, machine=True)
 
 

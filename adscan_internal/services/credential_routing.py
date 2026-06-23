@@ -75,7 +75,13 @@ def promote_credential_fields(
     ``password``. Every other field is returned unchanged. The function is
     pure and safe to call repeatedly (idempotent).
     """
-    pwd = (password or "").strip() or None
+    # Preserve an EMPTY password ('') as distinct from None: '' is a genuine
+    # blank-password credential (a PASSWD_NOTREQD account, found by the native
+    # blank spray) that must still verify/authenticate, whereas None means "no
+    # password credential". The old ``(password or '').strip() or None`` collapsed
+    # '' -> None, which made every blank-password transport config fail with
+    # "no usable credential". Whitespace-only also normalises to '' (blank).
+    pwd = password.strip() if isinstance(password, str) else None
     if pwd and not (nt_hash or "").strip() and looks_like_ntlm_hash(pwd):
         return None, normalize_ntlm_hash(pwd), aes_key, ccache_path
     return pwd, nt_hash, aes_key, ccache_path

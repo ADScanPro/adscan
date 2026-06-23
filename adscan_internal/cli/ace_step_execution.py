@@ -209,9 +209,20 @@ def _resolve_execution_user_with_source(
     summary: dict[str, Any],
     from_label: str | None,
     from_node_kind: str | None = None,
+    host: str | None = None,
     max_options: int = 20,
 ) -> tuple[str | None, str]:
-    """Resolve an execution user and indicate which source was used."""
+    """Resolve an execution user and indicate which source was used.
+
+    When ``host`` is provided (a NETWORK-authenticating step — SMB/WinRM/RDP/
+    MSSQL), candidate principals the host has already denied a network logon
+    (ground truth in the logon-denied cache) are sunk to the end of the list, so
+    the sole-candidate auto-select and the default prompt index prefer a
+    logon-capable principal while never emptying the candidate set. ``host=None``
+    (TGT/AS-REQ/scoped-ticket callers, or callers without a host in scope) leaves
+    ordering unchanged — the denial is network-logon-specific and must not gate
+    those flows.
+    """
 
     def _preview_users(users: list[str], *, max_items: int = 5) -> str:
         """Return a compact debug preview of candidate usernames."""
@@ -415,6 +426,19 @@ def _resolve_execution_user_with_source(
 
     if candidate_users:
         candidate_users = list(dict.fromkeys(candidate_users))
+        if host:
+            # Network-auth step: prefer a logon-capable principal (denied ones
+            # sink to the tail, retained as last resort). Single source.
+            from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+                order_logon_capable_first,
+            )
+
+            candidate_users = order_logon_capable_first(
+                getattr(shell, "domains_data", {}) or {},
+                domain,
+                host=host,
+                candidates=candidate_users,
+            )
         stored_credential_preview = (
             _preview_users([str(stored_user) for stored_user in creds.keys()])
             if isinstance(creds, dict)
@@ -516,9 +540,16 @@ def resolve_execution_user(
     summary: dict[str, Any],
     from_label: str | None,
     from_node_kind: str | None = None,
+    host: str | None = None,
     max_options: int = 20,
 ) -> str | None:
-    """Resolve an execution user for attack steps that require credentials."""
+    """Resolve an execution user for attack steps that require credentials.
+
+    Pass ``host`` for a NETWORK-authenticating step so principals already denied
+    a network logon on that host are deprioritized (see
+    :func:`_resolve_execution_user_with_source`). Omit it for TGT/AS-REQ/
+    scoped-ticket flows.
+    """
     exec_username, _ = _resolve_execution_user_with_source(
         shell,
         domain=domain,
@@ -526,6 +557,7 @@ def resolve_execution_user(
         summary=summary,
         from_label=from_label,
         from_node_kind=from_node_kind,
+        host=host,
         max_options=max_options,
     )
     return exec_username
@@ -565,6 +597,18 @@ class AceStepContext:
     target_kind: str
     target_enabled: bool | None
     target_sam_or_label: str
+    # RBCD chain coordination: when an AddMember/write-to-group step feeds a
+    # downstream AllowedToAct whose trustee is this group, the member to add must
+    # be an owned SPN-bearing account (the one the AllowedToAct will mint as) —
+    # resolved once via the shared helper so both steps agree. None = default
+    # behaviour (no downstream RBCD coordination).
+    member_to_add: str | None = None
+    # Tombstoned (AD Recycle Bin) target: the object is deleted and must be
+    # reanimated before the ACE technique runs — mirrors target_enabled→enable-first.
+    # target_enabled is derived from the tombstone's PRESERVED userAccountControl, so
+    # the existing enable-first check then handles a restored-but-disabled account.
+    target_tombstoned: bool = False
+    target_deleted_dn: str | None = None
 
 
 ACL_ACE_RELATIONS: set[str] = {
@@ -690,8 +734,13 @@ def build_ace_step_context(
     to_label: str,
     context_username: str | None,
     context_password: str | None,
+    member_to_add: str | None = None,
 ) -> AceStepContext | None:
-    """Build an ACE execution context for a given step (best-effort)."""
+    """Build an ACE execution context for a given step (best-effort).
+
+    ``member_to_add`` (RBCD coordination) overrides the group-membership default
+    when a downstream AllowedToAct needs a specific owned SPN-bearing member.
+    """
     from_node = get_node_by_label(shell, domain, label=from_label)
     to_node = get_node_by_label(shell, domain, label=to_label)
     exec_username, exec_user_source = _resolve_execution_user_with_source(
@@ -750,6 +799,13 @@ def build_ace_step_context(
         to_label=to_label,
     )
     target_sam_or_label = _node_sam_or_label(to_node, to_label)
+    _target_props = _node_props(to_node)
+    target_tombstoned = bool(_target_props.get("tombstoned"))
+    target_deleted_dn = (
+        str(_target_props.get("deleted_dn") or "").strip() or None
+        if target_tombstoned
+        else None
+    )
     marked_domain = mark_sensitive(domain, "domain")
     marked_from = mark_sensitive(from_label, "node")
     marked_to = mark_sensitive(to_label, "node")
@@ -780,6 +836,9 @@ def build_ace_step_context(
         target_kind=target_kind,
         target_enabled=target_enabled,
         target_sam_or_label=target_sam_or_label,
+        member_to_add=member_to_add,
+        target_tombstoned=target_tombstoned,
+        target_deleted_dn=target_deleted_dn,
     )
 
 
@@ -1207,6 +1266,29 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
 
     if relation in {"genericall", "genericwrite", "writeaccountrestrictions"}:
         if target_kind in {"user", "computer"}:
+            if context.target_tombstoned and target_kind == "user":
+                print_warning(f"Target {marked_to} is a deleted (tombstoned) object.")
+                if Confirm.ask(
+                    "Restore it from the AD Recycle Bin first?", default=True
+                ):
+                    if not shell.restore_deleted_object(
+                        context.domain,
+                        context.exec_username,
+                        context.exec_password,
+                        context.target_deleted_dn or context.target_sam_or_label,
+                    ):
+                        print_warning(
+                            f"Could not restore {marked_to}. Skipping exploitation."
+                        )
+                        return False
+                    # Reanimated. target_enabled was read from the tombstone's
+                    # PRESERVED userAccountControl, so the enable-first check below
+                    # still fires for a restored-but-disabled account.
+                else:
+                    print_warning(
+                        f"Skipping exploitation for tombstoned target {marked_to}."
+                    )
+                    return False
             if context.target_enabled is False and target_kind == "user":
                 print_warning(f"Target {marked_to} is disabled.")
                 if Confirm.ask("Do you want to try to enable it first?", default=True):
@@ -1269,6 +1351,8 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                         prompt_for_password_fallback=False,
                         prompt_for_user_privs_after=False,
                         prompt_for_method_choice=True,
+                        # ForceChangePassword needs GenericAll/Reset-Password — not GenericWrite.
+                        allow_force_change_password=(relation == "genericall"),
                     )
                 print_warning(
                     "Computer-object control exploitation helper is unavailable in this shell context."
@@ -1284,6 +1368,8 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 prompt_for_password_fallback=False,
                 prompt_for_user_privs_after=False,
                 prompt_for_method_choice=True,
+                # ForceChangePassword needs GenericAll/Reset-Password — not GenericWrite.
+                allow_force_change_password=(relation == "genericall"),
             )
             if ok:
                 _acl_cleanup_register(
@@ -1316,13 +1402,27 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             return _execute_genericall_domain_dcsync(shell, context)
 
         if target_kind == "group":
-            print_info(
-                f"[dim]Add member:[/dim] select a user to add to group {marked_to}."
-                " This modifies group membership in Active Directory."
-            )
+            # RBCD coordination: a downstream AllowedToAct on this group needs an
+            # owned SPN-bearing member (S4U requires an SPN). When the look-ahead
+            # resolved one, default to it instead of the path-source executor — a
+            # member without an SPN would fail the RBCD with KDC_ERR_BADOPTION.
+            add_default = context.member_to_add or context.exec_username
+            if context.member_to_add:
+                print_info(
+                    f"[dim]Add member:[/dim] the next step is resource-based "
+                    f"constrained delegation (AllowedToAct) on {marked_to}, which "
+                    f"needs an SPN-bearing member. ADscan selected the owned account "
+                    f"{mark_sensitive(context.member_to_add, 'user')} — adding it so "
+                    "the delegation ticket can be minted."
+                )
+            else:
+                print_info(
+                    f"[dim]Add member:[/dim] select a user to add to group {marked_to}."
+                    " This modifies group membership in Active Directory."
+                )
             changed_username = Prompt.ask(
                 "Enter the user to add",
-                default=context.exec_username,
+                default=add_default,
             )
             changed_username = _sanitize_prompt_account(changed_username)
             result = shell.exploit_add_member(
@@ -1399,13 +1499,25 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         return result
 
     if relation == "addmember":
-        print_info(
-            f"[dim]Add member:[/dim] select a user to add to group {marked_to}."
-            " This modifies group membership in Active Directory."
-        )
+        # RBCD coordination (see the genericall/genericwrite group branch): a
+        # downstream AllowedToAct on this group needs an SPN-bearing member.
+        add_default = context.member_to_add or context.exec_username
+        if context.member_to_add:
+            print_info(
+                f"[dim]Add member:[/dim] the next step is resource-based "
+                f"constrained delegation (AllowedToAct) on {marked_to}, which needs "
+                f"an SPN-bearing member. ADscan selected the owned account "
+                f"{mark_sensitive(context.member_to_add, 'user')} — adding it so the "
+                "delegation ticket can be minted."
+            )
+        else:
+            print_info(
+                f"[dim]Add member:[/dim] select a user to add to group {marked_to}."
+                " This modifies group membership in Active Directory."
+            )
         changed_username = Prompt.ask(
             "Enter the user to add",
-            default=context.exec_username,
+            default=add_default,
         )
         changed_username = _sanitize_prompt_account(changed_username)
         result = shell.exploit_add_member(
@@ -1520,13 +1632,27 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             )
 
         if target_kind == "group":
-            print_info(
-                f"[dim]Add member:[/dim] select a user to add to group {marked_to}."
-                " This modifies group membership in Active Directory."
-            )
+            # RBCD coordination: a downstream AllowedToAct on this group needs an
+            # owned SPN-bearing member (S4U requires an SPN). When the look-ahead
+            # resolved one, default to it instead of the path-source executor — a
+            # member without an SPN would fail the RBCD with KDC_ERR_BADOPTION.
+            add_default = context.member_to_add or context.exec_username
+            if context.member_to_add:
+                print_info(
+                    f"[dim]Add member:[/dim] the next step is resource-based "
+                    f"constrained delegation (AllowedToAct) on {marked_to}, which "
+                    f"needs an SPN-bearing member. ADscan selected the owned account "
+                    f"{mark_sensitive(context.member_to_add, 'user')} — adding it so "
+                    "the delegation ticket can be minted."
+                )
+            else:
+                print_info(
+                    f"[dim]Add member:[/dim] select a user to add to group {marked_to}."
+                    " This modifies group membership in Active Directory."
+                )
             changed_username = Prompt.ask(
                 "Enter the user to add",
-                default=context.exec_username,
+                default=add_default,
             )
             changed_username = _sanitize_prompt_account(changed_username)
             result = shell.exploit_add_member(

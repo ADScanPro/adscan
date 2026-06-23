@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from adscan_internal.services.domain_posture import DomainPosture
     from adscan_internal.services.posture_sink import PostureSink
 
+from adscan_core import telemetry
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_info_debug,
@@ -159,6 +160,22 @@ class CollectionOrchestrator:
         analyze_implicit_well_known_memberships(result)
         timing.post_processing = time.monotonic() - _t
 
+        # Machine-account password rotation policy (audit scope): read the GPO
+        # SYSVOL security templates over SMB to flag disabled/relaxed rotation — a
+        # domain-wide static-machine-password (Timeroast) surface. Best-effort.
+        if collection_scope == "audit":
+            self._inspect_machine_password_policy(
+                result,
+                target_domain=target_domain,
+                dc_address=dc_address,
+                dc_fqdn=kerberos_target_hostname,
+                auth_domain=auth_domain,
+                auth_kdc=auth_kdc,
+                credential=credential,
+                posture_sink=posture_sink,
+                posture_snapshot=posture_snapshot,
+            )
+
         if collect_smb or collect_shares:
             _t = time.monotonic()
             resolve_computer_nodes(
@@ -168,6 +185,15 @@ class CollectionOrchestrator:
                 domain=target_domain,
             )
             timing.dns = time.monotonic() - _t
+
+            # Duplicate-DNS hygiene: Computer nodes now carry their resolved IP,
+            # so flag IPs that more than one enabled computer resolves to (stale
+            # A-record / IP reuse → breaks Kerberos SPN targeting).
+            from adscan_internal.services.collector.audit_analyzer import (
+                analyze_duplicate_dns_findings,
+            )
+
+            result.audit_findings.extend(analyze_duplicate_dns_findings(result))
 
         if collect_smb or collect_shares:
             from adscan_internal.services.collector.host_collector import (
@@ -222,6 +248,78 @@ class CollectionOrchestrator:
             result.audit_findings.extend(analyze_host_audit_findings(result))
 
         return result, timing
+
+    def _inspect_machine_password_policy(
+        self,
+        result: CollectionResult,
+        *,
+        target_domain: str,
+        dc_address: str,
+        dc_fqdn: str | None,
+        auth_domain: str,
+        auth_kdc: str,
+        credential: _Credential,
+        posture_sink: Optional["PostureSink"],
+        posture_snapshot: Optional["DomainPosture"],
+    ) -> None:
+        """Read the machine-account password rotation policy from GPO SYSVOL.
+
+        Reuses the GPO nodes already collected by the LDAP collector and the
+        existing SMB transport (no new collector). Best-effort: any failure leaves
+        ``result.machine_password_policy`` unset and emits no finding.
+        """
+        from adscan_internal.services.collector.audit_analyzer import (
+            analyze_machine_rotation_finding,
+        )
+        from adscan_internal.services.collector.machine_password_policy import (
+            collect_machine_password_policy_sync,
+        )
+        from adscan_internal.services.smb_transport import SMBConfig
+
+        try:
+            gpo_specs = [
+                (node.name or node.object_id, f"{node.name} {node.distinguished_name}")
+                for node in result.nodes.values()
+                if node.kind == "GPO"
+            ]
+            if not gpo_specs:
+                return
+            use_kerberos = bool(getattr(credential, "use_kerberos", False))
+            dc_unc_host = (dc_fqdn or dc_address) if use_kerberos else dc_address
+            smb_config = SMBConfig(
+                target_ip=dc_address,
+                target_hostname=dc_fqdn or dc_address,
+                domain=target_domain,
+                auth_domain=auth_domain,
+                username=getattr(credential, "username", None),
+                password=getattr(credential, "password", None),
+                nt_hash=getattr(credential, "nt_hash", None),
+                aes_key=getattr(credential, "aes_key", None),
+                ccache_path=getattr(credential, "ccache_path", None),
+                use_kerberos=use_kerberos,
+                kdc_ip=auth_kdc or dc_address,
+                posture_sink=posture_sink,
+                posture_snapshot=posture_snapshot,
+            )
+            policy = collect_machine_password_policy_sync(
+                smb_config=smb_config,
+                dc_unc_host=dc_unc_host,
+                domain_fqdn=target_domain,
+                gpo_specs=gpo_specs,
+            )
+            if policy is None:
+                return
+            result.machine_password_policy = policy
+            result.audit_findings.extend(analyze_machine_rotation_finding(result))
+            print_info_verbose(
+                "Machine-account password policy: inspected "
+                f"{policy.inspected_gpos} GPO(s), rotation "
+                f"{'DISABLED' if policy.disable_password_change else 'enabled'}"
+                f"{f', max age {policy.max_age_days}d' if policy.max_age_days else ''}."
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never break collection
+            telemetry.capture_exception(exc)
+            print_info_debug(f"machine-pwd-policy: inspection failed: {exc}")
 
     def collect_scope(
         self,

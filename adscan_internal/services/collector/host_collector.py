@@ -61,10 +61,34 @@ from adscan_internal.services.collector.smb_collector import (
     SMBCollectorConfig,
     sid_to_object_id,
 )
+from adscan_internal.services.collector.well_known_sids import NON_GRANTEE_SIDS
 
 
 _HOST_CONCURRENCY_DEFAULT = 20
 _HOST_TIMEOUT_DEFAULT = 20
+
+# Hard wall-clock bound on the AUTHENTICATED SMB connect (the per-host
+# `smb_machine_with_fallback` enter: Kerberos getST + negotiate + session-setup,
+# plus the Kerberos→NTLM fallback). This is the one connect step that otherwise
+# rides only the transport's SOFT ``timeout=`` per internal op, so on a host that
+# opens TCP/445 but STALLS the SMB session (security appliances, honeypots/EDR,
+# printers/IoT, half-open firewalls — common at enterprise scale) the soft
+# timeouts sum to ~2-3× per-op (~53s observed) before failing.
+#
+# Value grounded in the field-proven collectors (studied in reference/): the
+# 445 gate above is the TCP pre-check those tools do first (bloodhound.py
+# ``tcp_ping(445)``; NetExec ``_is_port_open(1s)``); AFTER that pre-check they
+# bound the connect aggressively — bloodhound.py ``set_connect_timeout(1.0)``,
+# NetExec ``set_connect_timeout(5)`` (vs impacket's 60s default that an unbounded
+# connect would ride). Note both only bound the TCP/RPC SOCKET connect and can
+# still hang on a post-TCP SMB-session stall; ADscan bounds the FULL
+# authenticated session (negotiate + getST + session-setup), so it is strictly
+# more robust. A real authed session (TCP already gated) is <3s typical and <8s
+# pathological even with per-host getST under KDC load at scale, so 10s never
+# cuts a healthy host while capping a stalled one ~tightly — between NetExec's
+# 5s and an audit-tool completeness margin (we prefer not to skip a real-but-slow
+# host the way bloodhound's 1s would). Tune via ``ADSCAN_COLLECTOR_CONNECT_TIMEOUT``.
+_HOST_CONNECT_TIMEOUT_DEFAULT = 10
 
 # Hard per-host wall-clock SAFETY NET for the full collection of one host
 # (negotiate + auth-connect + SAMR + shares). Every per-op step is already a hard
@@ -128,6 +152,14 @@ class HostCollectorConfig:
             "ADSCAN_COLLECTOR_PER_HOST_TIMEOUT", _HOST_TIMEOUT_DEFAULT
         )
     )  # seconds; applied per SMB host operation (negotiate + SAMR + shares combined)
+    connect_timeout: int = field(
+        default_factory=lambda: _env_int(
+            "ADSCAN_COLLECTOR_CONNECT_TIMEOUT", _HOST_CONNECT_TIMEOUT_DEFAULT
+        )
+    )  # seconds; HARD bound on the authenticated SMB connect (incl. Kerberos→NTLM
+    # fallback) — the one step that otherwise rides only the soft transport
+    # timeout, so a TCP-open-but-SMB-stalled host fails fast instead of summing
+    # ~2-3× per-op. Frees the worker slot at scale; per_host_budget is the net.
     per_host_budget: int = field(
         default_factory=lambda: _env_int(
             "ADSCAN_COLLECTOR_PER_HOST_BUDGET", _HOST_BUDGET_DEFAULT
@@ -352,6 +384,8 @@ async def _do_samr(
     per_host_timeout: int,
     out: HostCollectionResult,
     timing: HostPhaseTiming,
+    self_user: str | None = None,
+    target_ip: str | None = None,
 ) -> None:
     from adscan_internal.services.collector.smb_collector import (
         collect_builtin_group_members,
@@ -362,7 +396,8 @@ async def _do_samr(
     try:
         try:
             sessions, sess_err = await asyncio.wait_for(
-                collect_sessions(machine), timeout=per_host_timeout
+                collect_sessions(machine, self_user=self_user, target_ip=target_ip),
+                timeout=per_host_timeout,
             )
             out.session_usernames = sessions
             if sess_err:
@@ -463,10 +498,37 @@ async def collect_one_host(
         posture_snapshot=config.smb.posture_snapshot,
     )
 
+    import contextlib
+
     try:
-        async with smb_machine_with_fallback(smb_config) as machine:
+        # Hard-bound the authenticated connect. ``smb_machine_with_fallback``
+        # enters via __aenter__ (Kerberos getST + negotiate + session-setup, plus
+        # the NTLM fallback) and is the ONLY step not already wrapped in a hard
+        # ``wait_for`` — it rides the transport's soft ``timeout=`` per internal
+        # op, so a TCP-open-but-SMB-stalled host can burn ~2-3× per_host_timeout
+        # (~53s observed) before failing. wait_for caps it at ``connect_timeout``;
+        # the resulting TimeoutError is recorded as a connect failure by the
+        # handler below, freeing the worker slot fast. The post-connect RPC stages
+        # keep their own per-op bounds. (Cancelling a hung connect is safe — the
+        # vendor aiosmb fix cancels the keepalive/incoming tasks on teardown, so
+        # no task leak; confirmed in-flight 0 at scale.)
+        machine_cm = smb_machine_with_fallback(smb_config)
+        # smb_machine_with_fallback is an @asynccontextmanager; pylint can't infer
+        # __aenter__/__aexit__ through the decorator (false-positive no-member).
+        machine = await asyncio.wait_for(
+            machine_cm.__aenter__(),  # pylint: disable=no-member
+            timeout=config.connect_timeout,
+        )
+        try:
             if config.collect_samr:
-                await _do_samr(machine, config.per_host_timeout, out, timing)
+                await _do_samr(
+                    machine,
+                    config.per_host_timeout,
+                    out,
+                    timing,
+                    self_user=config.smb.username,
+                    target_ip=target_ip,
+                )
             if config.collect_shares:
                 await _do_shares(
                     machine,
@@ -476,16 +538,35 @@ async def collect_one_host(
                     out,
                     timing,
                 )
+        finally:
+            with contextlib.suppress(Exception):
+                await machine_cm.__aexit__(None, None, None)  # pylint: disable=no-member
     except SMBAuthError as exc:
         out.errors["auth"] = f"{type(exc).__name__}: {exc}"
         if "AP_REP" in str(exc) or "asn1_structs" in str(exc):
             telemetry.capture_exception(exc)
+            # NOT a parser bug: a Kerberos AP/KDC rejection — typically a stale-DNS
+            # wrong-host SPN (the IP's live host differs from the targeted name).
+            # The transport SPN retry + the dedupe gate normally heal this; if it
+            # still surfaces here, no live FQDN candidate resolved for the IP.
             print_info_debug(
-                f"[host-collector] suspected minikerberos AP_REP parse bug on {target_ip}"
+                f"[host-collector] Kerberos AP/KDC rejection on {target_ip} "
+                "(likely stale-DNS wrong-host SPN; no live candidate resolved). "
+                "See the duplicate_dns_fqdn hygiene finding."
             )
     except SMBAccessDeniedError as exc:
         out.errors["auth"] = f"access_denied: {exc}"
-    except (SMBConnectionError, asyncio.TimeoutError) as exc:
+    except asyncio.TimeoutError:
+        # Only the authenticated-connect wait_for can surface a TimeoutError here
+        # — the RPC stages catch their own. Distinct, greppable message so a
+        # bounded connect-stall is visible in the collector-timing telemetry
+        # (separate from a fast RST connect refusal).
+        out.errors["connect"] = (
+            f"connect_timeout: SMB authenticated session exceeded "
+            f"{config.connect_timeout}s (host reachable on 445 but the SMB "
+            f"connect stalled — bounded to free the worker slot)"
+        )
+    except SMBConnectionError as exc:
         out.errors["connect"] = f"{type(exc).__name__}: {exc}"
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -637,13 +718,18 @@ def _merge_host_into_graph(
     # Share edges + names.
     #
     # NTFS-aware verification: a share-ACL grant alone over-reports access. The
-    # real access is share-ACL ∩ NTFS-folder-ACL. We TAG each edge with a
-    # verification tier (never drop it — the graph topology must stay identical
-    # so attack-path computation is unaffected):
+    # real access is share-ACL ∩ NTFS-folder-ACL. Each edge is tagged with a
+    # verification tier AND, when the effective access is CONFIRMED, that
+    # intersection drives the edge KIND (a confirmed read-only share never emits
+    # a WriteShare — see the emission below):
     #   * ntfs_computed   — both SDs read + per-principal winacl intersection.
-    #                       The effective mask is stored in notes.
-    #   * share_acl_only  — NTFS SD unreadable or eval not confident. Still a
-    #                       real lead, but NTFS-unverified.
+    #                       Effective mask drives the kind + stored in notes.
+    #   * self_mxac       — NTFS SD unreadable but the share grants a broad auth
+    #                       group the scanning identity belongs to: the server's
+    #                       MxAc self-effective mask drives the kind.
+    #   * share_acl_only  — NTFS SD unreadable AND not confirmable for this
+    #                       principal (e.g. Helpdesk). The RAW share-ACL edge is
+    #                       PRESERVED as an unverified write lead (recall).
     if host_data.shares:
         node.properties["smb_shares"] = [s.name for s in host_data.shares]
         for share in host_data.shares:
@@ -652,6 +738,13 @@ def _merge_host_into_graph(
             )
             for sid_str, mask in share.aces:
                 sid_upper = sid_str.strip().upper()
+                if sid_upper in NON_GRANTEE_SIDS:
+                    # Creator Owner / Creator Group / Owner Rights are owner/creator
+                    # ABSTRACTIONS, not principals you can authenticate as. Their ACE
+                    # is an inheritance/owner template, never a usable folder-access
+                    # grant — emitting an edge from them is a false capability (e.g.
+                    # Creator Owner:Full on a read-only share → bogus WriteShare).
+                    continue
                 principal = sid_to_node.get(sid_upper)
                 if principal is None or principal.kind not in (
                     "User",
@@ -665,10 +758,18 @@ def _merge_host_into_graph(
                     principal_kind=principal.kind,
                     group_closure=group_closure,
                 )
-                # Edge existence is driven by the RAW share-ACL mask exactly as
-                # before — never by the effective mask — so topology is
-                # unchanged. The effective mask is metadata only.
-                for relation in mask_to_edge_kinds(mask):
+                # The CONFIRMED effective access (share ∩ NTFS) drives the edge
+                # KIND when we have it: a share-ACL WRITE that the NTFS folder
+                # (ntfs_computed) or the server's MxAc (self_mxac) denies is
+                # emitted as ReadShare, never a false WriteShare. When the
+                # effective access is NOT confirmable (share_acl_only — NTFS SD
+                # unreadable AND not a current-user broad group, e.g. a Helpdesk
+                # grant we cannot evaluate), the RAW share-ACL mask drives the
+                # kind so the unverified write lead is preserved (recall).
+                # effective ⊆ raw (it is an intersection), so this only ever
+                # downgrades/drops edges — never invents one.
+                kind_mask = effective_mask if effective_mask is not None else mask
+                for relation in mask_to_edge_kinds(kind_mask):
                     notes: dict[str, Any] = {
                         "share_name": share.name,
                         "sd_source": share.sd_source,
@@ -689,6 +790,35 @@ def _merge_host_into_graph(
                     n_share += 1
 
     return n_session, n_admin, n_share, sd_source_counts
+
+
+def _pick_live_node(ip_nodes: list[Any]) -> Any:
+    """Return the LIVE node among several that resolve to one IP.
+
+    Stale DNS / IP reuse can leave two enabled computer accounts pointing at one
+    IP (e.g. a decommissioned CZN007 sharing the IP with the live CZN012). The
+    live machine is the most-recently-authenticated one (highest
+    lastLogonTimestamp). Prefer enabled nodes; fall back to the first when no
+    liveness signal exists (the transport SPN retry then backstops correctness).
+    """
+    def _is_enabled(node: Any) -> bool:
+        # enabled may live on the node field (production CollectorNode) or in
+        # properties (some builders/tests); only an explicit False disables.
+        val = getattr(node, "enabled", None)
+        if val is None:
+            val = (getattr(node, "properties", None) or {}).get("enabled")
+        return val is not False
+
+    enabled = [n for n in ip_nodes if _is_enabled(n)]
+    pool = enabled or ip_nodes
+
+    def _last_logon(node: Any) -> int:
+        try:
+            return int((getattr(node, "properties", None) or {}).get("lastlogon") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return max(pool, key=_last_logon)
 
 
 async def _gate_reachable_445(
@@ -755,9 +885,27 @@ async def _gate_reachable_445(
         # edges.
         reachable_nodes: list[Any] = []
         offline_nodes: list[Any] = []
+        duplicate_dns_skipped = 0
         for ip, ip_nodes in ip_to_nodes.items():
             if ip in reachable_ips:
-                reachable_nodes.extend(ip_nodes)
+                if len(ip_nodes) > 1:
+                    # Stale DNS / IP reuse: >1 enabled computer maps to one live
+                    # IP. Collect the LIVE host once (most-recent lastLogon); skip
+                    # the ghost(s) for SMB — the duplicate_dns_fqdn hygiene finding
+                    # already reports them. This avoids the wasted Kerberos attempt
+                    # against the stale name (cifs/<ghost> → KRB_ERR_GENERIC) and
+                    # the misleading "AP_REP parse bug" debug line. The transport
+                    # SPN retry remains the backstop when lastLogon is unavailable.
+                    live = _pick_live_node(ip_nodes)
+                    reachable_nodes.append(live)
+                    for node in ip_nodes:
+                        if node is not live:
+                            node.properties["smb_gate"] = (
+                                f"duplicate DNS — superseded by live host at {ip}"
+                            )
+                            duplicate_dns_skipped += 1
+                else:
+                    reachable_nodes.extend(ip_nodes)
             else:
                 for node in ip_nodes:
                     # Reuse collect_one_host's error vocabulary; persist on the
@@ -766,6 +914,11 @@ async def _gate_reachable_445(
                     node.properties["smb_gate"] = "445 closed/filtered"
                     offline_nodes.append(node)
         offline_count = len(offline_nodes)
+        if duplicate_dns_skipped:
+            print_info_debug(
+                f"[host-collector] skipped {duplicate_dns_skipped} duplicate-DNS "
+                "ghost node(s); collected the live host per shared IP"
+            )
 
         # Premium operator line, in host-node units with the FINAL elapsed (incl.
         # the VPN-loss re-probe). Reuses the shared summary vocabulary; the IP
