@@ -45,7 +45,7 @@ dev = [
     "badldap>=0.7.5,<0.8",
     "kerbad>=0.5.9",
     "impacket==0.13.1",
-    "pytest>=8.0,<9.0",
+    "pytest>=8.0,<10.0",
     # pytest-timeout converts hung tests into explicit failures with a
     # stack trace at the deadline instead of letting them stall CI for
     # hours. Configured in pytest.ini with a 60s default per test plus
