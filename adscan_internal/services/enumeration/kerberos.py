@@ -353,8 +353,15 @@ def _stream_userenum_into_dashboard(
                     last=last,
                 )
             else:
-                # Indeterminate: counter is the valid-hit count ("found N").
-                dashboard.update(done=len(seen_valid), last=last)
+                # Indeterminate: both the header ("found N", reads done) and the
+                # counter row ("✓ users N", reads success) track the valid-hit
+                # count, so pass success= as well -- otherwise the counter row
+                # stays stuck at 0 while the header advances (they disagree).
+                dashboard.update(
+                    done=len(seen_valid),
+                    success=len(seen_valid),
+                    last=last,
+                )
         except Exception:  # noqa: BLE001 -- render must not abort the run
             pass
 
@@ -1484,12 +1491,11 @@ class KerberosEnumerationMixin:
                 )
             )
 
-        if output_file is not None:
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            output_file.write_text(
-                "".join(f"{line}\n" for line in lines_to_write),
-                encoding="utf-8",
-            )
+        # Only materialize the hashfile when there is at least one hash. A
+        # zero-hash roast must NOT create a 0-byte file: downstream cracking
+        # guards on file presence, and an empty hashfile makes hashcat exit
+        # with "hashfile is empty or corrupt" (RC 255).
+        self._write_hash_lines(output_file, lines_to_write)
 
         skipped_total = revoked_count + other_skip_count + no_hash_count
         if skipped_total and not is_verbose_mode():
@@ -1767,8 +1773,16 @@ class KerberosEnumerationMixin:
     def _write_hash_lines(
         self, output_file: Optional[Path], lines_to_write: list[str]
     ) -> None:
-        """Write one hash per line when an output file is requested."""
+        """Write one hash per line when an output file is requested.
+
+        A zero-hash roast must NOT create a 0-byte file: downstream cracking
+        guards on file presence, and an empty hashfile makes hashcat exit with
+        "hashfile is empty or corrupt" (RC 255). When there are no hashes we
+        write nothing, so the absent file signals "no hashes" to the caller.
+        """
         if output_file is None:
+            return
+        if not lines_to_write:
             return
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_file.write_text(

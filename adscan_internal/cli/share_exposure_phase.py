@@ -37,6 +37,59 @@ _READ_ACCESS = {"Read", "Write", "Full Control"}
 _AUDIT_HUNT_SHARE_LIMIT = 25
 
 
+def _emit_share_operation_progress(
+    *,
+    label: str,
+    phase: str,
+    current: int | None = None,
+    total: int | None = None,
+    detail: str | None = None,
+    estimator: Any | None = None,
+    done: bool = False,
+) -> None:
+    """Emit one current-operation tick for the share-enumeration long step.
+
+    Live observability only — drives the platform's current-operation surface
+    ("Share enumeration · 3 of 12 · domain"). When an ``estimator`` (a shared
+    :class:`ProgressEstimator`) is supplied it is observed with the current/total
+    so the tick carries the live rate / ETA / elapsed — the same throughput
+    computation the CLI rich.live dashboards use. Best-effort and a no-op unless
+    the structured event sink is enabled (see ``emit_operation_progress``).
+
+    Pass ``done=True`` on the FINAL tick (the phase finished) so the platform's
+    live strip clears the operation immediately instead of freezing on the last
+    host count.
+    """
+    try:
+        from adscan_internal.cli.ci_events import emit_operation_progress  # noqa: PLC0415
+
+        rate: float | None = None
+        eta_seconds: float | None = None
+        elapsed_seconds: float | None = None
+        if estimator is not None and current is not None:
+            estimator.observe(current, total)
+            measured_rate = estimator.rate
+            rate = measured_rate if measured_rate > 0 else None
+            eta_seconds = estimator.eta_seconds
+            elapsed_seconds = estimator.elapsed_seconds
+
+        emit_operation_progress(
+            operation="share_enumeration",
+            label=label,
+            phase=phase,
+            phase_label="SMB Share Exposure",
+            current=current,
+            total=total,
+            rate=rate,
+            eta_seconds=eta_seconds,
+            elapsed_seconds=elapsed_seconds,
+            detail=detail,
+            done=done,
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry must never abort the phase
+        telemetry.capture_exception(exc)
+
+
 def _row_access(row: dict[str, Any]) -> set[str]:
     acc = row.get("access")
     return acc if isinstance(acc, set) else set(acc or [])
@@ -174,7 +227,21 @@ def _run_writable_capture_substep(
         details={"Domain": domain, "Writable hosts": str(len(by_host))},
         icon="📤",
     )
-    for host, names in by_host.items():
+    total_hosts = len(by_host)
+    # One shared estimator across the host loop yields the live rate / ETA /
+    # elapsed the platform strip shows, identical to the CLI dashboards.
+    from adscan_core.tui.progress_dashboard import ProgressEstimator  # noqa: PLC0415
+
+    estimator = ProgressEstimator()
+    for index, (host, names) in enumerate(by_host.items(), start=1):
+        _emit_share_operation_progress(
+            label="Share enumeration",
+            phase="share_credential_hunt",
+            current=index,
+            total=total_hosts,
+            detail=domain,
+            estimator=estimator,
+        )
         run_ntlmv2_capture_for_writable_shares(
             shell,
             domain=domain,
@@ -216,6 +283,13 @@ def _run_readable_hunt_substep(
     selected = _select_shares_for_hunt(shell, readable)
     if not selected:
         return
+    _emit_share_operation_progress(
+        label="Share enumeration",
+        phase="share_credential_hunt",
+        current=len(selected),
+        total=len(selected),
+        detail=domain,
+    )
     run_smb_share_credential_hunt(
         shell,
         domain=domain,
@@ -231,6 +305,11 @@ def _run_readable_hunt_substep(
 
 def run_smb_share_exposure_phase(shell: Any, *, domain: str) -> None:
     """Phase 7 — SMB Share Exposure: overview -> write capture -> read hunt."""
+    from adscan_internal.services.scan_phases import phase_is_enabled  # noqa: PLC0415
+
+    if not phase_is_enabled(shell, "share_credential_hunt"):
+        print_info("SMB Share Exposure skipped (disabled in scan configuration).")
+        return
     if getattr(shell, "_is_ctf_domain_pwned", lambda _d: False)(domain):
         return
 
@@ -267,17 +346,29 @@ def run_smb_share_exposure_phase(shell: Any, *, domain: str) -> None:
 
     writable, readable = _split_share_rows(rows)
 
-    # Sub-steps are independent: a failure in one never aborts the other.
+    # Sub-steps are independent: a failure in one never aborts the other. The
+    # whole phase shares one ``share_enumeration`` operation, so a single
+    # terminal done tick fires in the ``finally`` once both substeps have run —
+    # the live strip clears immediately instead of freezing on the last host
+    # count, even if a substep raised.
     try:
-        _run_writable_capture_substep(
-            shell, domain=domain, writable=writable, domain_data=domain_data
+        try:
+            _run_writable_capture_substep(
+                shell, domain=domain, writable=writable, domain_data=domain_data
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+        try:
+            _run_readable_hunt_substep(shell, domain=domain, readable=readable)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+    finally:
+        _emit_share_operation_progress(
+            label="Share enumeration",
+            phase="share_credential_hunt",
+            detail=domain,
+            done=True,
         )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-    try:
-        _run_readable_hunt_substep(shell, domain=domain, readable=readable)
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
 
 
 __all__ = ["run_smb_share_exposure_phase"]

@@ -9,7 +9,7 @@ from badauth.protocols.kerberos.gssapismb import get_gssapi as gssapi_smb
 
 from kerbad.common.spn import KerberosSPN
 from kerbad.gssapi.gssapi import GSSAPIFlags
-from kerbad.protocol.asn1_structs import AP_REP, EncAPRepPart, Ticket, EncryptedData
+from kerbad.protocol.asn1_structs import AP_REP, EncAPRepPart, Ticket, EncryptedData, KRB_ERROR
 from kerbad.protocol.constants import MESSAGE_TYPE
 from kerbad.protocol.ticketutils import construct_apreq_from_ticket
 from kerbad.protocol.encryption import Key, _enctype_table
@@ -153,12 +153,48 @@ class KerberosClientNative:
 					for target in self.ccred.ccache.list_targets():
 						# just printing this to debug...
 						logger.debug('CCACHE SPN record: %s' % target)
-					tgs, encpart, self.session_key, err = self.kc.tgs_from_ccache(spn)
-					if err:
-						raise err
-					logger.debug('Got TGS from CCACHE!')
-					
-					self.from_ccache = True
+
+					# --- ADscan vendor fix: fresh-TGS gate (KRB_ERR_GENERIC) ---
+					# When the credential ccache contains a TGT (a *generic* credential),
+					# reusing a cached SERVICE ticket via tgs_from_ccache /
+					# construct_apreq_from_ticket produced AP-REQs that the server
+					# rejected with KRB_ERR_GENERIC, while the SAME ticket freshly minted
+					# from the TGT worked. So when a TGT is present AND the requested SPN
+					# is itself a real service (not the krbtgt), mint a FRESH service
+					# ticket from the ccache TGT (get_TGS force_fresh_tgs=True contacts
+					# the KDC and bypasses its cached-TGS short-circuit) instead of
+					# reusing the cached service ticket.
+					#
+					# Scoped ccaches (S4U2Proxy / RBCD / silver) hold NO TGT — only the
+					# one service ticket that IS the capability — so they keep reusing
+					# that cached service ticket (ccache_has_tgt is False → gate off).
+					# A request whose SPN is the krbtgt (spn_is_tgt) also keeps the
+					# cached path: there is nothing fresher to mint.
+					ccache_has_tgt = any(
+						cred.server.to_string(separator='/').lower().find('krbtgt') != -1
+						for cred in self.ccred.ccache.credentials
+					)
+					spn_is_tgt = (
+						str(getattr(spn, 'service', '') or '').lower() == 'krbtgt'
+					)
+					if ccache_has_tgt and not spn_is_tgt:
+						logger.debug(
+							'Fresh-TGS gate: TGT present in ccache and SPN is a service; '
+							'minting a fresh service ticket instead of reusing a cached one.'
+						)
+						# Load the TGT from the ccache (get_TGT returns early when the
+						# ccache already holds it), then force a fresh KDC round-trip.
+						await self.kc.with_clock_skew(self.kc.get_TGT, override_etype = self.credential.etypes)
+						tgs, encpart, self.session_key = await self.kc.with_clock_skew(
+							self.kc.get_TGS, spn, force_fresh_tgs = True
+						)
+						self.from_ccache = False
+					else:
+						tgs, encpart, self.session_key, err = self.kc.tgs_from_ccache(spn)
+						if err:
+							raise err
+						logger.debug('Got TGS from CCACHE!')
+						self.from_ccache = True
 				except:
 					# fetching TGT
 					try:
@@ -258,13 +294,42 @@ class KerberosClientNative:
 				logger.debug('Processing AP_REP')  # ADSCAN: do not dump raw AP_REP bytes
 				try:
 					temp = KRB5_MECH_INDEP_TOKEN.from_bytes(authData)
-					try:
+					# The 2-byte inner token-type prefix (RFC 1964 §1.1) tells us what the
+					# server actually sent in the AP exchange:
+					#   \x02\x00 = KRB_AP_REP  (mutual-auth reply — the happy path)
+					#   \x03\x00 = KRB_ERROR   (the server rejected the AP-REQ)
+					# A wrapped KRB-ERROR (APPLICATION 30 / 0x7e) is NOT an AP-REP
+					# (APPLICATION 15 / 0x6f). Blindly calling AP_REP.load() on it dies with
+					# an opaque ASN.1 tag error and DESTROYS the real Kerberos error-code, so
+					# downstream code misdiagnoses every wrapped error as a wrong-SPN bind.
+					# Branch on the token-type so the genuine error-code (etype/salt/skew/SPN)
+					# survives and the posture/recovery seams can act on it.
+					token_id = temp.data[:2]
+					if token_id == b'\x03\x00':
+						# KRB_ERROR — propagate the real Kerberos error-code instead of
+						# corrupting it through an AP-REP parse.
+						krberr = KRB_ERROR.load(temp.data[2:])
+						logger.debug(
+							'AP exchange returned a wrapped KRB-ERROR error-code=%s'
+							% int(krberr.native.get('error-code', -1))
+						)
+						raise KerberosError(krberr, 'AP exchange rejected by server')
+					elif token_id == b'\x02\x00':
 						aprep = AP_REP.load(temp.data[2:]).native
-					except Exception:
-						# Some hosts omit the 2-byte token-type prefix inside the GSSAPI
-						# wrapper; try without skipping it before falling back.
-						logger.debug('AP_REP load with [2:] failed, retrying without offset')  # ADSCAN: do not dump raw AP_REP bytes
-						aprep = AP_REP.load(temp.data).native
+					else:
+						# Unexpected inner token-type — surface it explicitly rather than
+						# guessing it is an AP-REP and dying with an opaque tag error.
+						try:
+							aprep = AP_REP.load(temp.data[2:]).native
+						except Exception:
+							# Some hosts omit the 2-byte token-type prefix inside the GSSAPI
+							# wrapper; try without skipping it before falling back.
+							logger.debug('AP_REP load with [2:] failed, retrying without offset (token-id=0x%s)' % token_id.hex())  # ADSCAN: do not dump raw AP_REP bytes
+							aprep = AP_REP.load(temp.data).native
+				except KerberosError:
+					# A genuine, fully-decoded Kerberos error — re-raise as-is so the
+					# real error-code reaches the outer handler / recovery layer.
+					raise
 				except Exception as e:
 					# KRB5_MECH_INDEP_TOKEN.from_bytes() failed — happens on Windows 10
 					# workstations that wrap the AP-REP in a GSSAPI token whose OID the
@@ -289,10 +354,38 @@ class KerberosClientNative:
 								except Exception:
 									continue
 					if aprep is None:
+						# Before the blind AP_REP.load, the GSSAPI wrapper the earlier
+						# branches couldn't decode may still be carrying a KRB-ERROR
+						# (APPLICATION 30 / 0x7e) rather than an AP-REP (APPLICATION 15 /
+						# 0x6f) — the 0x6f scan above would not have matched it. Mirror the
+						# token-id 0x0300 branch above: scan for the KRB-ERROR tag, decode
+						# it and raise the REAL Kerberos error-code instead of corrupting it
+						# through an AP-REP parse.
+						if authData and authData[0:1] == b'\x60':
+							search_window = authData[:256]
+							for offset in range(1, len(search_window)):
+								if search_window[offset:offset+1] == b'\x7e':
+									try:
+										krberr = KRB_ERROR.load(authData[offset:])
+										logger.debug(
+											'AP exchange returned a wrapped KRB-ERROR error-code=%s'
+											% int(krberr.native.get('error-code', -1))
+										)
+										raise KerberosError(krberr, 'AP exchange rejected by server')
+									except KerberosError:
+										raise
+									except Exception:
+										continue
 						# Final fallback: raw bytes (will fail with original error if still 0x60)
 						try:
 							aprep = AP_REP.load(authData).native
 						except Exception as parse_exc:
+							# Do NOT double-wrap: if the inner error is already an
+							# 'Error parsing ...AP_REP' wrap, re-raise it as-is so the real
+							# Kerberos error survives instead of being buried under a second
+							# identical wrapper.
+							if str(parse_exc).startswith('Error parsing'):
+								raise
 							raise Exception(
 								'Error parsing %s.AP_REP - %s'  # ADSCAN: do not include raw AP_REP bytes in the error
 								% (AP_REP.__module__, parse_exc)

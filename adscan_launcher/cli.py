@@ -450,6 +450,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     ci.add_argument(
+        "--scan-config",
+        dest="scan_config",
+        default=None,
+        help=(
+            "Path to a YAML/JSON scan-configuration file that pre-configures the "
+            "scan (disable optional phases, set the trust-enumeration and "
+            "attack-path policies). Absent = today's interactive defaults. The "
+            "file is bind-mounted read-only into the scan container. Place it "
+            "before the auth/unauth positional."
+        ),
+    )
+    ci.add_argument(
         "args",
         nargs=argparse.REMAINDER,
         help="Arguments passed to the container after `ci`",
@@ -480,6 +492,33 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Random seed for jitter (default: 42).",
+    )
+
+    # ── adscan execute / doctor — container passthrough ───────────────
+    # Both run inside the container (the container owns the REPL engine and
+    # the preflight/auth/posture bootstrap). The launcher only needs to (a)
+    # recognise the verb so it surfaces in --help and (b) forward every
+    # remaining token verbatim through run_adscan_passthrough_docker. The
+    # container-side subparser (cli/execute.py, cli/doctor.py) is the single
+    # source of truth for the flag surface, so the launcher uses a permissive
+    # REMAINDER catch-all and never re-declares the flags (no drift).
+    execute_p = sub.add_parser(
+        "execute",
+        help="Run a single REPL command non-interactively (scripting / smoke-test).",
+    )
+    execute_p.add_argument(
+        "execute_args",
+        nargs=argparse.REMAINDER,
+        help="Verb and arguments forwarded to the container (see `adscan execute --list`).",
+    )
+    doctor_p = sub.add_parser(
+        "doctor",
+        help="Fast one-shot health check (DNS, connectivity, auth, posture).",
+    )
+    doctor_p.add_argument(
+        "doctor_args",
+        nargs=argparse.REMAINDER,
+        help="Arguments forwarded to the container health check.",
     )
 
     # ── Client Deliverables (Pass C) — passthrough into container ─────
@@ -810,6 +849,70 @@ def _ci_posture_env_from_flags(
         extra_env.append(("ADSCAN_TELEMETRY", "0"))
 
     return extra_env, cleaned
+
+
+# Container path the scan-config file is bind-mounted at. Fixed (not under the
+# workspace tree) so the engine resolves it the same way regardless of where the
+# host file lives. Read-only.
+_CI_SCAN_CONFIG_CONTAINER_PATH = "/opt/adscan/state/scan-config.in"
+
+
+def _ci_scan_config_from_flags(
+    ns: argparse.Namespace, passthrough: list[str]
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str]]:
+    """Translate ``--scan-config <path>`` into a container env var + RO mount.
+
+    The scan-config file lives on the HOST and must be readable INSIDE the
+    container. Rather than require it under the standard mounted tree, the
+    launcher bind-mounts it read-only at a fixed container path and tells the
+    engine where to find it via ``ADSCAN_SCAN_CONFIG`` (read by
+    ``adscan_internal.cli.ci``). Like the posture toggles, the flag is consumed
+    at the launcher seam and stripped from the passthrough so it never reaches
+    the container's own ``ci`` parser.
+
+    Both the parsed namespace attribute (set when the flag precedes the
+    auth/unauth positional) AND the raw passthrough list are inspected, so a
+    token that landed after the positional (past ``argparse.REMAINDER``'s flag
+    cut-off) still takes effect.
+
+    Returns:
+        ``(extra_env, extra_mounts, cleaned_passthrough)``. ``extra_env`` and
+        ``extra_mounts`` are empty when no ``--scan-config`` was given (default
+        behaviour unchanged). Exits non-zero via ``raise SystemExit`` when the
+        referenced file does not exist (fail loud, never silently ignore).
+    """
+    host_path = getattr(ns, "scan_config", None)
+
+    cleaned: list[str] = []
+    index = 0
+    tokens = list(passthrough)
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--scan-config":
+            if index + 1 < len(tokens):
+                host_path = tokens[index + 1]
+                index += 2
+                continue
+            print_error("--scan-config requires a file path argument.")
+            raise SystemExit(2)
+        if token.startswith("--scan-config="):
+            host_path = token.split("=", 1)[1]
+            index += 1
+            continue
+        cleaned.append(token)
+        index += 1
+
+    if not host_path:
+        return [], [], cleaned
+
+    resolved = os.path.abspath(os.path.expanduser(str(host_path)))
+    if not os.path.isfile(resolved):
+        print_error(f"Scan config file not found: {resolved}")
+        raise SystemExit(2)
+
+    extra_env = [("ADSCAN_SCAN_CONFIG", _CI_SCAN_CONFIG_CONTAINER_PATH)]
+    extra_mounts = [(resolved, _CI_SCAN_CONFIG_CONTAINER_PATH)]
+    return extra_env, extra_mounts, cleaned
 
 
 def _apply_host_posture_env(ns: argparse.Namespace, raw_argv: list[str]) -> None:
@@ -1294,14 +1397,62 @@ def _log_launcher_interrupt(*, kind: str, source: str) -> None:
 
 
 def _detect_installer_for_launcher() -> str:
-    """Best-effort detection for whether `adscan` is installed via pipx or pip."""
+    """Best-effort detection for whether `adscan` is installed via pipx or pip.
+
+    pipx is the documented primary install method. A pipx venv's
+    ``bin/python`` is a symlink to the system interpreter, so resolving it
+    with ``os.path.realpath`` ERASES the ``pipx/venvs`` path component and a
+    pipx install gets misdetected as pip — the upgrade then runs in the wrong
+    environment and the pipx launcher is never updated. So detect pipx from
+    the UNRESOLVED prefix/executable, and only fall back to ``realpath`` as a
+    last-ditch tiebreak.
+    """
+    pipx_marker = f"pipx{os.sep}venvs"
+
+    # 1. Explicit pipx home (env override or the documented default).
+    pipx_home = os.environ.get("PIPX_HOME")
+    pipx_roots: list[str] = []
+    if pipx_home:
+        pipx_roots.append(os.path.join(pipx_home, "venvs"))
+    pipx_roots.append(os.path.join(str(Path.home()), ".local", "pipx", "venvs"))
+
     try:
-        exe = os.path.realpath(sys.executable)
+        unresolved_prefix = os.path.abspath(str(sys.prefix))
     except Exception:
-        exe = str(sys.executable)
-    lowered = exe.lower()
-    if "/pipx/venvs/" in lowered or "pipx/venvs" in lowered:
+        unresolved_prefix = str(sys.prefix)
+    for root in pipx_roots:
+        try:
+            normalized_root = os.path.abspath(root)
+        except Exception:
+            normalized_root = root
+        # The adscan venv lives directly under <root>/adscan.
+        if unresolved_prefix == os.path.join(normalized_root, "adscan") or (
+            unresolved_prefix + os.sep
+        ).startswith(os.path.join(normalized_root, "adscan") + os.sep):
+            return "pipx"
+
+    # 2. Unresolved sys.prefix / sys.executable carrying the pipx layout.
+    for candidate in (str(sys.prefix), str(sys.executable)):
+        if pipx_marker in candidate or "pipx/venvs" in candidate:
+            return "pipx"
+
+    # 3. pipx writes a metadata file at the venv root (Path(sys.prefix).parent
+    #    is the venvs dir, but the metadata lives in the venv itself).
+    try:
+        if (Path(sys.prefix) / "pipx_metadata.json").is_file():
+            return "pipx"
+    except Exception:
+        pass
+
+    # 4. Last-ditch: the resolved executable (only useful when the symlink was
+    #    not collapsed, e.g. a copied interpreter).
+    try:
+        resolved = os.path.realpath(sys.executable).lower()
+    except Exception:
+        resolved = str(sys.executable).lower()
+    if pipx_marker in resolved or "pipx/venvs" in resolved:
         return "pipx"
+
     return "pip"
 
 
@@ -1709,6 +1860,13 @@ def main(argv: list[str] | None = None) -> None:
         # auth/unauth positional (past argparse.REMAINDER's flag cut-off) still
         # takes effect and never reaches the container parser.
         posture_env, passthrough = _ci_posture_env_from_flags(ns, passthrough)
+        # Translate --scan-config <host-path> into a read-only container mount +
+        # ADSCAN_SCAN_CONFIG env var. Consumed at the seam and stripped from the
+        # passthrough (mirrors the posture-toggle pattern). Absent = no-op.
+        scan_config_env, scan_config_mounts, passthrough = _ci_scan_config_from_flags(
+            ns, passthrough
+        )
+        ci_extra_env = list(posture_env) + list(scan_config_env)
         raise SystemExit(
             _run_host_command_with_session_capture(
                 command_type="ci",
@@ -1719,7 +1877,33 @@ def main(argv: list[str] | None = None) -> None:
                     debug=bool(getattr(ns, "debug", False)),
                     pull_timeout_seconds=int(ns.pull_timeout),
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
-                    extra_env=posture_env,
+                    extra_env=ci_extra_env,
+                    extra_mounts=scan_config_mounts,
+                ),
+                extra={"mode": "docker", "session_scope": "launcher_preflight"},
+                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
+            )
+        )
+
+    if cmd in ("execute", "doctor"):
+        # Container passthrough with launcher preflight + session capture.
+        # The REMAINDER args were captured on the dest named "<cmd>_args"; any
+        # leading option-looking token (e.g. `execute --list`) lands in
+        # ``unknown`` instead, so we prepend it — everything the operator typed
+        # after the verb is forwarded verbatim to the container (the container
+        # subparser is the single source of truth for the flag surface).
+        passthrough = list(unknown) + list(getattr(ns, f"{cmd}_args", []) or [])
+        if passthrough and passthrough[0] == "--":
+            passthrough = passthrough[1:]
+        raise SystemExit(
+            _run_host_command_with_session_capture(
+                command_type=str(cmd),
+                telemetry_console=telemetry_console,
+                runner=lambda: run_adscan_passthrough_docker(
+                    adscan_args=[cmd] + passthrough,
+                    verbose=bool(getattr(ns, "verbose", False)),
+                    debug=bool(getattr(ns, "debug", False)),
+                    pull_timeout_seconds=3600,
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),

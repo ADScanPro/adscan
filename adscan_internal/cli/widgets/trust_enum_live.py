@@ -304,6 +304,8 @@ def _remediation_for(error: str) -> str:
     text = (error or "").lower()
     if "signing" in text or "channel binding" in text or "strongerauth" in text:
         return "LDAP signing/CB required — try LDAPS or supply --ldap-channel-binding."
+    if "cross-realm" in text or "not reachable with the current credential" in text:
+        return "Partner realm not authenticatable with this credential — supply cross-forest creds for the partner domain."
     if "bind" in text or "credentials" in text or "preauth" in text:
         return "Bind failed — verify credentials are valid in the partner domain or supply cross-forest creds."
     if "timeout" in text or "unreachable" in text or "no route" in text:

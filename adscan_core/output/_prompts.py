@@ -33,6 +33,8 @@ __all__ = [
 # Prompt wrapper state
 _ORIGINAL_PROMPT_ASK: Optional[Callable[..., Any]] = None
 _ORIGINAL_CONFIRM_ASK: Optional[Callable[..., Any]] = None
+_ORIGINAL_INT_PROMPT_ASK: Optional[Callable[..., Any]] = None
+_ORIGINAL_FLOAT_PROMPT_ASK: Optional[Callable[..., Any]] = None
 _PROMPT_LOGGING_WRAPPERS_INSTALLED = False
 
 
@@ -80,20 +82,53 @@ def _logged_confirm_ask(*confirm_args: Any, **kwargs: Any) -> bool:
     )
 
 
+def _logged_int_prompt_ask(*prompt_args: Any, **kwargs: Any) -> Any:
+    """IntPrompt.ask wrapper with centralized telemetry/debug answer logging."""
+    from adscan_core import prompting
+
+    return prompting.logged_int_prompt_ask(
+        *prompt_args,
+        original_int_prompt_ask=_ORIGINAL_INT_PROMPT_ASK,
+        telemetry=print_telemetry_only,
+        debug=print_info_debug,
+        info=print_info,
+        **kwargs,
+    )
+
+
+def _logged_float_prompt_ask(*prompt_args: Any, **kwargs: Any) -> Any:
+    """FloatPrompt.ask wrapper with centralized telemetry/debug answer logging."""
+    from adscan_core import prompting
+
+    return prompting.logged_float_prompt_ask(
+        *prompt_args,
+        original_float_prompt_ask=_ORIGINAL_FLOAT_PROMPT_ASK,
+        telemetry=print_telemetry_only,
+        debug=print_info_debug,
+        info=print_info,
+        **kwargs,
+    )
+
+
 def install_prompt_logging_wrappers() -> None:
     """Install Prompt/Confirm wrappers to centrally log questions and answers."""
     global _ORIGINAL_PROMPT_ASK, _ORIGINAL_CONFIRM_ASK
+    global _ORIGINAL_INT_PROMPT_ASK, _ORIGINAL_FLOAT_PROMPT_ASK
     global _PROMPT_LOGGING_WRAPPERS_INSTALLED
 
     if _PROMPT_LOGGING_WRAPPERS_INSTALLED:
         return
 
-    from rich.prompt import Confirm, Prompt
+    from rich.prompt import Confirm, FloatPrompt, IntPrompt, Prompt
 
     _ORIGINAL_PROMPT_ASK = Prompt.ask
     _ORIGINAL_CONFIRM_ASK = Confirm.ask
+    _ORIGINAL_INT_PROMPT_ASK = IntPrompt.ask
+    _ORIGINAL_FLOAT_PROMPT_ASK = FloatPrompt.ask
     Prompt.ask = _logged_prompt_ask  # type: ignore[assignment]
     Confirm.ask = _logged_confirm_ask  # type: ignore[assignment]
+    IntPrompt.ask = _logged_int_prompt_ask  # type: ignore[assignment]
+    FloatPrompt.ask = _logged_float_prompt_ask  # type: ignore[assignment]
     _PROMPT_LOGGING_WRAPPERS_INSTALLED = True
 
 

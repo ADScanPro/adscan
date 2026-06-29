@@ -18,10 +18,10 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_info_debug, print_info_verbose
+from adscan_core.rich_output import print_info_debug, print_info_verbose, print_warning
 from adscan_core.interaction import is_non_interactive
 from adscan_core.tui.patience_notice import (
     PatienceNoticeConfig,
@@ -33,7 +33,9 @@ from adscan_core.tui.progress_dashboard import (
 )
 
 if TYPE_CHECKING:
-    pass  # DomainPosture, PostureSink used in Tasks 4-5 host-phase logic
+    from adscan_internal.services.collector.host_sweep_cancellation import (
+        HostSweepCancellation,
+    )
 
 from adscan_internal.services.collector.models import (
     CollectionResult,
@@ -52,7 +54,7 @@ from adscan_internal.services.collector.share_ntfs_verification import (
     VERIFICATION_SELF_MXAC,
     VERIFICATION_SHARE_ACL_ONLY,
     build_sid_group_closure,
-    compute_effective_file_mask,
+    compute_effective_file_masks,
     decide_verification_tier,
     is_broad_auth_sid,
     is_closure_confident,
@@ -61,7 +63,16 @@ from adscan_internal.services.collector.smb_collector import (
     SMBCollectorConfig,
     sid_to_object_id,
 )
-from adscan_internal.services.collector.well_known_sids import NON_GRANTEE_SIDS
+from adscan_internal.services.collector.well_known_sids import (
+    NON_GRANTEE_SIDS,
+    _node_primary_group_id,
+)
+
+
+# Domain Controllers (516) + Read-only DCs (521) are the identity control plane —
+# the single highest-signal hosts. Mirrors well_known_sids._DC_PRIMARY_GROUP_RIDS;
+# kept as a local frozenset so the ordering helper has no import cycle risk.
+_DC_PRIMARY_GROUP_RIDS = frozenset({516, 521})
 
 
 _HOST_CONCURRENCY_DEFAULT = 20
@@ -104,6 +115,214 @@ _HOST_BUDGET_DEFAULT = 180
 # run surfaces its duration distribution live instead of only at the end.
 _HOST_PROGRESS_TICK = 250
 
+# Minimum wall-clock gap between two live host-phase progress emits to the
+# platform's current-operation strip. Matches the share collector's object-count
+# cadence (``_COLLECTOR_PROGRESS_THROTTLE_SECS`` in intelligence.py) so a fast
+# fan-out surfaces calm ~1s motion instead of flooding the event sink.
+_HOST_EMIT_THROTTLE_SECS = 1.2
+
+
+def _host_is_server(node: Any) -> bool:
+    """True when a Computer node's ``operatingSystem`` marks it a member server."""
+    os_str = str((getattr(node, "properties", None) or {}).get("os") or "").casefold()
+    return "server" in os_str
+
+
+def _host_last_logon(node: Any) -> int:
+    """Most-recent ``lastLogonTimestamp`` as an int (0 when absent/unparseable)."""
+    try:
+        return int((getattr(node, "properties", None) or {}).get("lastlogon") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _host_name(node: Any) -> str:
+    """Stable display key for a host node (name, else object_id)."""
+    return str(getattr(node, "name", "") or getattr(node, "object_id", "") or "")
+
+
+def _computer_tier_rank(
+    node: Any,
+    *,
+    group_closure: dict[str, frozenset[str]] | None,
+    nodes_by_id: dict[str, Any] | None,
+) -> int:
+    """Privilege-Tier sort rank for one Computer node (HIGHER == swept earlier).
+
+    Reuses the SSOT :func:`privilege_tier_for_computer` so the sweep order keys on
+    the SAME computer Privilege Tier the /assets TierBadge and the severity engine
+    use — NOT a parallel taxonomy. Tier 0 (direct then escalation-capable,
+    e.g. DCs and ADCS Certificate-Authority hosts) ranks ahead of Tier 1 (member
+    servers) ahead of Tier 2 (workstations). The integer rank comes from the
+    canonical ``_PRIVILEGE_TIER_RANK`` map (TIER0_DIRECT=3 … TIER2=0).
+
+    The computer's transitive group SIDs (the input ``privilege_tier_for_computer``
+    classifies on) come from the ``group_closure`` already built for the NTFS
+    verification pass — no extra work. Group NAMES are resolved from ``nodes_by_id``
+    so name-only Tier 0 groups (DnsAdmins / Exchange) still classify. The DC
+    fast-path (primaryGroupID 516/521), member-server OS marker, and the
+    ``highvalue`` degraded fallback feed the same SSOT call, exactly like
+    ``inventory_persistence._classify_principals_by_membership``.
+
+    FALLBACK (tier unresolvable — no graph/closure at collection time, or the
+    import fails): rank by the DC-primaryGroupID / server-OS heuristic so a Tier-0
+    DC still sorts first and a server ahead of a workstation. Never raises, never
+    drops a host.
+
+    Returns a rank in ``0..3`` (higher first).
+    """
+    try:
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            _PRIVILEGE_TIER_RANK,
+            privilege_tier_for_computer,
+        )
+    except Exception:  # noqa: BLE001 — fall back to the heuristic below
+        return _host_tier_rank_fallback(node)
+
+    oid = str(getattr(node, "object_id", "") or "").upper()
+    is_dc = _node_primary_group_id(node) in _DC_PRIMARY_GROUP_RIDS
+
+    group_tokens: list[str] | None = None
+    if group_closure is not None and oid:
+        group_sids = group_closure.get(oid)
+        if group_sids:
+            tokens: list[str] = []
+            for gsid in group_sids:
+                tokens.append(gsid)
+                grp = (nodes_by_id or {}).get(gsid)
+                grp_name = getattr(grp, "name", "") if grp is not None else ""
+                if grp_name:
+                    tokens.append(grp_name)
+            group_tokens = tokens
+
+    tier = privilege_tier_for_computer(
+        group_names=group_tokens,
+        sid=getattr(node, "object_id", None),
+        is_dc=is_dc,
+        is_tier0_asset=bool(getattr(node, "highvalue", False)),
+        is_server=_host_is_server(node),
+    )
+    return _PRIVILEGE_TIER_RANK.get(tier, 0)
+
+
+def _host_tier_rank_fallback(node: Any) -> int:
+    """Heuristic tier rank when the Privilege-Tier SSOT is unavailable.
+
+    Same band ordering the SSOT would produce from role signals alone, so the
+    sweep stays representative-first even with no graph closure: DC (3) → Tier-0
+    tagged / unconstrained-delegation (2) → server (1) → workstation (0).
+    """
+    if _node_primary_group_id(node) in _DC_PRIMARY_GROUP_RIDS:
+        return 3
+    if bool(getattr(node, "highvalue", False)) or bool(
+        (getattr(node, "properties", None) or {}).get("unconstraineddelegation")
+    ):
+        return 2
+    if _host_is_server(node):
+        return 1
+    return 0
+
+
+def order_hosts_representative_first(
+    nodes: list[Any],
+    *,
+    group_closure: dict[str, frozenset[str]] | None = None,
+    nodes_by_id: dict[str, Any] | None = None,
+) -> list[Any]:
+    """Sort host nodes so the highest-signal hosts are swept FIRST.
+
+    Front-loads reach quality so the marginal-value curve of the SMB sweep is
+    visible early — the operator watching the live strip sees the estate's most
+    important hosts (Tier 0 DCs + ADCS CAs, then Tier 1 servers) reported in the
+    first minutes, not buried behind thousands of Tier 2 workstations. The
+    ordering is a STABLE, total sort (every tie resolves deterministically) so the
+    same estate always sweeps in the same order, run to run.
+
+    PRIMARY key — the computer **Privilege Tier** from the SSOT
+    :func:`compromise_class.privilege_tier_for_computer` (see
+    :func:`_computer_tier_rank`). One rule front-loads ALL Tier 0 hosts — Domain
+    Controllers, ADCS Certificate Authorities (Cert Publishers members), and any
+    other Tier 0 computer — not only DCs by primaryGroupID. Falls back to the
+    DC/server heuristic when the tier can't be resolved (no graph closure at
+    collection time).
+
+    SECONDARY keys (within one tier, deterministic): member servers before
+    workstations, then most-recent ``lastLogonTimestamp`` DESCENDING (a live,
+    recently-authenticated host outranks a stale one), then node name ASCENDING.
+
+    Args:
+        nodes: The reachable Computer nodes to dispatch for SMB collection.
+        group_closure: SID → transitive group-SID frozenset (from
+            ``_build_member_of_closure``). Drives the Privilege-Tier classifier;
+            None routes every host through the heuristic fallback.
+        nodes_by_id: Upper-cased object_id → node, used to resolve group NAMES for
+            the classifier (name-only Tier 0 groups). Optional.
+
+    Returns:
+        A new list ordered representative-first. Pure: never mutates ``nodes``.
+    """
+
+    def _sort_key(node: Any) -> tuple[int, int, int, str]:
+        # Negate so a HIGHER tier rank and a MORE-recent logon sort EARLIER; a
+        # server (1) sorts before a workstation (0) within the same tier band.
+        return (
+            -_computer_tier_rank(node, group_closure=group_closure, nodes_by_id=nodes_by_id),
+            -(1 if _host_is_server(node) else 0),
+            -_host_last_logon(node),
+            _host_name(node),
+        )
+
+    return sorted(nodes, key=_sort_key)
+
+
+def _apply_host_cap(dispatch_nodes: list, host_cap: int) -> tuple[list, int]:
+    """Truncate the representative-first dispatch list to at most ``host_cap`` hosts.
+
+    The input MUST already be ordered representative-first (Tier 0 / DCs / ADCS
+    first) so the kept prefix is always the highest-value hosts. Emits a LOUD,
+    non-debug warning when it actually caps — never a silent cap.
+
+    Args:
+        dispatch_nodes: The representative-first ordered host nodes to dispatch.
+        host_cap: Max hosts to keep. ``0`` (or negative) means unlimited — a
+            no-op that returns the list unchanged and ``0`` skipped.
+
+    Returns:
+        ``(kept_nodes, skipped_capped)`` — the (possibly truncated) prefix and the
+        count of hosts dropped by the cap (``0`` when the cap did not apply).
+    """
+    if host_cap <= 0 or len(dispatch_nodes) <= host_cap:
+        return dispatch_nodes, 0
+    capped_total = len(dispatch_nodes)
+    skipped_capped = capped_total - host_cap
+    kept = dispatch_nodes[:host_cap]
+    print_warning(
+        f"SMB sweep capped to {host_cap} of {capped_total} reachable hosts "
+        "(representative-first: Tier 0 collected first); "
+        f"{skipped_capped} hosts skipped to bound scan time. "
+        "Set host_cap=0 (or ADSCAN_COLLECTOR_HOST_CAP=0) for a full sweep."
+    )
+    return kept, skipped_capped
+
+
+@dataclass(frozen=True)
+class HostPhaseProgress:
+    """One determinate snapshot of the per-host SMB sweep for the web strip.
+
+    Carries exactly the numbers the platform's current-operation strip renders —
+    hosts ``done`` of ``total`` plus the rolling ``rate`` / ``eta_seconds`` /
+    ``elapsed_seconds`` computed by the SAME :class:`ProgressDashboard` that
+    drives the CLI rich.live panel, so the web reads identically to the terminal.
+    ``done=True`` marks the terminal snapshot (the sweep finished).
+    """
+
+    done: int
+    total: int
+    rate: float | None
+    eta_seconds: float | None
+    elapsed_seconds: float | None
+    finished: bool = False
+
 # Phase 2 reachability gate (445/tcp) -- pre-filter unreachable hosts before
 # paying the full per-host SMB collection timeout. The connect probe is cheap,
 # so concurrency runs far above the ~20 used for full collection.
@@ -121,6 +340,23 @@ def _env_int(name: str, default: int) -> int:
     try:
         value = int(raw)
         return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _env_int_floor0(name: str, default: int) -> int:
+    """Like :func:`_env_int` but accepts ``0`` (the "unlimited" sentinel).
+
+    ``_env_int`` rejects ``0``/negatives and falls back to its default — that is
+    correct for a concurrency knob but wrong for ``host_cap`` where ``0`` is a
+    meaningful value (unlimited). A negative value still falls back to ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+        return value if value >= 0 else default
     except ValueError:
         return default
 
@@ -178,8 +414,29 @@ class HostCollectorConfig:
             floor=_GATE_TIMEOUT_FLOOR,
         )
     )  # seconds; per-host 445 connect-probe budget
+    host_cap: int = field(
+        default_factory=lambda: _env_int_floor0("ADSCAN_COLLECTOR_HOST_CAP", 0)
+    )  # max hosts the SMB sweep enriches (0 = unlimited). The sweep is ordered
+    # representative-first (Tier 0 / DCs / ADCS first), so a positive cap always
+    # collects the highest-value hosts and bounds the wall-clock of the sweep at
+    # ~2k-host scale. Env override mirrors the ``concurrency`` knob.
     collect_samr: bool = True  # gates _do_samr per host (sessions + builtin groups)
     collect_shares: bool = True  # gates _do_shares per host
+    # Optional observability hook for the DETERMINATE host-phase progress (hosts
+    # done / total + rolling ETA). Invoked throttled during the fan-out and once
+    # at completion with a :class:`HostPhaseProgress`. None (default) is a no-op,
+    # leaving collection byte-for-byte identical. The CLI layer (intelligence.py)
+    # supplies one that routes the snapshot through ``emit_operation_progress`` so
+    # the web strip shows "342 / 1,847 hosts · ETA 12m" — the host_collector
+    # itself never imports the CLI event sink (clean service/CLI layering).
+    host_progress_callback: "Callable[[HostPhaseProgress], None] | None" = None
+    # Cooperative early-stop token for the per-host sweep (SSOT predicate checking
+    # the CLI in-process flag OR the platform sentinel file). When None (default)
+    # the sweep can never be stopped early — byte-for-byte the legacy behaviour. A
+    # caller that wants the operator STOP (CLI Ctrl+C / platform button) supplies
+    # one; the fan-out checks it at the dispatch boundary, drains in-flight hosts,
+    # and returns the partial set. See ``host_sweep_cancellation``.
+    cancellation: "HostSweepCancellation | None" = None
 
 
 @dataclass
@@ -228,6 +485,22 @@ class HostPhaseTiming:
     stage_outcomes: dict[str, dict[str, int]] = field(
         default_factory=lambda: {"sessions": {}, "localadmins": {}, "shares": {}}
     )
+    # Operator early-stop coverage (set ONLY when the sweep was halted early via
+    # the cooperative-cancellation token). ``early_stopped`` flags the stop;
+    # ``swept_before_stop`` / ``total_dispatch`` are the X-of-Y coverage the
+    # report + web surface so the partial sweep is transparent and audit-
+    # defensible; ``stop_source`` records which trigger fired ('cli'/'platform').
+    early_stopped: bool = False
+    swept_before_stop: int = 0
+    total_dispatch: int = 0
+    stop_source: str = ""
+    # Host-cap coverage (``host_cap`` / ``ADSCAN_COLLECTOR_HOST_CAP``). When a
+    # positive cap truncated the representative-first reachable set, ``host_capped``
+    # flags it and ``capped_skipped`` is the number of reachable hosts left
+    # un-enriched (Tier 0 always collected first). Distinct from the early-stop
+    # fields so the coverage statement can report both reasons exactly.
+    host_capped: bool = False
+    capped_skipped: int = 0
 
     @property
     def total(self) -> float:
@@ -609,8 +882,8 @@ def _resolve_share_verification(
     sid_upper: str,
     principal_kind: str,
     group_closure: dict[str, frozenset[str]],
-) -> tuple[str, int | None]:
-    """Decide the verification tier + effective mask for one (principal, share).
+) -> tuple[str, int | None, int | None, int | None]:
+    """Decide the verification tier + access masks for one (principal, share).
 
     Conservative by construction: only upgrades to ``ntfs_computed`` when BOTH
     SDs were read AND the principal's group closure is confident AND the winacl
@@ -618,7 +891,11 @@ def _resolve_share_verification(
     ``share_acl_only`` tier with no effective mask (the raw share-ACL edge still
     exists — we never drop it).
 
-    Returns ``(verification_tier, effective_mask_or_None)``.
+    Returns ``(verification_tier, effective_mask, share_mask, ntfs_mask)`` where
+    any of the masks may be ``None``. ``share_mask`` / ``ntfs_mask`` are the two
+    operands the effective access was intersected from (``ntfs_computed`` only,
+    so the view can render the share / NTFS / effective breakdown); ``self_mxac``
+    has only the server-confirmed effective mask (no separate operands).
     """
     eval_possible = bool(share.ntfs_sd_bytes) and is_closure_confident(
         sid_upper, group_closure, principal_kind=principal_kind
@@ -635,21 +912,22 @@ def _resolve_share_verification(
         # over-reported raw share grant — this is what stops NETLOGON/SYSVOL
         # showing Full Control / Write when the effective access is Read.
         if share.self_effective_mask is not None and is_broad_auth_sid(sid_upper):
-            return VERIFICATION_SELF_MXAC, int(share.self_effective_mask)
-        return VERIFICATION_SHARE_ACL_ONLY, None
+            return VERIFICATION_SELF_MXAC, int(share.self_effective_mask), None, None
+        return VERIFICATION_SHARE_ACL_ONLY, None, None, None
 
     group_sids = list(group_closure.get(sid_upper, frozenset()))
-    effective = compute_effective_file_mask(
+    masks = compute_effective_file_masks(
         share.share_sd_bytes,
         share.ntfs_sd_bytes,
         principal_sid=sid_upper,
         group_sids=group_sids,
     )
-    if effective is None:
+    if masks is None:
         # Intersection failed (parse error, evaluator unavailable). Stay
         # conservative — the raw share-ACL edge remains, only the tag downgrades.
-        return VERIFICATION_SHARE_ACL_ONLY, None
-    return VERIFICATION_NTFS_COMPUTED, int(effective)
+        return VERIFICATION_SHARE_ACL_ONLY, None, None, None
+    share_mask, ntfs_mask, effective = masks
+    return VERIFICATION_NTFS_COMPUTED, int(effective), int(share_mask), int(ntfs_mask)
 
 
 def _merge_host_into_graph(
@@ -752,7 +1030,12 @@ def _merge_host_into_graph(
                     "Computer",
                 ):
                     continue
-                verification, effective_mask = _resolve_share_verification(
+                (
+                    verification,
+                    effective_mask,
+                    share_level_mask,
+                    ntfs_level_mask,
+                ) = _resolve_share_verification(
                     share,
                     sid_upper=sid_upper,
                     principal_kind=principal.kind,
@@ -777,6 +1060,15 @@ def _merge_host_into_graph(
                     }
                     if effective_mask is not None:
                         notes["effective_mask"] = effective_mask
+                    # Component masks the effective access was intersected from
+                    # (ntfs_computed only) so the share-exposure view can render
+                    # the share / NTFS / effective breakdown. When NTFS is not
+                    # verified (share_acl_only) these stay absent and the view
+                    # labels the row "share-level only — NTFS not verified".
+                    if share_level_mask is not None:
+                        notes["share_mask"] = share_level_mask
+                    if ntfs_level_mask is not None:
+                        notes["ntfs_mask"] = ntfs_level_mask
                     result.add_edge(
                         CollectorEdge(
                             source_object_id=sid_upper,
@@ -1027,8 +1319,29 @@ async def _collect_domain_hosts_async(
     sid_to_node = _build_sid_to_node(result)
 
     # Build the MemberOf group closure once before fan-out — used by the NTFS
-    # effective-access verification to expand each principal's group set.
+    # effective-access verification to expand each principal's group set AND by the
+    # representative-first ordering below (the computer Privilege-Tier classifier
+    # reads each host's transitive group SIDs from it).
     group_closure = _build_member_of_closure(result)
+
+    # Representative-first ordering: sweep the highest-signal hosts FIRST so reach
+    # quality is front-loaded and the marginal-value curve is visible early on the
+    # live strip. Keyed on the computer Privilege Tier (SSOT — Tier 0 DCs + ADCS
+    # CAs, then Tier 1 servers, then Tier 2 workstations); the group closure +
+    # node map feed the SSOT classifier. Pure sort over data already collected — it
+    # never adds, drops, or mutates a node, so coverage and the gate's reachable
+    # set are unchanged.
+    dispatch_nodes = order_hosts_representative_first(
+        dispatch_nodes, group_closure=group_closure, nodes_by_id=sid_to_node
+    )
+
+    # Host cap (time-bound active scanning on large estates). The list above is
+    # already ordered representative-first (Tier 0 / DCs / ADCS first), so the cap
+    # always keeps the highest-value hosts. Pure helper so the slice + the loud log
+    # + the skipped count are unit-testable without standing up the fan-out.
+    dispatch_nodes, skipped_capped = _apply_host_cap(
+        dispatch_nodes, int(getattr(config, "host_cap", 0) or 0)
+    )
 
     # Build SAM-account lookup once before fan-out — O(1) per session in _merge_host_into_graph
     samaccount_to_node: dict[str, Any] = {}
@@ -1050,7 +1363,14 @@ async def _collect_domain_hosts_async(
     # the dashboard NEVER gates ``add_edge`` (graph topology is unchanged), and
     # any error inside ``update()`` is swallowed so the fan-out always finishes.
     dashboard = _build_smb_progress_dashboard(timing)
-    progress = {"done": 0, "ok": 0, "err": 0, "inflight": 0}
+    progress = {
+        "done": 0,
+        "ok": 0,
+        "err": 0,
+        "inflight": 0,
+        "skipped_stopped": 0,
+        "skipped_capped": skipped_capped,
+    }
 
     def _safe_update(**kwargs: Any) -> None:
         # Fail-open: a dashboard render glitch must never abort collection.
@@ -1059,8 +1379,40 @@ async def _collect_domain_hosts_async(
         except Exception as exc:  # noqa: BLE001 — presentation must never break the fan-out
             telemetry.capture_exception(exc)
 
+    # Determinate host-phase progress to the platform's current-operation strip.
+    # Reads rate/ETA/elapsed straight off the SAME dashboard the CLI rich.live
+    # panel renders, so the web matches the terminal exactly. Throttled to a calm
+    # cadence; the callback is best-effort and a no-op when none is supplied.
+    total_hosts = len(dispatch_nodes)
+    emit_state = {"last_emit": 0.0}
+
+    def _emit_host_progress(*, finished: bool = False) -> None:
+        callback = getattr(config, "host_progress_callback", None)
+        if callback is None:
+            return
+        now = time.monotonic()
+        if not finished and now - emit_state["last_emit"] < _HOST_EMIT_THROTTLE_SECS:
+            return
+        emit_state["last_emit"] = now
+        try:
+            callback(
+                HostPhaseProgress(
+                    done=progress["done"],
+                    total=total_hosts,
+                    rate=dashboard.rate or None,
+                    eta_seconds=dashboard.eta_seconds,
+                    elapsed_seconds=dashboard.elapsed,
+                    finished=finished,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — progress emit must never abort collection
+            telemetry.capture_exception(exc)
+
+    cancellation = getattr(config, "cancellation", None)
+
     async def _run(node: Any) -> None:
         had_error = False
+        skipped = False
         n_s = n_a = n_sh = 0
         target_ip = resolve_target_ip(node)
         if not target_ip:
@@ -1072,6 +1424,21 @@ async def _collect_domain_hosts_async(
         host_t0 = 0.0
         try:
             async with sem:
+                # Cooperative early-stop, checked at the true DISPATCH BOUNDARY:
+                # the moment THIS task acquires a worker slot. Every task is
+                # created up front, but the semaphore serialises the actual work;
+                # a task that was QUEUED behind the slot re-checks here when its
+                # slot frees. If a stop was requested while it waited, it returns
+                # WITHOUT dispatching its host (no connect, no auth). The hosts
+                # already inside their slot when the stop fires (in-flight) DRAIN
+                # to completion through the path below — there is no kill, no
+                # orphaned task, and the per-host budget + ``in-flight 0``-at-end
+                # invariants hold exactly as before. ``skipped_stopped`` counts
+                # the never-dispatched hosts so the coverage statement is exact.
+                if cancellation is not None and cancellation.is_requested():
+                    progress["skipped_stopped"] += 1
+                    skipped = True
+                    return
                 # Start the per-host clock AFTER acquiring the slot, so the
                 # measured duration is the actual collection WORK, not the time
                 # spent queueing for a free worker.
@@ -1105,37 +1472,55 @@ async def _collect_domain_hosts_async(
                 sd_source_counts[k] = sd_source_counts.get(k, 0) + v
         finally:
             progress["inflight"] -= 1
-            # Per-host MEASUREMENT (observability). RMW is safe: no await between
-            # here and the dashboard update below. host_t0 stays 0.0 if the slot
-            # was never acquired (cancelled while queueing) — skip those so the
-            # distribution only reflects hosts we actually worked.
-            if host_t0:
-                timing.per_host_durations.append(time.monotonic() - host_t0)
-            _errors = host_data.errors
-            _outcome = _classify_host_outcome(_errors)
-            timing.outcome_counts[_outcome] = timing.outcome_counts.get(_outcome, 0) + 1
-            # Dashboard ✓/⚠: a host is only a FAILURE for hard problems — an
-            # expected no-local-admin denial (or a clean collect) is success.
-            # This keeps denied-but-collected hosts (shares/admins gathered) as ✓
-            # instead of flipping to ⚠ now that denials are recorded.
-            had_error = _outcome not in _NON_FAILURE_OUTCOMES
-            # Per-stage outcomes, ONLY for hosts we reached with a live connection
-            # (connect/auth/budget failures never attempted the stages and are
-            # already in outcome_counts). For those hosts, the absence of a stage
-            # key means that stage succeeded.
-            _conn_failed = bool(
-                {"auth", "connect", "host_budget"} & set(_errors)
-            )
-            if not _conn_failed:
-                _stage_keys = []
-                if config.collect_samr:
-                    _stage_keys += [("sessions", "sessions"), ("localadmins", "builtin_groups")]
-                if config.collect_shares:
-                    _stage_keys += [("shares", "shares")]
-                for _stage, _err_key in _stage_keys:
-                    _o = _classify_stage_error(_errors.get(_err_key))
-                    _bucket = timing.stage_outcomes[_stage]
-                    _bucket[_o] = _bucket.get(_o, 0) + 1
+            # A host skipped by the early stop was never swept: release its slot
+            # (done above), refresh the in-flight gauge, and record NOTHING else
+            # (no duration, no outcome, no done/ok). The coverage statement reports
+            # it as "remaining queued". This keeps the dashboard ✓/⚠ + the per-host
+            # distribution honest — only hosts we actually worked are counted.
+            if skipped:
+                _safe_update(in_flight=progress["inflight"])
+            else:
+                # Per-host MEASUREMENT (observability). RMW is safe: no await
+                # between here and the dashboard update below. host_t0 is set
+                # since the slot was acquired and work ran.
+                if host_t0:
+                    timing.per_host_durations.append(time.monotonic() - host_t0)
+                _errors = host_data.errors
+                _outcome = _classify_host_outcome(_errors)
+                timing.outcome_counts[_outcome] = (
+                    timing.outcome_counts.get(_outcome, 0) + 1
+                )
+                # Dashboard ✓/⚠: a host is only a FAILURE for hard problems — an
+                # expected no-local-admin denial (or a clean collect) is success.
+                # Denied-but-collected hosts (shares/admins gathered) stay ✓.
+                had_error = _outcome not in _NON_FAILURE_OUTCOMES
+                # Per-stage outcomes, ONLY for hosts we reached with a live
+                # connection (connect/auth/budget failures never attempted the
+                # stages and are already in outcome_counts). For those hosts, the
+                # absence of a stage key means that stage succeeded.
+                _conn_failed = bool(
+                    {"auth", "connect", "host_budget"} & set(_errors)
+                )
+                if not _conn_failed:
+                    _stage_keys = []
+                    if config.collect_samr:
+                        _stage_keys += [
+                            ("sessions", "sessions"),
+                            ("localadmins", "builtin_groups"),
+                        ]
+                    if config.collect_shares:
+                        _stage_keys += [("shares", "shares")]
+                    for _stage, _err_key in _stage_keys:
+                        _o = _classify_stage_error(_errors.get(_err_key))
+                        _bucket = timing.stage_outcomes[_stage]
+                        _bucket[_o] = _bucket.get(_o, 0) + 1
+        # A host skipped by the early stop was never swept — it is not a ``done``
+        # host on the dashboard / web strip, nor an outcome. Its slot was already
+        # released (the ``finally`` ran) and nothing was recorded for it; the
+        # coverage statement reports it as "remaining queued". Short-circuit the
+        # done/ok/err accounting and the final dashboard tick.
+        if skipped:
+            return
         progress["done"] += 1
         if progress["done"] % _HOST_PROGRESS_TICK == 0:
             # live_tasks is the leak gauge: if it climbs monotonically with hosts
@@ -1166,12 +1551,62 @@ async def _collect_domain_hosts_async(
             last=last_label,
             last_detail=detail,
         )
+        # Determinate "X / N hosts · ETA" to the web strip (throttled).
+        _emit_host_progress()
 
     results: list = []
     async with dashboard.async_live_session():
         tasks = [asyncio.create_task(_run(node)) for node in dispatch_nodes]
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Operator early-stop coverage. If the cooperative token fired, some hosts
+    # were never dispatched (they returned at the boundary above). Record the
+    # exact X-of-Y so the report + web can surface a transparent, audit-
+    # defensible coverage statement ("Host enrichment: X of Y hosts; remaining
+    # queued") instead of hiding the partial sweep. The identity graph is
+    # already 100% (LDAP ran before this phase). When no stop fired this stays
+    # the no-op default and coverage reads as full.
+    timing.total_dispatch = total_hosts
+    # Flag a partial sweep ONLY when hosts were actually left un-dispatched. A
+    # stop that fired after the last host was already in flight drains to full
+    # coverage — no "partial" statement needed (it would read "X of X, 0
+    # remaining"). The drain itself is always honoured; this only gates the
+    # coverage record.
+    if progress["skipped_stopped"] > 0:
+        timing.early_stopped = True
+        timing.swept_before_stop = progress["done"]
+        timing.stop_source = (
+            (cancellation.requested_source if cancellation else "") or "cli"
+        )
+        skipped = progress["skipped_stopped"]
+        print_info_verbose(
+            "[host-collector] SMB enrichment stopped early "
+            f"({timing.stop_source}): swept {progress['done']} of {total_hosts} "
+            f"hosts; {skipped} remaining host(s) queued (identity graph complete)."
+        )
+
+    # Host-cap coverage. When the representative-first reachable set was truncated
+    # by ``host_cap``, record the exact reachable-minus-swept delta so the
+    # report + web coverage statement reads "enriched N of M reachable hosts
+    # (highest-value first); remaining bounded by host cap" — the identity graph is
+    # already 100% (LDAP ran before this phase). Distinct from the early-stop
+    # record; both can be absent (full sweep) or set independently.
+    if progress["skipped_capped"] > 0:
+        timing.host_capped = True
+        timing.capped_skipped = int(progress["skipped_capped"])
+        reachable_total = total_hosts + int(progress["skipped_capped"])
+        print_info_verbose(
+            "[host-collector] SMB enrichment host-capped: enriched "
+            f"{total_hosts} of {reachable_total} reachable host(s) "
+            "(representative-first: Tier 0 collected first); "
+            f"{progress['skipped_capped']} host(s) bounded by host cap "
+            "(identity graph complete)."
+        )
+
+    # Terminal host-phase snapshot — sweep finished; the strip can clear instead
+    # of freezing on the last throttled tick. Always fires (bypasses the throttle).
+    _emit_host_progress(finished=True)
     for r in results:
         if isinstance(r, Exception):
             telemetry.capture_exception(r)

@@ -3384,6 +3384,7 @@ def handle_ci_docker(
     report_renderer: str = "",
     report_template: str = "",
     report_theme: str = "",
+    report_only: str = "",
     pull_timeout_seconds: int | None = None,
     allow_low_memory: bool = False,
 ) -> int:
@@ -3504,6 +3505,8 @@ def handle_ci_docker(
                 adscan_args.extend(["--report-template", report_template])
             if report_theme:
                 adscan_args.extend(["--report-theme", report_theme])
+            if report_only:
+                adscan_args.extend(["--only", report_only])
 
         probe_and_warn_reduced_runtime(cfg)
         cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
@@ -3564,11 +3567,17 @@ def run_adscan_passthrough_docker(
     pull_timeout_seconds: int | None = None,
     allow_low_memory: bool = False,
     extra_env: list[tuple[str, str]] | None = None,
+    extra_mounts: list[tuple[str, str]] | None = None,
 ) -> int:
     """Run an arbitrary `adscan ...` command inside the container (host-side).
 
     This is used by the PyPI launcher to avoid duplicating the full internal
     CLI argument parsing while still keeping Docker-mode preflight consistent.
+
+    Args:
+        extra_mounts: Optional ``(host_path, container_path)`` read-only file
+            bind-mounts (e.g. a ``--scan-config`` file passed by absolute path
+            outside the standard mounted tree).
     """
     del allow_low_memory
     _emit_docker_runtime_context(command_name="passthrough")
@@ -3655,6 +3664,7 @@ def run_adscan_passthrough_docker(
                 # over any inherited value; empty by default (behaviour unchanged).
                 + list(extra_env or [])
             ),
+            extra_mounts=tuple(extra_mounts or []),
             run_host_dir=acq.session_dir,
         )
 

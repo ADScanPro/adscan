@@ -372,7 +372,12 @@ def render_no_extracted_findings_preview(
         f"count={analyzed_count} "
         f"manual_review_recommended={manual_review_recommended} "
         f"file_types={file_type_summary} "
-        f"preview=[{marked_preview}] "
+        # Escape the literal opening bracket (\\[) and rich-escape the joined
+        # preview so absolute candidate paths like ``/opt/adscan/workspaces/...``
+        # are not parsed as a Rich closing tag (``[/opt/...]``), which raised a
+        # MarkupError and aborted the command. Same pattern as
+        # credsweeper_service / spidering_service.
+        f"preview=\\[{rich_escape(marked_preview)}] "
         f"{location_fragment} "
         f"review_report={mark_sensitive(report_rel, 'path')}"
     )

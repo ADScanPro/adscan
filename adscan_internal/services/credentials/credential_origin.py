@@ -156,7 +156,9 @@ _ORIGIN_LABELS: dict[str, str] = {
     # Dumps / offline.
     "ntds": "NTDS dump",
     "samdump": "SAM dump",
-    "secretsdump": "secretsdump",
+    # Vendor-neutral: this label flows verbatim into the client PDF report's
+    # credential-provenance table, so it must not name the offensive tool.
+    "secretsdump": "credential dump",
     "lsassdump": "LSASS dump",
     "lsasecrets": "LSA secrets",
     "dpapi": "DPAPI",

@@ -10,11 +10,52 @@ from typing import Any, Dict, List, Optional, Union
 
 from rich.box import ROUNDED
 from rich.console import Group, RenderableType  # noqa: F401 — re-exported
+from rich.markup import MarkupError
 from rich.panel import Panel
 from rich.text import Text
 
 from adscan_core.output import _state
 from adscan_core.theme import ADSCAN_PRIMARY
+
+
+def _safe_markup_text(message: Any, *, style: Optional[str] = None) -> Text:
+    """Render ``message`` as a Rich ``Text`` without ever raising ``MarkupError``.
+
+    This is the single source of truth for turning a caller-supplied message
+    into a ``Text`` inside every ``print_*`` helper. The historical pattern —
+    ``Text.from_markup(message)`` whenever the string contained ``[`` and
+    ``]`` — crashes the whole print call when the brackets are NOT valid Rich
+    markup. The dominant real-world trigger is an interpolated value the caller
+    did not author and cannot sanitise: an absolute path (``[/opt/adscan/...]``
+    — Rich reads ``[/...]`` as a closing tag), or an exception message rendered
+    via ``f"...: {e}"`` whose text happens to contain a bracketed path. That
+    raised a fresh ``MarkupError`` out of ``print_warning``/``print_error`` and
+    propagated up to the command dispatcher as ``Error executing command``.
+
+    Behaviour:
+    - A ``Text`` is returned unchanged (caller already styled it).
+    - A string with ``[`` and ``]`` is parsed as markup; on ``MarkupError`` it
+      falls back to a LITERAL ``Text`` (brackets shown verbatim) with ``style``.
+    - A plain string (or any other type, stringified) becomes a styled ``Text``.
+
+    Args:
+        message: Caller-supplied message (``Text``, markup string, plain string).
+        style: Default style applied to the plain/fallback ``Text``.
+
+    Returns:
+        A ``Text`` suitable for ``console.print`` / ``Text.append``.
+    """
+    if isinstance(message, Text):
+        return message
+    text = message if isinstance(message, str) else str(message)
+    if "[" in text and "]" in text:
+        try:
+            return Text.from_markup(text)
+        except MarkupError:
+            # Brackets were not valid markup (uncontrolled path / exception
+            # text). Render the string literally instead of crashing the print.
+            return Text(text, style=style) if style else Text(text)
+    return Text(text, style=style) if style else Text(text)
 
 # Brand color mappings for message types
 BRAND_COLORS = {
@@ -305,8 +346,8 @@ def _print_logger_format_fallback(
     if isinstance(message, Text):
         output.append(message)
     elif "[" in str(message) and "]" in str(message):
-        # Rich markup string - parse it
-        output.append(Text.from_markup(message))
+        # Rich markup string - parse it (literal fallback on malformed markup)
+        output.append(_safe_markup_text(message))
     else:
         # Plain string
         output.append(plain_text)
@@ -358,14 +399,10 @@ def print_info(
     icon_text = Text(f"{icon} ", style=BRAND_COLORS["info"])
 
     # Format message (preserves Rich markup or Text object)
-    if isinstance(message, Text):
-        message_text = message
-    elif "[" in message and "]" in message:
-        # Rich markup string - parse it
-        message_text = Text.from_markup(message)
-    else:
-        # Plain string - apply default style
-        message_text = Text(message, style=BRAND_COLORS["info"])
+    # Render via the SSOT helper: parse markup when present, fall back to a
+    # LITERAL Text on malformed markup (e.g. a bracketed path / exception text)
+    # instead of raising MarkupError out of the print call.
+    message_text = _safe_markup_text(message, style=BRAND_COLORS["info"])
 
     if panel:
         content = Text()
@@ -380,8 +417,8 @@ def print_info(
                     content.append(item)
                     content.append("\n")
                 elif "[" in item and "]" in item:
-                    # Rich markup
-                    item_text = Text.from_markup(item)
+                    # Rich markup (literal fallback on malformed markup)
+                    item_text = _safe_markup_text(item)
                     content.append("  • ")
                     content.append(item_text)
                     content.append("\n")
@@ -843,14 +880,8 @@ def print_success(
     icon_text = Text(f"{icon} ", style="green")
 
     # Format message (preserves Rich markup or Text object)
-    if isinstance(message, Text):
-        message_text = message
-    elif "[" in message and "]" in message:
-        # Rich markup string - parse it
-        message_text = Text.from_markup(message)
-    else:
-        # Plain string - apply default style
-        message_text = Text(message, style="green")
+    # SSOT markup rendering with literal fallback (see _safe_markup_text).
+    message_text = _safe_markup_text(message, style="green")
 
     if panel:
         content = Text()
@@ -865,8 +896,8 @@ def print_success(
                     content.append(item)
                     content.append("\n")
                 elif "[" in item and "]" in item:
-                    # Rich markup
-                    item_text = Text.from_markup(item)
+                    # Rich markup (literal fallback on malformed markup)
+                    item_text = _safe_markup_text(item)
                     content.append("  • ")
                     content.append(item_text)
                     content.append("\n")
@@ -1060,14 +1091,8 @@ def print_warning(
     icon_text = Text(f"{icon} ", style="yellow")
 
     # Format message (preserves Rich markup or Text object)
-    if isinstance(message, Text):
-        message_text = message
-    elif "[" in message and "]" in message:
-        # Rich markup string - parse it
-        message_text = Text.from_markup(message)
-    else:
-        # Plain string - apply default style
-        message_text = Text(message, style="yellow")
+    # SSOT markup rendering with literal fallback (see _safe_markup_text).
+    message_text = _safe_markup_text(message, style="yellow")
 
     if panel:
         content = Text()
@@ -1082,8 +1107,8 @@ def print_warning(
                     content.append(item)
                     content.append("\n")
                 elif "[" in item and "]" in item:
-                    # Rich markup
-                    item_text = Text.from_markup(item)
+                    # Rich markup (literal fallback on malformed markup)
+                    item_text = _safe_markup_text(item)
                     content.append("  • ")
                     content.append(item_text)
                     content.append("\n")
@@ -1259,14 +1284,8 @@ def print_error(
     icon_text = Text(f"{icon} ", style="bold red")
 
     # Format message (preserves Rich markup or Text object)
-    if isinstance(message, Text):
-        message_text = message
-    elif "[" in message and "]" in message:
-        # Rich markup string - parse it
-        message_text = Text.from_markup(message)
-    else:
-        # Plain string - apply default style
-        message_text = Text(message, style="bold red")
+    # SSOT markup rendering with literal fallback (see _safe_markup_text).
+    message_text = _safe_markup_text(message, style="bold red")
 
     if panel:
         content = Text()
@@ -1281,8 +1300,8 @@ def print_error(
                     content.append(item)
                     content.append("\n")
                 elif "[" in item and "]" in item:
-                    # Rich markup
-                    item_text = Text.from_markup(item)
+                    # Rich markup (literal fallback on malformed markup)
+                    item_text = _safe_markup_text(item)
                     content.append("  • ")
                     content.append(item_text)
                     content.append("\n")
@@ -1710,6 +1729,74 @@ def print_exception(
             )
 
 
+def print_untrusted_command_output(
+    text_or_renderable: Any,
+    *,
+    line_count: Optional[int] = None,
+) -> None:
+    """Show arbitrary external-command output on screen, keep it OUT of telemetry.
+
+    Output produced by a user-initiated external command — ``cat``-ing an
+    engagement file, a ``system <cmd>`` shell passthrough — may contain
+    unredactable client data (file contents, raw username lists, anything the
+    operator chose to display). The telemetry sanitizer pattern-matches known
+    sensitive shapes (``mark_sensitive`` tokens, domains, IPs, hashes); it
+    CANNOT know what arbitrary file/command content is, so recording it
+    verbatim leaks client data into the session recording (a real audit
+    captured 75 client AD usernames from ``cat users.txt``).
+
+    This helper renders the output to the VISIBLE console with the
+    :class:`~adscan_core.output._state._TeeConsole` auto-mirror DISABLED, so
+    the operator still sees the full cleartext output, and records a privacy
+    PLACEHOLDER to telemetry instead of the raw content. The recording still
+    shows that the command produced output (and the masked command echo is
+    recorded separately), without exposing the content itself.
+
+    This is the SANCTIONED exception to the "do not use
+    ``_explicit_telemetry_mirror`` from new code" rule — a deliberate privacy
+    carve-out for untrusted external-command output, not a convenience bypass.
+    Do NOT route ADscan's own structured/tool output through this helper:
+    that output is sanitized per-token via ``mark_sensitive`` and SHOULD be
+    recorded.
+
+    Args:
+        text_or_renderable: The command's stdout (or any Rich renderable) to
+            display to the operator.
+        line_count: Optional explicit line count for the placeholder. When
+            omitted and the argument is a string, it is counted automatically.
+    """
+    console = _get_console()
+    telemetry_console = _get_telemetry_console()
+
+    if line_count is None and isinstance(text_or_renderable, str):
+        # Count non-empty trailing newline gracefully: "a\nb\n" -> 2 lines.
+        stripped = text_or_renderable.rstrip("\n")
+        line_count = stripped.count("\n") + 1 if stripped else 0
+
+    # Render the cleartext to the operator's terminal WITHOUT auto-mirroring
+    # it into the telemetry recording.
+    with _state._explicit_telemetry_mirror():
+        console.print(text_or_renderable)
+
+    # Record a privacy placeholder so the recording shows output was produced
+    # without exposing the (potentially client-sensitive) content.
+    if telemetry_console is not None:
+        if line_count is not None:
+            plural = "s" if line_count != 1 else ""
+            placeholder = (
+                f"<external command output omitted from recording for privacy "
+                f"— {line_count} line{plural}>"
+            )
+        else:
+            placeholder = (
+                "<external command output omitted from recording for privacy>"
+            )
+        try:
+            telemetry_console.print(placeholder)
+        except Exception:  # noqa: BLE001 — never break the visible flow on telemetry
+            pass
+
+
 __all__ = [
     "BRAND_COLORS",
     "print_info",
@@ -1726,6 +1813,7 @@ __all__ = [
     "print_error_verbose",
     "print_error_debug",
     "print_telemetry_only",
+    "print_untrusted_command_output",
     "print_event_debug",
     "print_cypher_query",
     "print_exception",

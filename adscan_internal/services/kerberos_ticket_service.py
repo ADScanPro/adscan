@@ -1923,6 +1923,7 @@ def ensure_user_ccache(
     credential: Optional[str] = None,
     dc_ip: Optional[str] = None,
     force_refresh: bool = False,
+    error_out: Optional[list] = None,
 ) -> Optional[str]:
     """Return path to a valid Kerberos ccache for ``user@domain``.
 
@@ -1965,6 +1966,12 @@ def ensure_user_ccache(
             always mint a fresh TGT. Use after privilege-granting
             operations (AddMember, ForceChangePassword) so the next
             bind sees the updated PAC.
+        error_out: Optional mutable list. When provided and the mint
+            fails, the underlying ``error_message`` (or a short reason)
+            is appended so the caller can classify the failure cause
+            (e.g. DC-unreachable vs credential-invalid) instead of
+            inferring it from a bare ``None``. Default ``None`` leaves
+            behaviour unchanged for every existing caller.
 
     Returns:
         Path to a valid ccache, or ``None`` when minting failed and
@@ -2082,6 +2089,8 @@ def ensure_user_ccache(
             f"domain={mark_sensitive(domain, 'domain')} "
             f"error={result.error_message!r}"
         )
+        if error_out is not None:
+            error_out.append(result.error_message or "TGT mint failed")
         return None
 
     # Update the legacy registry so other code paths that consult

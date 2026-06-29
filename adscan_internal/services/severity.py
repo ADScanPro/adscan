@@ -5,7 +5,14 @@ Severity is **not** a property of an edge. It is a **pure function** of:
 * the source's :class:`CompromiseClass`
 * the target's :class:`CompromiseClass`
 * the edge's :class:`EdgeKind`
-* whether the target is a Tier 0 asset (DC, Exchange, ADCS CA)
+* the target's own :class:`PrivilegeTier` — graded, not a flat boolean: a
+  ``TIER0_DIRECT`` asset (a DC, the Domain object) outranks a
+  ``TIER0_ESCALATION_CAPABLE`` asset (an ADCS CA / Cert Publishers host /
+  Exchange). Both are Tier 0; they are not equal.
+* the edge's :class:`ControlStrength` — refines auth edges so a full local
+  admin (``AdminTo``) outranks a session shell (``CanRDP``/``CanPSRemote``)
+  outranks a DB sysadmin (``SQLAdmin``) outranks a DB session (``SQLAccess``)
+  into the same target.
 * whether the target is the Domain object itself
 
 This separation resolves the false-positive observed on HTB Forest, where the
@@ -30,8 +37,8 @@ from enum import Enum
 
 from adscan_core.rich_output import print_warning
 
-from adscan_internal.services.compromise_class import CompromiseClass
-from adscan_internal.services.edge_kind import EdgeKind
+from adscan_internal.services.compromise_class import CompromiseClass, PrivilegeTier
+from adscan_internal.services.edge_kind import ControlStrength, EdgeKind
 
 
 class Severity(str, Enum):
@@ -67,13 +74,31 @@ class EdgeSeverityInput:
         target_compromise_class: The target's canonical compromise class.
             ``None`` denotes a target with no membership-based classification
             (e.g. a regular user/computer that is not in any privileged
-            group). Combined with ``target_is_tier0_asset`` and
-            ``target_is_domain`` to determine the severity row.
+            group). Combined with the target tier and ``target_is_domain`` to
+            determine the severity row.
         edge_kind: The canonical :class:`EdgeKind` of the edge. Use
             :func:`adscan_internal.services.edge_kind.classify_edge_kind`
             to derive it from a relation label.
-        target_is_tier0_asset: True when the target is a Tier 0 asset
-            (Domain Controller, Exchange server, ADCS CA). Distinct from
+        target_privilege_tier: The target's own :class:`PrivilegeTier`, graded.
+            ``TIER0_DIRECT`` (a DC, the Domain object) outranks
+            ``TIER0_ESCALATION_CAPABLE`` (an ADCS CA / Cert Publishers host /
+            Exchange) — both are inside the Tier 0 boundary but reaching the
+            former is the worse finding. Resolve it from the target node's role
+            via :func:`compromise_class.privilege_tier_for_computer` /
+            :func:`privilege_tier_for_principal`. ``None`` means "tier not
+            resolved" — :attr:`target_is_tier0_asset` is then the only Tier 0
+            signal (back-compatible with the pre-grading callers).
+        edge_control_strength: The edge's :class:`ControlStrength`, refining
+            auth edges (``AdminTo`` FULL > session > ``SQLAdmin`` >
+            ``SQLAccess`` LOW). Derive it from the relation via
+            :func:`adscan_internal.services.edge_kind.edge_control_strength`.
+            Only consulted for ``auth`` edges; defaults to
+            :attr:`ControlStrength.NOT_APPLICABLE`.
+        target_is_tier0_asset: Legacy flat Tier 0 signal, kept for
+            back-compatibility. True when the target is any Tier 0 asset
+            (DC, Exchange, ADCS CA). When ``target_privilege_tier`` is supplied
+            this is derivable from it; the canonical property
+            :attr:`is_target_tier0_asset` reconciles both. Distinct from
             ``target_is_domain`` — a Tier 0 *asset* is a host/server, the
             *domain* is the AD domain object itself.
         target_is_domain: True when the target node is the Domain object
@@ -84,8 +109,38 @@ class EdgeSeverityInput:
     source_compromise_class: CompromiseClass | None
     target_compromise_class: CompromiseClass | None
     edge_kind: EdgeKind
+    target_privilege_tier: PrivilegeTier | None = None
+    edge_control_strength: ControlStrength = ControlStrength.NOT_APPLICABLE
     target_is_tier0_asset: bool = False
     target_is_domain: bool = False
+
+    @property
+    def is_target_tier0_asset(self) -> bool:
+        """Return whether the target is a Tier 0 asset (graded ∪ legacy).
+
+        Honors both signals: an explicit graded ``target_privilege_tier`` inside
+        the Tier 0 boundary, OR the legacy flat ``target_is_tier0_asset`` flag.
+        This keeps callers that pass only the boolean working unchanged while
+        letting graded callers drive the tier from the node's role.
+        """
+        if self.target_privilege_tier is not None and self.target_privilege_tier.is_tier0:
+            return True
+        return bool(self.target_is_tier0_asset)
+
+    @property
+    def is_target_tier0_direct(self) -> bool:
+        """Return True only for a ``TIER0_DIRECT`` target (a DC / the domain).
+
+        ``TIER0_ESCALATION_CAPABLE`` assets (ADCS CA, Exchange) return False —
+        that is the whole point of the graded tier. When the tier was not
+        resolved (``None``), fall back to ``target_is_domain``: the domain
+        object is always direct.
+        """
+        if self.target_privilege_tier is PrivilegeTier.TIER0_DIRECT:
+            return True
+        if self.target_privilege_tier is not None:
+            return False
+        return bool(self.target_is_domain)
 
 
 def _is_low_priv_source(cls: CompromiseClass | None) -> bool:
@@ -110,6 +165,60 @@ def _target_is_domain_or_breaker(inp: EdgeSeverityInput) -> bool:
     return inp.target_compromise_class is CompromiseClass.DOMAIN_BREAKER
 
 
+def _grade_auth_to_tier0(
+    *,
+    base: Severity,
+    is_direct: bool,
+    strength: ControlStrength,
+) -> Severity:
+    """Refine an auth-edge severity into a Tier 0 asset by control strength.
+
+    Directness dominates: an auth edge into a ``TIER0_DIRECT`` asset (a DC, the
+    domain object) keeps its full ``base`` severity regardless of strength —
+    landing any session on a DC is already a Tier 0 foothold. The refinement
+    only fires for ``TIER0_ESCALATION_CAPABLE`` assets, where a weak edge does
+    not warrant the same alarm:
+
+    * ``FULL`` (``AdminTo`` → LSASS/SYSTEM) — keep ``base``.
+    * ``SESSION`` (``CanRDP`` / ``CanPSRemote`` / ``ExecuteDCOM``) — keep
+      ``base``; a shell on the host is still a real foothold.
+    * ``CONDITIONAL_EXEC`` (``SQLAdmin`` — host exec only via an extra step) —
+      drop one band.
+    * ``LOW`` (``SQLAccess`` — DB session, usually no host code-exec) — drop two
+      bands.
+    * ``NOT_APPLICABLE`` (auth edge with no mapped strength) — keep ``base``;
+      the absence of a strength signal must never *raise* severity, and bare
+      auth uncertainty is already capped by the caller's base band.
+
+    Never raises severity above ``base``; only refines downward for weak edges
+    into escalation-capable assets.
+    """
+    if is_direct:
+        return base
+    if strength in (ControlStrength.FULL, ControlStrength.SESSION, ControlStrength.NOT_APPLICABLE):
+        return base
+    drop = 1 if strength is ControlStrength.CONDITIONAL_EXEC else 2
+    return _lower_severity(base, drop)
+
+
+# Downward-only severity band ladder (Tier 0 auth-edge refinement). INFO /
+# STRUCTURAL are never produced by the refinement — the floor is LOW.
+_SEVERITY_LADDER: tuple[Severity, ...] = (
+    Severity.CRITICAL,
+    Severity.HIGH,
+    Severity.MEDIUM,
+    Severity.LOW,
+)
+
+
+def _lower_severity(base: Severity, steps: int) -> Severity:
+    """Return ``base`` lowered by ``steps`` bands, clamped to the LOW floor."""
+    if base not in _SEVERITY_LADDER or steps <= 0:
+        return base
+    idx = min(_SEVERITY_LADDER.index(base) + steps, len(_SEVERITY_LADDER) - 1)
+    return _SEVERITY_LADDER[idx]
+
+
 def compute_edge_severity(inp: EdgeSeverityInput) -> Severity:
     """Compute the canonical severity for one edge.
 
@@ -128,15 +237,23 @@ def compute_edge_severity(inp: EdgeSeverityInput) -> Severity:
     5. Compromise Enabler / low-priv → Domain or Domain Breaker via
        ``control``/``escalation``/``derived`` → ``CRITICAL``.
     6. Compromise Enabler / low-priv → Tier 0 asset via ``auth`` →
-       ``CRITICAL`` (Tier 0 Foothold real).
+       ``CRITICAL`` for a Tier 0 *direct* target (a DC), refined DOWN by
+       :func:`_grade_auth_to_tier0` for a weak edge into a Tier 0
+       *escalation-capable* target (e.g. ``SQLAccess`` → SQL host).
     7. Privileged Escalator → Domain/Domain Breaker via ``control``/
        ``escalation`` → ``HIGH``.
-    8. Privileged Escalator → Tier 0 asset via ``auth`` → ``HIGH``.
+    8. Privileged Escalator → Tier 0 asset via ``auth`` → ``HIGH`` (refined
+       down by control strength for escalation-capable targets).
     9. Compromise Enabler / low-priv → Privileged Escalator via
        ``control``/``escalation`` → ``HIGH``.
     10. Compromise Enabler / low-priv → Compromise Enabler via ``control``
         → ``MEDIUM`` (multi-hop link).
     11. Default → ``LOW``.
+
+    Target tier (``TIER0_DIRECT`` > ``TIER0_ESCALATION_CAPABLE``) and edge
+    control strength (``AdminTo`` > session > ``SQLAdmin`` > ``SQLAccess``)
+    grade WITHIN these rules; they never lift a structural/membership edge or
+    raise a Domain Breaker source above ``INFO`` (the HTB Forest guard).
     """
     kind = inp.edge_kind
 
@@ -167,7 +284,12 @@ def compute_edge_severity(inp: EdgeSeverityInput) -> Severity:
         return Severity.INFO
 
     target_is_terminal = _target_is_domain_or_breaker(inp)
-    target_is_t0_asset = bool(inp.target_is_tier0_asset)
+    # Graded Tier 0 signal: honors target_privilege_tier when supplied, else the
+    # legacy flat boolean (back-compatible). target_is_direct splits the Tier 0
+    # boundary so a DC outranks an escalation-capable asset (ADCS CA / Exchange).
+    target_is_t0_asset = inp.is_target_tier0_asset
+    target_is_direct = inp.is_target_tier0_direct
+    strength = inp.edge_control_strength
     target_is_escalator = (
         inp.target_compromise_class is CompromiseClass.PRIVILEGED_ESCALATOR
     )
@@ -201,9 +323,17 @@ def compute_edge_severity(inp: EdgeSeverityInput) -> Severity:
                 EdgeKind.DERIVED,
             ):
                 return Severity.CRITICAL
-            # Rule 6 — auth to Tier 0 asset → CRITICAL (real foothold)
+            # Rule 6 — auth to Tier 0 asset → CRITICAL (real foothold),
+            # refined DOWN by control strength for a weak edge into an
+            # escalation-capable (non-direct) asset: AdminTo/session keep
+            # CRITICAL, SQLAdmin drops one band, SQLAccess drops two. A direct
+            # Tier 0 target (a DC) keeps CRITICAL regardless of strength.
             if target_is_t0_asset and kind is EdgeKind.AUTH:
-                return Severity.CRITICAL
+                return _grade_auth_to_tier0(
+                    base=Severity.CRITICAL,
+                    is_direct=target_is_direct or target_is_terminal,
+                    strength=strength,
+                )
             # derived always >= HIGH (proof of compromise) — keep CRITICAL
             # when it lands on Tier 0 asset, HIGH otherwise.
             if kind is EdgeKind.DERIVED and target_is_t0_asset:
@@ -217,9 +347,14 @@ def compute_edge_severity(inp: EdgeSeverityInput) -> Severity:
                 EdgeKind.DERIVED,
             ):
                 return Severity.HIGH
-            # Rule 8 — escalator → Tier 0 asset via auth → HIGH
+            # Rule 8 — escalator → Tier 0 asset via auth → HIGH, refined down
+            # by control strength for an escalation-capable (non-direct) target.
             if target_is_t0_asset and kind is EdgeKind.AUTH:
-                return Severity.HIGH
+                return _grade_auth_to_tier0(
+                    base=Severity.HIGH,
+                    is_direct=target_is_direct or target_is_terminal,
+                    strength=strength,
+                )
 
     # Rule 9 — low-priv → Privileged Escalator via control/escalation → HIGH
     if (

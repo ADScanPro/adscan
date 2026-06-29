@@ -183,7 +183,7 @@ def query_trusted_domains(conn: Any, domain_dn: str) -> list[TrustedDomainEntry]
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_info_debug(f"[trust_query] search failed under {base}: {exc}")
+        print_info_debug(f"trust_query: search failed under {base}: {exc}")
         return []
 
     decoded: list[TrustedDomainEntry] = []
@@ -210,6 +210,6 @@ def query_trusted_domains(conn: Any, domain_dn: str) -> list[TrustedDomainEntry]
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            print_info_debug(f"[trust_query] entry decode failed: {exc}")
+            print_info_debug(f"trust_query: entry decode failed: {exc}")
 
     return decoded

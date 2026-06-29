@@ -9,43 +9,15 @@ from rich.table import Table
 from rich.text import Text
 
 from adscan_internal.rich_output import mark_sensitive, print_panel
+from adscan_internal.services import cleanup_taxonomy as _tax
 
 if TYPE_CHECKING:
     from adscan_internal.services.environment_change_ledger import EnvironmentChangeLedger
 
-_STATUS_ICON: dict[str, str] = {
-    "reverted": "✓",
-    "kept": "★",
-    "pending": "●",
-    "failed": "✗",
-    "operator_required": "⚠",
-    "not_applicable": "–",
-}
-
-_STATUS_STYLE: dict[str, str] = {
-    "reverted": "green",
-    "kept": "cyan",
-    "pending": "dim",
-    "failed": "bold red",
-    "operator_required": "yellow",
-    "not_applicable": "dim",
-}
-
-_KIND_DISPLAY: dict[str, str] = {
-    "group_membership_added":   "Group membership",
-    "file_uploaded":            "File upload",
-    "user_created":             "User created",
-    "password_changed":         "Password reset",
-    "template_modified":        "Template modified",
-    "acl_modified":             "ACL modified",
-    "shadow_credentials_added": "Shadow credentials",
-    "dacl_ace_added":           "DACL ACE (GenericAll)",
-    "owner_changed":            "Object owner",
-    "spn_added":                "SPN (Kerberoast)",
-    "machine_account_created":  "Machine account",
-    "rbcd_delegation_added":    "RBCD delegation",
-    "keycredentiallink_added":  "KeyCredentialLink",
-}
+# All status/kind vocabulary is the SSOT in cleanup_taxonomy; never re-derived here.
+_STATUS_ICON = _tax.STATUS_ICON
+_STATUS_STYLE = _tax.STATUS_STYLE
+_KIND_DISPLAY = _tax.KIND_DISPLAY
 
 
 class _ChangesTable(Table):
@@ -68,12 +40,21 @@ def render_cleanup_exit_panel(ledger: "EnvironmentChangeLedger") -> None:
         return
 
     summary = ledger.get_summary()
-    reverted = [c for c in changes if c.get("revert_status") == "reverted"]
-    kept = [c for c in changes if c.get("revert_status") == "kept"]
-    needs_action = [
-        c for c in changes
-        if c.get("revert_status") in ("operator_required", "failed", "pending")
-    ]
+    by_bucket: dict[str, list[dict[str, Any]]] = {
+        _tax.CLEANUP_BUCKET_REVERTED: [],
+        _tax.CLEANUP_BUCKET_MANUAL: [],
+        _tax.CLEANUP_BUCKET_KEPT: [],
+        _tax.CLEANUP_BUCKET_IN_PROGRESS: [],
+    }
+    for c in changes:
+        by_bucket[_tax.cleanup_bucket(c.get("revert_status"))].append(c)
+    reverted = by_bucket[_tax.CLEANUP_BUCKET_REVERTED]
+    kept = by_bucket[_tax.CLEANUP_BUCKET_KEPT]
+    # Anything not yet on the good/kept side needs the client's attention.
+    needs_action = (
+        by_bucket[_tax.CLEANUP_BUCKET_MANUAL]
+        + by_bucket[_tax.CLEANUP_BUCKET_IN_PROGRESS]
+    )
 
     renderables: list[Any] = []
 
@@ -81,7 +62,7 @@ def render_cleanup_exit_panel(ledger: "EnvironmentChangeLedger") -> None:
         count = len(reverted)
         renderables.append(
             Text(
-                f"✓ REVERTED                        {count} change{'s' if count != 1 else ''}",
+                f"✓ REVERTED (CONFIRMED)            {count} change{'s' if count != 1 else ''}",
                 style="bold green",
             )
         )
@@ -105,16 +86,18 @@ def render_cleanup_exit_panel(ledger: "EnvironmentChangeLedger") -> None:
         count = len(needs_action)
         renderables.append(
             Text(
-                f"⚠ REQUIRES MANUAL ACTION          {count} change{'s' if count != 1 else ''}",
-                style="bold yellow",
+                f"⚠ REQUIRES MANUAL CLEANUP         {count} change{'s' if count != 1 else ''}",
+                style="bold red",
             )
         )
         renderables.append(_build_changes_table(needs_action, show_instructions=True))
 
+    manual_count = summary.get("manual_required", summary.get("failed", 0))
+    in_progress_count = summary.get("in_progress", summary.get("pending", 0))
     border_style = "green"
-    if summary.get("failed", 0) > 0:
+    if manual_count > 0:
         border_style = "red"
-    elif summary.get("pending_manual", 0) > 0:
+    elif in_progress_count > 0:
         border_style = "yellow"
     elif kept and not reverted:
         border_style = "cyan"
@@ -154,7 +137,11 @@ def _build_changes_table(changes: list[dict[str, Any]], *, show_instructions: bo
         target = mark_sensitive(str(change.get("target") or ""), "text")
 
         if show_instructions:
-            instructions = str(change.get("manual_cleanup_instructions") or "")
+            instructions = str(
+                change.get("remediation_command")
+                or change.get("manual_cleanup_instructions")
+                or ""
+            )
             instr_text = Text(f"→ {instructions}", style="dim") if instructions else Text("")
             table.add_row(
                 Text(icon, style=style),

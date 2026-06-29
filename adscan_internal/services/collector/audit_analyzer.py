@@ -120,7 +120,15 @@ def analyze_audit_findings(
     findings: list[AuditFinding] = []
 
     def _is_human_user(node: Any) -> bool:
-        """True for enabled, non-machine User nodes — mirrors get_enabled_users()."""
+        """True for enabled, NON-``$`` User nodes — the hygiene audit's human scope.
+
+        Intentionally NARROWER than the inventory predicate
+        ``get_enabled_users`` (graph_queries/inventories.py): that predicate now
+        keeps gMSAs in the Users inventory, but stale-logon / password-not-required
+        hygiene findings target HUMAN accounts.  A gMSA has a machine-managed
+        password (no ``passwordnotreqd``) and a service-account logon cadence, so
+        ``$``-suffixed managed service accounts are deliberately excluded here.
+        """
         return (
             node.kind == "User"
             and bool(node.enabled)

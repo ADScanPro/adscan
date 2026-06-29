@@ -14,6 +14,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+## [9.2.1] - 2026-06-29
+
+### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
 ## [9.2.0] - 2026-06-23
 
 ### Added
@@ -104,7 +114,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - See GitHub release notes for details
 
-[Unreleased]: https://github.com/ADScanPro/adscan/compare/v9.2.0...HEAD
+[Unreleased]: https://github.com/ADScanPro/adscan/compare/v9.2.1...HEAD
+[9.2.1]: https://github.com/ADScanPro/adscan/compare/v9.2.0...v9.2.1
 [9.2.0]: https://github.com/ADScanPro/adscan/compare/v9.1.1...v9.2.0
 [9.1.1]: https://github.com/ADScanPro/adscan/compare/v9.1.0...v9.1.1
 [9.1.0]: https://github.com/ADScanPro/adscan/compare/v9.0.1...v9.1.0

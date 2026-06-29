@@ -50,6 +50,16 @@ NATIVE_KERBEROS_INFRA_ERROR_MARKERS: tuple[str, ...] = (
     "PARSING KERBAD.PROTOCOL.ASN1_STRUCTS",
     "KRB-ERROR ERROR-CODE",
     "REJECTED THE KERBEROS AP-REQ",
+    # AP-exchange leg: the server returned a GSSAPI-wrapped KRB-ERROR rejecting
+    # our AP-REQ. badauth now decodes the real Kerberos error-code instead of
+    # blindly parsing it as an AP-REP (which destroyed the code) — and prefixes
+    # the kerbad KerberosError with this extra_msg. The decoded code itself
+    # (KRB_AP_ERR_MODIFIED / KDC_ERR_ETYPE_NOTSUPP / KRB_AP_ERR_SKEW) is NOT a
+    # generic infra marker — those have dedicated recovery (SPN-candidate retry,
+    # ETYPE-INFO2 probe, clock-resync). Only the AP-exchange *rejection envelope*
+    # is marked infra: it is a Kerberos-leg failure, not a credential rejection,
+    # so NTLM fallback is the correct last-resort recovery when NTLM is available.
+    "AP EXCHANGE REJECTED BY SERVER",
 )
 
 
@@ -197,3 +207,48 @@ def is_kerberos_soft_error(exc_or_msg: Any) -> bool:
     NTLM with an expired credential to allow the password change.
     """
     return _matches_any_marker(exc_or_msg, KERBEROS_SOFT_ERROR_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# Unreachable foreign / trust realm — a partner domain whose KDC the current
+# credential cannot authenticate against (cross-forest AES-only KDC, no shared
+# trust key, foreign realm we have no usable secret for). The AS-REQ comes back
+# with KDC_ERR_ETYPE_NOTSUPP / KDC_ERR_PREAUTH_FAILED, OR kerbad returns a
+# ``None`` TGT which downstream asn1crypto tries to ``load(None)`` —
+# ``TypeError: encoded_data must be a byte string, not NoneType``. Both are ONE
+# root cause: we simply cannot reach that realm with this credential. There is
+# no recovery (re-mint, clock-resync and the ETYPE-INFO2 probe all assume we own
+# a secret valid in that realm), so the correct end state is a single clean
+# "realm not reachable" line, NOT a raw asn1 TypeError or a 160-line
+# KerberosError traceback. Both the trust enumerator and the attack-path LDAP
+# bind classify with this helper so the user-facing message stays consistent.
+# ---------------------------------------------------------------------------
+UNREACHABLE_FOREIGN_REALM_ERROR_MARKERS: tuple[str, ...] = (
+    # kerbad returned a None ticket → asn1crypto load(None) (asn1crypto/core.py).
+    "ENCODED_DATA MUST BE A BYTE STRING, NOT NONETYPE",
+    "MUST BE A BYTE STRING, NOT NONETYPE",
+    # AES-only / RC4-blocked KDC the credential's etypes do not satisfy. NOT a
+    # generic infra marker (KDC_ERR_ETYPE_NOTSUPP owns the ETYPE-INFO2 probe
+    # recovery for the LOCAL realm); here it specifically means a FOREIGN realm
+    # we cannot satisfy, so the caller gates this only on the cross-realm path.
+    "KDC_ERR_ETYPE_NOTSUPP",
+    "KDC HAS NO SUPPORT FOR ENCRYPTION TYPE",
+    # Foreign-realm preauth we cannot satisfy (no shared trust key / wrong creds
+    # for that realm).
+    "KDC_ERR_PREAUTH_FAILED",
+    "PREAUTH FAILED",
+)
+
+
+def is_unreachable_foreign_realm_error(exc_or_msg: Any) -> bool:
+    """Return True when a foreign/trust realm cannot be authenticated to.
+
+    Covers the two ways one root cause (a ``None`` Kerberos ticket from a
+    foreign-realm AS-REQ the credential cannot satisfy) surfaces: the
+    ``encoded_data must be a byte string, not NoneType`` asn1 ``TypeError`` and
+    the ``KDC_ERR_ETYPE_NOTSUPP`` / preauth-failed ``KerberosError``. Used by the
+    trust enumerator and the attack-path LDAP bind to render ONE clean
+    "realm not reachable" line instead of a raw traceback. There is no recovery
+    for this case — the realm is genuinely out of reach with this credential.
+    """
+    return _matches_any_marker(exc_or_msg, UNREACHABLE_FOREIGN_REALM_ERROR_MARKERS)

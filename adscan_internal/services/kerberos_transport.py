@@ -412,6 +412,44 @@ def _raise_translated_kerbad_error(exc: Exception) -> NoReturn:
 # ---------------------------------------------------------------------------
 
 
+def _emit_etype_probe_diagnostic(client: object, config: "KerberosConfig") -> None:
+    """Summarize the ETYPE-INFO2 salt-probe decision into a --debug recording.
+
+    Diagnostic-only. Lets the intermittent AES-only ``KDC_ERR_ETYPE_NOTSUPP``
+    (first TGT mint OK, later mints fail with the same user/salt/KDC) be
+    root-caused from a ``--debug`` recording without needing vendor DEBUG.
+
+    The resolved salt, the etype names the KDC advertised in ETYPE-INFO2, and
+    whether ``server_supp_enc_methods`` was populated are NOT secrets and are
+    safe to log. Key material (AES key / NT hash / password) is never logged.
+    The principal/domain are masked via ``mark_sensitive``. Bracket-free marker
+    (Rich silently drops ``[bracketed]`` prefixes). Best-effort; never raises.
+    """
+    try:
+        from adscan_internal.rich_output import mark_sensitive  # noqa: PLC0415
+
+        supp = getattr(client, "server_supp_enc_methods", None) or {}
+        try:
+            supp_names = [getattr(et, "name", str(et)) for et in supp.keys()]
+        except Exception:
+            supp_names = None
+        masked_domain = mark_sensitive(getattr(config, "domain", "") or "", "domain")
+        masked_user = mark_sensitive(getattr(config, "username", "") or "", "user")
+        print_info_debug(
+            "kdc-etype-probe: user=%s domain=%s server_salt_set=%s "
+            "supp_enc_etypes=%s supp_populated=%s"
+            % (
+                masked_user,
+                masked_domain,
+                getattr(client, "server_salt", None) is not None,
+                supp_names,
+                bool(supp),
+            )
+        )
+    except Exception:
+        pass
+
+
 async def _probe_and_set_etype_info2_salt(
     client: object, config: "KerberosConfig"
 ) -> bool:
@@ -495,6 +533,7 @@ async def _probe_and_set_etype_info2_salt(
                                 else aes_salt
                             )
                             break
+                _emit_etype_probe_diagnostic(client, config)
                 if client.server_salt is not None:
                     _emit_posture_signal(
                         config,
@@ -507,13 +546,7 @@ async def _probe_and_set_etype_info2_salt(
                             "etype probe required for password auth"
                         ),
                     )
-                    print_info_debug(
-                        f"[kerberos_transport] _probe_etype_info2: salt={client.server_salt!r}"
-                    )
                     return True
-                print_info_debug(
-                    f"[kerberos_transport] _probe_etype_info2: salt={client.server_salt!r}"
-                )
     except Exception as probe_exc:
         # Non-fatal: if the probe fails for any reason, fall through to normal
         # get_TGT which will surface the real error.
@@ -1005,6 +1038,54 @@ async def get_nt_from_pkinit(config: KerberosConfig) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+def _maybe_emit_roast_progress(
+    *,
+    operation: str,
+    label: str,
+    current: int,
+    total: int,
+    detail: str | None,
+    emit_state: dict[str, float],
+    force: bool = False,
+    done: bool = False,
+) -> None:
+    """Throttled live current-operation emit for the roasting iteration loops.
+
+    Pure observability: mirrors the per-ticket forward motion of the kerberoast /
+    AS-REP roast loops into the structured event stream so the platform shows
+    "Kerberoasting · X of N SPNs" live. Throttled to ~1.5s (same budget as the
+    port-scan emitter) so a large target set never floods the channel. No secret
+    reaches the event — only counts + the target domain. Client-safe, English,
+    vendor-neutral label. No-op unless the structured sink is enabled.
+
+    Pass ``done=True`` on the FINAL tick (the loop finished) so the platform's
+    live strip clears the operation instead of freezing on the last ticket count.
+    """
+    import time as _time  # noqa: PLC0415
+
+    now = _time.time()
+    if not force and now - emit_state.get("last_emit", 0.0) < 1.5:
+        return
+    emit_state["last_emit"] = now
+    try:
+        from adscan_internal.cli.ci_events import (  # noqa: PLC0415
+            emit_operation_progress,
+        )
+
+        emit_operation_progress(
+            operation=operation,
+            label=label,
+            phase="quick_credential_wins",
+            phase_label="Quick Credential Wins",
+            current=current or None,
+            total=total if total > 0 else None,
+            detail=detail or None,
+            done=done,
+        )
+    except Exception:  # noqa: BLE001 -- telemetry must not abort roasting
+        pass
+
+
 async def kerberoast_users(
     config: KerberosConfig,
     usernames: list[str],
@@ -1098,6 +1179,8 @@ async def kerberoast_users(
 
         cu = KerberosClientFactory.from_url(url)
         results: list[tuple[str, str | None, str | None]] = []
+        _total = len(usernames)
+        _emit_state: dict[str, float] = {"last_emit": 0.0}
         async for username, hash_line, err in _kerberoast(
             cu,
             usernames,
@@ -1106,6 +1189,26 @@ async def kerberoast_users(
             cross_domain=cross_domain,
         ):
             results.append((username, hash_line, str(err) if err is not None else None))
+            _maybe_emit_roast_progress(
+                operation="kerberoasting",
+                label="Kerberoasting",
+                current=len(results),
+                total=_total,
+                detail=domain,
+                emit_state=_emit_state,
+            )
+        # Land the live surface on the real total on completion, marked done so
+        # the platform's live strip clears the operation instead of freezing.
+        _maybe_emit_roast_progress(
+            operation="kerberoasting",
+            label="Kerberoasting",
+            current=len(results),
+            total=_total,
+            detail=domain,
+            emit_state=_emit_state,
+            force=True,
+            done=True,
+        )
         return results
 
     except Exception as exc:
@@ -1161,6 +1264,8 @@ async def asreproast_users(
     # which sends an AS-REQ without pre-auth and captures the raw AS-REP for hashcat output.
     try:
         per_user: dict[str, tuple[str | None, str | None]] = {}
+        _total = len(usernames)
+        _emit_state: dict[str, float] = {"last_emit": 0.0}
         for username in usernames:
             cred = KerberosCredential()
             cred.domain = domain
@@ -1174,7 +1279,27 @@ async def asreproast_users(
                 per_user[username] = (TGTTicket2hashcat(kcomm.kerberos_TGT), None)
             except Exception as exc:
                 per_user[username] = (None, str(exc))
+            _maybe_emit_roast_progress(
+                operation="asrep_roasting",
+                label="AS-REP roasting",
+                current=len(per_user),
+                total=_total,
+                detail=domain,
+                emit_state=_emit_state,
+            )
 
+        # Land the live surface on the real total on completion, marked done so
+        # the platform's live strip clears the operation instead of freezing.
+        _maybe_emit_roast_progress(
+            operation="asrep_roasting",
+            label="AS-REP roasting",
+            current=len(per_user),
+            total=_total,
+            detail=domain,
+            emit_state=_emit_state,
+            force=True,
+            done=True,
+        )
         return [(u, h, e) for u, (h, e) in per_user.items()]
 
     except Exception as exc:

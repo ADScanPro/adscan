@@ -2230,6 +2230,16 @@ def run_auth_shares(
     # the operator gets a single coherent surface across all hosts instead of a
     # blocking per-host menu. This path is ALWAYS live per-user — it never reads
     # the collector graph.
+    # Shared circuit-breaker: abort the sweep the moment the audit credential is
+    # locked out (or after consecutive logon failures) instead of re-asserting
+    # the lockout against every remaining host. Protects the CUSTOMER's account
+    # domain-wide — the same domain-lockout protection the pre-mint exists for,
+    # extended to the rejection path the pre-mint cannot cover. SSOT: sweep_credential.
+    from adscan_internal.services.sweep_credential import (  # noqa: PLC0415
+        SweepLockoutGuard,
+    )
+
+    lockout_guard = SweepLockoutGuard()
     view_sets: list[Any] = []
     for index, host_ip in enumerate(ordered_hosts, start=1):
         # Per-host progress so the operator knows more hosts follow before the
@@ -2248,6 +2258,24 @@ def run_auth_shares(
         )
         if view_set is not None:
             view_sets.append(view_set)
+
+        decision = lockout_guard.record(
+            host_ip, getattr(view_set, "live_error", None)
+        )
+        if decision.should_abort:
+            print_panel(
+                (
+                    f"{decision.reason}\n\n"
+                    f"Swept {index} of {total_hosts} host(s) as "
+                    f"{mark_sensitive(f'{username}@{domain}', 'user')} before "
+                    "aborting; the remaining "
+                    f"{total_hosts - index} host(s) were skipped to protect the "
+                    "account."
+                ),
+                title="SMB share sweep aborted — credential locked out / rejected",
+                border_style="red",
+            )
+            break
 
     _render_live_share_exposure_surface(
         shell,
@@ -4139,6 +4167,11 @@ def run_ask_for_smb_gpp(shell: Any, *, domain: str) -> None:
         domain: Domain name.
     """
     from adscan_internal.rich_output import confirm_operation
+    from adscan_internal.services.scan_phases import subphase_is_enabled
+
+    if not subphase_is_enabled(shell, "quick_credential_wins", "gpp_autologin"):
+        print_info("GPP autologin search skipped (disabled in scan configuration).")
+        return
 
     if shell.auto:
         run_gpp_autologin(shell, target_domain=domain)
@@ -4155,6 +4188,16 @@ def run_ask_for_smb_gpp(shell: Any, *, domain: str) -> None:
 def run_ask_for_smb_gpp_autologin(shell: Any, *, domain: str) -> None:
     """Prompt user to run the native GPP autologon walker."""
     from adscan_internal.rich_output import confirm_operation
+    from adscan_internal.services.scan_phases import (
+        phase_is_enabled,
+        subphase_is_enabled,
+    )
+
+    if not phase_is_enabled(shell, "quick_credential_wins"):
+        return
+    if not subphase_is_enabled(shell, "quick_credential_wins", "gpp_autologin"):
+        print_info("GPP autologin search skipped (disabled in scan configuration).")
+        return
 
     if shell.auto:
         run_gpp_autologin(shell, target_domain=domain)
@@ -4171,6 +4214,16 @@ def run_ask_for_smb_gpp_autologin(shell: Any, *, domain: str) -> None:
 def run_ask_for_smb_gpp_passwords(shell: Any, *, domain: str) -> None:
     """Prompt user to run the native GPP cpassword walker."""
     from adscan_internal.rich_output import confirm_operation
+    from adscan_internal.services.scan_phases import (
+        phase_is_enabled,
+        subphase_is_enabled,
+    )
+
+    if not phase_is_enabled(shell, "quick_credential_wins"):
+        return
+    if not subphase_is_enabled(shell, "quick_credential_wins", "gpp_passwords"):
+        print_info("GPP password search skipped (disabled in scan configuration).")
+        return
 
     if shell.auto:
         run_gpp_passwords(shell, target_domain=domain)
@@ -8168,11 +8221,11 @@ def _run_rclone_copy_loot_download(
             f"host={mark_sensitive(host, 'host')} share={mark_sensitive(share, 'share')} "
             f"command={command}"
         )
-        result = shell.run_command(
-            command,
-            timeout=1200,
-            ignore_errors=True,
-        )
+        rclone_env = service.build_rclone_env(obscured_password)
+        run_kwargs: dict[str, Any] = {"timeout": 1200, "ignore_errors": True}
+        if rclone_env is not None:
+            run_kwargs["env"] = rclone_env
+        result = shell.run_command(command, **run_kwargs)
         copied_file_count = _count_files_under_path(target_loot_dir)
         if result is None:
             return {"status": "failed", "host": host, "share": share, "rc": None}
@@ -8338,11 +8391,11 @@ def _run_rclone_copy_mapped_loot_download(
             f"host={mark_sensitive(host, 'host')} share={mark_sensitive(share, 'share')} "
             f"command={command}"
         )
-        result = shell.run_command(
-            command,
-            timeout=1200,
-            ignore_errors=True,
-        )
+        rclone_env = service.build_rclone_env(obscured_password)
+        run_kwargs: dict[str, Any] = {"timeout": 1200, "ignore_errors": True}
+        if rclone_env is not None:
+            run_kwargs["env"] = rclone_env
+        result = shell.run_command(command, **run_kwargs)
         copied_file_count = _count_files_under_path(target_loot_dir)
         if result is None:
             return {"status": "failed", "host": host, "share": share, "rc": None}
@@ -8486,14 +8539,17 @@ def _run_rclone_cat_library_fetch(
             f"host={mark_sensitive(host, 'host')} share={mark_sensitive(share, 'share')} "
             f"path={mark_sensitive(remote_path, 'path')} command={command}"
         )
-        result = shell.run_command(
-            command,
-            timeout=300,
-            ignore_errors=True,
-            text=False,
-            capture_output=True,
-            use_clean_env=True,
-        )
+        rclone_env = service.build_rclone_env(obscured_password)
+        cat_kwargs: dict[str, Any] = {
+            "timeout": 300,
+            "ignore_errors": True,
+            "text": False,
+            "capture_output": True,
+            "use_clean_env": True,
+        }
+        if rclone_env is not None:
+            cat_kwargs["env"] = rclone_env
+        result = shell.run_command(command, **cat_kwargs)
         if result is None:
             return index, None
         return_code = int(getattr(result, "returncode", 1))

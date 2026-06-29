@@ -705,9 +705,27 @@ def _cve_scope_summary(*, has_credentials: bool) -> str:
 
 def ask_for_enum_cve(self, target_domain: str) -> None:
     """Prompt user to enumerate CVE vulnerabilities."""
+    from adscan_internal.services.scan_phases import phase_is_enabled
+
+    if not phase_is_enabled(self, "audit_extras"):
+        from adscan_core.rich_output import print_info
+
+        print_info("CVE Verification skipped (disabled in scan configuration).")
+        return
     if self.auto:
+        # CVE target scope (audit_extras.target_scope). ``default`` keeps today's
+        # behavior — DCs always, plus every host for the audit engagement.
+        # ``domain_controllers`` narrows to DCs only; ``all_hosts`` forces the
+        # every-host pass regardless of engagement. Absent config = ``default``.
+        from adscan_internal.services.scan_phases import resolve_cve_target_scope
+
+        scope = resolve_cve_target_scope(self)
         self.do_enum_cve_dcs(target_domain)
-        if self.type == "audit":
+        run_all_hosts = (
+            scope == "all_hosts"
+            or (scope == "default" and self.type == "audit")
+        )
+        if run_all_hosts:
             self.do_enum_cve_all(target_domain)
     else:
         pdc = self.domains_data.get(target_domain, {}).get("pdc", "N/A")

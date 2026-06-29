@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import os
-import re
 
 from adscan_internal import (
     print_error,
@@ -183,19 +182,31 @@ def _normalize_hashes_file_for_hashcat(
     *,
     hashes_file_abs: str,
     target_user: str,
+    mode: str,
 ) -> str:
-    """Normalize an Impacket output file into `username:<hash>` single-line format.
+    """Materialise the native roaster output into a hashcat-parseable file.
 
-    Some Impacket outputs (or intermediary tooling) can leave hashes split across
-    multiple lines, which `hashcat` can't parse. Our cracking pipeline also uses
-    `--username`, so we ensure a stable `username:<hash>` format.
+    The native roaster writes one raw ``$krb5...`` hash per discovered SPN-bearing
+    user into the same file. The cracking pipeline runs hashcat with ``--username``,
+    so every line must be a ``<username>:<hash>`` shape the mode can parse.
+
+    This is a thin wrapper around the single-source-of-truth writer
+    ``cracking.write_crack_hashfile`` so the roasting path can never diverge from
+    the canonical, ``--username``-safe materialisation used everywhere else. The
+    SSOT writer is multi-line-aware (ALL captured hashes are kept, not just the
+    first), de-duplicates, sanitises the username field, and extracts the embedded
+    principal per-hash for the prepend.
 
     Args:
         hashes_file_abs: Absolute path to the (possibly raw) hashes file.
-        target_user: Username to prefix for `--username` mode.
+        target_user: Username to prefer as the prepend when a line carries no
+            extractable embedded principal (the caller knows the real account).
+        mode: hashcat mode string (``"13100"`` for Kerberoast TGS-REP, ``"18200"``
+            for AS-REP Roast).
 
     Returns:
-        Absolute path to the normalized file (may be the original path).
+        Absolute path to the hashcat-ready file (may be the original path when
+        nothing needed materialising / on error).
     """
     if not os.path.exists(hashes_file_abs):
         return hashes_file_abs
@@ -209,99 +220,36 @@ def _normalize_hashes_file_for_hashcat(
     if not lines:
         return hashes_file_abs
 
-    def _is_username_prefixed_hash(line: str) -> bool:
-        # Our cracking pipeline uses `hashcat --username`, so we normalize to:
-        #   <username>:$krb5...
-        # Note: raw ASREPRoast hashes include an internal ":" (after the realm),
-        # so we must only treat lines as "already normalized" when they start
-        # with "<user>:$krb5".
-        return bool(re.match(r"^[^:]+:\$krb5", line or ""))
-
-    def _hash_user(line: str) -> str | None:
-        """Return the username encoded inside a roast hash line.
-
-        Supported shapes:
-        - `user:$krb5...`               (already prefixed for `--username`)
-        - `$krb5tgs$<etype>$*user$REALM$spn*$...`   (TGS-REP / Kerberoasting)
-        - `$krb5asrep$<etype>$user@REALM:...`       (AS-REP Roasting)
-        """
-        if not line:
-            return None
-        m = re.match(r"^([^:$]+):\$krb5", line)
-        if m:
-            return m.group(1).strip().lower() or None
-        m = re.match(r"^\$krb5tgs\$\d+\$\*([^$]+)\$", line)
-        if m:
-            return m.group(1).strip().lower() or None
-        m = re.match(r"^\$krb5asrep\$\d+\$([^@]+)@", line)
-        if m:
-            return m.group(1).strip().lower() or None
-        return None
-
-    def _extract_hash_payload() -> str | None:
-        """Pick the hash line whose embedded user matches `target_user`.
-
-        The native roaster writes one hash per discovered SPN-bearing user into
-        the same file, so we must select the line that belongs to the user we
-        are about to crack — concatenating all of them would produce a single
-        malformed token that `hashcat` rejects.
-        """
-        wanted = (target_user or "").strip().lower()
-        first_marker_line: str | None = None
-        for line in lines:
-            if "$krb5" not in line:
-                continue
-            if first_marker_line is None:
-                first_marker_line = line
-            owner = _hash_user(line)
-            if owner and wanted and owner == wanted:
-                hash_start = line.find("$krb5")
-                payload = line[hash_start:].strip() if hash_start > 0 else line.strip()
-                if _is_username_prefixed_hash(line):
-                    return line.strip()
-                return payload or None
-
-        # Fallback: no per-user match (single-hash file written by older paths).
-        # Use the first marker line as-is.
-        if first_marker_line is None:
-            return None
-        hash_start = first_marker_line.find("$krb5")
-        if _is_username_prefixed_hash(first_marker_line):
-            return first_marker_line.strip()
-        return first_marker_line[hash_start:].strip() if hash_start >= 0 else None
-
-    # If already in `<user>:$krb5...` form *and* single-line, keep it as-is.
-    first = lines[0]
-    if len(lines) == 1 and _is_username_prefixed_hash(first):
-        print_info_debug(
-            "[roasting-exec] hash file already normalized for hashcat: "
-            f"file={mark_sensitive(hashes_file_abs, 'path')}"
-        )
+    # Route every captured hash through the SSOT writer. The native roaster may
+    # write one hash per discovered SPN/pre-auth user into the same file, so the
+    # username MUST be resolved per-line, not forced to a single target_user. The
+    # SSOT writer prefers the SUPPLIED username when present; passing it for every
+    # line would mislabel a multi-user file. So we supply target_user ONLY when a
+    # line carries no extractable embedded principal, and pass None otherwise so
+    # the writer extracts the correct account from each hash.
+    pairs: list[tuple[str | None, str]] = []
+    for line in lines:
+        embedded = cracking_cli.extract_embedded_username(line, mode=mode)
+        supplied = None if embedded else (target_user or None)
+        pairs.append((supplied, line))
+    normalized_path = f"{hashes_file_abs}.hashcat"
+    try:
+        written = cracking_cli.write_crack_hashfile(normalized_path, pairs, mode=mode)
+    except OSError:
         return hashes_file_abs
 
-    extracted = _extract_hash_payload()
-    if not extracted:
+    if not written:
         print_info_debug(
-            "[roasting-exec] unable to find a Kerberos roast hash marker in file: "
+            "[roasting-exec] no Kerberos roast hashes materialised for hashcat: "
             f"file={mark_sensitive(hashes_file_abs, 'path')} lines={len(lines)}"
         )
         return hashes_file_abs
 
-    normalized_line = (
-        extracted
-        if _is_username_prefixed_hash(extracted)
-        else f"{target_user}:{extracted}"
-    )
-    normalized_path = f"{hashes_file_abs}.hashcat"
-    try:
-        Path(normalized_path).write_text(normalized_line + "\n", encoding="utf-8")
-    except OSError:
-        return hashes_file_abs
     print_info_debug(
-        "[roasting-exec] normalized Kerberos roast hash file for hashcat: "
+        "[roasting-exec] materialised Kerberos roast hash file for hashcat via SSOT: "
         f"source={mark_sensitive(hashes_file_abs, 'path')} "
         f"target={mark_sensitive(normalized_path, 'path')} "
-        f"input_lines={len(lines)} already_prefixed={_is_username_prefixed_hash(extracted)}"
+        f"mode={mode} input_lines={len(lines)} written_lines={written}"
     )
     return normalized_path
 
@@ -380,7 +328,10 @@ def run_kerberoast_for_user(
         print_error(f"Kerberoast failed for {marked_user}.")
         return False
 
-    if not os.path.exists(hashes_file_abs):
+    # Guard on NON-EMPTINESS, not mere file presence: a zero-hash roast must
+    # never launch hashcat (an empty/absent hashfile -> "hashfile is empty or
+    # corrupt", RC 255) nor enter the "crack with another wordlist?" re-prompt.
+    if cracking_cli._count_hashes_in_file(hashes_file_abs) <= 0:
         marked_user = mark_sensitive(target_user, "user")
         print_warning(f"No Kerberoast hashes produced for {marked_user}.")
         return False
@@ -388,6 +339,7 @@ def run_kerberoast_for_user(
     hashes_file_for_cracking = _normalize_hashes_file_for_hashcat(
         hashes_file_abs=hashes_file_abs,
         target_user=target_user,
+        mode="13100",
     )
     print_info_debug(
         "[roasting-exec] Kerberoast cracking input prepared: "
@@ -479,7 +431,10 @@ def run_asreproast_for_user(
         print_error(f"ASREPRoast failed for {marked_user}.")
         return False
 
-    if not os.path.exists(hashes_file_abs):
+    # Guard on NON-EMPTINESS, not mere file presence: a zero-hash roast must
+    # never launch hashcat (an empty/absent hashfile -> "hashfile is empty or
+    # corrupt", RC 255) nor enter the "crack with another wordlist?" re-prompt.
+    if cracking_cli._count_hashes_in_file(hashes_file_abs) <= 0:
         marked_user = mark_sensitive(target_user, "user")
         print_warning(f"No ASREPRoast hashes produced for {marked_user}.")
         return False
@@ -487,6 +442,7 @@ def run_asreproast_for_user(
     hashes_file_for_cracking = _normalize_hashes_file_for_hashcat(
         hashes_file_abs=hashes_file_abs,
         target_user=target_user,
+        mode="18200",
     )
     print_info_debug(
         "[roasting-exec] ASREPRoast cracking input prepared: "

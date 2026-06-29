@@ -174,11 +174,18 @@ def extract_adcs_template_names(details: Mapping[str, Any] | None) -> list[str]:
                 _append(entry)
 
     # Compromise-centric ESC edges carry the abused templates / CAs in
-    # ``vulnerable_resources`` (the canonical post-derivation field).
+    # ``vulnerable_resources`` (the canonical post-derivation field). Some ESCs
+    # (e.g. ESC9/ESC10) also list the impersonatable "puppet" principals there
+    # as ``kind == "User"`` / ``"Computer"`` entries — those are NOT templates,
+    # so filter to certificate-template entries only. Entries without a ``kind``
+    # are kept (a bare template-name list predates the kind tagging).
     raw_resources = details.get("vulnerable_resources")
     if isinstance(raw_resources, list):
         for entry in raw_resources:
             if isinstance(entry, dict):
+                kind = str(entry.get("kind") or "").strip().lower()
+                if kind and kind != "certtemplate":
+                    continue
                 _append(entry.get("name"))
 
     summary = details.get("templates_summary")

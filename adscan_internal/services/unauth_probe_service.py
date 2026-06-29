@@ -217,7 +217,7 @@ async def _probe_smb_session(
                     async for share, share_err in machine.list_shares():
                         if share_err is not None:
                             print_info_debug(
-                                f"[unauth-probe][smb-{auth_label}] share iter "
+                                f"unauth-probe smb-{auth_label}: share iter "
                                 f"error on {target}: {share_err}"
                             )
                             break
@@ -233,7 +233,7 @@ async def _probe_smb_session(
                         )
                 except Exception as iter_exc:  # noqa: BLE001
                     print_info_debug(
-                        f"[unauth-probe][smb-{auth_label}] list_shares failed on "
+                        f"unauth-probe smb-{auth_label}: list_shares failed on "
                         f"{target}: {iter_exc}"
                     )
 
@@ -353,7 +353,7 @@ async def _probe_ldap_anonymous(
         except Exception as exc:  # noqa: BLE001
             import traceback as _tb
             print_info_debug(
-                f"[ldap_probe] {transport.upper()}:{port} exception: {type(exc).__name__}: {exc}\n"
+                f"ldap_probe: {transport.upper()}:{port} exception: {type(exc).__name__}: {exc}\n"
                 + "".join(_tb.format_tb(exc.__traceback__))
             )
             last_exc = exc
@@ -461,7 +461,7 @@ async def _probe_ldap_anonymous(
         except Exception as search_exc:  # noqa: BLE001
             import traceback as _tb
             print_info_debug(
-                f"[ldap_probe] pagedsearch exception: {type(search_exc).__name__}: {search_exc}\n"
+                f"ldap_probe: pagedsearch exception: {type(search_exc).__name__}: {search_exc}\n"
                 + "".join(_tb.format_tb(search_exc.__traceback__))
             )
             msg = str(search_exc)
@@ -512,7 +512,7 @@ async def _probe_ldap_anonymous(
                 if asyncio.iscoroutine(maybe_coro):
                     await maybe_coro
         except Exception as exc:  # noqa: BLE001
-            print_info_debug(f"[unauth-probe][ldap-anon] disconnect error: {exc}")
+            print_info_debug(f"unauth-probe ldap-anon: disconnect error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -881,5 +881,5 @@ def render_unauth_summary(results: UnauthProbeResults, *, domain: str) -> None:
     )
     _get_console().print(panel)
     print_info_verbose(
-        f"[unauth-probe] sweep finished in {results.duration_seconds:.2f}s"
+        f"unauth-probe sweep finished in {results.duration_seconds:.2f}s"
     )

@@ -88,6 +88,50 @@ _LAB_FAILURE_EXCEPTION_NAMES: tuple[str, ...] = (
 )
 
 
+def _is_environment_failure(exc: BaseException) -> bool:
+    """True when ``exc`` is a network / environment connectivity failure.
+
+    Two complementary signals route an exception to the environment bucket:
+
+    * Its class name is in :data:`_LAB_FAILURE_EXCEPTION_NAMES` (the curated
+      surface-level set), OR
+    * It is an :class:`OSError` instance.  This is the load-bearing addition:
+      ``socket.gaierror`` (DNS resolution failure — ``Name or service not
+      known``) subclasses ``OSError`` but its ``__name__`` is ``"gaierror"``,
+      which is NOT in the name set, so a name-only match misclassified DNS
+      failures as "unknown / may be an ADscan bug".  Matching the ``OSError``
+      base catches ``gaierror`` and every other socket/connection error class
+      regardless of its concrete name.
+    """
+    if isinstance(exc, OSError):
+        return True
+    return type(exc).__name__ in _LAB_FAILURE_EXCEPTION_NAMES
+
+
+def _is_dns_resolution_failure(exc: BaseException) -> bool:
+    """True when ``exc`` is a DNS name-resolution failure (``gaierror``).
+
+    Matches both the concrete ``socket.gaierror`` class and the canonical
+    resolver error messages so a ``gaierror`` wrapped as ``__cause__`` of a
+    higher-level error is still recognised.
+    """
+    import socket
+
+    if isinstance(exc, socket.gaierror):
+        return True
+    msg = str(exc).strip().lower()
+    return any(
+        marker in msg
+        for marker in (
+            "name or service not known",
+            "name resolution",
+            "nodename nor servname",
+            "temporary failure in name resolution",
+            "no address associated with hostname",
+        )
+    )
+
+
 def _iter_exception_chain(exc: BaseException) -> "list[BaseException]":
     """Return the exception chain (cause + context), shallowest-first."""
     seen: set[int] = set()
@@ -144,12 +188,14 @@ def _classify_cert_request_failure(
 
     # First pass: prefer the shallowest *informative* match (skip the
     # final ``CancelledError`` if a better candidate exists earlier).
-    informative_names = tuple(
-        n for n in _LAB_FAILURE_EXCEPTION_NAMES if n != "CancelledError"
-    )
+    # An ``OSError`` instance (which includes ``socket.gaierror``) is always
+    # informative — the raw cancel signal from ``asyncio.wait_for`` is the
+    # only class we defer to the second pass.
     selected: BaseException | None = None
     for link in chain:
-        if type(link).__name__ in informative_names:
+        if type(link).__name__ == "CancelledError":
+            continue
+        if _is_environment_failure(link):
             selected = link
             break
 
@@ -157,7 +203,7 @@ def _classify_cert_request_failure(
     # if no informative one was found in the chain.
     if selected is None:
         for link in chain:
-            if type(link).__name__ in _LAB_FAILURE_EXCEPTION_NAMES:
+            if _is_environment_failure(link):
                 selected = link
                 break
 
@@ -184,6 +230,42 @@ def _classify_cert_request_failure(
             technical_label=raw_label,
         )
 
+    ca_host_masked = mark_sensitive(config.ca_host, "hostname")
+
+    # DNS-resolution failure is its own environment cause and needs a
+    # DIFFERENT checklist than an RPC-connectivity failure: the CA host
+    # never resolved to an IP, so "port 135 filtered / service down /
+    # connection timed out" framing is wrong and would send the operator
+    # chasing a phantom firewall issue.  Surface a name-resolution cause
+    # label + a resolver checklist instead.  ``socket.gaierror`` may be
+    # the selected exception OR appear deeper as a ``__cause__`` of a
+    # higher-level error, so scan the whole chain.
+    if any(_is_dns_resolution_failure(link) for link in chain):
+        summary = (
+            f"The CA hostname {ca_host_masked} did not resolve from this host "
+            "(DNS name-resolution failed). The enrollment never reached the "
+            "CA because its name could not be turned into an IP address. This "
+            "points to the environment's name resolution, not to ADscan."
+        )
+        actions = (
+            f"Verify resolution:    nslookup {config.ca_host}   "
+            f"(or: getent hosts {config.ca_host})",
+            "Point the resolver at the domain controller / internal DNS that "
+            "serves this domain's records.",
+            f"As a fallback, add the CA host to /etc/hosts:  "
+            f"<CA-IP>  {config.ca_host}",
+            "If you only have the CA's IP, configure the workspace so the "
+            "CA host is reachable by name (Kerberos SPNs require the FQDN).",
+            "Once the CA hostname resolves, re-run the attack step.",
+        )
+        return _FailureClassification(
+            severity="lab",
+            title="ADCS enrollment failed — DNS resolution issue",
+            summary=summary,
+            actions=actions,
+            technical_label=raw_label,
+        )
+
     # Lab-bucket match — pick a neutral cause label that covers all
     # transport-layer failure modes (the operator can't tell the
     # difference between "host unreachable", "port filtered", "port
@@ -204,7 +286,6 @@ def _classify_cert_request_failure(
         specific_signal = "connection reset by peer (mid-handshake drop — possible firewall/IDS)"
 
     selected_name = type(selected).__name__
-    ca_host_masked = mark_sensitive(config.ca_host, "hostname")
     if specific_signal:
         summary = (
             f"The CA RPC endpoint did not respond on {ca_host_masked}:135. "
@@ -554,6 +635,16 @@ class CertRequestConfig:
     target_kdc_ip: Optional[str] = None
     application_policies: Optional[list[str]] = None
     ip_hostname_inventory: Optional[dict[str, list[str]]] = None
+    # NTLM-to-IP direct connection (centralized host→IP resolver, layer g/b/c).
+    # When ``connect_ip`` is set and ``force_ntlm`` is True the enrollment
+    # connects straight to that IP over an authenticated NTLM session — no DNS,
+    # no Kerberos SPN. This is the recovery path for an unresolvable (typically
+    # cross-forest) CA whose name has no route from the current vantage. The
+    # caller must posture-gate it (never set ``force_ntlm`` when NTLM is
+    # disabled for the realm). ``connect_ip`` without ``force_ntlm`` simply
+    # overrides the TCP address while keeping the Kerberos SPN path.
+    connect_ip: Optional[str] = None
+    force_ntlm: bool = False
     # When the workspace has a fingerprinted lab provider (``"goad"``,
     # ``"htb"``, etc.), pass it here so the failure panel can give
     # lab-specific remediation hints (e.g. "vagrant up braavos" for GOAD).
@@ -681,6 +772,31 @@ def _build_smb_url(config: CertRequestConfig) -> str:
 
     def _q(v: str) -> str:
         return urllib.parse.quote(v, safe="")
+
+    # NTLM-to-IP direct branch: when an operator/env IP was supplied for an
+    # otherwise-unresolvable CA, connect straight to the IP over an
+    # authenticated NTLM session. No Kerberos SPN, no serverip=/dc= params —
+    # MS-ICPR enrollment is auth-agnostic, so NTLM completes it with no DNS or
+    # realm lookup. Posture-gated by the caller (never reached when NTLM is
+    # disabled for the realm).
+    if config.force_ntlm and config.connect_ip:
+        if config.password:
+            scheme = "smb+ntlm-password"
+            secret = _q(config.password)
+        elif config.nt_hash:
+            scheme = "smb+ntlm-nt"
+            secret = _q(config.nt_hash)
+        else:
+            raise ValueError(
+                "CertRequestConfig must supply either password or nt_hash"
+            )
+        # The AS-REQ goes nowhere here — NTLM authenticates against the host
+        # directly. The domain prefix stays so the credential targets the right
+        # account namespace.
+        domain = _q(config.effective_auth_domain.upper())
+        username = _q(config.username)
+        connect_ip = _q(config.connect_ip)
+        return f"{scheme}://{domain}\\{username}:{secret}@{connect_ip}"
 
     if config.password:
         scheme = "smb+kerberos-password"
@@ -986,37 +1102,57 @@ async def _connect_icpr(config: CertRequestConfig):
 
     url = _build_smb_url(config)
     su = SMBConnectionFactory.from_url(url)
-    endpoint = resolve_kerberos_tcp_target(
-        target_host=config.ca_host,
-        spn_host=_resolve_ca_hostname(config),
-        resolver_ip=config.effective_target_kdc_ip or config.effective_auth_kdc_ip,
-    )
-    connect_host = endpoint.tcp_host or su.get_target().get_hostname_or_ip()
+
+    ntlm_to_ip = bool(config.force_ntlm and config.connect_ip)
+    if ntlm_to_ip:
+        # NTLM-to-IP: connect EPM straight to the operator/env IP — no DNS,
+        # no Kerberos SPN. The CA name never has to resolve.
+        connect_host = config.connect_ip
+    else:
+        endpoint = resolve_kerberos_tcp_target(
+            target_host=config.ca_host,
+            spn_host=_resolve_ca_hostname(config),
+            resolver_ip=config.effective_target_kdc_ip or config.effective_auth_kdc_ip,
+        )
+        connect_host = endpoint.tcp_host or su.get_target().get_hostname_or_ip()
 
     print_info_verbose("Connecting to CA endpoint...")
     # EPM uses the *target* KDC and *target* domain — the CA lives there and
-    # the SPN must resolve under that realm.
+    # the SPN must resolve under that realm. For NTLM-to-IP the dc_ip/domain
+    # hints are irrelevant (no Kerberos), so pass None to avoid a phantom KDC.
     target, err = await EPM.create_target(
         connect_host,
         ICPRRPC().service_uuid,
-        dc_ip=config.effective_target_kdc_ip,
-        domain=config.effective_target_domain,
+        dc_ip=None if ntlm_to_ip else config.effective_target_kdc_ip,
+        domain=None if ntlm_to_ip else config.effective_target_domain,
     )
     if err is not None:
         raise err
 
-    ca_hostname = _resolve_ca_hostname(config)
-    if ca_hostname:
-        target.hostname = ca_hostname
+    if not ntlm_to_ip:
+        ca_hostname = _resolve_ca_hostname(config)
+        if ca_hostname:
+            target.hostname = ca_hostname
 
     gssapi = su.get_credential()
     auth = DCERPCAuth.from_smb_gssapi(gssapi)
-    # Workaround: asyauth _deep_copy_context missing return in if-branch stores None
-    # in original_authentication_contexts — pull the live context from authentication_contexts.
-    if auth.kerberos is None and gssapi is not None:
-        auth.kerberos = gssapi.authentication_contexts.get(
-            "MS KRB5 - Microsoft Kerberos 5"
-        )
+    if ntlm_to_ip:
+        # Symmetric to the Kerberos extraction below: pull the live NTLM
+        # context when the deep-copy left auth.ntlm unset.
+        if auth.ntlm is None and gssapi is not None:
+            _NTLM_CTX = "NTLMSSP - Microsoft NTLM Security Support Provider"
+            try:
+                if _NTLM_CTX in gssapi.list_original_conexts():
+                    auth.ntlm = gssapi.get_original_context(_NTLM_CTX)
+            except Exception:  # noqa: BLE001 — fall back to whatever from_smb_gssapi set
+                auth.ntlm = gssapi.authentication_contexts.get(_NTLM_CTX)
+    else:
+        # Workaround: asyauth _deep_copy_context missing return in if-branch stores None
+        # in original_authentication_contexts — pull the live context from authentication_contexts.
+        if auth.kerberos is None and gssapi is not None:
+            auth.kerberos = gssapi.authentication_contexts.get(
+                "MS KRB5 - Microsoft Kerberos 5"
+            )
     connection = DCERPC5Connection(auth, target)
     rpc, err = await ICPRRPC.from_rpcconnection(connection, perform_dummy=True)
     if err is not None:

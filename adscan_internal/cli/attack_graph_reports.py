@@ -43,7 +43,10 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.cli.ci_events import emit_event
-from adscan_internal.cli.compromise_render import render_kpi_panel
+from adscan_internal.cli.compromise_render import (
+    render_kpi_panel,
+    render_tiering_legend,
+)
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
 from adscan_internal.rich_output import mark_sensitive, print_panel
 from adscan_core.output._state import _get_console
@@ -856,6 +859,25 @@ def _print_high_value_session_summary(
     header_lines.append("Identities  ", style="dim")
     header_lines.append(f"{total_users:>4d}", style="bold")
 
+    # Tier 0 Exposure rollup — accounts that sit inside the Tier 0 containment
+    # boundary (direct domain control, or one-technique escalation-capable).
+    # This is the SSOT "validated path to Tier 0" bucket the client report and
+    # web both headline, surfaced here so the operator reads the same rollup.
+    tier0_exposed = (
+        len(direct_domain_control_users)
+        + len(domain_compromise_enabler_users)
+        + len(high_impact_privilege_users)
+    )
+    if tier0_exposed:
+        header_lines.append("    ", style="default")
+        header_lines.append("Tier 0 Exposure  ", style="dim")
+        header_lines.append(
+            f"{tier0_exposed:>4d}",
+            style=f"bold {COLOR_CRIMSON}"
+            if direct_domain_control_users
+            else f"bold {COLOR_AMBER}",
+        )
+
     # Canonical compromise-class KPI panel (CLAUDE.md § Nomenclature
     # Standard). Legacy ``high_impact_privilege`` folds into Privileged
     # Escalator. Compromise Enabler is path-derived, not surfaced here.
@@ -951,9 +973,21 @@ def _print_high_value_session_summary(
             style="default",
         )
 
+    # Compact tiering legend (axis 1) from the SSOT glossary, so the operator
+    # reads the same Privilege Tier definitions the client deliverable carries.
+    legend_panel = render_tiering_legend()
+
     panel = Panel(
         Group(
-            header_lines, Text(""), kpi_panel, Text(""), table, Text(""), next_action
+            header_lines,
+            Text(""),
+            kpi_panel,
+            Text(""),
+            table,
+            Text(""),
+            next_action,
+            Text(""),
+            legend_panel,
         ),
         title=Text(f" {glyph}  Control-Exposure Session Exposure ", style="bold"),
         title_align="left",

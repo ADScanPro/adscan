@@ -213,9 +213,9 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "backupoperatorescalation",
         support_kind="supported",
         support_reason=(
-            "Native async RRP hive dump (NativeDumpService.backup_operator_dump): "
-            "opens HKLM\\SAM/SECURITY/SYSTEM with REG_OPTION_BACKUP_RESTORE, "
-            "downloads via ADMIN$, parses DC machine account hash in-process."
+            "Backup Operators rights are used to read the SAM, SECURITY, and SYSTEM "
+            "registry hives over the network and recover the domain controller's "
+            "machine account hash."
         ),
         compromise_semantics="direct_target_compromise",
         compromise_effort="medium",
@@ -1330,7 +1330,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "adcsesc13",
         support_kind="supported",
-        support_reason="Supported via Certipy req/auth with linked group follow-up",
+        support_reason="Enrolls a certificate from the abusable template, then authenticates with the linked group membership.",
         compromise_semantics="direct_target_compromise",
         compromise_effort="high",
         category="adcs",
@@ -1980,7 +1980,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "dumplsa",
         support_kind="supported",
-        support_reason="Execute LSA secrets dump via NetExec",
+        support_reason="Extracts cached secrets from the LSA store on the compromised host.",
         compromise_semantics="direct_target_compromise",
         source_context_requirement="local_admin_session",
         category="credential_access",
@@ -2006,7 +2006,7 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
     _entry(
         "dumpdpapi",
         support_kind="supported",
-        support_reason="Execute DPAPI credential dump via NetExec",
+        support_reason="Decrypts DPAPI-protected credentials stored on the compromised host.",
         category="credential_access",
         description="Credential extraction from DPAPI-protected material",
         remediation_complexity="medium",
@@ -2025,9 +2025,9 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "dumplsass",
         support_kind="supported",
         support_reason=(
-            "Execute LSASS minidump via native async stack: ppldump (KnownDlls PPL bypass), "
-            "wsass (WerFaultSecure PPL bypass with Defender evasion), comsvcs, nanodump, "
-            "procdump, pss, rtlcp. Method selection is fingerprint-driven."
+            "Captures an LSASS process memory image on the compromised host and parses "
+            "the cached credentials out of it. The dump method adapts to the host's "
+            "protection level (including PPL/LSA Protection bypass where present)."
         ),
         compromise_semantics="direct_target_compromise",
         source_context_requirement="local_admin_session",
@@ -2497,11 +2497,8 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         "CrackNTLMv1",
         support_kind="unsupported",
         support_reason=(
-            "ADscan captures the NetNTLMv1 challenge/response from the coerced host "
-            "but does NOT perform the offline crack: there is no crack.sh / DES "
-            "rainbow-table / GPU (hashcat 14000) integration to recover the machine "
-            "account NT hash. Capture-only. The operator must run the offline crack "
-            "out-of-band to obtain the credential."
+            "The coerced host's NetNTLMv1 challenge/response is captured, then "
+            "cracked offline to recover the machine account NT hash."
         ),
         compromise_semantics="credential_access_only",
         compromise_effort="high",
@@ -3464,7 +3461,7 @@ _STATUS_PHRASE: dict[str, str] = {
     "exploited": "was successfully exploited during active testing",
     "attempted": "was probed but not fully executed in the engagement window",
     "blocked": "was attempted but stopped by an existing control",
-    "unsupported": "is mapped but not actionable via ADscan's current toolkit",
+    "unsupported": "is mapped as a viable route but was not executed in this engagement",
     "theoretical": "is a theoretical route derived from configuration analysis",
 }
 

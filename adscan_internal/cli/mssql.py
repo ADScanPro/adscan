@@ -87,6 +87,7 @@ from adscan_internal.services.windows_ai_sensitive_analysis_service import (
     WindowsAISensitiveAnalysisService,
 )
 from adscan_internal.text_utils import strip_ansi_codes
+from rich.markup import escape as rich_escape
 from rich.prompt import Confirm
 from rich.table import Table
 from adscan_core.output._panels import print_panel
@@ -608,7 +609,10 @@ def _fetch_mssql_phase_files(
             f"access_denied={failure_summary['access_denied']} "
             f"file_in_use={failure_summary['file_in_use']} "
             f"other={failure_summary['other']} "
-            f"preview=[{format_fetch_path_preview(items=list(result.per_file_failures))}]"
+            # Escape the literal '[' (\\[) and rich-escape the joined path
+            # preview so a forward-slash / UNC fetch path is not parsed as a
+            # Rich closing tag (MarkupError). Same pattern as scan_outcome_flow.
+            f"preview=\\[{rich_escape(format_fetch_path_preview(items=list(result.per_file_failures)))}]"
         )
     return result
 

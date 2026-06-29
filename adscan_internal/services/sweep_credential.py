@@ -47,14 +47,22 @@ Exemptions (used as-is, never re-minted)
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_info_debug
 from adscan_internal.rich_output import mark_sensitive
 
-__all__ = ["SweepCredential", "resolve_sweep_credential"]
+__all__ = [
+    "SweepCredential",
+    "resolve_sweep_credential",
+    "SweepAuthOutcome",
+    "SweepGuardDecision",
+    "SweepLockoutGuard",
+    "classify_sweep_auth_error",
+]
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,48 @@ class SweepCredential:
 
 def _looks_like_ccache(value: str | None) -> bool:
     return bool((value or "").strip().lower().endswith(".ccache"))
+
+
+def _classify_premint_failure(exc: Exception | None, note: str) -> str | None:
+    """Classify a pre-mint failure into a non-credential root cause, if any.
+
+    The pre-mint can fail for reasons that have nothing to do with the
+    credential's validity — a DC that is unreachable (a stale / firewalled KDC
+    IP: ``connect call failed`` to :88, no route, connection refused) or a local
+    filesystem error writing the ccache (``Permission denied`` / ``[Errno 13]``).
+    Blaming the credential ("verify it is valid") in those cases is misleading
+    and sends the operator down the wrong path.
+
+    Returns a short, client-safe cause string when the failure is clearly
+    NON-credential (DC unreachable / local ccache write error), or ``None`` when
+    the cause is unknown — in which case the caller keeps the credential-oriented
+    default wording.
+    """
+    haystack = f"{note} {exc or ''}".lower()
+
+    # Local ccache filesystem error — writing/opening the ccache failed on the
+    # host, not an auth problem.
+    if (
+        "permission denied" in haystack
+        or "[errno 13]" in haystack
+        or "errno 13" in haystack
+    ):
+        return "local ccache write error (filesystem permissions on the host)"
+
+    # DC / KDC unreachable — a stale or firewalled KDC address. The kerbad /
+    # asysocks connect failure surfaces as "connect call failed" (often with the
+    # ", 88" Kerberos port in the tuple), or as the generic unreachable markers.
+    if (
+        "connect call failed" in haystack
+        or "no route" in haystack
+        or "unreachable" in haystack
+        or "connection refused" in haystack
+        or "timed out" in haystack
+        or "timeout" in haystack
+    ):
+        return "the Kerberos KDC (Domain Controller) was unreachable"
+
+    return None
 
 
 def resolve_sweep_credential(
@@ -175,6 +225,13 @@ def resolve_sweep_credential(
     # 3. Domain principal with a password / NT hash → pre-mint ONE TGT.
     mint_domain = (auth_domain or domain or "").strip()
     minted: str | None = None
+    mint_exc: Exception | None = None
+    mint_note: str = ""
+    # ``ensure_user_ccache`` swallows the underlying failure and returns ``None``
+    # in the common case (it does not raise). Capture the real reason here so the
+    # abort message can classify a DC-unreachable / ccache-fs failure honestly
+    # instead of blaming the credential.
+    mint_errors: list = []
     try:
         from adscan_internal.services.kerberos_ticket_service import (
             ensure_user_ccache,
@@ -186,10 +243,18 @@ def resolve_sweep_credential(
             domain=mint_domain,
             credential=secret,
             dc_ip=(kdc_ip or None),
+            error_out=mint_errors,
         )
     except Exception as exc:  # noqa: BLE001 — best-effort; classified below
         telemetry.capture_exception(exc)
-        notes.append(f"pre-mint raised: {exc}")
+        mint_exc = exc
+        mint_note = f"pre-mint raised: {exc}"
+        notes.append(mint_note)
+
+    if not minted and mint_errors:
+        # The mint returned None with a captured reason; fold it into the note
+        # the classifier inspects.
+        mint_note = f"{mint_note} {' '.join(str(e) for e in mint_errors)}".strip()
 
     if minted:
         print_info_debug(
@@ -223,12 +288,195 @@ def resolve_sweep_credential(
         "pre-mint failed; aborting sweep rather than spraying the secret across "
         "hosts (lockout-safe default)"
     )
-    return SweepCredential(
-        aborted=True,
-        abort_reason=(
+    # The ABORT itself is always correct (never spray a secret whose mint failed),
+    # but the message must state the REAL cause. A DC-unreachable (stale/firewalled
+    # KDC IP) or a local ccache filesystem error is NOT a credential-validity
+    # problem and is NOT a lockout risk — so don't tell the operator to "verify
+    # the credential". Only fall back to that wording when the cause is unknown.
+    classified_cause = _classify_premint_failure(mint_exc, mint_note)
+    if classified_cause:
+        abort_reason = (
+            f"Kerberos TGT pre-mint failed because {classified_cause}; aborting "
+            "the sweep before any host is contacted (no credential reached the "
+            "wire, so this is not a lockout risk). Resolve the underlying issue "
+            "and re-run — this is not a credential-validity problem."
+        )
+    else:
+        abort_reason = (
             "Kerberos TGT pre-mint failed; aborting the sweep to avoid spraying "
             "the credential across every host (domain-lockout protection). "
             "Verify the credential is valid, or re-run with an explicit ccache."
-        ),
+        )
+    return SweepCredential(
+        aborted=True,
+        abort_reason=abort_reason,
         notes=tuple(notes),
     )
+
+
+# ---------------------------------------------------------------------------
+# Sweep circuit-breaker — abort a mass-auth sweep when the credential is dead
+# ---------------------------------------------------------------------------
+#
+# The pre-mint above makes the SECRET mint once. It does NOT stop a sweep from
+# hammering a credential the DC keeps REJECTING: a rejected ``session_setup``
+# (or a re-asserted lockout) still hits the wire per host. Observed live in a
+# 117-host SMB share audit (2026-06-25): after two ``LOGON_FAILURE`` the account
+# locked at host 6, and the sweep kept going — returning ``ACCOUNT_LOCKED_OUT``
+# on every remaining host, re-asserting the lockout domain-wide and burning the
+# rest of the engagement on a dead credential.
+#
+# This guard is the shared circuit-breaker. Every sweep that routes its
+# credential through :func:`resolve_sweep_credential` (SMB / WinRM / MSSQL)
+# should feed each host's auth result into a :class:`SweepLockoutGuard` and stop
+# when it signals ABORT. The point is account protection for the CUSTOMER —
+# the same domain-lockout protection the pre-mint exists for, extended to the
+# rejection path the pre-mint cannot cover.
+
+# A single LOGON_FAILURE can be one offline / mis-joined host; a credential is
+# only "bad / rotated" after consecutive rejections. Conservative default.
+_DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 2
+
+# NTStatus strings surface with and without the ``STATUS_`` prefix depending on
+# the layer that stringifies them (aiosmb NTStatus enum vs raw wire name), so
+# match both spellings. Matching is substring + case-insensitive so a wrapped
+# message ("session_setup failed: NTStatus.ACCOUNT_LOCKED_OUT") still classifies.
+_LOCKOUT_MARKERS = ("account_locked_out",)
+_LOGON_FAILURE_MARKERS = ("logon_failure",)
+
+
+class SweepAuthOutcome(str, Enum):
+    """Classification of one host's authentication result during a sweep."""
+
+    OK = "ok"
+    LOCKED_OUT = "locked_out"
+    LOGON_FAILURE = "logon_failure"
+    OTHER = "other"
+    """A non-auth failure (timeout, unreachable, access-denied to a share, …).
+
+    Treated like a neutral event: it does NOT advance the consecutive-failure
+    counter (an unreachable host is not evidence of a bad credential) and does
+    NOT reset it (so a single reachable host interleaved with failures does not
+    mask a dead credential). Only a clean ``OK`` resets the streak.
+    """
+
+
+def classify_sweep_auth_error(auth_error: str | None) -> SweepAuthOutcome:
+    """Map a per-host auth-error string to a :class:`SweepAuthOutcome`.
+
+    ``None`` / empty means the host authenticated (``OK``). A string is matched
+    case-insensitively against the lockout and logon-failure markers (both the
+    ``STATUS_`` and bare NTStatus spellings); anything else is ``OTHER``.
+    """
+    if not (auth_error or "").strip():
+        return SweepAuthOutcome.OK
+    lowered = auth_error.lower()
+    if any(marker in lowered for marker in _LOCKOUT_MARKERS):
+        return SweepAuthOutcome.LOCKED_OUT
+    if any(marker in lowered for marker in _LOGON_FAILURE_MARKERS):
+        return SweepAuthOutcome.LOGON_FAILURE
+    return SweepAuthOutcome.OTHER
+
+
+@dataclass
+class SweepGuardDecision:
+    """The guard's verdict after recording one host's result.
+
+    ``should_abort`` is the actionable bit; ``reason`` is the operator-facing
+    one-line explanation to surface in the abort panel.
+    """
+
+    should_abort: bool = False
+    reason: str | None = None
+    outcome: SweepAuthOutcome = SweepAuthOutcome.OK
+
+
+@dataclass
+class SweepLockoutGuard:
+    """Stateful circuit-breaker that aborts a mass-auth sweep on a dead credential.
+
+    Feed each host's authentication result via :meth:`record`. The guard signals
+    ABORT on the FIRST ``ACCOUNT_LOCKED_OUT`` (the lockout is already asserted —
+    every further attempt re-asserts it), or after ``consecutive_failure_limit``
+    consecutive ``LOGON_FAILURE`` results (a bad / rotated credential). A clean
+    success resets the consecutive-failure streak.
+
+    The guard is protocol-agnostic: it consumes a stringified auth error, so the
+    SMB, WinRM and MSSQL sweeps can all share one instance / one policy.
+
+    Attributes:
+        consecutive_failure_limit: Consecutive ``LOGON_FAILURE`` results that
+            trip the breaker. Default 2 (a single failure may be one bad host).
+    """
+
+    consecutive_failure_limit: int = _DEFAULT_CONSECUTIVE_FAILURE_LIMIT
+    _consecutive_failures: int = field(default=0, init=False)
+    _tripped: bool = field(default=False, init=False)
+    _trip_reason: str | None = field(default=None, init=False)
+
+    @property
+    def aborted(self) -> bool:
+        """``True`` once the breaker has tripped (latched)."""
+        return self._tripped
+
+    @property
+    def abort_reason(self) -> str | None:
+        return self._trip_reason
+
+    def record(
+        self, host: str | None, auth_error: str | None
+    ) -> SweepGuardDecision:
+        """Record one host's auth result and return the abort decision.
+
+        Args:
+            host: The host that was attempted (for the reason string).
+            auth_error: The host's auth-error string (``None`` / empty on success).
+
+        Returns:
+            A :class:`SweepGuardDecision`. Once tripped, the guard stays tripped
+            (latched) and every subsequent ``record`` returns ``should_abort``.
+        """
+        outcome = classify_sweep_auth_error(auth_error)
+
+        if self._tripped:
+            return SweepGuardDecision(
+                should_abort=True, reason=self._trip_reason, outcome=outcome
+            )
+
+        host_label = host or "?"
+
+        if outcome is SweepAuthOutcome.LOCKED_OUT:
+            self._tripped = True
+            self._trip_reason = (
+                f"Credential locked out at host {host_label} "
+                "(ACCOUNT_LOCKED_OUT). Continuing would re-assert the lockout "
+                "against every remaining host — aborting to protect the account. "
+                "Reset/rotate the credential and re-run."
+            )
+            return SweepGuardDecision(
+                should_abort=True, reason=self._trip_reason, outcome=outcome
+            )
+
+        if outcome is SweepAuthOutcome.LOGON_FAILURE:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.consecutive_failure_limit:
+                self._tripped = True
+                self._trip_reason = (
+                    f"{self._consecutive_failures} consecutive authentication "
+                    f"failures (last at host {host_label}). The credential is "
+                    "likely wrong or rotated; continuing risks locking it out "
+                    "domain-wide — aborting the sweep. Verify the credential and "
+                    "re-run."
+                )
+                return SweepGuardDecision(
+                    should_abort=True, reason=self._trip_reason, outcome=outcome
+                )
+            return SweepGuardDecision(should_abort=False, outcome=outcome)
+
+        if outcome is SweepAuthOutcome.OK:
+            # A clean authentication clears the bad-credential suspicion.
+            self._consecutive_failures = 0
+
+        # OTHER (timeout / unreachable / share-level denial) neither advances nor
+        # resets the streak — it is not evidence about the credential itself.
+        return SweepGuardDecision(should_abort=False, outcome=outcome)

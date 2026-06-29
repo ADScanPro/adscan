@@ -62,6 +62,7 @@ from adscan_core.version_context import (
     resolve_installed_version_info,
 )
 from adscan_core.native_secret_scrub import scrub_native_secrets_buffer
+from adscan_core.attack_technique_names import is_attack_technique_name
 
 try:
     from adscan_internal.services.session_compromise_state_service import (
@@ -185,6 +186,48 @@ _WELL_KNOWN_PRINCIPALS_PASSTHROUGH: frozenset[str] = frozenset(
         "protected users",
         "authenticated users",
         "everyone",
+        # NT AUTHORITY well-known security principals (public SIDs, not org-specific).
+        # Both the bare label and the "NT AUTHORITY\<name>" qualified form resolve
+        # via _is_well_known_principal (whole-string) and _preserve_well_known_qualified
+        # (split on \\). S-1-5-18 / -19 / -20 / -11 / -9 / -2 / -7.
+        "system",
+        "nt authority\\system",
+        "local service",
+        "nt authority\\local service",
+        "network service",
+        "nt authority\\network service",
+        "authenticated users",
+        "nt authority\\authenticated users",
+        "enterprise domain controllers",
+        "nt authority\\enterprise domain controllers",
+        "anonymous logon",
+        "nt authority\\anonymous logon",
+        # Additional public BUILTIN groups
+        "users",
+        "guests",
+        "replicator",
+        "performance log users",
+        "performance monitor users",
+        "distributed com users",
+        "network configuration operators",
+        "iis_iusrs",
+        "event log readers",
+        "access control assistance operators",
+        "rds remote access servers",
+        "rds endpoint servers",
+        "rds management servers",
+        "hyper-v administrators",
+        "key admins",
+        "enterprise key admins",
+        "cloneable domain controllers",
+        "dnsupdateproxy",
+        "group policy creator owners",
+        "read-only domain controllers",
+        "enterprise read-only domain controllers",
+        "domain controllers",
+        "domain computers",
+        "domain users",
+        "domain guests",
         # Spanish group name equivalents (best-effort; environments may differ)
         "administradores del dominio",
         "usuarios del dominio",
@@ -226,6 +269,71 @@ def _is_well_known_principal(value: str) -> bool:
     if not raw:
         return False
     return raw.lower() in _WELL_KNOWN_PRINCIPALS_PASSTHROUGH
+
+
+def _preserve_well_known_qualified(value: str) -> Optional[str]:
+    """Preserve a well-known principal's public NAME while sanitizing its domain.
+
+    Recording paths see qualified forms (``administrators@corp.local``,
+    ``CORP\\administrators``, ``NT AUTHORITY\\SYSTEM``). Whole-string
+    well-known matching misses these because the bare name is in the set but
+    the qualified token is not. This helper splits on ``@`` / ``\\``, checks
+    the NAME part via :func:`_is_well_known_principal`, and — when it matches —
+    returns the public name with the customer-identifying DOMAIN part still
+    pseudonymized.
+
+    The full ``NT AUTHORITY\\SYSTEM`` form is also covered: it matches as a
+    whole-string well-known principal first (so ``NT AUTHORITY`` is preserved
+    too, because it is a public, non-org-identifying authority — not a customer
+    domain).
+
+    Args:
+        value: A candidate principal token (may carry quotes/whitespace).
+
+    Returns:
+        The name-preserved / domain-sanitized string when the value is a
+        well-known principal in qualified form, otherwise ``None`` (caller
+        should fall through to normal redaction).
+    """
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    # Only the QUALIFIED forms preserve here. A bare well-known name reaching the
+    # marker path (force=True) is an explicit sensitivity declaration and must
+    # still redact -- that is the caller's contract, so we never short-circuit a
+    # separator-less token.
+    if "@" not in raw and "\\" not in raw:
+        return None
+    # Fully-public qualified authority (e.g. "NT AUTHORITY\\SYSTEM"): the whole
+    # string is a well-known principal whose prefix is a public authority, not a
+    # customer domain -- preserve it verbatim.
+    if _is_well_known_principal(raw):
+        return raw
+
+    def _sanitize_domain_part(domain_part: str) -> str:
+        # Route through _record_pseudonym so the result is registered and a
+        # domain already pseudonymized by an earlier pass is not re-sanitized
+        # (the heuristic paths run this helper after each other on the same
+        # content; raw _pseudonymize_value would double-map and diverge).
+        if _is_already_sanitized(domain_part):
+            return domain_part
+        return _record_pseudonym(domain_part, "domain")
+
+    if "@" in raw:
+        name_part, domain_part = raw.split("@", 1)
+        if _is_well_known_principal(name_part):
+            if not domain_part:
+                return name_part
+            return f"{name_part}@{_sanitize_domain_part(domain_part)}"
+    if "\\" in raw:
+        domain_part, name_part = raw.rsplit("\\", 1)
+        if _is_well_known_principal(name_part):
+            if not domain_part:
+                return name_part
+            return f"{_sanitize_domain_part(domain_part)}\\{name_part}"
+    return None
 
 
 @functools.lru_cache(maxsize=1)
@@ -847,10 +955,10 @@ def _is_session_capture_enabled() -> bool:
 
 
 SESSION_CAPTURE_ALLOWED_COMMANDS = frozenset(
-    {"install", "ci", "start", "tui", "check", "update", "upgrade"}
+    {"install", "ci", "execute", "doctor", "start", "tui", "check", "update", "upgrade"}
 )
 HOST_SESSION_CAPTURE_COMMANDS = frozenset({"install", "check", "update", "upgrade"})
-CONTAINER_SESSION_CAPTURE_COMMANDS = frozenset({"start", "ci"})
+CONTAINER_SESSION_CAPTURE_COMMANDS = frozenset({"start", "ci", "execute", "doctor"})
 SESSION_WORKSPACE_CONTEXT_COMMANDS = frozenset({"start", "ci"})
 _SESSION_TRACE_ID_ENV = "ADSCAN_SESSION_TRACE_ID"
 _SESSION_WORKSPACE_CONTEXT_FIELDS = frozenset(
@@ -1231,27 +1339,26 @@ else:
 # Resolution order (single source of truth — `resolve_partner_tag`):
 #   1. env var ADSCAN_PARTNER_TAG (override for CI / power-users / legacy baked
 #      images that still carry `ENV ADSCAN_PARTNER_TAG`)
-#   2. persisted file in the volume (`get_adscan_home()/partner.json`,
+#   2. persisted file in the STATE dir (`get_adscan_state_dir()/partner.json`,
 #      field "partner_tag") — written once at runtime by the PRO start gate and
-#      surviving across `docker run` because the volume is bind-mounted
+#      surviving across `docker run --rm` because the state dir is bind-mounted
 #   3. "" when neither is present
 #
 # This mirrors the TELEMETRY_ID pattern above (env override → volume file → fall
-# back). The volume path is the same `~/.adscan` ↔ `/opt/adscan` mount, so the
-# tag persists between containers and is only re-asked if the volume is wiped.
+# back). The file MUST live under the STATE dir (`~/.adscan/state` ↔
+# `/opt/adscan/state`), which the launcher bind-mounts — NOT the home root
+# (`/opt/adscan`), which is only mounted via specific subdirs. Writing it to the
+# unmounted home root meant `docker run --rm` discarded it on every launch and
+# re-prompted the operator for the partner tag on every `adscan start`. A
+# read-side migration heals already-activated installs whose legacy file still
+# sits in the home root on a persistent (non-`--rm`) home.
 _PARTNER_TAG_FILENAME = "partner.json"
 _PARTNER_TAG_FIELD = "partner_tag"
 
 
-def _read_persisted_partner_tag() -> str:
-    """Return the partner tag persisted in the volume, or "" when absent.
-
-    Reads ``get_adscan_home()/partner.json`` and extracts the
-    ``partner_tag`` field. Any read/parse failure is swallowed and treated as
-    "no persisted tag" — resolution then falls through to the empty default.
-    """
+def _extract_partner_tag(partner_file: Path) -> str:
+    """Read and parse a single ``partner.json`` file, or "" on any failure."""
     try:
-        partner_file = get_adscan_home() / _PARTNER_TAG_FILENAME
         if not partner_file.exists():
             return ""
         data = json.loads(partner_file.read_text(encoding="utf-8"))
@@ -1260,6 +1367,32 @@ def _read_persisted_partner_tag() -> str:
     if not isinstance(data, dict):
         return ""
     return str(data.get(_PARTNER_TAG_FIELD, "") or "").strip()
+
+
+def _read_persisted_partner_tag() -> str:
+    """Return the partner tag persisted in the state dir, or "" when absent.
+
+    Reads ``get_adscan_state_dir()/partner.json`` and extracts the
+    ``partner_tag`` field. Any read/parse failure is swallowed and treated as
+    "no persisted tag" — resolution then falls through to the empty default.
+
+    Migration: if the state-dir file is absent but a legacy
+    ``get_adscan_home()/partner.json`` exists (an install activated before the
+    file moved out of the unmounted home root), read the legacy value and
+    re-persist it under the state dir so the install self-heals. Best-effort —
+    a failed migration write never raises.
+    """
+    state_tag = _extract_partner_tag(get_adscan_state_dir() / _PARTNER_TAG_FILENAME)
+    if state_tag:
+        return state_tag
+    legacy_tag = _extract_partner_tag(get_adscan_home() / _PARTNER_TAG_FILENAME)
+    if legacy_tag:
+        try:
+            persist_partner_tag(legacy_tag)
+        except OSError:
+            pass
+        return legacy_tag
+    return ""
 
 
 def resolve_partner_tag() -> str:
@@ -1276,15 +1409,17 @@ def resolve_partner_tag() -> str:
 
 
 def persist_partner_tag(partner_tag: str) -> None:
-    """Persist the partner tag to the volume so it survives across containers.
+    """Persist the partner tag to the state dir so it survives across containers.
 
-    Writes ``get_adscan_home()/partner.json`` with the ``partner_tag`` field.
-    The caller is responsible for validating the tag format before calling this.
+    Writes ``get_adscan_state_dir()/partner.json`` with the ``partner_tag``
+    field. The state dir is bind-mounted by the launcher, so the file survives
+    ``docker run --rm`` (the home root is not mounted directly). The caller is
+    responsible for validating the tag format before calling this.
 
     Args:
         partner_tag: The partner tag to persist (already validated).
     """
-    partner_dir = get_adscan_home()
+    partner_dir = get_adscan_state_dir()
     partner_dir.mkdir(parents=True, exist_ok=True)
     partner_file = partner_dir / _PARTNER_TAG_FILENAME
     partner_file.write_text(
@@ -2416,6 +2551,86 @@ def _apply_quote_wrapped(raw: str, replacement: str) -> str:
     return _fit_to_length(replacement, len(raw))
 
 
+def _scramble_ipv4_provably_fake(value: str) -> Optional[str]:
+    """Deterministically scramble an IPv4 address into a provably-fake one.
+
+    The per-digit scramble used for generic "ip"-typed tokens preserved the
+    dotted shape but applied no per-octet 0-255 clamp, so most outputs had an
+    octet > 255 (obviously fake) -- yet by chance a scramble could land all four
+    octets <= 255 and read as a genuine routable address
+    (e.g. ``90.33.18.184``). That undermines the no-exfiltration guarantee: a
+    reader cannot tell a scrambled IP from real customer infrastructure.
+
+    This replacement guarantees the result is **never** a syntactically-valid
+    routable IPv4: exactly one octet (chosen deterministically from the value)
+    is forced into the 256-999 range (three digits, structurally invalid), while
+    the other three octets carry the full scramble entropy so distinct inputs
+    stay distinct. The mapping is:
+
+    - **Deterministic** -- driven by the same HMAC-keyed byte stream as every
+      other pseudonym, so the same real IP always maps to the same fake one
+      within and across recordings (a reader can still correlate "host X").
+    - **Non-reversible** -- the scramble discards the real octet values; the
+      keyed HMAC cannot be inverted to recover the input.
+    - **Provably non-real** -- one octet is always > 255.
+
+    Args:
+        value: A bare IPv4 address (no CIDR suffix).
+
+    Returns:
+        The provably-fake scrambled address, or ``None`` if ``value`` is not a
+        dotted-quad IPv4 (caller falls back to the generic char scramble).
+    """
+    octets = value.split(".")
+    if len(octets) != 4 or not all(o.isdigit() for o in octets):
+        return None
+
+    stream = _iter_pseudorandom_bytes("ip", value)
+    # Derive a fresh scrambled value for every octet from independent bytes so
+    # distinct inputs stay distinct across the full 0-255 space per octet.
+    scrambled = [next(stream) % 256 for _ in range(4)]
+    # Pick which octet to force out-of-range deterministically from the stream.
+    forced_index = next(stream) % 4
+    # Force that octet to 256-999 (structurally invalid -> provably fake) while
+    # keeping per-input entropy: 256 + (byte over a 744-wide window).
+    scrambled[forced_index] = 256 + (next(stream) % 744)
+    return ".".join(str(o) for o in scrambled)
+
+
+def _scramble_ipv6_provably_fake(value: str) -> Optional[str]:
+    """Deterministically scramble an IPv6 address into a provably-fake one.
+
+    Mirrors :func:`_scramble_ipv4_provably_fake` for IPv6. Without this, a v6
+    address routed through the generic char scramble keeps its colon shape and
+    hex digits, so the output looks like a valid routable v6 address. This maps
+    the address into the IETF documentation prefix ``2001:db8::/32`` (RFC 3849)
+    -- reserved, non-routable, and large enough (96 host bits) that collisions
+    on a realistic recording are negligible while distinct inputs stay distinct.
+
+    The mapping is deterministic (keyed HMAC stream) and non-reversible (the
+    real host bits are discarded and replaced with keyed scramble bytes).
+
+    Args:
+        value: An IPv6 address (no CIDR suffix, no zone id).
+
+    Returns:
+        The provably-fake ``2001:db8:...`` address, or ``None`` if ``value`` is
+        not a valid IPv6 literal.
+    """
+    if ":" not in value:
+        return None
+    try:
+        ipaddress.IPv6Address(value)
+    except ValueError:
+        return None
+
+    stream = _iter_pseudorandom_bytes("ip", value)
+    # Fixed documentation prefix 2001:db8::/32, then 96 keyed bits below it.
+    host_bytes = bytes(next(stream) % 256 for _ in range(12))
+    addr_int = (0x20010DB8 << 96) | int.from_bytes(host_bytes, "big")
+    return str(ipaddress.IPv6Address(addr_int))
+
+
 def _pseudonymize_value(value: str, data_type: str) -> str:
     """Return a deterministic, length-preserving pseudonym for sensitive values.
 
@@ -2435,6 +2650,14 @@ def _pseudonymize_value(value: str, data_type: str) -> str:
     if not value or not isinstance(value, str):
         return value
 
+    # Never pseudonymize a known public technique / edge name (ADCSESC1,
+    # GenericAll, MemberOf, ...). These are vendor-neutral identifiers, not
+    # customer data, and mangling them ("ADCSESC1" -> "ISSSOND8") destroys
+    # triage readability while protecting nothing. Shape-gated so a host
+    # literally named "DCSYNC" still redacts (see is_attack_technique_name).
+    if is_attack_technique_name(value):
+        return value
+
     data_type = data_type.lower()
     if data_type == "ip":
         if _is_ip_passthrough(value):
@@ -2444,6 +2667,20 @@ def _pseudonymize_value(value: str, data_type: str) -> str:
             prefix = cidr_match.group("prefix")
             suffix = cidr_match.group("suffix")
             return f"{_pseudonymize_value(prefix, data_type)}/{suffix}"
+        # Whole-address scramble that is PROVABLY non-real. The old per-digit
+        # scramble (below, in the char loop) preserved the dotted/colon shape but
+        # could land on a syntactically-valid routable address by chance, making a
+        # scrambled IP indistinguishable from real customer infrastructure. These
+        # helpers guarantee structurally-impossible output (an octet > 255 for v4;
+        # the 2001:db8::/32 documentation prefix for v6) while staying
+        # deterministic, distinct, and non-reversible. Falls through to the char
+        # scramble only for IP-typed tokens that are not bare v4/v6 literals.
+        fake_v4 = _scramble_ipv4_provably_fake(value)
+        if fake_v4 is not None:
+            return fake_v4
+        fake_v6 = _scramble_ipv6_provably_fake(value)
+        if fake_v6 is not None:
+            return fake_v6
     preserve_non_alnum = data_type in {
         "domain",
         "hostname",
@@ -2454,6 +2691,7 @@ def _pseudonymize_value(value: str, data_type: str) -> str:
         "workspace",
         "share",
         "ip",
+        "mac",
         "redacted",
     }
     use_vowel_consonant = data_type in {
@@ -2502,6 +2740,15 @@ def _pseudonymize_value(value: str, data_type: str) -> str:
                 result.append(
                     char if preserve_non_alnum else digits[byte % len(digits)]
                 )
+            continue
+
+        if data_type == "mac":
+            # Scramble each hex nibble into another valid hex digit, preserving
+            # the MAC shape (6 groups of 2 hex separated by : or -) and case.
+            # The separators are kept by the preserve_non_alnum branch above, so
+            # this only ever sees a hex character here.
+            replacement = hex_digits[byte % len(hex_digits)]
+            result.append(replacement.upper() if char.isupper() else replacement)
             continue
 
         if char.isdigit():
@@ -2726,6 +2973,13 @@ def _record_pseudonym(value: str, data_type: str, *, force: bool = False) -> str
     """
     if value in _SANITIZED_VALUES:
         return value
+    # Never pseudonymize a known public technique / edge name, on EVERY path
+    # (including force=True from the marker path): a marker means "sensitive",
+    # but a technique label like "ADCSESC1" / "GenericAll" is structurally a
+    # public identifier, never a secret. Shape-gated (CamelCase / ADCSESC<N>)
+    # so a bare all-caps NetBIOS hostname (e.g. "DCSYNC") still redacts.
+    if is_attack_technique_name(value):
+        return value
     # Defense-in-depth: never pseudonymize a structural log-level token, even if
     # a short/word-like secret slipped into the known set or a future loop
     # over-matches. This keeps the recording's scaffolding readable
@@ -2780,6 +3034,31 @@ def _record_pseudonym(value: str, data_type: str, *, force: bool = False) -> str
 def _is_already_sanitized(value: str) -> bool:
     """Check if a value has already been pseudonymized in this pass."""
     return value in _SANITIZED_VALUES
+
+
+def _is_non_identifying_mac(value: str) -> bool:
+    """Return whether a MAC-shaped token is a non-customer-identifying MAC.
+
+    The broadcast MAC (ff:ff:ff:ff:ff:ff) and the all-zero MAC
+    (00:00:00:00:00:00) are protocol constants, not customer infrastructure
+    identifiers, so they survive verbatim for triage readability. The check is
+    case-insensitive and accepts both ``:`` and ``-`` separators.
+
+    Args:
+        value: A token already matched by the MAC-address structural pattern.
+
+    Returns:
+        True if the token is the broadcast or all-zero MAC.
+    """
+    octets = re.split(r"[:-]", value)
+    if len(octets) != 6:
+        return False
+    lowered = [octet.lower() for octet in octets]
+    if all(octet == "ff" for octet in lowered):
+        return True
+    if all(octet == "00" for octet in lowered):
+        return True
+    return False
 
 
 def _replace_table_cell(segment: str, data_type: str) -> str:
@@ -2852,9 +3131,19 @@ def _sanitize_by_markers(
             if data_type == "ip" and _is_ip_passthrough(value):
                 return value
             # A marker is an explicit declaration that this value is sensitive,
-            # so it overrides the well-known-principal passthrough: a MARKED
+            # so it overrides the bare well-known-principal passthrough: a MARKED
             # "administrator" / "Domain Admins" is a registered secret here and
             # must be redacted. force=True keeps only the log-level backstop.
+            #
+            # EXCEPTION — qualified well-known principals (administrators@domain,
+            # CORP\\administrators, NT AUTHORITY\\SYSTEM): preserve the PUBLIC
+            # name and sanitize only the customer domain. The bare name still
+            # redacts under a marker, but the qualified form would otherwise
+            # mangle a public, non-identifying built-in name.
+            if data_type == "user":
+                preserved = _preserve_well_known_qualified(value)
+                if preserved is not None:
+                    return preserved
             return _record_pseudonym(value, data_type, force=True)
 
         content = re.sub(pattern, _replace, content, flags=re.DOTALL)
@@ -2928,6 +3217,68 @@ def _sanitize_rich_output(content: str) -> str:
         content,
     )
 
+    # Structural backstop for Active Directory domain/account SIDs.
+    #
+    # A domain SID (S-1-5-21-<a>-<b>-<c>) and the per-account SIDs derived from
+    # it (one extra RID: ...-<c>-<rid>) are the unique fingerprint of a
+    # customer's directory -- customer-identifying data that must never reach
+    # the uploaded recording. mark_sensitive(..., "sid") at the source sites is
+    # the primary defense; this regex is the fail-closed net for any raw SID
+    # that slipped through unmarked (mirroring the IPv4/FQDN structural nets).
+    #
+    # Anchored on the S-1-5-21- prefix so well-known SIDs are NEVER matched:
+    # S-1-5-18/19/20/11/9/7 (local/system principals) and S-1-5-32-<rid>
+    # (BUILTIN groups, e.g. S-1-5-32-544 Administrators) are not customer-
+    # identifying and must survive verbatim for triage readability.
+    domain_account_sid_pattern = re.compile(
+        r"\bS-1-5-21-[0-9]+-[0-9]+-[0-9]+(?:-[0-9]+)?\b"
+    )
+    content = domain_account_sid_pattern.sub(
+        lambda m: m.group(0)
+        if _is_already_sanitized(m.group(0))
+        else _record_pseudonym(m.group(0), "sid"),
+        content,
+    )
+
+    # Structural backstop for Azure AD Connect / DirSync sync-account names.
+    #
+    # AAD Connect provisions an on-prem sync account named MSOL_<12 hex> (e.g.
+    # MSOL_c95ff8ea0437); the hex suffix is installation-specific, so the name
+    # is a customer-identifying account that must not reach the uploaded
+    # recording. The generic username heuristics don't catch this shape (the
+    # MSOL_ prefix reads as a structural token), so a raw MSOL_<hex> survived
+    # while ordinary usernames were scrambled. Anchored to exactly 12 hex
+    # digits after MSOL_ so a bare "MSOL" or a word like "MSOLAR" is NOT
+    # over-matched. Hex is case-insensitive; the prefix is not (MSOL is fixed).
+    msol_sync_account_pattern = re.compile(r"\bMSOL_[0-9a-fA-F]{12}\b")
+    content = msol_sync_account_pattern.sub(
+        lambda m: m.group(0)
+        if _is_already_sanitized(m.group(0))
+        else _record_pseudonym(m.group(0), "user"),
+        content,
+    )
+
+    # Structural backstop for hardware MAC addresses.
+    #
+    # A host MAC (e.g. from a ligolo agent's network JSON,
+    # "HardwareAddr": "00:15:5d:0b:dd:00") is a customer infrastructure
+    # identifier, and the OUI (first 3 octets) discloses the hardware/hypervisor
+    # vendor -- 00:15:5d is the Microsoft Hyper-V OUI. A raw MAC dumped from
+    # agent output has no marker, so this regex is the fail-closed net mirroring
+    # the IPv4/SID/MSOL structural nets. The 6-group colon/dash-separated hex
+    # shape is specific enough that it does NOT collide with SIDs, IPs, or
+    # hashes (none of which are six :/-separated hex pairs). Broadcast and
+    # all-zero MACs are protocol constants, not customer data, so they survive
+    # verbatim (see _is_non_identifying_mac). The pseudonym preserves the MAC
+    # shape and produces valid hex so the OUI is not recoverable.
+    mac_address_pattern = re.compile(r"\b(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}\b")
+    content = mac_address_pattern.sub(
+        lambda m: m.group(0)
+        if (_is_already_sanitized(m.group(0)) or _is_non_identifying_mac(m.group(0)))
+        else _record_pseudonym(m.group(0), "mac"),
+        content,
+    )
+
     # Redact explicit credential disclosures in log messages early to avoid false positives.
     password_added_pattern = re.compile(
         r"(?i)(password\s+added\s+for\s+user\s+[^\n:]+:\s*)([^\s<>\n]+)"
@@ -2971,7 +3322,12 @@ def _sanitize_rich_output(content: str) -> str:
         domain_repl = _apply_quote_wrapped(
             domain_raw, _record_pseudonym(domain, "domain")
         )
-        user_repl = _apply_quote_wrapped(user_raw, _record_pseudonym(user, "user"))
+        # Preserve a public well-known principal NAME in the user slot; the
+        # domain slot is always sanitized (customer-identifying).
+        if _is_well_known_principal(user):
+            user_repl = _apply_quote_wrapped(user_raw, user)
+        else:
+            user_repl = _apply_quote_wrapped(user_raw, _record_pseudonym(user, "user"))
         replacement = f"{domain_repl}/{user_repl}"
         if pwd:
             pwd_repl = _apply_quote_wrapped(
@@ -3081,7 +3437,12 @@ def _sanitize_rich_output(content: str) -> str:
         user = user_raw.strip("'\"")
         domain = domain_raw.strip("'\"")
         pwd = pwd.strip("'\"") if pwd else None
-        user_repl = _apply_quote_wrapped(user_raw, _record_pseudonym(user, "user"))
+        # Preserve a public well-known principal NAME in the user slot; the
+        # domain slot is always sanitized (customer-identifying).
+        if _is_well_known_principal(user):
+            user_repl = _apply_quote_wrapped(user_raw, user)
+        else:
+            user_repl = _apply_quote_wrapped(user_raw, _record_pseudonym(user, "user"))
         domain_repl = _apply_quote_wrapped(
             domain_raw, _record_pseudonym(domain, "domain")
         )
@@ -3202,6 +3563,10 @@ def _sanitize_rich_output(content: str) -> str:
         token = match.group(0)
         if "@" not in token:
             return token
+        # Qualified well-known principal: keep the public name, sanitize domain.
+        preserved = _preserve_well_known_qualified(token)
+        if preserved is not None:
+            return preserved
         user_part, domain_part = token.split("@", 1)
         user_repl = _record_pseudonym(user_part, "user")
         domain_repl = _record_pseudonym(domain_part, "domain")
@@ -3413,6 +3778,15 @@ def _sanitize_rich_output(content: str) -> str:
         content,
     )
 
+    # Protocol-recognizable native-stack scrub runs BEFORE the generic hex/hash
+    # nets so its informative markers win (e.g. an NTLMSSP message becomes
+    # "<redacted NTLM message: N bytes>", a key line keeps "<principal>:<enctype>:"
+    # visible) instead of being collapsed into an opaque hash pseudonym by the
+    # length-only nets below. The same scrub also runs as the final pass (LAST
+    # LINE OF DEFENCE further down) — it is idempotent, so running it twice is a
+    # no-op on already-redacted text.
+    content = scrub_native_secrets_buffer(content)
+
     # Redact hashes (NTLM / LM:NTLM combinations)
     def _replace_hash_argument(match: re.Match[str]) -> str:
         prefix = match.group(1)
@@ -3427,6 +3801,19 @@ def _sanitize_rich_output(content: str) -> str:
     )
     content = re.sub(
         r"\b[0-9a-f]{32}:[0-9a-f]{32}\b",
+        lambda m: _record_pseudonym(m.group(0), "hash"),
+        content,
+    )
+    # Generic long-hex net (defence-in-depth for Kerberos key material). A
+    # 64-hex AES256 key has no internal word boundary, so the {32} net below
+    # cannot anchor it; this net catches it before upload. The window is bounded
+    # 40..128 hex: the floor (40) keeps the 32-hex NT-hash net's dedicated
+    # handling below and never matches short hex (flags, etypes, seq numbers);
+    # the ceiling (128) covers AES256 (64) and a concatenated key pair while
+    # leaving absurdly long runs to the runaway-value guards (a 1024-char blob is
+    # not a key and the keyword sanitizer deliberately preserves it).
+    content = re.sub(
+        r"(?i)\b[0-9a-f]{40,128}\b",
         lambda m: _record_pseudonym(m.group(0), "hash"),
         content,
     )
@@ -3510,6 +3897,16 @@ def _sanitize_rich_output(content: str) -> str:
             "source domain",
             "target domain",
             "auth domain",
+            # Underscore-compound forms used in debug f-strings. The bare
+            # "domain" keyword above is matched with a \b word boundary, which
+            # does NOT fire inside "current_domain" ('_' is a word char), so
+            # current_domain=Rifa would otherwise leak the NetBIOS short name.
+            "current_domain",
+            "context_domain",
+            "source_domain",
+            "target_domain",
+            "auth_domain",
+            "current_credential_domain",
         ],
         data_type="domain",
         separator_pattern=r"\s*[│|:=]\s*",  # Only match pipe/colon/equals, not spaces

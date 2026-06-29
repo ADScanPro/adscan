@@ -281,6 +281,23 @@ class AIOKerberosClient:
 				override_etype = [override_etype]
 			supported_etypes = override_etype
 
+		# ADscan diagnostic (instrumentation-only): record the etype list actually
+		# sent to the KDC so an intermittent KDC_ERR_ETYPE_NOTSUPP (first mint OK,
+		# later mints fail with the SAME user/salt/KDC) is diagnosable. Bracket-free
+		# marker (Rich drops bracketed prefixes). No secret material is logged.
+		try:
+			logger.debug(
+				'kdc-etype-mint: override=%s requested_etypes=%s nopreauth=%s cert=%s server_salt_preseeded=%s' % (
+					override_etype is not None,
+					[EncryptionType(et).name for et in supported_etypes],
+					self.credential.nopreauth,
+					self.credential.certificate is not None,
+					self.server_salt is not None,
+				)
+			)
+		except Exception:
+			pass
+
 		if self.credential.nopreauth:
 			logger.debug('Generating initial TGT without authentication data')
 			now = self._now()
@@ -386,7 +403,22 @@ class AIOKerberosClient:
 										else aes_salt
 									)
 									break
-						logger.debug('ETYPE-INFO2 salt probe set server_salt=%s' % (self.server_salt,))
+						# ADscan diagnostic: record what ETYPE-INFO2 advertised so an
+						# intermittent salt/supp-enc mismatch is diagnosable. Salt and
+						# supported-etype names are NOT secrets; key material is never logged.
+						try:
+							supp_names = [
+								EncryptionType(et).name for et in (self.server_supp_enc_methods or {}).keys()
+							]
+						except Exception:
+							supp_names = None
+						logger.debug(
+							'kdc-etype-salt-probe: server_salt=%s supp_enc_methods=%s supp_populated=%s' % (
+								self.server_salt,
+								supp_names,
+								bool(self.server_supp_enc_methods),
+							)
+						)
 			except Exception as probe_exc:
 				# Non-fatal: fall through to the authenticated loop, which surfaces
 				# the real error. The probe must never convert a working flow into
@@ -399,16 +431,63 @@ class AIOKerberosClient:
 		# Try every supported encryption type until one works
 		for etype_int in supported_etypes:
 			etype = EncryptionType(etype_int)
+			# ADscan diagnostic: attempt number + etype tried in the authenticated
+			# loop, with the resolved salt/supp-enc state. Makes a first-success-
+			# then-fail pattern visible per mint. Bracket-free; no secrets.
+			try:
+				_attempt_idx = supported_etypes.index(etype_int)
+				logger.debug(
+					'kdc-etype-attempt: attempt=%d/%d etype=%s server_salt_set=%s supp_populated=%s' % (
+						_attempt_idx + 1,
+						len(supported_etypes),
+						etype.name,
+						self.server_salt is not None,
+						bool(self.server_supp_enc_methods),
+					)
+				)
+			except Exception:
+				pass
 			try:
 				preauth_rep = await self.do_preauth(etype, with_pac=with_pac)
 				break
 			except KerberosError as e:
 				if e.errorcode != KerberosErrorCode.KDC_ERR_ETYPE_NOTSUPP:
-					raise e	
+					raise e
 				logger.debug('Failed to get TGT with etype %s' % etype.name)
+				# ADscan diagnostic: the KDC rejected this etype. Record the rejected
+				# etype + whether the KDC supplied e-data so an intermittent
+				# KDC_ERR_ETYPE_NOTSUPP is diagnosable. The advertised supported etypes
+				# are logged below, AFTER the existing (single) select_preferred call
+				# parses them — this branch must NOT call it (extra call = side effects).
+				try:
+					logger.debug(
+						'kdc-etype-notsupp: rejected_etype=%s has_edata=%s server_salt=%s' % (
+							etype.name,
+							bool(e.krb_err_msg.get('e-data')),
+							self.server_salt,
+						)
+					)
+				except Exception:
+					pass
 				# If the server suggested encryption methods, we will use them
 				if e.krb_err_msg.get('e-data'):
 					srv_etype,default_supported_etypes = self.select_preferred_encryption_method(e.krb_err_msg)
+					# ADscan diagnostic: the KDC-advertised supported etypes + the
+					# server-preferred etype it suggested for the retry (parsed by the
+					# call above — no extra call). Names are not secrets.
+					try:
+						_supp_names = [
+							EncryptionType(et).name for et in (self.server_supp_enc_methods or {}).keys()
+						]
+						logger.debug(
+							'kdc-etype-suggested: srv_preferred=%s kdc_supp_etypes=%s server_salt=%s' % (
+								srv_etype.name,
+								_supp_names,
+								self.server_salt,
+							)
+						)
+					except Exception:
+						pass
 					# ADscan vendor fix: respect an explicit caller etype restriction.
 					# When get_TGT was called with override_etype, the server-suggested
 					# retry MUST stay within that list. select_preferred_encryption_method
@@ -482,21 +561,30 @@ class AIOKerberosClient:
 		except Exception as e:
 			return None, None, None, e
 
-	async def get_TGS(self, spn_user:KerberosSPN, override_etype = None, is_linux = False, flags = ['forwardable','renewable','renewable_ok', 'canonicalize']):
+	async def get_TGS(self, spn_user:KerberosSPN, override_etype = None, is_linux = False, flags = ['forwardable','renewable','renewable_ok', 'canonicalize'], force_fresh_tgs = False):
 		"""
 		Requests a TGS ticket for the specified user.
 		Returns the TGS ticket, end the decrpyted encTGSRepPart.
 
 		spn_user: KerberosTarget: the service user you want to get TGS for.
-		override_etype: None or list of etype values (int) Used mostly for kerberoasting, will override the AP_REQ supported etype values (which is derived from the TGT) to be able to recieve whatever tgs tiecket 
+		override_etype: None or list of etype values (int) Used mostly for kerberoasting, will override the AP_REQ supported etype values (which is derived from the TGT) to be able to recieve whatever tgs tiecket
+		force_fresh_tgs: ADscan vendor fix — when True, skip the cached-TGS
+			short-circuit below and ALWAYS contact the KDC for a fresh service
+			ticket (the cached TGT is still loaded from the ccache to sign the
+			TGS-REQ). Reusing a cached service ticket from a generic-TGT ccache
+			produced AP-REQs the server rejected with KRB_ERR_GENERIC; the badauth
+			fresh-TGS gate sets this so a fresh ticket is minted per SPN. Scoped
+			ccaches (S4U/RBCD/silver — no TGT) never set it and keep their one
+			cached service ticket (that IS the capability).
 		"""
-		
-		#first, let's check if CCACHE has the correct ticket already
-		tgs, encTGSRepPart, key, err = self.tgs_from_ccache(spn_user)
-		if err is None:
-			return tgs, encTGSRepPart, key
 
-		
+		#first, let's check if CCACHE has the correct ticket already
+		if not force_fresh_tgs:
+			tgs, encTGSRepPart, key, err = self.tgs_from_ccache(spn_user)
+			if err is None:
+				return tgs, encTGSRepPart, key
+
+
 		if self.kerberos_TGT is None:
 			#let's check if CCACHE has a TGT for us
 			_, err = self.tgt_from_ccache()

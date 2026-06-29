@@ -122,8 +122,8 @@ def _runtime_license_mode() -> str:
 
     PRO is the PyArmor + PyInstaller ``--onefile`` binary; LITE runs from
     Python source inside the runtime container. Several runtime checks
-    (notably the bundled-asset integrity probes for CredSweeper, weasyprint,
-    and other packages with non-Python data files) behave differently
+    (notably the bundled-asset integrity probes for CredSweeper and other
+    packages with non-Python data files) behave differently
     between the two tiers and surface different remediation paths.
 
     Resolution order:
@@ -168,6 +168,97 @@ class CheckFailureRecoveryGuidance:
     instruction: str
     follow_up_message: str | None = None
     interactive_prompt: str | None = None
+
+
+def _launcher_is_older_than_runtime(
+    launcher_version: str, runtime_version: str
+) -> bool:
+    """Return True when the host launcher is the OLDER side of the mismatch.
+
+    Uses PEP 440 comparison; falls back to a string inequality only when the
+    versions cannot be parsed (already known unequal at the call site).
+    """
+    try:
+        from packaging import version as _pkg_version
+
+        return _pkg_version.parse(launcher_version) < _pkg_version.parse(
+            runtime_version
+        )
+    except Exception:
+        # Unparseable versions: we only get here when they already differ, but
+        # we cannot tell direction. Default to the image-stale branch (the more
+        # common case) by reporting "launcher NOT older".
+        return False
+
+
+def _emit_launcher_stale_panel(
+    deps: Any,
+    *,
+    launcher_version: str,
+    launcher_source: str,
+    runtime_version: str,
+    runtime_source: str,
+) -> bool:
+    """Render guidance for the LAUNCHER-older-than-runtime direction.
+
+    This check runs INSIDE the container, so it cannot introspect the host's
+    pipx/pip state. Surface both safe options plus the mandatory shell-hash
+    note. Non-blocking — the runtime contract is still compatible.
+    """
+    deps.print_warning("Host launcher is out of date.")
+    print_panel = getattr(deps, "print_panel", None)
+    if callable(print_panel):
+        print_panel(
+            Group(
+                Text(
+                    "Update recommended: your host launcher is older than the "
+                    "runtime image.",
+                    style=f"bold {COLOR_WARNING}",
+                ),
+                Text(""),
+                Text(
+                    f"Launcher:      {launcher_version} ({launcher_source})",
+                    style=f"bold {COLOR_WARNING}",
+                ),
+                Text(
+                    f"Runtime image: {runtime_version} ({runtime_source})",
+                    style=ADSCAN_PRIMARY,
+                ),
+                Text(""),
+                Text(
+                    "Update the launcher on the host, then refresh your shell so "
+                    "the new launcher is picked up:",
+                    style=ADSCAN_PRIMARY,
+                ),
+                Text(
+                    "  pipx upgrade adscan        (if installed with pipx)",
+                    style="bold",
+                ),
+                Text(
+                    "  pip install --upgrade adscan   (if installed with pip)",
+                    style="bold",
+                ),
+                Text(
+                    "  hash -r   (or open a new terminal)",
+                    style="bold",
+                ),
+            ),
+            title="Host launcher is out of date",
+            border_style=COLOR_WARNING,
+            padding=(1, 2),
+        )
+    deps.print_instruction(
+        "Update the launcher on the host: `pipx upgrade adscan` (if installed "
+        "with pipx) or `pip install --upgrade adscan`, then run `hash -r` or "
+        "open a new terminal."
+    )
+    deps.print_info(
+        f"Host launcher {launcher_version} ({launcher_source}) is older than "
+        f"runtime image {runtime_version} ({runtime_source}). Upgrade the "
+        "launcher on the host (pipx/pip) and run `hash -r`."
+    )
+    # Non-blocking: the contract is compatible, so the scan continues.
+    return True
 
 
 def _check_container_runtime_version_alignment(deps: Any) -> bool:
@@ -235,43 +326,81 @@ def _check_container_runtime_version_alignment(deps: Any) -> bool:
     ):
         return True
 
-    deps.print_warning("Launcher/runtime product versions differ.")
+    # The launcher and the Docker runtime image disagree on product version.
+    # There are TWO directions and they need OPPOSITE remediations:
+    #   - runtime OLDER than launcher  → stale image      → `adscan update`
+    #   - launcher OLDER than runtime  → stale launcher   → upgrade the host
+    #     launcher (pipx/pip) + `hash -r`. `adscan update` is exactly the
+    #     command that FAILS to fix this when launcher self-upgrade is broken,
+    #     so pointing at it here would send the operator in a loop.
+    if _launcher_is_older_than_runtime(launcher_version, runtime_version):
+        return _emit_launcher_stale_panel(
+            deps,
+            launcher_version=launcher_version,
+            launcher_source=launcher_source,
+            runtime_version=runtime_version,
+            runtime_source=runtime_source,
+        )
+
+    # Runtime image is the older side: a stale image can re-hit bugs that were
+    # already fixed upstream, which has cost real engagements multi-hour dead
+    # runs. Non-blocking by design, but it must be loud and actionable.
+    is_pro_tier = _runtime_license_mode() == "PRO"
+
+    deps.print_warning("Runtime image is out of date.")
     print_panel = getattr(deps, "print_panel", None)
     if callable(print_panel):
+        if is_pro_tier:
+            heading = Text(
+                "ACTION REQUIRED before a real engagement",
+                style=f"bold {COLOR_WARNING}",
+            )
+        else:
+            heading = Text(
+                "Update recommended before a real engagement",
+                style=f"bold {COLOR_WARNING}",
+            )
+        panel_title = (
+            "Runtime image is out of date (PRO)"
+            if is_pro_tier
+            else "Runtime image is out of date"
+        )
         print_panel(
             Group(
+                heading,
+                Text(""),
                 Text(
-                    f"Launcher: {launcher_version} ({launcher_source})",
+                    f"Runtime image: {runtime_version} ({runtime_source})",
                     style=f"bold {COLOR_WARNING}",
                 ),
                 Text(
-                    f"Runtime: {runtime_version} ({runtime_source})",
-                    style=f"bold {COLOR_WARNING}",
+                    f"Launcher:      {launcher_version} ({launcher_source})",
+                    style=ADSCAN_PRIMARY,
                 ),
+                Text(""),
                 Text(
-                    "The launcher and Docker runtime are contract-compatible, but "
-                    "they were built from different product versions.",
+                    "Your Docker runtime image is older than your launcher. A stale "
+                    "image can re-hit bugs that are already fixed in the current "
+                    "release, which can waste hours on a live audit.",
                     style=ADSCAN_PRIMARY,
                 ),
                 Text(
-                    "Continuing. For reproducible results, use the launcher/runtime "
-                    "pair from the same delivery.",
+                    "Run 'adscan update' on the host to pull the matching runtime "
+                    "image before starting a real engagement.",
                     style="bold",
                 ),
             ),
-            title="Version Alignment",
+            title=panel_title,
             border_style=COLOR_WARNING,
             padding=(1, 2),
         )
+    deps.print_instruction("Run on the host: adscan update")
     deps.print_info(
-        "Launcher version "
-        f"{launcher_version} ({launcher_source}) does not match runtime version "
-        f"{runtime_version} ({runtime_source})."
+        f"Runtime image {runtime_version} ({runtime_source}) is older than launcher "
+        f"version {launcher_version} ({launcher_source}). Run 'adscan update' on the "
+        "host to refresh the runtime image."
     )
-    deps.print_info(
-        "Continuing because the launcher/runtime contract is compatible. "
-        "For reproducible results, use the launcher/runtime pair from the same delivery."
-    )
+    # Non-blocking: the contract is compatible, so the scan continues.
     return True
 
 

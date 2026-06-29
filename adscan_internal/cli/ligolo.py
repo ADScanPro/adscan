@@ -265,7 +265,11 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
                 f"{mark_sensitive(relaunch.status_label, 'text')} "
                 f"({mark_sensitive(relaunch.reason, 'detail')})"
             )
-            print_info_debug("[ligolo] Tunnel payload: " + str(mark_sensitive(str(record), "json")))
+            # NOTE: do NOT dump the raw record dict here. mark_sensitive(x,
+            # "json") is a no-op (no such SENSITIVE_MARKERS key), so it echoed
+            # the whole record UNWRAPPED — the same no-op-category leak fixed in
+            # the CLI command echo. The per-field-masked _print_tunnel_table
+            # above already shows this record safely.
             return
         if action == "stop":
             if len(argv) < 3:
@@ -459,10 +463,11 @@ def run_ligolo_command(shell: LigoloShell, args: str) -> None:
         preview = service.build_debug_log_preview()
         if preview:
             print_info_debug("[ligolo] Output preview:\n" + preview)
-        print_info_debug(
-            "[ligolo] Status payload: "
-            + str(mark_sensitive(str(state), "json"))
-        )
+        # NOTE: do NOT dump the raw state dict here. mark_sensitive(x, "json")
+        # is a no-op (no such SENSITIVE_MARKERS key) and echoed the whole state
+        # UNWRAPPED — the same no-op-category leak fixed in the CLI command echo.
+        # _print_proxy_status above already renders this state with per-field
+        # masking.
         return
 
     if action == "logs":

@@ -63,6 +63,15 @@ _LAUNCHER_RUNTIME_CONTRACT_VERSION_ENV = "ADSCAN_LAUNCHER_RUNTIME_CONTRACT_VERSI
 _RUNTIME_CONTRACT_VERSION_ENV = "ADSCAN_RUNTIME_CONTRACT_VERSION"
 _RUNTIME_VERSION_ENV = "ADSCAN_RUNTIME_VERSION"
 _RUNTIME_IMAGE_ENV = "ADSCAN_RUNTIME_IMAGE"
+# Build provenance baked into the runtime image at `docker build` time (the git
+# commit SHA the image was built from, plus `git describe` and a UTC timestamp).
+# Unlike the version string — which only changes on a manual pyproject bump and
+# is therefore identical for every build in the window between two bumps — the
+# commit SHA is unique per build, so session triage becomes an exact
+# commit-ancestry check instead of a fuzzy version-string compare.
+_BUILD_COMMIT_ENV = "ADSCAN_BUILD_COMMIT"
+_BUILD_DESCRIBE_ENV = "ADSCAN_BUILD_DESCRIBE"
+_BUILD_TIMESTAMP_ENV = "ADSCAN_BUILD_TIMESTAMP"
 _SOURCE_TREE_VERSION_RE = re.compile(
     r'(?ms)^\[project\].*?^\s*version\s*=\s*"([^"]+)"\s*$'
 )
@@ -136,6 +145,69 @@ def _resolve_source_tree_version() -> str | None:
 def get_source_tree_version() -> str | None:
     """Return the source-tree version from ``pyproject.toml`` when available."""
     return _resolve_source_tree_version()
+
+
+def _none_if_unknown(value: str | None) -> str | None:
+    """Normalize an empty / sentinel build-provenance value to ``None``."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() == "unknown":
+        return None
+    return stripped
+
+
+def get_runtime_build_provenance() -> dict[str, str]:
+    """Return the runtime image's build provenance from baked env vars.
+
+    The runtime image (PRO binary + LITE source) bakes the git commit SHA it was
+    built from into ``ADSCAN_BUILD_COMMIT`` (plus ``ADSCAN_BUILD_DESCRIBE`` and
+    ``ADSCAN_BUILD_TIMESTAMP``). Absent or sentinel ``unknown`` values are
+    omitted so the caller never has to special-case them.
+    """
+    provenance: dict[str, str] = {}
+    commit = _none_if_unknown(os.environ.get(_BUILD_COMMIT_ENV))
+    if commit:
+        provenance["build_commit"] = commit
+    describe = _none_if_unknown(os.environ.get(_BUILD_DESCRIBE_ENV))
+    if describe:
+        provenance["build_describe"] = describe
+    timestamp = _none_if_unknown(os.environ.get(_BUILD_TIMESTAMP_ENV))
+    if timestamp:
+        provenance["build_timestamp"] = timestamp
+    return provenance
+
+
+def get_launcher_build_provenance() -> dict[str, str]:
+    """Return the launcher wheel's build provenance baked at wheel-build time.
+
+    The launcher reads its version from package metadata, not from
+    ``pyproject.toml`` at runtime, so the commit SHA cannot be derived from a
+    file in the install tree. Instead the wheel-build pipeline generates
+    ``adscan_launcher/_build_commit.py`` (a one-line ``BUILD_COMMIT = "<sha>"``)
+    baked INTO the wheel — pip and pipx install the same wheel, so the value
+    travels install-method-agnostically. The module is gitignored / generated;
+    an sdist built outside a git tree falls back to ``"unknown"``.
+    """
+    provenance: dict[str, str] = {}
+    try:
+        # Generated at wheel-build time (scripts/build_pypi_launcher.sh); absent
+        # in the dev tree / sdist, so the import is guarded and best-effort.
+        from adscan_launcher import (  # type: ignore  # pylint: disable=no-name-in-module
+            _build_commit,
+        )
+    except Exception:
+        return provenance
+    commit = _none_if_unknown(getattr(_build_commit, "BUILD_COMMIT", None))
+    if commit:
+        provenance["launcher_build_commit"] = commit
+    describe = _none_if_unknown(getattr(_build_commit, "BUILD_DESCRIBE", None))
+    if describe:
+        provenance["launcher_build_describe"] = describe
+    timestamp = _none_if_unknown(getattr(_build_commit, "BUILD_TIMESTAMP", None))
+    if timestamp:
+        provenance["launcher_build_timestamp"] = timestamp
+    return provenance
 
 
 @functools.lru_cache(maxsize=1)
@@ -245,6 +317,16 @@ def get_telemetry_version_fields() -> dict[str, Any]:
     if runtime_image:
         fields["runtime_image"] = runtime_image
 
+    # Build provenance — the git commit SHA each artifact was built from. The
+    # runtime fields are present inside the container (baked into the image
+    # ENV); the launcher fields are present on the host (baked into the wheel).
+    # Both are omitted when absent / ``unknown`` so a missing one never crashes
+    # or pollutes the payload. Keeping both lets triage answer "is this exact
+    # session already fixed at dev?" via commit ancestry, independent of which
+    # side (image vs launcher) was rebuilt.
+    fields.update(get_runtime_build_provenance())
+    fields.update(get_launcher_build_provenance())
+
     if in_container_runtime:
         fields["runtime_version"] = installed_version
         fields["runtime_version_source"] = version_source
@@ -295,5 +377,7 @@ __all__ = [
     "get_installed_version",
     "get_source_tree_version",
     "get_telemetry_version_fields",
+    "get_runtime_build_provenance",
+    "get_launcher_build_provenance",
     "clear_version_context_caches",
 ]

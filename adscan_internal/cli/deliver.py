@@ -105,6 +105,28 @@ _KIT: tuple[_KitItem, ...] = (
 
 _VALID_SLUGS: tuple[str, ...] = tuple(item.slug for item in _KIT)
 
+# ---------------------------------------------------------------------------
+# Public deliverable SSOT — the single source of truth the rest of the
+# product (REPL, CI, and the cross-boundary web contract test) reads instead
+# of re-deriving the slug set. The slugs were hand-copied in five places
+# before this — the same drift gap that caused the ``--frameworks``/``nis2``
+# mismatch. ``tests/unit/test_cli_web_deliverable_contract.py`` now binds the
+# web copies to these so future drift fails CI.
+# ---------------------------------------------------------------------------
+
+#: Selectable deliverable slugs, in canonical kit order. Mirrors ``_VALID_SLUGS``
+#: (kept as a clean public name so callers never reach into the private alias).
+DELIVERABLE_SLUGS: tuple[str, ...] = _VALID_SLUGS
+
+#: ``{slug: human title}`` for every selectable deliverable — drives the
+#: deliverable checkbox labels (the operator picks titles, we map back to slugs).
+DELIVERABLE_LABELS: dict[str, str] = {item.slug: item.title for item in _KIT}
+
+#: Default deliverable selection: everything. A human-facing deliver run ships
+#: the full kit unless the operator deselects; automation (CI) overrides this
+#: with an explicit ``--only`` and never inherits the full kit by accident.
+DEFAULT_DELIVERABLE_SLUGS: tuple[str, ...] = DELIVERABLE_SLUGS
+
 # ``--only`` aliases. The slug ``executive`` is preserved internally for
 # back-compat (web Celery task, ``Sample_Kit.zip``, every customer script
 # pinned to ``--only executive``), but the artefact it renders is now the
@@ -354,6 +376,56 @@ def _resolve_frameworks(args: argparse.Namespace) -> list[str]:
     return chosen or list(_DEFAULT_FRAMEWORKS)
 
 
+def _resolve_deliverables(args: argparse.Namespace, *, shell: object | None = None) -> str | None:
+    """Resolve which deliverables to render, returning a ``--only`` string.
+
+    Precedence:
+        1. An explicit ``--only`` already on ``args`` wins untouched — automation
+           (CI / the web) sets it deliberately and the checkbox must never
+           override an explicit selection.
+        2. Interactive TTY contexts render a checkbox with every deliverable
+           pre-selected, so the default gesture (Enter) ships the full kit and
+           the operator can deselect down to e.g. only the Security Assessment
+           Report. Routed through the centralized prompt helper so it auto-resolves
+           to ALL deliverables non-interactively (CI/web) and is telemetry-mirrored.
+
+    Args:
+        args: argparse namespace; reads ``only``, writes nothing.
+        shell: Optional shell, threaded into the prompt helper so its
+            non-interactive predicate (``shell.auto`` / posture) is honoured.
+
+    Returns:
+        A comma-separated slug string for ``--only`` (a strict subset, or the
+        full set), or ``None`` when nothing should be narrowed (the caller then
+        treats ``None`` as "all" via :func:`_parse_only`). An explicit
+        ``args.only`` is returned verbatim.
+    """
+    explicit = getattr(args, "only", None)
+    if explicit and str(explicit).strip():
+        return str(explicit)
+
+    from adscan_core.rich_output import questionary_checkbox_values
+
+    labels = [DELIVERABLE_LABELS[slug] for slug in DELIVERABLE_SLUGS]
+    selected_labels = questionary_checkbox_values(
+        title="Select the deliverables to generate (all selected by default):",
+        options=labels,
+        default_values=None,  # None → ALL pre-selected / auto-all non-interactively.
+        shell=shell,
+    )
+
+    # ``None`` = cancelled / prompt unavailable → fall back to the full kit.
+    if not selected_labels:
+        return None
+
+    label_to_slug = {title: slug for slug, title in DELIVERABLE_LABELS.items()}
+    chosen = [label_to_slug[label] for label in selected_labels if label in label_to_slug]
+    if not chosen or len(chosen) == len(DELIVERABLE_SLUGS):
+        # Nothing resolved, or the full set chosen → let _parse_only default to all.
+        return None
+    return ",".join(chosen)
+
+
 # ---------------------------------------------------------------------------
 # Generators — async wrappers around the existing PRO renderers
 # ---------------------------------------------------------------------------
@@ -364,6 +436,7 @@ async def _render_bonus_async(
     output_path: Path,
     workspace_dir: Path | None = None,
     theme: str = "",
+    frameworks: list[str] | None = None,
 ) -> int:
     """Render a single bonus PDF in a worker thread.
 
@@ -371,11 +444,21 @@ async def _render_bonus_async(
     renderer so the playbook / checklist / coverage matrix can re-rank
     their content against the techniques actually observed in the scan.
     ``theme`` overrides the per-bonus default when non-empty.
+
+    ``frameworks`` carries the operator-selected compliance regimes so the
+    playbook/checklist render ONLY those frameworks' controls — the same
+    selection the Security Assessment Report honours. Without this the bonuses
+    fell back to ALL five frameworks and leaked DORA/ENS into an ISO 27001 kit.
     """
     from adscan_internal.cli.bonuses import render_bonus
 
     return await asyncio.to_thread(
-        render_bonus, bonus_key, output_path, workspace_dir=workspace_dir, theme=theme or None
+        render_bonus,
+        bonus_key,
+        output_path,
+        workspace_dir=workspace_dir,
+        theme=theme or None,
+        frameworks=frameworks,
     )
 
 
@@ -586,7 +669,11 @@ async def _render_kit(
         else:
             tasks.append(
                 _render_bonus_async(
-                    item.bonus_key, out_path, workspace_dir, theme=bonus_theme
+                    item.bonus_key,
+                    out_path,
+                    workspace_dir,
+                    theme=bonus_theme,
+                    frameworks=frameworks,
                 )
             )
     sizes = await asyncio.gather(*tasks)
@@ -1340,6 +1427,11 @@ def _prefill_interactive_inputs(args: argparse.Namespace) -> None:
     client, engagement = _resolve_client_meta(args)
     args.client = client
     args.engagement = engagement
+    # Deliverable selection FIRST: a checkbox (everything pre-selected) so the
+    # operator can deselect down to e.g. only the Security Assessment Report. An
+    # explicit ``--only`` is returned verbatim and never overridden; CI/web run
+    # non-interactively and auto-resolve to ALL (or their explicit ``--only``).
+    args.only = _resolve_deliverables(args, shell=getattr(args, "_shell", None))
     try:
         args.frameworks = ",".join(_resolve_frameworks(args))
     except ValueError:
@@ -1387,6 +1479,9 @@ def run_deliver_sync(args: argparse.Namespace) -> int:
 
 
 __all__ = (
+    "DEFAULT_DELIVERABLE_SLUGS",
+    "DELIVERABLE_LABELS",
+    "DELIVERABLE_SLUGS",
     "add_deliver_subparser",
     "run_deliver",
     "run_deliver_sync",

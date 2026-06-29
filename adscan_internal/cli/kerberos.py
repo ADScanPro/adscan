@@ -1086,9 +1086,11 @@ def finalize_roast_results(
             normalized_users[0] if normalized_users else "",
         )
         if normalization_target_user:
+            hashcat_mode = "13100" if roast_type == "kerberoast" else "18200"
             cracking_hashes_file_abs = _normalize_hashes_file_for_hashcat(
                 hashes_file_abs=hashes_file_abs,
                 target_user=normalization_target_user,
+                mode=hashcat_mode,
             )
             cracking_hashes_file_rel = os.path.relpath(
                 cracking_hashes_file_abs,

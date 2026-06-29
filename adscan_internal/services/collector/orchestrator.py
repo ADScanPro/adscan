@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional, Protocol, TYPE_CHECKING
+from typing import Any, Callable, Optional, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from adscan_internal.services.collector.host_collector import HostPhaseProgress
+    from adscan_internal.services.collector.host_sweep_cancellation import (
+        HostSweepCancellation,
+    )
     from adscan_internal.services.domain_posture import DomainPosture
     from adscan_internal.services.posture_sink import PostureSink
 
@@ -55,6 +59,13 @@ class CollectionTiming:
     host_samr: float = 0.0
     host_shares: float = 0.0
     extra: dict[str, float] = field(default_factory=dict)
+    # Operator early-stop coverage for the per-host SMB enrichment sweep. Empty
+    # when the sweep ran to completion (full coverage). When the operator halted
+    # the sweep early (CLI Ctrl+C or the platform button), this carries the
+    # transparent X-of-Y so the report + web can render an audit-defensible
+    # coverage statement: {"early_stopped", "hosts_swept", "hosts_total",
+    # "hosts_remaining", "source"}. The identity graph is always 100%.
+    host_coverage: dict[str, Any] = field(default_factory=dict)
 
     @property
     def host_total(self) -> float:
@@ -95,6 +106,27 @@ class CollectionOrchestrator:
         self._ldap_collector = ldap_collector or ADscanLDAPCollector()
         self._persistence = persistence or CollectorPersistence()
 
+    @staticmethod
+    def _report_progress(
+        progress_callback: Callable[[int], None] | None,
+        result: CollectionResult,
+    ) -> None:
+        """Report the running object count to an optional progress callback.
+
+        Pure observability: invoked at collection-phase boundaries with the
+        number of graph nodes pulled so far (``len(result.nodes)``), so a caller
+        can surface a live "objects pulled" count that climbs mid-run. A None
+        callback is a no-op (default), keeping behaviour byte-for-byte identical
+        to a run without the callback. A callback exception is captured and
+        swallowed so observability can never abort collection.
+        """
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(len(result.nodes))
+        except Exception as exc:  # noqa: BLE001 — progress must never abort collection
+            telemetry.capture_exception(exc)
+
     def collect_domain(
         self,
         *,
@@ -111,12 +143,34 @@ class CollectionOrchestrator:
         posture_sink: Optional["PostureSink"] = None,
         posture_snapshot: Optional["DomainPosture"] = None,
         output_dir: str | None = None,
+        progress_callback: Callable[[int], None] | None = None,
+        host_progress_callback: "Callable[[HostPhaseProgress], None] | None" = None,
+        host_cancellation: "HostSweepCancellation | None" = None,
+        host_cap: int = 0,
     ) -> tuple[CollectionResult, CollectionTiming]:
         """Collect a single domain and return the raw result with per-phase timing.
 
         When ``output_dir`` is supplied it is the workspace domain directory the
         Phase 2 DNS resolver persists ``massdns_resolution_report.json`` into;
         when None the resolver stays in-memory only (no file written).
+
+        ``progress_callback`` is an optional observability hook invoked with the
+        running object count (``len(result.nodes)``) at each collection-phase
+        boundary, so the caller can render live "objects pulled" motion. None
+        (default) makes it a no-op and leaves collection unchanged.
+
+        ``host_progress_callback`` is the DETERMINATE host-phase hook: it is
+        invoked (throttled) during the per-host SMB sweep with a
+        :class:`HostPhaseProgress` carrying hosts ``done`` of ``total`` plus the
+        rolling rate/ETA/elapsed, so the caller can render "342 / 1,847 hosts ·
+        ETA 12m" — a real ETA the object-count hook cannot give (no known total).
+        None (default) is a no-op.
+
+        ``host_cap`` bounds the per-host SMB enrichment sweep to at most this many
+        hosts (representative-first, Tier 0 / DCs / ADCS first), so a large estate
+        stays inside a PoV time budget. ``0`` (default) means unlimited — the full
+        sweep. The identity graph (LDAP) is always 100%; only deep host enrichment
+        is bounded.
         """
         timing = CollectionTiming()
         print_info_verbose(
@@ -142,6 +196,8 @@ class CollectionOrchestrator:
         )
         timing.adcs = result.adcs_elapsed
         timing.ldap = time.monotonic() - _t - timing.adcs
+        # Live observability: the LDAP pass pulled the bulk of the graph nodes.
+        self._report_progress(progress_callback, result)
 
         _t = time.monotonic()
         result.shadow_credential_findings = analyze_shadow_credentials(result)
@@ -159,6 +215,8 @@ class CollectionOrchestrator:
         inject_all_well_known_sid_nodes(result)
         analyze_implicit_well_known_memberships(result)
         timing.post_processing = time.monotonic() - _t
+        # Live observability: well-known SID injection grew the node count.
+        self._report_progress(progress_callback, result)
 
         # Machine-account password rotation policy (audit scope): read the GPO
         # SYSVOL security templates over SMB to flag disabled/relaxed rotation — a
@@ -234,11 +292,33 @@ class CollectionOrchestrator:
                 share=share_cfg,
                 collect_samr=collect_smb,
                 collect_shares=collect_shares,
+                host_progress_callback=host_progress_callback,
+                cancellation=host_cancellation,
             )
+            # Honor an explicit cap from the caller (scan config / web). When 0
+            # (default) the field keeps its env-overridable default, preserving
+            # the unlimited full sweep.
+            if host_cap and host_cap > 0:
+                host_cfg.host_cap = int(host_cap)
             host_timing = collect_domain_hosts(result, host_cfg)
             timing.host_negotiate = host_timing.negotiate
             timing.host_samr = host_timing.samr
             timing.host_shares = host_timing.shares
+            # Carry the operator early-stop coverage up to the report/web. Only
+            # populated when the sweep was halted early; otherwise stays empty
+            # (full coverage) so the surfaces read "100% host enrichment".
+            if host_timing.early_stopped:
+                timing.host_coverage = {
+                    "early_stopped": True,
+                    "hosts_swept": int(host_timing.swept_before_stop),
+                    "hosts_total": int(host_timing.total_dispatch),
+                    "hosts_remaining": max(
+                        0,
+                        int(host_timing.total_dispatch)
+                        - int(host_timing.swept_before_stop),
+                    ),
+                    "source": host_timing.stop_source or "cli",
+                }
 
             # Second-pass audit: findings that need SMB host data (signing,
             # dialect). Extends the list built by the first-pass analyze_audit_findings().
@@ -246,6 +326,8 @@ class CollectionOrchestrator:
                 analyze_host_audit_findings,
             )
             result.audit_findings.extend(analyze_host_audit_findings(result))
+            # Live observability: SMB/share host collection added host nodes.
+            self._report_progress(progress_callback, result)
 
         return result, timing
 
@@ -333,12 +415,23 @@ class CollectionOrchestrator:
         collect_shares: bool = True,
         posture_sink: Optional["PostureSink"] = None,
         posture_snapshot: Optional["DomainPosture"] = None,
+        progress_callback: Callable[[int], None] | None = None,
+        host_progress_callback: "Callable[[HostPhaseProgress], None] | None" = None,
+        host_cancellation: "HostSweepCancellation | None" = None,
+        host_cap: int = 0,
     ) -> tuple[
         dict[str, dict[str, int]],
         dict[str, "CollectionResult"],
         dict[str, "CollectionTiming"],
     ]:
-        """Collect all scopes in sequence, persist each, and resolve cross-domain FSPs."""
+        """Collect all scopes in sequence, persist each, and resolve cross-domain FSPs.
+
+        ``progress_callback`` is an optional observability hook. When supplied it
+        is invoked at collection-phase boundaries with the running object count
+        (graph nodes pulled so far) so the caller can surface live mid-run
+        motion. It defaults to None (no-op), leaving collection byte-for-byte
+        identical to a run without it.
+        """
         results: dict[str, CollectionResult] = {}
         counters: dict[str, dict[str, int]] = {}
         timings: dict[str, CollectionTiming] = {}
@@ -357,6 +450,10 @@ class CollectionOrchestrator:
                 posture_sink=posture_sink,
                 posture_snapshot=posture_snapshot,
                 output_dir=self._domain_output_dir(shell, scope.domain),
+                progress_callback=progress_callback,
+                host_progress_callback=host_progress_callback,
+                host_cancellation=host_cancellation,
+                host_cap=host_cap,
             )
             results[scope.domain] = result
             timings[scope.domain] = timing

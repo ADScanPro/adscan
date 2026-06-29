@@ -735,7 +735,11 @@ def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> b
             ctx.print_error("Failed to update the launcher via pipx.")
             ctx.print_instruction("Try: pipx upgrade adscan")
             return False
-    pip_python = shutil.which("python3") or shutil.which("python")
+    # Target THIS launcher's own interpreter, not whatever python3 is first on
+    # PATH. For a venv / `pip install --user` install, `shutil.which("python3")`
+    # can resolve to a different (system) interpreter and the upgrade lands in
+    # the wrong environment — leaving the running launcher stale.
+    pip_python = sys.executable or shutil.which("python3") or shutil.which("python")
     if not pip_python:
         ctx.print_error("python3 not found; cannot update via pip.")
         return False
@@ -756,16 +760,64 @@ def _update_launcher(ctx: UpdateContext, latest_version: str | None = None) -> b
     return True
 
 
-def _launcher_version_matches(ctx: UpdateContext, expected_version: str | None) -> bool:
-    """Return whether the installed launcher version matches the expected target."""
-    if not expected_version:
-        return False
+def _read_installed_version_clean(ctx: UpdateContext) -> str | None:
+    """Re-read the on-disk installed `adscan` version in a CLEAN subprocess.
+
+    The in-process ``__version__`` is frozen at import time (computed once via
+    ``importlib.metadata.version``), so re-reading it after the upgrade
+    subprocess still returns the OLD value — that is exactly what made "update
+    twice still stale" self-report a no-op and SKIP the restart. Spawning the
+    target env's python re-reads the package metadata fresh from disk, so a
+    successful upgrade is actually observed.
+    """
+    python_exe = sys.executable or shutil.which("python3") or shutil.which("python")
+    if not python_exe:
+        return None
     try:
-        installed_version = str(ctx.get_installed_version() or "").strip()
+        proc = subprocess.run(  # noqa: S603
+            [
+                python_exe,
+                "-c",
+                "import importlib.metadata as m; print(m.version('adscan'))",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=ctx.get_clean_env_for_compilation(),
+            timeout=30,
+        )
     except Exception as exc:  # pragma: no cover - defensive guard
         ctx.telemetry_capture_exception(exc)
-        ctx.print_info_debug(f"[update] Failed to re-read installed version: {exc}")
+        ctx.print_info_debug(f"[update] Clean-subprocess version re-read failed: {exc}")
+        return None
+    if proc.returncode != 0:
+        ctx.print_info_debug(
+            "[update] Clean-subprocess version re-read returned "
+            f"{proc.returncode}: {(proc.stderr or '').strip()}"
+        )
+        return None
+    return (proc.stdout or "").strip() or None
+
+
+def _launcher_version_matches(ctx: UpdateContext, expected_version: str | None) -> bool:
+    """Return whether the ON-DISK launcher version matches the expected target.
+
+    Uses a clean-subprocess metadata re-read (not the frozen in-process
+    ``__version__``) so a successful pip/pipx upgrade is actually detected and
+    the post-update restart is not wrongly skipped.
+    """
+    if not expected_version:
         return False
+    installed_version = _read_installed_version_clean(ctx)
+    if installed_version is None:
+        # We could not verify the on-disk version (no python, timeout, etc.).
+        # Do NOT block the restart on an unverifiable read — the upgrade step
+        # already returned success, so trust it and let the re-exec fire.
+        ctx.print_info_debug(
+            "[update] Could not verify on-disk launcher version; trusting "
+            "the successful upgrade and proceeding to restart."
+        )
+        return True
     if installed_version == str(expected_version).strip():
         return True
     ctx.print_warning(
@@ -775,8 +827,59 @@ def _launcher_version_matches(ctx: UpdateContext, expected_version: str | None) 
         "[update] Launcher version mismatch after update attempt: "
         f"expected={expected_version}, installed={installed_version}"
     )
-    ctx.print_instruction("Rerun `adscan update` from the host after fixing launcher install permissions/state.")
+    _print_launcher_restart_hint(ctx)
     return False
+
+
+def _resolve_launcher_restart_target() -> str | None:
+    """Resolve the relocated `adscan` console-script to re-exec.
+
+    ``os.execv(sys.executable, ...)`` re-execs the INTERPRETER, not the
+    upgraded console-script, so the freshly installed code may not be picked
+    up. Prefer the console-script on PATH (``adscan``); fall back to
+    ``sys.argv[0]`` when it points at a real file.
+    """
+    script = shutil.which("adscan")
+    if script:
+        return script
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0 and os.path.basename(argv0) in {"adscan", "adscan.exe"}:
+        resolved = shutil.which(argv0) or argv0
+        if os.path.isfile(resolved):
+            return resolved
+    return None
+
+
+def _print_launcher_restart_hint(ctx: UpdateContext) -> None:
+    """Tell the operator how to pick up the upgraded launcher when no clean
+    in-process re-exec is possible (bash caches the old path until ``hash -r``).
+    """
+    ctx.print_instruction(
+        "Launcher upgraded. Run `hash -r` or open a new terminal, then re-run "
+        "`adscan update`."
+    )
+
+
+def _restart_into_upgraded_launcher(ctx: UpdateContext) -> None:
+    """Re-exec into the upgraded console-script, or print the shell-hash hint.
+
+    Re-execs the relocated ``adscan`` console-script (not the bare
+    interpreter) so the new code is actually loaded. When the script cannot be
+    resolved, print the explicit ``hash -r`` / new-terminal instruction rather
+    than re-execing the interpreter (which would silently keep running the old
+    package).
+    """
+    target = _resolve_launcher_restart_target()
+    if not target:
+        _print_launcher_restart_hint(ctx)
+        return
+    ctx.print_success("Updates completed, restarting...")
+    try:
+        os.execv(target, [target] + sys.argv[1:])
+    except Exception as exc:  # pragma: no cover - defensive guard
+        ctx.telemetry_capture_exception(exc)
+        ctx.print_info_debug(f"[update] Re-exec into {target!r} failed: {exc}")
+        _print_launcher_restart_hint(ctx)
 
 
 def _update_docker_image(
@@ -1105,8 +1208,7 @@ def offer_updates_for_command(
         )
         if ctx.confirm_ask(prompt, True):
             if _update_launcher(ctx, str(launcher_info.get("latest") or "")):
-                ctx.print_success("Launcher update completed, restarting...")
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                _restart_into_upgraded_launcher(ctx)
         elif critical:
             ctx.print_error(
                 "Refused to continue with a launcher/image major-version mismatch. "
@@ -1115,8 +1217,7 @@ def offer_updates_for_command(
             raise SystemExit(2)
         elif not _confirm_skip_update(ctx, component_label="launcher"):
             if _update_launcher(ctx, str(launcher_info.get("latest") or "")):
-                ctx.print_success("Launcher update completed, restarting...")
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                _restart_into_upgraded_launcher(ctx)
 
     if docker_info.get("needs_update"):
         image_missing_locally = not bool(docker_info.get("image_present"))
@@ -1197,8 +1298,10 @@ def run_update_command(ctx: UpdateContext) -> bool:
     )
 
     if updated_launcher and launcher_restart_ready:
-        ctx.print_success("Updates completed, restarting...")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        _restart_into_upgraded_launcher(ctx)
+    elif updated_launcher and not launcher_restart_ready:
+        # Upgrade ran but we could not confirm a clean in-process restart.
+        _print_launcher_restart_hint(ctx)
     return ok
 
 

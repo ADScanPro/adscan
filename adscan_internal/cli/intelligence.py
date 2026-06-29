@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -13,6 +12,7 @@ from adscan_internal.rich_output import (
     print_error,
     print_info_debug,
     print_info_verbose,
+    print_warning,
 )
 from adscan_internal.services.attack_graph_service import load_attack_graph
 from adscan_internal.services.collector.orchestrator import (
@@ -214,6 +214,171 @@ def _resolve_dc_info(shell: Any, domain: str) -> tuple[str, str | None]:
     return dc_ip, dc_hostname
 
 
+def _emit_collector_operation_progress(
+    target_domain: str,
+    *,
+    label: str,
+    detail: str | None = None,
+    current: int | None = None,
+    rate: float | None = None,
+    elapsed_seconds: float | None = None,
+    done: bool = False,
+) -> None:
+    """Emit one current-operation tick for the share collector long step.
+
+    Live observability only — surfaces "SMB collector · N objects · domain"
+    on the platform's current-operation view. The collection has no known object
+    total up front, so it is INDETERMINATE: it carries a running ``current`` plus
+    the live ``rate`` (objects/sec) and ``elapsed`` but NO ETA (never fabricate
+    one without a total). Best-effort and a no-op unless the structured event
+    sink is enabled (see ``emit_operation_progress``).
+
+    Pass ``done=True`` on the FINAL tick (collection finished) so the platform's
+    live strip clears the operation immediately instead of freezing on the last
+    object count.
+    """
+    try:
+        from adscan_internal.cli.ci_events import emit_operation_progress  # noqa: PLC0415
+
+        emit_operation_progress(
+            # Web contract: the operation KEY stays "share_collector" (the web
+            # matches on it for isHostEnrichmentSweep / the stop button / the
+            # widget gate). Only the user-facing label/message reads "SMB
+            # collector" now. A full key rename is a deferred CLI↔web change.
+            operation="share_collector",
+            label=label,
+            phase="domain_collection",
+            phase_label="Domain Collection",
+            current=current,
+            rate=rate,
+            elapsed_seconds=elapsed_seconds,
+            detail=detail,
+            done=done,
+            message=(
+                f"{label} · {current} objects · {detail}"
+                if current is not None and detail
+                else None
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry must never abort collection
+        telemetry.capture_exception(exc)
+
+
+# Minimum wall-clock gap between two live "objects pulled" ticks. Throttles the
+# collector progress callback so a fast-growing node count emits at a calm ~1s
+# cadence on the platform's current-operation strip instead of flooding it.
+_COLLECTOR_PROGRESS_THROTTLE_SECS = 1.2
+
+
+def _make_collector_progress_callback(target_domain: str):
+    """Build a throttled progress callback for the share collector long step.
+
+    The returned callable accepts the running object count and emits at most one
+    ``emit_operation_progress`` tick per ``_COLLECTOR_PROGRESS_THROTTLE_SECS``,
+    so a climbing count surfaces as live motion ("SMB collector · N objects ·
+    domain") without spamming the event sink. The throttle rate-limits emission
+    frequency only; the count carried is always the latest value at emit time.
+    Pure observability and a no-op without a structured event sink (see
+    ``emit_operation_progress``).
+
+    The callback feeds each running count into a shared :class:`ProgressEstimator`
+    (the same throughput/elapsed computation the CLI ``ProgressDashboard`` uses)
+    so the emitted tick carries the live objects/sec rate and elapsed — matching
+    the terminal — without forking a second estimator.
+    """
+    from adscan_core.tui.progress_dashboard import ProgressEstimator  # noqa: PLC0415
+
+    estimator = ProgressEstimator()
+    state = {"last_emit": 0.0}
+
+    def _callback(current: int) -> None:
+        # Always observe so rate/elapsed stay accurate even on throttled ticks.
+        estimator.observe(int(current))
+        now = time.monotonic()
+        if now - state["last_emit"] < _COLLECTOR_PROGRESS_THROTTLE_SECS:
+            return
+        state["last_emit"] = now
+        rate = estimator.rate
+        _emit_collector_operation_progress(
+            target_domain,
+            label="SMB collector",
+            detail=target_domain,
+            current=int(current),
+            rate=rate if rate > 0 else None,
+            elapsed_seconds=estimator.elapsed_seconds,
+        )
+
+    return _callback
+
+
+def _make_host_progress_callback(target_domain: str):
+    """Build a DETERMINATE host-phase progress callback for the share collector.
+
+    The per-host SMB sweep knows its host list up front (LDAP + the 445 gate ran
+    first), so unlike the object-count callback it can report a real
+    ``hosts done / total`` AND a rolling ETA. The returned callable receives a
+    :class:`HostPhaseProgress` snapshot (computed by the SAME
+    :class:`ProgressDashboard` that drives the CLI rich.live panel) and routes it
+    through :func:`emit_operation_progress` under the SHARED ``share_collector``
+    operation key, so the platform's current-operation strip shows
+    "342 / 1,847 hosts · ETA 12m" — matching the terminal exactly.
+
+    The host_collector throttles the emit cadence itself (and always fires the
+    terminal snapshot), so this callback does no throttling. The ``finished``
+    snapshot stamps ``done=True`` so the web strip clears instead of freezing on
+    the last host. Best-effort: a telemetry failure never aborts collection.
+    """
+
+    def _callback(progress: Any) -> None:
+        try:
+            from adscan_internal.cli.ci_events import (  # noqa: PLC0415
+                emit_operation_progress,
+            )
+
+            emit_operation_progress(
+                # Web contract: key stays "share_collector" (see note above);
+                # only the displayed label/message reads "SMB collector".
+                operation="share_collector",
+                label="SMB collector",
+                phase="domain_collection",
+                phase_label="Domain Collection",
+                current=int(progress.done),
+                total=int(progress.total) if progress.total else None,
+                rate=progress.rate,
+                eta_seconds=progress.eta_seconds,
+                elapsed_seconds=progress.elapsed_seconds,
+                detail=target_domain,
+                done=bool(progress.finished),
+                # Host-keyed message so the strip reads in hosts, not objects.
+                message=(
+                    f"SMB collector · {int(progress.done)} of {int(progress.total)} "
+                    f"hosts · {target_domain}"
+                    if progress.total
+                    else None
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry must never abort collection
+            telemetry.capture_exception(exc)
+
+    return _callback
+
+
+def _resolve_host_cap(shell: Any) -> int:
+    """Resolve the active-host cap from the scan config.
+
+    Reads ``shell.scan_config.host_cap`` (the SSOT set by ``adscan ci`` / the web
+    scan-config form). Absent/malformed config → 0 (unlimited), so a plain
+    interactive run is byte-for-byte the full sweep. The collector still honors
+    ``ADSCAN_COLLECTOR_HOST_CAP`` for an env override; this only forwards an
+    explicit scan-config value.
+    """
+    try:
+        cap = int(getattr(getattr(shell, "scan_config", None), "host_cap", 0) or 0)
+        return cap if cap > 0 else 0
+    except Exception:  # noqa: BLE001 — a bad config must never break collection
+        return 0
+
+
 def run_native_collection(
     shell: Any,
     target_domain: str,
@@ -279,10 +444,15 @@ def run_native_collection(
         posture_snapshot = get_posture(shell.domains_data, domain=target_domain)
 
         from adscan_internal.cli._collection_selector import (
-            prompt_collection_selection,
+            resolve_collection_selection,
         )
 
-        selection = prompt_collection_selection(shell, target_domain)
+        # Config-first then interactive: when a --scan-config disables one or
+        # more optional collectors under phases.steps['domain_collection'], the
+        # selection is built from it without prompting; otherwise the interactive
+        # prompt runs exactly as today (default = ALL collectors). LDAP always
+        # runs regardless.
+        selection = resolve_collection_selection(shell, target_domain)
         # Persist the MSSQL toggle for later re-collection triggers (e.g. the
         # ask_for_user_privs followup re-running the collector for a new
         # credential). The Phase-2 MSSQL collector below is gated directly on
@@ -292,20 +462,63 @@ def run_native_collection(
         except Exception:  # noqa: BLE001 — selection persistence is best-effort
             pass
 
-        counters, collection_results, domain_timings = (
-            CollectionOrchestrator().collect_scope(
-                shell=shell,
-                scopes=[scope],
-                credential=credential,
-                collection_scope=collection_scope,
-                collect_smb=selection.collect_samr,
-                collect_shares=selection.collect_shares,
-                posture_sink=posture_sink,
-                posture_snapshot=posture_snapshot,
+        # Live current-operation telemetry — announce the collector starting so
+        # the platform's "current operation" surface lights up at the head of a
+        # long step, then reports the object count it pulled at completion. Pure
+        # observability: the collector's own logic is untouched.
+        _emit_collector_operation_progress(
+            target_domain, label="SMB collector", detail=target_domain
+        )
+
+        # Operator early-stop for the per-host SMB enrichment sweep. ONE
+        # cooperative-cancellation token, two triggers: the CLI Ctrl+C handler
+        # (in-process flag) and the platform "Stop host enrichment" button (a
+        # sentinel file in this scan's workspace root the collector polls). The
+        # token's predicate checks both; the fan-out drains in-flight hosts and
+        # continues the scan with the partial host set.
+        from adscan_internal.cli.host_sweep_stop import (  # noqa: PLC0415
+            HostSweepCancellation,
+            cli_host_sweep_stop,
+        )
+        from adscan_internal.services.collector.host_sweep_cancellation import (  # noqa: PLC0415
+            host_sweep_stop_sentinel_path,
+        )
+
+        _workspace_root = getattr(shell, "current_workspace_dir", None)
+        host_cancellation = HostSweepCancellation(
+            sentinel_path=(
+                host_sweep_stop_sentinel_path(_workspace_root)
+                if _workspace_root
+                else None
             )
         )
+
+        with cli_host_sweep_stop(host_cancellation, shell=shell):
+            counters, collection_results, domain_timings = (
+                CollectionOrchestrator().collect_scope(
+                    shell=shell,
+                    scopes=[scope],
+                    credential=credential,
+                    collection_scope=collection_scope,
+                    collect_smb=selection.collect_samr,
+                    collect_shares=selection.collect_shares,
+                    posture_sink=posture_sink,
+                    posture_snapshot=posture_snapshot,
+                    progress_callback=_make_collector_progress_callback(target_domain),
+                    host_progress_callback=_make_host_progress_callback(target_domain),
+                    host_cancellation=host_cancellation,
+                    host_cap=_resolve_host_cap(shell),
+                )
+            )
         elapsed = time.time() - started
         domain_counters = counters.get(target_domain, {})
+        _emit_collector_operation_progress(
+            target_domain,
+            label="SMB collector",
+            detail=target_domain,
+            current=int(domain_counters.get("nodes", 0) or 0),
+            done=True,
+        )
         timing = domain_timings.get(target_domain, CollectionTiming())
         print_info_verbose(
             "[intelligence] native collection complete "
@@ -325,9 +538,10 @@ def run_native_collection(
         _emit_collection_performance_telemetry(
             shell, target_domain, domain_counters, timing
         )
+        _surface_host_enrichment_coverage(shell, target_domain, timing)
         collector_result = collection_results.get(target_domain)
         _print_collection_summary_from_graph(shell, target_domain, elapsed)
-        _print_collector_enrichment_panel(collector_result, target_domain)
+        _print_collector_enrichment_panel(collector_result, target_domain, shell=shell)
         _persist_collector_findings(shell, target_domain, collector_result)
         _persist_machine_pwd_rotation_interval(shell, target_domain, collector_result)
         _populate_adcs_metadata(shell, target_domain, collector_result)
@@ -348,6 +562,12 @@ def run_native_collection(
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error(f"Native collection failed: {exc}")
+        # The collector long step ended (in error) — clear the live strip so the
+        # "SMB collector" operation never freezes on its last tick after a
+        # failed collection. Best-effort, mirrors the success-path done emit.
+        _emit_collector_operation_progress(
+            target_domain, label="SMB collector", detail=target_domain, done=True
+        )
     return []
 
 
@@ -503,6 +723,66 @@ def _emit_collection_performance_telemetry(
         telemetry.capture("native_collection_performance", properties)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
+
+
+def _surface_host_enrichment_coverage(
+    shell: Any,
+    domain: str,
+    timing: "CollectionTiming",
+) -> None:
+    """Record + show the SMB host-enrichment coverage when the sweep stopped early.
+
+    No-op when the sweep ran to completion (full coverage). On an operator early
+    stop (CLI Ctrl+C or the platform button) it:
+
+      * prints a transparent coverage line to the operator; and
+      * persists a ``host_enrichment_partial`` technical finding into
+        ``technical_report.json`` so the PDF report AND the web scan summary
+        render the SAME audit-defensible statement — the identity graph is 100%,
+        host enrichment is X of Y (representative-first), the rest queued.
+
+    Best-effort: a persistence failure never aborts the scan.
+    """
+    coverage = getattr(timing, "host_coverage", None) or {}
+    if not coverage.get("early_stopped"):
+        return
+    swept = int(coverage.get("hosts_swept", 0))
+    total = int(coverage.get("hosts_total", 0))
+    remaining = int(coverage.get("hosts_remaining", max(0, total - swept)))
+    source = str(coverage.get("source") or "cli")
+    print_warning(
+        "SMB host enrichment stopped early "
+        f"({'platform' if source == 'platform' else 'operator'}). Coverage — "
+        f"identity graph: 100% (full domain); host enrichment: {swept} of {total} "
+        f"hosts (representative-first); {remaining} remaining queued. The scan "
+        "continues with the collected host data."
+    )
+    try:
+        from adscan_core.reporting.technical_report import (
+            record_collection_coverage,
+        )
+
+        record_collection_coverage(
+            shell,
+            domain,
+            coverage={
+                "early_stopped": True,
+                "identity_graph_complete": True,
+                "hosts_swept": swept,
+                "hosts_total": total,
+                "hosts_remaining": remaining,
+                "ordering": "representative_first",
+                "stopped_by": source,
+                "statement": (
+                    "Identity graph: 100% (full domain). Host enrichment: "
+                    f"{swept} of {total} hosts (representative-first). "
+                    f"{remaining} remaining queued."
+                ),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[intelligence] host-coverage persist failed: {exc}")
 
 
 def _persist_collector_findings(
@@ -824,6 +1104,8 @@ _PRIVILEGED_GROUP_FRAGMENTS: tuple[str, ...] = (
 def _print_collector_enrichment_panel(
     result: Any,
     domain: str,
+    *,
+    shell: Any = None,
 ) -> None:
     """Render post-collection enrichment panels from CollectionResult.
 
@@ -932,214 +1214,62 @@ def _print_collector_enrichment_panel(
             border_style=BRAND_COLORS["warning"],
         )
 
-    # ── Panel 3: Audit Findings (audit scope only) ───────────────────────────
+    # ── Panel 3: Domain Hygiene Audit (audit scope only) ──────────────────────
+    #
+    # CONVERTED to the shared widget contract — proof of "one definition, both
+    # renderers". The hygiene findings are tapped (still-structured
+    # ``AuditFinding`` objects + ``DomainPolicy``) into a ``finding-table``
+    # widget + a ``kpi-strip`` widget by ``widget_builders``. The CLI panel is
+    # then drawn by the GENERIC ``widget_render.render_widget`` — there is no
+    # bespoke hygiene-panel string-building here any more. The SAME widget
+    # payload is emitted live + persisted via ``publish_widget`` so the web
+    # premium component renders the identical contract. A third panel of an
+    # existing widget type would need only a builder + a ``publish_widget``
+    # call; no new render code on either side.
     audit_findings = list(result.audit_findings or [])
     domain_policy = result.domain_policy
 
     if result.collection_scope == "audit" and (audit_findings or domain_policy):
-        # Severity badges with fixed-width text + colour. Two-track signal
-        # so the panel stays usable under NO_COLOR / colourblind operators
-        # (the badge text alone communicates severity), while the colour
-        # reinforces it for everyone else. Width is uniform so badges
-        # column-align without table machinery.
-        severity_colors = {
-            "critical": "[bold red]CRITICAL[/bold red]",
-            "high":     "[red]HIGH    [/red]",
-            "medium":   "[yellow]MEDIUM  [/yellow]",
-            "low":      "[cyan]LOW     [/cyan]",
-            "info":     "[dim]INFO    [/dim]",
-        }
-        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        from adscan_internal.cli.widgets.widget_artifacts import publish_widget
+        from adscan_internal.cli.widgets.widget_builders import (
+            build_hygiene_kpi_widget,
+            build_hygiene_widget,
+        )
+        from adscan_internal.cli.widgets.widget_render import render_widget
 
-        # Single-section layout: every actionable observation goes into
-        # the Findings list. The legacy "Domain Policy" section was a
-        # symptom of an inconsistent contract — half of its rows were
-        # already classified findings by ``audit_analyzer.py`` (e.g. MAQ
-        # as LOW), the rest (account lockout, min length, complexity)
-        # were rendered here but never persisted to ``technical_report.json``
-        # and never reached the catalogued vuln list. The new
-        # ``weak_password_policy`` consolidated finding closes that gap
-        # so password-policy weaknesses now travel end-to-end (panel →
-        # technical_report → PDF).
-        finding_lines: list[str] = []
-        footer_lines: list[str] = []
-
-        # Categories that are noise here because the same data is already
-        # the headline of another finding. Currently empty since the
-        # consolidation of MAQ + password-policy made every category
-        # carry distinct signal.
-        _DUPLICATE_OF_OTHER_FINDING: set[str] = set()
-
-        category_labels = {
-            "stale_user": "Stale enabled users (>90d no logon)",
-            "stale_computer": "Stale enabled computers (>90d no logon)",
-            "pwd_never_expires": "Password never expires",
-            "pwd_predates_policy": "Passwords older than current policy",
-            "passwd_notreqd": "PASSWD_NOTREQD (no password required)",
-            "krbtgt_age": "Krbtgt password age",
-            "machine_quota_risk": "Machine Account Quota risk",
-            "obsolete_os": "Obsolete operating systems",
-            "smb_v1_enabled": "SMBv1 protocol enabled",
-            "smb_signing_disabled": "SMB signing not required",
-            "duplicate_dns_fqdn": "Duplicate computer DNS (multiple FQDNs → one IP)",
-            "machine_pwd_rotation_disabled": "Machine password rotation disabled (GPO)",
-            "machine_pwd_rotation_relaxed": "Machine password rotation relaxed (GPO)",
-            "rc4_only": "RC4-only accounts",
-            "weak_password_policy": "Weak password policy",
-            "pwd_policy_never_modified": "Password policy never modified",
-        }
-        # Denominator sets for contextual X/total display.
-        _USER_HYGIENE_CATS = {"stale_user", "pwd_never_expires", "pwd_predates_policy", "passwd_notreqd"}
-        _COMPUTER_HYGIENE_CATS = {"obsolete_os", "smb_signing_disabled", "smb_v1_enabled", "stale_computer"}
         total_enabled_users = sum(
-            1 for n in result.nodes.values()
-            if n.kind == "User" and n.enabled
-            and not str(n.samaccountname).endswith("$")
+            1
+            for n in result.nodes.values()
+            if n.kind == "User" and n.enabled and not str(n.samaccountname).endswith("$")
         )
-        total_computers = sum(
-            1 for n in result.nodes.values() if n.kind == "Computer"
+        total_computers = sum(1 for n in result.nodes.values() if n.kind == "Computer")
+        pwd_last_changed = (
+            getattr(domain_policy, "pwd_policy_last_changed", None)
+            if domain_policy is not None
+            else None
         )
 
-        by_category: dict[str, list] = {}
-        for f in audit_findings:
-            by_category.setdefault(f.category, []).append(f)
+        kpi_widget = build_hygiene_kpi_widget(
+            domain=domain,
+            audit_findings=audit_findings,
+            total_enabled_users=total_enabled_users,
+            total_computers=total_computers,
+        )
+        hygiene_widget = build_hygiene_widget(
+            domain=domain,
+            audit_findings=audit_findings,
+            total_enabled_users=total_enabled_users,
+            total_computers=total_computers,
+            pwd_policy_last_changed=pwd_last_changed,
+        )
 
-        # Pre-compiled at module scope would be cleaner but keeping the
-        # regex local makes the krbtgt special-case self-contained — the
-        # only consumer is this branch.
-        _KRBTGT_AGE_DAYS_RE = re.compile(r"(\d+)\s+days")
+        # Render ONCE via the generic renderer (defined as data, drawn here).
+        render_widget(kpi_widget.to_payload())
+        render_widget(hygiene_widget.to_payload())
 
-        for cat, items in sorted(
-            by_category.items(),
-            key=lambda x: min(severity_order.get(f.severity, 9) for f in x[1]),
-        ):
-            if cat in _DUPLICATE_OF_OTHER_FINDING:
-                continue
-            label = category_labels.get(cat, cat)
-            worst_sev = min(items, key=lambda f: severity_order.get(f.severity, 9)).severity
-            sev = severity_colors.get(worst_sev, worst_sev)
-            count = len(items)
-
-            if cat == "machine_quota_risk":
-                # MAQ is a domain-wide finding; the count is always 1 and
-                # adds no signal. The interesting value is the MAQ itself
-                # (extracted from the finding detail, format set by
-                # ``audit_analyzer.py``: ``ms-DS-MachineAccountQuota = N — …``).
-                # When we cannot parse it, fall back to the consequence
-                # text so the row still reads correctly.
-                first = items[0]
-                m = re.search(r"=\s*(\d+)", first.detail or "")
-                if m:
-                    count_str = (
-                        f"[bold]{m.group(1)}[/bold] "
-                        f"[dim]— any domain user can join computers[/dim]"
-                    )
-                else:
-                    count_str = (
-                        "[bold]MAQ > 0[/bold] "
-                        "[dim]— any domain user can join computers[/dim]"
-                    )
-            elif cat == "weak_password_policy":
-                # Composite finding — the value is the enumeration of
-                # active sub-issues, persisted in ``detail`` by
-                # ``_analyze_weak_password_policy`` with format
-                # ``Weak Default Domain Password Policy — <issue> · <issue>``.
-                # Trim the prefix so the headline reads cleanly inline.
-                first = items[0]
-                sub_part = (first.detail or "").split("— ", 1)[-1]
-                if sub_part and sub_part != (first.detail or ""):
-                    count_str = (
-                        f"[bold]{sub_part}[/bold]"
-                    )
-                else:
-                    count_str = (
-                        f"[bold]{count}[/bold] sub-issue(s)"
-                    )
-            elif cat == "krbtgt_age":
-                # krbtgt is a single-object finding; the count is always 1
-                # and adds no signal. The *interesting* number is "how
-                # many days since rotation" — that lives in the finding's
-                # detail string (``audit_analyzer.py``). Parse it out and
-                # render it directly so the operator sees the rotation
-                # gap, not a meaningless ``1``.
-                days_ago: int | None = None
-                for item in items:
-                    m = _KRBTGT_AGE_DAYS_RE.search(item.detail or "")
-                    if m:
-                        try:
-                            days_ago = int(m.group(1))
-                            break
-                        except (TypeError, ValueError):
-                            continue
-                if days_ago is not None:
-                    count_str = (
-                        f"[bold]{days_ago}[/bold] days "
-                        f"[dim]since last rotation (>180d recommended)[/dim]"
-                    )
-                else:
-                    # Defensive fallback when audit_analyzer changes the
-                    # detail format. The finding still surfaces; just
-                    # without the headline number.
-                    count_str = f"[bold]{count}[/bold] [dim](rotation overdue)[/dim]"
-            elif cat in _USER_HYGIENE_CATS and total_enabled_users > 0:
-                count_str = f"[bold]{count}[/bold][dim]/{total_enabled_users} enabled users[/dim]"
-            elif cat in _COMPUTER_HYGIENE_CATS and total_computers > 0:
-                count_str = f"[bold]{count}[/bold][dim]/{total_computers} computers[/dim]"
-            else:
-                count_str = f"[bold]{count}[/bold]"
-
-            hv_count = sum(1 for f in items if f.highvalue)
-            hv_suffix = (
-                f"  [red]({hv_count} privileged)[/red]" if hv_count > 0 else ""
-            )
-            finding_lines.append(f"{sev}  {label}: {count_str}{hv_suffix}")
-
-        # ── Footer: contextual metadata (not findings) ─────────────────
-        # The last password-policy attribute change date is contextual:
-        # useful for the auditor to know but not actionable on its own
-        # (the operator decides whether a multi-year-old policy is
-        # concerning given the engagement scope). Render it dim and
-        # under the findings list so it never competes for attention
-        # with a real finding.
-        if domain_policy is not None:
-            pwd_last_changed = getattr(domain_policy, "pwd_policy_last_changed", None)
-            if pwd_last_changed:
-                footer_lines.append(
-                    f"[dim]Password policy attributes last modified: "
-                    f"{pwd_last_changed[:10]}[/dim]"
-                )
-
-        # Single-section render. ``Findings`` is the only header — any
-        # contextual metadata lives in the dim footer.
-        summary_lines: list[str] = []
-        if finding_lines:
-            summary_lines.append(
-                f"[bold]Findings ({len(finding_lines)})[/bold]"
-            )
-            summary_lines.extend(f"  {line}" for line in finding_lines)
-        if footer_lines:
-            if summary_lines:
-                summary_lines.append("")  # blank line before footer
-            summary_lines.extend(footer_lines)
-
-        if summary_lines:
-            # Panel title MUST NOT carry sensitivity markers. Rich `Panel`
-            # measures the title width *before* the real console's
-            # ``MarkerStrippingTextIO`` removes the zero-width characters
-            # from the write path, so the border drawing (╭ ╮) gets
-            # misaligned by the count of invisible markers — the panel
-            # appears "broken" at the corners. The domain is still
-            # sanitised end-to-end: the at-export regex in
-            # ``_sanitize_rich_output`` matches ``[A-Za-z0-9._-]+\.<tld>``
-            # tokens anywhere in the recording, including panel titles,
-            # so removing the markers here costs no telemetry coverage.
-            print_panel(
-                "\n".join(summary_lines),
-                title=(
-                    f"[bold blue]Domain Hygiene Audit — {domain}[/bold blue]"
-                ),
-                border_style=BRAND_COLORS["info"],
-            )
+        # Emit live + persist for the web (same payload, both halves).
+        publish_widget(shell, domain=domain, widget=kpi_widget)
+        publish_widget(shell, domain=domain, widget=hygiene_widget)
     elif result.collection_scope != "audit":
         print_info_verbose(
             "[collector] Audit findings skipped — scope is ctf. "
@@ -1473,6 +1603,78 @@ def _node_tier0_asset_role(node: dict[str, Any]) -> str | None:
     return None
 
 
+def _resolve_target_privilege_tier(
+    target_node: dict[str, Any],
+    *,
+    target_role: str | None,
+    target_is_domain: bool,
+):
+    """Resolve the target node's graded :class:`PrivilegeTier`.
+
+    Grades the Tier 0 boundary so a DC (or the Domain object) is
+    ``TIER0_DIRECT`` and an escalation-capable asset (ADCS CA, Exchange, or a
+    generic Tier 0 host) is ``TIER0_ESCALATION_CAPABLE`` — both Tier 0, not
+    equal. The DC signal reuses the collector SSOT
+    :func:`domain_controller_classifier.classify_computer_node_role`
+    (``primaryGroupID`` 516/521, RODC UAC bit, krbtgt SPN) rather than the
+    sparsely-populated ``is_dc`` flag, then maps role → tier through the
+    group-membership-driven SSOT
+    :func:`compromise_class.privilege_tier_for_computer`. Returns ``None`` for a
+    non-computer, non-domain target (group/user) — the existing
+    compromise-class rules already grade those, and a ``None`` tier keeps the
+    pre-grading behavior for them.
+
+    The resolver works on an attack-graph node that does not carry transitive
+    group memberships, so it uses the SSOT's documented ``is_tier0_asset``
+    degraded-fallback path: any non-DC Tier 0 asset role
+    (``target_role`` set by :func:`_node_tier0_asset_role` — ADCS CA, Exchange,
+    or the generic Tier 0 tag) collapses to ``is_tier0_asset=True`` →
+    escalation-capable. The collector path (``inventory_persistence``) has full
+    membership data and grades by group instead; both converge on the same SSOT.
+    """
+    from adscan_internal.services.compromise_class import (
+        PrivilegeTier,
+        privilege_tier_for_computer,
+    )
+    from adscan_internal.services.domain_controller_classifier import (
+        classify_computer_node_role,
+    )
+
+    if target_is_domain:
+        # The Domain object is the canonical Tier 0 direct terminal.
+        return PrivilegeTier.TIER0_DIRECT
+
+    kind = str(target_node.get("kind") or "")
+    if kind != "Computer":
+        # Group / user / container target — defer to compromise-class grading.
+        return None
+
+    # Authoritative DC detection via the collector SSOT (primaryGroupID etc.).
+    dc_role = classify_computer_node_role(target_node)
+
+    # Any non-DC Tier-0 asset role (ADCS CA / Exchange / generic Tier 0 host) →
+    # escalation-capable, via the SSOT's degraded ``is_tier0_asset`` fallback.
+    # ``target_role`` was resolved upstream by ``_node_tier0_asset_role``.
+    is_tier0_asset = target_role is not None
+
+    # Plain member server vs workstation, from the operatingSystem signal.
+    props = target_node.get("properties") if isinstance(target_node.get("properties"), dict) else {}
+    os_str = ""
+    for key in ("operatingsystem", "operatingSystem"):
+        val = (props or {}).get(key) or target_node.get(key)
+        if val:
+            os_str = str(val).lower()
+            break
+
+    # Single mapping path through the SSOT — DC > Tier0-asset > server >
+    # workstation. Same tier numbers as before; only the derivation is unified.
+    return privilege_tier_for_computer(
+        is_dc=dc_role is not None,
+        is_tier0_asset=is_tier0_asset,
+        is_server="server" in os_str,
+    )
+
+
 def _compute_finding_severity(
     *,
     source_node: dict[str, Any],
@@ -1486,7 +1688,7 @@ def _compute_finding_severity(
         source_is_unauthenticated).
     """
     from adscan_internal.services.compromise_class import CompromiseClass
-    from adscan_internal.services.edge_kind import classify_edge_kind
+    from adscan_internal.services.edge_kind import classify_edge_kind, edge_control_strength
     from adscan_internal.services.severity import (
         EdgeSeverityInput,
         compute_edge_severity,
@@ -1503,6 +1705,10 @@ def _compute_finding_severity(
             source_compromise_class=src_cls,
             target_compromise_class=tgt_cls,
             edge_kind=kind,
+            target_privilege_tier=_resolve_target_privilege_tier(
+                target_node, target_role=target_role, target_is_domain=target_is_domain
+            ),
+            edge_control_strength=edge_control_strength(relation),
             target_is_tier0_asset=target_is_t0_asset,
             target_is_domain=target_is_domain,
         )
@@ -1758,6 +1964,18 @@ def run_attack_path_discovery(
     the auto-flip silently gated execution forever in multi-domain
     workspaces.  Trust the caller's explicit ``build_only``.
     """
+    from adscan_internal.services.scan_phases import phase_is_enabled
+
+    # ``phases.disabled`` may turn off the discovery phase entirely. Only the
+    # interactive discovery/execution pass (``build_only=False``) is skipped;
+    # silent ``build_only=True`` graph builds still run because other phases and
+    # the cross-domain merge depend on those artefacts.
+    if not build_only and not phase_is_enabled(shell, "attack_paths_discovery"):
+        from adscan_core.rich_output import print_info
+
+        print_info("Attack Paths Discovery skipped (disabled in scan configuration).")
+        return
+
     from adscan_internal.cli.attack_graph_reports import run_attack_paths
 
     run_attack_paths(

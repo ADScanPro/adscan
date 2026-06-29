@@ -63,7 +63,11 @@ from adscan_internal.services.attack_step_catalog import (
 )
 from adscan_internal.services.domain_controller_classifier import node_is_rodc_computer
 from adscan_internal.services.edge_kind import classify_edge_kind
-from adscan_internal.services.compromise_class import apply_path_based_classification
+from adscan_internal.services.compromise_class import (
+    PrivilegeTier,
+    apply_path_based_classification,
+    privilege_tier_for_principal,
+)
 from adscan_internal.services.tier_lattice import (
     stamp_records_domain_compromise_tier,
     stamp_records_target_tier,
@@ -2501,6 +2505,96 @@ def _collapse_memberof_prefixes(
     )
 
 
+#: Tier-breakdown bucket keys for the affected-account blast radius. The two
+#: Tier-0 sub-tiers (direct vs escalation-capable) are collapsed into a single
+#: ``tier0`` bucket — the blast-radius KPI distinguishes only the three coarse
+#: ESAE tiers, while directness drives ordering/severity elsewhere.
+_AFFECTED_TIER_BUCKETS: tuple[str, str, str] = ("tier0", "tier1", "tier2")
+
+
+def _coarse_tier_bucket(tier: PrivilegeTier) -> str:
+    """Fold a fine :class:`PrivilegeTier` onto its coarse blast-radius bucket.
+
+    The drill-down breakdown distinguishes only ``tier0`` / ``tier1`` / ``tier2``:
+    both Tier-0 sub-tiers (direct, escalation-capable) collapse into ``tier0``.
+    The SINGLE place the fold is defined so the per-account classification and the
+    aggregate breakdown can never disagree (the per-account fine tiers always sum
+    back to the coarse breakdown).
+    """
+    if tier in (PrivilegeTier.TIER0_DIRECT, PrivilegeTier.TIER0_ESCALATION_CAPABLE):
+        return "tier0"
+    if tier is PrivilegeTier.TIER1:
+        return "tier1"
+    return "tier2"
+
+
+def _affected_users_tier_classification(
+    users: Iterable[str],
+    tier_resolver: Callable[[str], PrivilegeTier],
+) -> tuple[dict[str, int], dict[str, str]]:
+    """Classify affected accounts into a coarse breakdown AND a per-account map.
+
+    The drill-down for "accounts that can take over the domain" surfaces a
+    Tier-2 standard user with a validated path to domain compromise (the headline
+    delta) against the Tier-0 members that can take over because they ALREADY are
+    admins. The aggregate breakdown drives the summary counts; the per-account
+    map lets the report/web badge EACH row with its own Privilege Tier.
+
+    Both outputs come from ONE pass over ONE classification of each account, so
+    the per-account fine tiers always fold back onto the coarse breakdown — they
+    can never disagree.
+
+    Args:
+        users: The affected sAMAccountNames (the FULL blast radius, including
+            already-Tier-0 members — they are part of who can take over).
+        tier_resolver: Maps one account to its :class:`PrivilegeTier` via the
+            engine SSOT (``privilege_tier_for_principal``). Injected so the pure
+            classification logic is unit-testable without a shell.
+
+    Returns:
+        ``(breakdown, tier_map)`` where ``breakdown`` is
+        ``{"tier0": n0, "tier1": n1, "tier2": n2}`` (the two Tier-0 sub-tiers
+        folded into ``tier0``; the three buckets sum to the deduplicated account
+        count) and ``tier_map`` maps each ORIGINAL (un-normalised) account string
+        to its FINE :class:`PrivilegeTier` ``.value`` (``"tier0_direct"`` /
+        ``"tier0_escalation_capable"`` / ``"tier1"`` / ``"tier2"``). The fine
+        values preserve the directness split the coarse bucket discards, so the
+        badge SSOT can render "Tier 0: Domain Control" vs "Escalation-capable".
+    """
+    breakdown = {bucket: 0 for bucket in _AFFECTED_TIER_BUCKETS}
+    tier_map: dict[str, str] = {}
+    seen: set[str] = set()
+    for raw in users:
+        user = str(raw or "").strip()
+        if not user:
+            continue
+        key = user.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            tier = tier_resolver(user)
+        except Exception:  # noqa: BLE001 - a single bad lookup never breaks the report
+            tier = PrivilegeTier.TIER2
+        breakdown[_coarse_tier_bucket(tier)] += 1
+        tier_map[user] = tier.value
+    return breakdown, tier_map
+
+
+def _affected_users_tier_breakdown(
+    users: Iterable[str],
+    tier_resolver: Callable[[str], PrivilegeTier],
+) -> dict[str, int]:
+    """Coarse Tier 0 / 1 / 2 breakdown of the affected accounts.
+
+    Thin wrapper over :func:`_affected_users_tier_classification` that keeps only
+    the aggregate buckets. Retained as the stable public helper for callers (and
+    tests) that need the breakdown alone.
+    """
+    breakdown, _tier_map = _affected_users_tier_classification(users, tier_resolver)
+    return breakdown
+
+
 def _apply_affected_user_metadata(
     shell: object,
     domain: str,
@@ -2511,67 +2605,6 @@ def _apply_affected_user_metadata(
     """Annotate paths with affected-user metadata plus shell-aware fallbacks."""
     if not records:
         return []
-
-    def _filter_low_priv_affected_users(
-        users: list[str],
-        *,
-        scope_name: str,
-        source_name: str,
-        affected_source: str,
-    ) -> list[str]:
-        """Return broad-group affected users with Tier-0 users removed."""
-        normalized_users = sorted(
-            {
-                normalize_samaccountname(str(user))
-                for user in users
-                if normalize_samaccountname(str(user))
-            },
-            key=str.lower,
-        )
-        if not normalized_users:
-            return []
-
-        risk_flags = classify_users_tier0_high_value(
-            shell,
-            domain=domain,
-            usernames=normalized_users,
-        )
-        low_priv_users = [
-            user
-            for user in normalized_users
-            if not bool(getattr(risk_flags.get(user), "is_tier0", False))
-        ]
-        excluded_tier0 = sorted(
-            [
-                user
-                for user in normalized_users
-                if bool(getattr(risk_flags.get(user), "is_tier0", False))
-            ],
-            key=str.lower,
-        )
-        print_info_debug(
-            "[attack_paths] broad-group low-priv filter: "
-            f"domain={mark_sensitive(domain, 'domain')} "
-            f"source={mark_sensitive(source_name or 'N/A', 'group')} "
-            f"scope={mark_sensitive(scope_name, 'group')} "
-            f"resolver={affected_source or 'N/A'} "
-            f"raw_count={len(normalized_users)} "
-            f"lowpriv_count={len(low_priv_users)} "
-            f"excluded_tier0={len(excluded_tier0)}"
-        )
-        if excluded_tier0:
-            preview = ", ".join(
-                mark_sensitive(user, "user") for user in excluded_tier0[:5]
-            )
-            if len(excluded_tier0) > 5:
-                preview += f", +{len(excluded_tier0) - 5} more"
-            print_info_debug(
-                "[attack_paths] broad-group Tier-0 principals excluded from affected scope: "
-                f"domain={mark_sensitive(domain, 'domain')} "
-                f"scope={mark_sensitive(scope_name, 'group')} "
-                f"users={preview}"
-            )
-        return low_priv_users
 
     snapshot = _load_membership_snapshot(shell, domain)
     base_graph = load_attack_graph(shell, domain)
@@ -2626,6 +2659,65 @@ def _apply_affected_user_metadata(
         )
     )
     broad_group_resolution_cache: dict[str, tuple[list[str], str]] = {}
+    # Cache of the per-domain Tier 0/1/2 blast-radius classification, keyed by
+    # scope label, so a broad-group path shared across many records classifies
+    # once. Holds BOTH the coarse breakdown and the per-account fine-tier map.
+    broad_group_tier_classification_cache: dict[
+        str, tuple[dict[str, int], dict[str, str]]
+    ] = {}
+
+    # Recursive (transitive) group closure for principals, so a user's own
+    # Privilege Tier is derived from EVERY group it belongs to, not just the
+    # direct ones — the same transitive view the collector stamps onto
+    # users.json. Built once per call and reused by the tier resolver below.
+    _membership_closure: dict[str, tuple[str, ...]] = (
+        _build_recursive_membership_closure(domain, snapshot)
+        if isinstance(snapshot, dict)
+        else {}
+    )
+
+    def _tier_classification_for_affected(
+        users: list[str],
+    ) -> tuple[dict[str, int], dict[str, str]]:
+        """Tier 0/1/2 classification for a broad-group affected-account set.
+
+        Returns ``(breakdown, tier_map)`` — the coarse Tier 0/1/2 counts plus a
+        per-account map of (normalised sAMAccountName -> fine PrivilegeTier value)
+        so the drill-down can badge each row. Reuses the engine Privilege Tier
+        SSOT (``privilege_tier_for_principal`` over each account's transitive
+        group closure), with the identity-risk Tier-0 flag as a floor — catching
+        RID-500 Administrator and any account the graph already flagged Tier 0
+        even when its group closure is absent from the snapshot (the same SSOT the
+        previous low-priv strip trusted).
+        """
+        normalized_users = sorted(
+            {
+                normalize_samaccountname(str(user))
+                for user in users
+                if normalize_samaccountname(str(user))
+            },
+            key=str.lower,
+        )
+        if not normalized_users:
+            return {bucket: 0 for bucket in _AFFECTED_TIER_BUCKETS}, {}
+        risk_flags = classify_users_tier0_high_value(
+            shell,
+            domain=domain,
+            usernames=normalized_users,
+        )
+
+        def _resolver(samaccountname: str) -> PrivilegeTier:
+            canonical = _canonical_membership_label(domain, samaccountname)
+            groups = _membership_closure.get(canonical, ()) if canonical else ()
+            sid = label_sid_map.get(canonical or "", "") if canonical else ""
+            tier = privilege_tier_for_principal(list(groups), sid=sid or None)
+            if not tier.is_tier0:
+                risk = risk_flags.get(normalize_samaccountname(str(samaccountname)))
+                if bool(getattr(risk, "is_tier0", False)):
+                    return PrivilegeTier.TIER0_DIRECT
+            return tier
+
+        return _affected_users_tier_classification(normalized_users, _resolver)
 
     fallback_domain_users_source = ""
     enabled_users = get_enabled_users_for_domain(shell, domain)
@@ -2748,15 +2840,15 @@ def _apply_affected_user_metadata(
                     affected_count = len(affected_users)
                     if affected_count > 0:
                         affected_source = "snapshot_group_members"
-                if is_broad_group_scope and affected_users:
-                    affected_users = _filter_low_priv_affected_users(
-                        affected_users,
-                        scope_name=scope_name,
-                        source_name=source_name,
-                        affected_source=affected_source,
-                    )
-                    affected_count = len(affected_users)
                 if is_broad_group_scope:
+                    # Blast-radius fix: the affected set for "accounts that can
+                    # take over the domain" is the FULL broad-group population —
+                    # the already-Tier-0 members can take over because they ARE
+                    # admins, the lower-tier members because they reach Tier 0
+                    # via the path. We DO NOT strip the Tier-0 members here (the
+                    # old behaviour undercounted by exactly that delta); instead
+                    # we expose a Tier 0/1/2 breakdown of the full set so the
+                    # report/web can surface the delta. Stored is the full set.
                     broad_group_resolution_cache[scope_label] = (
                         list(affected_users),
                         affected_source,
@@ -2836,6 +2928,43 @@ def _apply_affected_user_metadata(
                 f"existing_count={existing_user_count} "
                 f"resolver={affected_source or 'N/A'}"
             )
+
+        # Explicit broad-group BOOLEAN CONTRACT (Defect A fix). The downstream
+        # exposure-KPI aggregator must NOT infer "all enabled domain users" from
+        # the fragile ``affected_users_source`` string allowlist (which drifted
+        # out of sync with the resolver's actual source tokens). It reads THIS
+        # boolean, stamped directly from the ``is_broad_group_scope`` the
+        # materializer already computed. Stamped for every broad-group path —
+        # independent of whether the user list itself was refreshed this pass —
+        # so idempotent re-runs and the metadata-preserved branch both carry it.
+        if is_broad_group_scope:
+            meta["affected_users_all_enabled"] = True
+            # Tier 0/1/2 classification of the FULL blast radius (the drill-down
+            # the report/web consume to surface the Tier-2 -> Tier-0 delta).
+            # Computed once per scope label and reused across every path sharing
+            # it. Stamps BOTH the coarse breakdown (summary counts) and the
+            # per-account fine-tier map (so every drill-down row can be badged by
+            # its own Privilege Tier). Both come from ONE classification pass, so
+            # the per-account tiers always fold back onto the breakdown.
+            breakdown_users = (
+                meta.get("affected_users")
+                if isinstance(meta.get("affected_users"), list)
+                else affected_users
+            )
+            if scope_label in broad_group_tier_classification_cache:
+                tier_breakdown, tier_map = broad_group_tier_classification_cache[
+                    scope_label
+                ]
+            else:
+                tier_breakdown, tier_map = _tier_classification_for_affected(
+                    [str(u) for u in (breakdown_users or []) if isinstance(u, str)]
+                )
+                broad_group_tier_classification_cache[scope_label] = (
+                    tier_breakdown,
+                    tier_map,
+                )
+            meta["affected_users_tier_breakdown"] = dict(tier_breakdown)
+            meta["affected_users_tier_map"] = dict(tier_map)
 
         enriched.append(current)
 
@@ -7133,6 +7262,57 @@ def _bake_edge_technique_knowledge(relation_norm: str) -> dict[str, Any] | None:
     return baked
 
 
+def _personalize_edge_knowledge(
+    relation_norm: str,
+    edge_notes: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Weave THIS edge's concrete assets into its baked technique knowledge.
+
+    The base knowledge from :func:`_bake_edge_technique_knowledge` is shared
+    (cached) per relation, so it carries the generic catalog prose. This builds
+    a per-edge COPY whose impact/remediation name the exact assets on this edge
+    (the abused certificate template, the enrolling principal), so the paid web
+    edge-detail panel reads "ESC1 (DOMAIN USERS can enrol)" instead of "the
+    affected template". Never mutates the cached base. Returns ``None`` when the
+    relation maps to no technique (so the caller stamps nothing).
+
+    Mirrors the finding-side weave in
+    ``report_service.sync_attack_graph_findings`` via the SAME affected-assets
+    SSOT, so the edge card and the finding card name identical assets.
+    """
+    base = _bake_edge_technique_knowledge(relation_norm)
+    if not isinstance(base, dict) or not base:
+        return base
+    if not isinstance(edge_notes, dict) or not edge_notes:
+        return base
+    try:
+        from adscan_internal.pro.reporting.affected_assets import (
+            weave_specifics_into_knowledge,
+        )
+    except Exception:  # noqa: BLE001 — LITE/runtime without the PRO catalog
+        return base
+    vuln_key = str(base.get("vuln_key") or "").strip()
+    if not vuln_key:
+        return base
+    # Synthesise the minimal ``details`` shape the specifics SSOT expects: one
+    # attack-graph edge whose source/target/notes carry the concrete assets.
+    synthetic_details = {
+        "attack_graph_edges": [
+            {
+                "relation": relation_norm,
+                "source": edge_notes.get("source_label") or "",
+                "target": edge_notes.get("target_label") or "",
+                "notes": edge_notes,
+            }
+        ]
+    }
+    try:
+        return weave_specifics_into_knowledge(vuln_key, base, synthetic_details)
+    except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
+        telemetry.capture_exception(exc)
+        return base
+
+
 def upsert_edge(
     graph: dict[str, Any],
     *,
@@ -7227,15 +7407,6 @@ def upsert_edge(
             edge["vuln_key"] = edge_vuln_key
             # Phase 2: keep canonical EdgeKind in sync with current catalog.
             edge["kind"] = classify_edge_kind(relation_norm).value
-            # Bake the technique-knowledge prose so the paid web edge panel can
-            # render it without importing the PRO catalog. Healed on re-sync:
-            # stamp when present, drop a stale block if the relation no longer
-            # maps to a technique.
-            baked_knowledge = _bake_edge_technique_knowledge(relation_norm)
-            if baked_knowledge:
-                edge["knowledge"] = baked_knowledge
-            elif "knowledge" in edge:
-                edge.pop("knowledge", None)
             current = str(edge.get("status") or "discovered")
             status_changed = _status_rank(desired_status) > _status_rank(current)
             if status_changed:
@@ -7254,6 +7425,17 @@ def upsert_edge(
             )
             if merged_notes:
                 edge["notes"] = merged_notes
+            # Bake the technique-knowledge prose so the paid web edge panel can
+            # render it without importing the PRO catalog. Personalised with THIS
+            # edge's concrete assets (template name, enrolling principal) from the
+            # merged notes, so the web edge-detail names the exact assets. Healed
+            # on re-sync: stamp when present, drop a stale block if the relation
+            # no longer maps to a technique.
+            baked_knowledge = _personalize_edge_knowledge(relation_norm, merged_notes)
+            if baked_knowledge:
+                edge["knowledge"] = baked_knowledge
+            elif "knowledge" in edge:
+                edge.pop("knowledge", None)
             return edge
 
     share_identity = _edge_share_identity(relation_norm, notes)
@@ -7278,9 +7460,13 @@ def upsert_edge(
     }
     # Bake the rich technique-knowledge prose onto the edge so the paid web edge
     # panel renders a high-level + technical brief without importing the PRO
-    # catalog. Only technique edges (those with a resolvable catalog entry)
-    # carry it; structural edges (MemberOf, Contains, ...) stay clean.
-    baked_knowledge = _bake_edge_technique_knowledge(relation_norm)
+    # catalog. Personalised with THIS edge's concrete assets (template name,
+    # enrolling principal) so the web edge-detail names the exact assets. Only
+    # technique edges (those with a resolvable catalog entry) carry it;
+    # structural edges (MemberOf, Contains, ...) stay clean.
+    baked_knowledge = _personalize_edge_knowledge(
+        relation_norm, entry.get("notes") if isinstance(entry.get("notes"), dict) else None
+    )
     if baked_knowledge:
         entry["knowledge"] = baked_knowledge
     edges.append(entry)

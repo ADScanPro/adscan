@@ -153,6 +153,33 @@ def _node_sam_or_label(node: dict[str, Any] | None, fallback: str) -> str:
     return label
 
 
+def _node_object_sid(node: dict[str, Any] | None) -> str | None:
+    """Return the node's objectSid (normalized to the ``S-1-...`` prefix) or None.
+
+    The SID is the unambiguous identity for resolving a tombstone DN — it is
+    preserved across AD Recycle Bin deletion. Mirrors the collector's node keying
+    (``object_id`` == SID) and the graph-layer ``objectid``/``objectId`` keys.
+    """
+    if not isinstance(node, dict):
+        return None
+    props = _node_props(node)
+    for value in (
+        props.get("objectid"),
+        props.get("objectId"),
+        node.get("objectid"),
+        node.get("objectId"),
+        node.get("object_id"),
+    ):
+        if isinstance(value, str) and value.strip():
+            sid = value.strip()
+            idx = sid.upper().find("S-1-")
+            if idx != -1:
+                sid = sid[idx:]
+            if sid.upper().startswith("S-1-"):
+                return sid.upper()
+    return None
+
+
 def _resolve_domain_password(shell: object, domain: str, username: str) -> str | None:
     domains_data = getattr(shell, "domains_data", None)
     if not isinstance(domains_data, dict):
@@ -609,6 +636,11 @@ class AceStepContext:
     # the existing enable-first check then handles a restored-but-disabled account.
     target_tombstoned: bool = False
     target_deleted_dn: str | None = None
+    # objectSid of the target — preserved across AD Recycle Bin deletion, so it is
+    # the unambiguous key for resolving the real tombstone DN when target_deleted_dn
+    # is absent (cached/merged graph node). msDS-LastKnownRDN is the clean RDN.
+    target_sid: str | None = None
+    target_last_known_rdn: str | None = None
 
 
 ACL_ACE_RELATIONS: set[str] = {
@@ -806,6 +838,10 @@ def build_ace_step_context(
         if target_tombstoned
         else None
     )
+    target_sid = _node_object_sid(to_node)
+    target_last_known_rdn = (
+        str(_target_props.get("last_known_rdn") or "").strip() or None
+    )
     marked_domain = mark_sensitive(domain, "domain")
     marked_from = mark_sensitive(from_label, "node")
     marked_to = mark_sensitive(to_label, "node")
@@ -839,6 +875,8 @@ def build_ace_step_context(
         member_to_add=member_to_add,
         target_tombstoned=target_tombstoned,
         target_deleted_dn=target_deleted_dn,
+        target_sid=target_sid,
+        target_last_known_rdn=target_last_known_rdn,
     )
 
 
@@ -1271,11 +1309,18 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 if Confirm.ask(
                     "Restore it from the AD Recycle Bin first?", default=True
                 ):
+                    # Pass the tombstone DN when known; otherwise the SID +
+                    # sAMAccountName so the service resolves the real Deleted-Objects
+                    # DN. NEVER fall back to the bare label as a search base — that is
+                    # an invalid base the DC always rejects with noSuchObject.
                     if not shell.restore_deleted_object(
                         context.domain,
                         context.exec_username,
                         context.exec_password,
-                        context.target_deleted_dn or context.target_sam_or_label,
+                        context.target_deleted_dn,
+                        object_sid=context.target_sid,
+                        sam_account_name=context.target_sam_or_label,
+                        last_known_rdn=context.target_last_known_rdn,
                     ):
                         print_warning(
                             f"Could not restore {marked_to}. Skipping exploitation."

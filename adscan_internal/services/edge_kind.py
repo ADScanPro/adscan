@@ -126,6 +126,13 @@ _AUTH_EDGES: Final[frozenset[str]] = frozenset(
         # Anonymous / null sessions
         "GuestSession",
         "LDAPAnonymousBind",
+        # Credential recovered from an AD object's description/info attribute
+        # (catalog step "userdescription"). The recovered secret authenticates
+        # AS that principal, so this is an entry/auth vector — same class as the
+        # session/credential edges above. Without this, a password pulled from a
+        # description field collapses to UNKNOWN and its entry vector is dropped
+        # from attack-path computation.
+        "UserDescription",
     }
 )
 
@@ -191,8 +198,14 @@ _DERIVED_EDGES: Final[frozenset[str]] = frozenset(
         "NoPac",
         "PrintNightmare",
         "BadSuccessor",
-        # Native CVE scanner Slice 3 — host-level CVEs and NTLM enablers
+        # Native CVE scanner Slice 3 — host-level CVEs and NTLM enablers.
+        # Both spellings are kept: BH CE / display uses the hyphenated
+        # "MS17-010", but the attack-step catalog's bh_cypher_names emits the
+        # hyphen-free "MS17010". Case-insensitive lookup can't bridge a hyphen
+        # difference, so both forms must be listed or the catalog form drifts to
+        # UNKNOWN.
         "MS17-010",
+        "MS17010",
         "SMBGhost",
         "PrinterBugSurface",
         "WebDAVEnabled",
@@ -371,3 +384,103 @@ def is_terminal_kind(kind: EdgeKind) -> bool:
     tier directly.
     """
     return kind in {EdgeKind.CONTROL, EdgeKind.DERIVED, EdgeKind.ESCALATION}
+
+
+# ---------------------------------------------------------------------------
+# Control strength — per-edge refinement WITHIN EdgeKind.AUTH.
+#
+# All session/exec auth edges (AdminTo, CanRDP, CanPSRemote, ExecuteDCOM,
+# SQLAdmin, SQLAccess) collapse to EdgeKind.AUTH — undifferentiated by kind
+# alone. But they are NOT equal in the code-execution capability they grant
+# on the target host, and severity must reflect that: reaching a Tier 0 asset
+# with full local admin (AdminTo → LSASS/SYSTEM) is a categorically worse
+# finding than holding a read-only SQL database session (SQLAccess), which
+# usually yields no host code-execution at all.
+#
+# This ordered SSOT feeds adscan_internal.services.severity.compute_edge_severity
+# as a fourth refinement input. It is NOT a tier and NOT a new axis — it is a
+# property of the edge, ranked so a stronger auth edge outranks a weaker one
+# into the same target. See CLAUDE.md § Nomenclature Standard, "Reach severity
+# is GRADED".
+# ---------------------------------------------------------------------------
+
+
+class ControlStrength(str, Enum):
+    """Code-execution strength an access/auth edge grants on the target host.
+
+    Ordered (see :data:`_CONTROL_STRENGTH_RANK`):
+    ``FULL > SESSION > CONDITIONAL_EXEC > LOW > NOT_APPLICABLE``.
+
+    * ``FULL`` — full local administrator on the host. Grants SYSTEM-level
+      code execution and LSASS/SAM credential access (``AdminTo``).
+    * ``SESSION`` — an interactive or remote session/shell at whatever
+      privilege the source lands with — not guaranteed administrator
+      (``CanPSRemote``, ``CanRDP``, ``ExecuteDCOM``).
+    * ``CONDITIONAL_EXEC`` — database sysadmin that reaches host code
+      execution only through an extra, often-disabled step such as
+      ``xp_cmdshell`` (``SQLAdmin``).
+    * ``LOW`` — a database/service session with no inherent host
+      code-execution (``SQLAccess``).
+    * ``NOT_APPLICABLE`` — the edge is not an access/auth edge, or control
+      strength does not apply (every non-AUTH edge, plus auth edges whose
+      strength is undefined).
+    """
+
+    FULL = "full"
+    SESSION = "session"
+    CONDITIONAL_EXEC = "conditional_exec"
+    LOW = "low"
+    NOT_APPLICABLE = "not_applicable"
+
+
+# Higher rank = stronger code-execution capability on the target host.
+_CONTROL_STRENGTH_RANK: Final[dict[ControlStrength, int]] = {
+    ControlStrength.FULL: 4,
+    ControlStrength.SESSION: 3,
+    ControlStrength.CONDITIONAL_EXEC: 2,
+    ControlStrength.LOW: 1,
+    ControlStrength.NOT_APPLICABLE: 0,
+}
+
+
+def control_strength_rank(strength: ControlStrength) -> int:
+    """Return the ordering rank — higher = stronger host code-execution."""
+    return _CONTROL_STRENGTH_RANK.get(strength, 0)
+
+
+# Per-relation control strength. Only access/auth relations appear here; any
+# relation not listed (control/derived/escalation/membership/trust/unknown, or
+# an unmapped auth edge such as a null-session bind) resolves to NOT_APPLICABLE.
+_CONTROL_STRENGTH_BY_RELATION: Final[dict[str, ControlStrength]] = {
+    # Full local admin → LSASS/SYSTEM.
+    "adminto": ControlStrength.FULL,
+    # Session/shell at the privilege you land with.
+    "canpsremote": ControlStrength.SESSION,
+    "canrdp": ControlStrength.SESSION,
+    "executedcom": ControlStrength.SESSION,
+    # DB sysadmin → host only via an extra (often-disabled) step.
+    "sqladmin": ControlStrength.CONDITIONAL_EXEC,
+    # DB session, usually no host code-execution.
+    "sqlaccess": ControlStrength.LOW,
+}
+
+
+def edge_control_strength(relation: str | None) -> ControlStrength:
+    """Return the :class:`ControlStrength` for one edge ``relation``.
+
+    Lookup is case-insensitive (collectors and the BloodHound CE sync layer
+    differ in casing). Only the access/auth relations carry a meaningful
+    strength; every other relation — and any unmapped auth edge — returns
+    :attr:`ControlStrength.NOT_APPLICABLE`, so callers can feed every edge
+    through this function unconditionally.
+
+    Args:
+        relation: The BloodHound (or ADscan synthetic) edge label.
+
+    Returns:
+        The canonical control strength.
+    """
+    canonical = (relation or "").strip().lower()
+    if not canonical:
+        return ControlStrength.NOT_APPLICABLE
+    return _CONTROL_STRENGTH_BY_RELATION.get(canonical, ControlStrength.NOT_APPLICABLE)

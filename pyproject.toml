@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "9.2.0"
+version = "9.2.1"
 description = "Free Active Directory pentesting CLI for AD enumeration, attack paths, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
@@ -80,7 +80,6 @@ cli = [
     "pypykatz>=0.6.10",
     "psutil",
     "python-docx",
-    "weasyprint>=60.0",
     "playwright==1.60.0",
     "jinja2>=3.0",
     "graphviz>=0.20",
@@ -127,13 +126,13 @@ changelog = "https://github.com/ADscanPro/adscan/releases"
 
 [project.scripts]
 adscan = "adscan_launcher.cli:main"
-"adscan.py" = "adscan_launcher.cli:main"
 
 [tool.uv.sources]
 # Vendored skelsec native AD stack — committed under vendor/ as the single
 # source of truth for the entire skelsec ecosystem. We pin to the local
 # checkout (not PyPI) so the code we read in vendor/<lib>/ is exactly what
-# runs in production. Refresh via scripts/refresh_vendor.sh.
+# runs in production. The stack is LOCALLY_MAINTAINED (forked); track upstream
+# drift read-only via scripts/check_vendor_drift.sh + vendor/UPSTREAM_SHAS.txt.
 #
 # Why this exists: PyPI releases of these libraries lag the upstream
 # repositories by months and ship known protocol bugs (e.g., aiosmb 0.4.14

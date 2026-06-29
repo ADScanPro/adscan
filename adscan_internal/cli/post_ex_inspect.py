@@ -69,6 +69,7 @@ def _render_path_summary(
 
     projection = project_foothold(path)
     cls_label = renderer.render_class_label(projection.compromise_class)
+    reach_label = renderer.render_reach_label(projection.compromise_class)
 
     source = str(path.get("source") or "")
     target = projection.target_label or "?"
@@ -81,6 +82,8 @@ def _render_path_summary(
     body = Text()
     body.append("Class: ", style="dim")
     body.append(f"{cls_label}\n")
+    body.append("Reach: ", style="dim")
+    body.append(f"{reach_label}\n")
     body.append("Source: ", style="dim")
     body.append(f"{masked_source}\n")
     body.append("Target: ", style="dim")

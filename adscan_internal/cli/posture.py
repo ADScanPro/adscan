@@ -164,8 +164,14 @@ def _do_posture_clear(shell: Any, domain_arg: Optional[str]) -> None:
         "ADscan will re-discover the posture from scratch on the next operation."
     )
 
-    if getattr(shell, "ui_silent", False):
+    from adscan_internal.interaction import is_non_interactive
+
+    if is_non_interactive(shell) or getattr(shell, "ui_silent", False):
         # Never clear without explicit confirmation in non-interactive mode.
+        # questionary.confirm is a DIRECT call (not covered by the Rich
+        # Prompt/Confirm wrapper), so it would block under adscan ci — guard it
+        # with the canonical predicate and resolve to the safe default (False:
+        # do not clear).
         print_info("Cancelled (non-interactive mode). Posture unchanged.")
         return
 

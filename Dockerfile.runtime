@@ -902,6 +902,15 @@ ARG ADSCAN_PARTNER_TAG=""
 
 # ADSCAN_RUNTIME_VERSION enters scope HERE — narrowest possible.
 ARG ADSCAN_RUNTIME_VERSION=""
+# Build provenance (git commit SHA / describe / UTC timestamp the image was
+# built from). Declared HERE — narrowest possible scope, BELOW every expensive
+# pip/apt layer above — so a new commit SHA per build does NOT re-key those
+# layers (the "a new ARG re-keys every RUN below it in scope" rule from
+# CLAUDE.md; mirrors the ADSCAN_RUNTIME_VERSION precedent). Empty / "unknown"
+# when built outside a git tree.
+ARG ADSCAN_BUILD_COMMIT="unknown"
+ARG ADSCAN_BUILD_DESCRIBE="unknown"
+ARG ADSCAN_BUILD_TIMESTAMP="unknown"
 RUN set -eux; \
   chmod +x /usr/local/bin/adscan; \
   if [[ -n "${ADSCAN_RUNTIME_VERSION}" ]]; then \
@@ -913,6 +922,9 @@ RUN set -eux; \
 # variables without contaminating upstream cache keys.
 ENV ADSCAN_PARTNER_TAG=${ADSCAN_PARTNER_TAG}
 ENV ADSCAN_RUNTIME_VERSION=${ADSCAN_RUNTIME_VERSION}
+ENV ADSCAN_BUILD_COMMIT=${ADSCAN_BUILD_COMMIT}
+ENV ADSCAN_BUILD_DESCRIBE=${ADSCAN_BUILD_DESCRIBE}
+ENV ADSCAN_BUILD_TIMESTAMP=${ADSCAN_BUILD_TIMESTAMP}
 
 ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]
 
@@ -977,7 +989,6 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
     selenium==4.31.0 \
     textual==0.80.1 \
     "redis>=5.0.0,<7.1.0" \
-    weasyprint>=60.0 \
     playwright==1.60.0 \
     jinja2>=3.0 \
     "scapy>=2.5.0,<3.0"
@@ -1064,6 +1075,15 @@ RUN printf '%s\n' \
 # Every layer above this point is independent of the version timestamp
 # and stays cacheable across builds with different versions.
 ARG ADSCAN_RUNTIME_VERSION=""
+# Build provenance (git commit SHA / describe / UTC timestamp the image was
+# built from). Declared HERE — narrowest possible scope, BELOW every expensive
+# pip/apt layer above — so a new commit SHA per build does NOT re-key those
+# layers (the "a new ARG re-keys every RUN below it in scope" rule from
+# CLAUDE.md; mirrors the ADSCAN_RUNTIME_VERSION precedent). Empty / "unknown"
+# when built outside a git tree.
+ARG ADSCAN_BUILD_COMMIT="unknown"
+ARG ADSCAN_BUILD_DESCRIBE="unknown"
+ARG ADSCAN_BUILD_TIMESTAMP="unknown"
 RUN set -eux; \
   if [[ -n "${ADSCAN_RUNTIME_VERSION}" ]]; then \
     printf '%s\n' "${ADSCAN_RUNTIME_VERSION}" > /opt/adscan/version; \
@@ -1073,5 +1093,8 @@ RUN set -eux; \
 # expensive layer above. The running container still exposes
 # ADSCAN_RUNTIME_VERSION without contaminating upstream cache keys.
 ENV ADSCAN_RUNTIME_VERSION=${ADSCAN_RUNTIME_VERSION}
+ENV ADSCAN_BUILD_COMMIT=${ADSCAN_BUILD_COMMIT}
+ENV ADSCAN_BUILD_DESCRIBE=${ADSCAN_BUILD_DESCRIBE}
+ENV ADSCAN_BUILD_TIMESTAMP=${ADSCAN_BUILD_TIMESTAMP}
 
 ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]

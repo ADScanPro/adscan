@@ -24,7 +24,7 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive
-from adscan_internal.cli.ci_events import emit_phase
+from adscan_internal.cli.ci_events import emit_phase, emit_scan_plan
 from adscan_internal.cli.session_preflight import (
     SessionPreflightConfig,
     SessionPreflightDeps,
@@ -54,11 +54,17 @@ except ImportError:  # pragma: no cover - public LITE repo excludes report gener
     ReportGenerationConfig = None  # type: ignore[assignment]
 
 
-# Canonical chapter list for `adscan ci`. ci.py itself only orchestrates a few
-# of these — the inner scan phases (enumeration, kerberos, ACL, BloodHound,
-# exploitation) all live inside shell.do_start_auth / do_start_unauth and do
-# not have stable insertion points here. We surface the chapter divider only
-# at boundaries we can confidently identify in this file.
+# Coarse CLI-only banner strip for `adscan ci`. ci.py orchestrates a few
+# boundaries it can confidently identify in this file; the inner scan phases
+# (enumeration, kerberos, ACL, collection, exploitation) live inside
+# shell.do_start_auth / do_start_unauth.
+#
+# This list is purely cosmetic terminal text — it is NOT the machine-readable
+# scan plan and feeds nothing the web consumes. The canonical plan (chapters →
+# phases → subphases, with the stable ids the structured ``phase`` /
+# ``scan_plan`` events and the web render) is the single source of truth in
+# ``adscan_internal.services.scan_phases``; this banner is a deliberately
+# coarser operator-facing wrapper around it.
 _CI_PHASES: tuple[tuple[str, str], ...] = (
     ("Preflight", "DNS validation, connectivity, and credential sanity checks."),
     ("Reconnaissance", "Domain mapping, trust enumeration, and authentication."),
@@ -129,6 +135,42 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     license_mode = deps.resolve_license_mode(config.requested_pro)
     shell = deps.create_shell(deps.console, license_mode)
     shell.session_command_type = "ci"
+
+    # Load the optional scan configuration (--scan-config). The launcher
+    # bind-mounts the file read-only and points ADSCAN_SCAN_CONFIG at it; an
+    # explicit ``args.scan_config`` (when the engine parser declares it) takes
+    # precedence. Absent / empty = DEFAULT_SCAN_CONFIG = today's interactive
+    # behavior, so the no-config path is byte-for-byte unchanged. The resolved
+    # config is stored on the shell so the gated decision points (trust enum,
+    # attack-path execution) consult one SSOT.
+    from adscan_internal.services.scan_config import (
+        DEFAULT_SCAN_CONFIG,
+        ScanConfigError,
+        load_scan_config,
+    )
+
+    scan_config_path = (
+        getattr(args, "scan_config", None) or os.environ.get("ADSCAN_SCAN_CONFIG") or ""
+    )
+    try:
+        shell.scan_config = load_scan_config(scan_config_path)
+    except ScanConfigError as exc:
+        telemetry.capture_exception(exc)
+        print_error(f"Invalid scan configuration: {exc}")
+        deps.exit(2)
+        return 2
+    if not shell.scan_config.is_default:
+        print_info("Scan configuration applied from --scan-config.")
+        print_info_verbose(
+            "Scan config: "
+            f"disabled_phases={list(shell.scan_config.phases.disabled)} "
+            f"trust_policy={shell.scan_config.trust_enumeration.policy} "
+            f"attack_path_policy={shell.scan_config.attack_paths.policy}"
+        )
+    else:
+        # Keep the attribute present and well-typed even on the default path so
+        # downstream getattr(shell, "scan_config", ...) always finds it.
+        shell.scan_config = DEFAULT_SCAN_CONFIG
 
     # PRO partner-tag gate (non-interactive path): the env var ADSCAN_PARTNER_TAG
     # must satisfy it; otherwise refuse to start PRO rather than hang on stdin.
@@ -244,6 +286,17 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 "Auto mode not found. Please configure it using 'set auto <value>'."
             )
             return False
+        # Declare the full ordered plan up-front so the web renders the
+        # engine-declared chapters → phases → subphases dynamically.
+        from adscan_internal.services.scan_phases import (
+            COMMAND_AUDIT,
+            COMMAND_CI_AUTH,
+        )
+
+        emit_scan_plan(
+            COMMAND_AUDIT if shell.type == "audit" else COMMAND_CI_AUTH,
+            getattr(shell, "scan_config", None),
+        )
         # Chapter 1: Preflight (DNS validation, connectivity)
         print_phase_chapter(_chapter(1))
         emit_phase("dns_validation")
@@ -294,6 +347,10 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         shell.hosts = args.hosts
         shell.do_clear_all(None)
         shell.scan_mode = None
+        # Declare the unauth plan up-front for the web renderer.
+        from adscan_internal.services.scan_phases import COMMAND_CI_UNAUTH
+
+        emit_scan_plan(COMMAND_CI_UNAUTH, getattr(shell, "scan_config", None))
         # Chapter 2: Reconnaissance — the unauth path is pure recon.
         print_phase_chapter(_chapter(2))
         if getattr(args, "dc_ip", None):
@@ -371,16 +428,12 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 if frameworks_raw
                 else None
             )
-            report_file_path = run_generate_report(
+            report_file_path = _run_ci_report_generation(
                 shell,
-                report_json_path,
-                report_format,
+                args,
+                report_json_path=report_json_path,
+                report_format=report_format,
                 frameworks=frameworks,
-                engine=getattr(args, "report_engine", "") or "",
-                renderer=getattr(args, "report_renderer", "") or "",
-                template=getattr(args, "report_template", "") or "",
-                theme=getattr(args, "report_theme", "") or "",
-                display_name=getattr(args, "display_name", "") or "",
             )
             if not report_file_path:
                 print_warning("Report generation failed")
@@ -485,7 +538,7 @@ def run_generate_report(
         report_profile: Report profile ("full", "technical", "executive")
         frameworks: Compliance frameworks. Valid values: "ens", "iso27001",
             "dora", "pci_dss". Defaults to ["ens"] (ENS Alto + NIS2).
-        engine: PDF engine ("weasyprint" | "chromium"). Empty = env/default.
+        engine: PDF engine ("chromium" — the only supported engine). Empty = env/default.
         renderer: Attack-path renderer ("graphviz" | "cytoscape"). Empty = env/default.
         template: Report template ("legacy" | "premium"). Empty = env/default.
         theme: Report theme ("premium_dark" | "corporate_light" | ""). Empty = env/default.
@@ -564,3 +617,106 @@ def run_generate_report(
             prompt_and_open(result_path_obj, prompt="Open the report now?")
 
     return str(result_path) if result_path else None
+
+
+def _run_ci_report_generation(
+    shell: object,
+    args: object,
+    *,
+    report_json_path: str,
+    report_format: str,
+    frameworks: Optional[list] = None,
+) -> Optional[str]:
+    """Route ``adscan ci --generate-report`` through the unified deliver engine.
+
+    CI defaults to REPORT-ONLY (a single Security Assessment Report PDF) — the
+    web runs ``adscan ci`` and then SEPARATELY dispatches the full kit via
+    ``_maybe_dispatch_deliverable_kit``, so emitting a full kit inline here
+    would double-generate. The deliverable selection grammar (``--only``) is the
+    SAME one the deliver flow uses, so there is one selection vocabulary across
+    the product:
+
+    * Report-only (default, or ``--only report`` / ``--only executive``) → render
+      the single PDF via :func:`run_generate_report`, preserving CI's single-PDF
+      artifact contract (pipelines and the web expect the PDF at the existing
+      report-service path).
+    * A wider explicit ``--only`` (e.g. ``--only report,playbook``) → render that
+      selection inline through the unified deliver engine, returning the headline
+      Security Assessment Report PDF as the artifact path.
+
+    Returns the path to the report PDF artifact, or ``None`` on failure.
+    """
+    from adscan_internal.cli.deliver import _parse_only
+
+    raw_only = getattr(args, "only", None)
+    try:
+        selected = _parse_only(raw_only)
+    except ValueError as exc:
+        print_error(str(exc))
+        return None
+    selected_slugs = {item.slug for item in selected}
+
+    # Report-only when the selection is exactly the assessment report (the
+    # ``report``/``executive`` slug). This is the CI/web default and keeps the
+    # single-PDF artifact contract untouched.
+    if selected_slugs == {"executive"}:
+        return run_generate_report(
+            shell,
+            report_json_path,
+            report_format,
+            frameworks=frameworks,
+            engine=getattr(args, "report_engine", "") or "",
+            renderer=getattr(args, "report_renderer", "") or "",
+            template=getattr(args, "report_template", "") or "",
+            theme=getattr(args, "report_theme", "") or "",
+            display_name=getattr(args, "display_name", "") or "",
+        )
+
+    # Wider selection: render it inline via the unified deliver engine. The
+    # headline Security Assessment Report PDF is returned as the artifact path so
+    # the downstream single-PDF plumbing (artifact copy) still works.
+    return _run_ci_deliver_selection(
+        shell,
+        args,
+        report_json_path=report_json_path,
+        frameworks=frameworks,
+        only=raw_only,
+    )
+
+
+def _run_ci_deliver_selection(
+    shell: object,
+    args: object,
+    *,
+    report_json_path: str,
+    frameworks: Optional[list],
+    only: Optional[str],
+) -> Optional[str]:
+    """Render a multi-deliverable CI selection via the unified deliver engine.
+
+    Builds the ``deliver`` argparse namespace from the CI flags and runs it
+    synchronously, then returns the staged Security Assessment Report PDF (the
+    headline artifact) so CI's single-PDF artifact plumbing still resolves.
+    """
+    import argparse as _argparse
+
+    from adscan_internal.cli.deliver import run_deliver_sync as _run_deliver_sync
+
+    workspace_dir = Path(report_json_path).parent
+    fw_value = ",".join(frameworks) if frameworks else None
+    ns = _argparse.Namespace(
+        workspace=str(workspace_dir),
+        client=getattr(args, "display_name", "") or None,
+        engagement=None,
+        output=None,
+        only=only,
+        no_navigator=False,
+        frameworks=fw_value,
+        theme="",
+        report_theme=getattr(args, "report_theme", "") or "",
+    )
+    rc = _run_deliver_sync(ns)
+    if rc != 0:
+        return None
+    headline = workspace_dir / "deliverables" / "staging" / "Security_Assessment_Report.pdf"
+    return str(headline) if headline.is_file() else None

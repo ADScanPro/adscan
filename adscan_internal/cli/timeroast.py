@@ -806,6 +806,16 @@ def _collect_timeroast_hashes(
 
 def run_timeroast_quick_win(shell: TimeroastShell, target_domain: str) -> bool:
     """Run the Phase 3 Timeroast quick win when BloodHound flags candidates."""
+    from adscan_internal.services.scan_phases import (
+        phase_is_enabled,
+        subphase_is_enabled,
+    )
+
+    if not phase_is_enabled(shell, "quick_credential_wins"):
+        return False
+    if not subphase_is_enabled(shell, "quick_credential_wins", "timeroast"):
+        print_info("Timeroast candidate check skipped (disabled in scan configuration).")
+        return False
     if target_domain not in shell.domains:
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_error(

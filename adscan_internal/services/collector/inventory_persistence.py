@@ -87,7 +87,12 @@ class CollectorInventoryPersistence:
         inventory_dir = _inventory_dir(shell, domain)
         os.makedirs(inventory_dir, exist_ok=True)
 
-        node_records_by_file = _group_node_records(result)
+        principal_class_by_id, principal_tier_by_id = (
+            _classify_principals_by_membership(result)
+        )
+        node_records_by_file = _group_node_records(
+            result, principal_class_by_id, principal_tier_by_id
+        )
         edge_records_by_file = _group_edge_records(result)
 
         files_written = 0
@@ -203,17 +208,185 @@ def _inventory_dir(shell: object, domain: str) -> str:
     return domain_subpath(workspace_cwd, domains_dir, domain, "inventory")
 
 
-def _group_node_records(result: CollectionResult) -> dict[str, list[dict[str, Any]]]:
+def _classify_principals_by_membership(
+    result: CollectionResult,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Map each User/Computer object_id to its privilege class AND tier.
+
+    Walks the ``MemberOf`` edges to compute every group a principal belongs to
+    transitively (nested groups included, with a cycle guard), then runs the
+    SSOT per-principal classifiers in ``compromise_class.py``
+    (:func:`classify_principal_by_groups` for the compromise class,
+    :func:`privilege_tier_for_principal` / :func:`privilege_tier_for_computer`
+    for the ESAE privilege tier — all share ONE set of group lists, never
+    mirrored here).
+
+    Both ``User`` and ``Computer`` nodes are classified the SAME way — by their
+    own (transitive) group memberships. The decisive consequence: ``BRAAVOS$``,
+    a member of **Cert Publishers** (RID 517), grades Tier 0 escalation-capable,
+    and ``MEEREEN$``, a member of **Domain Controllers** (RID 516), grades Tier 0
+    direct — generically, by membership, no per-role (ADCS/Exchange) special
+    case. The computer membership graph stores groups as SIDs, so the group
+    tokens fed to the classifier are the group nodes' SIDs (object_ids) and the
+    RID-matching path in ``classify_principal_by_groups`` is the load-bearing
+    one; resolved names are added too (belt-and-suspenders).
+
+    Two parallel axes are stamped (see CLAUDE.md § Nomenclature Standard,
+    "Two orthogonal axes"):
+
+    * ``privilege_class`` — the :class:`CompromiseClass` ``.value`` (Users only;
+      computers carry the tier, not a buyer-facing principal class).
+    * ``privilege_tier`` — the :class:`PrivilegeTier` ``.value``
+      (``tier0_direct`` / ``tier0_escalation_capable`` / ``tier1`` for computers /
+      ``tier2``).
+
+    Both are kept compact: a default principal (NONE / Tier 2) carries neither
+    field, so a missing field reads as "Standard / Tier 2".
+
+    Returns:
+        A ``(class_by_id, tier_by_id)`` pair of mappings keyed by upper-cased
+        object_id. Tier-2 principals are omitted from ``tier_by_id``; NONE
+        principals from ``class_by_id``.
+    """
+    # Lazy import keeps the collector module import-light and avoids a cycle
+    # (compromise_class imports edge_kind, not the collector).
+    from adscan_internal.services.collector.well_known_sids import (
+        _DC_PRIMARY_GROUP_RIDS,
+        _node_primary_group_id,
+    )
+    from adscan_internal.services.compromise_class import (
+        CompromiseClass,
+        PrivilegeTier,
+        classify_principal_by_groups,
+        privilege_tier_for_computer,
+        privilege_tier_for_principal,
+    )
+
+    # group object_id (upper) → set of parent group object_ids (upper) it is a
+    # MemberOf, so we can expand a principal's groups transitively.
+    parents_by_id: dict[str, set[str]] = defaultdict(set)
+    for edge in result.edges:
+        if str(edge.relation or "").strip() != "MemberOf":
+            continue
+        src = str(edge.source_object_id or "").upper()
+        dst = str(edge.target_object_id or "").upper()
+        if src and dst:
+            parents_by_id[src].add(dst)
+
+    def _expand_groups(start: str) -> set[str]:
+        """Return the upper-cased object_ids of every group reached from start."""
+        seen: set[str] = set()
+        stack: list[str] = list(parents_by_id.get(start, ()))
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(parents_by_id.get(current, ()))
+        return seen
+
+    def _group_tokens(group_oids: set[str]) -> list[str]:
+        """Return the group membership tokens for the classifier.
+
+        Each group's SID (its object_id) is always included — the RID-matching
+        path classifies SID-only memberships (computers store groups as SIDs).
+        The resolved name is added when available, so name-only groups
+        (DnsAdmins / Exchange) still classify.
+        """
+        tokens: list[str] = []
+        for goid in group_oids:
+            tokens.append(goid)
+            grp = result.nodes.get(goid)
+            if grp is not None and grp.name:
+                tokens.append(grp.name)
+        return tokens
+
+    classes: dict[str, str] = {}
+    tiers: dict[str, str] = {}
+    for node in result.nodes.values():
+        kind = str(node.kind)
+        if kind not in ("User", "Computer"):
+            continue
+        oid = str(node.object_id or "").upper()
+        if not oid:
+            continue
+        tokens = _group_tokens(_expand_groups(oid))
+
+        if kind == "User":
+            cls = classify_principal_by_groups(tokens, sid=node.object_id)
+            tier = privilege_tier_for_principal(tokens, sid=node.object_id)
+            # Only stamp a non-default class/tier; low-priv principals carry
+            # NONE / Tier 2 implicitly so the artifact stays compact.
+            if cls is not CompromiseClass.NONE:
+                classes[oid] = cls.value
+            if tier is not PrivilegeTier.TIER2:
+                tiers[oid] = tier.value
+            continue
+
+        # Computer — group-membership-driven tier (generic; ANY Tier 0 group
+        # classifies it). Role signals come from node properties: DC fast-path
+        # via primaryGroupID (516/521), member-server vs workstation via the OS
+        # string, and the highvalue tag as the degraded last-resort fallback.
+        is_dc = _node_primary_group_id(node) in _DC_PRIMARY_GROUP_RIDS
+        os_str = str(node.properties.get("os") or "").lower()
+        tier = privilege_tier_for_computer(
+            group_names=tokens,
+            sid=node.object_id,
+            is_dc=is_dc,
+            is_tier0_asset=bool(node.highvalue),
+            is_server=_SERVER_OS_MARKER in os_str,
+        )
+        if tier is not PrivilegeTier.TIER2:
+            tiers[oid] = tier.value
+    return classes, tiers
+
+
+def _group_node_records(
+    result: CollectionResult,
+    principal_class_by_id: dict[str, str] | None = None,
+    principal_tier_by_id: dict[str, str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    # Both axes are derived from group membership in ONE place
+    # (:func:`_classify_principals_by_membership`). Computers are classified the
+    # same way as users — by their (transitive) group SIDs — so an ADCS CA host
+    # (member of Cert Publishers, RID 517) grades Tier 0 escalation-capable and a
+    # DC (member of Domain Controllers, RID 516) grades Tier 0 direct, generically
+    # by membership with no per-role special case. When the caller did not supply
+    # the maps (direct unit-test entry), derive them here so this stays the SSOT.
+    if principal_class_by_id is None or principal_tier_by_id is None:
+        derived_classes, derived_tiers = _classify_principals_by_membership(result)
+        principal_class_by_id = (
+            principal_class_by_id if principal_class_by_id is not None else derived_classes
+        )
+        principal_tier_by_id = (
+            principal_tier_by_id if principal_tier_by_id is not None else derived_tiers
+        )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for node in result.nodes.values():
         if node.properties.get("well_known_sid"):
             filename = "well_known_principals.json"
         else:
             filename = _NODE_KIND_TO_FILE.get(str(node.kind), "objects.json")
-        grouped[filename].append(_node_inventory_record(node))
+        record = _node_inventory_record(node)
+        oid_upper = str(node.object_id or "").upper()
+        cls_value = principal_class_by_id.get(oid_upper)
+        if cls_value:
+            record["privilege_class"] = cls_value
+        # Axis 1 — Privilege Tier (ESAE). Users and Computers both get the
+        # membership-derived tier from the single classifier above.
+        tier_value = principal_tier_by_id.get(oid_upper)
+        if tier_value:
+            record["privilege_tier"] = tier_value
+        grouped[filename].append(record)
     return {
         name: sorted(records, key=_record_sort_key) for name, records in grouped.items()
     }
+
+
+# OS strings that mark a member server (not a workstation). AD exposes the role
+# only through the ``operatingSystem`` string; "Server" is the canonical marker
+# Microsoft uses for every server SKU.
+_SERVER_OS_MARKER = "server"
 
 
 def _group_edge_records(result: CollectionResult) -> dict[str, list[dict[str, Any]]]:

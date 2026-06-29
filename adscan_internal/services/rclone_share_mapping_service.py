@@ -13,9 +13,20 @@ from typing import Any, Callable
 import json
 import shlex
 
+from adscan_core.subprocess_env import get_clean_env_for_compilation
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.smb_guest_auth_service import is_guest_alias
 from adscan_internal.workspaces import write_json_file
+
+# rclone reads backend config from ``RCLONE_<BACKEND>_<KEY>`` environment
+# variables when the corresponding param is OMITTED from the connection string.
+# Passing the (reversible) obscured SMB password this way keeps it OUT of the
+# connection string rclone echoes verbatim into its STDERR error lines — the
+# exact text the recorded command preview captures. Verified against rclone:
+# with ``pass=`` absent from the ``:smb,...`` connection string and this env var
+# set, rclone resolves ``smb_pass`` from the environment and the echoed remote no
+# longer contains the credential.
+_RCLONE_SMB_PASS_ENV = "RCLONE_SMB_PASS"
 
 
 class RcloneShareMappingService(BaseService):
@@ -87,7 +98,18 @@ class RcloneShareMappingService(BaseService):
         obscured_password: str,
         domain: str,
     ) -> str:
-        """Build one inline rclone SMB remote for a host/share target."""
+        """Build one inline rclone SMB remote for a host/share target.
+
+        SECURITY: the (reversible) obscured SMB password is deliberately NOT
+        embedded in the connection string. rclone echoes the whole connection
+        string verbatim into its STDERR error lines, which the recorded command
+        preview captures — and ``rclone obscure`` is reversible with a static
+        public key, so an inline ``pass=<obscured>`` is a recoverable cleartext
+        credential in the session recording. The password is supplied OUT-OF-BAND
+        via the ``RCLONE_SMB_PASS`` environment variable instead (see
+        :meth:`build_rclone_env`). ``obscured_password`` is accepted only to
+        decide whether credentials are present at all.
+        """
         auth = RcloneShareMappingService.resolve_smb_remote_auth(
             username=username,
             password=obscured_password,
@@ -96,10 +118,26 @@ class RcloneShareMappingService(BaseService):
         remote_parts = [":smb", f"host={host}"]
         if auth["username"]:
             remote_parts.append(f"user={auth['username']}")
-            remote_parts.append(f"pass={auth['password']}")
         if auth["domain"]:
             remote_parts.append(f"domain={auth['domain']}")
         return f"{','.join(remote_parts)}:{share}"
+
+    @staticmethod
+    def build_rclone_env(obscured_password: str) -> dict[str, str] | None:
+        """Build the subprocess env that supplies the SMB password out-of-band.
+
+        Returns ``None`` when there is no password to inject (null/guest/empty),
+        so the caller leaves the executor's default environment untouched. When a
+        password IS present, returns a PyInstaller-safe clean environment (no
+        ``LD_LIBRARY_PATH`` leakage into the external rclone binary) with
+        ``RCLONE_SMB_PASS`` set to the obscured value. rclone reads it because the
+        connection string omits ``pass=``.
+        """
+        if not obscured_password:
+            return None
+        env = get_clean_env_for_compilation()
+        env[_RCLONE_SMB_PASS_ENV] = obscured_password
+        return env
 
     def generate_host_metadata_json(
         self,
@@ -151,6 +189,11 @@ class RcloneShareMappingService(BaseService):
                 "failed_targets": len(normalized_targets),
             }
 
+        # Supply the obscured SMB password out-of-band via RCLONE_SMB_PASS so it
+        # never appears in the connection string rclone echoes into its STDERR
+        # (and thence the recorded command preview).
+        rclone_env = self.build_rclone_env(obscured_password)
+
         host_payloads: dict[str, dict[str, dict[str, dict[str, str]]]] = {}
         failed_targets = 0
         partial_targets = 0
@@ -166,11 +209,13 @@ class RcloneShareMappingService(BaseService):
                 obscured_password=obscured_password,
                 domain=transport_auth["domain"],
             )
-            result = command_executor(
-                command,
-                timeout=timeout_seconds,
-                ignore_errors=True,
-            )
+            executor_kwargs: dict[str, Any] = {
+                "timeout": timeout_seconds,
+                "ignore_errors": True,
+            }
+            if rclone_env is not None:
+                executor_kwargs["env"] = rclone_env
+            result = command_executor(command, **executor_kwargs)
             if result is None:
                 failed_targets += 1
                 continue

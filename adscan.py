@@ -94,6 +94,7 @@ from adscan_internal import (
     print_panel,
     print_success,
     print_success_verbose,
+    print_untrusted_command_output,
     print_warning,
     print_warning_debug,
     print_warning_verbose,
@@ -206,6 +207,7 @@ from adscan_core.lab_catalog import (
     is_lab_whitelisted as is_catalog_lab_whitelisted,
 )
 from adscan_core.console_runtime import build_rich_console as _build_rich_console
+from adscan_core.native_secret_scrub import scrub_native_secrets
 from adscan_core.lab_context import build_lab_telemetry_fields
 from adscan_internal.services.dns_discovery_service import (
     is_dns_resolution_error,
@@ -3461,6 +3463,36 @@ class SmartCommandCompleter(Completer):
 # The functions are initialized with console and mode flags above
 
 
+# Matches sudo's "unable to resolve host <name>" / "unable to resolve host <name>:
+# Name or service not known" notice. sudo emits this to STDERR when the operator's
+# own laptop hostname is not in /etc/hosts. The hostname is the PENTESTER's machine
+# (not client data), but it is still a personal identifier, so we mark it for
+# telemetry scrubbing while keeping it cleartext on screen.
+_UNRESOLVABLE_HOST_RE = re.compile(
+    r"(unable to resolve host\s+)([^\s:]+)", re.IGNORECASE
+)
+
+
+def _mark_unresolvable_host_in_line(line: str) -> str:
+    """Mark the operator hostname in a sudo 'unable to resolve host' STDERR line.
+
+    Wraps the host token with ``mark_sensitive(..., "hostname")`` so the operator's
+    own machine name is scrubbed in the telemetry recording while staying cleartext
+    on the operator's terminal. Lines without the pattern are returned unchanged.
+
+    Args:
+        line: A single line of captured command STDERR.
+
+    Returns:
+        The line with the host token marked, or the original line untouched.
+    """
+
+    def _replace(match: "re.Match[str]") -> str:
+        return f"{match.group(1)}{mark_sensitive(match.group(2), 'hostname')}"
+
+    return _UNRESOLVABLE_HOST_RE.sub(_replace, line)
+
+
 def run_command(
     command_list,
     check=True,
@@ -3824,6 +3856,7 @@ from adscan_internal.cli.common import (  # noqa: E402
     build_cli_runtime_snapshot,
     normalize_command_alias,
     normalize_help_alias,
+    redact_command_for_log,
     should_show_workspace_getting_started,
 )
 
@@ -8798,6 +8831,127 @@ class CaseInsensitiveDict(dict):
             )
 
 
+# CLI<->web contract: the only workspace_type values the telemetry streamer
+# may emit are members of this set. The live-session viewer (separate TS repo)
+# accepts ``ctf | audit | unknown``; we send only the two concrete types and
+# let the server keep its ``unknown`` default when self.type is unset. Keeping
+# the set explicit (rather than trusting any normalized string through) is the
+# Python-side guard for that contract — see _resolve_streamer_workspace_type.
+_STREAMER_WORKSPACE_TYPES: frozenset[str] = frozenset({"ctf", "audit"})
+
+
+def _resolve_streamer_workspace_type(workspace_type_raw: Any) -> Optional[str]:
+    """Resolve a shell ``type`` value to a streamer-safe workspace_type.
+
+    Runs the raw value through the canonical ``normalize_workspace_type`` and
+    returns it only when it is a real, contract-allowed type ({"ctf","audit"}).
+    Returns ``None`` for unset/empty/unknown values so the caller omits the
+    field entirely and the server keeps its ``unknown`` default — never an
+    empty string on the wire.
+
+    Args:
+        workspace_type_raw: The raw ``shell.type`` value (may be None/empty).
+
+    Returns:
+        The normalized type ("ctf" or "audit") or None when not emittable.
+    """
+    try:
+        from adscan_core.lab_context import normalize_workspace_type
+
+        normalized = normalize_workspace_type(workspace_type_raw)
+    except Exception:  # noqa: BLE001
+        return None
+    if normalized and normalized in _STREAMER_WORKSPACE_TYPES:
+        return normalized
+    return None
+
+
+def _resolve_streamer_metadata_snapshot(shell: Any) -> dict[str, Any]:
+    """Snapshot the full valuable session metadata for a live streamer chunk.
+
+    The streamer fires a metadata-bearing chunk on every tick so a session that
+    hangs or crashes — and therefore never reaches ``capture_session_end`` — still
+    carries its identity (lab/partner), progressive compromise state, and AD scale
+    on the LAST chunk that did arrive. Previously only ``workspace_type`` rode the
+    live path; everything else was bound only at finalize, so a hung session was
+    untriageable.
+
+    All three blocks route through the SAME SSOT builders the finalize payload uses
+    (``build_lab_telemetry_fields`` / ``build_session_compromise_metadata`` /
+    ``build_session_ad_scale_metadata``) — zero drift between the live and finalize
+    ingest paths. Each block is independently best-effort: a builder failure on one
+    leaves the others intact and never breaks the chunk.
+
+    Privacy: the lab block goes through ``build_lab_telemetry_fields`` which only
+    emits the raw ``lab_name`` when whitelisted. For a non-whitelisted real customer
+    audit only provider/slug/partner flow — never the raw AD name. The compromise
+    and AD-scale builders are anonymous by construction (status + integer counts).
+
+    Args:
+        shell: The ``PentestShell`` instance for the live session.
+
+    Returns:
+        A dict of telemetry-safe metadata fields (may be empty). ``workspace_type``
+        is intentionally NOT included here — the closure keeps owning that field.
+    """
+    fields: dict[str, Any] = {}
+
+    # 1. Lab + partner (Class A — identity). Translate the canonical lab fields
+    #    to the ``target_*`` wire keys the legacy finalize payload uses, so the
+    #    live and finalize paths populate the SAME sessions-row columns.
+    try:
+        lab_fields = build_lab_telemetry_fields(
+            lab_provider=getattr(shell, "lab_provider", None),
+            lab_name=getattr(shell, "lab_name", None),
+            lab_name_whitelisted=getattr(shell, "lab_name_whitelisted", None),
+            include_slug=True,
+        )
+        lab_provider = lab_fields.get("lab_provider")
+        lab_name = lab_fields.get("lab_name")
+        lab_slug = lab_fields.get("lab_slug")
+        lab_name_whitelisted = lab_fields.get("lab_name_whitelisted")
+        if lab_provider:
+            fields["target_type"] = str(lab_provider).lower()
+        # lab_name is only present when whitelisted (privacy gate enforced by
+        # the builder) — never bypass it.
+        if lab_name:
+            fields["target_name"] = str(lab_name).lower()
+        if lab_slug:
+            fields["target_slug"] = str(lab_slug).lower()
+        if lab_name_whitelisted is not None:
+            fields["target_whitelisted"] = bool(lab_name_whitelisted)
+        # Partner attribution — re-resolve so a tag persisted by the start gate
+        # after process start is picked up (mirrors the finalize pattern).
+        try:
+            from adscan_core import telemetry as _partner_tel  # noqa: PLC0415
+
+            partner_tag = _partner_tel.refresh_partner_tag()
+            if partner_tag:
+                fields["partner_tag"] = partner_tag
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2. Compromise (Class B — progressive). Wire names already match the
+    #    sessions-row columns; emitted as-is.
+    try:
+        fields.update(build_session_compromise_metadata(shell))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3. AD-scale (Class B — progressive). The builder early-returns just the
+    #    domain count before the first Phase-2 collection; totals appear once it
+    #    has run. The viewer late-binds the totals when they arrive — do NOT try
+    #    to force them earlier.
+    try:
+        fields.update(build_session_ad_scale_metadata(shell))
+    except Exception:  # noqa: BLE001
+        pass
+
+    return fields
+
+
 class PentestShell:
     """Interactive ADscan shell.
 
@@ -11158,8 +11312,21 @@ class PentestShell:
                 stderr_raw = result.stderr or ""
                 stdout = strip_ansi_codes(stdout_raw)
                 stderr = strip_ansi_codes(stderr_raw)
-                stdout_lines = [line for line in stdout.splitlines() if line.strip()]
-                stderr_lines = [line for line in stderr.splitlines() if line.strip()]
+                # Belt-and-suspenders: scrub each preview line through the
+                # native-secret SSOT before it reaches the recorded debug panel,
+                # so a secret-bearing token in command output (e.g. an rclone
+                # connection string echoed in STDERR with a reversible
+                # pass=<obscured> blob) is redacted at the preview boundary.
+                stdout_lines = [
+                    scrub_native_secrets(line)
+                    for line in stdout.splitlines()
+                    if line.strip()
+                ]
+                stderr_lines = [
+                    _mark_unresolvable_host_in_line(scrub_native_secrets(line))
+                    for line in stderr.splitlines()
+                    if line.strip()
+                ]
 
                 print_info_debug(
                     "[cmd] Result: "
@@ -13620,8 +13787,8 @@ class PentestShell:
                 )
                 if command_alias_used:
                     print_info_debug(
-                        f"[cli] Command alias detected: {command_name} {' '.join(args_list)} -> "
-                        f"{normalized_command} {' '.join(normalized_args)}"
+                        f"[cli] Command alias detected: {redact_command_for_log(command_name, args_list)} -> "
+                        f"{redact_command_for_log(normalized_command, normalized_args)}"
                     )
                     command_name = normalized_command
                     args_list = normalized_args
@@ -13634,14 +13801,25 @@ class PentestShell:
                 )
                 if help_alias_used:
                     print_info_debug(
-                        f"[cli] Help alias detected: {command_name} {' '.join(args_list)} -> "
-                        f"{normalized_command} {' '.join(normalized_args)}"
+                        f"[cli] Help alias detected: {redact_command_for_log(command_name, args_list)} -> "
+                        f"{redact_command_for_log(normalized_command, normalized_args)}"
                     )
                     command_name = normalized_command
                     args_list = normalized_args
 
-                marked_user_input = mark_sensitive(user_input.strip(), "text")
-                print_info_debug(f"[cli] Execute command: {marked_user_input}")
+                # Echo the FULL cleartext command the operator ran (domain, IP,
+                # user, scan_mode, flags …) — the pentester must see what ran on
+                # screen and in their own recording. Only the secret positional
+                # (e.g. the password in ``start_auth <domain> <ip> <user>
+                # <password>`` / ``creds save … <credential>``) is wrapped with
+                # ``mark_sensitive(_, "password")`` by redact_command_for_log:
+                # the markers are invisible, so the secret stays cleartext on the
+                # terminal while the telemetry export sanitizer scrubs just that
+                # value. (The old all-positionals-to-``***`` form hid non-secret
+                # args from the operator and was over-correction.)
+                print_info_debug(
+                    f"[cli] Execute command: {redact_command_for_log(command_name, args_list)}"
+                )
                 log_cli_command_context(self, command_name, args_list, source="cli")
                 # Re-join for do_* methods that expect a raw string.
                 # Re-quote any token that contains whitespace so that a
@@ -13703,8 +13881,32 @@ class PentestShell:
                     except Exception as e:
                         telemetry.capture_exception(e)
                         print_error(f"Error executing command '{command_name}'.")
+                        # Single sanitized render in the default (non-secret)
+                        # mode: a second print_exception there only duplicates
+                        # the same one-line sanitized message (locals are
+                        # ignored by the sanitized branch). In secret mode the
+                        # second call adds the locals-annotated frame, so keep it
+                        # there. This removes the "printed twice" duplicate.
+                        from adscan_core.output._state import is_debug_mode, is_secret_mode
+
                         print_exception(show_locals=False, exception=e)
-                        print_exception(show_locals=True, exception=e)
+                        if is_secret_mode():
+                            print_exception(show_locals=True, exception=e)
+
+                        # Debuggability: under --debug, surface the FULL Python
+                        # traceback so the exact failing frame is visible without
+                        # an operator re-run. Routed through print_info_debug
+                        # (markup-safe), so a bracketed path / MarkupError text in
+                        # the trace can never re-trigger the same crash here.
+                        if is_debug_mode() and not is_secret_mode():
+                            import traceback as _tb
+                            from rich.markup import escape as _rich_escape
+
+                            tb_text = _tb.format_exc()
+                            print_info_debug(
+                                "command-dispatch traceback (debug):\n"
+                                + _rich_escape(tb_text)
+                            )
                 else:
                     print_warning(f"Unknown command: {command_name}")
                     if should_show_workspace_getting_started(self):
@@ -15008,7 +15210,12 @@ class PentestShell:
                     "PDC FQDN": pdc_fqdn,
                     "Username": user,
                     cred_type: cred_value,
-                    "Protocol": "LDAP",
+                    # Primary path is Kerberos (requesting a TGT IS the
+                    # verification). If the KDC is unreachable and the secret is
+                    # NTLM-native, the service falls back to an NTLM bind; the
+                    # actual transport that produced the verdict is reported
+                    # after verification via ``result.protocol_used``.
+                    "Protocol": "Kerberos",
                 },
                 icon="✓",
             )
@@ -15024,21 +15231,49 @@ class PentestShell:
 
         service = self._get_credential_service()
 
+        # Posture snapshot gates the KDC-unreachable NTLM fallback inside the
+        # service (skipped when NTLM_AUTHENTICATION is known-disabled) and is
+        # threaded into the transport configs for auth-plan pruning.
+        try:
+            from adscan_internal.services.domain_posture import get_posture
+
+            verify_posture_snapshot = get_posture(self.domains_data, domain=domain_name)
+        except Exception:  # noqa: BLE001
+            verify_posture_snapshot = None
+
         try:
             # Native Kerberos path — single source of truth. Requesting a
             # TGT IS the verification: success means valid creds and yields
-            # a usable ticket as a side-effect. The historic NetExec LDAP
-            # fallback was deleted because it silently disagreed with
-            # Kerberos's verdict; when port 88 is unreachable the result
-            # message now embeds a TCP-probed diagnosis (filtered/closed/
-            # reachable-but-failing) instead of switching protocols.
+            # a usable ticket as a side-effect. When the KDC is UNREACHABLE
+            # (no verdict) and the secret is NTLM-native, the service falls
+            # back to ONE NTLM bind (LDAP/389 then SMB/445) to validate it
+            # without port 88 — it NEVER second-guesses a definitive Kerberos
+            # verdict (wrong password / preauth-failed stays INVALID). When
+            # NTLM is also unreachable/disabled the precise TCP-probed
+            # KDC diagnosis (filtered/closed/reachable-but-failing) is kept.
             result = service._verify_via_kerberos_sync(
                 domain=domain_name,
                 kdc_ip=pdc_host,
                 username=user,
                 credential=cred_value,
                 credential_type="hash" if self.is_hash(cred_value) else "password",
+                posture_snapshot=verify_posture_snapshot,
             )
+
+            # Surface the transport that actually produced the verdict so the
+            # operator sees the real path when the NTLM fallback fired (the
+            # up-front header announces the planned Kerberos path).
+            if not ui_silent:
+                _protocol_label = {
+                    "kerberos": "Kerberos",
+                    "ntlm-ldap": "NTLM over LDAP",
+                    "ntlm-smb": "NTLM over SMB",
+                }.get(getattr(result, "protocol_used", "kerberos"), "Kerberos")
+                if _protocol_label != "Kerberos":
+                    print_info(
+                        "Kerberos KDC was unreachable; credential validated via "
+                        f"[bold]{_protocol_label}[/bold] (no TGT minted)."
+                    )
 
             if result.status == CredentialStatus.VALID and isinstance(
                 result.raw_output, bytes
@@ -16070,13 +16305,30 @@ class PentestShell:
                     f"[ntlm-capture][sweep] phase summary: {summary}"
                 )
 
-            if _run_step(
-                "NTLM Auth-Type Sweep",
-                _run_ntlm_auth_type_sweep_step,
-                step_number=3,
-                total_steps=3,
-            ):
-                return
+            # Declared as the optional ``ntlm_auth_type_sweep`` subphase of
+            # ``domain_analysis``; honour the operator's scan-config opt-out the
+            # same way the quick-win / spraying subphases do. The step also
+            # self-gates internally (>=2-reachable relay gate, OPSEC confirm),
+            # but the config toggle must win first so a disabled subphase never
+            # runs.
+            from adscan_internal.services.scan_phases import subphase_is_enabled
+
+            if subphase_is_enabled(self, "domain_analysis", "ntlm_auth_type_sweep"):
+                if _run_step(
+                    "NTLM Auth-Type Sweep",
+                    _run_ntlm_auth_type_sweep_step,
+                    step_number=3,
+                    total_steps=3,
+                ):
+                    return
+            else:
+                print_step_status(
+                    "NTLM Auth-Type Sweep",
+                    status="skipped",
+                    step_number=3,
+                    total_steps=3,
+                    details="Disabled in scan configuration",
+                )
 
             self.domains_data.setdefault(domain, {})["phase1_complete"] = (
                 _phase1_outputs_ready()
@@ -16333,6 +16585,15 @@ class PentestShell:
                     get_attack_path_summaries,
                     ATTACK_PATHS_MAX_DEPTH_DOMAIN,
                 )
+
+                # Conditional phase: this re-offer runs ONLY when the domain is
+                # already compromised. It is declared in the scan plan
+                # (scan_phases.post_compromise_validation, conditional=True) but
+                # emits its phase event only here, so the web pipeline advances
+                # past "CVE Verification" to "Exposure Validation" exactly when
+                # this step actually runs — and resolves it to "not applicable"
+                # at terminal status when it never does.
+                emit_phase("post_compromise_validation")
 
                 print_panel(
                     content=(
@@ -23568,17 +23829,33 @@ class PentestShell:
             print_error(f"Error enabling user {marked_target}: {e}")
             return False
 
-    def restore_deleted_object(self, domain, username, password, deleted_dn):
+    def restore_deleted_object(
+        self,
+        domain,
+        username,
+        password,
+        deleted_dn,
+        object_sid=None,
+        sam_account_name=None,
+        last_known_rdn=None,
+    ):
         """Reanimate a tombstoned object (AD Recycle Bin) via native LDAP.
 
         The lifecycle transition deleted→live, mirroring :meth:`enable_user`. Used by
         the ACE-step executor as a restore-first preparatory transform before running
         a GenericWrite/GenericAll technique against a tombstoned target.
+
+        ``deleted_dn`` is the tombstone's distinguishedName when known. On a cached
+        graph node it may be absent — pass ``object_sid`` (preferred) and/or
+        ``sam_account_name`` so the service resolves the real tombstone DN from the
+        recycle bin instead of attempting an always-failing search on a bare label.
         """
         from adscan_internal.rich_output import mark_sensitive
         from adscan_internal.services.exploitation import ExploitationService
 
-        marked_target = mark_sensitive(deleted_dn, "path")
+        marked_target = mark_sensitive(
+            deleted_dn or sam_account_name or object_sid or "target", "path"
+        )
         try:
             pdc_ip = self.domains_data[domain]["pdc"]
             pdc_hostname = self.domains_data[domain].get("pdc_hostname") or pdc_ip
@@ -23597,6 +23874,9 @@ class PentestShell:
                 password=password,
                 domain=domain,
                 deleted_dn=deleted_dn,
+                object_sid=object_sid,
+                sam_account_name=sam_account_name,
+                last_known_rdn=last_known_rdn,
                 kerberos=True,
             )
             if success:
@@ -26727,6 +27007,92 @@ class PentestShell:
             print_error("Error updating the technical report.")
             print_exception(show_locals=False, exception=e)
 
+    def do_deliver(self, args):
+        """
+        Generate the Client Deliverable Kit for the current workspace.
+
+        ``deliver`` is the canonical, single report engine in the REPL. By
+        default it renders the FULL kit (Security Assessment Report + AD
+        Hardening Playbook + AD Control Coverage Report, packaged into one ZIP)
+        with an interactive deliverable checkbox — everything pre-selected, so
+        you can deselect down to e.g. only the Security Assessment Report for a
+        report-only PDF. The reporting verbs ``report`` / ``reporting`` /
+        ``generate_report`` are aliased onto this command.
+
+        Args:
+            args (str): Optional ``deliver`` flags, e.g. ``--only report``,
+                ``--client "Acme Corp"``, ``--frameworks ens,iso27001``,
+                ``--theme corporate_light``. With no flags an interactive
+                checkbox picks the deliverables (all by default).
+        """
+        import argparse as _argparse
+        import shlex as _shlex
+
+        from adscan_internal.cli.deliver import (
+            add_deliver_subparser as _add_deliver_subparser,
+            run_deliver_sync as _run_deliver_sync,
+        )
+
+        # Build a throwaway parser carrying exactly the ``deliver`` subparser so
+        # the REPL honours the same flag surface as ``adscan deliver`` (the host
+        # launcher). Parsing failures fall back to the docstring usage.
+        _root = _argparse.ArgumentParser(prog="deliver", add_help=False)
+        _subs = _root.add_subparsers(dest="_cmd")
+        _deliver_parser = _add_deliver_subparser(_subs)
+        try:
+            ns = _deliver_parser.parse_args(_shlex.split(args or ""))
+        except SystemExit:
+            print_error(self.do_deliver.__doc__ or "Usage: deliver [--only ...]")
+            return None
+
+        # Thread the active workspace so deliver never prompts for one — the
+        # operator already has a session open. ``ADSCAN_INSIDE_SHELL`` tells the
+        # resolver to trust the session context; ``_shell`` is threaded into the
+        # deliverable checkbox so its non-interactive predicate sees the session.
+        if not getattr(ns, "workspace", None) and getattr(self, "current_workspace_dir", None):
+            ns.workspace = str(self.current_workspace_dir)
+        setattr(ns, "_shell", self)
+        os.environ["ADSCAN_INSIDE_SHELL"] = "1"
+        return _run_deliver_sync(ns)
+
+    def do_cheatsheet(self, args):
+        """
+        Render the Quick-Start Cheat Sheet PDF (LITE operator desk reference).
+
+        Mirrors the host launcher ``adscan cheatsheet`` so the REPL exposes the
+        same operator companion. ``cheat`` is an alias for this command.
+
+        Args:
+            args (str): Optional ``cheatsheet`` flags, e.g. ``--output <path>``,
+                ``--no-open``, ``--no-render`` (smoke / dry-run only).
+        """
+        import argparse as _argparse
+        import shlex as _shlex
+
+        from adscan_internal.cli.bonuses import (
+            add_cheatsheet_subparser as _add_cheatsheet_subparser,
+            run_cheatsheet as _run_cheatsheet,
+        )
+
+        # Build a throwaway parser carrying exactly the ``cheatsheet`` subparser
+        # so the REPL honours the same flag surface as ``adscan cheatsheet``.
+        _root = _argparse.ArgumentParser(prog="cheatsheet", add_help=False)
+        _subs = _root.add_subparsers(dest="_cmd")
+        _add_cheatsheet_subparser(_subs)
+        try:
+            ns = _root.parse_args(["cheatsheet", *_shlex.split(args or "")])
+        except SystemExit:
+            print_error(self.do_cheatsheet.__doc__ or "Usage: cheatsheet [--output ...]")
+            return None
+
+        return _run_cheatsheet(ns)
+
+    # ``cheat`` is a discoverable shorthand operators naturally type for the
+    # cheat sheet; alias it onto the canonical ``cheatsheet`` command.
+    def do_cheat(self, args):
+        """Alias for ``cheatsheet`` — render the Quick-Start Cheat Sheet PDF."""
+        return self.do_cheatsheet(args)
+
     def do_generate_report(self, args):
         """
         Generates a premium PDF report from the technical report JSON.
@@ -27992,50 +28358,89 @@ class PentestShell:
         return True
 
     def _prompt_interface_if_missing(self):
-        """Interactively prompt for network interface if not configured."""
+        """Interactively prompt for network interface if not configured.
+
+        Each option is annotated with its IPv4 address (or a ``(no IPv4)``
+        marker) so the operator does not blindly pick an interface that cannot
+        source traffic. Selecting a no-IPv4 interface re-prompts instead of
+        dead-ending; the user must explicitly cancel to abort. In
+        non-interactive mode the selection auto-resolves to the first interface
+        that has an IPv4 (never loops).
+        """
         if self.interface:
             return True
 
         from adscan_internal import print_warning
+        from adscan_internal.interaction import is_non_interactive
 
         print_warning("⚠️  Network interface not configured")
 
-        # Get available network interfaces
+        # Get available network interfaces with their IPv4 addresses so the
+        # picker can annotate each option and avoid the no-IP dead-end.
         try:
-            import netifaces
+            from adscan_internal.cli.start import _list_local_interfaces_with_ipv4
 
-            interfaces = netifaces.interfaces()
-            # Filter out loopback
-            interfaces = [iface for iface in interfaces if iface != "lo"]
+            annotated = _list_local_interfaces_with_ipv4()
 
-            if not interfaces:
+            if not annotated:
                 print_error("No network interfaces found.")
                 return False
 
-            # Format options with icons
-            iface_options = [f"🌐 {iface}" for iface in interfaces]
+            interfaces = [name for name, _ipv4s in annotated]
+            ipv4_by_iface = {name: list(ipv4s) for name, ipv4s in annotated}
 
-            selection_idx = self._questionary_select(
-                "Select network interface:", iface_options
+            def _format_option(name: str) -> str:
+                ipv4s = ipv4_by_iface.get(name) or []
+                if ipv4s:
+                    return f"🌐 {name}  [{', '.join(ipv4s)}]"
+                return f"🌐 {name}  (no IPv4)"
+
+            # Default to the first interface that actually has an IPv4 so the
+            # non-interactive auto-resolution picks a usable vantage point.
+            default_idx = next(
+                (idx for idx, name in enumerate(interfaces) if ipv4_by_iface.get(name)),
+                0,
             )
 
-            if selection_idx is None:
-                print_error("Network interface is required to continue.")
-                return False
+            noninteractive = is_non_interactive(self)
 
-            selected_iface = interfaces[selection_idx]
-            self.interface = selected_iface
-            ip = self.set_interface_ip(selected_iface)
+            while True:
+                iface_options = [_format_option(name) for name in interfaces]
 
-            if ip:
-                print_success(
-                    f"Interface configured: {self.interface} with IP: {self.myip}"
+                selection_idx = self._questionary_select(
+                    "Select network interface:",
+                    iface_options,
+                    default_idx=default_idx,
                 )
-            else:
-                print_error(f"Could not get IP for interface {self.interface}")
-                return False
 
-            return True
+                if selection_idx is None:
+                    print_error("Network interface is required to continue.")
+                    return False
+
+                selected_iface = interfaces[selection_idx]
+                self.interface = selected_iface
+                ip = self.set_interface_ip(selected_iface)
+
+                if ip:
+                    print_success(
+                        f"Interface configured: {self.interface} with IP: {self.myip}"
+                    )
+                    return True
+
+                # No usable IPv4 on the chosen interface.
+                self.interface = None
+                if noninteractive:
+                    print_error(
+                        f"Could not get IP for interface {selected_iface}; "
+                        "no usable interface available in non-interactive mode."
+                    )
+                    return False
+
+                print_warning(
+                    f"⚠️  Interface '{selected_iface}' has no assigned IPv4 address. "
+                    "Pick an interface that shows an IPv4 address, or cancel to abort."
+                )
+                # Loop and re-prompt instead of dead-ending.
 
         except ImportError:
             # Fallback to manual input if netifaces not available
@@ -28364,6 +28769,32 @@ class PentestShell:
                         fields["workspace_id_hash"] = ws_hash
             except Exception:  # noqa: BLE001
                 pass
+            # Carry the workspace TYPE (ctf/audit) on every chunk. The
+            # streamer is built in __init__ before self.type is known
+            # (set later by _prompt_type_if_missing / stored-value load),
+            # so snapshotting it per-chunk is what lets a live session be
+            # typed instead of stuck at the server's ``unknown`` default.
+            # Privacy: only the normalized ctf/audit ever travels — never
+            # the raw workspace name. We omit the key when self.type is
+            # unset so the server keeps ``unknown`` (never an empty string).
+            try:
+                ws_type = _resolve_streamer_workspace_type(
+                    getattr(self, "type", None)
+                )
+                if ws_type:
+                    fields["workspace_type"] = ws_type
+            except Exception:  # noqa: BLE001
+                pass
+            # Carry the FULL valuable metadata set on every chunk — lab+partner
+            # identity, progressive compromise state, and AD scale — through the
+            # SAME SSOT builders the finalize payload uses (zero drift). This is
+            # what keeps a session that hangs/crashes (and never finalizes) still
+            # triageable from its last live chunk. Best-effort: a failure here
+            # never breaks the chunk; workspace_type above is owned separately.
+            try:
+                fields.update(_resolve_streamer_metadata_snapshot(self))
+            except Exception:  # noqa: BLE001
+                pass
             return fields
 
         streamer = _tel.make_session_streamer(
@@ -28488,21 +28919,28 @@ class PentestShell:
                 print_error("Failed to execute command")
                 return
 
+            # External-command output (stdout/stderr) is arbitrary, operator-
+            # chosen content (e.g. `cat users.txt`) that the telemetry
+            # sanitizer cannot redact. Route it through the dedicated untrusted
+            # path: it stays visible on the operator's terminal but is kept out
+            # of the session recording (a privacy placeholder is recorded
+            # instead). The masked command echo is still recorded elsewhere.
             if completed_process.returncode == 0:
                 if completed_process.stdout:
-                    self.console.print(completed_process.stdout)
+                    print_untrusted_command_output(completed_process.stdout)
                 if completed_process.stderr:
-                    print_warning(
-                        f"Stderr (even on success): {completed_process.stderr}"
-                    )
+                    print_warning("Command produced stderr output (even on success):")
+                    print_untrusted_command_output(completed_process.stderr)
             else:
                 print_error(
                     f"Command '{arg}' failed with return code {completed_process.returncode}"
                 )
                 if completed_process.stdout:
-                    print_info(f"Stdout (on error): {completed_process.stdout}")
+                    print_info("Stdout (on error):")
+                    print_untrusted_command_output(completed_process.stdout)
                 if completed_process.stderr:
-                    print_error(f"Error: {completed_process.stderr}")
+                    print_error("Stderr (on error):")
+                    print_untrusted_command_output(completed_process.stderr)
 
         except Exception as e:
             telemetry.capture_exception(e)
@@ -28969,15 +29407,21 @@ class PentestShell:
         except Exception as exc:  # pragma: no cover - best-effort shutdown
             telemetry.capture_exception(exc)
             print_info_debug(f"[ledger] operator-confirmed exit cleanup failed: {exc}")
-        # Render environment change cleanup summary and finalise ledger
+        # Finalise the ledger FIRST so the session-died reconciliation
+        # force-transitions any non-terminal record (pending / revert_in_progress
+        # / revert_failed_retrying) to manual_required(session_died) with a native
+        # remediation command + DN — then render the panel so it reflects the
+        # complete, terminal truth (never a half-state). finalize() also flushes
+        # the ledger to environment_changes.json, which the web's final
+        # reconciliation pass picks up on graceful OR abrupt (atexit) exit.
         try:
             if getattr(self, "environment_change_ledger", None) is not None:
                 from adscan_internal.services.cleanup_ux import (
                     render_cleanup_exit_panel,
                 )
 
-                render_cleanup_exit_panel(self.environment_change_ledger)
                 self.environment_change_ledger.finalize()
+                render_cleanup_exit_panel(self.environment_change_ledger)
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_info_debug(f"[ledger] exit panel failed: {exc}")
@@ -29158,8 +29602,6 @@ class PentestShell:
                 "rid_cycling",
                 "netexec_gpp_autologin",
                 "netexec_gpp_passwords",
-                "netexec_null_general",
-                "netexec_null_shares",
                 "netexec_guest",
                 "netexec_auth_shares",
                 "netexec_smb_null_enum_users",
@@ -29169,7 +29611,6 @@ class PentestShell:
             ],
             "LDAP": [
                 "ldap_anonymous",
-                "netexec_ldap_descriptions",
                 "netexec_ldap_users",
                 "ldap_computers",
             ],
@@ -29186,8 +29627,6 @@ class PentestShell:
             "CVE": [
                 "enum_cve_dcs",
                 "enum_cve_all",
-                "netexec_cve_all",
-                "netexec_cve_dcs",
             ],
             "Poisoning": [
                 "poisoning",
@@ -29218,19 +29657,22 @@ class PentestShell:
                 "netexec_user_postauth_access",
             ],
             "BloodHound": [
-                "bloodhound_users",
-                "bloodhound_all_users",
-                "bloodhound_admin_users",
-                "bloodhound_privileged_users",
-                "bloodhound_python",
-                "bloodhound_sessions",
-                "bloodhound_computers",
-                "bloodhound_computers_all",
-                "bloodhound_computers_with_laps",
-                "bloodhound_computers_without_laps",
-                "bloodhound_pwdneverexpires",
-                "bloodhound_passnotreq",
-                "bloodhound_krbtgt, bloodhound_dc_access",
+                "graph_collection",
+                "users",
+                "all_users",
+                "admin_users",
+                "privileged_users",
+                "sessions",
+                "host_inventory",
+                "computers_all",
+                "computers_with_laps",
+                "computers_without_laps",
+                "pwdneverexpires",
+                "passnotreq",
+                "stale_enabled_users",
+                "tier0_highvalue_sprawl",
+                "krbtgt",
+                "dc_access",
             ],
             "Configs": [
                 "clear_all",
@@ -30082,6 +30524,76 @@ def handle_ci(args):
     )
 
 
+def handle_execute(args):
+    """Handle ``adscan execute <verb>`` — non-interactive single-verb runner.
+
+    Reuses the same shell factory, preflight, and auto-mode bootstrap as
+    ``handle_ci`` so the two stay in lockstep (one engine, two entry points).
+    """
+    from adscan_internal.cli.execute import (
+        ExecuteDeps,
+        config_from_args,
+        list_execute_verbs,
+        run_execute,
+    )
+
+    if getattr(args, "list_verbs", False):
+        return list_execute_verbs()
+
+    return run_execute(
+        config=config_from_args(args),
+        deps=ExecuteDeps(
+            enable_auto_mode=enable_auto_mode,
+            build_preflight_args=lambda: argparse.Namespace(
+                command="check",
+                fix=False,
+                preflight_mode="ci",
+            ),
+            handle_check=handle_check,
+            get_last_check_extra=lambda: _LAST_CHECK_SESSION_EXTRA or {},
+            track_docs_link_shown=track_docs_link_shown,
+            resolve_license_mode=lambda requested: _resolve_license_mode(
+                requested_pro=requested
+            ),
+            create_shell=lambda console_instance, license_mode: PentestShell(
+                console_instance=console_instance,
+                license_mode=license_mode,
+            ),
+            console=console,
+            exit=sys.exit,
+        ),
+    )
+
+
+def handle_doctor(args):
+    """Handle ``adscan doctor`` — fast one-shot environment health check."""
+    from adscan_internal.cli.doctor import (
+        DoctorDeps,
+        config_from_args,
+        run_doctor,
+    )
+
+    return run_doctor(
+        config=config_from_args(args),
+        deps=DoctorDeps(
+            build_preflight_args=lambda: argparse.Namespace(
+                command="check",
+                fix=False,
+                preflight_mode="ci",
+            ),
+            handle_check=handle_check,
+            resolve_license_mode=lambda requested: _resolve_license_mode(
+                requested_pro=requested
+            ),
+            create_shell=lambda console_instance, license_mode: PentestShell(
+                console_instance=console_instance,
+                license_mode=license_mode,
+            ),
+            console=console,
+        ),
+    )
+
+
 if __name__ == "__main__":
     # Required for multiprocessing with spawn context inside a PyInstaller binary.
     # Must be called before any other code in the __main__ block.
@@ -30287,6 +30799,19 @@ if __name__ == "__main__":
         help="Generate report after successful scan with flags captured (requires Report License)",
     )
     ci_parser.add_argument(
+        "--only",
+        dest="only",
+        type=str,
+        default="report",
+        help=(
+            "Deliverable selection for --generate-report, routed through the "
+            "unified deliver engine. Default 'report' = the single Security "
+            "Assessment Report PDF (CI stays report-only so the web does not "
+            "double-generate the full kit). Pass a wider comma-separated set "
+            "(e.g. 'report,playbook') to render those inline."
+        ),
+    )
+    ci_parser.add_argument(
         "--report-format",
         choices=["pdf"],
         default="pdf",
@@ -30347,6 +30872,21 @@ if __name__ == "__main__":
     # LITE-tier operator cheat sheet keeps a standalone subcommand.
     from adscan_internal.cli.bonuses import add_cheatsheet_subparser as _add_cheatsheet_subparser
     _add_cheatsheet_subparser(subparsers)
+
+    # ── adscan execute (single-verb non-interactive runner) ───────────
+    # Exposes the REPL's do_<verb> commands as one-shot CLI actions for
+    # scripting / smoke-tests. Verbs + allowlist live in cli/execute.py.
+    from adscan_internal.cli.execute import (
+        add_execute_subparser as _add_execute_subparser,
+    )
+    _add_execute_subparser(subparsers)
+
+    # ── adscan doctor (PoV health check) ──────────────────────────────
+    # Fast GREEN/RED smoke test over DNS, DC connectivity, auth, posture.
+    from adscan_internal.cli.doctor import (
+        add_doctor_subparser as _add_doctor_subparser,
+    )
+    _add_doctor_subparser(subparsers)
 
     # ── adscan deliver (PRO Client Deliverable Kit) ───────────────────
     # Renders the four PRO PDFs in parallel and packages them into a
@@ -30591,7 +31131,7 @@ if __name__ == "__main__":
     # Set global verbose mode (VERBOSE_MODE) if --verbose is passed with start/install/auto command
     if (
         hasattr(args, "command")
-        and args.command in ("start", "ci", "install", "check", "mitre-navigator")
+        and args.command in ("start", "ci", "execute", "doctor", "install", "check", "mitre-navigator")
         and hasattr(args, "verbose")
         and args.verbose
     ):
@@ -30606,7 +31146,7 @@ if __name__ == "__main__":
     # Debug mode (public in OSS launcher/runtime; does not enable SECRET_MODE).
     if (
         hasattr(args, "command")
-        and args.command in ("start", "ci", "install", "check", "deliver", "mitre-navigator")
+        and args.command in ("start", "ci", "execute", "doctor", "install", "check", "deliver", "mitre-navigator")
         and hasattr(args, "debug")
         and args.debug
     ):
@@ -30636,8 +31176,8 @@ if __name__ == "__main__":
         os.environ["ADSCAN_DOCKER_CHANNEL"] = "dev"
 
     # Offer upgrades early for relevant subcommands (interactive only).
-    if getattr(args, "command", None) == "ci":
-        # `adscan ci` must be non-interactive even in a real TTY.
+    if getattr(args, "command", None) in ("ci", "execute", "doctor"):
+        # These commands must be non-interactive even in a real TTY (Docker -it).
         os.environ.setdefault("ADSCAN_SESSION_ENV", "ci")
         os.environ["ADSCAN_NONINTERACTIVE"] = "1"
         enable_auto_mode()
@@ -30771,6 +31311,7 @@ if __name__ == "__main__":
                 report_renderer=str(getattr(args, "report_renderer", "") or ""),
                 report_template=str(getattr(args, "report_template", "") or ""),
                 report_theme=str(getattr(args, "report_theme", "") or ""),
+                report_only=str(getattr(args, "only", "") or ""),
             )
             # Docker-mode CI runs inside the container and should own session uploads.
             _SESSION_CAPTURE_FINALIZED = True
@@ -30784,6 +31325,31 @@ if __name__ == "__main__":
                 "ci",
                 success=(exit_code == 0),
                 extra={"mode": "container", "ci_mode": str(getattr(args, "mode", ""))},
+            )
+        sys.exit(exit_code)
+    elif args.command == "execute":
+        # Single-verb non-interactive runner. Runs inside the container; the
+        # launcher passes it through (no Docker-mode preflight branch needed —
+        # `execute` runs the shared session preflight itself).
+        exit_code = 1
+        try:
+            exit_code = handle_execute(args)
+        finally:
+            _capture_command_session(
+                "execute",
+                success=(exit_code == 0),
+                extra={"mode": "container", "verb": str(getattr(args, "verb", "") or "")},
+            )
+        sys.exit(exit_code)
+    elif args.command == "doctor":
+        exit_code = 1
+        try:
+            exit_code = handle_doctor(args)
+        finally:
+            _capture_command_session(
+                "doctor",
+                success=(exit_code == 0),
+                extra={"mode": "container"},
             )
         sys.exit(exit_code)
     elif args.command == "demo":

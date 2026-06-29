@@ -587,6 +587,7 @@ def collect_share_exposures_from_graph(
     from adscan_internal.services.collector.share_ntfs_verification import (
         VERIFICATION_NTFS_COMPUTED,
         VERIFICATION_SELF_MXAC,
+        VERIFICATION_SHARE_ACL_ONLY,
         effective_mask_relations,
     )
 
@@ -696,10 +697,21 @@ def collect_share_exposures_from_graph(
     # not an exposure for the scanning identity — drop it.
     resolved: list[dict[str, Any]] = []
     for row in exposures.values():
-        if row.get("_has_verified"):
+        has_verified = bool(row.get("_has_verified"))
+        if has_verified:
             row["access"] = set(row.get("_verified_access") or set())
         else:
             row["access"] = set(row.get("_raw_access") or set())
+        # Verification rollup for the access breakdown. When ANY edge on this
+        # (host, share) carried an NTFS/MxAc measurement the access shown is the
+        # effective (share ∩ NTFS) value — real. When none did, the access is
+        # the raw share-level grant only: NTFS was not verifiable, so the level
+        # may overstate (the NETLOGON/SYSVOL Full-Control-but-Read case). The
+        # view labels these "share-level only — NTFS not verified".
+        row["ntfs_verified"] = has_verified
+        row["verification"] = (
+            VERIFICATION_NTFS_COMPUTED if has_verified else VERIFICATION_SHARE_ACL_ONLY
+        )
         for internal in ("_verified_access", "_raw_access", "_has_verified"):
             row.pop(internal, None)
         if not row["access"]:

@@ -825,21 +825,29 @@ def _prompt_dc_discovery_recovery(
     return _DcDiscoveryRecoveryDecision(action="retry_scope", hosts=new_hosts)
 
 
-def _run_start_unauth_impl(shell, args: str | None) -> None:
+def _run_start_unauth_impl(shell, args: str | None) -> bool:
     """Start unauthenticated scan using the legacy PentestShell implementation.
 
     This helper mirrors :meth:`PentestShell.do_start_unauth` while keeping the
     orchestration logic in this module so that `adscan.py` can be slimmer.
+
+    Returns:
+        ``True`` only when an unauthenticated scan actually started in this call
+        (enumeration / service discovery ran). ``False`` on every early bail
+        before a scan runs (missing type/interface, invalid/missing target,
+        cancelled discovery, preflight abort) and when the flow delegates to
+        :func:`run_start_auth` (which emits its own post-scan panel). The caller
+        uses this to gate the post-scan "Scan complete" panel.
     """
     # Interactive configuration prompts
     if not shell._prompt_type_if_missing():
-        return
+        return False
 
     if not shell._prompt_interface_if_missing():
-        return
+        return False
 
     if not shell._prompt_auto_if_missing():
-        return
+        return False
 
     # Ask if user wants to clean workspace before starting scan (only if needed)
     _prompt_workspace_cleanup(shell)
@@ -881,8 +889,10 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                 border_style="green",
                 padding=(1, 2),
             )
+            # Delegated: run_start_auth emits its own post-scan panel, so this
+            # call must not also emit one.
             run_start_auth(shell, None)
-            return
+            return False
 
         print_info("Continuing with unauthenticated scan")
     else:
@@ -944,7 +954,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
         parts = args.strip().split()
         if len(parts) not in {1, 2}:
             print_error("Usage: start_unauth <domain|dc_ip> [dc_ip]")
-            return
+            return False
 
         service = shell._get_dns_discovery_service()
 
@@ -976,7 +986,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                         "Domain inference failed and interactive input is not available. "
                         "Provide the domain explicitly: `start_unauth <domain> <dc_ip>`."
                     )
-                    return
+                    return False
                 print_info(
                     "Could not infer the domain automatically; requesting input."
                 )
@@ -994,12 +1004,12 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     "That looks like an IP address, not a domain (FQDN). Provide the "
                     "domain as a DNS name (e.g., contoso.local): `start_unauth <domain> <dc_ip>`."
                 )
-                return
+                return False
             if "." not in domain:
                 print_error(
                     "Domain must be a FQDN (e.g., contoso.local), not a NetBIOS name."
                 )
-                return
+                return False
 
         # Case: `start_unauth <domain> [dc_ip]`
         if not is_first_ip:
@@ -1009,12 +1019,12 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     "That looks like an IP address, not a domain (FQDN). Provide the "
                     "domain as a DNS name (e.g., contoso.local): `start_unauth <domain> <dc_ip>`."
                 )
-                return
+                return False
             if "." not in domain:
                 print_error(
                     "Domain must be a FQDN (e.g., contoso.local), not a NetBIOS name."
                 )
-                return
+                return False
 
             candidate_ip = parts[1].strip() if len(parts) == 2 else None
             if candidate_ip:
@@ -1024,7 +1034,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     print_error(
                         f"Invalid DC/PDC IP address: {mark_sensitive(candidate_ip, 'ip')}"
                     )
-                    return
+                    return False
             else:
                 # Domain-only args: attempt to discover PDC via system DNS first.
                 pdc_ip, pdc_hostname = service.discover_pdc(domain=domain)
@@ -1077,7 +1087,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                         "No DC/DNS IP provided and PDC discovery failed. Provide a DC IP: "
                         "`start_unauth <domain> <dc_ip>`."
                     )
-                    return
+                    return False
                 print_info("PDC discovery failed; please provide a DC/DNS IP.")
                 candidate_ip = Prompt.ask(
                     Text(
@@ -1091,7 +1101,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     print_error(
                         f"Invalid DC/DNS IP address: {mark_sensitive(candidate_ip, 'ip')}"
                     )
-                    return
+                    return False
 
         decision = preflight_domain_pdc(
             shell,
@@ -1146,7 +1156,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
             _show_host_range_discovery_intro()
             target_input = _prompt_domain_discovery_hosts(shell)
             if not target_input:
-                return
+                return False
             target = target_input
             domain = None
             known_domain = None
@@ -1166,7 +1176,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     "Domain provided but no DC target is available. Provide a DC IP: "
                     "`start_unauth <domain> <pdc_ip>` or use domain discovery mode."
                 )
-                return
+                return False
 
     else:
         # Original behavior using shell.hosts
@@ -1176,13 +1186,13 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     "Direct domain enumeration requires a DC IP. Choose domain discovery "
                     "or provide the PDC/DC IP when prompted."
                 )
-                return
+                return False
             target = known_pdc_ip
             domain = known_domain
         else:
             target_input = _prompt_domain_discovery_hosts(shell)
             if not target_input:
-                return
+                return False
             target = target_input
             domain = known_domain
 
@@ -1196,7 +1206,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
             target_ip=known_pdc_ip,
             require_dc_ports=True,
         ):
-            return
+            return False
     else:
         if not _run_start_network_preflight(
             shell,
@@ -1205,7 +1215,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
             interactive=interactive_mode,
             hosts_expression=str(target),
         ):
-            return
+            return False
 
     # Professional scan initialization header
     from adscan_internal import print_operation_header
@@ -1265,7 +1275,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
             domain=known_domain,
             pdc_ip=known_pdc_ip,
         ):
-            return
+            return False
 
         # Skip to enumeration for this domain
         asyncio.run(
@@ -1281,6 +1291,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
         shell.workspace_save()
         if not shell._is_ctf_domain_pwned(known_domain):
             shell.ask_for_unauth_scan(known_domain)
+        return True
     else:
         # Original flow: scan services to discover domains
         # List of services to scan
@@ -1346,11 +1357,11 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                             ),
                         )
                         if recovery.action == "cancel":
-                            return
+                            return False
                         if recovery.action == "switch_context":
                             context = _domain_context_wizard_for_unauth(shell)
                             if context is None:
-                                return
+                                return False
                             known_domain, known_pdc_ip = context
                             break
                         target = recovery.hosts or target
@@ -1367,7 +1378,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                             "No domains inferred from candidate DC/DNS IPs. "
                             "Try a broader range or provide domain + DC IP."
                         )
-                        return
+                        return False
 
                     rows = [
                         (summary.domain, len(summary.candidate_ips), summary.methods)
@@ -1380,7 +1391,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                         title="[bold]» Candidate Domains[/bold]",
                     )
                     if not selected_domain:
-                        return
+                        return False
                     selected_summary = next(
                         summary
                         for summary in summaries
@@ -1401,16 +1412,16 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                                 shell, mode_label="unauth"
                             )
                             if context is None:
-                                return
+                                return False
                             known_domain, known_pdc_ip = context
                             break
-                        return
+                        return False
                     known_domain, known_pdc_ip = decision.domain, decision.pdc_ip
                     persist_pdc_preflight_result(shell, decision)
                     break
 
                 if not known_domain or not known_pdc_ip:
-                    return
+                    return False
 
                 if not hasattr(shell, "domains"):
                     shell.domains = []
@@ -1451,7 +1462,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                     domain=known_domain,
                     pdc_ip=known_pdc_ip,
                 ):
-                    return
+                    return False
 
                 asyncio.run(
                     ensure_posture_fresh(
@@ -1468,6 +1479,9 @@ def _run_start_unauth_impl(shell, args: str | None) -> None:
                 continue
 
             shell.scan_service(service, target, domain)
+
+    # Reached only after the discovery/enumeration branch ran a scan.
+    return True
 
 
 def _warn_if_single_discovery_target(hosts_expression: str | None) -> None:
@@ -2864,8 +2878,13 @@ def run_start_unauth(shell, args: str | None) -> None:
     """
     while True:
         try:
-            _run_start_unauth_impl(shell, args)
-            _emit_post_scan_panels("start_unauth")
+            scan_ran = _run_start_unauth_impl(shell, args)
+            # Only render the post-scan "Scan complete" panel when a scan
+            # actually ran. Early bails (no interface, invalid/missing target,
+            # cancelled discovery, preflight abort) and delegation to
+            # run_start_auth return False so we don't render a false completion.
+            if scan_ran:
+                _emit_post_scan_panels("start_unauth")
             return
         except (EOFError, KeyboardInterrupt):
             action = _handle_start_wizard_interrupt(
@@ -2880,21 +2899,29 @@ def run_start_unauth(shell, args: str | None) -> None:
             return
 
 
-def _run_start_auth_impl(shell, args: str | None) -> None:
+def _run_start_auth_impl(shell, args: str | None) -> bool:
     """Start authenticated scan using the legacy PentestShell implementation.
 
     This helper mirrors :meth:`PentestShell.do_start_auth` while also supporting
     a guided interactive mode when the user runs `start_auth` without arguments.
+
+    Returns:
+        ``True`` only when an authenticated scan actually started in this call
+        (the credential/enumeration path ran). ``False`` on every early bail
+        before a scan runs (missing type/interface, cancelled creds, invalid
+        target, preflight/DNS abort) and when the flow delegates to
+        :func:`run_start_unauth` (which emits its own post-scan panel). The
+        caller uses this to gate the post-scan "Scan complete" panel.
     """
     # Interactive configuration prompts
     if not shell._prompt_type_if_missing():
-        return
+        return False
 
     if not shell._prompt_interface_if_missing():
-        return
+        return False
 
     if not shell._prompt_auto_if_missing():
-        return
+        return False
 
     # Ask if user wants to clean workspace before starting scan (only if needed)
     _prompt_workspace_cleanup(shell)
@@ -2909,7 +2936,7 @@ def _run_start_auth_impl(shell, args: str | None) -> None:
                 print_info(
                     "Usage: start_auth <domain> <pdc_ip> <username> <password_or_hash>"
                 )
-                return
+                return False
             # Interactive recovery for partial/mistyped args.
             print_warning(
                 "Arguments were incomplete/invalid. Switching to guided setup..."
@@ -2940,7 +2967,7 @@ def _run_start_auth_impl(shell, args: str | None) -> None:
                     print_error(
                         "A valid DC/PDC target is required for authenticated scanning."
                     )
-                    return
+                    return False
                 domain, pdc_ip = context
             finalize_domain_context(
                 shell,
@@ -2948,23 +2975,22 @@ def _run_start_auth_impl(shell, args: str | None) -> None:
                 pdc_ip=pdc_ip,
                 interactive=bool(sys.stdin.isatty()),
             )
-            _start_auth_with_params(
+            return _start_auth_with_params(
                 shell,
                 domain=domain,
                 pdc_ip=pdc_ip,
                 username=username,
                 password=password,
             )
-            return
 
     if not sys.stdin.isatty():
         print_error("Interactive input is not available.")
         print_info("Usage: start_auth <domain> <pdc_ip> <username> <password_or_hash>")
-        return
+        return False
 
     creds = _prompt_auth_credentials_interactive(shell)
     if creds is None:
-        return
+        return False
     username, password = creds
 
     print_panel(
@@ -2991,14 +3017,13 @@ def _run_start_auth_impl(shell, args: str | None) -> None:
                 pdc_ip=pdc_ip,
                 interactive=True,
             )
-            _start_auth_with_params(
+            return _start_auth_with_params(
                 shell,
                 domain=domain,
                 pdc_ip=pdc_ip,
                 username=username,
                 password=password,
             )
-            return
 
         print_panel(
             "[bold yellow]⚠[/bold yellow]  [bold]Authenticated scanning needs a reachable DC/PDC.[/bold]\n\n"
@@ -3012,12 +3037,14 @@ def _run_start_auth_impl(shell, args: str | None) -> None:
             Text("Switch to start_unauth instead?", style="cyan"),
             default=False,
         ):
+            # Delegated: run_start_unauth emits its own post-scan panel, so this
+            # call must not also emit one.
             run_start_unauth(shell, None)
-            return
+            return False
         if not Confirm.ask(
             Text("Try entering the target context again?", style="cyan"), default=True
         ):
-            return
+            return False
 
 
 def _prompt_auth_credentials_interactive(shell: Any) -> tuple[str, str] | None:
@@ -3249,8 +3276,14 @@ def _start_auth_with_params(
     pdc_ip: str,
     username: str,
     password: str,
-) -> None:
-    """Run the authenticated scan flow for validated parameters."""
+) -> bool:
+    """Run the authenticated scan flow for validated parameters.
+
+    Returns:
+        ``True`` when the authenticated scan started (credential added and
+        enumeration kicked off); ``False`` when it bailed before scanning
+        (network preflight failed, DNS resolution failed).
+    """
     _maybe_apply_domain_inference(shell, domain)
     interactive_mode = bool(sys.stdin.isatty())
     if not _run_start_network_preflight(
@@ -3261,7 +3294,7 @@ def _start_auth_with_params(
         target_ip=pdc_ip,
         require_dc_ports=True,
     ):
-        return
+        return False
 
     # Professional scan initialization header
     from adscan_internal import print_operation_header
@@ -3283,7 +3316,7 @@ def _start_auth_with_params(
     )
 
     if not shell.do_check_dns(domain, pdc_ip):
-        return
+        return False
 
     shell.scan_mode = "auth"
     shell.domain_validated_cred_counts = {}
@@ -3359,6 +3392,7 @@ def _start_auth_with_params(
             shell.save_workspace_data()
         except Exception:  # noqa: BLE001 - onboarding persistence is best effort
             pass
+    return True
 
 
 def run_start_auth(shell, args: str | None) -> None:
@@ -3369,8 +3403,13 @@ def run_start_auth(shell, args: str | None) -> None:
     """
     while True:
         try:
-            _run_start_auth_impl(shell, args)
-            _emit_post_scan_panels("start_auth")
+            scan_ran = _run_start_auth_impl(shell, args)
+            # Only render the post-scan "Scan complete" panel when a scan
+            # actually ran. Early bails (no interface, cancelled creds, invalid
+            # target, preflight/DNS abort) and delegation to run_start_unauth
+            # return False so we don't render a false completion.
+            if scan_ran:
+                _emit_post_scan_panels("start_auth")
             return
         except (EOFError, KeyboardInterrupt):
             action = _handle_start_wizard_interrupt(

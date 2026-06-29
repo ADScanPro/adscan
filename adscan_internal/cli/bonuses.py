@@ -446,6 +446,7 @@ def _ctx_playbook(
     observed: set[str] | None = None,
     has_workspace_signal: bool = False,
     workspace_dir: Path | None = None,
+    frameworks: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja context for the AD Hardening Playbook.
 
@@ -504,7 +505,7 @@ def _ctx_playbook(
             build_playbook_databinding,
         )
 
-        client = build_playbook_databinding(workspace_dir)
+        client = build_playbook_databinding(workspace_dir, frameworks)
     except Exception as exc:  # noqa: BLE001 — bonus must still ship on failure
         telemetry.capture_exception(exc)
         client = None
@@ -574,6 +575,7 @@ def _ctx_checklist(
     observed: set[str] | None = None,
     has_workspace_signal: bool = False,
     workspace_dir: Path | None = None,
+    frameworks: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja context for the MITRE Remediation Checklist.
 
@@ -652,7 +654,7 @@ def _ctx_checklist(
             build_checklist_databinding,
         )
 
-        client = build_checklist_databinding(workspace_dir)
+        client = build_checklist_databinding(workspace_dir, frameworks)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         client = None
@@ -676,6 +678,7 @@ def _ctx_coverage_matrix(
     observed: set[str] | None = None,
     has_workspace_signal: bool = False,
     workspace_dir: Path | None = None,
+    frameworks: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja context for the AD Control Coverage Report.
 
@@ -684,9 +687,11 @@ def _ctx_coverage_matrix(
     by ``update_report_field`` → ``record_control_evidence``. This folds the
     legacy Coverage Matrix into a positive-assurance view driven by what was
     actually tested, rather than a static ATT&CK reference catalog. The
-    ``observed`` / ``has_workspace_signal`` args are accepted for the uniform
-    dynamic-builder signature but unused — coverage state comes from the
-    report's control evidence, not the observed-technique set.
+    ``observed`` / ``has_workspace_signal`` / ``frameworks`` args are accepted
+    for the uniform dynamic-builder signature but unused — coverage state comes
+    from the report's control evidence (control name + what it defends against),
+    NOT from any per-framework compliance map, so the selected ``--frameworks``
+    do not change this report's content.
 
     Delegates to
     ``coverage_report_databinding.build_coverage_report_databinding``, which
@@ -721,6 +726,7 @@ def _build_context(
     bonus_key: str,
     workspace_dir: Path | None,
     theme: str | None = None,
+    frameworks: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the Jinja context for ``bonus_key``, threading workspace data.
 
@@ -736,6 +742,12 @@ def _build_context(
         theme: The resolved theme the deliverable will render with. Drives
             the theme-aware ``brand_logo`` ink so the wordmark always
             contrasts with the page background — no template guesses.
+        frameworks: The compliance regimes the operator selected. Threaded into
+            the playbook / checklist builders so their per-finding compliance
+            cards and compliance-gap roll-ups render ONLY the selected
+            frameworks (an ISO 27001 kit never leaks DORA/ENS). ``None`` keeps
+            the legacy all-frameworks behaviour; the coverage report ignores it
+            (it is framework-agnostic).
     """
     def _with_brand(ctx: dict[str, Any]) -> dict[str, Any]:
         """Inject the ADscan wordmark data-URIs into every context.
@@ -795,6 +807,7 @@ def _build_context(
     }
     if bonus_key in ("playbook", "checklist", "coverage-matrix"):
         kwargs["workspace_dir"] = workspace_dir
+        kwargs["frameworks"] = frameworks
     return _with_brand(builder(**kwargs))
 
 
@@ -810,6 +823,7 @@ def render_bonus(
     truncate: bool = False,
     workspace_dir: Path | None = None,
     theme: str | None = None,
+    frameworks: list[str] | None = None,
 ) -> int:
     """Render a single bonus PDF to ``output_path``. Returns bytes written.
 
@@ -835,6 +849,12 @@ def render_bonus(
             ``"corporate_light"`` / ``"light"`` → white corporate theme
             suitable for printing or board presentations.  Empty string or
             ``None`` → use the theme catalogued in ``BONUSES[bonus_key]``.
+        frameworks: The compliance regimes the operator selected (via
+            ``adscan deliver --frameworks`` / the REPL / ``adscan ci``). The
+            playbook and checklist render ONLY these frameworks' controls, so a
+            kit built for one regime never leaks another's content. ``None``
+            keeps the legacy all-frameworks behaviour; an empty list renders no
+            compliance content. The coverage report ignores it.
 
     Real customer flows (``adscan deliver``, web Celery
     ``generate_deliverable_kit``) MUST NOT pass ``is_sample=True``.
@@ -847,7 +867,9 @@ def render_bonus(
     resolved_theme = _THEME_ALIASES.get(theme or "", theme or "") or meta["theme"]
     template_source = _load_template(meta["template"])
     theme_css = _load_theme(resolved_theme)
-    context = _build_context(bonus_key, workspace_dir, theme=resolved_theme)
+    context = _build_context(
+        bonus_key, workspace_dir, theme=resolved_theme, frameworks=frameworks
+    )
     if bonus_key == "playbook":
         context["truncate"] = bool(truncate)
     html_str = _render_html(template_source, context, theme_css)

@@ -282,6 +282,91 @@ def _resolve_reusable_pivot_secret(
     )
 
 
+def _refresh_expired_ccache_for_cleanup(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    secret: str | None,
+) -> str | None:
+    """Refresh a generic Kerberos ccache once before the end-of-session cleanup pass.
+
+    End-of-session cleanup frequently runs with a TGT that expired during the
+    engagement. The WinRM PSRP transport hands its ``.ccache`` straight to
+    pyspnego/GSSAPI, which does NOT route through the ``_kerberos_recovery``
+    reminter seam (that seam only covers the badldap/aiosmb transports), so an
+    expired ticket there fails the cleanup with ``Ticket expired`` and leaves
+    real artifacts (the Ligolo agent + any changed credential) on the client
+    host. To keep cleanup self-healing we re-mint the principal's TGT ONCE,
+    up front, via the ``ensure_user_ccache`` SSOT.
+
+    Only generic credentials are refreshed. A capability-bearing ccache (a
+    marked ESC13 PAC-injected TGT) must NEVER be re-minted — re-authenticating
+    would drop the synthetic group SID — so it is returned as-is. A non-ccache
+    secret (password / NT hash) is also returned unchanged: the WinRM path mints
+    a fresh ticket from it on demand, so it is already self-healing.
+
+    Returns the (possibly refreshed) secret to use for cleanup. On any failure
+    the original secret is returned unchanged so the existing fail-closed
+    manual-required ledger path still applies.
+    """
+
+    value = str(secret or "").strip()
+    if not value.lower().endswith(".ccache"):
+        # Password / NT hash: the WinRM PSRP path mints a fresh TGT on demand.
+        return secret
+    if not username or not domain:
+        return secret
+
+    # Capability-bearing carve-out: never re-mint a marked ESC13 / scoped ticket.
+    try:
+        from adscan_internal.services.credential_store_service import (
+            get_capability_bearing_ccache,
+        )
+
+        marked = get_capability_bearing_ccache(
+            getattr(shell, "domains_data", None),
+            domain=domain,
+            username=username,
+        )
+        if marked and str(marked).strip() == value:
+            print_info_debug(
+                "[ligolo-cleanup] cleanup credential is a capability-bearing ccache; "
+                "skipping pre-cleanup TGT refresh to preserve its synthetic SID."
+            )
+            return secret
+    except Exception as exc:  # noqa: BLE001 - carve-out probe is best-effort
+        telemetry.capture_exception(exc)
+
+    try:
+        from adscan_internal.services.kerberos_ticket_service import ensure_user_ccache
+
+        dc_ip = getattr(shell, "current_dc_ip", None) or None
+        refreshed = ensure_user_ccache(
+            shell,
+            user=username,
+            domain=domain,
+            dc_ip=dc_ip,
+            force_refresh=True,
+        )
+        if refreshed:
+            print_info_debug(
+                "[ligolo-cleanup] refreshed end-of-session TGT before cleanup for "
+                f"{mark_sensitive(username, 'user')}@{str(domain or '').upper()}"
+            )
+            return refreshed
+        print_info_debug(
+            "[ligolo-cleanup] could not re-mint TGT before cleanup; "
+            "falling back to the stored (possibly expired) ccache."
+        )
+    except Exception as exc:  # noqa: BLE001 - refresh is best-effort
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            f"[ligolo-cleanup] pre-cleanup TGT refresh failed (ignored): {exc}"
+        )
+    return secret
+
+
 def _persist_cleanup_result(
     *,
     service: LigoloProxyService,
@@ -352,6 +437,20 @@ def cleanup_workspace_ligolo_artifacts(
             username=username,
             source_service=source_service,
             record=record,
+        )
+
+        # An end-of-session TGT is frequently expired. The WinRM PSRP cleanup
+        # path uses the ccache via GSSAPI (outside the _kerberos_recovery
+        # reminter seam), so a stale ticket would fail the cleanup and orphan
+        # the Ligolo agent on the client host. Re-mint a generic TGT once, up
+        # front, before the cleanup pass; capability-bearing ccaches are left
+        # untouched and a refresh failure falls through to the fail-closed
+        # manual-required ledger path below.
+        password = _refresh_expired_ccache_for_cleanup(
+            shell,
+            domain=domain,
+            username=username,
+            secret=password,
         )
 
         if tunnel_id:

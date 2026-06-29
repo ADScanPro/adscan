@@ -8,51 +8,71 @@ shell.acl_cleanup_actions rather than scoped cleanup stacks.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 from adscan_internal import print_info, print_warning, telemetry
-from adscan_internal.principal_utils import normalize_machine_account
-from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services import cleanup_taxonomy as _tax
+from adscan_internal.services.cleanup_credential_resolver import (
+    CleanupCredential,
+    build_da_escalated_credential,
+    looks_like_access_denied,
+    resolve_minimal_revert_credential,
+)
+from adscan_internal.services.cleanup_verification import (
+    VERIFY_DACL_ACE,
+    VERIFY_GROUP_MEMBERSHIP,
+    VERIFY_KEYCREDENTIAL,
+    VERIFY_OWNER,
+    VERIFY_SPN,
+    verify_dacl_ace_removed,
+    verify_group_membership_removed,
+    verify_keycredential_removed,
+    verify_owner_restored,
+    verify_spn_removed,
+)
+from adscan_internal.services.environment_change_ledger import MAX_REVERT_ATTEMPTS
 from adscan_internal.services.exploitation import ExploitationService
-
-
-_MANUAL_SHADOW_CREDS = (
-    "Review msDS-KeyCredentialLink on the target and remove only the ADscan-created "
-    "KeyCredential value. Do not clear the whole attribute unless the client has "
-    "confirmed there are no legitimate Windows Hello for Business or other PKINIT "
-    "credentials on the object."
+from adscan_internal.services.ldap_transport_service import (
+    ADscanLDAPConfig,
+    ADscanLDAPConnection,
 )
 
-_MANUAL_DACL_ACE = (
-    "Remove the ACL entry added by ADscan manually:\n"
-    "  Remove-DomainObjectAcl -Rights All -TargetIdentity TARGET"
-    " -PrincipalIdentity TRUSTEE"
-)
+# Remediation templates are the SSOT in cleanup_taxonomy; re-exported here only
+# for back-compat references.
+_MANUAL_SHADOW_CREDS = _tax.MANUAL_SHADOW_CREDS
+_MANUAL_DACL_ACE = _tax.MANUAL_DACL_ACE
+_MANUAL_OWNER = _tax.MANUAL_OWNER
+_MANUAL_SPN = _tax.MANUAL_SPN
+_MANUAL_PASSWORD = _tax.MANUAL_PASSWORD
+_MANUAL_GROUP_MEMBERSHIP = _tax.MANUAL_GROUP_MEMBERSHIP
 
-_MANUAL_OWNER = (
-    "Restore the original owner of the object manually:\n"
-    "  $sd = Get-ADObject TARGET -Properties ntSecurityDescriptor\n"
-    "  $sd.ntSecurityDescriptor.SetOwner([System.Security.Principal.NTAccount]'ORIGINAL_OWNER')\n"
-    "  Set-ADObject TARGET -Replace @{ntSecurityDescriptor=$sd.ntSecurityDescriptor}"
+_TRANSIENT_EXC = (TimeoutError, asyncio.TimeoutError, ConnectionResetError, ConnectionError)
+_TRANSIENT_MARKERS = (
+    "timeout",
+    "timed out",
+    "wait_for",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "broken pipe",
+    "temporarily unavailable",
 )
+_REVERT_BACKOFF_SECONDS = 1.5
 
-_MANUAL_SPN = (
-    "Remove the injected SPN manually:\n"
-    "  Set-ADUser -Identity TARGET -ServicePrincipalNames @{Remove='SPN'}\n"
-    "  or: Set-ADComputer -Identity TARGET -ServicePrincipalNames @{Remove='SPN'}"
-)
 
-_MANUAL_PASSWORD = (
-    "Coordinate with the client to reset the target account password to a known value:\n"
-    "  Set-ADAccountPassword -Identity TARGET -NewPassword"
-    " (ConvertTo-SecureString 'NewPass' -AsPlainText -Force)\n"
-    "  This account's previous credential has been permanently replaced."
-)
-
-_MANUAL_GROUP_MEMBERSHIP = (
-    "Remove the group member added by ADscan manually:\n"
-    "  Remove-ADGroupMember -Identity 'GROUP' -Members 'MEMBER' -Confirm:$false"
-)
+def _is_transient_failure(error: BaseException | str | None) -> bool:
+    """Classify a revert failure as transient (retry) vs definitive (manual)."""
+    if isinstance(error, _TRANSIENT_EXC):
+        return True
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    if looks_like_access_denied(text):
+        return False
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
 
 
 def _resolve_pdc(shell: Any, domain: str) -> str:
@@ -91,15 +111,11 @@ def execute_acl_cleanup(shell: Any) -> None:
         target = str(action.get("target") or "").strip()
         domain = str(action.get("domain") or "").strip()
         target_domain = str(action.get("target_domain") or domain).strip() or domain
-        exec_username = str(action.get("exec_username") or "").strip()
-        exec_password = str(action.get("exec_password") or "").strip()
-        exec_username, exec_password = _resolve_cleanup_credential(
+        credential = resolve_minimal_revert_credential(
             shell,
             action=action,
             domain=domain,
             target_domain=target_domain,
-            exec_username=exec_username,
-            exec_password=exec_password,
         )
 
         try:
@@ -111,21 +127,33 @@ def execute_acl_cleanup(shell: Any) -> None:
                 target=target,
                 domain=domain,
                 target_domain=target_domain,
-                exec_username=exec_username,
-                exec_password=exec_password,
+                credential=credential,
                 action=action,
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             if ledger is not None and change_id:
                 try:
-                    ledger.mark_failed(
+                    ledger.mark_manual_required(
                         change_id,
+                        reason=_tax.MANUAL_REASON_REVERT_FAILED,
+                        remediation_command=_manual_instructions(kind, action),
+                        remediation_object_dn=_object_dn_for(action, target),
                         error=str(exc),
-                        manual_cleanup_instructions=_manual_instructions(kind, action),
                     )
                 except Exception:  # noqa: BLE001
                     pass
+
+
+def _object_dn_for(action: dict[str, Any], target: str) -> str:
+    """Best-known object DN the client acts on (for the manual checklist)."""
+    for key in ("target_dn", "object_dn", "dn", "target_object"):
+        value = str(action.get(key) or "").strip()
+        if value:
+            return value
+    if str(action.get("kind") or "") == "group_membership_changed":
+        return str(action.get("target_group") or target).strip()
+    return str(target or "").strip()
 
 
 def _execute_one_action(
@@ -137,20 +165,43 @@ def _execute_one_action(
     target: str,
     domain: str,
     target_domain: str,
-    exec_username: str,
-    exec_password: str,
+    credential: CleanupCredential,
     action: dict[str, Any],
 ) -> None:
-    marked_target = mark_sensitive(target, "user")
+    """Revert ONE ACL/attribute change with verify-the-undo + bounded retry.
 
+    Builds a per-kind plan (revert callable + verify callable + remediation +
+    object DN) and drives it through ``mark_revert_in_progress`` → (verify)
+    ``mark_reverted_confirmed`` / (transient) ``mark_revert_retry`` / (definitive
+    or unverifiable) ``mark_manual_required``. A ``TimeoutError`` is never
+    swallowed into a terminal state on the first hit. Escalation to a stored DA
+    credential is LAZY: only after a real ACCESS_DENIED on the minimal principal.
+    """
+    marked_target = mark_sensitive(target, "user")
+    object_dn = _object_dn_for(action, target)
+    remediation = _manual_instructions(kind, action)
+    if ledger is not None and change_id:
+        try:
+            ledger.set_revert_metadata(
+                change_id,
+                remediation_command=remediation,
+                remediation_object_dn=object_dn,
+                min_credential_principal=credential.principal_label or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+
+    # password_changed has NO automatic revert — the original secret is gone.
     if kind == "password_changed":
         print_warning(
             f"Password reset cannot be reverted automatically · {marked_target}"
         )
         if ledger is not None and change_id:
-            ledger.mark_operator_required(
+            ledger.mark_manual_required(
                 change_id,
-                manual_cleanup_instructions=_MANUAL_PASSWORD.replace("TARGET", target),
+                reason=_tax.MANUAL_REASON_NOT_ATTEMPTED,
+                remediation_command=_MANUAL_PASSWORD.replace("TARGET", target),
+                remediation_object_dn=object_dn,
             )
         return
 
@@ -160,194 +211,381 @@ def _execute_one_action(
             f"PDC not found for {target_domain} — cannot revert {kind} · {marked_target}"
         )
         if ledger is not None and change_id:
-            ledger.mark_operator_required(
+            ledger.mark_manual_required(
                 change_id,
-                manual_cleanup_instructions=_manual_instructions(kind, action),
+                reason=_tax.MANUAL_REASON_MISSING_METADATA,
+                remediation_command=remediation,
+                remediation_object_dn=object_dn,
             )
         return
 
-    if not exec_username or not exec_password:
-        print_warning(
-            f"No usable rollback credential found for {kind} · {marked_target}"
+    if not credential.usable:
+        # No minimal principal available. If a privileged-looking credential is
+        # stored, use it as the ONLY option (there is no lesser principal to be
+        # minimal about); otherwise this is genuinely uncleanable → manual.
+        escalated = (
+            build_da_escalated_credential(shell, target_domain or domain)
+            if credential.can_escalate_to_da
+            else None
         )
+        if escalated is None or not escalated.usable:
+            print_warning(
+                f"No usable rollback credential found for {kind} · {marked_target}"
+            )
+            if ledger is not None and change_id:
+                ledger.mark_manual_required(
+                    change_id,
+                    reason=_tax.MANUAL_REASON_MISSING_CREDENTIAL,
+                    remediation_command=remediation,
+                    remediation_object_dn=object_dn,
+                )
+            return
+        credential = escalated
+
+    plan = _build_revert_plan(kind=kind, target=target, action=action)
+    if plan is None:
+        print_warning(f"Unknown ACL cleanup kind '{kind}' — skipping")
+        return
+    if plan.get("needs_manual"):
         if ledger is not None and change_id:
-            ledger.mark_operator_required(
+            ledger.mark_manual_required(
                 change_id,
-                manual_cleanup_instructions=_manual_instructions(kind, action),
+                reason=_tax.MANUAL_REASON_MISSING_METADATA,
+                remediation_command=plan.get("remediation") or remediation,
+                remediation_object_dn=object_dn,
             )
         return
 
-    service = ExploitationService()
+    _drive_revert_with_verify(
+        shell=shell,
+        ledger=ledger,
+        change_id=change_id,
+        kind=kind,
+        target=target,
+        domain=domain,
+        target_domain=target_domain,
+        pdc_host=pdc_host,
+        credential=credential,
+        plan=plan,
+        remediation=remediation,
+        object_dn=object_dn,
+    )
 
+
+def _build_revert_plan(
+    *, kind: str, target: str, action: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return a per-kind revert plan, or None for an unknown kind.
+
+    A plan dict carries:
+        revert(service, conn_args) -> result    : performs the revert call
+        verify(conn) -> bool                     : post-revert re-read (fail-closed)
+        verification_method: str                 : ledger verification_method tag
+        success_label: str                       : info message on confirm
+        needs_manual: bool / remediation: str    : when metadata is missing
+    """
     if kind == "shadow_credentials_added":
         added_value = str(action.get("added_key_credential_value") or "").strip()
         if not added_value:
-            print_warning(
-                f"Shadow credentials cleanup needs manual review · {marked_target}"
+            return {
+                "needs_manual": True,
+                "remediation": _MANUAL_SHADOW_CREDS,
+            }
+
+        def _revert_shadow(service: Any, *, pdc_host: str, domain: str, cred: CleanupCredential):
+            return service.acl.remove_shadow_credential_value(
+                pdc_host=pdc_host, domain=domain, username=cred.username,
+                password=cred.secret, target_user=target,
+                key_credential_value=added_value, kerberos=True, timeout=300,
             )
-            if ledger is not None and change_id:
-                ledger.mark_operator_required(
-                    change_id,
-                    manual_cleanup_instructions=(
-                        "ADscan does not have the exact msDS-KeyCredentialLink value "
-                        "that it added, so it will not clear the whole attribute automatically. "
-                        "Review msDS-KeyCredentialLink on the target and remove only the ADscan-created value."
-                    ),
-                )
-            return
-        result = service.acl.remove_shadow_credential_value(
-            pdc_host=pdc_host,
-            domain=domain,
-            username=exec_username,
-            password=exec_password,
-            target_user=target,
-            key_credential_value=added_value,
-            kerberos=True,
-            timeout=300,
-        )
-        if result.success:
-            print_info(f"Shadow credential value removed · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_reverted(change_id)
-        else:
-            print_warning(f"Shadow credential value removal failed · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_failed(
-                    change_id,
-                    error=str(result.raw_output or "LDAP rollback returned false"),
-                    manual_cleanup_instructions=_MANUAL_SHADOW_CREDS,
-                )
-        return
+
+        return {
+            "revert": _revert_shadow,
+            "verify": lambda conn: verify_keycredential_removed(
+                conn, target=target, key_credential_value=added_value
+            ),
+            "verification_method": VERIFY_KEYCREDENTIAL,
+            "success_label": "Shadow credential value removed",
+        }
 
     if kind == "dacl_ace_added":
         trustee = str(action.get("trustee") or "").strip()
         rights_type = str(action.get("rights_type") or "genericAll").strip()
-        result = service.acl.remove_dacl_ace(
-            pdc_host=pdc_host,
-            domain=domain,
-            username=exec_username,
-            password=exec_password,
-            target_object=target,
-            trustee=trustee,
-            rights_type=rights_type,
-            kerberos=True,
-            timeout=300,
-        )
-        if result.success:
-            rights_label = "DCSync" if rights_type == "dcsync" else "GenericAll"
-            print_info(f"DACL ACE removed ({rights_label}) · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_reverted(change_id)
-        else:
-            print_warning(f"DACL ACE removal failed · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_failed(
-                    change_id,
-                    error=str(result.raw_output or "native LDAP returned non-zero"),
-                    manual_cleanup_instructions=_MANUAL_DACL_ACE,
-                )
+        trustee_sid = str(action.get("trustee_sid") or "").strip()
 
-    elif kind == "owner_changed":
+        def _revert_dacl(service: Any, *, pdc_host: str, domain: str, cred: CleanupCredential):
+            return service.acl.remove_dacl_ace(
+                pdc_host=pdc_host, domain=domain, username=cred.username,
+                password=cred.secret, target_object=target, trustee=trustee,
+                rights_type=rights_type, kerberos=True, timeout=300,
+            )
+
+        def _verify(conn: Any) -> bool:
+            # Without the resolved trustee SID we cannot positively confirm the
+            # ACE is gone → fail-closed (manual) rather than claim done.
+            if not trustee_sid:
+                return False
+            return verify_dacl_ace_removed(conn, target=target, trustee_sid=trustee_sid)
+
+        rights_label = "DCSync" if rights_type == "dcsync" else "GenericAll"
+        return {
+            "revert": _revert_dacl,
+            "verify": _verify,
+            "verification_method": VERIFY_DACL_ACE,
+            "success_label": f"DACL ACE removed ({rights_label})",
+        }
+
+    if kind == "owner_changed":
         original_owner_sid = action.get("original_owner_sid")
         if not original_owner_sid:
-            print_warning(
-                f"Original owner unknown — manual action required · {marked_target}"
+            return {"needs_manual": True, "remediation": _MANUAL_OWNER}
+
+        def _revert_owner(service: Any, *, pdc_host: str, domain: str, cred: CleanupCredential):
+            return service.acl.restore_owner(
+                pdc_host=pdc_host, domain=domain, username=cred.username,
+                password=cred.secret, target_object=target,
+                original_owner_sid=str(original_owner_sid), kerberos=True, timeout=300,
             )
-            if ledger is not None and change_id:
-                ledger.mark_operator_required(
-                    change_id,
-                    manual_cleanup_instructions=_MANUAL_OWNER,
-                )
-            return
-        result = service.acl.restore_owner(
-            pdc_host=pdc_host,
-            domain=domain,
-            username=exec_username,
-            password=exec_password,
-            target_object=target,
-            original_owner_sid=str(original_owner_sid),
-            kerberos=True,
-            timeout=300,
-        )
-        if result.success:
-            print_info(f"Object owner restored · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_reverted(change_id)
-        else:
-            print_warning(f"Owner restoration failed · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_failed(
-                    change_id,
-                    error=str(result.raw_output or "native LDAP returned non-zero"),
-                    manual_cleanup_instructions=_MANUAL_OWNER,
-                )
 
-    elif kind == "spn_added":
+        return {
+            "revert": _revert_owner,
+            "verify": lambda conn: verify_owner_restored(
+                conn, target=target, original_owner_sid=str(original_owner_sid)
+            ),
+            "verification_method": VERIFY_OWNER,
+            "success_label": "Object owner restored",
+        }
+
+    if kind == "spn_added":
         spn = str(action.get("spn") or "").strip()
-        result = service.acl.clear_service_principal_name(
-            pdc_host=pdc_host,
-            domain=domain,
-            username=exec_username,
-            password=exec_password,
-            target_user=target,
-            spn=spn,
-            kerberos=True,
-            timeout=300,
-        )
-        if result.success:
-            print_info(f"SPN cleared · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_reverted(change_id)
-        else:
-            print_warning(f"SPN clear failed · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_failed(
-                    change_id,
-                    error=str(result.raw_output or "native LDAP returned non-zero"),
-                    manual_cleanup_instructions=_MANUAL_SPN.replace(
-                        "TARGET", target
-                    ).replace("SPN", spn),
-                )
 
-    elif kind == "group_membership_changed":
+        def _revert_spn(service: Any, *, pdc_host: str, domain: str, cred: CleanupCredential):
+            return service.acl.clear_service_principal_name(
+                pdc_host=pdc_host, domain=domain, username=cred.username,
+                password=cred.secret, target_user=target, spn=spn,
+                kerberos=True, timeout=300,
+            )
+
+        return {
+            "revert": _revert_spn,
+            "verify": lambda conn: verify_spn_removed(conn, target=target, spn=spn),
+            "verification_method": VERIFY_SPN,
+            "success_label": "SPN cleared",
+        }
+
+    if kind == "group_membership_changed":
         target_group = str(action.get("target_group") or target).strip()
         added_user = str(action.get("added_user") or "").strip()
         if not target_group or not added_user:
-            print_warning(
-                f"Group membership cleanup needs manual review · {marked_target}"
+            return {"needs_manual": True}
+
+        def _revert_group(service: Any, *, pdc_host: str, domain: str, cred: CleanupCredential):
+            return service.acl.remove_group_member(
+                pdc_host=pdc_host, domain=domain, username=cred.username,
+                password=cred.secret, target_group=target_group,
+                target_username=added_user, kerberos=True,
+                target_domain=str(action.get("target_domain") or domain), timeout=300,
             )
+
+        return {
+            "revert": _revert_group,
+            "verify": lambda conn: verify_group_membership_removed(
+                conn, group=target_group, member=added_user
+            ),
+            "verification_method": VERIFY_GROUP_MEMBERSHIP,
+            "success_label": "Group membership reverted",
+        }
+
+    return None
+
+
+def _build_verification_conn(
+    shell: Any, *, domain: str, target_domain: str
+) -> ADscanLDAPConnection | None:
+    """Open a credentialed LDAP connection for the post-revert re-read.
+
+    Reuses the LDAP transport SSOT (LDAPS→LDAP fallback built in). Returns None
+    when no DC/credential is available — the caller then fails closed (manual).
+    """
+    domains_data = getattr(shell, "domains_data", {}) or {}
+    if not isinstance(domains_data, dict):
+        return None
+    domain_data = domains_data.get(target_domain) or domains_data.get(domain) or {}
+    if not isinstance(domain_data, dict):
+        return None
+    try:
+        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+        dc_ip = resolve_dc_ip(domain_data)
+    except Exception:  # noqa: BLE001
+        dc_ip = str(domain_data.get("pdc") or domain_data.get("dc_ip") or "").strip()
+    creds = domain_data.get("credentials")
+    username = ""
+    secret = ""
+    if isinstance(creds, dict):
+        for stored_user, stored_secret in creds.items():
+            if str(stored_secret or "").strip():
+                username = str(stored_user)
+                secret = str(stored_secret or "").strip()
+                break
+    if not dc_ip or not username or not secret:
+        return None
+    is_nt = len(secret) == 32 and all(c in "0123456789abcdefABCDEF" for c in secret)
+    config = ADscanLDAPConfig(
+        domain=target_domain or domain,
+        dc_ip=dc_ip,
+        use_ldaps=True,
+        use_kerberos=False,
+        username=username,
+        password=None if is_nt else secret,
+    )
+    try:
+        return ADscanLDAPConnection(config)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return None
+
+
+def _verify_revert(
+    shell: Any, *, domain: str, target_domain: str, plan: dict[str, Any]
+) -> bool:
+    """Open a re-read connection and run the plan's verifier. Fail-closed."""
+    verify_fn = plan.get("verify")
+    if not callable(verify_fn):
+        return False
+    conn = _build_verification_conn(shell, domain=domain, target_domain=target_domain)
+    if conn is None:
+        return False
+    try:
+        with conn as live:
+            return bool(verify_fn(live))
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return False
+
+
+def _drive_revert_with_verify(
+    *,
+    shell: Any,
+    ledger: Any,
+    change_id: str | None,
+    kind: str,
+    target: str,
+    domain: str,
+    target_domain: str,
+    pdc_host: str,
+    credential: CleanupCredential,
+    plan: dict[str, Any],
+    remediation: str,
+    object_dn: str,
+) -> None:
+    """Bounded-retry + verify-the-undo + lazy DA escalation for one revert."""
+    marked_target = mark_sensitive(target, "user")
+    service = ExploitationService()
+    active = credential
+    last_error = "Automatic cleanup returned a non-success result."
+
+    for _ in range(MAX_REVERT_ATTEMPTS + 1):
+        if ledger is not None and change_id:
+            try:
+                ledger.mark_revert_in_progress(change_id)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+        transient = False
+        try:
+            result = plan["revert"](
+                service, pdc_host=pdc_host, domain=domain, cred=active
+            )
+            success = bool(getattr(result, "success", False))
+            raw = str(getattr(result, "raw_output", "") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            success = False
+            raw = str(exc)
+            # Track transience from the EXCEPTION TYPE, not the (often opaque)
+            # string — a TimeoutError must never be misclassified as definitive.
+            transient = _is_transient_failure(exc)
+
+        if not success:
+            last_error = raw or last_error
+            transient = transient or _is_transient_failure(last_error)
+            # Lazy DA escalation only on a real ACCESS_DENIED (not transient).
+            if (
+                not transient
+                and looks_like_access_denied(last_error)
+                and not active.is_escalated
+                and active.can_escalate_to_da
+            ):
+                escalated = build_da_escalated_credential(shell, target_domain or domain)
+                if escalated is not None and escalated.usable:
+                    active = escalated
+                    continue
+            if transient and ledger is not None and change_id:
+                used = ledger.mark_revert_retry(change_id, error=last_error)
+                if used < MAX_REVERT_ATTEMPTS:
+                    print_warning(
+                        f"Transient cleanup failure (attempt {used}/{MAX_REVERT_ATTEMPTS}) "
+                        f"· {marked_target}; retrying…"
+                    )
+                    time.sleep(_REVERT_BACKOFF_SECONDS)
+                    continue
+                return  # budget exhausted → mark_revert_retry routed to manual
+            _manual(
+                ledger, change_id, _reason_for(last_error), remediation, object_dn, last_error
+            )
+            print_warning(f"{plan['success_label']} failed · {marked_target}")
+            return
+
+        # Revert call returned success — VERIFY by re-reading the object.
+        confirmed = _verify_revert(
+            shell, domain=domain, target_domain=target_domain, plan=plan
+        )
+        if confirmed:
+            print_info(f"{plan['success_label']} (verified) · {marked_target}")
             if ledger is not None and change_id:
-                ledger.mark_operator_required(
+                ledger.mark_reverted_confirmed(
                     change_id,
-                    manual_cleanup_instructions=_manual_instructions(kind, action),
+                    verification_method=str(plan.get("verification_method") or ""),
+                    min_credential_principal=active.principal_label or None,
                 )
             return
-        result = service.acl.remove_group_member(
-            pdc_host=pdc_host,
-            domain=domain,
-            username=exec_username,
-            password=exec_password,
-            target_group=target_group,
-            target_username=added_user,
-            kerberos=True,
-            target_domain=target_domain,
-            timeout=300,
+        # Call said ok, object still dirty / unverifiable → manual (fail-closed).
+        last_error = "Revert reported success but re-read could not confirm it."
+        print_warning(f"Could not verify rollback · {marked_target}")
+        _manual(
+            ledger, change_id, _tax.MANUAL_REASON_REVERT_FAILED, remediation,
+            object_dn, last_error,
         )
-        if result.success:
-            print_info(f"Group membership reverted · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_reverted(change_id)
-        else:
-            print_warning(f"Group membership removal failed · {marked_target}")
-            if ledger is not None and change_id:
-                ledger.mark_failed(
-                    change_id,
-                    error=str(result.raw_output or "native LDAP returned non-zero"),
-                    manual_cleanup_instructions=_manual_instructions(kind, action),
-                )
+        return
 
-    else:
-        print_warning(f"Unknown ACL cleanup kind '{kind}' — skipping")
+
+def _reason_for(error: str) -> str:
+    """Pick the manual_reason discriminator for a definitive revert failure."""
+    return (
+        _tax.MANUAL_REASON_ACCESS_DENIED
+        if looks_like_access_denied(error)
+        else _tax.MANUAL_REASON_REVERT_FAILED
+    )
+
+
+def _manual(
+    ledger: Any,
+    change_id: str | None,
+    reason: str,
+    remediation: str,
+    object_dn: str,
+    error: str,
+) -> None:
+    """Mark a change manual_required (no-op when ledger/change_id absent)."""
+    if ledger is None or not change_id:
+        return
+    ledger.mark_manual_required(
+        change_id,
+        reason=reason,
+        remediation_command=remediation,
+        remediation_object_dn=object_dn,
+        error=error,
+    )
 
 
 def _manual_instructions(kind: str, action: dict[str, Any]) -> str:
@@ -403,10 +641,19 @@ def _resolve_cleanup_actions(shell: Any) -> list[dict[str, Any]]:
         change_id = str(entry.get("change_id") or "").strip()
         if change_id and change_id in seen_ids:
             continue
-        if str(entry.get("revert_status") or "").strip().lower() not in {
-            "pending",
-            "failed",
-        }:
+        status = str(entry.get("revert_status") or "").strip().lower()
+        # Re-attempt records that are still pending/in-progress, or that landed in
+        # the collapsed manual_required(revert_failed) terminal (legacy "failed").
+        retryable = status in {
+            _tax.STATUS_PENDING,
+            _tax.STATUS_REVERT_IN_PROGRESS,
+            _tax.STATUS_REVERT_FAILED_RETRYING,
+            _tax.STATUS_LEGACY_FAILED,
+        } or (
+            status == _tax.STATUS_MANUAL_REQUIRED
+            and str(entry.get("manual_reason") or "") == _tax.MANUAL_REASON_REVERT_FAILED
+        )
+        if not retryable:
             continue
         action = _cleanup_action_from_ledger_entry(entry)
         if action:
@@ -458,98 +705,3 @@ def _cleanup_action_from_ledger_entry(entry: dict[str, Any]) -> dict[str, Any] |
     return action
 
 
-def _lookup_domain_credential(shell: Any, domain: str, username: str) -> str:
-    """Resolve one stored credential by username from shell.domains_data."""
-    if not domain or not username:
-        return ""
-    domains_data = getattr(shell, "domains_data", None)
-    if not isinstance(domains_data, dict):
-        return ""
-    domain_data = domains_data.get(domain)
-    if not isinstance(domain_data, dict):
-        return ""
-    creds = domain_data.get("credentials")
-    if not isinstance(creds, dict):
-        return ""
-    wanted = _normalize_credential_username(username)
-    for stored_user, stored_secret in creds.items():
-        if _normalize_credential_username(str(stored_user)) == wanted:
-            return str(stored_secret or "").strip()
-    return ""
-
-
-def _normalize_credential_username(username: str) -> str:
-    """Normalize usernames for stored credential lookup."""
-    value = str(username or "").strip()
-    if "\\" in value:
-        value = value.split("\\", 1)[1]
-    if "@" in value:
-        value = value.split("@", 1)[0]
-    if value.endswith("$"):
-        return normalize_machine_account(value).lower()
-    return value.lower()
-
-
-def _resolve_cleanup_credential(
-    shell: Any,
-    *,
-    action: dict[str, Any],
-    domain: str,
-    target_domain: str,
-    exec_username: str,
-    exec_password: str,
-) -> tuple[str, str]:
-    """Resolve rollback credentials, preferring the original executor."""
-    if exec_username and exec_password:
-        return exec_username, exec_password
-
-    if exec_username:
-        for lookup_domain in (domain, target_domain):
-            resolved = _lookup_domain_credential(shell, lookup_domain, exec_username)
-            if resolved:
-                print_info_debug(
-                    "[acl-cleanup] rollback credential resolved from stored original executor: "
-                    f"user={mark_sensitive(exec_username, 'user')} "
-                    f"domain={mark_sensitive(lookup_domain, 'domain')}"
-                )
-                return exec_username, resolved
-
-    fallback = _resolve_fallback_admin_credential(shell, target_domain or domain)
-    if fallback:
-        fallback_user, fallback_secret = fallback
-        print_info_debug(
-            "[acl-cleanup] rollback credential falling back to stored privileged-looking credential: "
-            f"user={mark_sensitive(fallback_user, 'user')} "
-            f"domain={mark_sensitive(target_domain or domain, 'domain')}"
-        )
-        return fallback_user, fallback_secret
-
-    return exec_username, exec_password
-
-
-def _resolve_fallback_admin_credential(
-    shell: Any, domain: str
-) -> tuple[str, str] | None:
-    """Return a conservative stored admin-looking credential for rollback fallback."""
-    domains_data = getattr(shell, "domains_data", None)
-    if not isinstance(domains_data, dict):
-        return None
-    domain_data = domains_data.get(domain)
-    if not isinstance(domain_data, dict):
-        return None
-    creds = domain_data.get("credentials")
-    if not isinstance(creds, dict):
-        return None
-    priority_names = (
-        "administrator",
-        "admin",
-        "domain.admin",
-        "da",
-    )
-    for wanted in priority_names:
-        for stored_user, stored_secret in creds.items():
-            if _normalize_credential_username(str(stored_user)) == wanted:
-                secret = str(stored_secret or "").strip()
-                if secret:
-                    return str(stored_user), secret
-    return None

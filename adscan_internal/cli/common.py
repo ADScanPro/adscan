@@ -406,6 +406,101 @@ def resolve_command_context_domain(
     return None, "none"
 
 
+# Per-command secret POSITIONAL indices for the command-dispatch echo.
+#
+# The interactive shell echoes every dispatched command under ``--debug``. The
+# operator/pentester MUST see the FULL cleartext command they ran (domain, IP,
+# user, scan_mode, flags …) on screen and in their own session recording — so
+# the echo is NOT redacted. Only the secret positional(s) are wrapped with
+# ``mark_sensitive(arg, "password")``: the markers are invisible (zero-width),
+# so the secret stays cleartext on the terminal while the telemetry EXPORT
+# sanitizer scrubs exactly that value before upload.
+#
+# Index is into ``args_list`` (the tokens AFTER the command verb), counting
+# POSITIONALS only (flags like ``-k`` / ``--debug`` are skipped when counting).
+# A command absent from this map has no secret positional → every arg cleartext.
+#
+# Built from the real command grammar (grep ``do_*`` signatures + their Usage):
+#   - ``creds save|add <domain> <username> <credential> [host] [service]``
+#     → after the ``save``/``add`` subcommand, the credential is positional 2.
+#   - Legacy positional auth entry points kept defensively:
+#       ``start_auth <domain> <ip> <user> <password>``  → password at index 3
+#       ``authenticate <domain> <user> <password>``     → password at index 2
+_SECRET_POSITIONAL_INDICES: dict[str, tuple[int, ...]] = {
+    "start_auth": (3,),
+    "authenticate": (2,),
+}
+
+# Commands whose FIRST positional is a subcommand that shifts the secret index.
+# Maps ``command -> {subcommand: (secret positional indices counted from arg0)}``.
+_SECRET_POSITIONAL_BY_SUBCOMMAND: dict[str, dict[str, tuple[int, ...]]] = {
+    "creds": {
+        "save": (3,),
+        "add": (3,),
+    },
+}
+
+
+def redact_command_for_log(command_name: str, args_list: list[str]) -> str:
+    """Build a debug echo of a CLI command line, marking ONLY secret positionals.
+
+    The interactive shell echoes every dispatched command under ``--debug``. The
+    operator must see the FULL cleartext command they ran — domain, IP, user,
+    scan_mode, flags, everything — both on screen and in their own session
+    recording. So this returns the command verbatim; the only transformation is
+    wrapping the secret positional(s) (per :data:`_SECRET_POSITIONAL_INDICES` /
+    :data:`_SECRET_POSITIONAL_BY_SUBCOMMAND`) with ``mark_sensitive(_,
+    "password")``. Those markers are invisible zero-width characters, so the
+    secret stays cleartext on the terminal while the telemetry export sanitizer
+    scrubs exactly that value before upload.
+
+    A command with no entry in the maps has no secret positional, so every
+    argument is echoed in cleartext unchanged.
+
+    Args:
+        command_name: The resolved command verb (already alias-normalized).
+        args_list: The tokenized arguments following the command.
+
+    Returns:
+        A single-line echo string safe to pass to ``print_info_debug``: full
+        cleartext, with only the secret positional(s) ``mark_sensitive``-wrapped.
+    """
+    cmd = (command_name or "").lower()
+
+    # Resolve which POSITIONAL indices (counted over non-flag tokens) are secret.
+    secret_positional_indices: tuple[int, ...] = _SECRET_POSITIONAL_INDICES.get(cmd, ())
+    sub_map = _SECRET_POSITIONAL_BY_SUBCOMMAND.get(cmd)
+    if sub_map and args_list:
+        first = (args_list[0] or "").strip().lower()
+        secret_positional_indices = sub_map.get(first, secret_positional_indices)
+
+    echoed: list[str] = []
+    positional_idx = -1
+    for token in args_list:
+        is_flag = token.startswith("-")
+        if not is_flag:
+            positional_idx += 1
+        mark_this = (not is_flag) and positional_idx in secret_positional_indices
+        # Defensive backstop: an inline credential form (``pass=…`` /
+        # ``password=…``) is marked even if the index map missed it. The index
+        # map is the primary mechanism; this only covers the obvious inline case.
+        lowered = token.lower()
+        if not is_flag and (
+            lowered.startswith("pass=") or lowered.startswith("password=")
+        ):
+            prefix, _, value = token.partition("=")
+            if value:
+                echoed.append(f"{prefix}={mark_sensitive(value, 'password')}")
+                continue
+        if mark_this:
+            echoed.append(mark_sensitive(token, "password"))
+        else:
+            echoed.append(token)
+    if echoed:
+        return f"{command_name} {' '.join(echoed)}"
+    return command_name
+
+
 def normalize_help_alias(
     command_name: str,
     args_list: list[str],
@@ -452,14 +547,22 @@ def normalize_command_alias(
         - ``start auth`` -> (``start_auth``, [], True)
         - ``start unauth`` -> (``start_unauth``, [], True)
         - ``start-auth`` -> (``start_auth``, [...], True)
-        - ``reporting`` -> (``generate_report``, [...], True)
+        - ``report`` / ``reporting`` / ``generate_report`` -> (``deliver``, [...], True)
+
+    The reporting verbs (``report``, ``reporting``, ``generate_report``) are
+    aliased onto ``deliver`` so the REPL exposes ONE report engine: the full
+    Client Deliverable Kit (the user deselects in the deliver checkbox to get
+    a report-only PDF). ``deliver`` is the canonical verb; these are the
+    discoverable on-ramps an operator naturally types.
     """
     cmd = (command_name or "").strip().lower()
     if not cmd:
         return command_name, args_list, False
 
     direct_aliases = {
-        "reporting": "generate_report",
+        "report": "deliver",
+        "reporting": "deliver",
+        "generate_report": "deliver",
         "start-auth": "start_auth",
         "startauth": "start_auth",
         "start-unauth": "start_unauth",

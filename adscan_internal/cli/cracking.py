@@ -580,8 +580,97 @@ def _build_hashcat_cmd(
     return " ".join(shlex.quote(a) for a in argv)
 
 
-def _resolve_hashcat_mode_and_description(hash_type: str) -> tuple[str, str]:
-    """Return the hashcat mode and human-readable description for a hash type."""
+# --- Per-hash etype → hashcat-mode routing (AES-only domains) -----------------
+#
+# A Kerberos roast hash carries its ticket encryption type (etype) in its 2nd
+# ``$``-delimited field: ``$krb5tgs$<etype>$...`` (TGS-REP / kerberoast) and
+# ``$krb5asrep$<etype>$...`` (AS-REP roast). hashcat uses a DIFFERENT mode per
+# etype, and runs exactly ONE mode per invocation. Hardcoding the RC4 (etype 23)
+# mode means AES tickets (etype 17/18 — the DEFAULT on hardened / AES-only
+# domains) get fed to an RC4-only kernel, which rejects them at parse time
+# (``Separator unmatched``) and they are SILENTLY never cracked.
+#
+# The mode is therefore a function of the hash's etype, not of the hash_type
+# alone. ``_KRB_ETYPE_HASHCAT_MODES`` is the canonical map; ``18`` (AES256) and
+# ``17`` (AES128) are the increasingly-common defaults, ``23`` (RC4) the legacy.
+_KRB_ETYPE_HASHCAT_MODES: dict[str, dict[int, str]] = {
+    # kerberoast (TGS-REP): RC4 -> 13100, AES128 -> 19600, AES256 -> 19700
+    "kerberoast": {23: "13100", 17: "19600", 18: "19700"},
+    # AS-REP roast: RC4 -> 18200, AES128 -> 19800, AES256 -> 19900
+    "asreproast": {23: "18200", 17: "19800", 18: "19900"},
+}
+
+# Human-readable description per resolved hashcat mode (keeps the preflight /
+# cracked-credentials panels accurate when the mode is etype-derived rather than
+# the hash_type default).
+_HASHCAT_MODE_DESCRIPTIONS: dict[str, str] = {
+    "13100": "Kerberos 5 TGS-REP etype 23 (RC4)",
+    "19600": "Kerberos 5 TGS-REP etype 17 (AES128)",
+    "19700": "Kerberos 5 TGS-REP etype 18 (AES256)",
+    "18200": "Kerberos 5 AS-REP etype 23 (RC4)",
+    "19800": "Kerberos 5 AS-REP etype 17 (AES128)",
+    "19900": "Kerberos 5 AS-REP etype 18 (AES256)",
+    "31300": "MS-SNTP Timeroast",
+    "5500": "NetNTLMv1",
+    "5600": "NetNTLMv2",
+}
+
+# The etype field of every AES mode needs the same --username prepend handling as
+# its RC4 sibling: the on-disk format is the identical ``$krb5tgs$``/``$krb5asrep$``
+# raw shape, only the etype digit differs. Register the AES modes against the same
+# extractor/needs-prepend rules so the SSOT hashfile writer materialises them
+# --username-safe too (see ``_HASHCAT_USERNAME_RULES`` below, which adds them).
+
+
+def _parse_krb_hash_etype(raw_hash: str) -> int | None:
+    """Return the Kerberos etype encoded in a ``$krb5(tgs|asrep)$<etype>$`` line.
+
+    The etype is the 2nd ``$``-delimited field of a kerberoast / AS-REP roast
+    hash. Returns ``None`` when the line is not a recognised Kerberos roast hash
+    or carries no numeric etype field (some legacy AS-REP emitters omit it).
+    """
+    match = re.match(r"\$krb5(?:tgs|asrep)\$(\d+)\$", (raw_hash or "").strip())
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def resolve_hashcat_mode_for_hash(raw_hash: str, hash_type: str) -> str:
+    """Resolve the correct hashcat mode for a SINGLE roast hash by its etype.
+
+    For ``kerberoast`` / ``asreproast`` the mode is a function of the per-hash
+    etype field, NOT the hash_type alone (an AES256 TGS-REP must route to 19700,
+    not the RC4-only 13100). For every other hash_type, or an unparseable etype,
+    fall back to the hash_type default from
+    :func:`_resolve_hashcat_mode_and_description`.
+    """
+    etype_map = _KRB_ETYPE_HASHCAT_MODES.get(hash_type)
+    if etype_map is not None:
+        etype = _parse_krb_hash_etype(raw_hash)
+        if etype is not None and etype in etype_map:
+            return etype_map[etype]
+    default_mode, _ = _resolve_hashcat_mode_and_description(hash_type)
+    return default_mode
+
+
+def _resolve_hashcat_mode_and_description(
+    hash_type: str, *, mode_override: str | None = None
+) -> tuple[str, str]:
+    """Return the hashcat mode and human-readable description for a hash type.
+
+    Args:
+        hash_type: The logical hash type (``kerberoast``, ``asreproast``,
+            ``timeroast``, ``NTLMv1``/``NTLMv2``).
+        mode_override: When set (e.g. a per-etype-resolved mode for a single
+            roast group), use this exact hashcat mode and look its description up
+            in :data:`_HASHCAT_MODE_DESCRIPTIONS`. This is how mixed-etype roast
+            captures keep an accurate per-mode description.
+    """
+    if mode_override is not None:
+        return mode_override, _HASHCAT_MODE_DESCRIPTIONS.get(mode_override, hash_type)
 
     hash_details = {
         "asreproast": ("18200", "Kerberos 5 AS-REP etype 23"),
@@ -784,12 +873,34 @@ def _sanitize_username_field(username: str) -> str:
 # pulls that embedded username from the raw hash for the auto-fix; ``None`` means
 # the mode is already field-prefixed and must be left untouched.
 _HASHCAT_USERNAME_RULES: dict[str, dict[str, object]] = {
+    # kerberoast (TGS-REP) — identical raw ``$krb5tgs$`` shape across etypes, so
+    # RC4 (13100) AND AES (19600/19700) share the same prepend extractor.
     "13100": {"needs_prepend": True, "extractor": _extract_kerberoast_username},
+    "19600": {"needs_prepend": True, "extractor": _extract_kerberoast_username},
+    "19700": {"needs_prepend": True, "extractor": _extract_kerberoast_username},
+    # AS-REP roast — identical raw ``$krb5asrep$`` shape across etypes, so RC4
+    # (18200) AND AES (19800/19900) share the same prepend extractor.
     "18200": {"needs_prepend": True, "extractor": _extract_asrep_username},
+    "19800": {"needs_prepend": True, "extractor": _extract_asrep_username},
+    "19900": {"needs_prepend": True, "extractor": _extract_asrep_username},
     "31300": {"needs_prepend": False, "extractor": None},
     "5500": {"needs_prepend": True, "extractor": _extract_netntlm_username},
     "5600": {"needs_prepend": True, "extractor": _extract_netntlm_username},
 }
+
+
+def extract_embedded_username(raw_hash: str, *, mode: str) -> str | None:
+    """Return the account embedded in ``raw_hash`` for ``mode`` (or ``None``).
+
+    Public accessor over the per-mode extractor table so other modules (e.g. the
+    roasting materialisation path) can resolve the per-line principal without
+    reaching into the private rules dict. Mirrors exactly the extraction
+    ``write_crack_hashfile`` performs internally.
+    """
+    extractor = _HASHCAT_USERNAME_RULES.get(mode, {}).get("extractor")
+    if not callable(extractor):
+        return None
+    return extractor((raw_hash or "").strip())
 
 
 def _line_is_username_safe_for_mode(line: str, mode: str) -> bool:
@@ -1181,6 +1292,69 @@ def crack_captured_netntlm(
             print_exception(show_locals=False, exception=exc)
 
 
+def _split_roast_hashfile_by_mode(
+    hash_file: str, hash_type: str
+) -> dict[str, str]:
+    """Split a roast hashfile into one per-etype-resolved-mode hashfile.
+
+    A single Kerberoast / AS-REP roast capture can contain hashes of DIFFERENT
+    etypes (e.g. one RC4 + one AES256) — common on AES-only domains where the
+    krbtgt or service account only has AES keys. hashcat runs ONE mode per
+    invocation, so every group must be cracked under its own correct mode.
+
+    Each hash is routed to its mode via :func:`resolve_hashcat_mode_for_hash`
+    and re-materialised through the SSOT ``--username``-safe writer
+    :func:`write_crack_hashfile` (one file per mode). Returns a mapping of
+    ``{hashcat_mode: per_mode_hashfile_path}``. When all hashes resolve to the
+    SAME mode (the common single-etype case) the result is a single entry —
+    written to a per-mode file so the downstream pipeline is unchanged.
+
+    On any read error or an empty file, returns an empty mapping so the caller
+    falls back to the legacy single-file path.
+    """
+    try:
+        raw = Path(hash_file).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {}
+
+    # Each on-disk line may already be ``username:$krb5...`` (materialised by the
+    # roasting path) or a bare ``$krb5...`` hash. Recover the raw hash + any
+    # supplied username so the per-mode writer keeps the --username prepend.
+    by_mode: dict[str, list[tuple[str | None, str]]] = {}
+    for line in (ln.strip() for ln in raw.splitlines()):
+        if not line:
+            continue
+        supplied_user: str | None = None
+        raw_hash = line
+        if not line.startswith("$krb5") and ":" in line:
+            head, rest = line.split(":", 1)
+            if rest.lstrip().startswith("$krb5"):
+                supplied_user = head.strip() or None
+                raw_hash = rest.strip()
+        mode = resolve_hashcat_mode_for_hash(raw_hash, hash_type)
+        by_mode.setdefault(mode, []).append((supplied_user, raw_hash))
+
+    if not by_mode:
+        return {}
+
+    # When everything is one mode, keep using the original file path so the
+    # common case produces no extra artifacts and the existing tests/paths hold.
+    if len(by_mode) == 1:
+        only_mode = next(iter(by_mode))
+        return {only_mode: hash_file}
+
+    out: dict[str, str] = {}
+    for mode, pairs in by_mode.items():
+        per_mode_path = f"{hash_file}.m{mode}"
+        try:
+            write_crack_hashfile(per_mode_path, pairs, mode=mode)
+        except OSError as exc:
+            telemetry.capture_exception(exc)
+            continue
+        out[mode] = per_mode_path
+    return out
+
+
 def run_cracking(
     shell: CrackingShell,
     *,
@@ -1189,12 +1363,59 @@ def run_cracking(
     hash_file: str,
     wordlists_dir: str,
     failed: bool = False,
+    mode_override: str | None = None,
 ) -> None:
-    """High-level cracking entrypoint used by the CLI shell."""
+    """High-level cracking entrypoint used by the CLI shell.
+
+    For Kerberoast / AS-REP roast captures the hashes may span MULTIPLE etypes
+    (RC4 + AES), each requiring a different hashcat mode. This entrypoint groups
+    the hashes by their etype-resolved mode and runs the single-mode pipeline
+    once per group, so AES tickets are cracked under 19600/19700/19800/19900
+    instead of being silently rejected by the RC4-only mode. ``mode_override``
+    is set internally on the per-group recursion to force that group's mode.
+    """
     if hash_type == "timeroast" and not _ensure_timeroast_hashcat_support(shell):
         return
 
-    hashcat_mode, hash_description = _resolve_hashcat_mode_and_description(hash_type)
+    # Belt-and-braces: never launch hashcat on an empty/absent hashfile. An
+    # empty hashfile makes hashcat exit with "hashfile is empty or corrupt"
+    # (RC 255); this early return protects EVERY caller from that and from the
+    # downstream "crack with another wordlist?" re-prompt loop.
+    if _count_hashes_in_file(hash_file) <= 0:
+        print_info("No hashes to crack — skipping (hashfile is empty or absent).")
+        return
+
+    # Mixed-etype dispatch: only for the roast hash types, only on the top-level
+    # call (mode_override unset). Split the capture into per-mode hashfiles and
+    # crack each group under its correct mode. A single-mode capture stays on the
+    # original file (no extra artifacts) — the common case is unchanged.
+    if mode_override is None and hash_type in _KRB_ETYPE_HASHCAT_MODES:
+        groups = _split_roast_hashfile_by_mode(hash_file, hash_type)
+        if len(groups) > 1:
+            print_info_debug(
+                "[cracking] mixed-etype roast capture: "
+                f"{len(groups)} hashcat mode group(s) -> "
+                f"{', '.join(sorted(groups))}"
+            )
+            for group_mode, group_file in groups.items():
+                run_cracking(
+                    shell,
+                    hash_type=hash_type,
+                    domain=domain,
+                    hash_file=group_file,
+                    wordlists_dir=wordlists_dir,
+                    failed=failed,
+                    mode_override=group_mode,
+                )
+            return
+        if len(groups) == 1:
+            # Single etype across the whole capture — force that exact mode so an
+            # all-AES capture does not fall back to the RC4 default.
+            mode_override = next(iter(groups))
+
+    hashcat_mode, hash_description = _resolve_hashcat_mode_and_description(
+        hash_type, mode_override=mode_override
+    )
     backend_selection = (
         _select_hashcat_backend(shell)
         if hashcat_mode != "Unknown"
@@ -1345,6 +1566,33 @@ def run_cracking(
         except Exception as exc:  # pragma: no cover
             telemetry.capture_exception(exc)
 
+    # Live current-operation telemetry — surface the cracking step on the
+    # platform's live operation strip. hashcat runs blocking and streams to its
+    # own window, so there is no per-hash loop to throttle here: one "started"
+    # event (0 of N) and one "completed" event (recovered of N) is enough to
+    # show the step advance without flooding. No secret reaches the event: only
+    # hash counts + the domain. Client-safe, vendor-neutral label.
+    def _emit_cracking_progress(*, current: int, done: bool = False) -> None:
+        try:
+            from adscan_internal.cli.ci_events import (  # noqa: PLC0415
+                emit_operation_progress,
+            )
+
+            emit_operation_progress(
+                operation="credential_cracking",
+                label="Credential cracking",
+                phase="quick_credential_wins",
+                phase_label="Quick Credential Wins",
+                current=current,
+                total=hash_count or None,
+                detail=domain or None,
+                done=done,
+            )
+        except Exception:  # noqa: BLE001 -- telemetry must not abort cracking
+            pass
+
+    _emit_cracking_progress(current=0)
+
     result = execute_cracking(
         shell,
         command=command or "",
@@ -1352,6 +1600,12 @@ def run_cracking(
         domain=domain,
         hash=hash_file,
         wordlist_name=wordlist_name_for_telemetry,
+        mode_override=mode_override,
+    )
+    # The cracking step finished — mark this terminal tick done so the platform's
+    # live strip clears the operation instead of freezing on the recovered count.
+    _emit_cracking_progress(
+        current=int((result or {}).get("cracked_count") or 0), done=True
     )
     register_cracking_attempt(
         shell,
@@ -2191,11 +2445,20 @@ def execute_cracking(
     domain: str,
     hash: str,
     wordlist_name: str | None = None,
+    mode_override: str | None = None,
 ) -> dict[str, object]:
-    """Execute the cracking command and process results."""
+    """Execute the cracking command and process results.
+
+    ``mode_override`` forces the resolved hashcat mode for this run (used by the
+    per-etype roast grouping in :func:`run_cracking` so the ``--show`` pass uses
+    the SAME mode the cracking command used — an AES roast group must read back
+    under 19700/19900, not the RC4 default).
+    """
     from adscan_internal.cli.tools_env import maybe_wrap_hashcat_for_container
 
-    hashcat_mode, hash_description = _resolve_hashcat_mode_and_description(hash_type)
+    hashcat_mode, hash_description = _resolve_hashcat_mode_and_description(
+        hash_type, mode_override=mode_override
+    )
     total_hashes = _count_hashes_in_file(hash)
     initial_failure_cause = "unknown"
 

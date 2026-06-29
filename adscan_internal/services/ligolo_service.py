@@ -42,6 +42,7 @@ from urllib import request as urllib_request
 from typing import Any
 
 from adscan_internal import print_info_debug, print_info_verbose
+from adscan_core import telemetry
 from adscan_core.local_bind_address import resolve_first_available_bind_addr
 from adscan_core.linux_capabilities import (
     CAP_NET_BIND_SERVICE_BIT,
@@ -368,13 +369,31 @@ class LigoloProxyService:
         return None
 
     def list_tunnel_records(self) -> list[dict[str, Any]]:
-        """Return normalized tunnel records enriched with current agent runtime state."""
+        """Return normalized tunnel records enriched with current agent runtime state.
+
+        The persisted records come from file state (``load_tunnels_state``), so this
+        must work even when the proxy API is unreachable (e.g. after the pivot keepalive
+        ended and the proxy was torn down). Live-agent enrichment is best-effort: if the
+        proxy API is unavailable, every persisted tunnel is reported as ``alive=False`` /
+        ``disconnected`` instead of crashing, so the operator can still see the dead
+        tunnel and ``ligolo tunnel relaunch`` it.
+        """
 
         records = []
-        agents_by_id = {
-            int(agent.get("id", -1)): agent
-            for agent in self.list_agents()
-        }
+        try:
+            agents_by_id = {
+                int(agent.get("id", -1)): agent
+                for agent in self.list_agents()
+            }
+        except Exception as exc:
+            # Proxy API not reachable (no api_laddr in state, connection refused, etc.).
+            # Fall back to file-based records with no live enrichment.
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                "[ligolo] Proxy API unavailable while listing tunnels; "
+                f"returning persisted records only: {exc}"
+            )
+            agents_by_id = {}
         for record in self.load_tunnels_state():
             normalized = dict(record)
             tunnel_id = str(normalized.get("tunnel_id") or "").strip()

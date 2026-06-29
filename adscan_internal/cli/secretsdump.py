@@ -1374,6 +1374,11 @@ def execute_dcsync_native(
             ensure_fresh_kerberos_ticket=False,
             ui_silent=False,
             metadata_by_user=metadata_by_user,
+            # Full DRSUAPI replication (DCSync-All): krbtgt + every user's hash.
+            # Tag the provenance so the Compromised Credentials views (web card,
+            # report, `creds show`) attribute each account to DCSync instead of
+            # rendering an empty/"via unknown" method.
+            credential_origin="dcsync",
         )
         _render_dcsync_batch_cracking_summary(
             shell=shell,

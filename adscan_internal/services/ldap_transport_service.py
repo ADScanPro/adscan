@@ -48,6 +48,8 @@ from adscan_internal.services.posture_sink import (  # noqa: F401  (re-exported)
 from adscan_internal.services import _kerberos_recovery  # noqa: F401
 from adscan_internal.services.auth_error_classification import (
     exception_chain_text,
+    is_native_kerberos_infra_error,
+    is_unreachable_foreign_realm_error,
 )
 from adscan_internal.services.async_bridge import run_async_sync, run_sync_off_loop
 
@@ -724,8 +726,18 @@ def _build_ldap_connection_url(config: "ADscanLDAPConfig") -> tuple[str, bool]:
 class ADscanLDAPConnection:
     """badldap-backed LDAP context manager for ADscan collectors."""
 
-    def __init__(self, config: ADscanLDAPConfig) -> None:
+    def __init__(
+        self, config: ADscanLDAPConfig, *, connect_timeout: float | None = None
+    ) -> None:
         self.config = config
+        # Optional per-transport connect budget (seconds). When set, each
+        # ``conn.connect()`` is wrapped in ``asyncio.wait_for`` so a silently
+        # DROPped port or an unreachable/AES-only foreign DC surfaces a
+        # ``TimeoutError`` in a few seconds instead of hanging the caller for
+        # ~77-90s. ``None`` (default) preserves the legacy unbounded-connect
+        # behaviour for authenticated callers that rely on the underlying
+        # transport's own timeouts.
+        self.connect_timeout = connect_timeout
         self._conn: Any | None = None
         self._factory: Any | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -746,7 +758,9 @@ class ADscanLDAPConnection:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         result = self._loop.run_until_complete(
-            async_connect_with_ldap_fallback(self.config)
+            async_connect_with_ldap_fallback(
+                self.config, connect_timeout=self.connect_timeout
+            )
         )
         # ``async_connect_with_ldap_fallback`` returns an
         # ``LDAPConnectResult``; read the live client and the
@@ -1093,6 +1107,22 @@ class ConfidentialChannelUnavailableError(RuntimeError):
     bind is achievable, this is raised instead of silently downgrading to an
     unsealed plain-LDAP channel that can NEVER return the attribute (the DC would
     answer ``ERROR_DS_CONFIDENTIALITY_REQUIRED`` / omit the value)."""
+
+
+class ForeignRealmUnreachableError(RuntimeError):
+    """Raised when an LDAP bind targets a foreign/trust realm we cannot reach.
+
+    The current credential cannot authenticate against the target realm's KDC
+    (cross-forest AES-only KDC, no shared trust key, no usable secret for that
+    realm). The AS-REQ comes back ``KDC_ERR_ETYPE_NOTSUPP`` / preauth-failed, or
+    kerbad returns a ``None`` ticket which asn1crypto then fails to ``load`` with
+    ``encoded_data must be a byte string, not NoneType``. Both are ONE root
+    cause and have NO recovery (re-mint / clock-resync / ETYPE-INFO2 all assume a
+    secret valid in that realm). This typed error replaces the raw asn1
+    ``TypeError`` / 160-line ``KerberosError`` traceback with one clean line so a
+    caller (attack-path discovery, trust enum) can render "realm not reachable"
+    instead of crashing the phase. See
+    :func:`auth_error_classification.is_unreachable_foreign_realm_error`."""
 
 
 class ConfidentialityMechanism(str, enum.Enum):
@@ -1857,6 +1887,25 @@ def _is_starttls_unavailable(exc: BaseException) -> bool:
     return any(marker in chain_text for marker in starttls_markers)
 
 
+def _ldap_ntlm_disabled_high(posture: "DomainPosture | None") -> bool:
+    """Return True when posture HIGH-knows NTLM is DISABLED for this domain.
+
+    Mirrors the ``ntlm_disabled_high`` guard in ``build_smb_plan`` /
+    ``build_winrm_plan``: the NTLM last-resort rung is granted only when NTLM has
+    not been ruled out by HIGH-confidence posture. ``None`` posture (or any
+    UNKNOWN/LOW NTLM state) means "not ruled out" → the grant is allowed.
+    """
+    if posture is None:
+        return False
+    entry = posture.get(ConstraintCategory.NTLM_AUTHENTICATION)
+    if entry is None:
+        return False
+    return bool(
+        entry.confidence is SignalConfidence.HIGH
+        and entry.effective_state is TriState.DISABLED
+    )
+
+
 def _classify_recoverable_bind_failure(
     exc: BaseException,
     *,
@@ -2165,7 +2214,7 @@ def _diag_dump_ccache(ccache_path: str | Path | None) -> None:
     try:
         path = Path(ccache_path) if ccache_path else None
         if not path or not path.exists():
-            print_info_debug(f"[ldap_transport][diag] ccache missing: {ccache_path}")
+            print_info_debug(f"ldap_transport diag: ccache missing: {ccache_path}")
             return
 
         from kerbad.common.ccache import CCACHE  # type: ignore
@@ -2425,8 +2474,18 @@ def _ldap_config_would_mint_fresh_tgt(config: "ADscanLDAPConfig") -> bool:
 
 async def _premint_kerberos_ccache_for_ldap(
     config: "ADscanLDAPConfig",
+    *,
+    connect_timeout: float | None = None,
 ) -> "ADscanLDAPConfig":
     """Pre-mint a TGT once and rewrite ``config`` to ``kerberos-ccache``.
+
+    ``connect_timeout`` (when set) bounds the AS-REQ round-trip so an
+    unreachable / un-authenticatable foreign realm (e.g. a cross-forest
+    AES-only KDC the credential cannot satisfy) fails in a few seconds instead
+    of hanging the caller for the kerbad default (~30s per AS-REQ × retries).
+    The budget is applied BOTH as the ``KerberosConfig.timeout`` and as an
+    overall ``asyncio.wait_for`` wrapper; a timeout falls back to the original
+    config (best-effort, like every other pre-mint failure).
 
     FIX 1 — ladder-bind dedup (the value that remains after the vendor fix):
     an authenticated LDAPS→LDAP confidentiality ladder rebuilds the bind config
@@ -2488,6 +2547,14 @@ async def _premint_kerberos_ccache_for_ldap(
         != str(config.domain or "").strip().casefold()
     )
 
+    # Bound the AS-REQ when a connect budget was supplied so an unreachable /
+    # un-authenticatable foreign realm fails fast instead of hanging for the
+    # kerbad default (~30s × retries). Floor at 3s so a slow-but-alive KDC over
+    # VPN is not falsely timed out (see adscan-ad-constraints § 7bis).
+    _krb_timeout_kwargs: dict[str, Any] = {}
+    if connect_timeout is not None:
+        _krb_timeout_kwargs["timeout"] = max(3, int(connect_timeout))
+
     try:
         krb_cfg = KerberosConfig(
             domain=auth_realm,
@@ -2502,6 +2569,7 @@ async def _premint_kerberos_ccache_for_ldap(
             auth_kdc_ip=auth_kdc_ip if cross_realm else None,
             posture_sink=getattr(config, "posture_sink", None),
             posture_snapshot=getattr(config, "posture_snapshot", None),
+            **_krb_timeout_kwargs,
         )
         print_info_debug(
             "[ldap_transport] pre-minting salt-correct TGT via kerberos_transport."
@@ -2509,7 +2577,12 @@ async def _premint_kerberos_ccache_for_ldap(
             f"realm={mark_sensitive(auth_realm, 'domain')} "
             "(LDAP Kerberos bind would otherwise skip the ETYPE-INFO2 salt probe)"
         )
-        ccache_bytes = await get_tgt(krb_cfg)
+        if connect_timeout is not None:
+            ccache_bytes = await asyncio.wait_for(
+                get_tgt(krb_cfg), timeout=max(3.0, float(connect_timeout))
+            )
+        else:
+            ccache_bytes = await get_tgt(krb_cfg)
     except Exception as exc:  # noqa: BLE001
         # Best-effort: do not mask the real error. Fall back to the original
         # config so the bind surfaces the authentic failure on its own path.
@@ -2747,7 +2820,9 @@ async def async_connect_with_ldap_fallback(
         if _ldap_credential_context_can_remint(_premint_cred_ctx):
             config = await _premint_via_credential_context(config, _premint_cred_ctx)
         else:
-            config = await _premint_kerberos_ccache_for_ldap(config)
+            config = await _premint_kerberos_ccache_for_ldap(
+                config, connect_timeout=connect_timeout
+            )
     # ------------------------------------------------------------------------
 
     # ---- Build the confidentiality ladder (per LDAP connection) -------------
@@ -3006,10 +3081,43 @@ async def async_connect_with_ldap_fallback(
             _kerberos_recovery.register_expiry_reminter(
                 _expiry_reminter_realm, _make_ldap_expiry_reminter(cred_ctx)
             )
+
+    # NTLM last-resort rung for a caller-requested-Kerberos bind that dead-ends
+    # on a residual Kerberos AP-exchange rejection (the GSSAPI-wrapped KRB-ERROR
+    # envelope, "AP EXCHANGE REJECTED BY SERVER"). This mirrors the SMB planner
+    # grant (build_smb_plan / build_winrm_plan) elevated to the planner SSOT so
+    # all caller-requested-Kerberos transports inherit the same defensive
+    # recovery. It is built here (NOT placed in the eager ``configs_to_try``) and
+    # injected ONLY at loop exhaustion, gated on the AP-exchange infra marker —
+    # so it NEVER fires on KDC_ERR_ETYPE_NOTSUPP / KRB_AP_ERR_SKEW /
+    # KRB_AP_ERR_MODIFIED (those own dedicated recovery: ETYPE-INFO2 mint,
+    # clock-resync, SPN-candidate). Posture-gated: skipped when NTLM is known
+    # DISABLED HIGH (capability-bearing ccache binds excluded — they carry an
+    # explicit ccache the NTLM rung cannot reproduce).
+    _ntlm_last_resort_cfg: "ADscanLDAPConfig | None" = None
+    if (
+        config.use_kerberos
+        and not _ldap_ntlm_disabled_high(getattr(config, "posture_snapshot", None))
+        and not str(getattr(config, "ccache_path", "") or "").strip()
+        and not getattr(config, "aes_key", None)
+    ):
+        import dataclasses as _dc_ntlm_lr
+
+        _ntlm_last_resort_cfg = _dc_ntlm_lr.replace(
+            config,
+            use_kerberos=False,
+            ccache_path=None,
+            aes_key=None,
+            channel_binding=False,
+        )
+
     try:
         last_exc: Exception | None = None
         last_attempt_was_ldaps: bool = False
         ldaps_disabled_emitted: bool = False
+        # One-shot budget for the NTLM last-resort rung (see above). A single
+        # injected attempt — never a loop.
+        _ntlm_last_resort_used: bool = False
 
         # Self-healing retry budget. For each recoverable posture category
         # (CBT, LDAP signing) we allow EXACTLY ONE injected retry per
@@ -3163,7 +3271,7 @@ async def async_connect_with_ldap_fallback(
                         )
                         ldaps_disabled_emitted = True
                     print_info_debug(
-                        f"[ldap_transport] LDAPS unavailable on {config.dc_ip}, retrying on plain LDAP"
+                        f"ldap_transport: LDAPS unavailable on {config.dc_ip}, retrying on plain LDAP"
                     )
                     continue
 
@@ -3289,6 +3397,34 @@ async def async_connect_with_ldap_fallback(
                             f"already queued by a prior rung; continuing to it"
                         )
                     continue
+
+                # NTLM last-resort rung. Reached only when no posture self-heal
+                # was queued (recovered_cfg is None) — so the dedicated-code
+                # recoveries (ETYPE-INFO2 mint, clock-resync, SPN-candidate) have
+                # already had their chance at mint/transport time. Inject the
+                # single NTLM attempt ONLY when THIS failure is the residual
+                # Kerberos AP-exchange rejection envelope and NTLM was not ruled
+                # out by posture. ``is_native_kerberos_infra_error`` keys on
+                # "AP EXCHANGE REJECTED BY SERVER" (and the kindred KDC/SPN/AP
+                # infra markers) — it does NOT match the decoded ETYPE/SKEW/
+                # MODIFIED codes, so the carve-out holds exactly.
+                if (
+                    _ntlm_last_resort_cfg is not None
+                    and not _ntlm_last_resort_used
+                    and is_native_kerberos_infra_error(exc)
+                ):
+                    _ntlm_last_resort_used = True
+                    _ntlm_is_ldaps = bool(
+                        getattr(_ntlm_last_resort_cfg, "use_ldaps", is_ldaps)
+                    )
+                    configs_to_try.append((_ntlm_last_resort_cfg, _ntlm_is_ldaps))
+                    print_info_debug(
+                        "[ldap_transport] NTLM last-resort: caller-requested "
+                        "Kerberos dead-ended on a residual AP-exchange rejection; "
+                        "queued one NTLM bind with the same credential "
+                        f"(transport={'LDAPS' if _ntlm_is_ldaps else 'LDAP'})"
+                    )
+                    continue
                 raise
 
         if last_exc is not None:
@@ -3309,6 +3445,19 @@ async def async_connect_with_ldap_fallback(
                 "(anonymous / SIMPLE) cannot negotiate LDAP sign+seal. The managed "
                 "password cannot be read over an unsealed channel. Provide credentials "
                 "for an authenticated bind, or restore LDAPS reachability to the DC."
+            ) from last_exc
+        # Foreign / trust realm we genuinely cannot authenticate to (cross-forest
+        # AES-only KDC, no shared trust key) — collapse the raw asn1 ``None``-ticket
+        # ``TypeError`` / 160-line ``KerberosError`` traceback into one clean typed
+        # error so attack-path discovery (and any other caller) surfaces a single
+        # "realm not reachable" line instead of crashing the phase. There is no
+        # recovery for this case; the dedicated-code recoveries (ETYPE-INFO2 mint,
+        # clock-resync, SPN-candidate) all assume a secret valid in that realm.
+        if last_exc is not None and is_unreachable_foreign_realm_error(last_exc):
+            realm = mark_sensitive(str(config.domain or "the target realm"), "domain")
+            raise ForeignRealmUnreachableError(
+                f"Foreign/trust realm {realm} is not reachable with the current "
+                "credential (cross-realm Kerberos auth unavailable)."
             ) from last_exc
         raise last_exc or RuntimeError(
             "Both LDAPS and plain LDAP connection attempts failed"

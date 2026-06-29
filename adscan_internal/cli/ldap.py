@@ -4293,6 +4293,22 @@ def run_ldap_descriptions(
     Sensitive-keyword matches in any of the description-class fields are
     surfaced as ``ldap_user_description_password_leak`` technical findings.
     """
+    # The authenticated Phase 3 quick-win is part of ``quick_credential_wins``;
+    # honor a scan-config disable. The anonymous/unauth-surface call path is a
+    # different phase and is never gated here.
+    if not anonymous:
+        from adscan_internal.services.scan_phases import (
+            phase_is_enabled,
+            subphase_is_enabled,
+        )
+
+        if not phase_is_enabled(shell, "quick_credential_wins"):
+            return
+        if not subphase_is_enabled(shell, "quick_credential_wins", "ldap_descriptions"):
+            print_info(
+                "LDAP description parsing skipped (disabled in scan configuration)."
+            )
+            return
     if target_domain not in shell.domains:
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_error(

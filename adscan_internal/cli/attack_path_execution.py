@@ -12999,6 +12999,77 @@ def offer_attack_paths_for_execution_for_principals(
     )
 
 
+def _summary_match_tokens(summary: dict[str, Any]) -> set[str]:
+    """Collect the lower-cased identifiers a ``selected`` policy can match on.
+
+    A configured ``attack_paths.selected`` entry matches a path summary when it
+    equals (case-insensitively) the path id, its source node, or its target
+    node. We also derive source/target from ``nodes`` / ``title`` so a config
+    written against the rendered ``source -> target`` still matches.
+    """
+    tokens: set[str] = set()
+    for key in ("id", "path_id", "source", "target", "target_name", "source_name"):
+        value = summary.get(key)
+        if value:
+            tokens.add(str(value).strip().lower())
+    nodes = summary.get("nodes") if isinstance(summary.get("nodes"), list) else []
+    if nodes:
+        tokens.add(str(nodes[0]).strip().lower())
+        tokens.add(str(nodes[-1]).strip().lower())
+    title = str(summary.get("title") or "")
+    if "->" in title:
+        for part in title.split("->"):
+            cleaned = part.strip().lower()
+            if cleaned:
+                tokens.add(cleaned)
+    return {t for t in tokens if t}
+
+
+def _apply_attack_path_policy(
+    shell: Any, domain: str, summaries: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Filter ``summaries`` per the scan-config attack-path execution policy.
+
+    Returns the (possibly narrowed) list of summaries the offer should act on.
+    ``none`` returns an empty list (skip execution); ``selected`` keeps only the
+    summaries matching a configured entry; ``all`` / ``interactive`` (default,
+    or absent config) return the list unchanged.
+    """
+    from adscan_internal.services.scan_config import (
+        ATTACK_PATH_POLICY_NONE,
+        ATTACK_PATH_POLICY_SELECTED,
+    )
+
+    scan_config = getattr(shell, "scan_config", None)
+    ap_cfg = getattr(scan_config, "attack_paths", None)
+    policy = getattr(ap_cfg, "policy", None)
+
+    if policy == ATTACK_PATH_POLICY_NONE:
+        print_info(
+            "Attack-path execution skipped (disabled in scan configuration)."
+        )
+        return []
+
+    if policy == ATTACK_PATH_POLICY_SELECTED:
+        wanted = {str(s).strip().lower() for s in getattr(ap_cfg, "selected", ())}
+        if not wanted:
+            return summaries
+        filtered = [
+            s
+            for s in summaries
+            if isinstance(s, dict) and (_summary_match_tokens(s) & wanted)
+        ]
+        if not filtered:
+            print_warning(
+                "No discovered attack path matched the scan configuration's "
+                "selected set; skipping execution."
+            )
+        return filtered
+
+    # ``all`` and ``interactive`` (and any unknown value) keep the full set.
+    return summaries
+
+
 def offer_attack_paths_for_execution_summaries(
     shell: Any,
     domain: str,
@@ -13040,6 +13111,15 @@ def offer_attack_paths_for_execution_summaries(
       ``attempted``) so the operator can retry attempted paths manually
       if they want — CI never auto-retries.
     """
+    if not summaries:
+        return False
+
+    # Honor the scan-config attack-path execution policy (one SSOT gate for both
+    # the CI non-interactive branch and the interactive offer). ``none`` skips
+    # execution entirely; ``selected`` narrows the offered set to the listed
+    # path ids/targets; ``all`` / ``interactive`` (default) keep today's
+    # behavior. Absent config = interactive = unchanged.
+    summaries = _apply_attack_path_policy(shell, domain, summaries)
     if not summaries:
         return False
 

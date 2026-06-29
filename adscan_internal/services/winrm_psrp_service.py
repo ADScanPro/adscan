@@ -405,29 +405,32 @@ class WinRMPSRPService:
 
         # Posture-driven auth-mode override (PR11). When a posture snapshot
         # carries NTLM_AUTHENTICATION = DISABLED HIGH, force Kerberos so the
-        # very first attempt skips the doomed NTLM bind.
-        if self._posture_snapshot is not None:
-            try:
-                from adscan_internal.services.auth_plan import (  # noqa: PLC0415
-                    build_winrm_plan,
-                )
+        # very first attempt skips the doomed NTLM bind. The plan is consulted
+        # even when no posture snapshot is present so a caller-requested
+        # Kerberos auth_mode inherits the NTLM-last-resort grant on a residual
+        # KRB-ERROR (posture=None ⇒ NTLM not ruled out ⇒ grant allowed); the
+        # chokepoint still gates the actual fallback on _is_kerberos_infra_error.
+        try:
+            from adscan_internal.services.auth_plan import (  # noqa: PLC0415
+                build_winrm_plan,
+            )
 
-                plan = build_winrm_plan(
-                    requested_auth_mode=self.auth_mode,
-                    posture=self._posture_snapshot,
-                )
-                self._ntlm_fallback_allowed = plan.ntlm_fallback_allowed
-                if plan.is_pruned:
-                    print_info_debug(
-                        f"[winrm_psrp] posture plan: {plan.attempt.rationale}"
-                    )
-                    self.auth_mode = plan.attempt.auth_mode
-            except Exception as plan_exc:  # pragma: no cover - defensive
-                telemetry.capture_exception(plan_exc)
+            plan = build_winrm_plan(
+                requested_auth_mode=self.auth_mode,
+                posture=self._posture_snapshot,
+            )
+            self._ntlm_fallback_allowed = plan.ntlm_fallback_allowed
+            if plan.is_pruned:
                 print_info_debug(
-                    f"[winrm_psrp] posture plan resolution failed (ignored): "
-                    f"{type(plan_exc).__name__}: {plan_exc}"
+                    f"[winrm_psrp] posture plan: {plan.attempt.rationale}"
                 )
+                self.auth_mode = plan.attempt.auth_mode
+        except Exception as plan_exc:  # pragma: no cover - defensive
+            telemetry.capture_exception(plan_exc)
+            print_info_debug(
+                f"[winrm_psrp] posture plan resolution failed (ignored): "
+                f"{type(plan_exc).__name__}: {plan_exc}"
+            )
 
         if self.auth_mode == "auto":
             if KERBEROS_FIRST_POLICY:

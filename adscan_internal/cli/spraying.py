@@ -40,6 +40,7 @@ from adscan_internal.rich_output import (
     print_exception,
     print_panel,
     print_table,
+    questionary_select_index,
 )
 from adscan_internal.subprocess_env import command_string_needs_clean_env
 from adscan_internal.text_utils import strip_ansi_codes
@@ -4365,6 +4366,11 @@ def _enforce_lockout_guardrail(
 
 def ask_for_spraying(shell: SprayShell, domain: str) -> None:
     """Prompt user to perform password spraying on a domain."""
+    from adscan_internal.services.scan_phases import phase_is_enabled
+
+    if not phase_is_enabled(shell, "password_spraying"):
+        print_info("Password Spraying skipped (disabled in scan configuration).")
+        return
     if shell.domains_data[domain]["auth"] == "pwned":
         return
 
@@ -5549,11 +5555,20 @@ def _prompt_variation_spray(
     if not accepted:
         return False, None, None
 
-    max_tier = IntPrompt.ask(
-        "Maximum tier to include [1=~15 / 2=~40 / 3=~80 variations/user]",
-        default=prefs.max_tier_default,
+    tier_options = [
+        "Tier 1 — ~15 variations/user",
+        "Tier 2 — ~40 variations/user",
+        "Tier 3 — ~80 variations/user",
+    ]
+    tier_default_idx = max(0, min(2, prefs.max_tier_default - 1))
+    selected_tier_idx = questionary_select_index(
+        title="Maximum tier to include",
+        options=tier_options,
+        default_idx=tier_default_idx,
     )
-    max_tier = max(1, min(3, int(max_tier)))
+    if selected_tier_idx is None:
+        selected_tier_idx = tier_default_idx
+    max_tier = selected_tier_idx + 1
 
     budget = IntPrompt.ask(
         "Budget (max authentications)",
@@ -7134,6 +7149,7 @@ def _run_spray_with_dashboard(
     command: str,
     spray_label: str,
     use_clean_env: bool,
+    domain: str | None = None,
 ) -> "subprocess.CompletedProcess[str] | None":
     """Run a kerbrute spray LIVE under a streaming progress dashboard.
 
@@ -7194,10 +7210,43 @@ def _run_spray_with_dashboard(
     hits_seen: set[str] = set()
     state = {"tested": 0}
 
+    # Live current-operation telemetry — mirror the spray dashboard's forward
+    # motion into the structured event stream so the platform shows "Password
+    # spraying · X of N accounts" live, not just at completion. Throttled to
+    # ~1.5s (same budget as the port-scan emitter) so a large spray never floods
+    # the event channel. No secret reaches the event: only counts + the domain.
+    _emit_state: dict[str, float] = {"last_emit": 0.0}
+
+    def _maybe_emit_spray_progress(*, force: bool = False, done: bool = False) -> None:
+        import time as _time  # noqa: PLC0415
+
+        now = _time.time()
+        if not force and now - _emit_state["last_emit"] < 1.5:
+            return
+        _emit_state["last_emit"] = now
+        try:
+            from adscan_internal.cli.ci_events import (  # noqa: PLC0415
+                emit_operation_progress,
+            )
+
+            emit_operation_progress(
+                operation="password_spraying",
+                label="Password spraying",
+                phase="password_spraying",
+                phase_label="Password Spraying",
+                current=state["tested"] or None,
+                total=total if determinate else None,
+                detail=domain or None,
+                done=done,
+            )
+        except Exception:  # noqa: BLE001 -- telemetry must not abort the spray
+            pass
+
     def _on_line(line: str) -> None:
         if not _is_kerbrute_login_attempt_line(line):
             return
         state["tested"] += 1
+        _maybe_emit_spray_progress()
 
         current_user: str | None = None
         parsed_login = _parse_kerbrute_valid_login_line(line)
@@ -7243,6 +7292,10 @@ def _run_spray_with_dashboard(
                 dashboard.update(done=len(hits_seen))
         except Exception:  # noqa: BLE001 -- final frame is best-effort
             pass
+        # Emit the terminal count so the live surface lands on the real total,
+        # marked done so the platform's live strip clears the operation instead
+        # of freezing on the final tested count.
+        _maybe_emit_spray_progress(force=True, done=True)
 
     try:
         with dashboard.live_session():
@@ -7308,6 +7361,7 @@ def execute_spraying_command(
             command=command,
             spray_label=_spinner_label,
             use_clean_env=use_clean_env,
+            domain=domain,
         )
 
         if completed_process is None:
@@ -7872,6 +7926,13 @@ def _run_pre2k_step(shell: "SprayShell", domain: str, *, interactive: bool) -> N
     re-run, but the prompt defaults to NO so a re-entered scan does not silently
     re-spray.
     """
+    from adscan_internal.services.scan_phases import subphase_is_enabled
+
+    if not subphase_is_enabled(shell, "password_spraying", "pre2k"):
+        print_info(
+            "Pre2k computer-account spray skipped (disabled in scan configuration)."
+        )
+        return
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
     if not has_enabled_computer_list(workspace_cwd, shell.domains_dir, domain):
         return  # nothing to pre2k against
@@ -8029,7 +8090,22 @@ def _interactive_select_spray(
 def _dispatch_spray_choice(
     shell: "SprayShell", domain: str, choice: str, *, overview: dict, interactive: bool
 ) -> None:
-    """Execute one selected spray via the existing per-type executors."""
+    """Execute one selected spray via the existing per-type executors.
+
+    Strategy-level scan-config gating: the canonical spray strategies (``blank``,
+    ``useraspass``, ``reuse``) map to ``password_spraying`` subphases the client
+    can disable individually. The retry/custom selector entries are not strategy
+    subphases and are never gated here. Absent config = every strategy runs.
+    """
+    from adscan_internal.services.scan_phases import subphase_is_enabled
+
+    if choice in {"blank", "useraspass", "reuse"} and not subphase_is_enabled(
+        shell, "password_spraying", choice
+    ):
+        print_info(
+            f"Spray strategy '{choice}' skipped (disabled in scan configuration)."
+        )
+        return
     if choice == "useraspass":
         transform = _select_useraspass_transform(shell, interactive=interactive)
         spraying_with_username_as_password(shell, domain, transform=transform)

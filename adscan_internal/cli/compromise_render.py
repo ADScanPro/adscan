@@ -29,7 +29,11 @@ from rich.table import Table
 from rich.text import Text
 
 from adscan_core.theme import COLOR_CRIMSON
-from adscan_internal.services.compromise_class import CompromiseClass
+from adscan_internal.services.compromise_class import (
+    CompromiseClass,
+    compromise_reach_label,
+    tier_glossary,
+)
 from adscan_internal.services.edge_phrasing import translate_edge
 
 
@@ -56,7 +60,7 @@ _CLASS_STYLE: dict[CompromiseClass, str] = {
     CompromiseClass.NONE: "dim",
 }
 
-_KPI_HEADERS: tuple[str, str, str] = ("CLASS", "ACCOUNTS", "PATHS")
+_KPI_HEADERS: tuple[str, str, str, str] = ("CLASS", "ACCOUNTS", "PATHS", "REACH")
 
 
 def class_badge(klass: CompromiseClass, *, audience: Audience = "technical") -> Text:
@@ -69,6 +73,17 @@ def class_badge(klass: CompromiseClass, *, audience: Audience = "technical") -> 
     if audience == "executive":
         return Text(klass.display_label, style=style)
     return Text(klass.cli_badge, style=style)
+
+
+def class_reach(klass: CompromiseClass) -> Text:
+    """Return the axis-2 Compromise Reach phrase for one class, styled dim.
+
+    Translates from the SSOT :func:`compromise_reach_label` so the CLI shows
+    the SAME reach vocabulary the report and web carry. Pairs with
+    :func:`class_badge`: the badge is the technical class, the reach phrase is
+    the shared plain-language axis.
+    """
+    return Text(compromise_reach_label(klass), style="dim")
 
 
 def render_kpi_panel(
@@ -108,8 +123,12 @@ def render_kpi_panel(
         expand=False,
     )
     for header in _KPI_HEADERS:
-        justify = "left" if header == "CLASS" else "right"
-        table.add_column(header, justify=justify, no_wrap=True)
+        if header == "CLASS" or header == "REACH":
+            justify = "left"
+        else:
+            justify = "right"
+        # The REACH column carries a full phrase; keep it wrap-free off.
+        table.add_column(header, justify=justify, no_wrap=header != "REACH")
 
     rows: Sequence[tuple[CompromiseClass, tuple[int, int]]] = (
         (CompromiseClass.DOMAIN_BREAKER, domain_breaker),
@@ -122,6 +141,7 @@ def render_kpi_panel(
             class_badge(klass, audience=audience),
             Text(f"{accounts:>4d}", style="bold"),
             Text(f"{paths:>4d}", style="bold"),
+            class_reach(klass),
         )
 
     return Panel(
@@ -237,6 +257,51 @@ def render_path_summary_line(
     )
 
 
+def render_tiering_legend(*, title: str = "Tiering legend") -> Panel:
+    """Return a compact legend explaining the Privilege Tiers (axis 1).
+
+    The content is pulled verbatim from the SSOT :func:`tier_glossary` so the
+    operator reads the SAME tier definitions the client report and web carry.
+    One row per tier, ordered most-privileged-first, with the canonical label
+    and a one-line meaning. Rendered restrained: the tier label is the only
+    styled cell, the meaning is dim body text.
+    """
+    table = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="dim bold",
+        pad_edge=False,
+        padding=(0, 2),
+        expand=False,
+    )
+    table.add_column("TIER", justify="left", no_wrap=True)
+    table.add_column("MEANS", justify="left", overflow="fold")
+
+    # Map each glossary tier value to a restrained accent so the legend reads
+    # on the same severity ramp as the KPI panel without inventing new colors.
+    tier_styles: dict[str, str] = {
+        "tier0_direct": f"bold {COLOR_CRIMSON}",
+        "tier0_escalation_capable": "bold yellow",
+        "tier1": "bold cyan",
+        "tier2": "dim",
+    }
+    for entry in tier_glossary():
+        style = tier_styles.get(entry.get("tier", ""), "default")
+        table.add_row(
+            Text(entry.get("label", ""), style=style),
+            Text(entry.get("meaning", ""), style="dim"),
+        )
+
+    return Panel(
+        table,
+        title=Text(title, style="bold"),
+        title_align="left",
+        border_style="dim",
+        box=box.SQUARE,
+        padding=(1, 2),
+    )
+
+
 def coerce_class(raw: Any) -> CompromiseClass:
     """Coerce stored payload values into a :class:`CompromiseClass`.
 
@@ -265,8 +330,10 @@ def coerce_class(raw: Any) -> CompromiseClass:
 __all__ = [
     "Audience",
     "class_badge",
+    "class_reach",
     "coerce_class",
     "render_kpi_panel",
     "render_path_chain",
     "render_path_summary_line",
+    "render_tiering_legend",
 ]

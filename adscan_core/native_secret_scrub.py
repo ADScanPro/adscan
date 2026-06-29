@@ -29,6 +29,10 @@ Two redaction strategies, combined
      The crackable response is redacted; ``user::DOMAIN`` is kept (it is not the
      secret, and keeping it preserves debuggability).
    * Server/NTLM challenge byte-reprs — ``ServerChallenge: b'...'``.
+   * rclone backend connection-string passwords — ``:smb,...,pass=<obscured>``.
+     ``rclone obscure`` is reversible with a static public key, so the echoed
+     connection string in rclone's STDERR carries a recoverable cleartext
+     credential. The value after ``pass=`` / ``password=`` is redacted.
 
 2. **LABEL-GATED hex/base64 redaction** (the conservative complement). A long
    hex OR base64 run is redacted ONLY when a known secret label immediately
@@ -93,6 +97,51 @@ _CHALLENGE_REPR_RE = re.compile(
     r"(?P<prefix>b?)(?P<quote>['\"])(?P<value>(?:\\.|[^'\"\\]){4,}?)(?P=quote)"
 )
 
+# secretsdump / NTDS / DCSync key-line shape, LABEL-FREE:
+#   <principal>:<enctype>:<hexkey>
+# e.g. ``krbtgt:aes256-cts-hmac-sha1-96:0123...<64 hex>`` or the legacy
+# ``Administrator:des-cbc-md5:0011223344556677``. The enc-type sits between two
+# colons and the trailing field is the raw key — we redact ONLY the hex key and
+# keep ``<principal>:<enctype>`` visible (aids debugging; the enc-type NAME is
+# not secret). The hex floor (>=16) keeps DES (16 hex) covered while never
+# matching a short non-key token, and the enc-type alternation anchors the shape
+# so an arbitrary ``foo:bar:deadbeef…`` elsewhere is not eaten.
+_KEY_ENCTYPE_ALT = "|".join(
+    re.escape(et)
+    for et in (
+        "aes256-cts-hmac-sha1-96",
+        "aes128-cts-hmac-sha1-96",
+        "des-cbc-md5",
+        "des-cbc-crc",
+        "des3-cbc-sha1",
+        "rc4-hmac",
+        "rc4-hmac-nt",
+        "aes256",
+        "aes128",
+    )
+)
+_KEY_LINE_RE = re.compile(
+    rf"(?i)(?P<head>[^\s:]{{1,256}}:(?:{_KEY_ENCTYPE_ALT}):)(?P<val>[0-9a-f]{{16,}})"
+)
+
+# rclone backend connection-string password, LABEL-FREE on the rclone shape.
+#   :smb,host=h,user=u,pass=<obscured>,domain=d:share
+#   :smb,host=h,user=u,password=<obscured>:share
+# ``rclone obscure`` is reversible with a STATIC PUBLIC key — anyone holding the
+# recording can run ``rclone reveal <blob>`` and recover the customer's cleartext
+# password. The obscured value is a base64url-ish run; rclone echoes the whole
+# connection string verbatim inside its STDERR error lines (``Creating backend
+# with remote ":smb,...,pass=<obscured>:share"``), which then lands in the
+# recorded command preview. We redact the VALUE after ``pass=`` / ``password=``
+# and keep the key name. Anchored on the rclone connection-string shape (a
+# ``:<backend>,`` prefix somewhere before the ``pass=``) so an unrelated
+# ``pass=`` in prose is NOT eaten; the >=16-char base64-ish floor keeps short
+# benign ``pass=ok`` tokens safe while erring toward redaction for any real blob.
+_RCLONE_PASS_RE = re.compile(
+    r"(?i)(?P<pre>:[a-z0-9_]+,(?:[^\s:]*,)*?)(?P<key>pass(?:word)?=)"
+    r"(?P<val>[A-Za-z0-9_\-+/=]{16,})"
+)
+
 
 def _redact_ntlmssp(match: "re.Match[str]") -> str:
     blob = match.group(0)
@@ -110,6 +159,15 @@ def _redact_challenge(match: "re.Match[str]") -> str:
         f"{match.group('prefix')}{match.group('quote')}"
         f"<redacted challenge>{match.group('quote')}"
     )
+
+
+def _redact_key_line(match: "re.Match[str]") -> str:
+    n_bytes = len(match.group("val")) // 2
+    return f"{match.group('head')}<redacted key: {n_bytes} bytes>"
+
+
+def _redact_rclone_pass(match: "re.Match[str]") -> str:
+    return f"{match.group('pre')}{match.group('key')}<redacted>"
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +216,23 @@ SECRET_LABELS: tuple[str, ...] = (
     "tgt",
     "kerberos key",
     "kerberoskey",
+    # Kerberos enc-type key material (secretsdump / NTDS / DCSync key lines).
+    # The LABEL is the enc-type name; the VALUE that follows it (after a ":"
+    # separator) is the raw key and is what we redact. The enc-type name itself,
+    # when mentioned WITHOUT a trailing hex value (e.g. "negotiated etype
+    # aes256-cts-hmac-sha1-96"), is never touched because the hex floor below is
+    # not reached.
+    "aes256-cts-hmac-sha1-96",
+    "aes128-cts-hmac-sha1-96",
+    "aes256",
+    "aes128",
+    "des-cbc-md5",
+    "des-cbc-crc",
+    "rc4-hmac",
+    # NTDS bootkey / encryption key material.
+    "pek",
+    "syskey",
+    "dckey",
 )
 
 _LABEL_ALT = "|".join(re.escape(lbl) for lbl in SECRET_LABELS)
@@ -228,6 +303,11 @@ def scrub_native_secrets(line: str) -> str:
         line = _NTLMSSP_MESSAGE_RE.sub(_redact_ntlmssp, line)
         line = _NETNTLM_HASHCAT_RE.sub(_redact_netntlm, line)
         line = _CHALLENGE_REPR_RE.sub(_redact_challenge, line)
+        # Label-free secretsdump/NTDS key line: <principal>:<enctype>:<hexkey>.
+        line = _KEY_LINE_RE.sub(_redact_key_line, line)
+        # Label-free rclone backend connection-string password (reversible
+        # ``rclone obscure`` blob — recoverable cleartext credential).
+        line = _RCLONE_PASS_RE.sub(_redact_rclone_pass, line)
         # Strategy 2 — label-gated hex then base64.
         line = _LABEL_HEX_RE.sub(_redact_label_hex, line)
         line = _LABEL_B64_RE.sub(_redact_label_b64, line)

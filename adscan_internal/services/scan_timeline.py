@@ -141,6 +141,16 @@ def phase_span(
     error: BaseException | None = None
     try:
         yield
+    except GeneratorExit:
+        # The span was abandoned, not failed: a caller opened the span via
+        # ``__enter__`` and returned early without an explicit ``__exit__``
+        # (common in ``run_enumeration``'s many early-return points), so the
+        # suspended generator is closed/GC'd and Python throws ``GeneratorExit``
+        # in here. That is a clean teardown, NOT a phase error — recording it as
+        # ``status="error"`` mislabels a healthy phase (e.g. domain_analysis with
+        # +9 users / +4 edges showed up as an error). Re-raise so the generator
+        # protocol stays correct, but leave ``error`` unset so the row reads ok.
+        raise
     except BaseException as exc:  # noqa: BLE001 — captured to enrich timeline row
         error = exc
         raise

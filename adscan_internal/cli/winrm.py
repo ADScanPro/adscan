@@ -1604,6 +1604,14 @@ def check_autologon(
             "$props | ConvertTo-Json -Compress"
         )
 
+        # Resolve the target's FQDN ONCE so Kerberos builds HTTP/<fqdn> (not
+        # HTTP/<ip>, which yields KDC_ERR_S_PRINCIPAL_UNKNOWN on IP-addressed
+        # hosts). Same SSOT the access probe uses (choose_hostname_for_kerberos_spn
+        # via _resolve_winrm_kerberos_spn_host); None falls back to the current
+        # normalize_kerberos_target_hostname behavior.
+        kerberos_spn_host = _resolve_winrm_kerberos_spn_host(
+            shell, domain=domain, host=host
+        )
         try:
             output = _execute_powershell_via_psrp(
                 domain=domain,
@@ -1612,6 +1620,7 @@ def check_autologon(
                 password=password,
                 script=autologon_script,
                 operation_name="autologon_registry_query",
+                kerberos_spn_host=kerberos_spn_host,
             )
             data = json.loads(output) if output.strip() else {}
             default_user_name = str(data.get("DefaultUserName") or "").strip()
@@ -1875,6 +1884,14 @@ def check_powershell_transcripts(
             "ForEach-Object { $_.FullName }; "
             "$results | ConvertTo-Json -Compress"
         )
+        # Resolve the target's FQDN ONCE so Kerberos builds HTTP/<fqdn> (not
+        # HTTP/<ip>, which yields KDC_ERR_S_PRINCIPAL_UNKNOWN on IP-addressed
+        # hosts). Same SSOT the access probe uses (choose_hostname_for_kerberos_spn
+        # via _resolve_winrm_kerberos_spn_host); None falls back to the current
+        # normalize_kerberos_target_hostname behavior.
+        kerberos_spn_host = _resolve_winrm_kerberos_spn_host(
+            shell, domain=domain, host=host
+        )
         try:
             search_output = _execute_powershell_via_psrp(
                 domain=domain,
@@ -1883,6 +1900,7 @@ def check_powershell_transcripts(
                 password=password,
                 script=search_script,
                 operation_name="powershell_transcript_search",
+                kerberos_spn_host=kerberos_spn_host,
             )
             transcript_paths = _parse_psrp_path_list(search_output)
         except (WinRMPSRPError, json.JSONDecodeError) as exc:
@@ -2149,6 +2167,14 @@ def check_firefox_credentials(
             "$results | ConvertTo-Json -Compress"
         )
 
+        # Resolve the target's FQDN ONCE so Kerberos builds HTTP/<fqdn> (not
+        # HTTP/<ip>, which yields KDC_ERR_S_PRINCIPAL_UNKNOWN on IP-addressed
+        # hosts). Same SSOT the access probe uses (choose_hostname_for_kerberos_spn
+        # via _resolve_winrm_kerberos_spn_host); None falls back to the current
+        # normalize_kerberos_target_hostname behavior.
+        kerberos_spn_host = _resolve_winrm_kerberos_spn_host(
+            shell, domain=domain, host=host
+        )
         try:
             output = _execute_powershell_via_psrp(
                 domain=domain,
@@ -2157,6 +2183,7 @@ def check_firefox_credentials(
                 password=password,
                 script=search_script,
                 operation_name="firefox_credentials_search",
+                kerberos_spn_host=kerberos_spn_host,
             )
             paths = _parse_psrp_path_list(output)
         except (WinRMPSRPError, json.JSONDecodeError) as exc:

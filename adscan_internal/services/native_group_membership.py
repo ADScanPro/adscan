@@ -10,6 +10,81 @@ from adscan_internal.services.ldap_query_service import query_shell_ldap_attribu
 
 _LDAP_MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"
 
+# Built-in domain group RIDs that always carry a fixed, language-independent
+# sAMAccountName. Used as a last-resort filter when the domain SID cannot be
+# resolved, so a missing SID degrades to a name-based lookup instead of the
+# opaque ``inappropriateMatching`` rejection raised by the constructed
+# ``primaryGroupToken`` attribute.
+_WELL_KNOWN_GROUP_SAM_NAMES: dict[int, str] = {
+    512: "Domain Admins",
+    513: "Domain Users",
+    514: "Domain Guests",
+    515: "Domain Computers",
+    516: "Domain Controllers",
+    518: "Schema Admins",
+    519: "Enterprise Admins",
+    520: "Group Policy Creator Owners",
+    521: "Read-only Domain Controllers",
+    525: "Protected Users",
+    526: "Key Admins",
+    527: "Enterprise Key Admins",
+}
+
+
+def _resolve_group_dn_filter_by_rid(shell: Any, domain: str, rid_value: int) -> str | None:
+    """Build a group-DN-lookup LDAP filter for ``rid`` that AD will accept.
+
+    ``primaryGroupToken`` is a CONSTRUCTED attribute: AD computes it per object
+    and rejects any search filter that references it
+    (``ERROR_DS_FILTER_USES_CONTRUCTED_ATTRS`` / ``inappropriateMatching``).
+    The correct, stored attribute to match a group on is ``objectSid``, built as
+    ``<domain_sid>-<rid>`` and encoded as raw LDAP filter bytes.
+
+    Resolution order:
+      1. ``(&(objectCategory=group)(objectSid=<encoded domain_sid-rid>))`` — the
+         canonical, exact match, preferred whenever the domain SID is known.
+      2. ``(&(objectCategory=group)(sAMAccountName=<well-known name>))`` — a
+         name-based fallback for built-in RIDs when the domain SID is missing.
+      3. ``None`` — neither is available; the caller surfaces a clear error
+         instead of emitting a filter AD will reject.
+    """
+    from adscan_internal.services.attack_graph_service import _resolve_domain_sid
+    from adscan_internal.services.exploitation.acl import _sid_to_ldap_filter_bytes
+
+    marked_domain = mark_sensitive(domain, "domain")
+
+    domain_sid: str | None = None
+    try:
+        snapshot: dict[str, Any] = {}
+        domain_sid = _resolve_domain_sid(shell, domain, snapshot)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        domain_sid = None
+
+    if domain_sid:
+        group_sid = f"{domain_sid}-{rid_value}"
+        encoded = _sid_to_ldap_filter_bytes(group_sid)
+        if encoded:
+            return f"(&(objectCategory=group)(objectSid={encoded}))"
+        print_info_debug(
+            f"[ldap-group-rid] domain SID {mark_sensitive(domain_sid, 'user')} for "
+            f"{marked_domain} could not be encoded for RID {rid_value}; trying name fallback."
+        )
+
+    well_known = _WELL_KNOWN_GROUP_SAM_NAMES.get(rid_value)
+    if well_known:
+        print_info_debug(
+            f"[ldap-group-rid] domain SID unavailable for {marked_domain}; resolving group "
+            f"RID {rid_value} by well-known sAMAccountName '{well_known}'."
+        )
+        return f"(&(objectCategory=group)(sAMAccountName={escape_ldap_filter_value(well_known)}))"
+
+    print_info_debug(
+        f"[ldap-group-rid] cannot build a valid group filter for RID {rid_value} in "
+        f"{marked_domain}: domain SID unavailable and RID is not a built-in group."
+    )
+    return None
+
 
 def escape_ldap_filter_value(value: str) -> str:
     """Escape a value for use inside an LDAP filter assertion."""
@@ -42,17 +117,25 @@ def resolve_enabled_group_members_by_rid_native(
     """Return enabled direct/recursive members of a domain group RID via native LDAP."""
     rid_value = int(rid)
     marked_domain = mark_sensitive(domain, "domain")
-    group_dns = query_shell_ldap_attribute_values(
-        shell,
-        domain=domain,
-        ldap_filter=f"(&(objectCategory=group)(primaryGroupToken={rid_value}))",
-        attribute="distinguishedName",
-        prefer_kerberos=True,
-        allow_ntlm_fallback=True,
-        operation_name=operation_name or f"group RID {rid_value} DN lookup",
-    )
-    if group_dns is None:
-        return None
+    group_dn_filter = _resolve_group_dn_filter_by_rid(shell, domain, rid_value)
+    if group_dn_filter is None:
+        print_info_debug(
+            f"[ldap-group-rid] no resolvable group filter for RID {rid_value} in "
+            f"{marked_domain}; falling back to primaryGroupID-only member lookup."
+        )
+        group_dns: list[Any] | None = []
+    else:
+        group_dns = query_shell_ldap_attribute_values(
+            shell,
+            domain=domain,
+            ldap_filter=group_dn_filter,
+            attribute="distinguishedName",
+            prefer_kerberos=True,
+            allow_ntlm_fallback=True,
+            operation_name=operation_name or f"group RID {rid_value} DN lookup",
+        )
+        if group_dns is None:
+            return None
 
     member_filters = [f"(primaryGroupID={rid_value})"]
     for group_dn in group_dns:

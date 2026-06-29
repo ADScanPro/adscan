@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Protocol, Literal
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import ipaddress
 import os
@@ -32,6 +32,10 @@ from adscan_internal.rich_output import (
     print_warning,
 )
 from adscan_internal.services._kerberos_spn import is_ip_address
+from adscan_internal.services.dc_confidence import (
+    DcConfidence,
+    score_dc_confidence,
+)
 from adscan_internal.services.network_discovery import (
     extract_netbios,
     infer_domain_from_ldap_banner,
@@ -442,12 +446,82 @@ class CandidateIpFingerprintEvidence:
 
 @dataclass(frozen=True)
 class CandidateDcPortEvidence:
-    """Best-effort AD/DC port evidence gathered for a candidate IP."""
+    """Best-effort AD/DC port evidence gathered for a candidate IP.
+
+    ``dc_likely`` is retained as a coarse boolean for existing callers, but it
+    is now derived from the scored DC-confidence SSOT
+    (``services.dc_confidence``): ``dc_likely`` is True exactly when the port
+    signals reach the ``>= LIKELY`` tier. Use :meth:`confidence` for the full
+    graded tier.
+    """
 
     ip: str
     open_tcp_ports: tuple[int, ...]
     dc_likely: bool
     source: str
+
+    def confidence(self) -> DcConfidence:
+        """Return the scored DC-confidence tier for the observed open ports."""
+        return score_dc_confidence(self.open_tcp_ports)
+
+
+def _port_evidence_dc_likely(open_ports: Iterable[int] | None) -> bool:
+    """Whether the observed open ports reach the DC-action (``>= LIKELY``) tier.
+
+    Single point that replaces the historical lax
+    ``389 in ports and (53 or 88)`` boolean with the scored SSOT in
+    ``services.dc_confidence``. Keeps the same coarse ``dc_likely`` contract
+    every existing caller depends on while making the underlying decision the
+    tiered model.
+    """
+    return score_dc_confidence(open_ports).is_dc_like
+
+
+# Transient per-session cache of the strongest AD-port observation seen for each
+# candidate IP. Lives on the shell (never in ``domains_data`` — it holds a set
+# of ports and must not reach ``save_workspace_data()``). A non-root nmap
+# connect-scan is flaky: it intermittently reports "no open ports" or "only 445"
+# for a host that earlier exposed 389/445. Unioning each round's observation
+# against this cache keeps the best-effort continuation offer alive across a
+# later flaky re-scan instead of dropping it on a single bad round.
+_CANDIDATE_PORT_CACHE_ATTR = "_dns_candidate_dc_port_cache"
+
+
+def _candidate_port_cache(shell: Any) -> dict[str, set[int]]:
+    """Return (creating if needed) the per-session candidate-IP port cache."""
+    cache = getattr(shell, _CANDIDATE_PORT_CACHE_ATTR, None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(shell, _CANDIDATE_PORT_CACHE_ATTR, cache)
+        except Exception:  # noqa: BLE001 — best-effort; shell may reject attrs
+            return {}
+    return cache
+
+
+def _accumulate_candidate_ports(
+    shell: Any,
+    *,
+    candidate_ip: str,
+    observed_ports: set[int] | tuple[int, ...] | list[int] | None,
+) -> tuple[int, ...]:
+    """Union this round's observed ports into the per-IP cache and return them.
+
+    The cumulative union is what callers should classify against — a host that
+    exposed 389/445 in an earlier round must not lose its DC classification on a
+    later flaky nmap pass that returns fewer (or no) ports.
+    """
+    ip_clean = (candidate_ip or "").strip()
+    if not ip_clean:
+        return tuple(sorted({int(p) for p in (observed_ports or [])}))
+    cache = _candidate_port_cache(shell)
+    bucket = cache.setdefault(ip_clean, set())
+    for port in observed_ports or []:
+        try:
+            bucket.add(int(port))
+        except (TypeError, ValueError):
+            continue
+    return tuple(sorted(bucket))
 
 
 @dataclass(frozen=True)
@@ -475,11 +549,21 @@ def _host_looks_like_dc_candidate(
     fingerprint_evidence: CandidateIpFingerprintEvidence | None,
     port_evidence: CandidateDcPortEvidence | None,
 ) -> bool:
-    """Return True when the overall evidence supports a DC-like classification."""
-    return bool(
-        (port_evidence and port_evidence.dc_likely)
-        or _fingerprint_is_strong_dc_signal(fingerprint_evidence)
-    )
+    """Return True when the overall evidence supports a DC-like classification.
+
+    This is the strong "offer DC actions / proceed best-effort against the DC"
+    gate. It fires when EITHER:
+
+    * the observed AD ports reach the scored ``>= LIKELY`` tier
+      (``services.dc_confidence``) — replacing the old lax
+      ``one-open-port`` / ``389 + (53 or 88)`` boolean; or
+    * a strong SMB/LDAP/hosts fingerprint already identified the host as a DC
+      (the ``4554eb40`` recovery path — a flaky nmap round must not suppress a
+      continuation offer when ADscan has already fingerprinted the DC).
+    """
+    if port_evidence is not None and port_evidence.confidence().is_dc_like:
+        return True
+    return _fingerprint_is_strong_dc_signal(fingerprint_evidence)
 
 
 def _host_looks_like_dns_candidate(
@@ -528,7 +612,7 @@ def _candidate_dc_port_evidence_from_open_ports(
             dc_likely=False,
             source=source,
         )
-    dc_likely = 389 in normalized_ports and (53 in normalized_ports or 88 in normalized_ports)
+    dc_likely = _port_evidence_dc_likely(normalized_ports)
     return CandidateDcPortEvidence(
         ip=ip_clean,
         open_tcp_ports=normalized_ports,
@@ -722,15 +806,21 @@ def _probe_dc_candidate_ports(
         return None
 
     if known_open_tcp_ports is not None:
+        union_ports = _accumulate_candidate_ports(
+            shell,
+            candidate_ip=ip_clean,
+            observed_ports=known_open_tcp_ports,
+        )
         evidence = _candidate_dc_port_evidence_from_open_ports(
             candidate_ip=ip_clean,
-            open_tcp_ports=known_open_tcp_ports,
+            open_tcp_ports=union_ports,
             source="nmap_cached",
         )
         if evidence is not None:
             print_info_debug(
                 f"[pdc_preflight] cached DC probe for {mark_sensitive(ip_clean, 'ip')}: "
-                f"open_ports={evidence.open_tcp_ports}, dc_likely={evidence.dc_likely}"
+                f"open_ports={evidence.open_tcp_ports}, dc_likely={evidence.dc_likely} "
+                "(cumulative)"
             )
         return evidence
 
@@ -754,11 +844,15 @@ def _probe_dc_candidate_ports(
             except OSError:
                 pass
 
-        open_ports = tuple(sorted(port_map.get(ip_clean, set())))
-        dc_likely = 389 in open_ports and (53 in open_ports or 88 in open_ports)
+        open_ports = _accumulate_candidate_ports(
+            shell,
+            candidate_ip=ip_clean,
+            observed_ports=port_map.get(ip_clean, set()),
+        )
+        dc_likely = _port_evidence_dc_likely(open_ports)
         print_info_debug(
             f"[pdc_preflight] nmap DC probe for {marked_ip}: "
-            f"open_ports={open_ports}, dc_likely={dc_likely}"
+            f"open_ports={open_ports}, dc_likely={dc_likely} (cumulative)"
         )
         return CandidateDcPortEvidence(
             ip=ip_clean,
@@ -779,11 +873,15 @@ def _probe_dc_candidate_ports(
             expected_interface=getattr(shell, "interface", None),
             tcp_ports=(53, 88, 389, 445),
         )
-        open_ports = tuple(sorted(reachability.open_ports))
-        dc_likely = 389 in open_ports and (53 in open_ports or 88 in open_ports)
+        open_ports = _accumulate_candidate_ports(
+            shell,
+            candidate_ip=ip_clean,
+            observed_ports=reachability.open_ports,
+        )
+        dc_likely = _port_evidence_dc_likely(open_ports)
         print_info_debug(
             f"[pdc_preflight] socket DC probe for {marked_ip}: "
-            f"open_ports={open_ports}, dc_likely={dc_likely}"
+            f"open_ports={open_ports}, dc_likely={dc_likely} (cumulative)"
         )
         return CandidateDcPortEvidence(
             ip=ip_clean,
@@ -1369,7 +1467,12 @@ def preflight_domain_pdc_noninteractive(
             action="use",
             domain=domain,
             pdc_ip=candidate_ip,
-            best_effort=bool(port_evidence and port_evidence.dc_likely),
+            # A strong SMB/LDAP fingerprint is sufficient to proceed best-effort
+            # against the known DC IP — do not gate solely on a flaky nmap round.
+            best_effort=_host_looks_like_dc_candidate(
+                fingerprint_evidence=fingerprint_evidence,
+                port_evidence=port_evidence,
+            ),
             pdc_hostname=_normalize_hostname_label(
                 fingerprint_evidence.hostname if fingerprint_evidence else None
             ),
@@ -1516,9 +1619,13 @@ def preflight_domain_pdc_interactive(
             fingerprint_evidence=fingerprint_evidence,
             port_evidence=port_evidence,
         )
+        looks_like_dc = _host_looks_like_dc_candidate(
+            fingerprint_evidence=fingerprint_evidence,
+            port_evidence=port_evidence,
+        )
         best_effort_policy = (
             _build_best_effort_prompt_policy(shell, candidate_ip=candidate_ip)
-            if port_evidence and port_evidence.dc_likely
+            if looks_like_dc
             else None
         )
         if best_effort_policy is not None:
@@ -1592,7 +1699,7 @@ def preflight_domain_pdc_interactive(
                 candidate_ip=candidate_ip,
                 mode_label=mode_label,
             )
-        if port_evidence and port_evidence.dc_likely and best_effort_policy is not None:
+        if looks_like_dc and best_effort_policy is not None:
             if best_effort_policy.show_risk_panel:
                 print_panel(
                     "[bold yellow]This workspace is configured as an audit.[/bold yellow]\n\n"
@@ -1601,8 +1708,11 @@ def preflight_domain_pdc_interactive(
                     border_style="yellow",
                     padding=(1, 2),
                 )
-            if Confirm.ask(
-                Text(best_effort_policy.prompt, style="cyan"),
+            # Route through the centralized prompt helper so the offer stays
+            # non-interactive-safe (auto-resolves to the policy default on EOF /
+            # in `adscan ci`) instead of hanging on a raw Confirm.ask.
+            if confirm_ask(
+                best_effort_policy.prompt,
                 default=best_effort_policy.default,
             ):
                 telemetry.capture(
@@ -1610,7 +1720,9 @@ def preflight_domain_pdc_interactive(
                     properties={
                         "mode": mode_label,
                         "action": "use_best_effort_dc",
-                        "dc_probe_source": port_evidence.source,
+                        "dc_probe_source": (
+                            port_evidence.source if port_evidence else "fingerprint"
+                        ),
                         "workspace_type": str(getattr(shell, "type", "") or "").strip().lower(),
                     },
                 )

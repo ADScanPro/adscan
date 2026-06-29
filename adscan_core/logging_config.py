@@ -15,11 +15,60 @@ import subprocess
 import shutil
 from typing import Optional
 
-from rich.console import Console
+from rich.console import Console, ConsoleRenderable
 from rich.logging import RichHandler
+from rich.markup import MarkupError
+from rich.text import Text
 
 from adscan_core.path_utils import expand_effective_user_path, get_adscan_home
 from adscan_core.sensitive import strip_sensitive_markers
+
+
+class MarkupSafeRichHandler(RichHandler):
+    """``RichHandler`` whose markup parse can never crash a ``logger.*`` call.
+
+    The stock ``RichHandler.render_message`` calls ``Text.from_markup(message)``
+    when markup is enabled. If ``message`` contains brackets that are NOT valid
+    Rich markup — an absolute path (``[/opt/...]`` reads as a closing tag), an
+    exception string with a bracketed token, or a sanitizer that corrupted a
+    closing tag (``[/bold]`` -> ``[/sozf]``, the 1adb425f regression) — that
+    raises ``rich.errors.MarkupError`` which propagates UNCAUGHT out of
+    ``logger.info``/``debug`` and crashes the whole command.
+
+    This subclass overrides only the markup-parse step: on ``MarkupError`` it
+    falls back to a LITERAL ``Text(message)`` (brackets rendered verbatim) and
+    continues with the normal highlighter / keyword pass. No logging path can
+    crash on malformed markup again, regardless of where the bad markup came
+    from. This is the durable, source-independent guarantee — complementary to
+    (not a replacement for) sanitizing PLAIN text in
+    ``TelemetrySanitizingFormatter``.
+    """
+
+    def render_message(
+        self, record: logging.LogRecord, message: str
+    ) -> ConsoleRenderable:
+        use_markup = getattr(record, "markup", self.markup)
+        if use_markup:
+            try:
+                message_text = Text.from_markup(message)
+            except MarkupError:
+                # Brackets were not valid markup — render literally instead of
+                # letting the MarkupError escape and crash the command.
+                message_text = Text(message)
+        else:
+            message_text = Text(message)
+
+        highlighter = getattr(record, "highlighter", self.highlighter)
+        if highlighter:
+            message_text = highlighter(message_text)
+
+        if self.keywords is None:
+            self.keywords = self.KEYWORDS
+
+        if self.keywords:
+            message_text.highlight_words(self.keywords, "logging.keyword")
+
+        return message_text
 
 
 # Global logger instance (initialized by init_logging)
@@ -38,6 +87,64 @@ class MarkerStrippingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         rendered = super().format(record)
         return strip_sensitive_markers(rendered)
+
+
+class TelemetrySanitizingFormatter(logging.Formatter):
+    """Formatter that sanitizes a record's message before it reaches telemetry.
+
+    The telemetry console buffer is sanitized once more at export time
+    (``telemetry._sanitize_rich_output`` over the whole buffer), but that
+    pass runs AFTER Rich has laid the message out for the console. Rich's
+    layout (word wrapping at the console width) can inject newlines into the
+    middle of a marked value, and can move the invisible zero-width markers
+    away from the value they wrap — so the marker pass at export time may no
+    longer see an intact ``<start>value<end>`` triplet. ``print_info_debug``
+    routes through ``logger.debug`` → ``RichHandler``, so a ``mark_sensitive``
+    value on a debug line is exposed to exactly that layout step.
+
+    This formatter closes the gap by sanitizing the message string at FORMAT
+    time — before ``RichHandler`` renders it to the telemetry console — while
+    the markers are still glued to their value. It reuses the single export
+    sanitizer (marker pass + keyword pass), so there is no parallel
+    sanitization logic. The VISIBLE console uses a different handler
+    (``_console_handler``) with no sanitizing formatter, so the operator still
+    sees cleartext (the markers are invisible on screen).
+
+    Critical: the message string may contain Rich MARKUP tags
+    (``[bold]...[/bold]``), and ``_sanitize_rich_output`` is designed for
+    POST-render PLAIN text. Running it on a markup string CORRUPTS the closing
+    tags — the ``/bold`` fragment inside ``[/bold]`` is pseudonymized as if it
+    were a path (``[/sozf]``), and when the telemetry ``RichHandler`` re-parses
+    that broken markup it raises ``rich.errors.MarkupError`` which propagates
+    uncaught through ``logger.info`` and crashes the whole command. So we first
+    resolve the markup to PLAIN text (``_safe_markup_text(...).plain`` — the
+    crash-safe parser that never raises on bad markup), THEN sanitize the plain
+    text. Sanitizing plain text cannot corrupt markup tags because there are
+    none. The telemetry handler also runs with ``markup=False`` (defense in
+    depth), so a stray ``[`` in a sanitized value or path can never crash it.
+
+    Fail-closed: if the telemetry sanitizer cannot be imported/run, fall back
+    to stripping the markers so a marked value is never emitted raw.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        try:
+            from adscan_core import telemetry
+            from adscan_core.output._log import _safe_markup_text
+
+            # Resolve any Rich markup to PLAIN text BEFORE sanitizing. The
+            # sanitizer is a plain-text transform; handing it a markup string
+            # corrupts the closing tags (e.g. [/bold] -> [/sozf]) which then
+            # crashes the markup re-parse. _safe_markup_text never raises on
+            # bad markup.
+            plain = _safe_markup_text(rendered).plain
+            return telemetry._sanitize_rich_output(plain)
+        except Exception:
+            # Never let a sanitization failure leak a marked value: strip the
+            # markers as the conservative fallback (matches the file-handler
+            # formatter behaviour).
+            return strip_sensitive_markers(rendered)
 
 
 def _diag_enabled() -> bool:
@@ -365,8 +472,11 @@ def init_logging(
         _workspace_file_handler = None
         _workspace_debug_file_handler = None
 
-    # Console handler (Rich, conditional based on verbose/debug mode)
-    console_handler = RichHandler(
+    # Console handler (Rich, conditional based on verbose/debug mode).
+    # MarkupSafeRichHandler: malformed markup (a bracketed path / exception
+    # token reaching logger.* with markup=True) renders literally instead of
+    # raising a MarkupError that would crash the command.
+    console_handler = MarkupSafeRichHandler(
         rich_tracebacks=True,
         show_path=bool(debug_mode or secret_mode),
         console=console,
@@ -478,14 +588,27 @@ def init_logging(
                 except Exception:
                     pass
 
-        telemetry_handler = RichHandler(
+        telemetry_handler = MarkupSafeRichHandler(
             rich_tracebacks=True,
             show_path=False,
             console=telemetry_console,
             show_time=False,
-            markup=True,
+            # markup=False (defense in depth): TelemetrySanitizingFormatter
+            # already resolves markup to plain text and sanitizes it, so the
+            # handler receives a plain string with no intentional markup. With
+            # markup=False, a stray '[' surviving in a sanitized value or path
+            # can never be parsed as a Rich tag and crash emit() with a
+            # MarkupError (the regression from 1adb425f). The VISIBLE console
+            # handler keeps markup=True so the operator still sees styling.
+            markup=False,
         )
         telemetry_handler.setLevel(logging.DEBUG)
+        # Sanitize the message at FORMAT time (before Rich's console layout can
+        # split a marked value across a wrap boundary or displace its invisible
+        # markers). This protects mark_sensitive values on print_info_debug
+        # lines, which route through logger.debug -> this RichHandler. The
+        # whole-buffer export sanitizer still runs as the second layer.
+        telemetry_handler.setFormatter(TelemetrySanitizingFormatter())
         logger.addHandler(telemetry_handler)
         _telemetry_console_handler = telemetry_handler
 

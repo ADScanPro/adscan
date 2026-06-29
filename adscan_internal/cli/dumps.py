@@ -1612,6 +1612,7 @@ def _persist_bulk_sam_local_credentials(
                 verify_local_credential=False,
                 prompt_local_reuse_after=False,
                 ui_silent=True,
+                credential_origin="sam_dump",
             )
             return
         except TypeError:
@@ -1630,6 +1631,7 @@ def _persist_bulk_sam_local_credentials(
             prompt_local_reuse_after=False,
             ui_silent=True,
             ensure_fresh_kerberos_ticket=False,
+            credential_origin="sam_dump",
         )
 
 
@@ -4472,6 +4474,7 @@ async def _run_native_local_admin_reuse_check_async(
                     verify_local_credential=False,
                     prompt_local_reuse_after=False,
                     ui_silent=True,
+                    credential_origin="credential_reuse",
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
@@ -4645,6 +4648,9 @@ def _native_execute_dump_sam(
         domain=domain, dump_kind="SAM", host=host, auth_username=auth_username
     )
     add_kwargs: dict[str, Any] = {"source_steps": source_steps} if source_steps else {}
+    # Tag every SAM-extracted local account so the Compromised Credentials views
+    # attribute it to the SAM dump rather than rendering an empty method.
+    add_kwargs["credential_origin"] = "sam_dump"
     for cred in result.credentials:
         nt_hash_clean = str(getattr(cred, "nt_hash", "") or "").strip().lower()
         if nt_hash_clean == _EMPTY_NTLM_HASH:

@@ -70,7 +70,12 @@ from adscan_core.theme import (
 )
 from adscan_core.tui.live_session import LiveSession, LiveSessionConfig
 
-__all__ = ["ProgressDashboard", "ProgressDashboardConfig", "format_eta"]
+__all__ = [
+    "ProgressDashboard",
+    "ProgressDashboardConfig",
+    "ProgressEstimator",
+    "format_eta",
+]
 
 # Braille spinner frames — the modern default per tui-design § 5.
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -98,6 +103,82 @@ def format_eta(seconds: Optional[float]) -> str:
     hours = secs // 3600
     minutes = (secs % 3600) // 60
     return f"{hours}h {minutes}m"
+
+
+class ProgressEstimator:
+    """Throughput / ETA estimator shared by the CLI dashboard and the web events.
+
+    The CLI ``ProgressDashboard`` computes ``rate`` (items/sec), ``eta_seconds``
+    and ``elapsed`` from a construction timestamp and a cumulative ``done`` count.
+    The web "current operation" strip wants the SAME three numbers on the
+    ``operation_progress`` event so the platform matches the CLI rich.live view.
+
+    Rather than fork a second estimator, this is the small computation lifted out
+    of the dashboard. Call sites that already drive a :class:`ProgressDashboard`
+    read its ``rate`` / ``eta_seconds`` / ``elapsed`` properties directly. Call
+    sites that only have a cumulative ``(current, total)`` stream over wall-clock
+    (the share collector, the share-enumeration host loop) keep one of these and
+    call :meth:`observe` per tick. Both produce identical numbers because they
+    share these exact formulas.
+
+    ``elapsed`` is wall-clock since construction. ``rate`` is ``done / elapsed``
+    (0.0 before any time has elapsed or any item is done). ``eta_seconds`` is
+    ``remaining / rate`` and is ``None`` when the total is unknown or no
+    forward motion exists yet — the estimator NEVER fabricates an ETA for an
+    indeterminate run.
+    """
+
+    def __init__(self, *, _clock: Callable[[], float] = time.monotonic) -> None:
+        """Initialise the estimator.
+
+        Args:
+            _clock: Injected monotonic clock (tests pass a deterministic one).
+        """
+        self._clock = _clock
+        self._start = _clock()
+        self._current = 0
+        self._total: Optional[int] = None
+        self._elapsed = 0.0
+
+    def observe(self, current: int, total: Optional[int] = None) -> None:
+        """Record the latest cumulative count (and optional total) and snapshot time.
+
+        Args:
+            current: Cumulative items completed so far (NOT a delta).
+            total: Known total, or ``None`` for an indeterminate run.
+        """
+        self._current = max(0, int(current))
+        if total is not None:
+            self._total = max(0, int(total))
+        self._elapsed = max(0.0, self._clock() - self._start)
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """Wall-clock seconds since construction (snapshot at the last observe)."""
+        return self._elapsed
+
+    @property
+    def rate(self) -> float:
+        """Throughput in items/second (0.0 before any progress)."""
+        if self._elapsed <= 0 or self._current <= 0:
+            return 0.0
+        return self._current / self._elapsed
+
+    @property
+    def eta_seconds(self) -> Optional[float]:
+        """Estimated seconds remaining, or ``None`` when indeterminate.
+
+        Returns ``None`` when the total is unknown / non-positive or no forward
+        rate exists yet — an indeterminate run must not show a fabricated ETA.
+        """
+        total = self._total
+        if total is None or total <= 0:
+            return None
+        rate = self.rate
+        if rate <= 0:
+            return None
+        remaining = max(0, total - self._current)
+        return remaining / rate
 
 
 @dataclass(frozen=True)
@@ -244,10 +325,16 @@ class ProgressDashboard:
 
     @property
     def eta_seconds(self) -> Optional[float]:
-        """Estimated seconds remaining, or ``None`` in indeterminate mode."""
+        """Estimated seconds remaining, or ``None`` in indeterminate mode.
+
+        In indeterminate mode (no ``total``) this returns the tool's own
+        externally reported remaining time when one has been fed via
+        :meth:`set_reported_progress` (e.g. Nmap's ``ETC``), so a subprocess op
+        that reports its own ETA still exposes one to callers (the web event).
+        """
         total = self._config.total
         if total is None or total <= 0:
-            return None
+            return self._reported_eta_seconds
         rate = self.rate
         if rate <= 0:
             return None

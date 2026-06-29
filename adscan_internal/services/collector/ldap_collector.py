@@ -11,6 +11,7 @@ from adscan_internal import telemetry
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_info_debug,
+    print_warning,
     print_warning_debug,
 )
 from adscan_internal.services.collector.acl_parser import ACLParser
@@ -855,6 +856,9 @@ class ADscanLDAPCollector:
         # Set per-call so phase helpers can consult scope without changing
         # their signatures. None outside an active collect() call.
         self._active_scope: LDAPCollectionScope | None = None
+        # Diagnostic breadcrumb: which sub-collection is in flight (sizes/counts
+        # only). Set per-phase in the connection-scoped block; None when idle.
+        self._active_phase: str | None = None
 
     def collect(
         self,
@@ -955,16 +959,23 @@ class ADscanLDAPCollector:
             f"acls={scope.acls} memberships={scope.group_memberships}"
         )
         self._active_scope = scope
+        # Diagnostic breadcrumb (bracket-free). Records which sub-collection is
+        # in flight so any 'Connection closed!' caught below (or in a per-phase
+        # handler) can report the exact phase that died over the sealed channel.
+        self._active_phase = None
         sealing_mechanism: object | None = None
         try:
             with ADscanLDAPConnection(config) as conn:
                 acl_parser = ACLParser(domain=credentials.domain, connection=conn)
                 if scope.domain_node:
+                    self._active_phase = "domain_node"
                     self._collect_domain_node(conn, config, result, acl_parser)
                 if scope.domain_policy:
+                    self._active_phase = "domain_policy"
                     self._collect_domain_policy(conn, config, result)
                     self._collect_psos(conn, config, result)
                 if scope.collects_objects:
+                    self._active_phase = "objects_acls"
                     self._collect_objects(conn, config, result, acl_parser)
                     # Tombstoned (AD Recycle Bin) accounts: a deleted object with a
                     # writable ACE is a restore→foothold path neither this collector
@@ -973,14 +984,19 @@ class ADscanLDAPCollector:
                     # GenericWrite/GenericAll edge, with the node flagged tombstoned —
                     # the execution layer then restores it first (mirrors enable-first).
                     if scope.acls:
+                        self._active_phase = "deleted_objects_acls"
                         self._collect_deleted_objects(conn, config, result, acl_parser)
                 if scope.group_memberships:
+                    self._active_phase = "group_memberships"
                     self._collect_group_memberships(conn, config, result)
                 if scope.gpo_links:
+                    self._active_phase = "gpo_links"
                     self._collect_gpo_links(conn, config, result)
                 if scope.trusts:
+                    self._active_phase = "trusts"
                     self._collect_trusts(conn, config, result)
                 if scope.adcs:
+                    self._active_phase = "adcs"
                     _adcs_t = time.monotonic()
                     self._collect_adcs(conn, credentials.domain, acl_parser, result)
                     result.adcs_elapsed = time.monotonic() - _adcs_t
@@ -990,9 +1006,40 @@ class ADscanLDAPCollector:
                 sealing_mechanism = conn.mechanism
         except Exception as exc:
             telemetry.capture_exception(exc)
-            print_warning_debug(f"[ldap-collector] collection failed: {exc}")
+            from adscan_internal.services.auth_error_classification import (
+                is_unreachable_foreign_realm_error,
+            )
+
+            # A foreign/trust realm we cannot authenticate to (cross-forest
+            # AES-only KDC, no shared trust key) is not a collector bug — it is
+            # an out-of-reach domain. Surface ONE clean operator line (the
+            # transport already collapsed the raw asn1/Kerberos traceback into a
+            # typed ForeignRealmUnreachableError); everything else stays a debug
+            # log so a default run is not noisy.
+            if is_unreachable_foreign_realm_error(exc):
+                print_warning(
+                    "Skipped "
+                    f"{mark_sensitive(credentials.domain, 'domain')}: not reachable "
+                    "with the current credential (cross-realm Kerberos auth "
+                    "unavailable)."
+                )
+            else:
+                # Diagnostic (bracket-free). When the whole connection-scoped
+                # block aborts, report which phase was in flight and the sealing
+                # mechanism so a 'Connection closed!' here is attributable to the
+                # sealed ACL/security-descriptor read rather than something else.
+                print_info_debug(
+                    "ldap-collector-seal: connection-scoped collection aborted "
+                    f"phase={self._active_phase} "
+                    f"sealing_mechanism={sealing_mechanism} "
+                    f"nodes_so_far={len(result.nodes)} "
+                    f"edges_so_far={len(result.edges)} "
+                    f"error_type={type(exc).__name__}"
+                )
+                print_warning_debug(f"[ldap-collector] collection failed: {exc}")
         finally:
             self._active_scope = None
+            self._active_phase = None
         self._maybe_advise_cleartext(credentials, config, sealing_mechanism)
         print_info_debug(
             "[ldap-collector] done "
@@ -1355,6 +1402,20 @@ class ADscanLDAPCollector:
         ldap_filter = scope.object_class_filter()
         if not ldap_filter:
             return
+        # Diagnostic (bracket-free marker; sizes/counts/mechanism only). This is
+        # the paged search that reads nTSecurityDescriptor (ACL) blobs when
+        # scope.acls is True — the large-binary read most likely to be cut by a
+        # SASL sign/seal channel close. Logs which sub-collection is in flight,
+        # the page size, whether the SD_FLAGS (ACL) control is attached, and the
+        # confidentiality mechanism that sealed the channel.
+        print_info_debug(
+            "ldap-collector-seal: starting paged objects search "
+            f"phase={self._active_phase} sub=objects acls={scope.acls} "
+            f"paged_size={config.paged_size} "
+            f"attrs={len(_COLLECT_ATTRS)} "
+            f"sd_flags_control={bool(scope.acls)} "
+            f"sealing_mechanism={getattr(conn, 'mechanism', None)}"
+        )
         try:
             conn.search(
                 search_base=config.domain_dn,
@@ -1365,6 +1426,19 @@ class ADscanLDAPCollector:
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
+            # Diagnostic (bracket-free). When this fires with a 'Connection
+            # closed!' exc on a sealed channel, cross-reference the badldap
+            # 'ldap-conn-closed:' debug line (recv_buffer_pending / mid_response)
+            # to tell a mid-response cut (large sealed nTSecurityDescriptor read)
+            # apart from a clean post-message close. objects_received is how many
+            # entries were already collected before the close.
+            print_info_debug(
+                "ldap-collector-seal: paged objects search ended with error "
+                f"phase={self._active_phase} acls={scope.acls} "
+                f"sealing_mechanism={getattr(conn, 'mechanism', None)} "
+                f"objects_received={len(conn.entries)} "
+                f"error_type={type(exc).__name__}"
+            )
             print_warning_debug(
                 f"[ldap-collector] _collect_objects search failed: {exc}"
             )

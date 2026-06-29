@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
+from adscan_core.native_secret_scrub import scrub_native_secrets
+
 ExecutionResult = subprocess.CompletedProcess[str]
 
 
@@ -23,10 +25,24 @@ class CommandSpec:
 
 
 def _extract_non_empty_lines(text: str | None) -> list[str]:
-    """Return non-empty output lines from stdout/stderr text."""
+    """Return non-empty output lines from stdout/stderr text.
+
+    Belt-and-suspenders secret hygiene: every preview line is routed through the
+    native-secret scrubber (the SSOT in :mod:`adscan_core.native_secret_scrub`)
+    before it can reach a recorded ``print_*`` call. This guarantees that even an
+    unforeseen secret-bearing token in command output — e.g. an rclone backend
+    connection string echoed in STDERR with a reversible ``pass=<obscured>`` blob
+    — is redacted at the preview boundary. Scrubbing is best-effort and never
+    raises; it does not change the line COUNT, so execution summaries are
+    unaffected.
+    """
     if not text:
         return []
-    return [line for line in text.splitlines() if line.strip()]
+    return [
+        scrub_native_secrets(line)
+        for line in text.splitlines()
+        if line.strip()
+    ]
 
 
 def _coerce_timeout_output_text(output: str | bytes | None) -> str:

@@ -160,6 +160,11 @@ class DockerRunConfig:
     # Extra environment variables to pass into the container via `-e KEY=VALUE`.
     # This is preferred over mutating `os.environ` at call sites.
     extra_env: tuple[tuple[str, str], ...] = ()
+    # Extra read-only host file bind-mounts as ``(host_path, container_path)``
+    # pairs, rendered as ``-v <host>:<container>:ro``. Used to expose a host
+    # file the container must read but that lives outside the standard mounted
+    # tree (e.g. a ``--scan-config`` file passed by absolute path).
+    extra_mounts: tuple[tuple[str, str], ...] = ()
     # Host directory bind-mounted into the container at /run/adscan. When
     # None, defaults to ``workspaces_host_dir.parent / "run"`` for backwards
     # compatibility. Per-launcher session directories live under
@@ -991,6 +996,15 @@ def build_adscan_run_command(
                 )
         except OSError:
             continue
+
+    # Extra read-only host file mounts (e.g. a --scan-config file passed by
+    # absolute path that lives outside the standard mounted tree).
+    for host_path, container_path in cfg.extra_mounts:
+        if host_path and container_path:
+            cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
+            print_info_debug(
+                f"[docker] mounting host file read-only: {host_path} -> {container_path}"
+            )
 
     # Default to running as the current user to avoid root-owned files in the host mount.
     if cfg.run_as_current_user:

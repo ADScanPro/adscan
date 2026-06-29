@@ -28,7 +28,6 @@ from adscan_internal.rich_output import (
     print_warning,
     print_warning_debug,
 )
-from adscan_internal.cli.ci_events import emit_phase
 from adscan_internal.cli.dns import (
     confirm_domain_pdc_mapping,
     finalize_domain_context,
@@ -230,6 +229,25 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
     This is a CLI orchestration helper extracted from the legacy shell to keep
     `adscan.py` slimmer. It expects PRO checks to have been done by the caller.
     """
+    # Honor the scan-config trust-enumeration policy. ``skip`` short-circuits
+    # before any DC contact; ``selected`` constrains the recursive BFS to the
+    # listed partner domains; ``all`` / ``interactive`` (default) run the full
+    # enumeration exactly as before. Absent config = interactive = unchanged.
+    from adscan_internal.services.scan_config import (
+        TRUST_POLICY_SELECTED,
+        TRUST_POLICY_SKIP,
+    )
+
+    scan_config = getattr(shell, "scan_config", None)
+    trust_cfg = getattr(scan_config, "trust_enumeration", None)
+    trust_policy = getattr(trust_cfg, "policy", None)
+    trust_allowlist: set[str] | None = None
+    if trust_policy == TRUST_POLICY_SKIP:
+        print_info("Trust enumeration skipped (disabled in scan configuration).")
+        return
+    if trust_policy == TRUST_POLICY_SELECTED:
+        trust_allowlist = {d.strip().lower() for d in getattr(trust_cfg, "domains", ())}
+
     if (
         domain not in shell.domains_data
         or "pdc" not in shell.domains_data[domain]
@@ -266,9 +284,12 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
         auth_domain = str(domain_state.get("auth_domain") or domain)
         auth_kdc = str(domain_state.get("auth_kdc") or pdc)
 
-        emit_phase("trust_enumeration")
         # Surface this as a top-level chapter so it shares the numbered
         # phase strip with Domain Collection and the analysis pipeline.
+        # ``emit_chapter`` below fires the canonical ``topology_and_trusts``
+        # phase event for both the CLI strip and the web — no separate
+        # ``emit_phase`` (which previously used the drifted ``trust_enumeration``
+        # id) is needed.
         # The timeline span is opened here and closed in the function-level
         # finally so the row is written even on the error path.
         try:
@@ -437,6 +458,7 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
                 progress_cb=live_view.on_event,
                 posture_sink=posture_sink,
                 posture_snapshot=posture_snapshot,
+                allowed_partner_domains=trust_allowlist,
             )
 
         # Premium summary card.
@@ -1253,16 +1275,51 @@ def _handle_trust_enumeration_result(
             for main_domain in phase1_needed:
                 shell.do_enum_domain_auth_phase1(main_domain)
 
-            if len(phase2_all) > 1:
-                # Phase 2 build-only for all: populate every attack_graph.json
-                # before computing paths so multi-hop cross-domain edges are present.
-                for main_domain in phase2_all:
-                    run_attack_path_discovery(shell, main_domain, build_only=True)
-                # Single merged cross-domain path display.
-                run_cross_domain_attack_path_discovery(shell, phase2_all)
-            else:
-                # Single domain — build + display in one pass (no merge needed).
-                run_attack_path_discovery(shell, phase2_all[0])
+            # Announce the Attack Paths Discovery phase transition through the
+            # canonical SSOT, exactly like ``domain_collection`` does in
+            # ``ldap.py``. The per-domain Phase-1 calls above stop at
+            # ``domain_analysis`` (``stop_after_phase=1``), and this multi-domain
+            # pivot computes attack paths OUTSIDE ``run_enumeration`` — so without
+            # this emit the worker's ``current_phase`` would freeze at
+            # ``domain_analysis`` even though paths are computed and ingested.
+            # Emit ONCE here (not per-domain) covering both the merged
+            # cross-domain pass and the single selected-domain pass; the silent
+            # ``build_only=True`` graph builds run inside the same span so its
+            # delta footer reflects the discovery output.
+            _ap_phase_cm = None
+            try:
+                from adscan_internal.services.scan_phases import emit_chapter
+                from adscan_internal.services.scan_timeline import phase_span
+
+                _scan_type = getattr(shell, "type", "default")
+                emit_chapter("attack_paths_discovery", scan_type=_scan_type)
+                _ap_phase_cm = phase_span(
+                    shell,
+                    domain,
+                    phase_id="attack_paths_discovery",
+                    phase_title="Attack Paths Discovery",
+                )
+                _ap_phase_cm.__enter__()
+            except Exception:  # noqa: BLE001 — telemetry must never block discovery
+                _ap_phase_cm = None
+
+            try:
+                if len(phase2_all) > 1:
+                    # Phase 2 build-only for all: populate every attack_graph.json
+                    # before computing paths so multi-hop cross-domain edges are present.
+                    for main_domain in phase2_all:
+                        run_attack_path_discovery(shell, main_domain, build_only=True)
+                    # Single merged cross-domain path display.
+                    run_cross_domain_attack_path_discovery(shell, phase2_all)
+                else:
+                    # Single domain — build + display in one pass (no merge needed).
+                    run_attack_path_discovery(shell, phase2_all[0])
+            finally:
+                if _ap_phase_cm is not None:
+                    try:
+                        _ap_phase_cm.__exit__(None, None, None)
+                    except Exception:  # noqa: BLE001 — telemetry must never block
+                        pass
 
             # Phase 3+: only for new domains (credential spraying, share scan, etc.)
             # Already-enumerated domains completed these phases before the pivot.

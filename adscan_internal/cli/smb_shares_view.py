@@ -43,6 +43,7 @@ from adscan_core.output import (
     create_styled_table,
     operation_timer,
     print_empty_state,
+    print_info_debug,
     print_operation_header,
     print_operation_summary_footer,
     print_remediation_card,
@@ -197,6 +198,10 @@ def run_native_shares_view(
     view_set = compose_share_views(host=target_host, live=live, graph=graph)
     if resolved_mode == SharesViewMode.DELTA:
         view_set = _filter_delta(view_set)
+    # Carry the live-probe error out to multi-host sweep callers so the shared
+    # SweepLockoutGuard can abort on a locked-out / rejected credential instead
+    # of re-asserting the lockout against every remaining host.
+    view_set.live_error = error_during_live
 
     # ── 3. Render the result table ─────────────────────────────────────────
     _render_view_set(view_set=view_set, mode=resolved_mode)
@@ -314,6 +319,21 @@ def _run_live_probe(
                     f"adscan domain creds set --domain {domain} --user <u> --password <p>",
                     f"adscan smb shares --domain {domain} --output json --mode graph",
                 ],
+            )
+        return None, str(exc)
+    except Exception as exc:  # noqa: BLE001
+        # Config-build can fail before the native enumerator's own soft-error
+        # boundary is reached — e.g. a Kerberos pre-mint / get_TGT preauth
+        # rejection on an AES-only / non-default-salt DC. Without this catch the
+        # exception escapes run_native_shares_view to the REPL, which dumps a
+        # raw multi-frame Rich traceback. Classify it (the same Kerberos-posture
+        # mapping the enumerator's errors use) and render a clean one-line card.
+        telemetry.capture_exception(exc)
+        if not suppress_rich():
+            print_remediation_card(
+                error=f"Live SMB share probe failed: {exc}",
+                cause=_classify_error_cause(str(exc)),
+                commands=_remediation_commands(domain=domain, status="error"),
             )
         return None, str(exc)
 
@@ -784,6 +804,19 @@ def _build_smb_config_for_host(
                 spn_host = None
                 use_kerberos = False
 
+        # Diagnostic for the cross-realm AP-REP-parse case: a foreign-suffix host
+        # reached via a pivot whose FQDN is in inventory may still drop to cifs/<ip>
+        # if the resolver wasn't given the host's inventory or rejected the foreign
+        # realm. Log the per-host SPN decision (bracket-free marker; Rich eats [..])
+        # so the next occurrence is diagnosable without changing behavior.
+        print_info_debug(
+            "smb-probe-spn: "
+            f"host={mark_sensitive(target or '-', 'hostname')} "
+            f"spn_host={mark_sensitive(spn_host or '-', 'hostname')} "
+            f"kerberos={use_kerberos} "
+            f"domain={mark_sensitive(domain, 'domain')}"
+        )
+
         return SMBConfig(
             target_ip=target or pdc_ip,
             target_hostname=spn_host or target or pdc_ip,
@@ -818,25 +851,65 @@ def _build_smb_config_for_host(
 
 
 def _classify_error_cause(error_text: str) -> str:
-    """Map an error string to a short human-readable probable cause."""
+    """Map an error string to a short human-readable probable cause.
+
+    badauth now decodes a GSSAPI-wrapped KRB-ERROR on the AP exchange into the
+    real Kerberos error-code instead of blindly parsing it as an AP-REP (which
+    destroyed the code). So when the error string carries a concrete Kerberos
+    error name, classify on THAT — never guess "wrong SPN" from an opaque
+    AP-REP parse failure that may actually be a non-default salt/etype or clock
+    skew. The wrong-SPN message is reserved for the codes that genuinely mean it.
+    """
     upper = error_text.upper()
-    # Kerberos AP-REP / GSSAPI parse failure or an SPN mismatch surfaces as a
-    # generic auth/parse error: the service ticket was minted for a different
-    # host's SPN (e.g. the PDC's) than the one the AP-REQ is validated against,
-    # so the target rejects it. Recognise it explicitly so a genuine SPN issue
-    # is actionable instead of "Unknown SMB transport error".
+
+    # Concrete, decoded Kerberos AP-exchange error codes — diagnose precisely.
+    # Match both the symbolic code AND the human-readable strings that surface
+    # from a get_TGT preauth rejection on an AES-only / RC4-disabled DC, so a
+    # raw "KDC has no support for encryption type" is never mislabeled as an
+    # unknown SMB transport error.
+    if (
+        "KDC_ERR_ETYPE_NOTSUPP" in upper
+        or "KDC HAS NO SUPPORT FOR ENCRYPTION TYPE" in upper
+        or "KDC_ERR_PREAUTH_FAILED" in upper
+        or "PREAUTH" in upper
+    ):
+        return (
+            "The DC rejected the Kerberos encryption type (the domain may be "
+            "AES-only / RC4-disabled, or the account uses a non-default "
+            "Kerberos salt) — see the domain posture."
+        )
+    if "KRB_AP_ERR_SKEW" in upper:
+        return (
+            "Kerberos clock skew is too large — the host clock and the DC differ "
+            "by more than the allowed 5 minutes."
+        )
     if (
         "KRB_AP_ERR_MODIFIED" in upper
-        or "AP_REP" in upper
+        or "KRB_AP_ERR_BADMATCH" in upper
+        or "KRB_AP_ERR_NOT_US" in upper
+    ):
+        return (
+            "Kerberos service ticket was issued for a different host's SPN "
+            "(the target's own FQDN was not used)."
+        )
+
+    # Opaque AP-REP / GSSAPI / SPNEGO failures with no decoded error-code. These
+    # are a Kerberos AP-exchange leg problem; without a concrete code we cannot
+    # claim it is the SPN specifically — describe it honestly so a non-SPN cause
+    # (salt/etype/skew) is not misattributed.
+    if (
+        "AP_REP" in upper
         or "AP-REP" in upper
+        or "AP EXCHANGE REJECTED" in upper
         or "GSSAPI" in upper
         or "GSS-API" in upper
         or "SPNEGO" in upper
         or "SEC_E_LOGON_DENIED" in upper
     ):
         return (
-            "Kerberos service ticket was issued for a different host's SPN "
-            "(the target's own FQDN was not used)."
+            "The Kerberos AP exchange was rejected by the target (wrong SPN, "
+            "non-default salt/encryption type, or clock skew). NTLM is retried "
+            "automatically when it is not disabled in this domain."
         )
     if "ACCESS_DENIED" in upper or "LOGON_FAILURE" in upper:
         return "The credentials were rejected (wrong password, locked account, or auth method blocked)."

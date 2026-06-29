@@ -242,18 +242,19 @@ def ensure_domain_ready_for_manual_credential_save(
 
 def _resolve_credential_provenance_label(
     shell: Any, *, domain: str, user: str
-) -> str:
+) -> str | None:
     """Return a compact provenance attribution for a stored credential.
 
-    Reads the recorded ``source_steps`` (when present) and derives a short
-    "via X" label (spray, kerberoast, DCSync, GPP, LAPS, backup_operators,
-    ADCS, manual save, ...). When nothing is recorded the label degrades to
-    a neutral marker so the column never goes blank.
+    Reads the recorded ``credential_origin`` (when present) and derives a short,
+    client-safe label via the SSOT (spray, kerberoast, DCSync, GPP, LAPS,
+    backup_operators, ADCS, manual save, ...). When nothing is recorded, returns
+    ``None`` so the caller can render a NEUTRAL marker instead of the literal
+    "unknown" — the provenance column must never read "via unknown".
     """
     try:
         domain_data = (shell.domains_data or {}).get(domain, {}) or {}
     except Exception:  # noqa: BLE001
-        return "unknown"
+        return None
 
     meta_root = domain_data.get("credentials_meta") or {}
     user_meta = meta_root.get(user) if isinstance(meta_root, dict) else None
@@ -269,6 +270,9 @@ def _resolve_credential_provenance_label(
                 return label
 
     # Fall back to scanning the attack graph provenance edges when available.
+    # The relation slug is routed through the SAME SSOT label map so the graph
+    # fallback renders a curated label (e.g. "AS-REP roast"), never a raw
+    # BloodHound relation like ``ASREPRoasting``.
     try:
         graph_provenance = domain_data.get("credential_provenance") or {}
         user_steps = (
@@ -279,11 +283,11 @@ def _resolve_credential_provenance_label(
             if isinstance(first, dict):
                 relation = str(first.get("relation") or first.get("kind") or "").strip()
                 if relation:
-                    return relation
+                    return origin_display_label(relation) or None
     except Exception:  # noqa: BLE001
         pass
 
-    return "unknown"
+    return None
 
 
 def show_creds(shell: Any) -> None:
@@ -355,9 +359,10 @@ def show_creds(shell: Any) -> None:
                 provenance = _resolve_credential_provenance_label(
                     shell, domain=domain, user=user
                 )
-                provenance_cell = Text(
-                    f"via {provenance}",
-                    style=COLOR_MUTED if provenance == "unknown" else COLOR_STEEL,
+                provenance_cell = (
+                    Text(f"via {provenance}", style=COLOR_STEEL)
+                    if provenance
+                    else Text(GLYPH_BULLET, style=COLOR_MUTED)
                 )
                 domain_creds_table.add_row(
                     glyph_cell,
@@ -560,14 +565,16 @@ def _prompt_for_domain_user_selection(
         provenance = _resolve_credential_provenance_label(
             shell, domain=domain, user=user_name
         )
+        provenance_cell = (
+            Text(f"via {provenance}", style=COLOR_STEEL)
+            if provenance
+            else Text(GLYPH_BULLET, style=COLOR_MUTED)
+        )
         table.add_row(
             str(idx + 1),
             Text(GLYPH_VERIFIED, style=COLOR_SAGE),
             marked_user_name,
-            Text(
-                f"via {provenance}",
-                style=COLOR_MUTED if provenance == "unknown" else COLOR_STEEL,
-            ),
+            provenance_cell,
         )
 
     print_table(table)
@@ -604,6 +611,9 @@ def _prompt_for_domain_user_selection(
         selected_user_num = IntPrompt.ask(
             f"{prompt_label} (1-{num_users})",
             choices=[str(i + 1) for i in range(num_users)],
+            # A non-interactive run (adscan ci) must not block: the IntPrompt
+            # wrapper auto-resolves to default=, so pick the first user.
+            default=1,
             show_default=False,
             show_choices=False,
         )
@@ -2226,7 +2236,10 @@ def add_credential(
             "Scope": scope,
             "Domain": domain,
             "Username": user,
-            cred_type: cred,
+            # Keep the secret CLEARTEXT on the operator terminal (the pentester
+            # needs it) while marking it so the telemetry export sanitizer
+            # scrubs it. Never redact to "***".
+            cred_type: mark_sensitive(cred, "password"),
         }
         if host:
             details["Target Host"] = host
@@ -3667,7 +3680,9 @@ def return_credentials(shell: Any, domain: str) -> tuple[str | None, str | None]
         shell.console.print(f"{idx + 1}. {user}")
 
     try:
-        selected_idx = int(Prompt.ask("\nSelect a user by number: ")) - 1
+        # default="1" so a non-interactive run (adscan ci) resolves to the
+        # first user instead of returning "" → int("") ValueError crash.
+        selected_idx = int(Prompt.ask("\nSelect a user by number: ", default="1")) - 1
         if 0 <= selected_idx < len(user_list):
             selected_user = user_list[selected_idx]
             selected_cred = shell.domains_data[domain]["credentials"][selected_user]
@@ -3996,7 +4011,9 @@ def process_cpassword_text(
                 ):
                     telemetry.capture_exception(exc)
 
-        print_success(f"cpassword found{source_label}: {cpassword_value}")
+        print_success(
+            f"cpassword found{source_label}: {mark_sensitive(cpassword_value, 'password')}"
+        )
         plaintext_password = decrypt_cpassword(cpassword_value)
         if not plaintext_password:
             print_warning(f"Failed to decrypt cpassword{source_label}.")
@@ -4007,7 +4024,7 @@ def process_cpassword_text(
             shell.username = normalized_user
             print_success(f"Username: {normalized_user}")
             shell.password = plaintext_password
-            print_success(f"Password: {plaintext_password}")
+            print_success(f"Password: {mark_sensitive(plaintext_password, 'password')}")
             try:
                 from adscan_internal.services.share_credential_provenance_service import (
                     ShareCredentialProvenanceService,
@@ -4058,7 +4075,9 @@ def process_cpassword_text(
                     credential_origin="gpp_cpassword",
                 )
         else:
-            print_success(f"Decrypted password{source_label}: {plaintext_password}")
+            print_success(
+                f"Decrypted password{source_label}: {mark_sensitive(plaintext_password, 'password')}"
+            )
 
     return True
 

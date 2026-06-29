@@ -81,6 +81,15 @@ class MSLDAPClientConnection:
 		self.message_id = 0
 		self.message_table = {}
 		self.message_table_notify = {}
+		# ADSCAN diagnostic counters (sizes/counts only — never any wire bytes).
+		# Used by the bracket-free 'ldap-conn-closed' debug log at the recv-loop
+		# close point to distinguish a clean close after N messages from a close
+		# mid-response (a non-empty reassembly buffer = a partial/cut message).
+		self._recv_buffers_total = 0      # number of (decrypted) buffers drained
+		self._recv_plaintext_bytes = 0    # cumulative decrypted plaintext bytes
+		self._messages_dispatched = 0     # complete LDAP messages emitted
+		self._last_message_id_seen = None # most recent messageID dispatched
+		self._largest_message_bytes = 0   # largest single LDAP message seen
 		self.encryption_sequence_counter = 0 # this will be set by the inderlying auth algo
 		self.cb_data = None #for channel binding
 		self._disable_channel_binding = False # putting it here for scanners to be able to turn it off
@@ -148,11 +157,16 @@ class MSLDAPClientConnection:
 				# "Insufficient data - N bytes requested but only M available" and
 				# tore down the whole connection.
 				self.__recv_buffer += message_data
+				# ADSCAN diagnostic accounting (sizes/counts only).
+				self._recv_buffers_total += 1
+				self._recv_plaintext_bytes += len(message_data)
 				messages = []
 				while True:
 					msg_len = _complete_ldap_message_length(self.__recv_buffer)
 					if msg_len is None:
 						break
+					if msg_len > self._largest_message_bytes:
+						self._largest_message_bytes = msg_len
 					messages.append(LDAPMessage.load(self.__recv_buffer[:msg_len]))
 					self.__recv_buffer = self.__recv_buffer[msg_len:]
 
@@ -161,13 +175,43 @@ class MSLDAPClientConnection:
 					continue
 
 				message_id = messages[0]['messageID'].native
+				# ADSCAN diagnostic accounting.
+				self._messages_dispatched += len(messages)
+				self._last_message_id_seen = message_id
 				if message_id not in self.message_table:
 					self.message_table[message_id] = []
 				self.message_table[message_id].extend(messages)
 				if message_id not in self.message_table_notify:
 					self.message_table_notify[message_id] = asyncio.Event()
 				self.message_table_notify[message_id].set()
-		
+
+			# ADSCAN diagnostic (bracket-free marker; sizes/counts/ids only, no
+			# wire bytes / no credential material). The recv loop ended because
+			# network.read() returned None = the peer closed the TCP connection.
+			# A NON-EMPTY reassembly buffer here means the socket closed
+			# MID-RESPONSE (a partial/cut LDAP message) — the strong signal of a
+			# sealed-channel cut on a large response (e.g. a big nTSecurityDescriptor
+			# over SASL sign/seal). An empty buffer means a clean close after the
+			# last complete message (whose id is last_message_id). 'seal' reflects
+			# whether the channel was GSS sealed (encrypt) or signed.
+			seal_state = 'seal' if self.__encrypt_messages else ('sign' if self.__sign_messages else 'none')
+			logger.debug(
+				'ldap-conn-closed: peer closed the connection. '
+				'seal=%s buffers=%d plaintext_bytes=%d messages=%d '
+				'last_message_id=%s largest_message_bytes=%d '
+				'recv_buffer_pending=%d mid_response=%s lasterror=%s'
+				% (
+					seal_state,
+					self._recv_buffers_total,
+					self._recv_plaintext_bytes,
+					self._messages_dispatched,
+					self._last_message_id_seen,
+					self._largest_message_bytes,
+					len(self.__recv_buffer),
+					len(self.__recv_buffer) > 0,
+					type(self.lasterror).__name__ if self.lasterror is not None else 'none',
+				)
+			)
 			raise Exception('Connection closed!')
 		except asyncio.CancelledError:
 			self.status = MSLDAPClientStatus.STOPPED
@@ -486,7 +530,19 @@ class MSLDAPClientConnection:
 				challenge = None
 				while True:
 					try:
-						flags = ISC_REQ.CONNECTION|ISC_REQ.CONFIDENTIALITY|ISC_REQ.INTEGRITY
+						# MUTUAL_AUTH is REQUIRED for a GSS sign+seal LDAP bind on plain 389.
+						# Without it the Kerberos AP-REQ carries ap-options=0x00 (no mutual-
+						# required), so the acceptor never returns an AP-REP and no GSS acceptor
+						# subkey is negotiated; the per-message seal is then keyed off the bare
+						# TGS session key. Windows AD tolerates this, but a Samba 4 AD DC
+						# (Heimdal GSS) cannot unwrap the first sealed PDU and silently CLOSES
+						# the connection right after the bind succeeds (badldap surfaced this as
+						# 'Connection closed!' at the first post-bind sealed query). Real LDAP
+						# clients (cyrus-sasl, Windows) always set mutual-required for a sealed
+						# bind; mirror that. TLS (LDAPS/StartTLS) and the disable-signing probe
+						# override flags below, so MUTUAL_AUTH is scoped to the plain sign+seal
+						# rung that needs it.
+						flags = ISC_REQ.CONNECTION|ISC_REQ.CONFIDENTIALITY|ISC_REQ.INTEGRITY|ISC_REQ.MUTUAL_AUTH
 						if self.target.protocol == UniProto.CLIENT_SSL_TCP:
 							flags = ISC_REQ.CONNECTION
 						

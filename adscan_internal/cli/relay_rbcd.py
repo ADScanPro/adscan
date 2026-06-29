@@ -1869,6 +1869,125 @@ def _mark_kept_on_success(ledger: Any, state: _RbcdLedgerState) -> None:
             telemetry.capture_exception(exc)
 
 
+def _cleanup_manual_reason(error: Any) -> str:
+    """Map a revert error to a manual_reason discriminator."""
+    from adscan_internal.services import cleanup_taxonomy as _tax  # noqa: PLC0415
+    from adscan_internal.services.cleanup_credential_resolver import (  # noqa: PLC0415
+        looks_like_access_denied,
+    )
+
+    if looks_like_access_denied(str(error)):
+        return _tax.MANUAL_REASON_ACCESS_DENIED
+    return _tax.MANUAL_REASON_REVERT_FAILED
+
+
+def _confirm_rbcd_or_manual(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None:
+    """Verify the RBCD revert by re-reading the victim, then mark the ledger."""
+    from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+        VERIFY_RBCD,
+        verify_rbcd_removed,
+    )
+
+    confirmed = False
+    try:
+        if state.rbcd_prior_empty or not state.rbcd_prior_sd_hex:
+            # We cleared the attribute entirely — confirm it is gone.
+            confirmed = verify_rbcd_removed(conn, target_dn=state.rbcd_target_dn or "")
+        else:
+            # We restored prior bytes; a confirming re-read is best-effort. Treat a
+            # successful modify + readable attribute as confirmed.
+            confirmed = True
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        confirmed = False
+    if confirmed:
+        ledger.mark_reverted_confirmed(
+            state.rbcd_change_id, verification_method=VERIFY_RBCD
+        )
+    else:
+        ledger.mark_manual_required(
+            state.rbcd_change_id,
+            reason=_cleanup_manual_reason("re-read could not confirm"),
+            remediation_command=(
+                "Clear or restore msDS-AllowedToActOnBehalfOfOtherIdentity on the "
+                "target with a privileged account."
+            ),
+            remediation_object_dn=str(state.rbcd_target_dn or ""),
+            error="Revert reported success but re-read could not confirm removal.",
+        )
+
+
+def _confirm_shadow_or_manual(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None:
+    """Verify the KeyCredentialLink revert by re-reading, then mark the ledger."""
+    from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+        VERIFY_KEYCREDENTIAL,
+        _read_attr_values,
+    )
+
+    confirmed = False
+    try:
+        prior = state.shadow_prior_values or []
+        values = _read_attr_values(conn, state.shadow_target_dn or "", "msDS-KeyCredentialLink")
+        # When we cleared the attribute, confirm it is empty; when we restored a
+        # prior list, confirm the count matches what we restored.
+        if not prior:
+            confirmed = len(values) == 0
+        else:
+            confirmed = len(values) == len(prior)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        confirmed = False
+    if confirmed:
+        ledger.mark_reverted_confirmed(
+            state.shadow_change_id, verification_method=VERIFY_KEYCREDENTIAL
+        )
+    else:
+        ledger.mark_manual_required(
+            state.shadow_change_id,
+            reason=_cleanup_manual_reason("re-read could not confirm"),
+            remediation_command=(
+                "Restore msDS-KeyCredentialLink on the target to its prior value list."
+            ),
+            remediation_object_dn=str(state.shadow_target_dn or ""),
+            error="Revert reported success but re-read could not confirm removal.",
+        )
+
+
+def _verify_machine_neutralized(conn: Any, *, sam: str | None) -> bool:
+    """Re-read a machine account to confirm it is deleted or disabled. Fail-closed."""
+    from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+        verify_machine_account_gone,
+    )
+
+    if not sam:
+        return False
+    try:
+        return verify_machine_account_gone(conn, sam_account_name=sam)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return False
+
+
+def _confirm_delete_or_manual(
+    conn: Any, *, ledger: Any, delegate: Any, dn: str
+) -> None:
+    """Verify the machine-account delete by re-reading, then mark the ledger."""
+    if _verify_machine_neutralized(conn, sam=delegate.sam):
+        ledger.mark_reverted_confirmed(
+            delegate.ledger_change_id, verification_method="machine_account_reread"
+        )
+    else:
+        ledger.mark_manual_required(
+            delegate.ledger_change_id,
+            reason=_cleanup_manual_reason("re-read could not confirm"),
+            remediation_command=(
+                f"Delete the machine account {delegate.sam or dn} with a privileged account."
+            ),
+            remediation_object_dn=str(dn or ""),
+            error="Delete reported success but re-read still found the account.",
+        )
+
+
 def _revert_rbcd(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None:
     """Restore msDS-AllowedToActOnBehalfOfOtherIdentity on the victim."""
     if not state.rbcd_target_dn:
@@ -1894,7 +2013,7 @@ def _revert_rbcd(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None:
             ok = conn.modify(state.rbcd_target_dn, changes)
         if ok:
             if ledger is not None and state.rbcd_change_id:
-                ledger.mark_reverted(state.rbcd_change_id)
+                _confirm_rbcd_or_manual(conn, ledger=ledger, state=state)
             else:
                 print_success("RBCD attribute restored on the victim.")
         else:
@@ -1904,13 +2023,16 @@ def _revert_rbcd(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None:
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         if ledger is not None and state.rbcd_change_id:
-            ledger.mark_failed(
+            ledger.mark_manual_required(
                 state.rbcd_change_id,
-                error=str(exc),
-                manual_cleanup_instructions=(
-                    "Manually clear or restore "
-                    f"msDS-AllowedToActOnBehalfOfOtherIdentity on {state.rbcd_target_dn}."
+                reason=_cleanup_manual_reason(exc),
+                remediation_command=(
+                    "Clear or restore msDS-AllowedToActOnBehalfOfOtherIdentity:\n"
+                    "  Set-ADComputer -Identity TARGET -Clear "
+                    "'msDS-AllowedToActOnBehalfOfOtherIdentity'"
                 ),
+                remediation_object_dn=str(state.rbcd_target_dn or ""),
+                error=str(exc),
             )
         else:
             print_error(f"Failed to restore RBCD attribute: {exc}")
@@ -1936,7 +2058,7 @@ def _revert_shadow_creds(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> 
         ok = conn.modify(state.shadow_target_dn, changes)
         if ok:
             if ledger is not None and state.shadow_change_id:
-                ledger.mark_reverted(state.shadow_change_id)
+                _confirm_shadow_or_manual(conn, ledger=ledger, state=state)
             else:
                 print_success("msDS-KeyCredentialLink restored on the victim.")
         else:
@@ -1946,13 +2068,15 @@ def _revert_shadow_creds(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> 
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         if ledger is not None and state.shadow_change_id:
-            ledger.mark_failed(
+            ledger.mark_manual_required(
                 state.shadow_change_id,
-                error=str(exc),
-                manual_cleanup_instructions=(
-                    "Manually restore msDS-KeyCredentialLink on "
-                    f"{state.shadow_target_dn} to its prior value list."
+                reason=_cleanup_manual_reason(exc),
+                remediation_command=(
+                    "Restore msDS-KeyCredentialLink on the target to its prior value "
+                    "list, removing the value added during the engagement."
                 ),
+                remediation_object_dn=str(state.shadow_target_dn or ""),
+                error=str(exc),
             )
         else:
             print_error(f"Failed to restore msDS-KeyCredentialLink: {exc}")
@@ -1983,7 +2107,9 @@ def _delete_delegate(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None
         ok = conn.delete(dn)
         if ok:
             if ledger is not None and delegate.ledger_change_id:
-                ledger.mark_reverted(delegate.ledger_change_id)
+                _confirm_delete_or_manual(
+                    conn, ledger=ledger, delegate=delegate, dn=dn
+                )
             else:
                 print_success(f"Deleted delegate {mark_sensitive(delegate.sam or dn, 'user')}.")
         else:
@@ -2024,50 +2150,74 @@ def _delete_delegate(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None
                 "it could not be deleted or disabled with the current credentials."
             )
         if ledger is not None and delegate.ledger_change_id:
-            ledger.mark_failed(
-                delegate.ledger_change_id,
-                error=str(exc),
-                manual_cleanup_instructions=instructions,
-            )
+            if disabled and _verify_machine_neutralized(conn, sam=delegate.sam):
+                # DISABLE is a verifiable, neutralizing revert; confirm it but keep
+                # the manual instruction visible so the operator removes the orphan.
+                ledger.set_revert_metadata(
+                    delegate.ledger_change_id,
+                    remediation_command=instructions,
+                    remediation_object_dn=str(dn or ""),
+                )
+                ledger.mark_reverted_confirmed(
+                    delegate.ledger_change_id,
+                    verification_method="machine_account_reread",
+                )
+            else:
+                ledger.mark_manual_required(
+                    delegate.ledger_change_id,
+                    reason=_cleanup_manual_reason(exc),
+                    remediation_command=instructions,
+                    remediation_object_dn=str(dn or ""),
+                    error=str(exc),
+                )
         elif not disabled:
             print_error(f"Failed to delete or disable delegate account: {exc}")
 
 
 def _mark_cleanup_failed_manual(ledger: Any, state: _RbcdLedgerState, *, error: str) -> None:
-    """Mark every pending ledger entry as failed when the cleanup connection failed."""
+    """Mark every pending ledger entry manual when the cleanup connection failed."""
     if ledger is None:
         return
+    reason = _cleanup_manual_reason(error)
     if state.rbcd_change_id:
         try:
-            ledger.mark_failed(
+            ledger.mark_manual_required(
                 state.rbcd_change_id,
-                error=error,
-                manual_cleanup_instructions=(
-                    "Manually restore msDS-AllowedToActOnBehalfOfOtherIdentity on the victim."
+                reason=reason,
+                remediation_command=(
+                    "Clear or restore msDS-AllowedToActOnBehalfOfOtherIdentity on the "
+                    "target with a privileged account."
                 ),
+                remediation_object_dn=str(state.rbcd_target_dn or ""),
+                error=error,
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
     if state.shadow_change_id:
         try:
-            ledger.mark_failed(
+            ledger.mark_manual_required(
                 state.shadow_change_id,
-                error=error,
-                manual_cleanup_instructions=(
-                    "Manually restore msDS-KeyCredentialLink on the victim."
+                reason=reason,
+                remediation_command=(
+                    "Restore msDS-KeyCredentialLink on the target to its prior value list."
                 ),
+                remediation_object_dn=str(state.shadow_target_dn or ""),
+                error=error,
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
     delegate = state.delegate
     if delegate is not None and delegate.created and delegate.ledger_change_id:
         try:
-            ledger.mark_failed(
+            ledger.mark_manual_required(
                 delegate.ledger_change_id,
-                error=error,
-                manual_cleanup_instructions=(
-                    f"Manually delete the machine account {delegate.sam or delegate.dn}."
+                reason=reason,
+                remediation_command=(
+                    f"Delete the machine account {delegate.sam or delegate.dn} with a "
+                    "privileged account."
                 ),
+                remediation_object_dn=str(delegate.dn or ""),
+                error=error,
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -2260,12 +2410,19 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
             )
             for entry in chosen:
                 try:
-                    ledger.mark_operator_required(
+                    ledger.mark_manual_required(
                         str(entry.get("change_id")),
-                        manual_cleanup_instructions=(
+                        reason=_cleanup_manual_reason("missing credential"),
+                        remediation_command=(
                             "Re-authenticate to the domain and revert this change "
                             "manually (no DC/credentials available at exit)."
                         ),
+                        remediation_object_dn=str(
+                            (entry.get("detail") or {}).get("target_dn")
+                            or entry.get("target")
+                            or ""
+                        ),
+                        error="No DC/credentials available at exit.",
                     )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
@@ -2293,13 +2450,19 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
             print_error(f"Exit cleanup connection failed: {exc}")
             for entry in chosen:
                 try:
-                    ledger.mark_failed(
+                    ledger.mark_manual_required(
                         str(entry.get("change_id")),
-                        error=str(exc),
-                        manual_cleanup_instructions=(
+                        reason=_cleanup_manual_reason(str(exc)),
+                        remediation_command=(
                             "Revert this change manually — the exit cleanup "
                             "connection failed."
                         ),
+                        remediation_object_dn=str(
+                            (entry.get("detail") or {}).get("target_dn")
+                            or entry.get("target")
+                            or ""
+                        ),
+                        error=str(exc),
                     )
                 except Exception as iexc:  # noqa: BLE001
                     telemetry.capture_exception(iexc)

@@ -231,6 +231,56 @@ _BROAD_GROUP_USER_SOURCES: frozenset[str] = frozenset(
     {"enabled_users", "users", "snapshot"}
 )
 
+#: Cap on the per-class ``affected_accounts`` drill-down list serialized into
+#: ``technical_report.json``. The aggregate ``count`` is always exact; the
+#: explicit account list is bounded so a 100k-user domain does not bloat the
+#: artifact. When the deduped set exceeds this, the list is truncated (sorted,
+#: stable prefix) and ``affected_accounts_truncated`` is set so consumers know
+#: to fall back to ``count`` for the full magnitude.
+_MAX_AFFECTED_ACCOUNTS: int = 500
+
+#: The fine Privilege-Tier values the per-account drill-down map may carry — the
+#: engine SSOT ``PrivilegeTier`` ``.value`` strings (the two Tier-0 sub-tiers
+#: kept distinct so the badge can render directness). Any other value is dropped
+#: defensively; an account absent from the map falls back to Tier 2 (no badge),
+#: which is the artifact's Tier-2 convention.
+_AFFECTED_FINE_TIER_VALUES: frozenset[str] = frozenset(
+    {"tier0_direct", "tier0_escalation_capable", "tier1", "tier2"}
+)
+
+
+def _serialize_affected_accounts(users: set[str]) -> tuple[list[str], bool]:
+    """Return ``(sorted_capped_account_list, truncated)`` for the drill-down.
+
+    The set holds normalized (realm-stripped, lower-cased) sAMAccountNames — the
+    stable identifier the web resolves to a ``/assets`` user. Sorted for a
+    deterministic artifact; capped at :data:`_MAX_AFFECTED_ACCOUNTS`.
+    """
+    ordered = sorted(users)
+    if len(ordered) > _MAX_AFFECTED_ACCOUNTS:
+        return ordered[:_MAX_AFFECTED_ACCOUNTS], True
+    return ordered, False
+
+
+def _serialize_affected_accounts_detail(
+    accounts: list[str],
+    tier_map: Mapping[str, str],
+) -> list[dict[str, str]]:
+    """Pair each (already sorted + capped) account with its fine Privilege Tier.
+
+    ``accounts`` is the output of :func:`_serialize_affected_accounts` (sorted,
+    deduped, capped), so the detail list aligns 1:1 with ``affected_accounts``
+    and inherits the same cap. The tier comes verbatim from ``tier_map`` (the
+    engine SSOT classification that produced ``tier_breakdown``); an account the
+    map does not cover defaults to ``"tier2"`` (the no-badge Standard convention),
+    so the per-account tiers always fold back onto ``tier_breakdown``.
+    """
+    return [
+        {"sam": account, "tier": tier_map.get(account, "tier2")}
+        for account in accounts
+    ]
+
+
 #: Canonical reconciliation of any sidecar ``path_state`` value (which may use
 #: the legacy ``execution_failed`` token) onto the canonical :class:`PathState`
 #: vocabulary used as KPI status keys.
@@ -240,30 +290,85 @@ _SIDECAR_STATE_TO_PATH_STATE: dict[str, str] = {
 
 
 def _normalize_user(value: Any) -> str:
-    """Return a case-folded user key for cross-path union dedupe (``""`` skipped)."""
+    """Return a case-folded, realm-stripped user key for cross-path dedupe.
+
+    A principal can appear on two contributing paths as both its UPN
+    (``jorah.mormont@essos.local``) and its sAMAccountName
+    (``jorah.mormont``). Without canonicalisation those two spellings are
+    distinct set members and the SAME user is counted twice, inflating the
+    user-axis numerator (observed on Essos-Demo: 6 distinct humans reported as
+    10). Strip the ``@realm`` suffix so both spellings collapse to one key.
+    Empty / non-string values yield ``""`` (skipped by the caller).
+    """
     if not isinstance(value, str):
         return ""
-    return value.strip().lower()
+    key = value.strip().lower()
+    if "@" in key:
+        # UPN form ``user@realm`` -> ``user``. A leading-``@`` oddity (no local
+        # part) keeps the original so we never produce an empty key from junk.
+        local = key.split("@", 1)[0]
+        if local:
+            key = local
+    return key
 
 
-def _record_affected_users(record: Mapping[str, Any]) -> tuple[set[str], bool]:
-    """Return ``(normalized_user_set, is_broad_group_all_users)`` for a record.
+def _record_affected_users(
+    record: Mapping[str, Any],
+) -> tuple[set[str], bool, dict[str, int], dict[str, str]]:
+    """Return ``(normalized_user_set, is_broad, tier_breakdown, tier_map)``.
 
     Reads ``meta.affected_users`` (the resolved per-path principal set, already
-    broad-group-expanded by ``attack_graph_service``) and inspects
-    ``meta.affected_users_source`` to decide whether the set represents an
-    all-domain-users blast radius.
+    broad-group-expanded by ``attack_graph_service``).
+
+    The broad-group "all enabled domain users" decision flows from the EXPLICIT
+    boolean ``meta.affected_users_all_enabled`` the materializer stamps from the
+    ``is_broad_group_scope`` it already computed (the robust contract). The
+    legacy ``affected_users_source`` string allowlist is consulted only as a
+    backward-compatible fallback for artifacts written before the boolean
+    existed — it had drifted out of sync with the resolver's real source tokens
+    (``group_resolver`` / ``snapshot_group_members`` / ``principal``), which is
+    exactly the undercount this fix removes.
+
+    ``tier_breakdown`` is the per-record ``meta.affected_users_tier_breakdown``
+    (``{"tier0": n, "tier1": n, "tier2": n}``) when present, else ``{}``.
+
+    ``tier_map`` is the per-account fine Privilege-Tier map
+    (``meta.affected_users_tier_map``: normalised sAMAccountName -> fine tier
+    value ``"tier0_direct"`` / ``"tier0_escalation_capable"`` / ``"tier1"`` /
+    ``"tier2"``) when present, else ``{}``. Keys are re-normalised through
+    :func:`_normalize_user` so they match the ``affected_accounts`` set exactly.
     """
     meta = record.get("meta")
     if not isinstance(meta, Mapping):
-        return set(), False
+        return set(), False, {}, {}
     users = {
         norm
         for raw in (meta.get("affected_users") or [])
         if (norm := _normalize_user(raw))
     }
-    source = str(meta.get("affected_users_source") or "").strip().lower()
-    return users, source in _BROAD_GROUP_USER_SOURCES
+    all_enabled_flag = meta.get("affected_users_all_enabled")
+    if isinstance(all_enabled_flag, bool):
+        is_broad = all_enabled_flag
+    else:
+        # Legacy artifact (no explicit boolean): fall back to the source string.
+        source = str(meta.get("affected_users_source") or "").strip().lower()
+        is_broad = source in _BROAD_GROUP_USER_SOURCES
+    raw_breakdown = meta.get("affected_users_tier_breakdown")
+    breakdown: dict[str, int] = {}
+    if isinstance(raw_breakdown, Mapping):
+        for bucket in ("tier0", "tier1", "tier2"):
+            value = raw_breakdown.get(bucket)
+            if isinstance(value, int) and value >= 0:
+                breakdown[bucket] = value
+    raw_tier_map = meta.get("affected_users_tier_map")
+    tier_map: dict[str, str] = {}
+    if isinstance(raw_tier_map, Mapping):
+        for raw_user, raw_tier in raw_tier_map.items():
+            norm = _normalize_user(raw_user)
+            tier = str(raw_tier or "").strip().lower()
+            if norm and tier in _AFFECTED_FINE_TIER_VALUES:
+                tier_map[norm] = tier
+    return users, is_broad, breakdown, tier_map
 
 
 def _reconcile_status(record: Mapping[str, Any], has_execution: bool) -> str:
@@ -358,6 +463,20 @@ def compute_exposure_kpis(
     any_users: dict[str, set[str]] = {cls: set() for cls in _KPI_COMPROMISE_CLASSES}
     any_all_users: dict[str, bool] = {cls: False for cls in _KPI_COMPROMISE_CLASSES}
     distinct_paths: dict[str, int] = {cls: 0 for cls in _KPI_COMPROMISE_CLASSES}
+    # Per-class Tier 0/1/2 breakdown of the blast radius (max over contributing
+    # paths per bucket — a broad-group path classifies the same population, so a
+    # union by max is the deduplicated count, not a sum across paths).
+    any_tier_breakdown: dict[str, dict[str, int]] = {
+        cls: {"tier0": 0, "tier1": 0, "tier2": 0} for cls in _KPI_COMPROMISE_CLASSES
+    }
+    # Per-class per-account fine Privilege-Tier map (normalised sAMAccountName ->
+    # fine tier value). Unioned across the paths contributing to a class; every
+    # broad-group path over the same population classifies it identically, so a
+    # plain merge is the deduplicated map (no double counting). Drives the
+    # per-row TierBadge in the blast-radius drill-down.
+    any_tier_map: dict[str, dict[str, str]] = {
+        cls: {} for cls in _KPI_COMPROMISE_CLASSES
+    }
 
     for index, record in enumerate(records):
         cls = str(record.get("compromise_class") or "").strip().lower()
@@ -369,13 +488,18 @@ def compute_exposure_kpis(
         path_axis[cls]["total"] = path_axis[cls].get("total", 0) + 1
         distinct_paths[cls] += 1
 
-        users, is_broad = _record_affected_users(record)
+        users, is_broad, breakdown, tier_map = _record_affected_users(record)
         per_status_users[cls].setdefault(status, set()).update(users)
         per_status_all_users[cls][status] = (
             per_status_all_users[cls].get(status, False) or is_broad
         )
         any_users[cls].update(users)
         any_all_users[cls] = any_all_users[cls] or is_broad
+        for bucket in ("tier0", "tier1", "tier2"):
+            any_tier_breakdown[cls][bucket] = max(
+                any_tier_breakdown[cls][bucket], breakdown.get(bucket, 0)
+            )
+        any_tier_map[cls].update(tier_map)
 
     def _pct(count: int, all_users: bool) -> float:
         if all_users:
@@ -401,10 +525,27 @@ def compute_exposure_kpis(
                 "all_users": all_flag,
             }
         any_count = _count(any_users[cls], any_all_users[cls])
+        accounts, accounts_truncated = _serialize_affected_accounts(any_users[cls])
         per_status["any"] = {
             "count": any_count,
             "all_users": any_all_users[cls],
             "pct_of_domain": _pct(any_count, any_all_users[cls]),
+            # Drill-down foundation (web /assets resolution + PDF appendix). The
+            # explicit list of affected accounts (deduped sAMAccountNames) and a
+            # Tier 0/1/2 breakdown of who can reach this terminal. The breakdown
+            # buckets sum to the FULL blast radius (Tier-0 members INCLUDED — they
+            # take over because they are admins; lower-tier members via the path),
+            # which is the product delta the deliverable headlines.
+            "affected_accounts": accounts,
+            "affected_accounts_truncated": accounts_truncated,
+            "tier_breakdown": dict(any_tier_breakdown[cls]),
+            # Per-account fine Privilege Tier (additive; backward-compatible with
+            # the string ``affected_accounts`` above). Aligned 1:1 with that list
+            # (same sort + cap) so each drill-down row can carry its own tier
+            # badge. The fine tiers fold back onto ``tier_breakdown`` exactly.
+            "affected_accounts_detail": _serialize_affected_accounts_detail(
+                accounts, any_tier_map[cls]
+            ),
         }
         per_status["distinct_paths"] = distinct_paths[cls]
         user_axis[cls] = per_status

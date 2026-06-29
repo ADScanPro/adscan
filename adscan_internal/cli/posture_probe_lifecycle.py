@@ -30,6 +30,57 @@ def is_posture_probe_disabled() -> bool:
     return val in {"1", "true", "yes", "on"}
 
 
+def _publish_posture_widget_best_effort(
+    shell: Any,
+    domain: str,
+    results: list[ProbeResult],
+) -> None:
+    """Build + emit + persist the domain-hardening posture as a shared widget.
+
+    Taps the SAME structured ``ProbeResult`` objects the summary panel renders,
+    reusing the posture-probe label maps, and reduces them to a ``matrix-panel``
+    widget. Emitted live + persisted via ``publish_widget`` so the web premium
+    component renders the identical contract.
+
+    This is the web-side half of "one definition, both renderers" for Posture:
+    the CLI keeps its battle-tested ``render_posture_probe_summary`` panel
+    (premium, inside the LiveSession summary), while the web is driven purely by
+    this emitted widget data — same source objects, no second hand-built UI.
+    Best-effort: never raises into the probe flow.
+    """
+    try:
+        from adscan_internal.cli.widgets.posture_probe_live import (
+            _PROBE_HARDENING_LABEL,
+            _PROBE_PERMISSIVE_LABEL,
+        )
+        from adscan_internal.cli.widgets.widget_artifacts import publish_widget
+        from adscan_internal.cli.widgets.widget_builders import build_posture_widget
+
+        detected: list[tuple[str, str, str]] = []
+        permissive: list[tuple[str, str]] = []
+        for result in results:
+            if result.skipped or not result.succeeded:
+                continue
+            hardening = _PROBE_HARDENING_LABEL.get((result.category, result.state))
+            if hardening is not None:
+                detected.append(
+                    (hardening, str(getattr(result.confidence, "value", "")), "")
+                )
+                continue
+            weak = _PROBE_PERMISSIVE_LABEL.get((result.category, result.state))
+            if weak is not None:
+                permissive.append((weak, ""))
+
+        widget = build_posture_widget(
+            domain=domain,
+            detected_hardening=detected,
+            permissive=permissive,
+        )
+        publish_widget(shell, domain=domain, widget=widget)
+    except Exception as exc:  # noqa: BLE001 — widget publication never aborts the scan
+        telemetry.capture_exception(exc)
+
+
 def _emit_posture_findings_best_effort(shell: Any, domain: str) -> None:
     """Translate the freshly-updated posture cache into technical findings.
 
@@ -296,6 +347,7 @@ async def arun_posture_probe(
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
+        _publish_posture_widget_best_effort(shell, domain, results)
         _emit_posture_findings_best_effort(shell, domain)
         return results
 

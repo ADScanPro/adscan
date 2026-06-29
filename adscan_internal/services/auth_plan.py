@@ -732,6 +732,20 @@ def build_smb_plan(
         and ntlm_entry.effective_state is TriState.DISABLED
     )
 
+    # NTLM fallback on a Kerberos *infrastructure* error (KDC/SPN/AP-exchange leg)
+    # is correct recovery whenever NTLM has not been ruled out by posture — a
+    # Kerberos infra error is never a credential rejection, so retrying NTLM with
+    # the same credential is sound. This holds regardless of whether the caller
+    # explicitly requested Kerberos or the Kerberos-first policy promoted it.
+    # Without this, a caller that sets ``use_kerberos=True`` (e.g. the live SMB
+    # share probe, which resolves the per-host SPN itself) would hit a
+    # GSSAPI-wrapped KRB-ERROR on the AP exchange — now correctly decoded by
+    # badauth into a real Kerberos error-code — and surface a dead-end instead of
+    # recovering over NTLM. The chokepoint still gates the actual fallback on the
+    # error being a Kerberos *infra* error (not a credential rejection).
+    if caller_requested_kerberos and not ntlm_disabled_high:
+        ntlm_fallback_allowed = True
+
     # Rule 0: global Kerberos-first default when Kerberos is viable and the
     # caller did not explicitly request Kerberos. NTLM fallback is allowed only
     # for this policy-selected path, and only when posture has not ruled NTLM out.
@@ -900,6 +914,25 @@ def build_winrm_plan(
     notes: list[str] = []
     pruned: bool = False
     ntlm_fallback_allowed: bool = False
+
+    # Caller explicitly requested Kerberos. Posture-gate the NTLM last-resort up
+    # front (mirrors ``build_smb_plan``): NTLM fallback on a residual Kerberos
+    # *infrastructure* error (the GSSAPI-wrapped KRB-ERROR / AP-exchange leg) is
+    # correct recovery whenever NTLM has not been ruled out by posture — a
+    # Kerberos infra error is never a credential rejection, so retrying NTLM with
+    # the same credential is sound. The chokepoint (winrm_psrp_service) still
+    # gates the actual fallback on ``_is_kerberos_infra_error`` so it fires ONLY
+    # on the residual KRB-ERROR class, never on KDC_ERR_ETYPE_NOTSUPP /
+    # KRB_AP_ERR_SKEW / KRB_AP_ERR_MODIFIED (those own dedicated recovery).
+    ntlm_disabled_high = False
+    if posture is not None:
+        _ntlm_entry = posture.get(ConstraintCategory.NTLM_AUTHENTICATION)
+        ntlm_disabled_high = bool(
+            _has_high_confidence(_ntlm_entry.effective_state, _ntlm_entry.confidence)
+            and _ntlm_entry.effective_state is TriState.DISABLED
+        )
+    if requested == "kerberos" and not ntlm_disabled_high:
+        ntlm_fallback_allowed = True
 
     if KERBEROS_FIRST_POLICY and kerberos_viable and requested == "auto":
         auth_mode = "kerberos"

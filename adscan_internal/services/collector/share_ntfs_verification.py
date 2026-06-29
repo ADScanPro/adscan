@@ -257,6 +257,34 @@ def effective_mask_relations(mask: int) -> list[str]:
     return kinds
 
 
+def mask_to_access_label(mask: int | None) -> str | None:
+    """Map a file-access mask to a single human access label.
+
+    Returns ``"Full Control"`` / ``"Read+Write"`` / ``"Write"`` / ``"Read"``,
+    or ``None`` when the mask grants none of these (or is ``None``). Used to
+    render the share-level and NTFS-level components of the access breakdown
+    (share / NTFS / effective) on the share-exposure surfaces, so the headline
+    effective access can be shown next to the two values it was derived from.
+
+    Semantics match :func:`effective_mask_relations` exactly so a label and the
+    relation it corresponds to never disagree.
+    """
+    if mask is None:
+        return None
+    relations = effective_mask_relations(int(mask))
+    if "FullControlShare" in relations:
+        return "Full Control"
+    has_read = "ReadShare" in relations
+    has_write = "WriteShare" in relations
+    if has_read and has_write:
+        return "Read+Write"
+    if has_write:
+        return "Write"
+    if has_read:
+        return "Read"
+    return None
+
+
 def hunt_gate_decision(
     *,
     verification: str,
@@ -288,21 +316,29 @@ def hunt_gate_decision(
     return (True, True)
 
 
-def compute_effective_file_mask(
+def compute_effective_file_masks(
     share_sd_bytes: Optional[bytes],
     ntfs_sd_bytes: Optional[bytes],
     *,
     principal_sid: str,
     group_sids: Iterable[str],
-) -> Optional[int]:
+) -> Optional[tuple[int, int, int]]:
     """Intersect share SD ∩ NTFS folder-root SD for one principal via winacl.
 
-    Returns the effective file-access mask, or ``None`` when either SD is
-    missing/unparseable (the caller then keeps the ``share_acl_only`` tier).
+    Like :func:`compute_effective_file_mask` but returns the THREE component
+    masks the breakdown is built from: ``(share_mask, ntfs_mask,
+    effective_mask)`` where ``effective_mask = share_mask & ntfs_mask``.
+    Returns ``None`` when either SD is missing/unparseable (the caller then
+    keeps the ``share_acl_only`` tier).
 
-    This is the only function here that imports winacl; it reuses the offline
-    evaluator wrapped at ``vendor/aiosmb/.../utils/faccess.py`` so the
-    intersection semantics match the live ``smbclient`` path exactly.
+    Surfacing the two operands — not just their AND — lets the share-exposure
+    view render "Share: Full Control / NTFS: Read / Effective: Read" so the
+    headline effective access is shown next to the values it was derived from,
+    making an NTFS-restricted share grant legible rather than a bare number.
+
+    This is the only place that imports winacl; it reuses the offline evaluator
+    wrapped at ``vendor/aiosmb/.../utils/faccess.py`` so the intersection
+    semantics match the live ``smbclient`` path exactly.
     """
     if not share_sd_bytes or not ntfs_sd_bytes:
         return None
@@ -331,7 +367,33 @@ def compute_effective_file_mask(
     except Exception:
         return None
 
-    return share_mask & ntfs_mask
+    return share_mask, ntfs_mask, share_mask & ntfs_mask
+
+
+def compute_effective_file_mask(
+    share_sd_bytes: Optional[bytes],
+    ntfs_sd_bytes: Optional[bytes],
+    *,
+    principal_sid: str,
+    group_sids: Iterable[str],
+) -> Optional[int]:
+    """Intersect share SD ∩ NTFS folder-root SD for one principal via winacl.
+
+    Returns the effective file-access mask, or ``None`` when either SD is
+    missing/unparseable (the caller then keeps the ``share_acl_only`` tier).
+
+    Thin wrapper over :func:`compute_effective_file_masks` keeping the
+    single-value contract for callers that only need the AND.
+    """
+    masks = compute_effective_file_masks(
+        share_sd_bytes,
+        ntfs_sd_bytes,
+        principal_sid=principal_sid,
+        group_sids=group_sids,
+    )
+    if masks is None:
+        return None
+    return masks[2]
 
 
 __all__ = [
@@ -345,6 +407,8 @@ __all__ = [
     "effective_mask_has_read",
     "effective_mask_has_write",
     "effective_mask_relations",
+    "mask_to_access_label",
     "hunt_gate_decision",
     "compute_effective_file_mask",
+    "compute_effective_file_masks",
 ]

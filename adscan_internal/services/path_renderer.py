@@ -24,7 +24,10 @@ from __future__ import annotations
 
 from typing import Any, Literal, Mapping, Protocol
 
-from adscan_internal.services.compromise_class import CompromiseClass
+from adscan_internal.services.compromise_class import (
+    CompromiseClass,
+    compromise_reach_label,
+)
 from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
 from adscan_internal.services.edge_phrasing import translate_edge
 from adscan_internal.services.path_state import PathState
@@ -44,6 +47,9 @@ class PathRenderer(Protocol):
 
     def render_class_label(self, cls: CompromiseClass) -> str:
         """Return the short label for a compromise class (badge text)."""
+
+    def render_reach_label(self, cls: CompromiseClass) -> str:
+        """Return the axis-2 Compromise Reach phrase for a path's class."""
 
     def render_state_label(self, state: PathState) -> str:
         """Return the customer-facing label for a path lifecycle state."""
@@ -166,6 +172,13 @@ class TechnicalRenderer:
     def render_class_label(self, cls: CompromiseClass) -> str:
         return cls.cli_badge
 
+    def render_reach_label(self, cls: CompromiseClass) -> str:
+        # Axis 2 (Compromise Reach) — the SAME SSOT phrase the report and web
+        # render, so the operator and the client deliverable agree on what a
+        # path reaches. The CLI keeps its technical badge for the class; the
+        # reach phrase is the shared plain-language axis.
+        return compromise_reach_label(cls)
+
     def render_state_label(self, state: PathState) -> str:
         return _PATH_STATE_TECHNICAL.get(state, state.value)
 
@@ -226,6 +239,11 @@ class ExecutiveRenderer:
 
     def render_class_label(self, cls: CompromiseClass) -> str:
         return _EXECUTIVE_CLASS_LABELS.get(cls, cls.display_label)
+
+    def render_reach_label(self, cls: CompromiseClass) -> str:
+        # Axis 2 (Compromise Reach) — SSOT phrase, shared verbatim with the CLI
+        # and platform so every surface speaks one reach vocabulary.
+        return compromise_reach_label(cls)
 
     def render_state_label(self, state: PathState) -> str:
         return _PATH_STATE_EXECUTIVE.get(state, state.value)

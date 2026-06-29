@@ -148,6 +148,52 @@ def load_workspace_ip_hostname_inventory(
     return inventory
 
 
+def load_workspace_hostname_ip_inventory(
+    *,
+    workspace_dir: str,
+    domains_dir: str,
+    domain: str,
+) -> dict[str, str]:
+    """Load persisted hostname → IP mapping for one domain workspace (reverse).
+
+    Inverts :func:`load_workspace_ip_hostname_inventory` (IP → hostname
+    candidates) into a hostname → IP lookup, so a host→address resolver can
+    answer "what IP does this name live at?" from the same massdns +
+    reachability data that already powers the IP → SPN-hostname path.
+
+    The map is alias-aware: every FQDN candidate is also indexed under its
+    short label (the part before the first dot). When a short label maps to
+    more than one IP (different hosts sharing a short name across subdomains)
+    the FIRST-seen IP wins for the short key, while every FQDN key stays
+    exact — callers that have the FQDN get the precise address, callers with
+    only the short name get a best-effort one. Keys are lowercased and
+    trailing-dot stripped.
+
+    Returns an empty mapping when no inventory is available (best-effort).
+    """
+    ip_to_hosts = load_workspace_ip_hostname_inventory(
+        workspace_dir=workspace_dir,
+        domains_dir=domains_dir,
+        domain=domain,
+    )
+    hostname_to_ip: dict[str, str] = {}
+    for ip_value, hostnames in ip_to_hosts.items():
+        ip_clean = _normalize_ip(ip_value)
+        if not ip_clean:
+            continue
+        for hostname in hostnames:
+            host_clean = _normalize_hostname(hostname).lower()
+            if not host_clean:
+                continue
+            # Exact FQDN / full-name key always reflects the first IP it was
+            # seen at (massdns is ordered live-first by the liveness ranking).
+            hostname_to_ip.setdefault(host_clean, ip_clean)
+            short = host_clean.split(".", 1)[0]
+            if short and short != host_clean:
+                hostname_to_ip.setdefault(short, ip_clean)
+    return hostname_to_ip
+
+
 def register_spn_candidate_resolver_for_shell(shell: Any) -> None:
     """Arm the stale-DNS SPN self-heal for this session (dependency-inversion).
 
@@ -250,4 +296,5 @@ __all__ = [
     "HostnameInventory",
     "choose_hostname_for_kerberos_spn",
     "load_workspace_ip_hostname_inventory",
+    "load_workspace_hostname_ip_inventory",
 ]

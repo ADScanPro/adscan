@@ -529,6 +529,10 @@ def render_smb_exposed_resources_panel(
 
     sorted_hosts = sorted(by_host.items(), key=_host_sort_key)
 
+    # Set when any rendered row's access is share-level only (NTFS unverified),
+    # so the footer can explain the "(share-level only)" marker once.
+    any_unverified = False
+
     # ── Access semantics — severity-coded label per access set ────────────────
     def _access_label(access_set: set[str]) -> tuple[str, str]:
         if "Full Control" in access_set:
@@ -626,13 +630,21 @@ def render_smb_exposed_resources_panel(
                 row.get("access") if isinstance(row.get("access"), set) else set()
             )
             acc_label, acc_style = _access_label(access_set)
+            # A row whose access came only from the raw share-level ACL (NTFS
+            # never verified) may overstate write/full-control — flag it so the
+            # access reads as a lead to confirm, not a confirmed grant.
+            ntfs_unverified = row.get("ntfs_verified") is False
+            access_text = Text(acc_label, style=acc_style)
+            if ntfs_unverified:
+                access_text.append("  (share-level only)", style="dim")
+                any_unverified = True
             via_str = _principals_display(row.get("principals"))
             share_cell = Text()
             share_cell.append("    ", style="dim")  # indent under host
             share_cell.append(share_name, style="white")
             table.add_row(
                 share_cell,
-                Text(acc_label, style=acc_style),
+                access_text,
                 via_str or "-",
             )
 
@@ -642,6 +654,13 @@ def render_smb_exposed_resources_panel(
         console.print(
             "Access shown is this credential's effective access "
             "(share ACL ∩ NTFS, SMB2 MaximalAccess).",
+            style="dim",
+        )
+    if any_unverified:
+        console.print(
+            "Rows marked (share-level only) report the share ACL alone — NTFS "
+            "permissions were not verified, so the access may be lower in "
+            "practice. Review before relying on write/full-control.",
             style="dim",
         )
 

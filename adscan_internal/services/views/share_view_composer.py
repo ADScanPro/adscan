@@ -217,6 +217,16 @@ class ShareViewSet:
           "graph": "loaded" | "missing" | "host_not_found",
         }
     """
+    live_error: Optional[str] = None
+    """The raw live-probe error string for this host, when the probe failed.
+
+    Holds the underlying error (e.g. an NTStatus string like
+    ``NTStatus.ACCOUNT_LOCKED_OUT`` / ``STATUS_LOGON_FAILURE``) so a multi-host
+    sweep can feed it into the shared :class:`SweepLockoutGuard` circuit-breaker
+    and abort on a locked-out / rejected credential instead of re-asserting the
+    lockout against every remaining host. ``None`` when the live probe
+    succeeded or was not run. NOT serialized into ``to_dict`` (provenance, not
+    share data)."""
 
     @property
     def counts(self) -> Dict[str, int]:

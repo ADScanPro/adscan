@@ -913,7 +913,8 @@ def load_membership_snapshot(
         generated_at = data.get("generated_at") if isinstance(data, dict) else None
         print_info_debug(
             f"[membership] snapshot loaded: domain={domain_key} path={path} "
-            f"keys={sorted(snapshot.keys())} domain_sid={domain_sid or 'unset'}"
+            f"keys={sorted(snapshot.keys())} "
+            f"domain_sid={mark_sensitive(domain_sid, 'sid') if domain_sid else 'unset'}"
         )
         if generated_at:
             print_info_debug(

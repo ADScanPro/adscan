@@ -11,12 +11,15 @@ import asyncio
 import subprocess
 import os
 import logging
+import re
 import shlex
 
 from adscan_internal import telemetry
+from adscan_core.rich_output import print_info_debug
 from adscan_internal.command_runner import CommandSpec, default_runner
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.core import CredentialFoundEvent
+from adscan_internal.execution_outcomes import output_has_timeout_marker
 from adscan_internal.integrations.impacket.parsers import (
     extract_kerberoast_candidate_users,
     parse_asreproast_output,
@@ -29,6 +32,11 @@ from adscan_internal.subprocess_env import (
 
 
 logger = logging.getLogger(__name__)
+
+_NETEXEC_NEGATIVE_AUTH_LINE_RE = re.compile(
+    r"\[-\]\s+(?P<principal>[^\s]+(?:\\|/)[^:\s]+):",
+    re.IGNORECASE,
+)
 
 CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str] | None]
 
@@ -102,6 +110,23 @@ async def _diagnose_kdc_unreachable(*, kdc_ip: str, original_error: str) -> str:
     return f"Kerberos transport error (TCP/88 reachable on {kdc_ip}): {original_error}"
 
 
+def _walk_exc_chain(exc: BaseException, *, max_depth: int = 10) -> list[BaseException]:
+    """Return the exception and its ``__cause__`` / ``__context__`` chain.
+
+    Bounded to ``max_depth`` to guard against cyclic chains. Used to classify a
+    bind failure (definitive credential rejection vs transport/policy) across
+    the whole nested chain badldap/aiosmb may raise.
+    """
+    seen: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and len(seen) < max_depth:
+        if current in seen:
+            break
+        seen.append(current)
+        current = current.__cause__ or current.__context__
+    return seen
+
+
 class CredentialStatus(str, Enum):
     """Status of credential verification."""
 
@@ -129,6 +154,9 @@ class CredentialVerificationResult:
         error_message: Error message if verification failed
         is_admin: Whether account has admin privileges (if detected)
         raw_output: Raw tool output when available (not serialized for security)
+        protocol_used: Which transport actually produced the verdict
+            ("kerberos", "ntlm-ldap", "ntlm-smb"). Lets the caller render an
+            accurate Protocol label instead of a hardcoded one.
     """
 
     status: CredentialStatus
@@ -137,6 +165,7 @@ class CredentialVerificationResult:
     credential_type: str = "password"
     error_message: Optional[str] = None
     is_admin: bool = False
+    protocol_used: str = "kerberos"
     # Raw command output is kept for in-process consumers (e.g. CLI) but is
     # intentionally excluded from serialized representations to avoid leaking
     # potentially sensitive information.
@@ -231,6 +260,7 @@ class CredentialService(BaseService):
         username: str,
         credential: str,
         credential_type: str,
+        posture_snapshot: Any = None,
     ) -> "CredentialVerificationResult":
         """Verify a domain credential by requesting a Kerberos TGT via kerbad.
 
@@ -241,9 +271,19 @@ class CredentialService(BaseService):
         ``result.raw_output`` field (bytes, not str) so the caller can persist
         the ticket immediately without an extra round-trip.
 
-        Falls through to ``ERROR`` only for genuinely unexpected transport
-        failures (network unreachable, etc.) — the caller should then fall back
-        to the netexec path if appropriate.
+        No-verdict recovery: when the KDC is unreachable (port 88 filtered /
+        transport error) Kerberos reaches NO verdict at all. In that case ONLY —
+        never when Kerberos returned a definitive auth answer — and only for an
+        NTLM-native secret (password / NT hash), we attempt ONE NTLM bind
+        (LDAP/389 first, SMB/445 backstop) to validate the credential without
+        the KDC. This is the recovery the historic, deleted NetExec fallback
+        botched: that fallback fired on EVERY failure and second-guessed real
+        Kerberos verdicts. This one fires only on the no-verdict case. See
+        :meth:`_verify_via_ntlm`.
+
+        ``posture_snapshot`` (a ``DomainPosture``) gates the NTLM fallback: it
+        is skipped when ``NTLM_AUTHENTICATION`` is known-DISABLED, and threaded
+        into the transport configs for auth-plan pruning.
         """
         from adscan_internal.services.kerberos_transport import (
             KerberosAuthError,
@@ -304,7 +344,22 @@ class CredentialService(BaseService):
             except KerberosPrincipalError:
                 return _fail(CredentialStatus.USER_NOT_FOUND, "User not found")
             except KerberosTransportError as exc:
-                return _fail(CredentialStatus.ERROR, str(exc))
+                # No-verdict transport failure on the AES retry — same recovery
+                # as the outer branch: try NTLM (LDAP then SMB) before giving up.
+                ntlm_result = await self._verify_via_ntlm(
+                    domain=domain,
+                    target_ip=kdc_ip,
+                    username=username,
+                    credential=credential,
+                    credential_type=credential_type,
+                    posture_snapshot=posture_snapshot,
+                )
+                if ntlm_result is not None:
+                    return ntlm_result
+                diagnosis = await _diagnose_kdc_unreachable(
+                    kdc_ip=kdc_ip, original_error=str(exc)
+                )
+                return _fail(CredentialStatus.ERROR, diagnosis)
 
         except KerberosPrincipalError:
             return _fail(CredentialStatus.USER_NOT_FOUND, "User not found")
@@ -341,12 +396,27 @@ class CredentialService(BaseService):
             return _fail(CredentialStatus.ERROR, "Clock skew too large — sync clocks and retry")
 
         except KerberosTransportError as exc:
-            # Port 88 unreachable, DNS failure, etc. Enrich the error with a
-            # native TCP probe so the operator gets a precise diagnosis
-            # ("filtered" vs "closed" vs "reachable but failing") instead of
-            # a generic transport string. Replaces the historic NetExec LDAP
-            # fallback — that path silently disagreed with Kerberos's verdict
-            # and was deleted.
+            # Port 88 unreachable, DNS failure, etc. This is the NO-VERDICT
+            # case: Kerberos never reached the credential check, so trying NTLM
+            # here does NOT second-guess a real Kerberos answer (unlike the
+            # deleted NetExec fallback, which fired on every failure). When the
+            # secret is NTLM-native and a non-Kerberos auth port is reachable,
+            # one NTLM bind validates it without the KDC.
+            ntlm_result = await self._verify_via_ntlm(
+                domain=domain,
+                target_ip=kdc_ip,
+                username=username,
+                credential=credential,
+                credential_type=credential_type,
+                posture_snapshot=posture_snapshot,
+            )
+            if ntlm_result is not None:
+                return ntlm_result
+
+            # NTLM was disabled, not applicable, or also unreachable. Keep the
+            # precise KDC diagnosis ("filtered" vs "closed" vs reachable-but-
+            # failing) — it is the correct verdict when no transport could
+            # validate the credential.
             diagnosis = await _diagnose_kdc_unreachable(
                 kdc_ip=kdc_ip, original_error=str(exc)
             )
@@ -355,6 +425,282 @@ class CredentialService(BaseService):
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             return _fail(CredentialStatus.ERROR, str(exc))
+
+    async def _verify_via_ntlm(
+        self,
+        *,
+        domain: str,
+        target_ip: str,
+        username: str,
+        credential: str,
+        credential_type: str,
+        posture_snapshot: Any = None,
+    ) -> "Optional[CredentialVerificationResult]":
+        """Validate an NTLM-native credential via a single NTLM bind.
+
+        Recovery path for the KDC-unreachable / no-verdict case: tries LDAP/389
+        NTLM first (cheapest, most permissive), then SMB/445 as a backstop. A
+        successful bind on either → :class:`CredentialStatus.VALID`. An NTLM
+        transport that is itself definitive about the credential (the bind
+        completed and the server rejected the password) → ``INVALID``; that is
+        a real NTLM verdict and is trusted (it is no longer the no-verdict
+        case). When NTLM cannot be used at all, returns ``None`` so the caller
+        keeps the precise KDC diagnosis:
+
+        - the secret is not NTLM-native (a ccache / AES key / SPN-only artifact);
+        - ``NTLM_AUTHENTICATION`` posture is known-DISABLED;
+        - both NTLM transports were also unreachable (no port answered).
+
+        Never raises — any unexpected error is captured and returns ``None``.
+
+        Args:
+            domain: Target domain the credential belongs to.
+            target_ip: DC / host to bind against (LDAP 389, SMB 445).
+            username: sAMAccountName to authenticate as.
+            credential: The secret (password or NT hash).
+            credential_type: ``"password"`` or ``"hash"``.
+            posture_snapshot: ``DomainPosture`` for the target domain; gates
+                NTLM and is threaded into the transport configs for pruning.
+
+        Returns:
+            A VALID/INVALID result when NTLM produced a verdict; ``None`` when
+            NTLM could not be attempted or was also unreachable.
+        """
+        # NTLM bind only accepts a password or an NT hash — never a ccache, an
+        # AES key, or any capability-bearing artifact. AES-only credentials are
+        # not NTLM-native (NTLM derives from the NT hash, not the AES key).
+        if credential_type not in ("password", "hash"):
+            return None
+
+        # Posture gate: do not spend an NTLM bind when the DC is known to reject
+        # NTLM. A known-DISABLED verdict is the only reason to skip — UNKNOWN /
+        # ENABLED both allow the attempt (observe, do not infer).
+        if self._ntlm_known_disabled(posture_snapshot):
+            print_info_debug(
+                "[verify] NTLM fallback skipped: NTLM_AUTHENTICATION is "
+                "known-disabled for this domain."
+            )
+            return None
+
+        nt_hash = credential if credential_type == "hash" else None
+        password = credential if credential_type == "password" else None
+
+        ldap_result = await self._verify_via_ntlm_ldap(
+            domain=domain,
+            target_ip=target_ip,
+            username=username,
+            password=password,
+            nt_hash=nt_hash,
+            credential_type=credential_type,
+            posture_snapshot=posture_snapshot,
+        )
+        if ldap_result is not None:
+            return ldap_result
+
+        return await self._verify_via_ntlm_smb(
+            domain=domain,
+            target_ip=target_ip,
+            username=username,
+            password=password,
+            nt_hash=nt_hash,
+            credential_type=credential_type,
+            posture_snapshot=posture_snapshot,
+        )
+
+    @staticmethod
+    def _ntlm_known_disabled(posture_snapshot: Any) -> bool:
+        """Return True only when NTLM_AUTHENTICATION is recorded DISABLED HIGH.
+
+        Observe-don't-infer: an UNKNOWN / LOW-confidence record never blocks the
+        attempt. Never raises.
+        """
+        if posture_snapshot is None:
+            return False
+        try:
+            from adscan_internal.services.domain_posture import (
+                ConstraintCategory,
+                SignalConfidence,
+                TriState,
+            )
+
+            state = posture_snapshot.get(ConstraintCategory.NTLM_AUTHENTICATION)
+            return bool(
+                state
+                and state.state is TriState.DISABLED
+                and state.confidence is SignalConfidence.HIGH
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _verify_via_ntlm_ldap(
+        self,
+        *,
+        domain: str,
+        target_ip: str,
+        username: str,
+        password: Optional[str],
+        nt_hash: Optional[str],
+        credential_type: str,
+        posture_snapshot: Any = None,
+    ) -> "Optional[CredentialVerificationResult]":
+        """Attempt one NTLM LDAP bind. See :meth:`_verify_via_ntlm` for contract."""
+        from adscan_internal.services import ldap_transport_service as _ldap_mod
+
+        try:
+            # ADscanLDAPConfig has no dedicated nt_hash field: an NT hash placed
+            # in ``password`` is auto-routed to the ``ntlm-nt`` (pass-the-hash)
+            # auth kind by ``_is_nt_hash`` inside the transport.
+            cfg = _ldap_mod.ADscanLDAPConfig(
+                domain=domain,
+                dc_ip=target_ip,
+                use_ldaps=True,  # fallback downgrades to LDAP/389 automatically
+                use_kerberos=False,
+                username=username,
+                password=(nt_hash or password or ""),
+                posture_snapshot=posture_snapshot,
+            )
+            result = await _ldap_mod.async_connect_with_ldap_fallback(
+                cfg, bind_only=True
+            )
+            client = result.client
+            try:
+                if client is not None:
+                    await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            print_info_debug(
+                "[verify] credential validated via NTLM LDAP bind "
+                "(Kerberos KDC was unreachable)."
+            )
+            return CredentialVerificationResult(
+                status=CredentialStatus.VALID,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message=(
+                    "Validated via NTLM (LDAP); Kerberos KDC unreachable, no TGT minted."
+                ),
+                protocol_used="ntlm-ldap",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Transport failure (LDAP also unreachable) → no verdict here; let
+            # the SMB backstop try. A definitive bind rejection → NTLM verdict.
+            if _ldap_mod.is_ldaps_transport_failure(exc):
+                print_info_debug(
+                    f"[verify] NTLM LDAP bind unreachable: {type(exc).__name__}; "
+                    "trying SMB backstop."
+                )
+                return None
+            if self._is_ntlm_bind_rejection(exc):
+                print_info_debug(
+                    "[verify] NTLM LDAP bind rejected the credential — "
+                    "definitive INVALID verdict."
+                )
+                return CredentialVerificationResult(
+                    status=CredentialStatus.INVALID,
+                    username=username,
+                    domain=domain,
+                    credential_type=credential_type,
+                    error_message="Invalid credentials (validated via NTLM/LDAP)",
+                    protocol_used="ntlm-ldap",
+                )
+            # Anything we cannot classify (e.g. strongerAuthRequired / channel
+            # binding) is not a credential verdict — fall through to SMB.
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[verify] NTLM LDAP bind inconclusive: {type(exc).__name__}: {exc}; "
+                "trying SMB backstop."
+            )
+            return None
+
+    async def _verify_via_ntlm_smb(
+        self,
+        *,
+        domain: str,
+        target_ip: str,
+        username: str,
+        password: Optional[str],
+        nt_hash: Optional[str],
+        credential_type: str,
+        posture_snapshot: Any = None,
+    ) -> "Optional[CredentialVerificationResult]":
+        """Attempt one NTLM SMB bind (445). See :meth:`_verify_via_ntlm`."""
+        try:
+            from adscan_internal.services.smb_transport import (
+                SMBAuthError,
+                SMBConfig,
+                smb_machine_for,
+            )
+
+            cfg = SMBConfig(
+                target_ip=target_ip,
+                domain=domain,
+                auth_domain=domain,
+                username=username,
+                password=password,
+                nt_hash=nt_hash,
+                use_kerberos=False,
+                posture_snapshot=posture_snapshot,
+            )
+            async with smb_machine_for(cfg):
+                # Connecting + logging in is the verification; reaching here means
+                # the server accepted the credential.
+                pass
+            print_info_debug(
+                "[verify] credential validated via NTLM SMB bind "
+                "(Kerberos KDC was unreachable)."
+            )
+            return CredentialVerificationResult(
+                status=CredentialStatus.VALID,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message=(
+                    "Validated via NTLM (SMB); Kerberos KDC unreachable, no TGT minted."
+                ),
+                protocol_used="ntlm-smb",
+            )
+        except SMBAuthError:
+            print_info_debug(
+                "[verify] NTLM SMB bind rejected the credential — "
+                "definitive INVALID verdict."
+            )
+            return CredentialVerificationResult(
+                status=CredentialStatus.INVALID,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Invalid credentials (validated via NTLM/SMB)",
+                protocol_used="ntlm-smb",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # SMB also unreachable / inconclusive → no verdict; the caller keeps
+            # the precise KDC-filtered diagnosis.
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[verify] NTLM SMB bind unreachable/inconclusive: "
+                f"{type(exc).__name__}: {exc}."
+            )
+            return None
+
+    @staticmethod
+    def _is_ntlm_bind_rejection(exc: BaseException) -> bool:
+        """Return whether an LDAP exception is a definitive NTLM credential rejection.
+
+        A completed bind that the DC rejected with ``invalidCredentials`` /
+        ``SEC_E_LOGON_DENIED`` (the badldap shapes for a bad NTLM password) is a
+        real verdict. ``strongerAuthRequired`` / ``SEC_E_BAD_BINDINGS`` are
+        signing/channel-binding policy, NOT a credential verdict, so they are
+        excluded — those mean "this transport could not carry the bind", which
+        is inconclusive, not INVALID.
+        """
+        text = " ".join(
+            f"{type(c).__name__}: {c}".lower()
+            for c in _walk_exc_chain(exc)
+        )
+        if "strongerauthrequired" in text or "sec_e_bad_bindings" in text:
+            return False
+        return "invalidcredentials" in text or "sec_e_logon_denied" in text
 
     async def _ldap_get_account_status(
         self,
@@ -413,11 +759,15 @@ class CredentialService(BaseService):
         username: str,
         credential: str,
         credential_type: str,
+        posture_snapshot: Any = None,
     ) -> "CredentialVerificationResult":
         """Sync wrapper for :meth:`_verify_via_kerberos`.
 
         Detects whether an event loop is already running (lab runner, test
         harness) and dispatches to a worker thread to avoid nested-loop errors.
+
+        ``posture_snapshot`` is forwarded to gate the KDC-unreachable NTLM
+        fallback (skipped when NTLM is known-disabled).
         """
         import concurrent.futures
 
@@ -427,6 +777,7 @@ class CredentialService(BaseService):
             username=username,
             credential=credential,
             credential_type=credential_type,
+            posture_snapshot=posture_snapshot,
         )
         try:
             asyncio.get_running_loop()
@@ -947,7 +1298,7 @@ class CredentialService(BaseService):
 
             output = (result.stdout or "") + (result.stderr or "")
 
-            verification_result = self._parse_verification_output(  # pylint: disable=no-member
+            verification_result = self._parse_verification_output(
                 output, username, domain, credential_type
             )
             verification_result.raw_output = output
@@ -1036,6 +1387,158 @@ class CredentialService(BaseService):
                 credential_type=credential_type,
                 error_message=str(e),
             )
+
+    def _parse_verification_output(
+        self,
+        output: str,
+        username: str,
+        domain: str,
+        credential_type: str,
+    ) -> CredentialVerificationResult:
+        """Parse NetExec verification output.
+
+        Args:
+            output: Command output
+            username: Username tested
+            domain: Domain tested
+            credential_type: Type of credential
+
+        Returns:
+            CredentialVerificationResult
+        """
+        # Check for various status codes
+        if output_has_timeout_marker(output):
+            return CredentialVerificationResult(
+                status=CredentialStatus.TIMEOUT,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message=(
+                    "NetExec command timed out. Verify VPN/network connectivity and retry."
+                ),
+            )
+
+        if "STATUS_LOGON_FAILURE" in output:
+            return CredentialVerificationResult(
+                status=CredentialStatus.INVALID,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Incorrect credentials",
+            )
+
+        if "STATUS_ACCOUNT_LOCKED_OUT" in output:
+            return CredentialVerificationResult(
+                status=CredentialStatus.ACCOUNT_LOCKED,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Account locked out",
+            )
+
+        if "STATUS_ACCOUNT_DISABLED" in output:
+            return CredentialVerificationResult(
+                status=CredentialStatus.ACCOUNT_DISABLED,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Account disabled",
+            )
+
+        if "STATUS_ACCOUNT_RESTRICTION" in output:
+            return CredentialVerificationResult(
+                status=CredentialStatus.ACCOUNT_RESTRICTION,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Account restricted",
+            )
+
+        if "STATUS_PASSWORD_EXPIRED" in output:
+            return CredentialVerificationResult(
+                status=CredentialStatus.PASSWORD_EXPIRED,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Password expired",
+            )
+
+        if "KDC_ERR_KEY_EXPIRED" in output or "STATUS_PASSWORD_MUST_CHANGE" in output:
+            return CredentialVerificationResult(
+                status=CredentialStatus.PASSWORD_MUST_CHANGE,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Password must be changed before logon",
+            )
+
+        if "KDC_ERR_C_PRINCIPAL_UNKNOWN" in output:
+            return CredentialVerificationResult(
+                status=CredentialStatus.USER_NOT_FOUND,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="User not found",
+            )
+
+        if "KDC_ERR_PREAUTH_FAILED" in output:
+            return CredentialVerificationResult(
+                status=CredentialStatus.INVALID,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Pre-authentication failed",
+            )
+
+        if self._contains_negative_auth_result(output, username, domain):
+            return CredentialVerificationResult(
+                status=CredentialStatus.INVALID,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message="Incorrect credentials",
+            )
+
+        # Check for success
+        if "[+]" in output:
+            is_admin = "(Pwn3d!)" in output
+            return CredentialVerificationResult(
+                status=CredentialStatus.VALID,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                is_admin=is_admin,
+            )
+
+        # Unknown status
+        return CredentialVerificationResult(
+            status=CredentialStatus.ERROR,
+            username=username,
+            domain=domain,
+            credential_type=credential_type,
+            error_message="Unknown verification result",
+        )
+
+    @staticmethod
+    def _contains_negative_auth_result(output: str, username: str, domain: str) -> bool:
+        """Return True when NetExec emitted a generic failed-auth line.
+
+        NetExec often returns ``0`` even when LDAP/SMB auth fails, and for some
+        protocols it emits only a generic ``[-] domain\\user:secret`` line
+        without a more specific status code such as ``STATUS_LOGON_FAILURE``.
+        Treat those lines as invalid credentials when they match the tested
+        principal so the CLI does not downgrade them to an opaque error.
+        """
+
+        expected_principals = {
+            f"{domain}\\{username}".lower(),
+            f"{domain}/{username}".lower(),
+            username.lower(),
+        }
+        for match in _NETEXEC_NEGATIVE_AUTH_LINE_RE.finditer(output):
+            if match.group("principal").lower() in expected_principals:
+                return True
+        return False
 
     def execute_password_spraying(
         self,

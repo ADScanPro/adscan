@@ -48,6 +48,7 @@ contract that the MITRE Navigator reader depends on — do not change them.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -214,12 +215,34 @@ def _load_technical_report(shell: ReportShell) -> dict[str, Any]:
 
 
 def _save_technical_report(shell: ReportShell, report: dict[str, Any]) -> None:
-    """Persist the technical report JSON to disk."""
+    """Persist the technical report JSON to disk atomically.
+
+    The write goes to a sibling temp file first, then is promoted with
+    ``os.replace`` (a POSIX-atomic same-filesystem rename). A concurrent reader
+    therefore always sees a COMPLETE old or new ``technical_report.json`` and
+    NEVER a half-written file. This matters because the report is regenerated
+    during the Reporting phase while the web live-ingestion tick reads it: a
+    non-atomic write let the reader observe a partial file, raising
+    ``json.JSONDecodeError`` and (downstream) driving false finding remediation.
+    Mirrors the ``.tmp.docx`` + replace pattern the PRO report service already
+    uses for the DOCX.
+    """
     report_path = _get_technical_report_path(shell)
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        with report_path.open("w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
+        tmp_path = report_path.with_name(report_path.name + ".tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, report_path)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error("Error saving technical report.")
@@ -436,6 +459,36 @@ def record_control_evidence(
         for item in evidence:
             _append_unique(entry["evidence"], item)
 
+    _save_technical_report(shell, report)
+
+
+def record_collection_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    coverage: dict[str, Any],
+) -> None:
+    """Persist the collection-coverage statement for *domain*.
+
+    Write-side single source of truth for the audit-defensible coverage statement
+    when the operator stops the per-host SMB enrichment sweep early (CLI Ctrl+C or
+    the platform button). The identity graph is always complete; this records the
+    host-enrichment X-of-Y so the PDF report AND ``adscan_web`` render the SAME
+    transparent statement (the scan continued with partial host data — the rest
+    were queued, not silently dropped).
+
+    ``coverage`` carries ``identity_graph_complete`` (bool), ``hosts_swept``,
+    ``hosts_total``, ``hosts_remaining``, ``ordering``, ``stopped_by`` and a
+    rendered ``statement``. Mirrors :func:`record_exposure_score`: stamps the
+    value onto ``domains[<domain>]["collection_coverage"]`` so the JSON export
+    carries it and downstream consumers read it instead of recomputing. Best-
+    effort: ignores a missing/invalid payload and never raises into the caller.
+    """
+    if not domain or not isinstance(coverage, dict) or "statement" not in coverage:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry["collection_coverage"] = coverage
     _save_technical_report(shell, report)
 
 

@@ -36,6 +36,17 @@ from adscan_internal.subprocess_env import get_clean_env_for_compilation
 logger = logging.getLogger(__name__)
 
 
+# Per-foreign-domain LDAP connect budget for trust BFS. A partner DC that is
+# unreachable from our vantage, or a foreign/trust realm whose AES-only KDC the
+# current credential cannot authenticate to, must NOT hang the trust phase for
+# the kerbad/transport defaults (observed ~77-90s per dead domain in the field).
+# 8s covers a legitimate LDAPS+bind round-trip even over VPN (≈2-3 RTT TLS + a
+# bind at 300-500ms RTT; see adscan-ad-constraints § 7bis) while failing a dead
+# realm fast. Bounds BOTH the Kerberos AS-REQ pre-mint and the LDAPS/LDAP
+# connect inside ``ADscanLDAPConnection``.
+_TRUST_FOREIGN_CONNECT_TIMEOUT_S: float = 8.0
+
+
 @dataclass
 class TrustRelationship:
     """Represents a domain trust relationship.
@@ -111,11 +122,18 @@ class DomainService(BaseService):
         progress_cb: Optional[Callable[[Any], None]] = None,
         posture_sink: Optional[PostureSink] = None,
         posture_snapshot: Optional[DomainPosture] = None,
+        allowed_partner_domains: Optional[set] = None,
     ) -> TrustEnumerationResult:
         """Enumerate trusts recursively over native badldap.
 
         BFS expands across all reachable partner domains, opening a fresh
         LDAP connection per domain (with built-in LDAPS→LDAP fallback).
+
+        When ``allowed_partner_domains`` is provided (lower-cased domain names),
+        the BFS only expands INTO those partner domains — the source domain is
+        always enumerated, and discovered trusts to non-listed partners are
+        still recorded, but ADscan does not recurse into them. ``None`` (the
+        default) enumerates every reachable partner, exactly as before.
 
         Args:
             domain: Source domain to enumerate.
@@ -222,7 +240,9 @@ class DomainService(BaseService):
                         pdc=current_pdc,
                     )
                 )
-                with ADscanLDAPConnection(ldap_cfg) as conn:
+                with ADscanLDAPConnection(
+                    ldap_cfg, connect_timeout=_TRUST_FOREIGN_CONNECT_TIMEOUT_S
+                ) as conn:
                     entries = query_trusted_domains(conn, ldap_cfg.domain_dn)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
@@ -296,7 +316,16 @@ class DomainService(BaseService):
                 )
 
                 should_enqueue = True
-                if partner_pdc and check_domain_reachability is not None:
+                # Scope the BFS expansion to the configured partner allowlist
+                # (trust_enumeration.policy == "selected"). The trust to this
+                # partner is still recorded above; we just do not recurse into a
+                # partner the operator did not select.
+                if (
+                    allowed_partner_domains is not None
+                    and partner.strip().lower() not in allowed_partner_domains
+                ):
+                    should_enqueue = False
+                if should_enqueue and partner_pdc and check_domain_reachability is not None:
                     try:
                         connectivity = check_domain_reachability(
                             partner, partner_pdc, current_domain
@@ -343,6 +372,30 @@ class DomainService(BaseService):
     @staticmethod
     def _summarize_ldap_error(exc: BaseException) -> str:
         """Compress an LDAP/Kerberos exception chain into one user line."""
+        from adscan_internal.services.auth_error_classification import (
+            is_unreachable_foreign_realm_error,
+        )
+
+        # A foreign/trust realm whose KDC the current credential cannot
+        # authenticate against (cross-forest AES-only KDC, no shared trust key)
+        # surfaces TWO cryptic ways from ONE root cause — a ``None`` Kerberos
+        # ticket: the ``encoded_data must be a byte string, not NoneType`` asn1
+        # ``TypeError`` and the ``KDC_ERR_ETYPE_NOTSUPP`` / preauth-failed
+        # ``KerberosError``. Collapse both into one clean line (routed to the
+        # summary's ``preauth`` remediation branch) instead of leaking the raw
+        # asn1 message or a Kerberos traceback. There is no recovery here — the
+        # realm is genuinely out of reach with this credential.
+        if is_unreachable_foreign_realm_error(exc):
+            return (
+                "not reachable with the current credential "
+                "(cross-realm Kerberos auth unavailable)"
+            )
+        # Fast-fail connect budget hit (dead partner DC / firewalled port). The
+        # bounded ``ADscanLDAPConnection`` surfaces a bare ``TimeoutError`` whose
+        # ``str()`` is empty, so key on the type before the text checks below.
+        # (Py3.11+: asyncio.TimeoutError is an alias of the builtin TimeoutError.)
+        if isinstance(exc, TimeoutError):
+            return "timeout (partner DC unreachable from current vantage)"
         text = str(exc or "")
         lower = text.lower()
         if "signing" in lower or "strongerauth" in lower:
@@ -364,6 +417,14 @@ class DomainService(BaseService):
         ):
             return "DC unreachable"
         if "kerberos" in lower or "krb_ap_err" in lower or "gssapi" in lower:
+            # Surface the actual KDC error code so the operator can judge
+            # recoverability (clock-skew vs unknown-SPN vs unsupported-etype vs
+            # unreachable). ``KerberosError`` carries ``.errorcode`` whose
+            # ``.name`` is the wire code (e.g. KDC_ERR_S_PRINCIPAL_UNKNOWN).
+            errorcode = getattr(exc, "errorcode", None)
+            code_name = getattr(errorcode, "name", None)
+            if code_name:
+                return f"Kerberos error: {code_name}"
             return f"Kerberos error: {type(exc).__name__}"
         # Compact fallback
         compact = text.strip().splitlines()[0] if text.strip() else type(exc).__name__

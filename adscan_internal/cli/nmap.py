@@ -16,6 +16,7 @@ import shlex
 import shutil
 import csv
 import ipaddress
+import time
 from datetime import datetime, timezone
 from typing import Literal, Protocol
 import json
@@ -37,7 +38,7 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
-from adscan_internal.cli.ci_events import emit_event
+from adscan_internal.cli.ci_events import emit_event, emit_operation_progress
 from adscan_internal.cli.target_scope_warning import confirm_large_target_scope
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.workspaces import domain_subpath
@@ -1327,6 +1328,9 @@ def _stream_nmap_scan_into_dashboard(
     command: str,
     timeout_seconds: int | None,
     dashboard: "ProgressDashboard",
+    domain: str = "",
+    total_hosts: int | None = None,
+    emit_terminal_done: bool = True,
 ) -> _StreamingScanResult | None:
     """Spawn an Nmap scan and drive the dashboard from its live stdout.
 
@@ -1343,6 +1347,21 @@ def _stream_nmap_scan_into_dashboard(
         command: Full Nmap command string (already shell-quoted).
         timeout_seconds: Wall-clock budget, or ``None`` for no limit.
         dashboard: Live dashboard to drive.
+        domain: Domain surfaced as the operation event's ``detail``.
+        total_hosts: Number of hosts queued for the scan (the IP-file line
+            count). When known, the structured ``port_scan`` operation event is
+            DETERMINATE — ``total=total_hosts`` with a monotonic
+            ``current=<hosts scanned>`` derived from Nmap's own reported
+            progress — so the platform renders an honest "X of Y hosts" bar
+            instead of an indeterminate strip. When ``None``, the event stays
+            indeterminate (monotonic ``current``, no ``total``).
+        emit_terminal_done: When ``True`` (default), the single terminal
+            ``done=True`` tick (``current=total``, ``percent=100``) is emitted
+            after the scan loop ends. The orchestrator sets this ``False`` for a
+            FIRST attempt that may still be retried under sudo — a failed
+            privilege-denied attempt must NOT latch the web widget as complete.
+            The retried (final) attempt then owns the single terminal tick. See
+            :func:`_run_important_port_scan_with_dashboard`.
 
     Returns:
         A :class:`_StreamingScanResult` on completion, or ``None`` if the
@@ -1353,6 +1372,76 @@ def _stream_nmap_scan_into_dashboard(
     setattr(shell, "_last_run_command_error", None)
 
     hosts_with_open_ports: set[str] = set()
+    # Live current-operation telemetry — mirror the dashboard's forward motion
+    # into the structured event stream so the platform shows "Port scan: X of Y
+    # hosts" live, not just at completion. Throttled to ~1.5s so a 12-port scan
+    # of 1-2k hosts never floods the event channel (no-saturation directive).
+    #
+    # DETERMINATE when ``total_hosts`` is known: ``current`` is the count of
+    # hosts SCANNED so far, derived from Nmap's own reported "About X% done"
+    # against the queued host total, and kept MONOTONIC so the platform's bar
+    # only ever advances. We MUST NOT emit ``done=True`` (nor ``percent=100``)
+    # on any of these mid-scan ticks — a premature done event makes the web
+    # treat the operation as finished and hide every later tick. The single
+    # terminal ``done=True`` is emitted once after the scan loop ends (below).
+    _op_state: dict[str, float | None] = {
+        "last_emit": 0.0,
+        "last_percent": None,
+        "last_current": 0.0,
+    }
+
+    def _scanned_hosts_from_percent() -> int | None:
+        """Monotonic hosts-scanned count from Nmap's reported percent.
+
+        Returns ``None`` when no total is known (indeterminate operation) so the
+        caller falls back to a bare monotonic ``current``.
+        """
+        if not total_hosts or total_hosts <= 0:
+            return None
+        pct = _op_state["last_percent"]
+        derived = 0.0 if pct is None else (float(pct) / 100.0) * float(total_hosts)
+        # Clamp BELOW the total mid-scan: the terminal done tick owns "Y of Y".
+        derived = max(0.0, min(derived, float(total_hosts - 1)))
+        # Never regress (Nmap's per-target % can wobble); the bar only advances.
+        if derived < float(_op_state["last_current"] or 0.0):
+            derived = float(_op_state["last_current"] or 0.0)
+        _op_state["last_current"] = derived
+        return int(derived)
+
+    def _maybe_emit_port_scan_progress(percent: float | None) -> None:
+        now = time.time()
+        if percent is not None:
+            _op_state["last_percent"] = percent
+        last_emit = _op_state["last_emit"] or 0.0
+        if now - last_emit < 1.5:
+            return
+        _op_state["last_emit"] = now
+        try:
+            # Reuse the dashboard's OWN rate / ETA / elapsed (same numbers the
+            # CLI rich.live panel renders) so the platform's live strip matches
+            # the terminal. Nmap is an opaque subprocess: its ETA is the tool's
+            # reported ``ETC`` (exposed via the dashboard's eta_seconds in
+            # indeterminate mode); rate is the host-discovery rate.
+            rate = dashboard.rate
+            scanned = _scanned_hosts_from_percent()
+            emit_operation_progress(
+                operation="port_scan",
+                label="Port scan",
+                phase="domain_analysis",
+                phase_label="Domain Intelligence",
+                # Determinate "X of Y hosts" when total is known; otherwise a
+                # bare monotonic count of hosts with open ports found so far.
+                current=scanned if scanned is not None else (len(hosts_with_open_ports) or None),
+                total=total_hosts if (total_hosts and total_hosts > 0) else None,
+                percent=_op_state["last_percent"],
+                rate=rate if rate > 0 else None,
+                eta_seconds=dashboard.eta_seconds,
+                elapsed_seconds=dashboard.elapsed,
+                detail=domain or None,
+                # NEVER done here — only the terminal tick after the loop is done.
+            )
+        except Exception:  # noqa: BLE001 -- telemetry must not abort scan
+            pass
 
     def _on_line(line: str) -> None:
         parsed = _parse_nmap_discovered_port(line)
@@ -1373,6 +1462,7 @@ def _stream_nmap_scan_into_dashboard(
                     dashboard.update(done=len(hosts_with_open_ports), last=host_ip)
                 except Exception:  # noqa: BLE001 -- render must not abort scan
                     pass
+                _maybe_emit_port_scan_progress(None)
 
         percent, eta_seconds = _parse_nmap_timing_progress(line)
         if percent is not None or eta_seconds is not None:
@@ -1382,18 +1472,85 @@ def _stream_nmap_scan_into_dashboard(
                 )
             except Exception:  # noqa: BLE001 -- render must not abort scan
                 pass
+            _maybe_emit_port_scan_progress(percent)
 
     def _on_timeout() -> None:
         # Mirror run_command's timeout signalling so the recovery prompt fires.
         setattr(shell, "_last_run_command_error", ("timeout", command))
 
-    return stream_command_lines(
+    result = stream_command_lines(
         shell.spawn_command,
         command=command,
         timeout_seconds=timeout_seconds,
         on_line=_on_line,
         on_timeout=_on_timeout,
     )
+
+    # The scan loop has ended — emit one TERMINAL done tick so the platform's
+    # live "Port scan" strip clears immediately instead of freezing on its last
+    # progress event (the operation finishes inside ``domain_analysis`` while
+    # that phase keeps running its later sub-steps, so a phase-supersede clear
+    # alone would never fire). Best-effort: telemetry must never abort the scan.
+    #
+    # SUPPRESSED on a to-be-retried first attempt (``emit_terminal_done=False``).
+    # A privilege-denied first attempt that is about to re-spawn under sudo must
+    # NOT emit ``done=True`` (it would arrive at elapsed ~0 with
+    # ``current=total``/``percent=100`` and the web widget would latch the whole
+    # operation complete, then ignore the real sudo-retry progress). The retried
+    # FINAL attempt owns the single terminal tick instead.
+    if not emit_terminal_done:
+        return result
+    _emit_port_scan_terminal_done(
+        dashboard,
+        total_hosts=total_hosts,
+        domain=domain,
+        hosts_found=len(hosts_with_open_ports),
+    )
+    return result
+
+
+def _emit_port_scan_terminal_done(
+    dashboard: "ProgressDashboard",
+    *,
+    total_hosts: int | None,
+    domain: str,
+    hosts_found: int,
+) -> None:
+    """Emit the single TERMINAL ``done=True`` tick for the port-scan operation.
+
+    This is the ONLY ``done=True`` event for the whole ``port_scan`` operation
+    and MUST be emitted exactly once, after the FINAL attempt completes — never
+    on a privilege-denied first attempt that is about to be retried under sudo
+    (that premature terminal tick latches the web widget complete and hides the
+    real sudo-retry progress). Best-effort: telemetry must never abort the scan.
+
+    Args:
+        dashboard: The live dashboard the scan drove (for ``rate``/``elapsed``).
+        total_hosts: Queued host total, or ``None`` for an indeterminate bar.
+        domain: Surfaced as the event's ``detail``.
+        hosts_found: Count of hosts found with open ports (the indeterminate
+            ``current`` when no total is known).
+    """
+    try:
+        rate = dashboard.rate
+        emit_operation_progress(
+            operation="port_scan",
+            label="Port scan",
+            phase="domain_analysis",
+            phase_label="Domain Intelligence",
+            # Terminal tick: all queued hosts have been scanned. "Y of Y" when
+            # the total is known; otherwise the count of hosts found with open
+            # ports. This is the ONLY ``done=True`` for the operation.
+            current=total_hosts if (total_hosts and total_hosts > 0) else (hosts_found or None),
+            total=total_hosts if (total_hosts and total_hosts > 0) else None,
+            percent=100,
+            rate=rate if rate > 0 else None,
+            elapsed_seconds=dashboard.elapsed,
+            detail=domain or None,
+            done=True,
+        )
+    except Exception:  # noqa: BLE001 -- telemetry must not abort scan
+        pass
 
 
 def _run_important_port_scan_with_dashboard(
@@ -1403,6 +1560,7 @@ def _run_important_port_scan_with_dashboard(
     domain: str,
     timeout_seconds: int,
     run_scan_fallback: "callable",
+    total_hosts: int | None = None,
     _is_full_adscan_container_runtime: "callable | None" = None,
     _sudo_validate: "callable | None" = None,
 ) -> any:
@@ -1431,6 +1589,9 @@ def _run_important_port_scan_with_dashboard(
         timeout_seconds: Wall-clock budget for the streaming scan.
         run_scan_fallback: Zero-arg buffered-path callable used when streaming
             cannot be set up.
+        total_hosts: Number of hosts queued for the scan (forwarded to the
+            streamer so the structured ``port_scan`` operation event is a
+            determinate "X of Y hosts" bar).
         _is_full_adscan_container_runtime: Optional container runtime detector
             (forwarded to the sudo-retry logic).
         _sudo_validate: Optional sudo validation callback.
@@ -1445,36 +1606,76 @@ def _run_important_port_scan_with_dashboard(
         return run_scan_fallback()
 
     def _stream_once(
-        cmd: str, budget: int | None, dash: "ProgressDashboard"
+        cmd: str,
+        budget: int | None,
+        dash: "ProgressDashboard",
+        *,
+        emit_terminal_done: bool,
     ) -> _StreamingScanResult | None:
         return _stream_nmap_scan_into_dashboard(
-            shell, command=cmd, timeout_seconds=budget, dashboard=dash
+            shell,
+            command=cmd,
+            timeout_seconds=budget,
+            dashboard=dash,
+            domain=domain,
+            total_hosts=total_hosts,
+            emit_terminal_done=emit_terminal_done,
+        )
+
+    def _emit_terminal_done(dash: "ProgressDashboard") -> None:
+        _emit_port_scan_terminal_done(
+            dash,
+            total_hosts=total_hosts,
+            domain=domain,
+            hosts_found=getattr(dash, "_done", 0) or 0,
         )
 
     def _maybe_sudo_retry(
         result: _StreamingScanResult, budget: int | None, dash: "ProgressDashboard"
     ) -> _StreamingScanResult:
-        """Re-spawn under sudo when the attempt was privilege-denied."""
+        """Re-spawn under sudo when the attempt was privilege-denied.
+
+        Owns the SINGLE terminal ``done=True`` for the operation. The first
+        attempt streamed with ``emit_terminal_done=False`` (it might be retried),
+        so this function emits the terminal tick exactly once for the FINAL
+        result: the sudo-retry attempt carries it (``emit_terminal_done=True``)
+        when a retry happens, otherwise this function emits it directly for the
+        first (final) attempt. A privilege-denied attempt that re-spawns under
+        sudo therefore never latches the web widget complete at elapsed ~0.
+        """
         if result.returncode == 0:
+            _emit_terminal_done(dash)
             return result
         combined = (result.stdout or "") + "\n" + (result.stderr or "")
         needs_priv = _nmap_output_indicates_missing_privileges(combined)
         can_escalate = os.geteuid() != 0 and shutil.which("sudo") is not None
         if not needs_priv or not can_escalate:
+            # No retry will happen: the first attempt was final — emit its tick.
+            _emit_terminal_done(dash)
             return result
         if _is_full_adscan_container_runtime and _is_full_adscan_container_runtime():
             print_info_debug(
                 "Nmap important port scan requires privileges in container "
                 "runtime; retrying via sudo -n."
             )
-            retry = _stream_once(f"sudo -n {command}", budget, dash)
-            return retry if retry is not None else result
+            retry = _stream_once(f"sudo -n {command}", budget, dash, emit_terminal_done=True)
+            if retry is not None:
+                return retry
+            # Sudo re-spawn could not start — the first attempt is the result we
+            # return, so it owns the terminal tick (suppressed on its own run).
+            _emit_terminal_done(dash)
+            return result
         if _sudo_validate is None or _sudo_validate():
             print_info_debug(
                 "Nmap important port scan requires privileges; retrying via sudo."
             )
-            retry = _stream_once(f"sudo {command}", budget, dash)
-            return retry if retry is not None else result
+            retry = _stream_once(f"sudo {command}", budget, dash, emit_terminal_done=True)
+            if retry is not None:
+                return retry
+            _emit_terminal_done(dash)
+            return result
+        # Sudo validation declined — no retry; the first attempt is final.
+        _emit_terminal_done(dash)
         return result
 
     def _streamed_out() -> bool:
@@ -1487,7 +1688,9 @@ def _run_important_port_scan_with_dashboard(
 
     try:
         with dashboard.live_session():
-            result = _stream_once(command, timeout_seconds, dashboard)
+            # First attempt suppresses the terminal done — it may be retried
+            # under sudo. `_maybe_sudo_retry` owns the single terminal tick.
+            result = _stream_once(command, timeout_seconds, dashboard, emit_terminal_done=False)
             if result is None:
                 # spawn failed -- leave the live session, fall back below.
                 raise _StreamingSpawnFailed()
@@ -1527,7 +1730,7 @@ def _run_important_port_scan_with_dashboard(
             return run_scan_fallback()
         try:
             with retry_dashboard.live_session():
-                retry_result = _stream_once(command, None, retry_dashboard)
+                retry_result = _stream_once(command, None, retry_dashboard, emit_terminal_done=False)
                 if retry_result is None:
                     raise _StreamingSpawnFailed()
                 retry_result = _maybe_sudo_retry(retry_result, None, retry_dashboard)
@@ -2105,6 +2308,115 @@ def save_host_to_file(shell: NmapShell, host: str, service_dir: str) -> None:
     if host not in existing_hosts:
         with open(host_file, "a", encoding="utf-8") as f:
             f.write(f"{host}\n")
+
+
+# Service name -> (shell service-dir attribute, tcp port). SSOT for the per-service
+# {service}/ips.txt write surface AND the active-host cap intersection, so the cap
+# and the writer can never drift on which port maps to which service directory.
+_SERVICE_DIR_PORTS: tuple[tuple[str, str, int], ...] = (
+    ("smb", "smb_dir", 445),
+    ("winrm", "winrm_dir", 5985),
+    ("rdp", "rdp_dir", 3389),
+    ("mssql", "mssql_dir", 1433),
+    ("ftp", "ftp_dir", 21),
+    ("ssh", "ssh_dir", 22),
+    ("dns", "dns_dir", 53),
+    ("http", "http_dir", 80),
+    ("https", "https_dir", 443),
+    ("ldap", "ldap_dir", 389),
+    ("vnc", "vnc_dir", 5900),
+    ("kerberos", "kerberos_dir", 88),
+)
+
+
+def _resolve_active_host_cap(shell: "NmapShell") -> int:
+    """Resolve the active-host cap from the scan config (mirror of
+    ``intelligence._resolve_host_cap``).
+
+    Reads ``shell.scan_config.host_cap`` (the SSOT set by ``adscan ci`` / the web
+    scan-config form). Absent/malformed → ``0`` (unlimited), so a plain interactive
+    run keeps every reachable host in every service list (legacy behavior).
+    """
+    try:
+        cap = int(getattr(getattr(shell, "scan_config", None), "host_cap", 0) or 0)
+        return cap if cap > 0 else 0
+    except Exception:  # noqa: BLE001 — a bad config must never break the scan
+        return 0
+
+
+def _load_domain_computer_props(shell: "NmapShell", domain: str) -> list[dict]:
+    """Load the Phase-2 attack-graph Computer property dicts for ``domain``.
+
+    Best-effort: returns ``[]`` when the graph is absent/unreadable (the cap then
+    falls back to an IP-only representative-first order — Tier 0 hosts still surface
+    via the unknown-IP tie-break, never raises). Used only to feed the active-host
+    cap's tier ordering; never gates whether the scan ran.
+    """
+    try:
+        from adscan_internal.services.attack_graph_service import load_attack_graph
+        from adscan_internal.services.graph_queries.inventories import (
+            get_enabled_computers,
+        )
+
+        graph = load_attack_graph(shell, domain)
+        if not isinstance(graph, dict):
+            return []
+        return list(get_enabled_computers(graph, domain))
+    except Exception as exc:  # noqa: BLE001 — graph load must never abort the scan
+        telemetry.capture_exception(exc)
+        return []
+
+
+def _write_capped_service_ips(
+    shell: "NmapShell",
+    domain: str,
+    open_ports_by_host: dict[str, set[int]],
+) -> None:
+    """Write each domain ``{service}/ips.txt`` bounded to the capped active host set.
+
+    When ``host_cap`` is positive, the reachable active host set (hosts exposing any
+    targeted AD service port) is capped representative-first (Tier 0 / DCs / ADCS
+    first) into a SINGLE union; every ``{service}/ips.txt`` is then that union ∩ the
+    hosts with that service's port open — so the TOTAL active footprint (and every
+    downstream SMB/WinRM/MSSQL privilege sweep) is bounded to ``host_cap`` hosts, not
+    ``host_cap`` per service. ``host_cap=0`` is a no-op: every reachable service host
+    is written (legacy behavior).
+
+    Args:
+        shell: The active shell (service-dir attributes + scan config + graph load).
+        domain: Domain whose per-domain service files are being written.
+        open_ports_by_host: ``{ip: {open tcp ports}}`` from the just-finished scan.
+    """
+    from adscan_internal.services.collector.active_host_cap import (
+        select_capped_active_hosts,
+    )
+
+    service_ports = {name: port for name, _attr, port in _SERVICE_DIR_PORTS}
+    # The active universe is exactly the hosts that would land in SOME
+    # {service}/ips.txt under the legacy writer: every host with at least one
+    # targeted service port open. A host with an open port IS reachable for that
+    # service (the open-ports map is the port scan's reachability signal), so this
+    # set equals the legacy write universe — making host_cap=0 a byte-for-byte
+    # no-op.
+    targeted_ports = set(service_ports.values())
+    active_universe = [
+        ip for ip, ports in open_ports_by_host.items() if ports & targeted_ports
+    ]
+
+    host_cap = _resolve_active_host_cap(shell)
+    computers_props = _load_domain_computer_props(shell, domain) if host_cap > 0 else []
+
+    capped = select_capped_active_hosts(
+        reachable_ips=active_universe,
+        open_ports_by_host=open_ports_by_host,
+        service_ports=service_ports,
+        computers_props=computers_props,
+        host_cap=host_cap,
+    )
+
+    for service, attr, _port in _SERVICE_DIR_PORTS:
+        for host_ip in capped.service_ips.get(service, []):
+            save_domain_host_to_file(shell, host_ip, getattr(shell, attr), domain)
 
 
 def _normalize_massdns_hostname(hostname: object) -> str:
@@ -2693,6 +3005,9 @@ def convert_hostnames_to_ips_and_scan(
                 domain=domain,
                 timeout_seconds=NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS,
                 run_scan_fallback=_run_port_scan_buffered,
+                # Drive the platform's "X of Y hosts" port-scan bar off the
+                # queued IP count (enabled_computers_ips.txt line count).
+                total_hosts=ip_count,
                 _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
                 _sudo_validate=_sudo_validate,
             )
@@ -2727,39 +3042,13 @@ def convert_hostnames_to_ips_and_scan(
                         for line in normal_text.splitlines():
                             shell.console.print(line)
 
-                for host_ip, ports in open_ports_by_host.items():
-                    if 445 in ports:
-                        save_domain_host_to_file(shell, host_ip, shell.smb_dir, domain)
-                    if 5985 in ports:
-                        save_domain_host_to_file(
-                            shell, host_ip, shell.winrm_dir, domain
-                        )
-                    if 3389 in ports:
-                        save_domain_host_to_file(shell, host_ip, shell.rdp_dir, domain)
-                    if 1433 in ports:
-                        save_domain_host_to_file(
-                            shell, host_ip, shell.mssql_dir, domain
-                        )
-                    if 21 in ports:
-                        save_domain_host_to_file(shell, host_ip, shell.ftp_dir, domain)
-                    if 22 in ports:
-                        save_domain_host_to_file(shell, host_ip, shell.ssh_dir, domain)
-                    if 53 in ports:
-                        save_domain_host_to_file(shell, host_ip, shell.dns_dir, domain)
-                    if 80 in ports:
-                        save_domain_host_to_file(shell, host_ip, shell.http_dir, domain)
-                    if 443 in ports:
-                        save_domain_host_to_file(
-                            shell, host_ip, shell.https_dir, domain
-                        )
-                    if 389 in ports:
-                        save_domain_host_to_file(shell, host_ip, shell.ldap_dir, domain)
-                    if 5900 in ports:
-                        save_domain_host_to_file(shell, host_ip, shell.vnc_dir, domain)
-                    if 88 in ports:
-                        save_domain_host_to_file(
-                            shell, host_ip, shell.kerberos_dir, domain
-                        )
+                # Per-service {service}/ips.txt, bounded by the active-host cap.
+                # The port scan above already ran on ALL hosts (cheap, complete
+                # reachability inventory); this caps the REACHABLE active set to the
+                # top host_cap hosts representative-first (Tier 0 first) as a single
+                # union, then writes each service list as union ∩ service-open. With
+                # host_cap=0 it is a no-op (every reachable service host written).
+                _write_capped_service_ips(shell, domain, open_ports_by_host)
 
                 discovered_hosts = len(open_ports_by_host)
                 discovered_ports = sum(len(p) for p in open_ports_by_host.values())

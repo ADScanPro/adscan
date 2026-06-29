@@ -142,6 +142,14 @@ def do_unauth_scan(self, domain: str) -> None:
     (Kerberos user enumeration via kerbrute) stays sequential because the
     user-enumeration UX expects a focused, dedicated panel.
     """
+    from adscan_internal.services.scan_phases import phase_is_enabled  # noqa: PLC0415
+
+    if not phase_is_enabled(self, "unauthenticated_attack_surface"):
+        print_info(
+            "Unauthenticated Attack Surface skipped (disabled in scan configuration)."
+        )
+        return
+
     initial_auth = self.domains_data.get(domain, {}).get("auth")
     pdc_ip = self.domains_data.get(domain, {}).get("pdc")
     if pdc_ip:

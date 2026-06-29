@@ -676,6 +676,11 @@ def is_verbose_mode() -> bool:
     return _verbose_mode
 
 
+def is_secret_mode() -> bool:
+    """Return True when secret/internal-details output mode is active."""
+    return _secret_mode
+
+
 def update_modes(
     verbose_mode: Optional[bool] = None,
     debug_mode: Optional[bool] = None,

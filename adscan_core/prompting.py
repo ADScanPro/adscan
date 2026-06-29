@@ -241,6 +241,132 @@ def logged_prompt_ask(
     return answer_text
 
 
+def logged_numeric_prompt_ask(
+    *prompt_args: Any,
+    original_prompt_ask: PromptAsk | None,
+    coerce: Callable[[Any], Any],
+    rich_prompt_name: str,
+    telemetry: LogMessage,
+    debug: LogMessage,
+    info: LogMessage,
+    **kwargs: Any,
+) -> Any:
+    """IntPrompt/FloatPrompt wrapper mirroring :func:`logged_prompt_ask`.
+
+    Numeric Rich prompts (``IntPrompt.ask`` / ``FloatPrompt.ask``) were never
+    wrapped, so a raw call stayed interactive and HUNG ``adscan ci`` (Docker
+    ``-it`` hands a blocking TTY rather than EOF). This wrapper applies the same
+    non-interactive auto-resolve-to-``default`` behavior the text/confirm
+    wrappers use, returning the SAME native type Rich would (``int`` /
+    ``float``) so call sites that arithmetic on the result keep working.
+
+    Args:
+        prompt_args: Positional args forwarded to the original prompt.
+        original_prompt_ask: Captured original ``IntPrompt.ask`` /
+            ``FloatPrompt.ask`` (``None`` → resolved lazily from Rich).
+        coerce: Value coercer applied to the resolved default
+            (``int`` / ``float``) so the auto-resolved answer matches Rich's
+            native return type.
+        rich_prompt_name: ``"IntPrompt"`` / ``"FloatPrompt"`` — used to resolve
+            the original callable lazily when ``original_prompt_ask`` is None.
+        telemetry: Telemetry sink callback.
+        debug: Debug-log sink callback.
+        info: Visible-info sink callback.
+        kwargs: Keyword args forwarded to the original prompt (``default`` is
+            read for the auto-resolve path).
+
+    Returns:
+        The numeric answer (``int`` / ``float``).
+    """
+    prompt_message = str(prompt_args[0]) if prompt_args else "?"
+    default_value = kwargs.get("default")
+
+    telemetry(f"[prompt] {prompt_message}")
+    debug(f"[prompt] Prompt: {prompt_message}")
+
+    def _resolve_default() -> Any:
+        if default_value is None:
+            return None
+        try:
+            return coerce(default_value)
+        except (TypeError, ValueError):
+            return default_value
+
+    if _PROMPT_AUTO_MODE_ACTIVE or should_disable_prompt_interaction():
+        resolved = _resolve_default()
+        if _PROMPT_AUTO_MODE_ACTIVE:
+            info(f"{prompt_message} [dim](auto: {resolved})[/dim]")
+        else:
+            debug(
+                f"[prompt] Non-interactive mode; using fallback for '{prompt_message}'."
+            )
+        _log_prompt_answer(
+            prompt_message=prompt_message,
+            answer_text="" if resolved is None else str(resolved),
+            password_mode=False,
+            telemetry=telemetry,
+            debug=debug if _PROMPT_AUTO_MODE_ACTIVE else None,
+        )
+        return resolved
+
+    if original_prompt_ask is None:
+        import rich.prompt as _rich_prompt
+
+        original_prompt_ask = getattr(_rich_prompt, rich_prompt_name).ask
+    answer = original_prompt_ask(*prompt_args, **kwargs)
+
+    _log_prompt_answer(
+        prompt_message=prompt_message,
+        answer_text="" if answer is None else str(answer),
+        password_mode=False,
+        telemetry=telemetry,
+        debug=debug,
+    )
+    return answer
+
+
+def logged_int_prompt_ask(
+    *prompt_args: Any,
+    original_int_prompt_ask: PromptAsk | None,
+    telemetry: LogMessage,
+    debug: LogMessage,
+    info: LogMessage,
+    **kwargs: Any,
+) -> Any:
+    """IntPrompt.ask wrapper: auto-resolve to ``int(default)`` non-interactively."""
+    return logged_numeric_prompt_ask(
+        *prompt_args,
+        original_prompt_ask=original_int_prompt_ask,
+        coerce=int,
+        rich_prompt_name="IntPrompt",
+        telemetry=telemetry,
+        debug=debug,
+        info=info,
+        **kwargs,
+    )
+
+
+def logged_float_prompt_ask(
+    *prompt_args: Any,
+    original_float_prompt_ask: PromptAsk | None,
+    telemetry: LogMessage,
+    debug: LogMessage,
+    info: LogMessage,
+    **kwargs: Any,
+) -> Any:
+    """FloatPrompt.ask wrapper: auto-resolve to ``float(default)`` non-interactively."""
+    return logged_numeric_prompt_ask(
+        *prompt_args,
+        original_prompt_ask=original_float_prompt_ask,
+        coerce=float,
+        rich_prompt_name="FloatPrompt",
+        telemetry=telemetry,
+        debug=debug,
+        info=info,
+        **kwargs,
+    )
+
+
 def logged_confirm_ask(
     *confirm_args: Any,
     original_confirm_ask: ConfirmAsk | None,
