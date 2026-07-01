@@ -80,7 +80,7 @@ cli = [
     "pypykatz>=0.6.10",
     "psutil",
     "python-docx",
-    "playwright==1.60.0",
+    "playwright==1.61.0",
     "jinja2>=3.0",
     "graphviz>=0.20",
     "python-magic>=0.4.27,<0.5; platform_system == 'Linux'",
