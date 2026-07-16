@@ -16,12 +16,6 @@ from adscan_internal.rich_output import (
     print_system_change_warning,
 )
 from adscan_internal import telemetry
-from adscan_internal.integrations.netexec.parsers import (
-    parse_netexec_sysvol_listing,
-)
-from adscan_internal.integrations.netexec.shares import (
-    list_share_directory,
-)
 from adscan_internal.cli.ace_step_execution import set_last_execution_outcome
 from adscan_internal.services.attack_graph_runtime_service import (
     update_active_step_status,
@@ -239,6 +233,71 @@ def _clear_sysvol_cleanup_pending(shell: Any, *, domain: str) -> None:
             print_error("Failed to persist SYSVOL cleanup state.")
 
 
+def _build_backup_ops_smb_config(
+    *, pdc_ip: str, pdc_hostname: str, domain: str, username: str, password: str
+) -> Any:
+    """Build the SMBConfig for the SYSVOL cleanup, mirroring the RRP dump path."""
+    from adscan_internal.services.smb_transport import SMBConfig
+
+    is_hash = len(password) == 32 and all(
+        c in "0123456789abcdef" for c in password.lower()
+    )
+    return SMBConfig(
+        target_ip=pdc_ip,
+        target_hostname=pdc_hostname or None,
+        domain=domain,
+        auth_domain=domain,
+        username=username,
+        password=None if is_hash else password,
+        nt_hash=password if is_hash else None,
+        kdc_ip=pdc_ip,
+        use_kerberos=False,
+    )
+
+
+async def _native_sysvol_hive_scan(
+    smb_config: Any, *, pdc: str, delete: bool
+) -> list[str]:
+    """List (and optionally delete) SAM/SYSTEM/SECURITY hives at the SYSVOL root.
+
+    Native replacement for the nxc SMB ``dir``/``del`` exec + share listing:
+    enumerates the SYSVOL share root via ``SMBDirectory.list_r`` and, when
+    ``delete`` is set, removes each hive via ``delete_unc_file`` then re-lists to
+    verify. Returns the hive names STILL present (empty list = clean).
+    """
+    from aiosmb.commons.interfaces.directory import SMBDirectory
+
+    from adscan_internal.services.smb_transport import (
+        delete_unc_file,
+        smb_machine_for,
+    )
+
+    unc_root = f"\\\\{pdc}\\SYSVOL"
+
+    async def _present(connection: Any) -> list[str]:
+        found: list[str] = []
+        root = SMBDirectory.from_uncpath(unc_root)
+        async for path, otype, err in root.list_r(connection, depth=1):
+            if err is not None or otype != "file":
+                continue
+            name = str(path.fullpath).replace("/", "\\").split("\\")[-1]
+            if name.upper() in _SYSVOL_SHARE_FILES:
+                found.append(name)
+        return found
+
+    async with smb_machine_for(smb_config) as machine:
+        connection = machine.connection
+        present = await _present(connection)
+        if not delete:
+            return present
+        for name in present:
+            try:
+                await delete_unc_file(machine, f"{unc_root}\\{name}")
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+        return await _present(connection)
+
+
 def handle_backup_ops_sysvol_cleanup(
     shell: Any,
     *,
@@ -267,19 +326,18 @@ def handle_backup_ops_sysvol_cleanup(
 
     marked_domain = mark_sensitive(domain, "domain")
     marked_host = mark_sensitive(str(hostname or pdc), "hostname")
-    share_listing = list_share_directory(
-        shell,
+    from adscan_internal.services.async_bridge import run_async_sync
+
+    smb_config = _build_backup_ops_smb_config(
+        pdc_ip=str(pdc),
+        pdc_hostname=str(hostname or ""),
         domain=domain,
-        host=str(pdc),
-        auth=shell.build_auth_nxc(username, password, domain, kerberos=True),
-        share="SYSVOL",
-        directory=None,
+        username=username,
+        password=password,
     )
-    sysvol_files = [
-        entry.path
-        for entry in share_listing.entries
-        if entry.path.upper() in _SYSVOL_SHARE_FILES
-    ]
+    sysvol_files = run_async_sync(
+        _native_sysvol_hive_scan(smb_config, pdc=str(pdc), delete=False)
+    )
     if not sysvol_files:
         _clear_sysvol_cleanup_pending(shell, domain=domain)
         return
@@ -304,46 +362,10 @@ def handle_backup_ops_sysvol_cleanup(
         )
         return
 
-    if not getattr(shell, "netexec_path", None):
-        print_warning("NetExec not available; cannot execute cleanup command.")
-        return
-
-    auth = shell.build_auth_nxc(username, password, domain, kerberos=True)
-    delete_cmd = (
-        "del C:\\Windows\\sysvol\\sysvol\\SECURITY && "
-        "del C:\\Windows\\sysvol\\sysvol\\SAM && "
-        "del C:\\Windows\\sysvol\\sysvol\\SYSTEM"
+    # Native SMB delete of the SYSVOL hives + re-list verification (no exec).
+    remaining = run_async_sync(
+        _native_sysvol_hive_scan(smb_config, pdc=str(pdc), delete=True)
     )
-    from adscan_internal.integrations.netexec.exec import (
-        run_netexec_remote_command,
-    )
-
-    exec_result = run_netexec_remote_command(
-        shell,
-        domain=domain,
-        host=str(pdc),
-        auth=auth,
-        remote_command=delete_cmd,
-        service="smb",
-        timeout=300,
-    )
-    exec_status = exec_result.status
-    if exec_status.executed:
-        print_info_debug(
-            f"[backup-ops] SYSVOL cleanup executed via {exec_status.method or 'unknown'}."
-        )
-
-    verify_result = run_netexec_remote_command(
-        shell,
-        domain=domain,
-        host=str(pdc),
-        auth=auth,
-        remote_command="dir C:\\Windows\\sysvol\\sysvol",
-        service="smb",
-        timeout=300,
-    )
-    verify_output = verify_result.command_output or verify_result.output
-    remaining = parse_netexec_sysvol_listing(verify_output)
     if remaining:
         print_warning(
             "SYSVOL artifacts still present after cleanup attempt. "

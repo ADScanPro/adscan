@@ -30,6 +30,7 @@ if _STATIC_ANALYSIS:
     from .command_runner import CommandRunner, CommandSpec, default_runner
     from .rich_output import (
         TelemetryAwareConsole,
+        wrap_console_for_telemetry,
         create_credentials_table,
         create_domains_table,
         create_findings_table,
@@ -100,6 +101,7 @@ _EXPORT_MODULES: dict[str, str] = {
     "init_rich_output": ".rich_output",
     "get_console": ".rich_output",
     "set_telemetry_console": ".rich_output",
+    "wrap_console_for_telemetry": ".rich_output",
     "update_modes": ".rich_output",
     "reset_spacing": ".rich_output",
     "print_info": ".rich_output",

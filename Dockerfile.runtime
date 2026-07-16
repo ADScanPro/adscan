@@ -27,6 +27,10 @@ FROM debian:trixie-slim AS john_builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG JOHN_BLEEDING_JUMBO_COMMIT=d8f5b0138e6f9fe24ab453f886dcaa2abb2e5407
+# TARGETARCH is auto-provided by BuildKit (amd64 / arm64) for both `docker build`
+# and `docker buildx build`; the John compile below selects its Makefile.legacy
+# target + SIMD from it so an arm64 leg builds a native NEON binary.
+ARG TARGETARCH
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
@@ -96,12 +100,19 @@ RUN set -eux; \
     done; \
   fi; \
   [ "${fetched}" = "1" ] || { echo "[john_builder] giving up: both tarball and git fetch failed" >&2; exit 1; }; \
+  jarch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+  case "${jarch}" in \
+    amd64) john_mk_target="linux-x86-64"; john_configure=(./configure --disable-native-tests --enable-simd=sse2) ;; \
+    arm64) john_mk_target="linux-arm64le"; john_configure=(./configure --disable-native-tests) ;; \
+    *) john_mk_target="generic"; john_configure=(./configure --disable-native-tests) ;; \
+  esac; \
+  echo "[john_builder] arch=${jarch} legacy-target=${john_mk_target}" >&2; \
   ( \
     cd /opt/adscan/tools/john/src && \
     make -s -f Makefile.legacy clean && \
-    make -sj"$(nproc)" -f Makefile.legacy linux-x86-64 && \
+    make -sj"$(nproc)" -f Makefile.legacy "${john_mk_target}" && \
     cp /opt/adscan/tools/john/run/john /tmp/john-generic && \
-    ./configure --disable-native-tests --enable-simd=sse2 >/dev/null && \
+    "${john_configure[@]}" >/dev/null && \
     make -s clean && \
     make -sj"$(nproc)" && \
     cp /tmp/john-generic /opt/adscan/tools/john/run/john-generic && \
@@ -193,6 +204,11 @@ ARG FREERDP_VERSION=3.24.1
 ARG FREERDP_COMMIT=b6e770ccba87c58ffd0a55366fef33361798e39c
 ARG SLU_COMMIT=31132bd5da19787152a354e6adad18b2c8432e73
 ARG ADSCAN_RUNTIME_CONTRACT_VERSION="1"
+# Target architecture (amd64 / arm64), auto-provided by BuildKit for both
+# `docker build` and `docker buildx build`. Arch-specific tool downloads below
+# (kerbrute, ligolo proxy) and the amd64-only tools (hashcat, donut) branch on
+# it so an arm64 image pulls native binaries instead of amd64 ones.
+ARG TARGETARCH
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ENV ADSCAN_HOME=/opt/adscan \
@@ -274,18 +290,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       libldap2 \
       libldns-dev \
       nmap \
-      hydra \
       pocl-opencl-icd \
-      samba \
       samba-common-bin \
       mono-devel \
       mingw-w64 \
       gcc-mingw-w64-x86-64 \
-      musl-tools \
       tesseract-ocr \
       antiword \
       moreutils \
-      libreoffice \
       graphviz \
       fontconfig \
       fonts-crosextra-carlito \
@@ -322,31 +334,31 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       libepoxy-dev \
       libicu-dev \
       libmagic1 \
-      rustc \
-      cargo \
       ntpsec-ntpdate \
       unbound \
       unbound-anchor \
       dns-root-data \
-      libpango-1.0-0 \
-      libcairo2 \
-      libglib2.0-0 \
-      libpangocairo-1.0-0 \
-      libharfbuzz0b \
-      libfontconfig1 \
     && mkdir -p /etc/OpenCL/vendors \
     && printf '%s\n' 'libnvidia-opencl.so.1' > /etc/OpenCL/vendors/nvidia.icd \
     && rm -rf /var/lib/apt/lists/*
 
-# --http1.1 is forced on every adscan-curl download: GitHub's CDN intermittently
-# cancels HTTP/2 streams mid-transfer under load ("curl 92 stream CANCEL"), which
-# kills release/raw downloads (mimikatz, Rubeus, kerbrute, ligolo, ...) the same
-# way it kills the John fetch. HTTP/1.1 avoids that failure class; it works on
-# every host we download from and the per-file perf cost is negligible.
+# Centralized resilient curl for every build-time download. Two failure classes
+# are handled once here so no call site has to:
+#   1. --http1.1 — GitHub's CDN intermittently cancels HTTP/2 streams mid-transfer
+#      under load ("curl 92 stream CANCEL"), killing release/raw downloads
+#      (mimikatz, Rubeus, kerbrute, ligolo, ...). HTTP/1.1 avoids that class.
+#   2. --retry — GitHub-raw / sysinternals throttle hard mid-build (HTTP 403/429),
+#      which with -f surfaces as a bare "curl exit 22" that fails the whole layer
+#      on the FIRST hiccup. --retry rides it out; --retry-all-errors is required
+#      because plain --retry only covers 5xx/408/429 (not the 403 GitHub-raw
+#      sometimes returns), and --retry-connrefused covers a refused reconnect.
+# Every call site writes to a file (-o / piped-after-download), so a retried
+# request is safe (curl truncates + re-fetches). Per-file perf cost is negligible.
 RUN printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
-  'if curl --http1.1 "$@"; then' \
+  'adscan_curl_opts=(--http1.1 --retry 5 --retry-delay 3 --retry-connrefused --retry-all-errors)' \
+  'if curl "${adscan_curl_opts[@]}" "$@"; then' \
   '  exit 0' \
   'else' \
   '  status=$?' \
@@ -355,7 +367,7 @@ RUN printf '%s\n' \
   '  exit "$status"' \
   'fi' \
   'echo "warning: curl TLS verification failed; retrying with insecure fallback (-k)" >&2' \
-  'exec curl --http1.1 -k "$@"' \
+  'exec curl "${adscan_curl_opts[@]}" -k "$@"' \
   > /usr/local/bin/adscan-curl \
   && chmod +x /usr/local/bin/adscan-curl
 
@@ -396,6 +408,17 @@ COPY --from=freerdp_source /opt/adscan/tools/freerdp/install /opt/adscan/tools/f
 # Wordlists layer below tarball-fetches it only when this dir is empty.
 COPY --from=slu_source /usr/share/wordlists/statistically-likely-usernames /usr/share/wordlists/statistically-likely-usernames
 
+# Our maintained aardwolf (0.2.13) — needed EARLY (before the tool-venv layer)
+# so NetExec's ``aardwolf>=0.2.8`` requirement is satisfied by THIS copy instead
+# of a PyPI source build. debian:trixie ships Python 3.13, and upstream aardwolf
+# has no cp313 wheel, so a PyPI install source-builds it — whose Rust extension
+# (`librlers`) is FATAL there. Our vendor setup.py marks that RustExtension
+# ``optional=True`` (skelsec fork), so it installs pure-Python when no Rust
+# compiler is present (exactly how the main venv at the bottom already installs
+# it). Pre-seeding it into the NetExec venv is what makes this layer build cold
+# (the failure only surfaced in CI because the warm local layer cache hid it).
+COPY vendor/aardwolf /opt/adscan-src/vendor/aardwolf
+
 # Install Python tool environments (mirrors `PipToolsConfig` from adscan.py)
 # BuildKit cache mount persists pip's wheel cache ACROSS builds (in the builder
 # cache, NOT the image — image stays small), so when this layer is invalidated
@@ -406,7 +429,7 @@ COPY --from=slu_source /usr/share/wordlists/statistically-likely-usernames /usr/
 RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
   set -eux; \
   export PIP_CACHE_DIR=/var/cache/adscan-pip; \
-  # Several tool deps are git+https clones from GitHub (NetExec, enum-trusts,
+  # Several tool deps are git+https clones from GitHub (NetExec,
   # MANSPIDER). This layer runs BEFORE the External-tools layer that sets the
   # global git HTTP/1.1 config, so without this its clones default to HTTP/2 and
   # hit the same "curl 92 stream CANCEL" / pack-corruption failures under GitHub
@@ -435,19 +458,27 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
   \
   python3 -m venv /opt/adscan/tool_venvs/netexec/venv; \
   pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python -U pip; \
-  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python "git+https://github.com/Pennyw0rth/NetExec.git@73ccf0d"; \
-  \
-  python3 -m venv /opt/adscan/tool_venvs/certipy/venv; \
-  pip_retry /opt/adscan/tool_venvs/certipy/venv/bin/python -U pip; \
-  pip_retry /opt/adscan/tool_venvs/certipy/venv/bin/python "certipy-ad==5.0.4"; \
-  \
-  python3 -m venv /opt/adscan/tool_venvs/bloodyad/venv; \
-  pip_retry /opt/adscan/tool_venvs/bloodyad/venv/bin/python -U pip; \
-  pip_retry /opt/adscan/tool_venvs/bloodyad/venv/bin/python "bloodyAD==2.5.4"; \
-  \
-  python3 -m venv /opt/adscan/tool_venvs/enum-trusts/venv; \
-  pip_retry /opt/adscan/tool_venvs/enum-trusts/venv/bin/python -U pip; \
-  pip_retry /opt/adscan/tool_venvs/enum-trusts/venv/bin/python "git+https://github.com/ADScanPro/enum-trusts.git@f7eae14"; \
+  # NetExec pulls ``aardwolf>=0.2.8``. On this Python 3.13 base (debian:trixie)
+  # upstream aardwolf has no cp313 wheel, so a plain install source-builds it and
+  # its librlers Rust extension is FATAL (no Rust compiler in this layer). Our
+  # vendor aardwolf 0.2.13 marks that RustExtension ``optional=True``, so it
+  # builds a pure-Python wheel with no Rust. Build that wheel ONCE, install it,
+  # then install NetExec with ``--find-links`` + ``--only-binary=aardwolf`` pointed
+  # at it so pip is FORCED to take aardwolf from THIS wheel and can NEVER
+  # source-build the Rust-fatal PyPI sdist (if no aardwolf wheel is found it errors
+  # loudly instead of silently building). ``--only-binary`` is scoped to aardwolf
+  # ONLY, so NetExec's own git deps (certipy, impacket, ...) still build normally.
+  # A plain pre-seed install is NOT enough: pip re-resolves aardwolf during the
+  # NetExec install and rebuilds the PyPI sdist across every retry — forcing
+  # binary-only for aardwolf is what actually prevents that.
+  /opt/adscan/tool_venvs/netexec/venv/bin/python -m pip wheel --no-deps \
+    --wheel-dir /tmp/aardwolf-wheel /opt/adscan-src/vendor/aardwolf; \
+  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python \
+    --find-links /tmp/aardwolf-wheel --only-binary=aardwolf aardwolf; \
+  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python \
+    --find-links /tmp/aardwolf-wheel --only-binary=aardwolf \
+    "git+https://github.com/Pennyw0rth/NetExec.git@73ccf0d"; \
+  rm -rf /tmp/aardwolf-wheel; \
   \
   python3 -m venv /opt/adscan/tool_venvs/manspider/venv; \
   pip_retry /opt/adscan/tool_venvs/manspider/venv/bin/python -U pip; \
@@ -460,10 +491,6 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
   python3 -m venv /opt/adscan/tool_venvs/pypykatz/venv; \
   pip_retry /opt/adscan/tool_venvs/pypykatz/venv/bin/python -U pip; \
   pip_retry /opt/adscan/tool_venvs/pypykatz/venv/bin/python "pypykatz==0.6.13"; \
-  \
-  python3 -m venv /opt/adscan/tool_venvs/lsassy/venv; \
-  pip_retry /opt/adscan/tool_venvs/lsassy/venv/bin/python -U pip; \
-  pip_retry /opt/adscan/tool_venvs/lsassy/venv/bin/python "lsassy==3.1.16"; \
   \
   # Volatility 3 — offline VM MEMORY-image credential carving (vm_artifact_service:
   # .vmem/.vmrs → windows.registry.hashdump/lsadump/cachedump). Invoked as a
@@ -489,16 +516,26 @@ RUN set -eux; \
   git config --global http.lowSpeedLimit 1000; \
   git config --global http.lowSpeedTime 60; \
   mkdir -p /opt/adscan/tools; \
-  if ! adscan-curl -fsSL "https://hashcat.net/files/hashcat-${HASHCAT_VERSION}.7z" -o /tmp/hashcat.7z; then \
-    echo "warning: official hashcat download failed; falling back to SourceForge mirror" >&2; \
-    wget --max-redirect=10 --no-check-certificate -O /tmp/hashcat.7z \
-      "https://sourceforge.net/projects/hashcat.mirror/files/v${HASHCAT_VERSION}/hashcat-${HASHCAT_VERSION}.7z/download"; \
+  effarch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+  echo "[external-tools] target arch=${effarch}" >&2; \
+  # hashcat ships an OFFICIAL prebuilt binary for amd64 only (the .7z carries an
+  # x86_64 hashcat.bin). No arm64 release exists, so on arm64 the offline GPU/CPU
+  # cracking engine is John the Ripper (compiled natively above) instead. Skip
+  # the amd64 download on arm64 rather than shipping a non-executable x86_64 bin.
+  if [ "${effarch}" = "amd64" ]; then \
+    if ! adscan-curl -fsSL "https://hashcat.net/files/hashcat-${HASHCAT_VERSION}.7z" -o /tmp/hashcat.7z; then \
+      echo "warning: official hashcat download failed; falling back to SourceForge mirror" >&2; \
+      wget --max-redirect=10 --no-check-certificate -O /tmp/hashcat.7z \
+        "https://sourceforge.net/projects/hashcat.mirror/files/v${HASHCAT_VERSION}/hashcat-${HASHCAT_VERSION}.7z/download"; \
+    fi; \
+    7z x /tmp/hashcat.7z -o/opt/adscan/tools >/dev/null; \
+    test -x "/opt/adscan/tools/hashcat-${HASHCAT_VERSION}/hashcat.bin"; \
+    ln -sf "/opt/adscan/tools/hashcat-${HASHCAT_VERSION}/hashcat.bin" /opt/adscan/bin/hashcat; \
+    /opt/adscan/bin/hashcat --version | grep -F "v${HASHCAT_VERSION}"; \
+    rm -f /tmp/hashcat.7z; \
+  else \
+    echo "warning: hashcat has no ${effarch} prebuilt binary; skipping (John the Ripper handles cracking on this arch)" >&2; \
   fi; \
-  7z x /tmp/hashcat.7z -o/opt/adscan/tools >/dev/null; \
-  test -x "/opt/adscan/tools/hashcat-${HASHCAT_VERSION}/hashcat.bin"; \
-  ln -sf "/opt/adscan/tools/hashcat-${HASHCAT_VERSION}/hashcat.bin" /opt/adscan/bin/hashcat; \
-  /opt/adscan/bin/hashcat --version | grep -F "v${HASHCAT_VERSION}"; \
-  rm -f /tmp/hashcat.7z; \
   \
   git clone --depth 1 https://github.com/Greenwolf/ntlm_theft.git /opt/adscan/tools/ntlm_theft; \
   mkdir -p /opt/adscan/tools/firepwd; \
@@ -507,11 +544,6 @@ RUN set -eux; \
   python3 -m venv /opt/adscan/tool_venvs/firepwd/venv; \
   /opt/adscan/tool_venvs/firepwd/venv/bin/python -m pip install --no-cache-dir -U pip; \
   /opt/adscan/tool_venvs/firepwd/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/firepwd/requirements.txt; \
-  \
-  git clone --depth 1 https://github.com/spextat0r/LSA-Reaper.git /opt/adscan/tools/LSA-Reaper; \
-  python3 -m venv --system-site-packages /opt/adscan/tool_venvs/LSA-Reaper/venv; \
-  /opt/adscan/tool_venvs/LSA-Reaper/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/LSA-Reaper/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/LSA-Reaper/requirements.txt impacket; \
   \
   mkdir -p /opt/adscan/tools/PKINITtools; \
   adscan-curl -fsSL https://raw.githubusercontent.com/dirkjanm/PKINITtools/refs/heads/master/gettgtpkinit.py -o /opt/adscan/tools/PKINITtools/gettgtpkinit.py; \
@@ -522,17 +554,22 @@ RUN set -eux; \
   /opt/adscan/tool_venvs/PKINITtools/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/PKINITtools/requirements.txt; \
   \
   mkdir -p /opt/adscan/tools/kerbrute; \
-  adscan-curl -fsSL https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_amd64 -o /opt/adscan/tools/kerbrute/kerbrute; \
+  adscan-curl -fsSL "https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_${effarch}" -o /opt/adscan/tools/kerbrute/kerbrute; \
   chmod +x /opt/adscan/tools/kerbrute/kerbrute; \
   \
-  mkdir -p /opt/adscan/tools/ligolo-ng/proxy/linux-amd64; \
+  # ligolo-ng PROXY runs on the ADscan host, so it must match the host arch —
+  # ligolo publishes native linux_amd64 + linux_arm64 proxy binaries. The layout
+  # (proxy/linux-<arch>/) is exactly what ligolo_manager.get_ligolo_proxy_local_path
+  # resolves from platform.machine(). The AGENT below stays windows-amd64: it is a
+  # payload dropped on the Windows target, independent of the ADscan host arch.
+  mkdir -p "/opt/adscan/tools/ligolo-ng/proxy/linux-${effarch}"; \
   adscan-curl -fsSL \
-    "https://github.com/nicocha30/ligolo-ng/releases/download/v${LIGOLO_NG_VERSION}/ligolo-ng_proxy_${LIGOLO_NG_VERSION}_linux_amd64.tar.gz" \
+    "https://github.com/nicocha30/ligolo-ng/releases/download/v${LIGOLO_NG_VERSION}/ligolo-ng_proxy_${LIGOLO_NG_VERSION}_linux_${effarch}.tar.gz" \
     -o /tmp/ligolo_proxy.tar.gz; \
-  tar -xzf /tmp/ligolo_proxy.tar.gz -C /opt/adscan/tools/ligolo-ng/proxy/linux-amd64 proxy; \
-  chmod +x /opt/adscan/tools/ligolo-ng/proxy/linux-amd64/proxy; \
-  setcap cap_net_admin,cap_net_bind_service+ep /opt/adscan/tools/ligolo-ng/proxy/linux-amd64/proxy; \
-  ln -sf /opt/adscan/tools/ligolo-ng/proxy/linux-amd64/proxy /opt/adscan/bin/ligolo-proxy; \
+  tar -xzf /tmp/ligolo_proxy.tar.gz -C "/opt/adscan/tools/ligolo-ng/proxy/linux-${effarch}" proxy; \
+  chmod +x "/opt/adscan/tools/ligolo-ng/proxy/linux-${effarch}/proxy"; \
+  setcap cap_net_admin,cap_net_bind_service+ep "/opt/adscan/tools/ligolo-ng/proxy/linux-${effarch}/proxy"; \
+  ln -sf "/opt/adscan/tools/ligolo-ng/proxy/linux-${effarch}/proxy" /opt/adscan/bin/ligolo-proxy; \
   rm -f /tmp/ligolo_proxy.tar.gz; \
   \
   mkdir -p /opt/adscan/tools/ligolo-ng/agent/windows-amd64; \
@@ -541,11 +578,6 @@ RUN set -eux; \
     -o /tmp/ligolo_agent_windows_amd64.zip; \
   unzip -q /tmp/ligolo_agent_windows_amd64.zip agent.exe -d /opt/adscan/tools/ligolo-ng/agent/windows-amd64; \
   rm -f /tmp/ligolo_agent_windows_amd64.zip; \
-  \
-  git clone --depth 1 https://github.com/p0dalirius/Coercer.git /opt/adscan/tools/coercer; \
-  python3 -m venv /opt/adscan/tool_venvs/coercer/venv; \
-  /opt/adscan/tool_venvs/coercer/venv/bin/python -m pip install --no-cache-dir -U pip; \
-  /opt/adscan/tool_venvs/coercer/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/coercer/requirements.txt; \
   \
   # FreeRDP: reuse the host-seeded install/ tree when present (COPYed from
   # freerdp_source above), else clone + cmake-build from source. The compile is
@@ -608,12 +640,20 @@ RUN set -eux; \
 # Donut – PE-to-shellcode converter for the Tier-3 in-memory loader pipeline.
 # Installed to /opt/adscan/bin/ which is on PATH (see ENV above).
 # CFLAGS=-w suppresses deprecation warnings that would fail on GCC 13+ with -Werror.
+# donut's generator + its embedded x86/x64 loader stubs target amd64; upstream
+# ships no arm64 build, so on arm64 the Tier-3 shellcode-loader pipeline is
+# skipped (the rest of post-ex is unaffected). Flagged as an arm64 limitation.
 RUN set -eux; \
-  git clone --depth 1 https://github.com/TheWover/donut.git /tmp/donut_build; \
-  make -C /tmp/donut_build CFLAGS="-w -O2"; \
-  cp /tmp/donut_build/donut /opt/adscan/bin/donut; \
-  chmod 0755 /opt/adscan/bin/donut; \
-  rm -rf /tmp/donut_build
+  effarch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+  if [ "${effarch}" = "amd64" ]; then \
+    git clone --depth 1 https://github.com/TheWover/donut.git /tmp/donut_build; \
+    make -C /tmp/donut_build CFLAGS="-w -O2"; \
+    cp /tmp/donut_build/donut /opt/adscan/bin/donut; \
+    chmod 0755 /opt/adscan/bin/donut; \
+    rm -rf /tmp/donut_build; \
+  else \
+    echo "warning: donut has no ${effarch} build; skipping Tier-3 shellcode loader on this arch" >&2; \
+  fi
 
 # Windows attack binaries (binary_ops catalog – Tier 1 prebuilt cache).
 # Stored at /opt/adscan/tools/windows-tools/<name>/<filename> to match
@@ -833,8 +873,10 @@ RUN set -eux; \
   }; \
   mkdir -p /opt/adscan/wordlists; \
   download_wordlist https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt /opt/adscan/wordlists/rockyou.txt; \
-  download_wordlist https://gist.github.com/The-Viper-One/a1ee60d8b3607807cc387d794e809f0b/raw/b7d83af6a8bbb43013e04f78328687d19d0cf9a7/kerberoast_pws.xz /opt/adscan/wordlists/kerberoast_pws.xz; \
-  xz -d -c /opt/adscan/wordlists/kerberoast_pws.xz > /opt/adscan/wordlists/kerberoast_pws; \
+  # kerberoast_pws is no longer downloaded here: it is staged host-side by
+  # scripts/prepare_runtime_wordlists.sh and folded into combined_audit_base.txt
+  # by scripts/build_combined_audit_wordlist.sh, then dropped from the context —
+  # the image ships the combined audit base only (no standalone kerberoast_pws).
   mkdir -p /usr/share/wordlists/statistically-likely-usernames; \
   # Reuse the host-seeded usernames dir when present (COPYed from slu_source
   # above), else fetch the commit-pinned tarball. A bare `git clone` corrupts
@@ -862,7 +904,6 @@ RUN set -eux; \
     done; \
     [ "${slu_fetched}" = "1" ] || { echo "statistically-likely-usernames: giving up after retries" >&2; exit 1; }; \
   fi; \
-  rm -f /opt/adscan/wordlists/kerberoast_pws.xz; \
   chmod -R 0777 /opt/adscan/wordlists /usr/share/wordlists/statistically-likely-usernames
 
 COPY adscan_internal/assets/wordlists/kerberos-format-inference.txt /opt/adscan/wordlists/kerberos-format-inference.txt
@@ -960,7 +1001,6 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
     python-docx==1.2.0 \
     openpyxl==3.1.5 \
     netifaces==0.11.0 \
-    posthog==7.9.3 \
     certifi==2026.1.4 \
     ipaddress==1.0.23 \
     python-dotenv==1.2.1 \
@@ -969,7 +1009,7 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
     questionary==2.1.1 \
     pypsrp[kerberos]==0.9.0 \
     pydantic-settings==2.13.1 \
-    "pydantic-ai-slim[ag-ui,anthropic,bedrock,cli,cohere,evals,fastmcp,google,groq,huggingface,logfire,mcp,mistral,openai,retries,temporal,ui,vertexai]==1.101.0" \
+    "pydantic-ai-slim[anthropic,google,openai]==1.101.0" \
     gssapi==1.10.1 \
     krb5==0.9.0 \
     python-magic==0.4.27 \

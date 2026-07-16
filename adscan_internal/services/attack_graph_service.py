@@ -7,6 +7,7 @@ import os
 import re
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -162,6 +163,38 @@ def _attack_path_debug_summary_tables(enabled: bool):
         yield
     finally:
         _ATTACK_PATH_DEBUG_SUMMARY_TABLES_ENABLED = previous
+
+
+# When set, ``_ask_or_get_attack_path_engine`` skips the DEV engine/parallelism
+# questionary pickers and returns the production default (local DFS, sequential).
+# The pickers are a dev-only benchmark affordance; some callers drive attack-path
+# computation from an INCIDENTAL, non-interactive seam (the background-job drain /
+# idle-prompt harvest review) where firing an engine picker every render is a
+# UX defect, not a meaningful choice. Scope it with ``suppress_dev_engine_picker``
+# rather than threading an ``engine_override`` through every nested call site.
+_SUPPRESS_DEV_ENGINE_PICKER: ContextVar[bool] = ContextVar(
+    "_suppress_dev_engine_picker", default=False
+)
+
+
+@contextmanager
+def suppress_dev_engine_picker() -> Iterator[None]:
+    """Force the production attack-path engine default within this scope.
+
+    Inside the ``with`` block, ``_ask_or_get_attack_path_engine`` returns
+    ``("local", 0)`` without prompting, even in dev mode — so any attack-path
+    computation triggered from an incidental non-interactive seam (e.g. the
+    background-job drain rendering a harvest review, which classifies compromise
+    reach via ``get_attack_path_summaries``) never fires the dev engine /
+    parallelism questionary pickers. The INTENDED interactive selectors of that
+    flow (credential activation) are unaffected; only the dev-benchmark engine
+    picker is silenced. Re-entrant and asyncio-safe (backed by a ``ContextVar``).
+    """
+    token = _SUPPRESS_DEV_ENGINE_PICKER.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESS_DEV_ENGINE_PICKER.reset(token)
 
 
 def _maybe_print_attack_paths_summary_debug(
@@ -1933,6 +1966,28 @@ def _attack_paths_cache_base_key(
     )
 
 
+def attack_paths_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...]:
+    """Return the graph-epoch tokens the attack-path compute cache keys on.
+
+    Single source of truth for the ``(graph_mtime, snapshot_mtime)`` invalidation
+    epoch shared by :func:`_attack_paths_cache_base_key`. A per-principal reach
+    memo in front of the set-granular compute cache MUST key on THESE exact
+    tokens (not a parallel epoch) so that every ``save_attack_graph`` — which
+    bumps the graph file mtime AND calls :func:`_invalidate_attack_paths_cache` —
+    also ages out every memoized per-principal reach. This is what makes such a
+    memo provably never-stale: a step-state change (persisted inside
+    ``attack_graph.json``) changes the graph mtime, hence the epoch, hence forces
+    a recompute.
+
+    Returns:
+        ``(graph_mtime_token, snapshot_mtime_token)`` — each a float mtime or
+        ``None`` when the file is absent. Best-effort; never raises.
+    """
+    graph_path = _graph_path(shell, domain)
+    snapshot_path = _membership_snapshot_path(shell, domain)
+    return (_file_mtime_token(graph_path), _file_mtime_token(snapshot_path))
+
+
 def _attack_paths_cache_get(
     key: tuple[Any, ...], *, domain: str, scope: str, no_cache: bool = False
 ) -> list[dict[str, Any]] | None:
@@ -2438,6 +2493,7 @@ def get_attack_paths_cache_stats(
 
 __all__ = [
     "AttackPathSummaryFilters",
+    "attack_paths_epoch_fingerprint",
     "get_attack_path_summaries",
     "get_graph_service_access_pairs",
     "get_owned_attack_path_summaries_to_target",
@@ -10702,6 +10758,122 @@ def upsert_ldap_anonymous_bind_entry_edge(
     return True
 
 
+def upsert_poison_capture_ntlmv2_crack_edge(
+    shell: object,
+    domain: str,
+    *,
+    username: str,
+    status: str = "success",
+    notes: dict[str, Any] | None = None,
+) -> bool:
+    """Materialize a broadcast-poison → NetNTLMv2 capture → offline-crack edge.
+
+    Records ``ANONYMOUS LOGON -> PoisonCaptureNtlmv2Crack -> <cracked user>`` as
+    an entry-vector edge. The source is the unauthenticated-principal node (the
+    same ``ANONYMOUS LOGON`` representation used by
+    :func:`upsert_ldap_anonymous_bind_entry_edge`) so the edge is classified
+    ``UNAUTHENTICATED_PRINCIPAL`` at the source and severity-capped accordingly —
+    no credential is held by the attacker.
+
+    This edge is materialized ONLY on crack SUCCESS: the capture on its own is
+    the LLMNR/NBT-NS poisoning FINDING, and a NetNTLMv2 response is not usable
+    until it is cracked back to the cleartext password. Once cracked, the victim
+    user is an owned entry point, so the edge makes that principal a valid start
+    for attack-path search (like the anonymous-bind / password-spray entry
+    edges). Distinct from the NTLMv1 steps by design — those recover a machine
+    NT hash (pass-the-hash capable) and keep their own relations.
+
+    Args:
+        shell: Shell instance used for workspace path context.
+        domain: Domain the cracked credential belongs to.
+        username: sAMAccountName of the user whose NetNTLMv2 was cracked.
+        status: Edge status (default ``success`` — this edge only exists once
+            the crack has proven a usable credential).
+        notes: Optional edge notes (e.g. observed segment / capture metadata).
+
+    Returns:
+        True when the edge was recorded, False when the username was empty.
+    """
+    user_clean = str(username or "").strip()
+    if not user_clean:
+        return False
+    graph = load_attack_graph(shell, domain)
+    entry_id = ensure_entry_node_for_domain(
+        shell, domain, graph, label="ANONYMOUS LOGON"
+    )
+    user_id = ensure_user_node_for_domain(shell, domain, graph, username=user_clean)
+    upsert_edge(
+        graph,
+        from_id=entry_id,
+        to_id=user_id,
+        relation="PoisonCaptureNtlmv2Crack",
+        edge_type="entry_vector",
+        status=status,
+        notes=notes or {},
+    )
+    save_attack_graph(shell, domain, graph)
+    return True
+
+
+def upsert_ntlmv1_crack_user_edge(
+    shell: object,
+    domain: str,
+    *,
+    username: str,
+    status: str = "success",
+    notes: dict[str, Any] | None = None,
+) -> bool:
+    """Materialize a wordlist-cracked USER NetNTLMv1 as a ``CrackNTLMv1`` edge.
+
+    Reuses the existing ``CrackNTLMv1`` relation (the catalog entry keeps its
+    static ``unsupported`` default for the coercion-relay, machine-targeted
+    avenue built by ``ntlmv1_relay_graph_builder``) but records THIS specific
+    instance — a captured NetNTLMv1 challenge/response for a USER account,
+    recovered by an ordinary wordlist crack — as its own ``ANONYMOUS LOGON ->
+    CrackNTLMv1 -> <cracked user>`` entry-vector edge with an executed
+    (``success``) status. A per-edge ``success`` status renders as exploited
+    regardless of the relation's global catalog classification (see
+    ``attack_step_support_registry.classify_relation_support`` and the
+    derived-status precedence in this module), so a user-account crack is
+    never masked by the machine-account avenue's ``unsupported`` default.
+
+    Call site: ``cli/cracking.py``'s crack-success materialization, mirroring
+    :func:`upsert_poison_capture_ntlmv2_crack_edge`. Gate the CALL on
+    ``attack_step_catalog.ntlmv1_crack_support_for(account_type) ==
+    "supported"`` (via ``captured_credential_policy.classify_principal``) —
+    a machine account must never reach this function.
+
+    Args:
+        shell: Shell instance used for workspace path context.
+        domain: Domain the cracked credential belongs to.
+        username: sAMAccountName of the user whose NetNTLMv1 was cracked.
+        status: Edge status (default ``success``).
+        notes: Optional edge notes (e.g. capture/crack metadata).
+
+    Returns:
+        True when the edge was recorded, False when the username was empty.
+    """
+    user_clean = str(username or "").strip()
+    if not user_clean:
+        return False
+    graph = load_attack_graph(shell, domain)
+    entry_id = ensure_entry_node_for_domain(
+        shell, domain, graph, label="ANONYMOUS LOGON"
+    )
+    user_id = ensure_user_node_for_domain(shell, domain, graph, username=user_clean)
+    upsert_edge(
+        graph,
+        from_id=entry_id,
+        to_id=user_id,
+        relation="CrackNTLMv1",
+        edge_type="entry_vector",
+        status=status,
+        notes=notes or {},
+    )
+    save_attack_graph(shell, domain, graph)
+    return True
+
+
 def upsert_password_spray_entry_edge(
     shell: object,
     domain: str,
@@ -14026,6 +14198,12 @@ def _ask_or_get_attack_path_engine(shell: object) -> tuple[str, int]:
     if not is_dev:
         return "local", 0
 
+    # An incidental non-interactive seam (the background-job drain / idle-prompt
+    # harvest review) suppresses the dev picker for its scope — return the
+    # production default rather than prompting on every render.
+    if _SUPPRESS_DEV_ENGINE_PICKER.get():
+        return "local", 0
+
     if not hasattr(shell, "_questionary_select"):
         return "local", 0
 
@@ -14218,13 +14396,25 @@ def get_attack_path_summaries(
         _engine, _dev_workers = _ask_or_get_attack_path_engine(shell)
     else:
         _engine = str(engine_override or "local").strip().lower() or "local"
+        # Default to the module worker setting (env ADSCAN_ATTACK_PATH_WORKERS,
+        # default 0 = SEQUENTIAL). Measured 2026-07: on real attack-path graphs
+        # parallel gives no speedup (the cost is the shared-subtree re-walk /
+        # per-principal downstream fan-out, not independent per-source work), it
+        # was the source of an under-reporting coverage divergence vs sequential,
+        # and its per-worker graph copies pressure memory on weak VMs. Sequential
+        # is the correct production default; parallel stays available for
+        # debugging via ADSCAN_ATTACK_PATH_WORKERS=-1, an explicit
+        # dev_workers_override, or the dev interactive engine selector.
         _dev_workers = (
-            int(dev_workers_override) if isinstance(dev_workers_override, int) else -1
+            int(dev_workers_override)
+            if isinstance(dev_workers_override, int)
+            else attack_graph_core._ATTACK_PATH_WORKERS  # noqa: SLF001
         )
 
-    # Temporarily override the worker count for this computation when a dev
-    # override was selected (dev mode only — in production _dev_workers == -1
-    # which matches the module default, so there is no observable difference).
+    # Apply the resolved worker count for this computation, restoring the module
+    # default in the finally. In production _dev_workers now equals the module
+    # setting (sequential by default), so this is a no-op unless a debug override
+    # (env / param / dev selector) explicitly requested parallel.
     _prev_graph_workers = attack_graph_core._ATTACK_PATH_WORKERS  # noqa: SLF001
     _prev_principal_workers = attack_paths_core._PRINCIPAL_WORKERS  # noqa: SLF001
     attack_graph_core._ATTACK_PATH_WORKERS = _dev_workers  # noqa: SLF001

@@ -20,6 +20,7 @@ import contextvars
 import logging
 import os
 import sys
+import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Optional
 
@@ -464,6 +465,182 @@ def pop_deferred_live_buffer(
     return []
 
 
+# ---------------------------------------------------------------------------
+# Background-thread console silence — a worker thread NEVER paints the live
+# console; its output is telemetered + deferred for the foreground to render.
+# ---------------------------------------------------------------------------
+#
+# Why this exists.
+#
+# Background work (the poisoning listener, the benchmark warm-up, background
+# cracking) runs on daemon threads. If such a thread writes to the visible
+# console it (a) interleaves with the foreground sequential scan flow so the
+# operator cannot tell foreground from background, and (b) — the real bug —
+# collides with a live interactive prompt, garbling a selector
+# (``? Crack discovered user? (Use arrow keys)DEBUG Result: exit_code=0...``).
+#
+# The single enforcement point is here, at ``_TeeConsole.print`` (which ALL
+# ``print_*`` helpers route through). A worker marks its thread via
+# :func:`background_console_context` (or :func:`mark_background_thread`) for the
+# duration of its run. While that marker is active on the CURRENT thread, every
+# ``print()`` is (a) mirrored into telemetry as usual and (b) appended to a
+# shared deferred buffer the FOREGROUND drains + renders at a safe breakpoint
+# (``check_background_tasks``, before the next prompt) — and is NEVER written to
+# the live visible console. This makes it structurally impossible for any
+# background thread to collide with the foreground flow or a prompt, for ALL
+# background threads at once, without any per-caller code.
+#
+# Default (non-debug) behaviour is unchanged: ``print_info_debug`` is a no-op
+# when debug is off, so nothing is captured and nothing is deferred — this only
+# changes WHERE background output goes when it exists.
+
+# Per-thread marker. ``depth`` > 0 means the current thread is a background
+# worker; ``labels`` is a stack of human-readable attributions for the flush.
+_bg_console_local = threading.local()
+
+# Shared, thread-safe buffer of ``(label, args, kwargs)`` captured from
+# background worker threads, drained + re-rendered by the FOREGROUND.
+_BACKGROUND_CONSOLE_LOCK = threading.Lock()
+_BACKGROUND_CONSOLE_BUFFER: list[tuple[str, tuple[Any, ...], Dict[str, Any]]] = []
+
+
+def _is_background_console_thread() -> bool:
+    """True when the CURRENT thread is marked as a background worker."""
+    try:
+        return int(getattr(_bg_console_local, "depth", 0)) > 0
+    except Exception:  # noqa: BLE001 — never let the console path raise
+        return False
+
+
+def _current_background_label() -> str:
+    labels = getattr(_bg_console_local, "labels", None)
+    if labels:
+        return str(labels[-1])
+    return "background"
+
+
+@contextmanager
+def background_console_context(label: str = "background"):
+    """Route this thread's console output off the live terminal for its lifetime.
+
+    While active on the CURRENT thread, every ``print()`` / ``print_*`` call is
+    telemetered as usual AND appended to a shared deferred buffer the foreground
+    drains + renders at a safe breakpoint — but is NEVER painted to the live
+    visible console. This is the single enforcement point for the background-job
+    invariant "a worker thread never prints/prompts": a background thread can
+    neither interleave with the foreground sequential flow nor corrupt a live
+    interactive prompt.
+
+    Best-effort and reentrant: nesting increments a depth counter; the console
+    path never raises. Use this to wrap a worker thread's run body.
+
+    Args:
+        label: Short attribution shown in the foreground flush header.
+    """
+    depth = int(getattr(_bg_console_local, "depth", 0))
+    labels = getattr(_bg_console_local, "labels", None)
+    if labels is None:
+        labels = []
+        _bg_console_local.labels = labels
+    _bg_console_local.depth = depth + 1
+    labels.append(str(label))
+    try:
+        yield
+    finally:
+        try:
+            if labels:
+                labels.pop()
+        except Exception:  # noqa: BLE001
+            pass
+        _bg_console_local.depth = max(
+            0, int(getattr(_bg_console_local, "depth", 1)) - 1
+        )
+
+
+def mark_background_thread(label: str = "background") -> None:
+    """Permanently mark the CURRENT thread as a background worker (no scope).
+
+    Convenience for a dedicated daemon thread whose entire life is background
+    work and cannot wrap its body in :func:`background_console_context`. Prefer
+    the context manager where a clear scope exists.
+
+    Args:
+        label: Short attribution shown in the foreground flush header.
+    """
+    _bg_console_local.depth = int(getattr(_bg_console_local, "depth", 0)) + 1
+    labels = getattr(_bg_console_local, "labels", None)
+    if labels is None:
+        labels = []
+        _bg_console_local.labels = labels
+    labels.append(str(label))
+
+
+def _capture_background_console(
+    label: str, args: tuple[Any, ...], kwargs: Dict[str, Any]
+) -> None:
+    """Best-effort append of one captured background renderable."""
+    try:
+        with _BACKGROUND_CONSOLE_LOCK:
+            _BACKGROUND_CONSOLE_BUFFER.append((label, args, dict(kwargs)))
+    except Exception:  # noqa: BLE001 — never break the caller on capture
+        pass
+
+
+def drain_background_console_output() -> (
+    list[tuple[str, tuple[Any, ...], Dict[str, Any]]]
+):
+    """Return + clear every captured background-thread renderable.
+
+    Called by the FOREGROUND at a safe breakpoint. The returned entries are
+    re-printed to the operator's real terminal by
+    :func:`flush_deferred_background_console`.
+    """
+    with _BACKGROUND_CONSOLE_LOCK:
+        drained = list(_BACKGROUND_CONSOLE_BUFFER)
+        _BACKGROUND_CONSOLE_BUFFER.clear()
+        return drained
+
+
+def flush_deferred_background_console() -> int:
+    """Render captured background-thread output to the operator's terminal.
+
+    Runs on the FOREGROUND REPL thread only (from ``check_background_tasks``,
+    after any active render has completed). Drains the shared buffer and
+    re-prints each renderable — attributed under a dim header — so background
+    diagnostics that were withheld from the live console during the run surface
+    at a safe point instead of colliding with the foreground flow or a prompt.
+
+    Each entry was already mirrored into telemetry at capture time, so the
+    re-print here is wrapped in :func:`_explicit_telemetry_mirror` to avoid a
+    double telemetry record; only the decorative header is new. Best-effort:
+    never raises. Returns the number of entries flushed.
+    """
+    entries = drain_background_console_output()
+    if not entries:
+        return 0
+    console = _get_console()
+    header = None
+    try:
+        from rich.text import Text  # noqa: PLC0415
+
+        labels = ", ".join(sorted({label for label, _, _ in entries}))
+        header = Text(f"─ background output · {labels}", style="dim")
+    except Exception:  # noqa: BLE001
+        header = None
+    with _explicit_telemetry_mirror():
+        if header is not None:
+            try:
+                console.print(header)
+            except Exception:  # noqa: BLE001
+                pass
+        for _label, args, kwargs in entries:
+            try:
+                console.print(*args, **kwargs)
+            except Exception:  # noqa: BLE001
+                pass
+    return len(entries)
+
+
 class _TeeConsole(Console):
     """Visible :class:`rich.console.Console` that mirrors print to telemetry.
 
@@ -476,6 +653,19 @@ class _TeeConsole(Console):
     """
 
     def print(self, *args: Any, **kwargs: Any) -> None:
+        # Background worker thread: NEVER paint the live visible console —
+        # it would interleave with the foreground sequential scan flow or
+        # corrupt a live interactive prompt. Instead route the renderable to
+        # telemetry (as usual) + a shared deferred buffer the foreground
+        # drains + renders at a safe breakpoint. This is the single
+        # enforcement point for the background-job "never prints" invariant,
+        # applied to ALL background threads at once.
+        if _is_background_console_thread():
+            _capture_background_console(_current_background_label(), args, kwargs)
+            if not _skip_auto_mirror.get():
+                self._mirror_to_telemetry(args, kwargs)
+            return
+
         # Always render to the visible terminal first. If the visible
         # render itself raises, we let that propagate — that's a real
         # bug the operator needs to see.
@@ -499,6 +689,10 @@ class _TeeConsole(Console):
         if _skip_auto_mirror.get():
             return
 
+        self._mirror_to_telemetry(args, kwargs)
+
+    def _mirror_to_telemetry(self, args: tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Best-effort mirror of one ``print`` into the telemetry recording."""
         telemetry_console = _telemetry_console
         if telemetry_console is None or telemetry_console is self:
             return
@@ -849,11 +1043,17 @@ def _should_use_questionary_prompt() -> bool:
 
 
 class TelemetryAwareConsole:
-    """Wrapper console that duplicates output to a telemetry console.
+    """Wrapper that mirrors a *plain* console's prints into telemetry.
 
-    This ensures that direct console.print() calls in the shell (e.g. do_help tables)
-    are captured in the session recording, not just output routed through the
-    logging system or rich_output helpers.
+    Fallback for the rare case where the visible console is a vanilla
+    :class:`rich.console.Console` rather than a :class:`_TeeConsole`. A
+    :class:`_TeeConsole` already auto-mirrors every ``print()`` into the
+    telemetry recording, so wrapping one in this class would record every
+    line TWICE (the tee's auto-mirror + this wrapper's explicit mirror).
+
+    Never wrap a :class:`_TeeConsole` in this class — use
+    :func:`wrap_console_for_telemetry`, which returns a tee console unchanged
+    and only wraps genuine plain consoles so capture happens exactly once.
     """
 
     def __init__(self, main_console, telemetry_console):
@@ -867,6 +1067,38 @@ class TelemetryAwareConsole:
 
     def __getattr__(self, name):
         return getattr(self.main_console, name)
+
+
+def wrap_console_for_telemetry(
+    console: Console, telemetry_console: Optional[Console]
+) -> Console:
+    """Return a console that records every ``print`` into telemetry exactly once.
+
+    This is the single decision point for "make direct ``console.print`` calls
+    land in the session recording". It exists to prevent the double-mirror bug:
+
+    * If ``console`` is already a :class:`_TeeConsole`, it auto-mirrors every
+      ``print()`` into the telemetry recording on its own, so it is returned
+      **unchanged**. Wrapping it in :class:`TelemetryAwareConsole` would record
+      every line twice (auto-mirror copy + the wrapper's explicit copy),
+      doubling the size of every session recording.
+    * Otherwise (a genuine plain :class:`rich.console.Console` with no
+      auto-mirror) it is wrapped in :class:`TelemetryAwareConsole` so its prints
+      are still captured — exactly once.
+
+    Args:
+        console: The visible console to make telemetry-aware.
+        telemetry_console: The telemetry recording console (may be ``None``).
+
+    Returns:
+        ``console`` itself when it already auto-mirrors, otherwise a
+        :class:`TelemetryAwareConsole` wrapping it. In both cases a single
+        telemetry copy is produced per ``print``.
+    """
+    if isinstance(console, _TeeConsole):
+        # Already auto-mirrors into telemetry; wrapping would double-record.
+        return console
+    return TelemetryAwareConsole(console, telemetry_console)
 
 
 __all__ = [
@@ -890,6 +1122,12 @@ __all__ = [
     # deferred live-log capture
     "push_deferred_live_buffer",
     "pop_deferred_live_buffer",
+    # background-thread console silence
+    "background_console_context",
+    "mark_background_thread",
+    "drain_background_console_output",
+    "flush_deferred_background_console",
     # console wrapper
     "TelemetryAwareConsole",
+    "wrap_console_for_telemetry",
 ]

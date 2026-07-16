@@ -1564,13 +1564,6 @@ def check_dpapi(
         print_exception(show_locals=False, exception=exc)
 
 
-def netexec_extract_winrm(shell: Any, *, domain: str) -> None:
-    """Extract WinRM hosts from a generic list using NetExec output."""
-    marked_domain = mark_sensitive(domain, "domain")
-    command = f"{shell.netexec_path} winrm winrm/ips.txt | grep {marked_domain}"
-    shell.extract_services(command, domain, "winrm")
-
-
 def check_autologon(
     shell: Any, *, domain: str, host: str, username: str, password: str
 ) -> None:

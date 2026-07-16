@@ -946,7 +946,31 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
             read_json_file(variables_file) if os.path.exists(variables_file) else None
         )
         if variables is not None:
+            # The workspace identity is ACTIVATION-OWNED, not variables-owned:
+            # activate_workspace() (and every caller of this loader) sets
+            # shell.current_workspace / current_workspace_dir to the authoritative
+            # filesystem identity BEFORE we run. A corrupt/empty/key-absent
+            # variables.json must NEVER override that identity — otherwise
+            # apply_workspace_variables_to_shell() resets both to their None
+            # default (the key is missing from the recovered ``{}``), which the
+            # ``while not shell.current_workspace`` guard in start.py misreads as a
+            # cancelled workspace selection and bricks an existing workspace in a
+            # false "cancelled" loop. Capture the activated identity and re-assert
+            # it after applying variables so corrupt, absent, or stale values can
+            # never win. (``workspace_path`` is deliberately NOT used as the source
+            # here: this loader is also invoked with a DOMAIN directory, so its
+            # basename is not reliably the workspace name.)
+            activation_current_workspace = getattr(shell, "current_workspace", None)
+            activation_current_workspace_dir = getattr(
+                shell, "current_workspace_dir", None
+            )
+
             apply_workspace_variables_to_shell(shell, variables)
+
+            if activation_current_workspace:
+                shell.current_workspace = activation_current_workspace
+            if activation_current_workspace_dir:
+                shell.current_workspace_dir = activation_current_workspace_dir
 
             # Infer lab from workspace name, backfilling inference metadata
             # even for existing workspaces that already have lab_provider set.
@@ -1308,6 +1332,19 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
 
     if loaded_successfully:
         print_success(f"Workspace data successfully processed for {workspace_path}")
+        # Auto-surface the crash-resume offer: if this workspace holds a scan that
+        # was interrupted mid-phase, offer to continue it from where it stopped
+        # (interactive only; gated off + idempotent under ``adscan ci``). Best
+        # effort — never let the offer break workspace loading.
+        try:
+            from adscan_internal.cli.workspace_resume_offer import (
+                maybe_offer_incomplete_scan_resume,
+            )
+
+            maybe_offer_incomplete_scan_resume(shell)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[workspace_load] incomplete-scan resume offer failed: {exc}")
     else:
         print_error(
             f"Failed to fully load workspace data from {workspace_path}. Check errors above."

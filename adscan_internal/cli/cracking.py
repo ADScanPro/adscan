@@ -14,7 +14,7 @@ results; this module:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 from pathlib import Path
 import os
 import re
@@ -75,6 +75,14 @@ from adscan_internal.services.cracking_history_service import (
     find_matching_attempt,
     register_cracking_attempt,
 )
+from adscan_internal.services.cracking_benchmark import load_cached_benchmark
+from adscan_internal.services.cracking_wordlist_policy import (
+    EffortEstimate,
+    base_for,
+    estimate_effort,
+    resolve_single_tier,
+)
+from adscan_core.rich_output import questionary_select_index
 import rich.box
 from rich.console import Group
 from rich.table import Table
@@ -82,14 +90,52 @@ from rich.prompt import Confirm, Prompt
 from rich.text import Text
 from adscan_internal.interaction import is_non_interactive
 
+# Lazily bound to avoid an import cycle: the ``background_jobs`` package
+# __init__ imports poisoning_job -> cli.creds -> cli.cracking. A module-level
+# ``from ... import enqueue_cracking_job`` therefore deadlocks at import time.
+# Kept as a module GLOBAL (not a local) so tests can still patch
+# ``adscan_internal.cli.cracking.enqueue_cracking_job`` and the dispatch resolves
+# the patched value at call time.
+enqueue_cracking_job = None  # type: ignore[assignment]
+
+
+def _ensure_enqueue_cracking_job():
+    """Resolve :func:`enqueue_cracking_job` lazily (cycle-safe)."""
+    global enqueue_cracking_job  # noqa: PLW0603
+    if enqueue_cracking_job is None:
+        from adscan_internal.services.background_jobs.cracking_enqueue import (  # noqa: PLC0415
+            enqueue_cracking_job as _impl,
+        )
+
+        enqueue_cracking_job = _impl
+    return enqueue_cracking_job
+
 _MINIMUM_TIMEROAST_HASHCAT_VERSION = (7, 1, 2)
 _GRAPH_TRACKED_ROAST_HASH_TYPES = {"asreproast", "kerberoast"}
 _HASHCAT_NO_DEVICE_TEXT = "No devices found/left"
 _HASHCAT_EXHAUSTED_EXIT_CODE = 1
+# hashcat exits with code 2 when a run is aborted cleanly (e.g. the --runtime
+# cap is reached). When ADscan sets --runtime itself this is expected, not a
+# failure — the potfile still holds any creds recovered before the cap.
+_HASHCAT_RUNTIME_ABORT_EXIT_CODE = 2
 _HASHCAT_FATAL_ERROR_PATTERNS = (
     "Kernel /",
     "build failed",
     ".kernel: Permission denied",
+)
+# Out-of-memory: hashcat / CUDA / OpenCL cannot allocate enough device or host
+# memory for the attack (typically exits rc 252). This is NOT "no candidate
+# matched" — another wordlist will not help; the operator needs a smaller
+# wordlist, more free memory, or a machine with a dedicated GPU. Classified as a
+# DISTINCT cause so the no-match panel gives the right advice instead of the
+# misleading "try a different wordlist" (field session a38bbbff: a 256 MB host
+# crashed with this and got told to try another wordlist).
+_HASHCAT_OOM_ERROR_PATTERNS = (
+    "not enough allocatable device memory",
+    "cuda_error_out_of_memory",
+    "cl_out_of_resources",
+    "cl_mem_object_allocation_failure",
+    "out of memory",
 )
 _HASHCAT_BENIGN_STDERR_PATTERNS = (
     "nvmlDeviceGetFanSpeed(): Not Supported",
@@ -139,8 +185,8 @@ def _count_hashes_in_file(hash_file: str) -> int:
 def _classify_hashcat_failure(combined_output: str, returncode: int | None) -> str:
     """Return a short label for the most likely failure cause.
 
-    Returns one of: ``no_device``, ``exhausted``, ``hash_format``, ``runtime``,
-    ``unknown``.
+    Returns one of: ``no_device``, ``out_of_memory``, ``exhausted``,
+    ``hash_format``, ``runtime``, ``unknown``.
     """
     lowered = (combined_output or "").lower()
     if _HASHCAT_NO_DEVICE_TEXT.lower() in lowered:
@@ -149,6 +195,8 @@ def _classify_hashcat_failure(combined_output: str, returncode: int | None) -> s
         return "hash_format"
     if "salt-length exception" in lowered or "token length exception" in lowered:
         return "hash_format"
+    if any(pattern in lowered for pattern in _HASHCAT_OOM_ERROR_PATTERNS):
+        return "out_of_memory"
     if _is_fatal_hashcat_runtime_error(combined_output):
         return "runtime"
     if int(returncode or 0) == _HASHCAT_EXHAUSTED_EXIT_CODE:
@@ -156,13 +204,145 @@ def _classify_hashcat_failure(combined_output: str, returncode: int | None) -> s
     return "unknown"
 
 
+# The wordlists the image actually ships as SELECTABLE standalone files.
+# ``kaonashi`` and ``kerberoast_pws`` are no longer shipped standalone — they are
+# folded into ``combined_audit_base.txt`` (see the wordlist manifest components),
+# so they must not appear as bundled telemetry names or as selector options.
+_BUNDLED_WORDLIST_TELEMETRY_NAMES: frozenset[str] = frozenset(
+    {
+        "rockyou.txt",
+        "combined_audit_base.txt",
+        "hashmob.net_2025.micro.found",
+    }
+)
+
+# Canonical telemetry labels for non-bundled wordlists. A generic operator list
+# buckets to ``custom``; a list built by ``custom_wordlist_service`` (mined from
+# this environment) gets its own ``custom_targeted`` label so the crack-ratio
+# analytics can A/B the targeted builder against generic lists.
+_GENERIC_CUSTOM_TELEMETRY_LABEL = "custom"
+_CUSTOM_TARGETED_TELEMETRY_LABEL = "custom_targeted"
+
+# The SSOT layout for a targeted custom wordlist is
+# ``.../wordlists/custom/<domain>/`` (see
+# ``custom_wordlist_service.custom_wordlist_dir`` — host ``~/.adscan`` <->
+# container ``/opt/adscan``). This marker segment is what distinguishes a
+# targeted build from an arbitrary operator "other" path.
+_CUSTOM_WORDLIST_PATH_MARKER = "/wordlists/custom/"
+
+
+def _is_targeted_custom_wordlist(wordlist: str | None) -> bool:
+    """Return ``True`` when ``wordlist`` is a targeted list built by the service.
+
+    A targeted custom wordlist always lives under ``.../wordlists/custom/`` (the
+    SSOT layout of ``custom_wordlist_service.custom_wordlist_dir``), so a path
+    location check reliably separates it from an arbitrary operator-supplied
+    "other" path. Never raises — telemetry labelling must not crash a crack.
+    """
+    if not wordlist:
+        return False
+    normalized = str(wordlist).replace("\\", "/")
+    return _CUSTOM_WORDLIST_PATH_MARKER in normalized
+
+
+def _wordlist_telemetry_label(wordlist: str | None) -> str | None:
+    """Map a wordlist path/name to a telemetry-safe analytics label.
+
+    Operator-supplied CUSTOM wordlists are often named after the client or its
+    domain, so the raw basename either leaks client data into telemetry OR gets
+    pseudonymized into an unreadable token by the domain sanitizer (a bare
+    ``word.ext`` looks like an FQDN). Emit the basename ONLY for a KNOWN bundled
+    wordlist; a wordlist mined from this environment gets the dedicated
+    ``custom_targeted`` label; everything else buckets to ``custom``. This keeps
+    the crack-ratio analytics clean (real bundled names + a ``custom`` /
+    ``custom_targeted`` aggregate for the A/B) and guarantees no client-named
+    path reaches the recording. The operator still sees the real wordlist name
+    on screen; this is the telemetry LABEL only.
+
+    Idempotent: ``run_cracking`` labels the wordlist once and passes the LABEL to
+    ``execute_cracking``, which re-labels it — a value already mapped to a
+    canonical label passes through unchanged (so ``custom_targeted`` is never
+    silently downgraded to ``custom`` on the second pass).
+    """
+    if not wordlist:
+        return None
+    name = os.path.basename(str(wordlist)).strip()
+    if name in {_GENERIC_CUSTOM_TELEMETRY_LABEL, _CUSTOM_TARGETED_TELEMETRY_LABEL}:
+        return name
+    if name in _BUNDLED_WORDLIST_TELEMETRY_NAMES:
+        return name
+    if _is_targeted_custom_wordlist(wordlist):
+        return _CUSTOM_TARGETED_TELEMETRY_LABEL
+    return _GENERIC_CUSTOM_TELEMETRY_LABEL
+
+
+def format_chosen_wordlist_line(
+    *,
+    wordlist_path: str | None = None,
+    rules_path: str | None = None,
+    tiers: "Sequence[tuple[str, str | None]] | None" = None,
+) -> str:
+    """Format the operator-visible "which wordlist/rules got picked" line.
+
+    Two calling shapes:
+
+    * ``tiers`` — an ordered sequence of ``(base_path, rule_path)`` pairs, for
+      when the effort engine (``cracking_wordlist_policy.resolve_effort``)
+      resolved an escalating ladder of tiers to try in order. Takes priority
+      over ``wordlist_path``/``rules_path`` when non-empty.
+    * ``wordlist_path`` (+ optional ``rules_path``) — the plain single-choice
+      interactive selection.
+
+    Only basenames are shown (never a full path). Returns ``""`` when nothing
+    was resolved (defensive; callers should not print an empty line).
+    """
+
+    def _piece(base_path: str, rule_path: str | None) -> str:
+        piece = os.path.basename(str(base_path))
+        if rule_path:
+            piece += f"  ·  rules: {os.path.basename(str(rule_path))}"
+        return piece
+
+    if tiers:
+        pieces = [_piece(base, rule) for base, rule in tiers if base]
+        if not pieces:
+            return ""
+        if len(pieces) == 1:
+            return f"Cracking with wordlist: {pieces[0]}"
+        return "Cracking with wordlists: " + " → ".join(pieces)
+
+    if not wordlist_path:
+        return ""
+    return f"Cracking with wordlist: {_piece(wordlist_path, rules_path)}"
+
+
+_HASH_TYPE_TO_HARVEST_SOURCE: dict[str, str] = {
+    "kerberoast": "kerberoasting",
+    "asreproast": "asreproasting",
+    "NTLMv1": "poisoning",
+    "NTLMv2": "poisoning",
+}
+
+
+def _harvest_source_for_hash_type(hash_type: str) -> str:
+    """Map a hashcat ``hash_type`` label to the shared harvest ``source`` slug.
+
+    NTLMv1/v2 crack successes reaching this path are broadcast-poisoning
+    captures (the only NTLM-capture flow that lands in ``execute_cracking``'s
+    interactive path); kerberoast/asreproast map 1:1 to their own harvest
+    source. Falls back to the raw ``hash_type`` for anything unmapped
+    (e.g. ``timeroast``) so a future hash type still gets a source label
+    instead of an empty string.
+    """
+    return _HASH_TYPE_TO_HARVEST_SOURCE.get(hash_type, hash_type)
+
+
 def _next_action_for_failure(cause: str, hash_type: str) -> str:
     """Human-readable next action paired with a failure cause."""
     if cause == "exhausted":
         return (
             "Wordlist exhausted without a match. "
-            "Retry with a larger wordlist (kaonashi14M, hashmob medium) "
-            "or a targeted ruleset."
+            "Retry with the combined audit base wordlist or a targeted ruleset."
         )
     if cause == "no_device":
         return _hashcat_no_device_guidance()
@@ -177,10 +357,17 @@ def _next_action_for_failure(cause: str, hash_type: str) -> str:
             "Hashcat hit a fatal runtime error before any candidates were tried. "
             "Re-run with ADSCAN_HASHCAT_FORCE_CPU=1 to bypass an unstable GPU stack."
         )
+    if cause == "out_of_memory":
+        return (
+            "Hashcat ran out of GPU/host memory before cracking could begin, so no "
+            "candidates were tried. Free up memory, use a smaller wordlist, or run "
+            "on a machine with more RAM or a dedicated GPU. A different wordlist "
+            "will not help."
+        )
     if hash_type == "asreproast":
         return "Try a Kerberos-specific wordlist or AS-REP rule set."
     if hash_type == "kerberoast":
-        return "Service accounts often use long passphrases; consider kerberoast_pws or kaonashi14M."
+        return "Service accounts often use long passphrases; try the combined audit base wordlist."
     return "Try a different wordlist or add hashcat rules."
 
 
@@ -261,42 +448,65 @@ class HashCrackingShell(Protocol):
     ) -> subprocess.CompletedProcess[str] | None: ...
 
 
+def _cracking_wordlist_option_rows(workspace_type: str) -> list[tuple[str, str]]:
+    """Return the ``(key, label)`` rows offered by the wordlist selector.
+
+    Only the wordlists the image actually ships standalone are offered, so an
+    operator can never pick a file that was folded into
+    ``combined_audit_base.txt`` and no longer exists on disk (``kaonashi14M``,
+    ``kerberoast_pws``, the retired hashmob-medium list). The shipped set is:
+    the combined audit base, rockyou, the per-domain targeted custom list
+    (mined from this environment, ``custom_targeted`` — a selectable option but
+    NEVER the non-interactive default, so ``adscan ci`` never auto-builds it),
+    and an "Other" custom-path escape hatch. Audit workspaces lead with the
+    combined base; every other workspace leads with rockyou (the CTF default).
+    """
+    targeted_row = (
+        "custom_targeted",
+        "Targeted custom wordlist (mined from this environment)",
+    )
+    other_row = ("other", "Other (custom path)")
+    if str(workspace_type or "").strip().lower() == "audit":
+        return [
+            (
+                "combined_audit",
+                "combined_audit_base.txt (Recommended for real-world environments)",
+            ),
+            ("rockyou", "rockyou.txt (Recommended for CTFs)"),
+            targeted_row,
+            other_row,
+        ]
+    return [
+        ("rockyou", "rockyou.txt (Recommended for CTF)"),
+        ("combined_audit", "combined_audit_base.txt"),
+        targeted_row,
+        other_row,
+    ]
+
+
 def choose_cracking_wordlist(
-    shell: CrackingShell, hash_type: str, wordlists_dir: str
+    shell: CrackingShell, hash_type: str, wordlists_dir: str, *, domain: str | None = None
 ) -> str:
-    """Interactive wordlist selector for cracking operations."""
+    """Interactive wordlist selector for cracking operations.
+
+    Args:
+        shell: Active cracking shell (workspace, non-interactive predicate).
+        hash_type: Logical hash type being cracked (drives copy only).
+        wordlists_dir: Directory holding the bundled wordlists.
+        domain: Target domain, required to offer the targeted custom wordlist
+            (mined from this environment). When ``None`` the targeted option is
+            still shown but resolves to the generic default if chosen.
+    """
     from adscan_internal import print_instruction
 
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     default_wordlist = (
-        os.path.join(wordlists_dir, "hashmob.net_2025.medium.found")
+        os.path.join(wordlists_dir, "combined_audit_base.txt")
         if workspace_type == "audit"
         else os.path.join(wordlists_dir, "rockyou.txt")
     )
 
-    option_rows: list[tuple[str, str]]
-    if workspace_type == "audit":
-        option_rows = [
-            (
-                "hashmob_medium",
-                "hashmob.net_2025.medium.found (Recommended for real world environments)",
-            ),
-            (
-                "kaonashi14M",
-                "kaonashi14M.txt (Recommended for ES environments)",
-            ),
-            ("rockyou", "rockyou.txt (Recommended for CTFs)"),
-            ("kerberoast_pws", "kerberoast_pws (Specialized for Kerberoasting)"),
-            ("other", "Other (custom path)"),
-        ]
-    else:
-        option_rows = [
-            ("rockyou", "rockyou.txt (Recommended for CTF)"),
-            ("kerberoast_pws", "kerberoast_pws (AD service accounts)"),
-            ("hashmob_medium", "hashmob.net_2025.medium.found"),
-            ("kaonashi14M", "kaonashi14M.txt"),
-            ("other", "Other (custom path)"),
-        ]
+    option_rows = _cracking_wordlist_option_rows(workspace_type)
     options = [label for _, label in option_rows]
     key_by_label = {label: key for key, label in option_rows}
     recommended_key = option_rows[0][0] if option_rows else "rockyou"
@@ -333,7 +543,12 @@ def choose_cracking_wordlist(
         )
         selection = key_by_label.get(selected_label or "")
         if not selection:
-            # Backward-compatible aliases for older wrappers/tests.
+            # Backward-compatible aliases for older wrappers/tests. The
+            # ``kaonashi``/``kerberoast_pws`` keys are no longer offered in the
+            # live menu (folded into combined_audit_base), but the aliases +
+            # resolution branches below are retained so an externally-supplied
+            # legacy label still resolves deterministically rather than falling
+            # through to the default.
             selected_lower = str(selected_label or "").strip().lower()
             aliases = {
                 "rockyou": "rockyou",
@@ -342,8 +557,14 @@ def choose_cracking_wordlist(
                 "kerberoast_pws": "kerberoast_pws",
                 "other (custom path)": "other",
                 "other": "other",
-                "hashmob": "hashmob_medium",
-                "hashmob medium": "hashmob_medium",
+                "combined": "combined_audit",
+                "combined_audit": "combined_audit",
+                "combined_audit_base.txt": "combined_audit",
+                # Legacy aliases: the retired hashmob-medium keys now resolve to
+                # the shipped combined audit base (medium's content is subsumed).
+                "hashmob": "combined_audit",
+                "hashmob medium": "combined_audit",
+                "hashmob_medium": "combined_audit",
                 "kaonashi": "kaonashi14M",
                 "kaonashi14m": "kaonashi14M",
                 "kaonashi14m.txt (recommended for audit - es environments)": "kaonashi14M",
@@ -357,55 +578,333 @@ def choose_cracking_wordlist(
         return os.path.join(wordlists_dir, "rockyou.txt")
     if selection == "kerberoast_pws":
         return os.path.join(wordlists_dir, "kerberoast_pws")
-    if selection == "hashmob_medium":
-        return os.path.join(wordlists_dir, "hashmob.net_2025.medium.found")
+    if selection == "combined_audit":
+        return os.path.join(wordlists_dir, "combined_audit_base.txt")
     if selection == "kaonashi14M":
         return os.path.join(wordlists_dir, "kaonashi14M.txt")
+    if selection == "custom_targeted":
+        built = _build_targeted_custom_wordlist(shell, domain=domain)
+        if built:
+            return built
+        print_warning(
+            "Could not build a targeted custom wordlist for this environment; "
+            "using the recommended default wordlist instead."
+        )
+        return default_wordlist
     if selection == "other":
-        in_container_runtime = _is_full_container_runtime(shell)
-
-        custom_path = ""
-        if in_container_runtime:
-            custom_path = (
-                _select_host_file_via_gui(
-                    shell,
-                    title="Select the cracking wordlist (host file)",
-                    initial_dir=str(Path.home()),
-                )
-                or ""
-            ).strip()
-            if not custom_path:
-                print_info_debug(
-                    "[cracking] Host GUI picker not used/failed; falling back to manual path prompt"
-                )
-        else:
-            print_info_debug(
-                "[cracking] Not running in container runtime; skipping host GUI picker"
-            )
-
-        if not custom_path:
-            try:
-                custom_path = (
-                    Prompt.ask("Enter the full path of the wordlist", default="") or ""
-                ).strip()
-            except EOFError:
-                print_warning(
-                    "Input stream ended while requesting custom wordlist path. "
-                    "Using recommended default wordlist."
-                )
-                return default_wordlist
-        if not custom_path:
-            print_warning("No path provided. Using recommended default wordlist.")
-            return default_wordlist
-        # In Docker runtime, user-provided paths commonly refer to the host FS and
-        # will be imported into the workspace later. Avoid emitting a false warning
-        # before we get a chance to do that.
-        if not in_container_runtime and not os.path.exists(custom_path):
-            marked_path = mark_sensitive(custom_path, "path")
-            print_warning(f"Wordlist not found at {marked_path}. Hashcat may fail.")
-        return custom_path
+        return _prompt_custom_wordlist_path(shell, default_wordlist=default_wordlist)
 
     return default_wordlist
+
+
+def _prompt_custom_wordlist_path(
+    shell: CrackingShell, *, default_wordlist: str
+) -> str:
+    """Prompt for an operator-supplied wordlist path (the "Other / custom" escape
+    hatch), returning ``default_wordlist`` when nothing is provided or the stream
+    ends. Shared by :func:`choose_cracking_wordlist` and
+    :func:`choose_cracking_effort` so the picker behaviour stays identical."""
+    in_container_runtime = _is_full_container_runtime(shell)
+
+    custom_path = ""
+    if in_container_runtime:
+        custom_path = (
+            _select_host_file_via_gui(
+                shell,
+                title="Select the cracking wordlist (host file)",
+                initial_dir=str(Path.home()),
+            )
+            or ""
+        ).strip()
+        if not custom_path:
+            print_info_debug(
+                "[cracking] Host GUI picker not used/failed; falling back to manual path prompt"
+            )
+    else:
+        print_info_debug(
+            "[cracking] Not running in container runtime; skipping host GUI picker"
+        )
+
+    if not custom_path:
+        try:
+            custom_path = (
+                Prompt.ask("Enter the full path of the wordlist", default="") or ""
+            ).strip()
+        except EOFError:
+            print_warning(
+                "Input stream ended while requesting custom wordlist path. "
+                "Using recommended default wordlist."
+            )
+            return default_wordlist
+    if not custom_path:
+        print_warning("No path provided. Using recommended default wordlist.")
+        return default_wordlist
+    # In Docker runtime, user-provided paths commonly refer to the host FS and
+    # will be imported into the workspace later. Avoid emitting a false warning
+    # before we get a chance to do that.
+    if not in_container_runtime and not os.path.exists(custom_path):
+        marked_path = mark_sensitive(custom_path, "path")
+        print_warning(f"Wordlist not found at {marked_path}. Hashcat may fail.")
+    return custom_path
+
+
+# --- Benchmark-driven interactive effort selector -----------------------------
+#
+# Replaces the legacy audit WORDLIST picker with an EFFORT picker: for the hash
+# type being cracked, offer fast / balanced / thorough with real per-tier time
+# estimates pulled from the hardware benchmark (cracking_benchmark), plus an
+# "Other / custom wordlist" escape hatch for power users. fast runs INLINE
+# (blocking, a few seconds); balanced / thorough run as BACKGROUND jobs so the
+# REPL is never blocked for minutes/hours (same deferred-notification bus as the
+# poisoning capture-crack). See docs/superpowers/specs/2026-07-07-cracking-
+# effort-engine-design.md.
+
+_EFFORT_SELECTOR_LEVELS: tuple[str, ...] = ("fast", "balanced", "thorough")
+_EFFORT_SELECTOR_DEFAULT_IDX = 1  # balanced
+
+# Wall-clock ceilings (seconds) applied ONLY when a background tier has to run
+# INLINE (a non-NetNTLM audit crack that cannot be handed to the NetNTLM
+# background job yet) so it can never hang the REPL. 0 = no cap (fast is a bare
+# wordlist and finishes on its own). Mirrors the policy tier budgets.
+_EFFORT_INLINE_RUNTIME_CAP: dict[str, int] = {"fast": 0, "balanced": 300, "thorough": 3600}
+
+
+@dataclass(frozen=True)
+class EffortSelection:
+    """The operator's effort choice from :func:`choose_cracking_effort`."""
+
+    kind: str  # "inline" | "background" | "custom"
+    effort: str  # fast | balanced | thorough | custom
+    wordlist: str | None
+    rule_path: str | None = None
+    is_blocking: bool = True
+    provisional: bool = False
+
+
+@dataclass(frozen=True)
+class _EffortDispatch:
+    """How :func:`run_cracking` should proceed after the effort selector."""
+
+    dispatched_background: bool
+    wordlist: str | None
+    rules_path: str | None = None
+    runtime_seconds: int | None = None
+
+
+def _effort_tier_label(level: str, est: EffortEstimate) -> str:
+    """Menu label for one effort tier: ``Balanced — ≈ 8 min · background``."""
+    title = level.capitalize()
+    lane = "runs now" if level == "fast" else "background"
+    suffix = " (estimating…)" if est.provisional else ""
+    return f"{title} — {est.human} · {lane}{suffix}"
+
+
+def choose_cracking_effort(
+    shell: CrackingShell,
+    *,
+    hash_type: str,
+    mode: str,
+    wordlists_dir: str,
+    domain: str | None = None,
+) -> EffortSelection:
+    """Interactive effort selector for the audit crack path.
+
+    Presents fast / balanced / thorough with live per-tier time estimates for
+    ``mode`` on THIS hardware (plus an "Other / custom wordlist" escape hatch).
+    Non-interactive resolves to ``balanced`` with NO prompt. ``fast`` -> inline
+    (blocking); ``balanced`` / ``thorough`` -> background (enqueued by the
+    caller). ``mode`` is the resolved hashcat mode string driving the estimate.
+    """
+    from adscan_internal import print_instruction  # noqa: PLC0415
+
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "audit"
+    benchmark = load_cached_benchmark()
+    _base_path, base_lines = base_for(workspace_type, wordlists_dir)
+    default_wordlist = os.path.join(wordlists_dir, "combined_audit_base.txt")
+
+    estimates = {
+        level: estimate_effort(level, mode, benchmark=benchmark, base_lines=base_lines)
+        for level in _EFFORT_SELECTOR_LEVELS
+    }
+
+    def _selection_for(level: str) -> EffortSelection:
+        est = estimates[level]
+        tier = resolve_single_tier(
+            level,
+            workspace_type=workspace_type,
+            wordlists_dir=wordlists_dir,
+            benchmark=benchmark,
+        )
+        # Routing is by LEVEL, not by the per-mode estimate: per the effort-
+        # engine design, fast stays inline (blocking) and balanced/thorough
+        # ALWAYS run as background jobs -- even on a fast hash mode where the
+        # balanced keyspace would finish in a few seconds. ``is_blocking`` on
+        # the estimate stays informational (drives the web artifact).
+        return EffortSelection(
+            kind="inline" if level == "fast" else "background",
+            effort=level,
+            wordlist=tier.base_path,
+            rule_path=tier.rule_path,
+            is_blocking=est.is_blocking,
+            provisional=est.provisional,
+        )
+
+    if bool(getattr(shell, "auto", False)) or is_non_interactive(shell=shell):
+        print_info_debug(
+            "[cracking] Non-interactive/auto mode; using default cracking effort: balanced."
+        )
+        return _selection_for("balanced")
+
+    tier_labels = [_effort_tier_label(level, estimates[level]) for level in _EFFORT_SELECTOR_LEVELS]
+    options = tier_labels + ["Other / custom wordlist"]
+
+    message_lines = [f"Select the cracking effort for {hash_type}:"]
+    for idx, label in enumerate(options, start=1):
+        message_lines.append(f"{idx}) {label}")
+    print_instruction("\n".join(message_lines) + "\n")
+
+    idx = questionary_select_index(
+        title=f"Select the cracking effort for {hash_type}",
+        options=options,
+        default_idx=_EFFORT_SELECTOR_DEFAULT_IDX,
+        shell=shell,
+    )
+    if idx is None:
+        # Cancelled (Ctrl+C): the least-surprising safe default is a quick
+        # inline fast crack rather than launching a long background job.
+        return _selection_for("fast")
+    if idx == len(_EFFORT_SELECTOR_LEVELS):
+        custom_path = _prompt_custom_wordlist_path(shell, default_wordlist=default_wordlist)
+        return EffortSelection(
+            kind="custom", effort="custom", wordlist=custom_path, is_blocking=True
+        )
+    level = _EFFORT_SELECTOR_LEVELS[idx] if 0 <= idx < len(_EFFORT_SELECTOR_LEVELS) else "balanced"
+    return _selection_for(level)
+
+
+def _ntlm_version_for_hash_type(hash_type: str) -> str | None:
+    """Map a NetNTLM hash type to the ``v1``/``v2`` the background crack job
+    keys on. ``None`` for non-NetNTLM types (Kerberoast / AS-REP / timeroast) —
+    for those the background job keys on the hashcat ``mode`` directly, so this
+    returns ``None`` and the caller passes no ``ntlm_version``."""
+    t = str(hash_type or "").strip().lower()
+    if t in {"ntlmv1", "netntlmv1"}:
+        return "v1"
+    if t in {"ntlmv2", "netntlmv2"}:
+        return "v2"
+    return None
+
+
+def _primary_user_for_hash_file(hash_file: str, mode: str, domain: str) -> str:
+    """Resolve a representative principal for a hash file, for the crack-job scope.
+
+    The per-mode embedded-username extractor is tried FIRST — it correctly parses
+    the principal out of a raw ``$krb5tgs$`` / ``$krb5asrep$`` (roast) or
+    ``user::domain`` (NetNTLM) line, and is not fooled by the colons inside an
+    AS-REP body the way a naive ``split(":")`` would be. Only when no mode
+    extractor matches does it fall back to the first ``user:hash`` colon-field
+    (an already-prepended file). Falls back to the domain (or ``"captured"``)
+    when nothing can be resolved. Never raises.
+    """
+    try:
+        if os.path.exists(hash_file):
+            with open(hash_file, "r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    embedded = extract_embedded_username(line, mode=str(mode))
+                    if embedded:
+                        return embedded
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+    users = _extract_hash_users(hash_file)
+    if users:
+        return users[0]
+    return domain or "captured"
+
+
+def _maybe_dispatch_audit_effort(
+    shell: CrackingShell,
+    *,
+    hash_type: str,
+    hashcat_mode: str,
+    domain: str,
+    hash_file: str,
+    wordlists_dir: str,
+    failed: bool,
+) -> _EffortDispatch | None:
+    """Run the interactive effort selector for the audit crack path and decide
+    inline-vs-background.
+
+    Returns ``None`` when the selector does not apply (non-audit workspace,
+    unknown mode, failed-retry re-prompt, or non-interactive/CI) so
+    :func:`run_cracking` keeps its existing wordlist resolution. Otherwise a
+    :class:`_EffortDispatch`: ``dispatched_background`` short-circuits
+    ``run_cracking`` (a background job now owns the crack); ``wordlist`` (+
+    optional ``rules_path``/``runtime_seconds``) drives an inline crack.
+    """
+    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    if workspace_type != "audit":
+        return None
+    if not hashcat_mode or hashcat_mode == "Unknown":
+        return None
+    if failed:
+        return None
+    if bool(getattr(shell, "auto", False)) or is_non_interactive(shell=shell):
+        return None
+
+    selection = choose_cracking_effort(
+        shell,
+        hash_type=hash_type,
+        mode=str(hashcat_mode),
+        wordlists_dir=wordlists_dir,
+        domain=domain,
+    )
+
+    if selection.kind != "background":
+        # fast (inline) or the custom escape hatch: run inline as today.
+        return _EffortDispatch(dispatched_background=False, wordlist=selection.wordlist)
+
+    # A background tier was chosen. Hand it to the generalized background crack
+    # job for ANY supported hashcat mode — NetNTLM (5500/5600) AND Kerberoast /
+    # AS-REP roast (13100/18200 and their AES variants). The job runs
+    # ``-m <mode>`` off the scan flow. ``hashcat_mode`` is already the concrete,
+    # etype-resolved mode here (the roast mixed-etype split ran upstream in
+    # ``run_cracking``), so the roast hash file it points at is single-mode.
+    version = _ntlm_version_for_hash_type(hash_type)  # None for roast
+    user = _primary_user_for_hash_file(hash_file, hashcat_mode, domain)
+    job_id = None
+    try:
+        job_id = _ensure_enqueue_cracking_job()(
+            shell,
+            domain=domain or "",
+            user=user,
+            mode=str(hashcat_mode),
+            ntlm_version=version,
+            hash_file=hash_file,
+            effort=selection.effort,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+    if job_id:
+        print_success(
+            f"Cracking handed off to a background job at {selection.effort} effort — "
+            "the scan continues and you'll get a notification when it finishes."
+        )
+        return _EffortDispatch(dispatched_background=True, wordlist=None)
+
+    # No background job launched (e.g. enqueue declined by policy — a machine
+    # NetNTLM account — or an internal failure): fall back to an inline
+    # (benchmark-capped) run so the audit crack still completes.
+    cap = _EFFORT_INLINE_RUNTIME_CAP.get(selection.effort) or None
+    print_info(f"Running the {selection.effort} cracking tier now.")
+    return _EffortDispatch(
+        dispatched_background=False,
+        wordlist=selection.wordlist,
+        rules_path=selection.rule_path,
+        runtime_seconds=cap,
+    )
 
 
 def _is_full_container_runtime(shell: CrackingShell) -> bool:
@@ -557,13 +1056,137 @@ def _select_hashcat_backend(shell: CrackingShell) -> HashcatBackendSelection:
     return selection
 
 
+# --- Hashcat rules (-r) + interactive runtime cap -----------------------------
+#
+# A hashcat rule file (``-r``) mangles each wordlist candidate into many variants
+# (best64, OneRule...), multiplying the candidate space. ADscan uses two rules,
+# chosen by mode + wordlist size:
+#
+#   best64.rule                 ~77 rules    bundled in-repo; cheap, always safe
+#   OneRuleToRuleThemStill.rule ~49.5k rules managed (large); ONLY for a small
+#                                            custom list on a FAST (RC4) mode
+#
+# The rule multiplier is only affordable when the base wordlist is small (a
+# custom list) OR the per-candidate cost is low (RC4 modes). AES roast modes are
+# 20-40x slower than RC4, so they always take the cheap best64 rule regardless
+# of list size. Every rules-enabled run is bounded by a ``--runtime`` cap so a
+# mangled attack cannot run unbounded during the interactive step.
+_RULES_ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "rules"
+
+# Canonical rule filenames.
+BEST64_RULE = "best64.rule"
+ONE_RULE_TO_RULE_THEM_STILL = "OneRuleToRuleThemStill.rule"
+
+# hashcat modes whose per-candidate cost is high (AES-encrypted Kerberos
+# tickets). Feeding a large rule to these explodes the runtime, so they always
+# get the cheap best64 rule.
+_AES_ROAST_HASHCAT_MODES: frozenset[str] = frozenset(
+    {"19600", "19700", "19800", "19900"}
+)
+
+# Interactive runtime caps (seconds) for a rules-mangled attack.
+_RULES_RUNTIME_CAP_AES = 300
+_RULES_RUNTIME_CAP_FAST = 180
+
+
+def resolve_rules_path(name: str) -> str | None:
+    """Resolve a hashcat rule file by name to an on-disk path.
+
+    Search order:
+      1. the bundled in-repo asset dir (``adscan_internal/assets/rules/``) —
+         ships ``best64.rule``;
+      2. the managed rules dir under the ADscan home
+         (``~/.adscan/wordlists/rules/`` on the host, ``/opt/adscan/wordlists/
+         rules/`` in the container) — where a large downloaded rule (e.g.
+         ``OneRuleToRuleThemStill.rule``) is placed by the operator.
+
+    Args:
+        name: Rule filename (e.g. ``best64.rule``).
+
+    Returns:
+        The first existing path as a string, or ``None`` when the rule is not
+        present (so the caller can fall back to a no-rules attack).
+    """
+    if not name:
+        return None
+    bundled = _RULES_ASSET_DIR / name
+    if bundled.is_file():
+        return str(bundled)
+    try:
+        managed = get_adscan_home() / "wordlists" / "rules" / name
+    except Exception:  # noqa: BLE001
+        return None
+    if managed.is_file():
+        return str(managed)
+    return None
+
+
+def select_rules_for_crack(
+    mode: str, wordlist_is_custom: bool
+) -> tuple[str | None, int | None]:
+    """Pick the hashcat rule file and runtime cap for a crack run.
+
+    Policy (see the module comment above):
+
+    * AES roast modes (19600/19700/19800/19900) -> ``best64`` regardless of
+      wordlist size; the per-candidate cost is too high for a large rule.
+    * A small CUSTOM wordlist on a FAST (RC4/NTLM) mode -> the large
+      ``OneRuleToRuleThemStill`` rule, falling back to ``best64`` when the large
+      rule is not installed.
+    * The default path -- a big BUNDLED wordlist on a fast mode -> ``(None,
+      None)`` so existing behaviour is unchanged unless a caller opts in (the
+      bundled lists are already ~14M lines, so they are left unmangled).
+
+    Args:
+        mode: The resolved hashcat mode string (e.g. ``13100``, ``19700``).
+        wordlist_is_custom: ``True`` when the base wordlist is an operator/custom
+            list (small) rather than a large bundled list.
+
+    Returns:
+        ``(rules_path, runtime_seconds)``. ``rules_path`` is ``None`` when no
+        rule applies (or the resolved rule is missing on disk); ``runtime_seconds``
+        is ``None`` on the behaviour-preserving default path.
+    """
+    if mode in _AES_ROAST_HASHCAT_MODES:
+        return resolve_rules_path(BEST64_RULE), _RULES_RUNTIME_CAP_AES
+    if wordlist_is_custom:
+        rule = resolve_rules_path(ONE_RULE_TO_RULE_THEM_STILL) or resolve_rules_path(
+            BEST64_RULE
+        )
+        return rule, _RULES_RUNTIME_CAP_FAST
+    # Default non-custom (big bundled) fast path -- behaviour-preserving.
+    return None, None
+
+
 def _build_hashcat_cmd(
-    hash_value: str, wordlist: str, mode: str, shell: CrackingShell
+    hash_value: str,
+    wordlist: str,
+    mode: str,
+    shell: CrackingShell,
+    *,
+    rules_path: str | None = None,
+    runtime_seconds: int | None = None,
 ) -> str:
-    """Build a hashcat command string for a given mode."""
+    """Build a hashcat command string for a given mode.
+
+    Args:
+        hash_value: Path to the hashfile hashcat should crack.
+        wordlist: Path to the base wordlist.
+        mode: The hashcat ``-m`` mode string.
+        shell: The cracking shell (provides device/backend args).
+        rules_path: Optional hashcat rule file (``-r``); appended only when set.
+        runtime_seconds: Optional interactive time cap (``--runtime=<n>``);
+            appended only when a positive value is given.
+    """
 
     device_args = _hashcat_device_args(shell)
     tuning_args = ["-w", "1"] if device_args else []
+    rules_args = ["-r", rules_path] if rules_path else []
+    runtime_args = (
+        [f"--runtime={int(runtime_seconds)}"]
+        if runtime_seconds is not None and int(runtime_seconds) > 0
+        else []
+    )
     argv: list[str] = [
         "hashcat",
         "-m",
@@ -574,6 +1197,8 @@ def _build_hashcat_cmd(
         "--force",
         *tuning_args,
         *device_args,
+        *rules_args,
+        *runtime_args,
         hash_value,
         wordlist,
     ]
@@ -1108,12 +1733,16 @@ def _render_cracking_preflight(
     wordlist_name: str,
     hash_count: int,
     failed_retry: bool,
+    rules_path: str | None = None,
+    runtime_seconds: int | None = None,
 ) -> None:
     """Render a premium pre-flight panel before hashcat starts.
 
     Shows the operator the inputs at a glance, the compute mode, and a brief
     note on what to expect while waiting. Uses tabular layout over paragraph
-    copy so eyes can scan the row that changed since the last attempt.
+    copy so eyes can scan the row that changed since the last attempt. When a
+    hashcat rule file is in play (targeted custom wordlist) the chosen rules and
+    the interactive runtime cap are surfaced too.
     """
     table = Table(
         show_header=False,
@@ -1140,6 +1769,16 @@ def _render_cracking_preflight(
     table.add_row("Hash type", f"{hash_description} [dim](mode {hashcat_mode})[/dim]")
     table.add_row("Hashes queued", count_text)
     table.add_row("Wordlist", wordlist_name)
+    if rules_path:
+        from rich.markup import escape as _rich_escape
+
+        rules_label = _rich_escape(os.path.basename(str(rules_path)))
+        cap_suffix = (
+            f" [dim](cap {int(runtime_seconds)}s)[/dim]"
+            if runtime_seconds is not None and int(runtime_seconds) > 0
+            else ""
+        )
+        table.add_row("Rules", f"{rules_label}{cap_suffix}")
     table.add_row("Compute", backend_value)
     if failed_retry:
         table.add_row("Mode", f"[{COLOR_AMBER}]retry with a different wordlist[/]")
@@ -1166,6 +1805,187 @@ def _render_cracking_preflight(
         box=rich.box.ROUNDED,
         padding=(1, 2),
     )
+
+
+def _render_custom_wordlist_summary(
+    *,
+    domain: str,
+    base_count: int,
+    literal_count: int,
+    combined_count: int,
+    date_band: "list[int]",
+) -> None:
+    """Render a premium summary of a freshly-built targeted custom wordlist.
+
+    Shown BEFORE the crack so the operator sees what was mined from this
+    environment: how many base (rule-fodder) seed words, the whenCreated-seeded
+    date band, how many pre-expanded calendar candidates, and the combined line
+    count hashcat will consume. The chosen rules + hashcat mode are surfaced by
+    the downstream pre-flight panel (they depend on the per-hash etype).
+    """
+    table = Table(
+        show_header=False,
+        show_edge=False,
+        box=None,
+        padding=(0, 1),
+        expand=False,
+    )
+    table.add_column("label", style=f"bold {COLOR_STEEL}", no_wrap=True)
+    table.add_column("value", overflow="fold")
+
+    if date_band:
+        low, high = date_band[0], date_band[-1]
+        band_text = f"{low}" if low == high else f"{low}–{high}"
+        band_value = f"{band_text} [dim]({len(date_band)} year(s), from whenCreated + recent)[/dim]"
+    else:
+        band_value = "[dim]none seeded[/dim]"
+
+    table.add_row("Domain", mark_sensitive(domain, "domain"))
+    table.add_row(
+        "Base words mined",
+        f"[bold]{base_count}[/bold] [dim](seed words for rule mangling)[/dim]",
+    )
+    table.add_row("Date band", band_value)
+    table.add_row(
+        "Pre-expanded",
+        f"[bold]{literal_count}[/bold] [dim]calendar/literal candidate(s)[/dim]",
+    )
+    table.add_row(
+        "Total candidates",
+        f"[bold]{combined_count}[/bold] [dim]line(s) before rule mangling[/dim]",
+    )
+
+    body = Group(
+        table,
+        Text(""),
+        Text.from_markup(
+            f"[{COLOR_MUTED}]{_GLYPH_INFO} Mined from data already collected for this "
+            f"environment. Hashcat rules multiply these candidates further.[/]"
+        ),
+    )
+    print_panel(
+        body,
+        title=f"[bold]Targeted Custom Wordlist[/bold] [{COLOR_MUTED}]· mined from this environment[/]",
+        title_align="left",
+        border_style=COLOR_SAGE,
+        box=rich.box.ROUNDED,
+        padding=(1, 2),
+    )
+
+
+def _build_targeted_custom_wordlist(
+    shell: CrackingShell, *, domain: str | None
+) -> str | None:
+    """Build a targeted wordlist mined from this environment; return its path.
+
+    Wraps the reusable :mod:`custom_wordlist_service` core (never re-implements
+    mining/date-seeding): loads the persisted user/computer inventory for
+    ``domain``, mines base words + whenCreated date seeds, and writes
+    ``base.txt`` (rule fodder) + ``literal.txt`` (pre-expanded calendar forms).
+    Because hashcat runs a single ``-a 0`` wordlist, the two are merged into one
+    de-duplicated ``custom_targeted.txt`` under the SSOT
+    ``.../wordlists/custom/<domain>/`` dir — the seeds get mangled by the
+    mode-aware rules :func:`select_rules_for_crack` picks, the literals are tried
+    verbatim (a rule engine cannot synthesize the client year).
+
+    Returns the combined wordlist path, or ``None`` on any failure so the caller
+    falls back to a generic list (never aborts the crack). ``current_year`` is
+    injected here (the I/O boundary) so the pure core stays deterministic.
+    """
+    resolved_domain = str(domain or "").strip()
+    if not resolved_domain:
+        print_warning_debug(
+            "[cracking] targeted custom wordlist requested without a domain; "
+            "cannot mine environment words."
+        )
+        return None
+
+    from datetime import datetime, timezone
+
+    from adscan_internal.services import custom_wordlist_service as cwl
+
+    workspace_dir = str(getattr(shell, "current_workspace_dir", None) or os.getcwd())
+    try:
+        objects = cwl.load_objects_from_inventory(workspace_dir, resolved_domain)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        objects = []
+
+    try:
+        domain_data = dict(
+            (getattr(shell, "domains_data", {}) or {}).get(resolved_domain, {}) or {}
+        )
+    except Exception:  # noqa: BLE001
+        domain_data = {}
+    netbios = str(domain_data.get("netbios") or "").strip()
+    company = str(domain_data.get("company") or "").strip()
+
+    context = cwl.WordlistContext(
+        domain=resolved_domain,
+        netbios=netbios,
+        company=company,
+        objects=tuple(objects),
+        current_year=datetime.now(timezone.utc).year,
+    )
+
+    try:
+        artifact = cwl.for_crack(
+            context, domain=resolved_domain, output_stem="custom_targeted"
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"[cracking] targeted custom wordlist build failed: {type(exc).__name__}: {exc}"
+        )
+        return None
+
+    # Merge base (rule fodder) + literal (verbatim calendar forms) into ONE
+    # hashcat wordlist, de-duped, order-stable.
+    combined_path = artifact.base_path.parent / "custom_targeted.txt"
+    seen: set[str] = set()
+    combined_lines: list[str] = []
+    for source in (artifact.base_path, artifact.literal_path):
+        try:
+            content = source.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            token = line.strip()
+            if token and token not in seen:
+                seen.add(token)
+                combined_lines.append(token)
+
+    if not combined_lines:
+        print_warning_debug(
+            "[cracking] targeted custom wordlist produced no candidates "
+            "(no inventory / no mined words)."
+        )
+        return None
+
+    try:
+        combined_path.write_text(
+            "\n".join(combined_lines) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_warning_debug(
+            f"[cracking] could not write combined targeted wordlist: {exc}"
+        )
+        return None
+
+    try:
+        date_band = cwl.global_date_band(objects, context.current_year)
+    except Exception:  # noqa: BLE001
+        date_band = []
+
+    _render_custom_wordlist_summary(
+        domain=resolved_domain,
+        base_count=artifact.base_count,
+        literal_count=artifact.literal_count,
+        combined_count=len(combined_lines),
+        date_band=date_band,
+    )
+    return str(combined_path)
 
 
 def crack_captured_netntlm(
@@ -1364,6 +2184,8 @@ def run_cracking(
     wordlists_dir: str,
     failed: bool = False,
     mode_override: str | None = None,
+    rules_path: str | None = None,
+    runtime_seconds: int | None = None,
 ) -> None:
     """High-level cracking entrypoint used by the CLI shell.
 
@@ -1373,6 +2195,12 @@ def run_cracking(
     once per group, so AES tickets are cracked under 19600/19700/19800/19900
     instead of being silently rejected by the RC4-only mode. ``mode_override``
     is set internally on the per-group recursion to force that group's mode.
+
+    ``rules_path`` (hashcat ``-r``) and ``runtime_seconds`` (``--runtime``) are
+    OPTIONAL and default to no rules / no cap, so the default crack behaviour is
+    unchanged; a caller (e.g. a custom-wordlist adapter) opts in via
+    :func:`select_rules_for_crack`. Both are forwarded through the per-etype
+    recursion and into the hashcat command.
     """
     if hash_type == "timeroast" and not _ensure_timeroast_hashcat_support(shell):
         return
@@ -1406,6 +2234,8 @@ def run_cracking(
                     wordlists_dir=wordlists_dir,
                     failed=failed,
                     mode_override=group_mode,
+                    rules_path=rules_path,
+                    runtime_seconds=runtime_seconds,
                 )
             return
         if len(groups) == 1:
@@ -1437,17 +2267,62 @@ def run_cracking(
         )
         return
 
+    # Interactive audit path: offer the benchmark-driven effort selector. A
+    # background tier short-circuits here (a job now owns the crack); an inline
+    # choice hands back a preselected wordlist (+ optional rules/runtime) so the
+    # rest of this function runs unchanged. Every other path (CTF, CI/non-
+    # interactive, failed-retry) returns None and keeps the legacy resolution.
+    effort_dispatch = _maybe_dispatch_audit_effort(
+        shell,
+        hash_type=hash_type,
+        hashcat_mode=hashcat_mode,
+        domain=domain,
+        hash_file=hash_file,
+        wordlists_dir=wordlists_dir,
+        failed=failed,
+    )
+    if effort_dispatch is not None and effort_dispatch.dispatched_background:
+        return
+    if effort_dispatch is not None and effort_dispatch.rules_path is not None:
+        rules_path = effort_dispatch.rules_path
+    if effort_dispatch is not None and effort_dispatch.runtime_seconds is not None:
+        runtime_seconds = effort_dispatch.runtime_seconds
+
     wordlist = resolve_cracking_wordlist(
         shell=shell,
         hash_type=hash_type,
         domain=domain,
         wordlists_dir=wordlists_dir,
         failed=failed,
+        preselected_wordlist=(
+            effort_dispatch.wordlist if effort_dispatch is not None else None
+        ),
     )
 
     wordlist_name = os.path.basename(wordlist) if wordlist else "N/A"
     hash_count = _count_hashes_in_file(hash_file)
     backend_is_gpu = "GPU" in backend_selection.label
+
+    # A targeted custom wordlist (mined from this environment) is small, so it
+    # earns the mode-aware rule ladder: the big rule list on fast RC4/NTLM modes,
+    # best64 on the 20-40x-slower AES roast modes — each bounded by an interactive
+    # --runtime cap. Only auto-select when the operator picked the targeted list
+    # AND the caller did not already pass explicit rules (e.g. credsweeper).
+    if (
+        rules_path is None
+        and runtime_seconds is None
+        and hashcat_mode != "Unknown"
+        and _is_targeted_custom_wordlist(wordlist)
+    ):
+        rules_path, runtime_seconds = select_rules_for_crack(
+            hashcat_mode, wordlist_is_custom=True
+        )
+
+    announce_line = format_chosen_wordlist_line(
+        wordlist_path=wordlist, rules_path=rules_path
+    )
+    if announce_line:
+        print_info(announce_line)
 
     _render_cracking_preflight(
         shell,
@@ -1460,6 +2335,8 @@ def run_cracking(
         wordlist_name=wordlist_name,
         hash_count=hash_count,
         failed_retry=failed,
+        rules_path=rules_path,
+        runtime_seconds=runtime_seconds,
     )
 
     # hashcat is ALWAYS invoked with --username (see _build_hashcat_cmd), so
@@ -1475,7 +2352,14 @@ def run_cracking(
             print_warning_debug(
                 f"[cracking] hashfile pre-flight repair failed (continuing): {exc}"
             )
-        command = _build_hashcat_cmd(hash_file, wordlist, hashcat_mode, shell)
+        command = _build_hashcat_cmd(
+            hash_file,
+            wordlist,
+            hashcat_mode,
+            shell,
+            rules_path=rules_path,
+            runtime_seconds=runtime_seconds,
+        )
 
     if hashcat_mode != "Unknown":
         print_info_debug(
@@ -1494,7 +2378,7 @@ def run_cracking(
             pass
         print_warning_debug(f"Command: {marked_command}")
 
-    wordlist_name_for_telemetry = os.path.basename(wordlist) if wordlist else None
+    wordlist_name_for_telemetry = _wordlist_telemetry_label(wordlist)
 
     attempt_template = build_cracking_attempt(
         tool="hashcat",
@@ -1601,6 +2485,7 @@ def run_cracking(
         hash=hash_file,
         wordlist_name=wordlist_name_for_telemetry,
         mode_override=mode_override,
+        runtime_seconds=runtime_seconds,
     )
     # The cracking step finished — mark this terminal tick done so the platform's
     # live strip clears the operation instead of freezing on the recovered count.
@@ -1629,17 +2514,29 @@ def resolve_cracking_wordlist(
     domain: str,
     wordlists_dir: str,
     failed: bool = False,
+    preselected_wordlist: str | None = None,
 ) -> str:
-    """Resolve the effective cracking wordlist using workspace-aware UX rules."""
+    """Resolve the effective cracking wordlist using workspace-aware UX rules.
+
+    ``preselected_wordlist`` (set by the interactive effort selector — see
+    :func:`_maybe_dispatch_audit_effort`) bypasses the wordlist prompt entirely
+    and is used as-is (still passed through the host-import + missing-file
+    guard), so the effort selector and the legacy prompt share ONE resolution
+    tail.
+    """
     workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     should_prompt_wordlist_selector = failed or workspace_type == "audit"
 
-    if should_prompt_wordlist_selector:
+    if preselected_wordlist is not None:
+        wordlist = preselected_wordlist
+    elif should_prompt_wordlist_selector:
         if workspace_type == "audit" and not failed:
             print_info(
                 "Audit workspace detected: select a cracking wordlist (rockyou is not forced by default)."
             )
-        wordlist = choose_cracking_wordlist(shell, hash_type, wordlists_dir)
+        wordlist = choose_cracking_wordlist(
+            shell, hash_type, wordlists_dir, domain=domain
+        )
     else:
         print_info("Using rockyou as the default wordlist.")
         wordlist = os.path.join(wordlists_dir, "rockyou.txt")
@@ -2327,6 +3224,95 @@ def _render_cracked_credentials_panel(
     )
 
 
+def _render_credential_harvest_for_crack(
+    shell: CrackingShell,
+    *,
+    domain: str,
+    hash_type: str,
+    creds: dict[str, str],
+    hash_file: str,
+) -> None:
+    """Build + persist + render HarvestedPrincipal records for a crack success.
+
+    Runs on the foreground REPL thread only (``execute_cracking`` is never
+    called from a background thread). Best-effort — a classification or
+    rendering failure here never blocks the credential from having already
+    been persisted by the caller's ``add_credential`` step above.
+
+    Every cracked secret is left cleartext on the operator's terminal (the
+    shared harvest panel marks the principal fields itself); only the
+    ``username`` is interpolated here, and the shared panel handles masking.
+    """
+    from datetime import UTC, datetime
+
+    from adscan_internal.cli.widgets.credential_harvest_panel import (
+        build_credential_harvest_panel,
+        offer_credential_harvest_actions,
+    )
+    from adscan_internal.services.captured_credential_policy import classify_principal
+    from adscan_internal.services.credential_harvest_classification import (
+        classify_harvested_principal_tier,
+        classify_harvested_principals_reach,
+    )
+    from adscan_internal.services.credential_harvest_record import HarvestedPrincipal
+    from adscan_internal.services.credential_harvest_store import append_harvest_records
+    from adscan_internal.services.high_value import normalize_samaccountname
+
+    if not creds:
+        return
+    source = _harvest_source_for_hash_type(hash_type)
+    ntlm_version = "v2" if "NTLMv2" in hash_type else "v1" if "NTLMv1" in hash_type else ""
+    usernames = list(creds.keys())
+    reach_by_user = classify_harvested_principals_reach(
+        shell, domain=domain, usernames=usernames
+    )
+    records: list[HarvestedPrincipal] = []
+    for username in usernames:
+        account_type = classify_principal(
+            username, getattr(shell, "domains_data", None), domain
+        )
+        tier = classify_harvested_principal_tier(
+            shell, domain=domain, username=username, account_type=account_type
+        )
+        # ``tier`` / ``reach`` may be None (UNDETERMINED — no membership/graph
+        # data at capture time); persist None so the row renders "Unknown" /
+        # "Not assessed" rather than a false Tier 2 / Standard reach. It is
+        # re-derived to the real tier once collection populates the graph.
+        reach = reach_by_user.get(normalize_samaccountname(username))
+        records.append(
+            HarvestedPrincipal(
+                domain=domain,
+                username=username,
+                source=source,
+                account_type=account_type,
+                ntlm_version=ntlm_version,
+                crack_status="cracked",
+                privilege_tier=tier.value if tier is not None else None,
+                compromise_reach=reach.value if reach is not None else None,
+                hash_file=hash_file,
+                captured_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+            )
+        )
+    if not records:
+        return
+    # Persist + render the classified harvest ALWAYS (interactive or CI) — the
+    # tier/reach/status records feed the web/artefact ingestion regardless of
+    # session mode.
+    append_harvest_records(shell, records)
+    console = getattr(shell, "console", None)
+    if console is not None:
+        console.print(build_credential_harvest_panel(records))
+    # The add-credential + pivot offer is INTERACTIVE polish only. In a
+    # non-interactive run (`adscan ci`) the crack-success loop below already
+    # persisted every cracked principal with its REAL secret, and the scan flow
+    # pivots from all known credentials — so auto-adding the same principals
+    # (with no secret, via the shared checkbox default) and launching a
+    # redundant attack-path pass here would duplicate that work. Offer it only
+    # when an operator is present to choose.
+    if not (bool(getattr(shell, "auto", False)) or is_non_interactive(shell=shell)):
+        offer_credential_harvest_actions(shell, domain, records)
+
+
 def _render_cracking_format_error_panel(
     *,
     hash_type: str,
@@ -2397,6 +3383,7 @@ def _render_cracking_failure_panel(
         "no_device": "No usable hashcat compute device",
         "hash_format": "Hash format did not match the selected mode",
         "runtime": "Hashcat hit a fatal runtime error",
+        "out_of_memory": "Insufficient GPU/host memory for the attack",
         "unknown": "Hashcat finished without recovering any password",
     }.get(cause, "Hashcat finished without recovering any password")
 
@@ -2422,12 +3409,16 @@ def _render_cracking_failure_panel(
         Text.from_markup(
             f"[{COLOR_CRIMSON}]{_GLYPH_FAILED}[/] "
             f"[bold]{hash_description}[/bold] "
-            f"[{COLOR_MUTED}]· no hash recovered[/]"
+            f"[{COLOR_MUTED}]· not cracked[/]"
         ),
         Text(""),
         *(Text.from_markup(line) for line in diag_lines),
     )
-    border = COLOR_CRIMSON if cause in {"no_device", "runtime", "hash_format"} else COLOR_AMBER
+    border = (
+        COLOR_CRIMSON
+        if cause in {"no_device", "runtime", "hash_format", "out_of_memory"}
+        else COLOR_AMBER
+    )
     print_panel(
         body,
         title=f"[bold]Hash Cracking[/bold] [{COLOR_MUTED}]· no match[/]",
@@ -2438,6 +3429,95 @@ def _render_cracking_failure_panel(
     )
 
 
+def _maybe_materialize_poison_capture_crack_edge(
+    shell: CrackingShell, domain: str, username: str
+) -> None:
+    """Materialize the PoisonCaptureNtlmv2Crack edge for a poisoner-cracked user.
+
+    Only fires when the poisoning capture handler recorded ``username`` as a
+    NetNTLMv2 principal captured via broadcast poisoning
+    (``domains_data[domain]["poison_captured_ntlmv2_users"]``). This keeps a
+    NetNTLMv2 hash cracked from any other origin (e.g. MSSQL coercion) from being
+    mis-attributed to wire poisoning. Best-effort — a materialization failure
+    must never break the cracking flow.
+    """
+    from adscan_core.rich_output import print_info_debug
+
+    user_clean = str(username or "").strip()
+    if not user_clean:
+        return
+    try:
+        domains_data = getattr(shell, "domains_data", {}) or {}
+        domain_state = domains_data.get(domain) or {}
+        captured = domain_state.get("poison_captured_ntlmv2_users") or []
+        if not isinstance(captured, list):
+            return
+        # Case-insensitive membership: the capture stores the raw sAMAccountName.
+        captured_lower = {str(u).strip().lower() for u in captured}
+        if user_clean.lower() not in captured_lower:
+            return
+        from adscan_internal.services.attack_graph_service import (
+            upsert_poison_capture_ntlmv2_crack_edge,
+        )
+
+        upsert_poison_capture_ntlmv2_crack_edge(
+            shell, domain, username=user_clean, status="success"
+        )
+        print_info_debug(
+            "Materialized PoisonCaptureNtlmv2Crack edge for a poisoner-cracked "
+            "NetNTLMv2 credential."
+        )
+    except Exception as exc:  # noqa: BLE001 — materialization is best-effort
+        telemetry.capture_exception(exc)
+
+
+def _maybe_materialize_ntlmv1_crack_edge(
+    shell: CrackingShell, domain: str, username: str
+) -> None:
+    """Materialize a ``CrackNTLMv1`` edge for a wordlist-cracked USER NetNTLMv1.
+
+    Account-type-aware counterpart of
+    :func:`_maybe_materialize_poison_capture_crack_edge`. A captured NetNTLMv1
+    challenge/response for a USER account has a human-chosen password, so
+    ordinary wordlist cracking recovers it (``supported``); a machine account
+    has a random DC-generated password that only rainbow tables recover, so it
+    stays ``unsupported`` and this function is a no-op for it (the
+    coercion-relay avenue already models that case separately). Best-effort —
+    a materialization failure must never break the cracking flow.
+    """
+    from adscan_core.rich_output import print_info_debug
+
+    user_clean = str(username or "").strip()
+    if not user_clean:
+        return
+    try:
+        from adscan_internal.services.attack_step_catalog import (
+            ntlmv1_crack_support_for,
+        )
+        from adscan_internal.services.captured_credential_policy import (
+            classify_principal,
+        )
+
+        domains_data = getattr(shell, "domains_data", None)
+        account_type = classify_principal(user_clean, domains_data, domain)
+        if ntlmv1_crack_support_for(account_type) != "supported":
+            return
+
+        from adscan_internal.services.attack_graph_service import (
+            upsert_ntlmv1_crack_user_edge,
+        )
+
+        upsert_ntlmv1_crack_user_edge(
+            shell, domain, username=user_clean, status="success"
+        )
+        print_info_debug(
+            "Materialized CrackNTLMv1 edge for a wordlist-cracked user "
+            "NetNTLMv1 credential."
+        )
+    except Exception as exc:  # noqa: BLE001 — materialization is best-effort
+        telemetry.capture_exception(exc)
+
+
 def execute_cracking(
     shell: CrackingShell,
     command: str,
@@ -2446,6 +3526,7 @@ def execute_cracking(
     hash: str,
     wordlist_name: str | None = None,
     mode_override: str | None = None,
+    runtime_seconds: int | None = None,
 ) -> dict[str, object]:
     """Execute the cracking command and process results.
 
@@ -2453,8 +3534,15 @@ def execute_cracking(
     per-etype roast grouping in :func:`run_cracking` so the ``--show`` pass uses
     the SAME mode the cracking command used — an AES roast group must read back
     under 19700/19900, not the RC4 default).
+
+    ``runtime_seconds`` mirrors the ``--runtime`` cap baked into ``command`` (see
+    :func:`_build_hashcat_cmd`): it widens the subprocess timeout so the process
+    is not killed before hashcat's own cap elapses, and it lets a clean
+    runtime-limit abort be treated as non-fatal. It is ``None`` (unchanged
+    behaviour) unless a caller opts into rules-based cracking.
     """
     from adscan_internal.cli.tools_env import maybe_wrap_hashcat_for_container
+    from adscan_internal.services.hashcat_coordination import hashcat_slot
 
     hashcat_mode, hash_description = _resolve_hashcat_mode_and_description(
         hash_type, mode_override=mode_override
@@ -2466,7 +3554,21 @@ def execute_cracking(
         # First phase: execute the initial cracking command
         if command:
             cracking_cmd = maybe_wrap_hashcat_for_container(command)
-            completed_process_initial = shell.run_command(cracking_cmd, timeout=300)
+            # When hashcat carries its own --runtime cap, widen the subprocess
+            # timeout past that cap (+60s buffer) so the process is not killed
+            # before hashcat aborts cleanly and writes any recovered creds.
+            subprocess_timeout = 300
+            if runtime_seconds is not None and int(runtime_seconds) > 0:
+                subprocess_timeout = max(300, int(runtime_seconds) + 60)
+            # Serialize this real crack against every other hashcat launch (a
+            # concurrent crack, or the best-effort benchmark warm-up) via the
+            # shared single-instance slot. block=True: the interactive crack is
+            # a real crack — it always eventually runs, never collides with
+            # hashcat's single-instance lock, and the warm-up yields to it.
+            with hashcat_slot(block=True):
+                completed_process_initial = shell.run_command(
+                    cracking_cmd, timeout=subprocess_timeout
+                )
 
             if completed_process_initial is None:
                 print_error("Cracking command failed to execute.")
@@ -2478,7 +3580,25 @@ def execute_cracking(
                 + (completed_process_initial.stderr or "")
             )
             initial_stderr = completed_process_initial.stderr or ""
-            if not _is_nonfatal_hashcat_exit_code(completed_process_initial.returncode):
+            # A clean --runtime abort exits with code 2; when we set the cap
+            # ourselves that is expected (not a failure) and the potfile still
+            # holds any creds recovered before the cap, so treat it as non-fatal.
+            runtime_capped_abort = (
+                runtime_seconds is not None
+                and int(runtime_seconds) > 0
+                and int(completed_process_initial.returncode or 0)
+                == _HASHCAT_RUNTIME_ABORT_EXIT_CODE
+            )
+            if runtime_capped_abort:
+                initial_failure_cause = "runtime_capped"
+                print_info_debug(
+                    "hashcat reached the --runtime cap "
+                    f"({int(runtime_seconds)}s); checking the potfile for "
+                    "recovered credentials."
+                )
+            if not runtime_capped_abort and not _is_nonfatal_hashcat_exit_code(
+                completed_process_initial.returncode
+            ):
                 print_warning(
                     f"Initial cracking command may have failed. Return code: {completed_process_initial.returncode}"
                 )
@@ -2574,7 +3694,10 @@ def execute_cracking(
         show_cmd = " ".join(shlex.quote(str(a)) for a in show_argv)
         show_cmd = maybe_wrap_hashcat_for_container(show_cmd)
         print_info_debug(f"Executing hashcat show command: {show_cmd}")
-        completed_process_show = shell.run_command(show_cmd, timeout=300)
+        # The --show read is a second hashcat launch — serialize it too so it
+        # never collides with a concurrent crack or the benchmark warm-up.
+        with hashcat_slot(block=True):
+            completed_process_show = shell.run_command(show_cmd, timeout=300)
 
         # Layer 3 (continued) — the --show pass is a second hashcat invocation
         # over the same file; a parse error here is the same FORMAT class. Catch
@@ -2663,7 +3786,7 @@ def execute_cracking(
                         "scan_mode": getattr(shell, "scan_mode", None),
                         "workspace_type": shell.type,
                         "auto_mode": shell.auto,
-                        "wordlist": wordlist_name,
+                        "wordlist": _wordlist_telemetry_label(wordlist_name),
                     }
                     properties.update(
                         build_lab_event_fields(shell=shell, include_slug=True)
@@ -2678,7 +3801,7 @@ def execute_cracking(
                     if str(getattr(shell, "type", "") or "").strip().lower() == "audit":
                         audit_properties = {
                             "hash_type": hash_type,
-                            "wordlist": wordlist_name,
+                            "wordlist": _wordlist_telemetry_label(wordlist_name),
                             "hashes_cracked": len(creds),
                             "scan_mode": getattr(shell, "scan_mode", None),
                             "workspace_type": getattr(shell, "type", None),
@@ -2702,6 +3825,16 @@ def execute_cracking(
                     wordlist_name=wordlist_name,
                     total_hashes=total_hashes,
                 )
+                try:
+                    _render_credential_harvest_for_crack(
+                        shell,
+                        domain=domain,
+                        hash_type=hash_type,
+                        creds=creds,
+                        hash_file=file_path,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
                 # Persist credentials after displaying them
                 attempted_users = set(_extract_hash_users(hash))
                 cracked_users = set(creds.keys())
@@ -2750,6 +3883,26 @@ def execute_cracking(
                         credential_origin=hash_type,
                     )
 
+                    # Broadcast-poison NetNTLMv2 → materialize the attack-graph
+                    # entry-vector edge on crack SUCCESS only (the capture itself
+                    # is the LLMNR/NBT-NS poisoning finding, not an edge). Gated on
+                    # the provenance the poisoning capture handler recorded, so a
+                    # NetNTLMv2 captured via another origin is never mis-attributed.
+                    if "NTLMv2" in hash_type:
+                        _maybe_materialize_poison_capture_crack_edge(
+                            shell, domain, username
+                        )
+
+                    # NetNTLMv1 crack SUCCESS: account-type-aware. A user
+                    # account is wordlist-crackable (supported) and is
+                    # materialized as its own exploited CrackNTLMv1 edge; a
+                    # machine account stays unsupported (rainbow-only) and is
+                    # a no-op here.
+                    if "NTLMv1" in hash_type:
+                        _maybe_materialize_ntlmv1_crack_edge(
+                            shell, domain, username
+                        )
+
                 # Mark remaining attempted users as failed for this wordlist.
                 if hash_type in _GRAPH_TRACKED_ROAST_HASH_TYPES:
                     remaining = sorted(
@@ -2790,7 +3943,7 @@ def execute_cracking(
                     "scan_mode": getattr(shell, "scan_mode", None),
                     "workspace_type": shell.type,
                     "auto_mode": shell.auto,
-                    "wordlist": wordlist_name,
+                    "wordlist": _wordlist_telemetry_label(wordlist_name),
                 }
                 properties.update(
                     build_lab_event_fields(shell=shell, include_slug=True)
@@ -2875,6 +4028,7 @@ __all__ = [
     "HashCrackingShell",
     "ask_for_cracking",
     "choose_cracking_wordlist",
+    "format_chosen_wordlist_line",
     "run_cracking",
     "do_cracking",
     "execute_cracking",

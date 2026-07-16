@@ -30,6 +30,7 @@ from adscan_internal.rich_output import (
     print_exception,
     print_success,
     print_warning,
+    questionary_select_index,
 )
 from adscan_internal.services._kerberos_spn import is_ip_address
 from adscan_internal.services.dc_confidence import (
@@ -253,6 +254,7 @@ def infer_domain_from_candidate_ip(
     candidate_ip: str,
     timeout_seconds: int = 60,
     open_tcp_ports: set[int] | None = None,
+    credential: tuple[str, str] | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Infer a domain from a candidate DC/DNS IP using robust fallbacks.
 
@@ -261,6 +263,12 @@ def infer_domain_from_candidate_ip(
         candidate_ip: Candidate DC/DNS IP address.
         timeout_seconds: Timeout for SMB fingerprinting probe.
         open_tcp_ports: Optional open-port hints already known for the candidate.
+        credential: Optional ``(username, password)`` already captured for this
+            scan (e.g. an authenticated ``start_auth`` flow). Forwarded to the
+            LDAP rootDSE probe as a RETRY when the anonymous read fails — a
+            hardened DC that blocks anonymous LDAP still answers a bind the
+            operator already holds valid credentials for. ``None`` (default)
+            keeps the probe anonymous-only.
 
     Returns:
         Tuple of (domain, method, hostname) where method is one of:
@@ -280,7 +288,10 @@ def infer_domain_from_candidate_ip(
 
     if open_tcp_ports is None or 389 in open_tcp_ports:
         ldap_domain, ldap_hostname = infer_domain_from_ldap_banner(
-            shell, target_ip=ip_clean, timeout_seconds=timeout_seconds
+            shell,
+            target_ip=ip_clean,
+            timeout_seconds=timeout_seconds,
+            credential=credential,
         )
         if ldap_domain:
             return ldap_domain, "ldap", ldap_hostname
@@ -372,6 +383,15 @@ class PdcPreflightResult:
     pdc_ip: str | None = None
     best_effort: bool = False
     pdc_hostname: str | None = None
+    # Scope-aware DC/PDC selection (2026-07-12): when the operator knowingly
+    # picks a non-PDC DC as the operational target, ``authoritative_pdc_ip``
+    # carries the true SRV-discovered PDC (when known) so spray-safety lockout
+    # reads can be redirected to it, and ``operator_overrode_pdc`` records the
+    # informed-consent override. Defaults preserve every existing caller and
+    # every existing workspace (absent flag behaves exactly as today).
+    authoritative_pdc_ip: str | None = None
+    authoritative_pdc_hostname: str | None = None
+    operator_overrode_pdc: bool = False
 
 
 def persist_pdc_preflight_result(shell: Any, result: PdcPreflightResult | None) -> None:
@@ -394,9 +414,30 @@ def persist_pdc_preflight_result(shell: Any, result: PdcPreflightResult | None) 
         return
 
     domain_info["pdc"] = pdc_ip
-    domain_info["dns_validation_mode"] = (
-        "best_effort" if bool(getattr(result, "best_effort", False)) else "validated"
-    )
+
+    # Scope-aware override (2026-07-12): the operator knowingly kept a non-PDC DC
+    # as the operational target. Persist the true PDC alongside it and flag the
+    # lockout authority as a replica so spray-safety reads can redirect to the
+    # real PDC (or fall conservative when it is unreachable). Only the explicit
+    # override writes these keys — absent ``lockout_authority`` means the chosen
+    # ``pdc`` IS the authority, keeping every existing workspace unchanged.
+    overrode = bool(getattr(result, "operator_overrode_pdc", False))
+    authoritative_pdc_ip = getattr(result, "authoritative_pdc_ip", None)
+    if overrode and authoritative_pdc_ip:
+        domain_info["authoritative_pdc_ip"] = authoritative_pdc_ip
+        domain_info["lockout_authority"] = "replica"
+        domain_info["dns_validation_mode"] = "operator_dc_override"
+        authoritative_hostname = _normalize_hostname_label(
+            getattr(result, "authoritative_pdc_hostname", None)
+        )
+        if authoritative_hostname:
+            domain_info["authoritative_pdc_hostname"] = authoritative_hostname
+    else:
+        domain_info["dns_validation_mode"] = (
+            "best_effort"
+            if bool(getattr(result, "best_effort", False))
+            else "validated"
+        )
 
     hostname = _normalize_hostname_label(getattr(result, "pdc_hostname", None))
     if hostname:
@@ -1853,29 +1894,81 @@ def preflight_domain_pdc_interactive(
             return PdcPreflightResult(action="reenter", domain=domain)
         return PdcPreflightResult(action="fallback", domain=domain)
 
-    marked_discovered = mark_sensitive(selected_ip, "ip")
-    marked_hostname = (
-        mark_sensitive(discovered_pdc_hostname, "hostname")
-        if discovered_pdc_hostname and discovered_pdc_ip == selected_ip
+    # ── Scope-aware DC/PDC selection (2026-07-12) ────────────────────────────
+    # The provided IP is a DC (or an unrecognised IP), but it is not the PDC
+    # emulator. Recommend the PDC (freshest data + authoritative lockout owner +
+    # domain time source) yet let the operator knowingly keep their in-scope DC
+    # when the PDC is out of scope — the reported abandonment loop happened
+    # because this branch previously offered no "use my provided DC" escape.
+    recommended_ip = discovered_pdc_ip or selected_ip
+    recommended_role = "PDC" if discovered_pdc_ip else "DC"
+    recommended_hostname = (
+        discovered_pdc_hostname
+        if (discovered_pdc_ip and recommended_ip == discovered_pdc_ip)
         else None
     )
-    discovered_line = f"{marked_discovered} ({marked_hostname})" if marked_hostname else marked_discovered
+    marked_recommended = mark_sensitive(recommended_ip, "ip")
+    marked_recommended_host = (
+        mark_sensitive(recommended_hostname, "hostname")
+        if recommended_hostname
+        else None
+    )
+    recommended_display = (
+        f"{marked_recommended} ({marked_recommended_host})"
+        if marked_recommended_host
+        else marked_recommended
+    )
 
     if candidate_is_dc:
-        summary = "[bold yellow]The provided IP is a Domain Controller, but another DC/PDC resolver is preferred.[/bold yellow]"
         result_kind = "candidate_is_dc_not_pdc"
+        offer_provided_override = True
+        lead_line = (
+            "The IP you provided is a valid Domain Controller, but it is not "
+            "the PDC emulator for this domain."
+        )
+        provided_line = f"{marked_candidate}  [dim](replica)[/dim]"
+        border = "cyan"
     else:
-        summary = "[bold red]The provided IP does not match DCs published by DNS SRV for this domain.[/bold red]"
         result_kind = "candidate_not_dc"
+        # Only invite a use-as-is override for a non-DNS-published IP when it
+        # still fingerprints as a DC. Here DNS SRV validated the domain, so we
+        # hold no DC evidence for this IP — keep the conservative
+        # recommend / re-enter / fallback set (no override option).
+        offer_provided_override = _host_looks_like_dc_candidate(
+            fingerprint_evidence=fingerprint_evidence,
+            port_evidence=port_evidence,
+        )
+        lead_line = (
+            "The IP you provided does not match any Domain Controller published "
+            "by DNS SRV for this domain."
+        )
+        provided_line = marked_candidate
+        border = "yellow"
+
+    panel_body = (
+        f"[bold]{lead_line}[/bold]\n\n"
+        f"  Domain               {marked_domain}\n"
+        f"  Provided DC          {provided_line}\n"
+        f"  Recommended · {recommended_role:<4} {recommended_display}\n\n"
+        "[bold]Why the PDC is recommended[/bold]\n"
+        "  · Freshest data: replicas lag by the replication interval.\n"
+        "  · Authoritative for account-lockout counting, so password spraying\n"
+        "    can measure attempts remaining safely.\n"
+        "  · Domain time source, so Kerberos clock sync is most reliable.\n"
+    )
+    if offer_provided_override:
+        panel_body += (
+            "\n[bold]If you choose your provided DC instead[/bold]\n"
+            "  · Lockout counters read from a replica can be stale: ADscan will\n"
+            "    read them from the PDC when it is reachable, otherwise it will\n"
+            "    spray more cautiously or skip spraying to protect live accounts.\n"
+            "  · If the replica clock drifts, Kerberos may hit skew.\n"
+        )
 
     print_panel(
-        f"{summary}\n\n"
-        f"Domain: {marked_domain}\n"
-        f"Provided IP: {marked_candidate}\n"
-        f"Recommended resolver target: {discovered_line}\n\n"
-        "[dim]ADscan selected this target after validating route + TCP/53 + DNS SRV checks.[/dim]",
-        title="[bold]🧭 DC/PDC Validation[/bold]",
-        border_style="cyan",
+        panel_body,
+        title="[bold]🧭 DC/PDC Selection[/bold]",
+        border_style=border,
         padding=(1, 2),
     )
 
@@ -1888,25 +1981,75 @@ def preflight_domain_pdc_interactive(
         },
     )
 
-    if Confirm.ask(
-        Text(
-            f"Use {discovered_line} as the DC/PDC target for this scan? (recommended)",
-            style="cyan",
-        ),
-        default=True,
-    ):
+    option_use_recommended = f"Use the recommended {recommended_role} ({recommended_ip})"
+    if candidate_is_dc:
+        option_use_provided = (
+            f"Use my provided DC ({candidate_ip}) : I understand the PDC is out of scope"
+        )
+    else:
+        option_use_provided = (
+            f"Use my provided IP ({candidate_ip}) anyway : not a DNS-published DC"
+        )
+    option_reenter = "Re-enter the domain and DC/PDC IP"
+    option_fallback = "Fall back to domain discovery"
+
+    options = [option_use_recommended]
+    if offer_provided_override:
+        options.append(option_use_provided)
+    options.append(option_reenter)
+    options.append(option_fallback)
+
+    selected_idx = questionary_select_index(
+        title="Which DC should ADscan use for this scan?",
+        options=options,
+        default_idx=0,
+        shell=shell,
+    )
+    if selected_idx is None:
+        # Cancelled (Ctrl-C / EOF): re-enter, matching the sibling branches.
+        selected_idx = options.index(option_reenter)
+    chosen = options[selected_idx]
+
+    if chosen == option_use_recommended:
         telemetry.capture(
             "pdc_preflight_confirmed",
             properties={"mode": mode_label, "action": "use_discovered_pdc"},
         )
         return PdcPreflightResult(
-            action="use", domain=domain, pdc_ip=selected_ip
+            action="use",
+            domain=domain,
+            pdc_ip=recommended_ip,
+            pdc_hostname=_normalize_hostname_label(recommended_hostname),
         )
 
-    if Confirm.ask(
-        Text("Re-enter the domain and DC/PDC IP?", style="cyan"),
-        default=True,
-    ):
+    if chosen == option_use_provided:
+        telemetry.capture(
+            "pdc_preflight_confirmed",
+            properties={
+                "mode": mode_label,
+                "action": "use_operator_dc_override",
+                "pdc_out_of_scope": True,
+            },
+        )
+        if discovered_pdc_ip:
+            print_success(
+                f"Using {marked_candidate} as the scan DC. The PDC "
+                f"{marked_recommended} is recorded as the lockout authority — "
+                "spraying reads lockout counters from it when reachable, and "
+                "stays conservative otherwise."
+            )
+        else:
+            print_success(f"Using {marked_candidate} as the scan DC.")
+        return PdcPreflightResult(
+            action="use",
+            domain=domain,
+            pdc_ip=candidate_ip,
+            authoritative_pdc_ip=discovered_pdc_ip,
+            authoritative_pdc_hostname=_normalize_hostname_label(discovered_pdc_hostname),
+            operator_overrode_pdc=True,
+        )
+
+    if chosen == option_reenter:
         telemetry.capture(
             "pdc_preflight_confirmed",
             properties={"mode": mode_label, "action": "reenter"},
@@ -2498,6 +2641,16 @@ def check_dns(shell: DNSShell, domain: str, ip: str | None = None) -> bool:
 def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
     """Update local DNS resolver configuration for a domain/DC pair.
 
+    Idempotent per session: this is invoked from every ``finalize_domain_context``
+    call site (workspace load, target set, posture, scan-confirm — roughly 4x per
+    run), but the underlying Unbound reconfigure + restart + verification is only
+    useful the first time for a given (domain, DC) pair. A per-session memo on
+    ``shell._dns_configured`` (mirrors the ``ensure_*_fresh`` idempotent-guard
+    pattern used for posture/clock-sync) skips the redundant reconfigure work —
+    and the warning/success noise pair it produces — on repeat calls. Only a
+    *successful* configure is memoized, so a prior failure never blocks a retry
+    (same "cache observations, never absences" policy as posture caching).
+
     Args:
         shell: Shell object providing DNS management helpers and telemetry.
         domain: Active Directory domain name.
@@ -2508,6 +2661,23 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
     """
     marked_domain = mark_sensitive(domain, "domain")
     marked_ip = mark_sensitive(ip, "ip")
+
+    memo_key = ((domain or "").strip().rstrip(".").lower(), (ip or "").strip())
+    dns_configured = getattr(shell, "_dns_configured", None)
+    if dns_configured is None:
+        dns_configured = set()
+        try:
+            shell._dns_configured = dns_configured  # ephemeral, never persisted to domains_data
+        except Exception:  # noqa: BLE001 — best-effort memo; a failure to attach
+            # the cache attribute just means every call reconfigures (safe fallback).
+            dns_configured = None
+    if dns_configured is not None and memo_key in dns_configured:
+        print_info_debug(
+            "[dns] update_resolver_for_domain: already configured this session for "
+            f"domain={marked_domain}, dc_ip={marked_ip}; skipping redundant reconfigure"
+        )
+        return True
+
     print_info(f"Updating DNS for domain {marked_domain} using DC {marked_ip}")
     print_info_debug(
         f"[dns] update_resolver_for_domain start: domain={marked_domain}, dc_ip={marked_ip}"
@@ -2669,7 +2839,10 @@ def update_resolver_for_domain(shell: DNSShell, domain: str, ip: str) -> bool:
         return False
     shell._log_dns_management_debug("after resolv.conf update")
 
-    return shell._verify_dns_resolution(domain)
+    verified = shell._verify_dns_resolution(domain)
+    if verified and dns_configured is not None:
+        dns_configured.add(memo_key)
+    return verified
 
 
 def resolve_pdc_hostname(
@@ -2764,8 +2937,29 @@ def finalize_domain_context(
     interactive: bool,
     best_effort: bool | None = None,
     pdc_hostname_hint: str | None = None,
+    make_active: bool = False,
 ) -> None:
-    """Finalize DNS + /etc/hosts setup after confirming a domain and PDC/DC IP."""
+    """Finalize DNS + /etc/hosts setup after confirming a domain and PDC/DC IP.
+
+    This has two distinct responsibilities that MUST stay decoupled:
+
+    1. POPULATE ``domains_data[domain]`` (pdc/dc_ip/dcs/pdc_hostname + the DC
+       FQDN keys) and reconfigure the local DNS resolver / ``/etc/hosts`` for
+       this domain. This runs unconditionally for EVERY caller — including the
+       trust-enumeration and per-domain scan loops that finalize discovered or
+       secondary domains.
+    2. MAKE this domain the operator's ACTIVE REPL context (``shell.domain``).
+       This is a side effect only the primary ``start_unauth`` / ``start_auth``
+       / ``add_credential`` entry points want, so it is gated behind
+       ``make_active`` and defaults to ``False``. A looping caller (trust enum,
+       automated scan) leaves the default so it never clobbers ``shell.domain``
+       with a discovered/secondary domain.
+
+    Args:
+        make_active: When ``True``, lock ``domain`` as the shell's active
+            context via ``set_active_domain``. Defaults to ``False`` so only the
+            explicit primary entry points flip the operator's active domain.
+    """
     if not domain or not pdc_ip:
         return
 
@@ -2785,9 +2979,43 @@ def finalize_domain_context(
         f"best_effort={best_effort}"
     )
 
+    # Lock the resolved domain as the shell's active context so subsequent bare
+    # REPL commands (which default to ``shell.domain``) work after both
+    # start_unauth and start_auth — not only on the credentialed path. Single
+    # source of truth: ``set_active_domain``. Gated on ``make_active`` so the
+    # per-domain trust-enum / scan loops (which finalize discovered or secondary
+    # domains) do NOT flip the operator's active context.
+    if make_active:
+        try:
+            from adscan_internal.cli.common import set_active_domain  # noqa: PLC0415
+
+            set_active_domain(shell, domain)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[dns] Failed to set active domain context for {marked_domain}: {exc}"
+            )
+
     try:
         domain_info["pdc"] = pdc_ip
-        domain_info["dns_validation_mode"] = "best_effort" if best_effort else "validated"
+        # Preserve a scope-aware operator DC override (2026-07-12): the operator
+        # knowingly kept a non-PDC replica, so keep that marker + the persisted
+        # lockout authority rather than downgrading it to "validated".
+        if str(domain_info.get("dns_validation_mode", "")).strip().lower() != "operator_dc_override":
+            domain_info["dns_validation_mode"] = "best_effort" if best_effort else "validated"
+        # Fill the model DC-IP field when absent so ``resolve_dc_ip`` and any
+        # direct reader agree with the authoritative PDC IP. Never overwrite a
+        # value already discovered by a richer path.
+        if not str(domain_info.get("dc_ip") or "").strip():
+            domain_info["dc_ip"] = pdc_ip
+        # Ensure the resolved PDC/DC IP is represented in the DC list without
+        # clobbering a fuller list a discovery/collection pass may have built.
+        dcs = domain_info.get("dcs")
+        if not isinstance(dcs, list):
+            dcs = []
+        if pdc_ip not in dcs:
+            dcs.append(pdc_ip)
+        domain_info["dcs"] = dcs
     except Exception:
         pass
     shell.pdc = pdc_ip
@@ -2873,6 +3101,43 @@ def finalize_domain_context(
             domain_info["pdc"] = pdc_ip
         except Exception:
             pass
+
+        # Persist the DC FQDN keys so raw readers (those that do NOT route
+        # through ``resolve_dc_fqdn`` / a config ``__post_init__``) get a real
+        # Kerberos SPN target instead of a bare IP or short label. Runs in BOTH
+        # best-effort and validated modes. Guards mirror the multi-forest safety
+        # of ``update_resolver_for_domain`` (see its 2580-2595 block):
+        #   - only a dotted qualified value is ever written;
+        #   - a genuine dotted FQDN already present (e.g. one the validated
+        #     ``update_resolver_for_domain`` run just observed from live DNS) is
+        #     NEVER overwritten — only an absent/empty/short/IP value is filled,
+        #     so the DNS-observed name always wins;
+        #   - synthesis only from an existing short ``pdc_hostname`` (guaranteed
+        #     inside this ``if hostname:`` block); the IP is never turned into a
+        #     synthetic FQDN — the ``resolve_dc_fqdn`` inventory fallback handles
+        #     the ``pdc_hostname``-absent case at read time.
+        try:
+            from adscan_internal.models.domain import qualify_host_fqdn  # noqa: PLC0415
+
+            qualified_fqdn = qualify_host_fqdn(hostname, domain)
+            if qualified_fqdn and "." in qualified_fqdn:
+                for fqdn_key in ("pdc_hostname_fqdn", "pdc_fqdn", "dc_fqdn"):
+                    existing = str(domain_info.get(fqdn_key) or "").strip().rstrip(".")
+                    # Fill only when there is no genuine dotted FQDN already:
+                    # absent/empty, a short label, or a stray IP are all safe to
+                    # replace; a real dotted non-IP FQDN is left intact.
+                    if not existing or "." not in existing or is_ip_address(existing):
+                        domain_info[fqdn_key] = qualified_fqdn
+                print_info_debug(
+                    "[dns] finalize_domain_context: persisted DC FQDN keys for "
+                    f"{marked_domain} -> {mark_sensitive(qualified_fqdn, 'hostname')} "
+                    "(best-effort SSOT; genuine dotted FQDNs left intact)"
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort; never break finalize
+            telemetry.capture_exception(exc)
+            print_info_debug(
+                f"[dns] Failed to derive DC FQDN keys for {marked_domain}: {exc}"
+            )
 
         try:
             if not shell.add_to_hosts(domain):

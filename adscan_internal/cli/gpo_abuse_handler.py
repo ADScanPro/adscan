@@ -93,16 +93,24 @@ def _resolve_active_credential(
 
 
 def _resolve_dc_fqdn(shell: Any, domain: str) -> str:
+    """Resolve the DC FQDN for the GPO-abuse Kerberos SPN (CLAUDE.md FQDN rule).
+
+    The GPO exploit binds with Kerberos, so the SPN host must be a real FQDN.
+    Routes through the ``resolve_dc_fqdn`` SSOT, which promotes a short
+    ``pdc_hostname`` to ``<host>.<domain>`` and adds the workspace inventory
+    fallback. The caller keeps the separate ``dc_ip`` as the KDC-IP argument and
+    as its own final fallback, so a bare IP is never fabricated as the SPN host
+    here.
+    """
     domains_data = getattr(shell, "domains_data", {}) or {}
     entry = domains_data.get(domain) if isinstance(domains_data, dict) else {}
     if not isinstance(entry, dict):
         return ""
-    return str(
-        entry.get("pdc_hostname_fqdn")
-        or entry.get("pdc_hostname")
-        or entry.get("pdc")
-        or ""
-    ).strip()
+    from adscan_internal.models.domain import (  # noqa: PLC0415
+        resolve_dc_fqdn as _resolve_dc_fqdn_ssot,
+    )
+
+    return str(_resolve_dc_fqdn_ssot(entry, target_domain=domain) or "").strip()
 
 
 def _resolve_workspace_dir(shell: Any) -> Path | None:

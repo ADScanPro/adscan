@@ -111,9 +111,70 @@ _HOST_CONNECT_TIMEOUT_DEFAULT = 10
 # via the env var only once a measured per-host duration distribution is in hand.
 _HOST_BUDGET_DEFAULT = 180
 
+# Lever C -- RTT-adaptive per-host ENUMERATION timeout.
+#
+# ``_do_samr`` bounds each SAMR/SRVSVC enum stage on ``per_host_timeout`` (default
+# 20s). But a host that opens 445 yet FILTERS the IPC$ named pipes (EDR, hardened
+# member, appliance) still burns the full per_host_timeout of dead-wait per stage
+# before the ``wait_for`` fires -- and at 1-2k-host scale that dead-wait dominates
+# the phase wall-clock. The 445 gate already measured the TCP-connect RTT for every
+# reachable IP; a LOW RTT PROVES the link is fast, so a much tighter enum bound is
+# safe on that host (a live pipe answers in well under a second on a fast link).
+# When RTT is unknown or high we stay at the full per_host_timeout -- this ONLY
+# reclaims dead-wait on hosts the gate proved fast, and NEVER shortens a slow/VPN
+# host (correctness-preserving on the constrained environments ADscan targets).
+#
+# Bound: ``timeout = clamp(_ENUM_TIMEOUT_BASE + rtt_s * _ENUM_RTT_MULT,
+#                          _ENUM_TIMEOUT_FLOOR, per_host_timeout)``.
+# floor 8s so a live-but-loaded pipe under KDC/SAMR pressure is never cut; base 6s
+# fixed overhead; +30s of budget per second of RTT so a 200ms link -> ~12s, a
+# 400ms link -> ~18s, and anything >~470ms RTT stays at the 20s ceiling.
+_ENUM_TIMEOUT_FLOOR = 8
+_ENUM_TIMEOUT_BASE = 6
+_ENUM_RTT_MULT = 30
+
+
+def _adaptive_enum_timeout(rtt_ms: float | None, per_host_timeout: int) -> int:
+    """RTT-adaptive per-host SAMR/SRVSVC enum timeout, clamped to a safe band.
+
+    Tightens the enum bound ONLY when the 445 gate proved the link fast (low
+    TCP-connect RTT); returns the full ``per_host_timeout`` when RTT is unknown or
+    high, so slow/VPN and unmeasured hosts are unchanged. The result is always in
+    ``[_ENUM_TIMEOUT_FLOOR, per_host_timeout]`` (the ceiling is the caller's own
+    per-host timeout, so this can only ever REDUCE dead-wait, never extend it).
+
+    Best-effort: any unparsable override or bad input falls back to
+    ``per_host_timeout``. Env escape hatches:
+      - ``ADSCAN_COLLECTOR_ENUM_TIMEOUT``  -- explicit int, wins over adaptation.
+      - ``ADSCAN_COLLECTOR_ENUM_ADAPTIVE=0`` -- disable adaptation entirely.
+    """
+    override = os.getenv("ADSCAN_COLLECTOR_ENUM_TIMEOUT")
+    if override:
+        try:
+            return max(1, int(override))
+        except (TypeError, ValueError):
+            pass
+    if os.getenv("ADSCAN_COLLECTOR_ENUM_ADAPTIVE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return per_host_timeout
+    # No proof the link is fast -> stay generous.
+    if rtt_ms is None or rtt_ms <= 0:
+        return per_host_timeout
+    derived = int(_ENUM_TIMEOUT_BASE + (rtt_ms / 1000.0) * _ENUM_RTT_MULT)
+    return max(_ENUM_TIMEOUT_FLOOR, min(per_host_timeout, derived))
+
+
 # Emit a running per-host-phase progress line every N completed hosts, so a slow
 # run surfaces its duration distribution live instead of only at the end.
 _HOST_PROGRESS_TICK = 250
+
+# Host-granular Domain-Collection crash-resume (see services/collection_progress).
+# The mid-sweep graph checkpoint (persist the partial graph + flush the done-set)
+# fires on the ``_HOST_PROGRESS_TICK`` boundary ONLY for estates at or above this
+# size — same threshold as the patience notice below. Small labs stay on the
+# single end-of-sweep persist (byte-identical, zero cost); large estates get
+# crash durability. A run never even reaches the boundary below ``_HOST_PROGRESS_TICK``
+# hosts, so this gate is belt-and-suspenders that also survives a future TICK change.
+_MID_SWEEP_PERSIST_THRESHOLD = 200
 
 # Minimum wall-clock gap between two live host-phase progress emits to the
 # platform's current-operation strip. Matches the share collector's object-count
@@ -437,6 +498,24 @@ class HostCollectorConfig:
     # one; the fan-out checks it at the dispatch boundary, drains in-flight hosts,
     # and returns the partial set. See ``host_sweep_cancellation``.
     cancellation: "HostSweepCancellation | None" = None
+    # Host-granular Domain-Collection crash-resume (Slice 1). All optional /
+    # fail-open; the defaults (empty set + None callbacks) leave collection
+    # byte-for-byte identical to a run without resume. Supplied by the
+    # orchestrator so this pure service never imports the shell/workspace SSOT
+    # (``services/collection_progress``) — it only invokes opaque callables.
+    #  * ``resumed_host_ids`` — UPPER-cased graph ``object_id``s already enriched
+    #    in a prior interrupted run; the fan-out skips them before dispatch.
+    resumed_host_ids: "frozenset[str]" = field(default_factory=frozenset)
+    #  * ``collection_on_sweep_start(hosts_total)`` — fired ONCE when the post-cap
+    #    dispatch size is known; marks ``collection_progress`` running.
+    collection_on_sweep_start: "Callable[[int], None] | None" = None
+    #  * ``collection_mark_host_done(object_id)`` — fired per enriched host;
+    #    records the id (buffered in memory, flushed by the checkpoint below).
+    collection_mark_host_done: "Callable[[str], None] | None" = None
+    #  * ``collection_checkpoint()`` — fired on the ``_HOST_PROGRESS_TICK``
+    #    boundary for large estates: persists the partial graph FIRST, then
+    #    flushes the done-set (ordering is load-bearing — see collection_progress).
+    collection_checkpoint: "Callable[[], None] | None" = None
 
 
 @dataclass
@@ -485,6 +564,12 @@ class HostPhaseTiming:
     stage_outcomes: dict[str, dict[str, int]] = field(
         default_factory=lambda: {"sessions": {}, "localadmins": {}, "shares": {}}
     )
+    # Per-host list of (hostname, ip) whose SHARE stage ABORTED (connection dropped
+    # mid-RPC) even after the single fresh-connection retry — populated only for
+    # reached hosts. This is the exact set needed to distinguish a genuine "no
+    # shares" result from an incomplete/failed enumeration in the operator
+    # notification (a list, never a set — this is JSON-persisted via domains_data).
+    shares_aborted_hosts: list[tuple[str, str]] = field(default_factory=list)
     # Operator early-stop coverage (set ONLY when the sweep was halted early via
     # the cooperative-cancellation token). ``early_stopped`` flags the stop;
     # ``swept_before_stop`` / ``total_dispatch`` are the X-of-Y coverage the
@@ -502,9 +587,26 @@ class HostPhaseTiming:
     host_capped: bool = False
     capped_skipped: int = 0
 
+    # Host-granular resume coverage (Slice 1). ``resumed_skipped`` is the number
+    # of hosts skipped this run because a prior interrupted sweep already enriched
+    # them (they are on the persisted partial graph). Distinct from the early-stop
+    # and host-cap fields so the surfaces read "enriched N new; K already collected
+    # in a prior run" rather than conflating resume with a fresh partial sweep.
+    resumed_skipped: int = 0
+
     @property
     def total(self) -> float:
         return self.negotiate + self.samr + self.shares
+
+    @property
+    def shares_reached_hosts(self) -> int:
+        """Hosts we reached with a live connection that RAN the share stage.
+
+        ``sum`` of the per-outcome ``shares`` counters — the ``N`` in the
+        notification's "failed on M of N reachable hosts". Connect/auth/budget
+        failures never attempted a stage, so they are excluded by construction.
+        """
+        return int(sum((self.stage_outcomes.get("shares") or {}).values()))
 
 
 def _classify_host_outcome(errors: dict[str, str]) -> str:
@@ -659,18 +761,43 @@ async def _do_samr(
     timing: HostPhaseTiming,
     self_user: str | None = None,
     target_ip: str | None = None,
+    enum_timeout: int | None = None,
 ) -> None:
+    """Collect SRVSVC sessions + SAMR BUILTIN local-group members for one host.
+
+    The two stages use INDEPENDENT DCE-RPC pipes (SRVSVC vs SAMR), but they are
+    awaited SEQUENTIALLY over the ONE authenticated SMB2 connection — NOT
+    concurrently. aiosmb's ``SMBConnection`` is not concurrency-safe across pipes:
+    its ``SequenceWindow`` / SMB2 credit accounting is mutated on both send and
+    receive and its ``OutstandingResponses`` dicts are shared, so two independent
+    send→recv loops over one connection desync the credit window, the server RSTs
+    the TCP connection, and every later RPC on that ``machine`` — including the
+    reused-connection share stage — fails with ``CONNECTION_ABORTED``. This was
+    reproduced live against GOAD (regression from commit ``dedfe333`` / "Lever A",
+    which ran the two stages under ``asyncio.gather``); a send-serialization lock,
+    even process-global, did NOT fix it (the race is on the receive-side credit
+    bookkeeping). Sequential is the proven-clean end state — one authenticated
+    connection per host (one AS-REQ / one bind: the lockout / scale posture is
+    preserved) and identical edges are emitted. Do NOT reintroduce concurrent
+    multi-pipe RPC over a single connection; if per-host scale ever demands it, the
+    robust route is one connection per concurrent pipe. Locked by
+    ``tests/unit/vendor/test_aiosmb_single_connection_concurrency.py``.
+
+    ``enum_timeout`` (Lever C) is the RTT-adaptive per-op budget; it falls back to
+    ``per_host_timeout`` when not provided (unknown/slow env → generous default).
+    """
     from adscan_internal.services.collector.smb_collector import (
         collect_builtin_group_members,
         collect_sessions,
     )
 
-    t = time.monotonic()
-    try:
+    timeout = enum_timeout if enum_timeout is not None else per_host_timeout
+
+    async def _collect_sessions_stage() -> None:
         try:
             sessions, sess_err = await asyncio.wait_for(
                 collect_sessions(machine, self_user=self_user, target_ip=target_ip),
-                timeout=per_host_timeout,
+                timeout=timeout,
             )
             out.session_usernames = sessions
             if sess_err:
@@ -684,9 +811,10 @@ async def _do_samr(
             telemetry.capture_exception(exc)
             out.errors["sessions"] = f"{type(exc).__name__}: {exc}"
 
+    async def _collect_builtin_stage() -> None:
         try:
             builtin_groups, builtin_err = await asyncio.wait_for(
-                collect_builtin_group_members(machine), timeout=per_host_timeout
+                collect_builtin_group_members(machine), timeout=timeout
             )
             out.builtin_groups = builtin_groups
             if builtin_err:
@@ -696,6 +824,13 @@ async def _do_samr(
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             out.errors["builtin_groups"] = f"{type(exc).__name__}: {exc}"
+
+    t = time.monotonic()
+    try:
+        # SEQUENTIAL over the one connection — never asyncio.gather (see docstring:
+        # concurrent multi-pipe RPC over a single aiosmb connection RSTs the socket).
+        await _collect_sessions_stage()
+        await _collect_builtin_stage()
     finally:
         timing.samr += time.monotonic() - t
 
@@ -734,13 +869,84 @@ async def _do_shares(
         timing.shares += time.monotonic() - t
 
 
+async def _do_shares_with_retry(
+    machine: Any,
+    smb_config: Any,
+    target_ip: str,
+    share_cfg: ShareCollectorConfig,
+    per_host_timeout: int,
+    connect_timeout: int,
+    out: HostCollectionResult,
+    timing: HostPhaseTiming,
+) -> None:
+    """Run the share stage; on a connection ABORT retry ONCE on a fresh connection.
+
+    Defense in depth (independent of the sequential-SAMR root-cause fix): the
+    share inventory is the highest-value output of the SMB sweep and must not be
+    silently zeroed by ANY mid-RPC connection drop — a slow host, a server
+    idle-close, a VPN blip, or the abort class this file's ``_do_samr`` docstring
+    describes. When the first attempt (over the reused ``machine``) records an
+    ``abort``-classified share error — and ONLY ``abort``, never ``denied`` or
+    ``timeout`` — open ONE fresh ``smb_machine_with_fallback`` connection and
+    re-run the share collection exactly once. Bounded + abort-only: a healthy host
+    pays zero extra auth, and a locked-out / permission-denied host is never
+    re-sprayed (respects the domain-lockout constraint). Proven to recover live
+    against GOAD (fresh 2nd connection → shares enumerate cleanly).
+    """
+    await _do_shares(machine, target_ip, share_cfg, per_host_timeout, out, timing)
+    if _classify_stage_error(out.errors.get("shares")) != "abort":
+        return
+
+    # Abort-only, single fresh-connection retry. Preserve the original abort
+    # marker so a retry that also fails still records the share stage as aborted
+    # (never silently "ok") for the per-stage outcome telemetry + notification.
+    original_err = out.errors.get("shares")
+    out.errors.pop("shares", None)
+    print_info_debug(
+        f"[host-collector] share stage aborted on {target_ip}; retrying once on a "
+        "fresh SMB connection (bounded, abort-only)."
+    )
+
+    import contextlib
+
+    from adscan_internal.services.smb_transport import smb_machine_with_fallback
+
+    t = time.monotonic()
+    try:
+        machine_cm = smb_machine_with_fallback(smb_config)
+        fresh_machine = await asyncio.wait_for(
+            machine_cm.__aenter__(),  # pylint: disable=no-member
+            timeout=connect_timeout,
+        )
+        try:
+            await _do_shares(
+                fresh_machine, target_ip, share_cfg, per_host_timeout, out, timing
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await machine_cm.__aexit__(None, None, None)  # pylint: disable=no-member
+    except Exception as exc:  # noqa: BLE001 — retry is best-effort; keep the abort recorded
+        telemetry.capture_exception(exc)
+        out.errors["shares"] = original_err
+    finally:
+        timing.shares += time.monotonic() - t
+
+
 async def collect_one_host(
     target_ip: str,
     target_hostname: str | None,
     config: HostCollectorConfig,
     timing: HostPhaseTiming,
+    rtt_ms: float | None = None,
 ) -> HostCollectionResult:
-    """Run negotiate + SAMR + SRVSVC against a single host on ONE SMB session."""
+    """Run negotiate + SAMR + SRVSVC against a single host on ONE SMB session.
+
+    ``rtt_ms`` is the 445-gate TCP-connect RTT for this host (``None`` when the
+    gate did not measure it). It feeds Lever C's RTT-adaptive enum timeout so a
+    proven-fast host that filters the IPC$ pipes stops burning the full
+    ``per_host_timeout`` of dead-wait per SAMR stage; slow/unknown-RTT hosts keep
+    the generous ``per_host_timeout`` unchanged.
+    """
     from adscan_internal.services.smb_transport import (
         SMBAccessDeniedError,
         SMBAuthError,
@@ -801,13 +1007,16 @@ async def collect_one_host(
                     timing,
                     self_user=config.smb.username,
                     target_ip=target_ip,
+                    enum_timeout=_adaptive_enum_timeout(rtt_ms, config.per_host_timeout),
                 )
             if config.collect_shares:
-                await _do_shares(
+                await _do_shares_with_retry(
                     machine,
+                    smb_config,
                     target_ip,
                     config.share,
                     config.per_host_timeout,
+                    config.connect_timeout,
                     out,
                     timing,
                 )
@@ -1159,6 +1368,11 @@ async def _gate_reachable_445(
             max_concurrency=config.gate_concurrency,
         )
         gate_probe_ms = reach.elapsed_ms
+        # Lever C -- carry the per-IP TCP-connect RTT of the 445 probe so
+        # collect_one_host can tighten the SAMR enum timeout on proven-fast hosts.
+        rtt_by_ip: dict[str, float] = {
+            ip: p.elapsed_ms for ip, p in reach.raw_results.items() if p.status == "open"
+        }
         if reach.offline:
             reach2 = await filter_reachable_hosts(
                 list(reach.offline),
@@ -1167,6 +1381,9 @@ async def _gate_reachable_445(
                 max_concurrency=config.gate_concurrency,
             )
             gate_probe_ms += reach2.elapsed_ms
+            rtt_by_ip.update(
+                {ip: p.elapsed_ms for ip, p in reach2.raw_results.items() if p.status == "open"}
+            )
             reachable_ips = set(reach.reachable) | set(reach2.reachable)
         else:
             reachable_ips = set(reach.reachable)
@@ -1189,6 +1406,7 @@ async def _gate_reachable_445(
                     # the misleading "AP_REP parse bug" debug line. The transport
                     # SPN retry remains the backstop when lastLogon is unavailable.
                     live = _pick_live_node(ip_nodes)
+                    live.properties["_gate_rtt_ms"] = rtt_by_ip.get(ip)
                     reachable_nodes.append(live)
                     for node in ip_nodes:
                         if node is not live:
@@ -1197,6 +1415,8 @@ async def _gate_reachable_445(
                             )
                             duplicate_dns_skipped += 1
                 else:
+                    for node in ip_nodes:
+                        node.properties["_gate_rtt_ms"] = rtt_by_ip.get(ip)
                     reachable_nodes.extend(ip_nodes)
             else:
                 for node in ip_nodes:
@@ -1343,6 +1563,44 @@ async def _collect_domain_hosts_async(
         dispatch_nodes, int(getattr(config, "host_cap", 0) or 0)
     )
 
+    # Host-granular Domain-Collection crash-resume (Slice 1). ``hosts_total`` is
+    # the FULL swept set across a run and its resume (post-cap, PRE resume-skip),
+    # so it is stable whether this is a fresh run or a reload — the resume offer +
+    # coverage read consistently ("enriched N new of M; K already collected").
+    # Announce the sweep start (marks ``collection_progress`` running) BEFORE the
+    # skip so the total is the full set, not the remainder.
+    hosts_total_for_resume = len(dispatch_nodes)
+    _on_sweep_start = getattr(config, "collection_on_sweep_start", None)
+    if _on_sweep_start is not None:
+        try:
+            _on_sweep_start(hosts_total_for_resume)
+        except Exception as exc:  # noqa: BLE001 — checkpoint must never break collection
+            telemetry.capture_exception(exc)
+
+    # Skip hosts already enriched in a prior interrupted run. The done-set is the
+    # durable projection of that sweep's merges, keyed by graph ``object_id`` (SID,
+    # alias-independent). Reuse it directly as the skip filter — do NOT re-derive
+    # "done" from graph edges (a host with zero sessions/admins/shares was still
+    # collected and leaves no distinguishing edge). Applied AFTER the cap so the
+    # cap never drops an already-done host. ``skipped_resumed`` is distinct from
+    # ``skipped_stopped`` (early stop) and ``skipped_capped`` (host cap).
+    resumed_host_ids = getattr(config, "resumed_host_ids", frozenset()) or frozenset()
+    skipped_resumed = 0
+    if resumed_host_ids:
+        _pre_resume = len(dispatch_nodes)
+        dispatch_nodes = [
+            n
+            for n in dispatch_nodes
+            if str(getattr(n, "object_id", "") or "").upper() not in resumed_host_ids
+        ]
+        skipped_resumed = _pre_resume - len(dispatch_nodes)
+        if skipped_resumed:
+            print_info_verbose(
+                f"[host-collector] resume: skipping {skipped_resumed} host(s) "
+                "already enriched in a prior interrupted run; sweeping the "
+                f"remaining {len(dispatch_nodes)} of {hosts_total_for_resume}."
+            )
+
     # Build SAM-account lookup once before fan-out — O(1) per session in _merge_host_into_graph
     samaccount_to_node: dict[str, Any] = {}
     for n in result.nodes.values():
@@ -1370,6 +1628,7 @@ async def _collect_domain_hosts_async(
         "inflight": 0,
         "skipped_stopped": 0,
         "skipped_capped": skipped_capped,
+        "skipped_resumed": skipped_resumed,
     }
 
     def _safe_update(**kwargs: Any) -> None:
@@ -1451,7 +1710,13 @@ async def _collect_domain_hosts_async(
                     # generous (well above the intended per-op sum) → it never cuts
                     # a host that behaves; it only kills genuine hangs.
                     host_data = await asyncio.wait_for(
-                        collect_one_host(target_ip, target_hostname, config, timing),
+                        collect_one_host(
+                            target_ip,
+                            target_hostname,
+                            config,
+                            timing,
+                            rtt_ms=node.properties.get("_gate_rtt_ms"),
+                        ),
                         timeout=config.per_host_budget,
                     )
                 except asyncio.TimeoutError:
@@ -1470,6 +1735,23 @@ async def _collect_domain_hosts_async(
             totals["share"] += n_sh
             for k, v in src_counts.items():
                 sd_source_counts[k] = sd_source_counts.get(k, 0) + v
+            # Host-granular resume: record THIS host as enriched. Every dispatched
+            # host that reaches the merge (success OR a connect/auth failure) is
+            # "collected" for resume purposes — a resume re-touches only the
+            # remaining hosts, so a host down in the first run is not retried
+            # (strictly LESS SMB noise; the escape hatch is a fresh full re-run).
+            # Buffered in memory (no per-host save); flushed on the checkpoint
+            # cadence. Safe here — no await between the merge above and this call,
+            # so cooperative scheduling guarantees no preemption (same window as
+            # the totals RMW). Best-effort: never abort the sweep.
+            _mark_done = getattr(config, "collection_mark_host_done", None)
+            if _mark_done is not None:
+                _oid = str(getattr(node, "object_id", "") or "")
+                if _oid:
+                    try:
+                        _mark_done(_oid)
+                    except Exception as exc:  # noqa: BLE001 — checkpoint must never break collection
+                        telemetry.capture_exception(exc)
         finally:
             progress["inflight"] -= 1
             # A host skipped by the early stop was never swept: release its slot
@@ -1514,6 +1796,15 @@ async def _collect_domain_hosts_async(
                         _o = _classify_stage_error(_errors.get(_err_key))
                         _bucket = timing.stage_outcomes[_stage]
                         _bucket[_o] = _bucket.get(_o, 0) + 1
+                    # Retain the affected hosts (not just counts) so the operator
+                    # notification can list WHICH hosts had share collection fail
+                    # — a genuine "no shares" result vs an incomplete enumeration.
+                    if config.collect_shares and (
+                        _classify_stage_error(_errors.get("shares")) == "abort"
+                    ):
+                        timing.shares_aborted_hosts.append(
+                            (target_hostname or "", target_ip)
+                        )
         # A host skipped by the early stop was never swept — it is not a ``done``
         # host on the dashboard / web strip, nor an outcome. Its slot was already
         # released (the ``finally`` ran) and nothing was recorded for it; the
@@ -1537,6 +1828,21 @@ async def _collect_domain_hosts_async(
                 f"budget_timeouts={timing.host_budget_timeouts} · "
                 f"live_tasks={live_tasks}"
             )
+            # Host-granular resume: mid-sweep crash checkpoint for large estates.
+            # The callback persists the partial graph FIRST, then flushes the
+            # done-set (ordering is load-bearing). Gated on the FULL swept-set
+            # size so small estates keep the single end-of-sweep persist. Runs in
+            # the same no-await window as the debug log above; the persist itself
+            # is synchronous so no other coroutine mutates ``result`` mid-write.
+            _checkpoint = getattr(config, "collection_checkpoint", None)
+            if (
+                _checkpoint is not None
+                and hosts_total_for_resume >= _MID_SWEEP_PERSIST_THRESHOLD
+            ):
+                try:
+                    _checkpoint()
+                except Exception as exc:  # noqa: BLE001 — checkpoint must never break collection
+                    telemetry.capture_exception(exc)
         if had_error:
             progress["err"] += 1
         else:
@@ -1568,6 +1874,10 @@ async def _collect_domain_hosts_async(
     # already 100% (LDAP ran before this phase). When no stop fired this stays
     # the no-op default and coverage reads as full.
     timing.total_dispatch = total_hosts
+    # Host-granular resume coverage: hosts skipped because a prior interrupted run
+    # already enriched them. Surfaced distinctly from the early-stop / host-cap
+    # records so the coverage statement stays honest on a resumed sweep.
+    timing.resumed_skipped = int(progress["skipped_resumed"])
     # Flag a partial sweep ONLY when hosts were actually left un-dispatched. A
     # stop that fired after the last host was already in flight drains to full
     # coverage — no "partial" statement needed (it would read "X of X, 0
@@ -1615,6 +1925,22 @@ async def _collect_domain_hosts_async(
     # Measured per-host duration distribution + outcome histogram (the data that
     # tells us where the SMB-collection time actually went).
     _log_host_phase_stats(timing, len(dispatch_nodes))
+
+    # Operator notification — distinguish the three share-collection states so an
+    # aborted enumeration (coverage unknown) is never rendered as "0 shares"
+    # (genuine absence). Loud warning panel on abort; one quiet info line when the
+    # sweep ran clean and found nothing; silent when shares were found (the
+    # exposure panel renders them later).
+    if config.collect_shares:
+        from adscan_internal.services.collector.share_collection_notify import (
+            emit_collection_complete_share_notice,
+        )
+
+        emit_collection_complete_share_notice(
+            aborted_hosts=timing.shares_aborted_hosts,
+            reached_hosts=timing.shares_reached_hosts,
+            share_count=int(totals["share"]),
+        )
 
     relation_counts = Counter(e.relation for e in result.edges)
     signing_required = sum(

@@ -10,16 +10,12 @@ from dataclasses import dataclass, field
 import asyncio
 import subprocess
 
-from adscan_internal.core import AuthMode, requires_auth
+from adscan_internal.core import AuthMode
 from adscan_internal.command_runner import CommandSpec, default_runner
 from adscan_internal.subprocess_env import (
     command_string_needs_clean_env,
     get_clean_env_for_compilation,
 )
-from adscan_internal.execution_outcomes import (
-    result_is_exact_ldap_connection_timeout,
-)
-
 
 
 CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str]]
@@ -254,6 +250,146 @@ class LDAPAnonymousUserRecord:
         }
 
 
+# ACCOUNTDISABLE bit in userAccountControl (MS-ADTS 2.2.16).
+_UAC_ACCOUNTDISABLE = 0x0002
+
+
+def _ldap_entries_to_computers(
+    records: list[dict[str, Any]],
+) -> List[LDAPComputer]:
+    """Map raw badldap computer entries into ``LDAPComputer`` models.
+
+    Pure logic (no network), so it is unit-testable in isolation from the
+    live LDAP transport.
+
+    Args:
+        records: List of ``{"dn": str, "attributes": {attr: [values]}}`` items
+            as produced by a paged search for ``(objectCategory=computer)``.
+
+    Returns:
+        List of populated ``LDAPComputer`` objects, one per record that carries
+        at least a ``sAMAccountName`` or a ``dNSHostName``.
+    """
+    computers: List[LDAPComputer] = []
+    for record in records:
+        attrs = record.get("attributes") or {}
+        if not isinstance(attrs, dict):
+            continue
+
+        def _first(name: str, _attrs: dict[str, Any] = attrs) -> str:
+            value = _attrs.get(name)
+            if isinstance(value, list):
+                return str(value[0]).strip() if value else ""
+            if value is None:
+                return ""
+            return str(value).strip()
+
+        sam = _first("sAMAccountName")
+        dns_hostname = _first("dNSHostName")
+        if not sam and not dns_hostname:
+            continue
+        hostname = dns_hostname or sam.rstrip("$")
+
+        uac_raw = attrs.get("userAccountControl")
+        if isinstance(uac_raw, list):
+            uac_raw = uac_raw[0] if uac_raw else None
+        try:
+            uac = int(uac_raw) if uac_raw is not None else 0
+        except (TypeError, ValueError):
+            uac = 0
+
+        computers.append(
+            LDAPComputer(
+                hostname=hostname,
+                samaccountname=sam,
+                distinguished_name=str(record.get("dn") or "").strip(),
+                operating_system=_first("operatingSystem"),
+                os_version=_first("operatingSystemVersion"),
+                is_enabled=not bool(uac & _UAC_ACCOUNTDISABLE),
+                dns_hostname=dns_hostname,
+            )
+        )
+    return computers
+
+
+def _native_computer_enumeration(
+    *,
+    domain: str,
+    pdc: str,
+    username: str,
+    password: str,
+    timeout: int,
+    posture_snapshot: object | None = None,
+    posture_sink: object | None = None,
+) -> List[LDAPComputer]:
+    """Enumerate domain computers via a native badldap paged search.
+
+    Replaces the legacy ``nxc ldap <pdc> --computers`` subprocess. Goes through
+    :class:`ADscanLDAPConnection` so the LDAPS->LDAP fallback, sign/seal toggles
+    and posture-aware auth planning all stay centralized. ``password`` may be a
+    cleartext password or an NT hash; the transport auto-detects the hash and
+    performs pass-the-hash over LDAP.
+
+    Args:
+        domain: Target AD domain FQDN.
+        pdc: Target domain controller IP or hostname.
+        username: Authenticating principal sAMAccountName.
+        password: Authenticating secret (password or 32-hex NT hash).
+        timeout: Per-connect budget in seconds.
+        posture_snapshot: Optional posture snapshot for the auth planner.
+        posture_sink: Optional posture sink for reactive signal emission.
+
+    Returns:
+        List of ``LDAPComputer`` objects.
+
+    Raises:
+        ValueError: When credentials are missing.
+    """
+    from adscan_internal.services.ldap_transport_service import (
+        ADscanLDAPConfig,
+        ADscanLDAPConnection,
+    )
+
+    if not username or not password:
+        raise ValueError(
+            "Authenticated LDAP computer enumeration requires username + password/nt_hash."
+        )
+
+    config = ADscanLDAPConfig(
+        domain=domain,
+        dc_ip=pdc,
+        use_ldaps=True,
+        use_kerberos=False,
+        username=username,
+        password=password,
+        posture_snapshot=posture_snapshot,
+        posture_sink=posture_sink,
+    )
+
+    attributes = [
+        "sAMAccountName",
+        "dNSHostName",
+        "operatingSystem",
+        "operatingSystemVersion",
+        "userAccountControl",
+    ]
+
+    records: list[dict[str, Any]] = []
+    with ADscanLDAPConnection(config, connect_timeout=float(timeout)) as conn:
+        conn.search(
+            search_base=conn.domain_dn,
+            search_filter="(objectCategory=computer)",
+            attributes=attributes,
+            search_scope="SUBTREE",
+            paged_size=1000,
+        )
+        for entry in conn.entries:
+            records.append(
+                {"dn": entry.dn, "attributes": entry.entry_attributes_as_dict}
+            )
+    return _ldap_entries_to_computers(records)
+
+
 class LDAPEnumerationMixin:
     """LDAP enumeration operations.
 
@@ -272,345 +408,6 @@ class LDAPEnumerationMixin:
         """
         self.parent = parent_service
         self.logger = parent_service.logger
-
-    @requires_auth(AuthMode.AUTHENTICATED)
-    def enumerate_users(
-        self,
-        domain: str,
-        pdc: str,
-        auth_mode: AuthMode,
-        username: str,
-        password: str,
-        netexec_path: str,
-        *,
-        executor: CommandExecutor | None = None,
-        scan_id: Optional[str] = None,
-        timeout: int = 120,
-    ) -> List[LDAPUser]:
-        """Enumerate domain users via LDAP.
-
-        This operation requires authenticated access.
-
-        Args:
-            domain: Domain name
-            pdc: PDC hostname/IP
-            auth_mode: Authentication mode (must be AUTHENTICATED)
-            username: Username
-            password: Password or hash
-            netexec_path: Path to NetExec
-            scan_id: Optional scan ID
-            timeout: Timeout in seconds
-
-        Returns:
-            List of domain users
-
-        Raises:
-            AuthenticationError: If auth_mode is not AUTHENTICATED
-        """
-        self.parent._emit_progress(
-            scan_id=scan_id,
-            phase="ldap_user_enumeration",
-            progress=0.0,
-            message=f"Enumerating users via LDAP on {domain}",
-        )
-
-        self.logger.info(f"Enumerating users via LDAP on domain {domain}")
-
-        # Build auth string
-        is_hash = len(password) == 32 and all(
-            c in "0123456789abcdef" for c in password.lower()
-        )
-
-        if is_hash:
-            auth_string = f"-u '{username}' -H '{password}' -d '{domain}'"
-        else:
-            auth_string = f"-u '{username}' -p '{password}' -d '{domain}'"
-
-        command = f"{netexec_path} ldap {pdc} {auth_string} --users"
-
-        try:
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_user_enumeration",
-                progress=0.3,
-                message="Executing LDAP query",
-            )
-
-            exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
-            if result_is_exact_ldap_connection_timeout(result):
-                self.logger.warning(
-                    "LDAP user enumeration hit the exact NetExec LDAP timeout signature; "
-                    "treating LDAP as unavailable for this attempt."
-                )
-                self.parent._emit_progress(
-                    scan_id=scan_id,
-                    phase="ldap_user_enumeration",
-                    progress=1.0,
-                    message="LDAP user enumeration unavailable (connection timeout)",
-                )
-                return []
-
-            users = []
-            if result.returncode == 0 and result.stdout:
-                users = self._parse_netexec_users_output(result.stdout)
-
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_user_enumeration",
-                progress=1.0,
-                message=f"User enumeration completed: {len(users)} user(s) found",
-            )
-
-            self.logger.info(f"Found {len(users)} domain users")
-            return users
-
-        except subprocess.TimeoutExpired:
-            self.logger.error("LDAP user enumeration timed out")
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_user_enumeration",
-                progress=1.0,
-                message="User enumeration timed out",
-            )
-            return []
-        except Exception as e:
-            self.logger.exception(f"Error during LDAP user enumeration: {e}")
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_user_enumeration",
-                progress=1.0,
-                message="User enumeration failed",
-            )
-            return []
-
-    @requires_auth(AuthMode.AUTHENTICATED)
-    def enumerate_groups(
-        self,
-        domain: str,
-        pdc: str,
-        auth_mode: AuthMode,
-        username: str,
-        password: str,
-        netexec_path: str,
-        *,
-        executor: CommandExecutor | None = None,
-        scan_id: Optional[str] = None,
-        timeout: int = 120,
-    ) -> List[LDAPGroup]:
-        """Enumerate domain groups via LDAP.
-
-        This operation requires authenticated access.
-
-        Args:
-            domain: Domain name
-            pdc: PDC hostname/IP
-            auth_mode: Authentication mode (must be AUTHENTICATED)
-            username: Username
-            password: Password or hash
-            netexec_path: Path to NetExec
-            scan_id: Optional scan ID
-            timeout: Timeout in seconds
-
-        Returns:
-            List of domain groups
-
-        Raises:
-            AuthenticationError: If auth_mode is not AUTHENTICATED
-        """
-        self.parent._emit_progress(
-            scan_id=scan_id,
-            phase="ldap_group_enumeration",
-            progress=0.0,
-            message=f"Enumerating groups via LDAP on {domain}",
-        )
-
-        self.logger.info(f"Enumerating groups via LDAP on domain {domain}")
-
-        # Build auth string
-        is_hash = len(password) == 32 and all(
-            c in "0123456789abcdef" for c in password.lower()
-        )
-
-        if is_hash:
-            auth_string = f"-u '{username}' -H '{password}' -d '{domain}'"
-        else:
-            auth_string = f"-u '{username}' -p '{password}' -d '{domain}'"
-
-        command = f"{netexec_path} ldap {pdc} {auth_string} --groups"
-
-        try:
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_group_enumeration",
-                progress=0.3,
-                message="Executing LDAP query",
-            )
-
-            exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
-            if result_is_exact_ldap_connection_timeout(result):
-                self.logger.warning(
-                    "LDAP group enumeration hit the exact NetExec LDAP timeout signature; "
-                    "treating LDAP as unavailable for this attempt."
-                )
-                self.parent._emit_progress(
-                    scan_id=scan_id,
-                    phase="ldap_group_enumeration",
-                    progress=1.0,
-                    message="LDAP group enumeration unavailable (connection timeout)",
-                )
-                return []
-
-            groups = []
-            if result.returncode == 0 and result.stdout:
-                groups = self._parse_netexec_groups_output(result.stdout)
-
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_group_enumeration",
-                progress=1.0,
-                message=f"Group enumeration completed: {len(groups)} group(s) found",
-            )
-
-            self.logger.info(f"Found {len(groups)} domain groups")
-            return groups
-
-        except subprocess.TimeoutExpired:
-            self.logger.error("LDAP group enumeration timed out")
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_group_enumeration",
-                progress=1.0,
-                message="Group enumeration timed out",
-            )
-            return []
-        except Exception as e:
-            self.logger.exception(f"Error during LDAP group enumeration: {e}")
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_group_enumeration",
-                progress=1.0,
-                message="Group enumeration failed",
-            )
-            return []
-
-    def _parse_netexec_users_output(self, output: str) -> List[LDAPUser]:
-        """Parse NetExec --users output.
-
-        Args:
-            output: NetExec stdout
-
-        Returns:
-            List of LDAPUser objects
-        """
-        users = []
-
-        # NetExec LDAP --users output format:
-        # LDAP  10.0.0.1  389    DC01  [+] example.local\user1
-        # LDAP  10.0.0.1  389    DC01      CN=User1,CN=Users,DC=example,DC=local
-        # LDAP  10.0.0.1  389    DC01      Description: IT Admin
-
-        lines = output.splitlines()
-        current_user = None
-
-        for line in lines:
-            line = line.strip()
-            if not line or "LDAP" not in line:
-                continue
-
-            # Check if this is a user line
-            if "[+]" in line and "\\" in line:
-                # Extract username
-                parts = line.split("\\")
-                if len(parts) >= 2:
-                    username = parts[-1].strip()
-                    current_user = LDAPUser(username=username)
-                    users.append(current_user)
-
-            # Parse additional attributes
-            elif current_user:
-                if "CN=" in line and "DC=" in line:
-                    current_user.distinguished_name = line.split("DC01")[-1].strip()
-                elif "Description:" in line:
-                    current_user.description = line.split("Description:")[-1].strip()
-                elif "userPrincipalName:" in line:
-                    current_user.user_principal_name = line.split("userPrincipalName:")[
-                        -1
-                    ].strip()
-                elif "adminCount:" in line:
-                    try:
-                        admin_count_str = line.split("adminCount:")[-1].strip()
-                        current_user.admin_count = int(admin_count_str)
-                    except ValueError:
-                        pass
-
-        return users
-
-    def _parse_netexec_groups_output(self, output: str) -> List[LDAPGroup]:
-        """Parse NetExec --groups output.
-
-        Args:
-            output: NetExec stdout
-
-        Returns:
-            List of LDAPGroup objects
-        """
-        groups = []
-
-        # NetExec LDAP --groups output format similar to --users
-        lines = output.splitlines()
-        current_group = None
-
-        # Privileged groups list
-        privileged_groups = {
-            "Domain Admins",
-            "Enterprise Admins",
-            "Administrators",
-            "Schema Admins",
-            "Account Operators",
-            "Backup Operators",
-            "Server Operators",
-            "Print Operators",
-        }
-
-        for line in lines:
-            line = line.strip()
-            if not line or "LDAP" not in line:
-                continue
-
-            # Check if this is a group line
-            if "[+]" in line or "Group:" in line:
-                # Extract group name
-                if "\\" in line:
-                    parts = line.split("\\")
-                    if len(parts) >= 2:
-                        group_name = parts[-1].strip()
-                    else:
-                        continue  # Skip invalid group line
-                else:
-                    group_name = line.split()[-1].strip()
-
-                if not group_name:
-                    continue  # Skip empty group name
-
-                is_privileged = group_name in privileged_groups
-
-                current_group = LDAPGroup(
-                    name=group_name,
-                    is_privileged=is_privileged,
-                )
-                groups.append(current_group)
-
-            # Parse additional attributes
-            elif current_group:
-                if "CN=" in line and "DC=" in line:
-                    current_group.distinguished_name = line.split("DC01")[-1].strip()
-                elif "Description:" in line:
-                    current_group.description = line.split("Description:")[-1].strip()
-
-        return groups
-
 
     def query_anonymous_user_inventory(
         self,
@@ -699,32 +496,45 @@ class LDAPEnumerationMixin:
         auth_mode: AuthMode,
         username: str,
         password: str,
-        netexec_path: str,
+        netexec_path: str = "",
         *,
         executor: CommandExecutor | None = None,
         scan_id: Optional[str] = None,
         timeout: int = 120,
+        posture_snapshot: object | None = None,
+        posture_sink: object | None = None,
     ) -> List[LDAPComputer]:
-        """Enumerate domain computers via LDAP.
+        """Enumerate domain computers via a native badldap LDAP search.
 
         This operation requires authenticated access.
 
+        Native implementation: a single paged search for
+        ``(objectCategory=computer)`` over :class:`ADscanLDAPConnection` (LDAPS
+        with automatic LDAP fallback). Replaces the legacy
+        ``nxc ldap <pdc> --computers`` subprocess. ``password`` may be a
+        cleartext password or an NT hash — the transport auto-detects the hash
+        and performs pass-the-hash over LDAP.
+
         Args:
-            domain: Domain name
-            pdc: PDC hostname/IP
-            auth_mode: Authentication mode (must be AUTHENTICATED)
-            username: Username
-            password: Password or hash
-            netexec_path: Path to NetExec
-            scan_id: Optional scan ID
-            timeout: Timeout in seconds
+            domain: Domain name.
+            pdc: PDC hostname/IP.
+            auth_mode: Authentication mode (must be AUTHENTICATED).
+            username: Username.
+            password: Password or NT hash.
+            netexec_path: Unused — retained for backward-compatible call sites.
+            executor: Unused — retained for backward-compatible call sites.
+            scan_id: Optional scan ID.
+            timeout: Per-connect budget in seconds.
+            posture_snapshot: Optional posture snapshot for the auth planner.
+            posture_sink: Optional posture sink for reactive posture signals.
 
         Returns:
-            List of domain computers
-
-        Raises:
-            AuthenticationError: If auth_mode is not AUTHENTICATED
+            List of domain computers.
         """
+        # Retained for backward compatibility with legacy call sites; the
+        # enumeration is now fully native (badldap), no subprocess involved.
+        _ = (netexec_path, executor)
+
         self.parent._emit_progress(
             scan_id=scan_id,
             phase="ldap_computer_enumeration",
@@ -734,18 +544,6 @@ class LDAPEnumerationMixin:
 
         self.logger.info(f"Enumerating computers via LDAP on domain {domain}")
 
-        # Build auth string
-        is_hash = len(password) == 32 and all(
-            c in "0123456789abcdef" for c in password.lower()
-        )
-
-        if is_hash:
-            auth_string = f"-u '{username}' -H '{password}' -d '{domain}'"
-        else:
-            auth_string = f"-u '{username}' -p '{password}' -d '{domain}'"
-
-        command = f"{netexec_path} ldap {pdc} {auth_string} --computers"
-
         try:
             self.parent._emit_progress(
                 scan_id=scan_id,
@@ -754,12 +552,15 @@ class LDAPEnumerationMixin:
                 message="Executing LDAP query",
             )
 
-            exec_fn = executor or _default_executor
-            result = exec_fn(command, timeout)
-
-            computers = []
-            if result.returncode == 0 and result.stdout:
-                computers = self._parse_netexec_computers_output(result.stdout)
+            computers = _native_computer_enumeration(
+                domain=domain,
+                pdc=pdc,
+                username=username,
+                password=password,
+                timeout=timeout,
+                posture_snapshot=posture_snapshot,
+                posture_sink=posture_sink,
+            )
 
             self.parent._emit_progress(
                 scan_id=scan_id,
@@ -771,15 +572,6 @@ class LDAPEnumerationMixin:
             self.logger.info(f"Found {len(computers)} domain computers")
             return computers
 
-        except subprocess.TimeoutExpired:
-            self.logger.error("LDAP computer enumeration timed out")
-            self.parent._emit_progress(
-                scan_id=scan_id,
-                phase="ldap_computer_enumeration",
-                progress=1.0,
-                message="Computer enumeration timed out",
-            )
-            return []
         except Exception as e:
             self.logger.exception(f"Error during LDAP computer enumeration: {e}")
             self.parent._emit_progress(
@@ -956,61 +748,4 @@ class LDAPEnumerationMixin:
             )
 
         return records
-
-    def _parse_netexec_computers_output(self, output: str) -> List[LDAPComputer]:
-        """Parse NetExec --computers output.
-
-        Args:
-            output: NetExec stdout
-
-        Returns:
-            List of LDAPComputer objects
-        """
-        computers = []
-
-        # NetExec LDAP --computers output format similar to --users
-        # LDAP  10.0.0.1  389    DC01  [+] example.local\DC01$
-        # LDAP  10.0.0.1  389    DC01      CN=DC01,OU=Domain Controllers,DC=example,DC=local
-        # LDAP  10.0.0.1  389    DC01      operatingSystem: Windows Server 2019
-
-        lines = output.splitlines()
-        current_computer = None
-
-        for line in lines:
-            line = line.strip()
-            if not line or "LDAP" not in line:
-                continue
-
-            # Check if this is a computer line (ends with $)
-            if "[+]" in line and "\\" in line:
-                # Extract computer name
-                parts = line.split("\\")
-                if len(parts) >= 2:
-                    computer_name = parts[-1].strip()
-                    # Remove trailing $ if present
-                    hostname = computer_name.rstrip("$")
-                    current_computer = LDAPComputer(
-                        hostname=hostname,
-                        samaccountname=computer_name,
-                    )
-                    computers.append(current_computer)
-
-            # Parse additional attributes
-            elif current_computer:
-                if "CN=" in line and "DC=" in line:
-                    current_computer.distinguished_name = line.split("DC01")[-1].strip()
-                elif "operatingSystem:" in line:
-                    current_computer.operating_system = line.split("operatingSystem:")[
-                        -1
-                    ].strip()
-                elif "operatingSystemVersion:" in line:
-                    current_computer.os_version = line.split("operatingSystemVersion:")[
-                        -1
-                    ].strip()
-                elif "dNSHostName:" in line:
-                    current_computer.dns_hostname = line.split("dNSHostName:")[
-                        -1
-                    ].strip()
-
-        return computers
 

@@ -50,6 +50,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
@@ -516,6 +517,35 @@ def record_exposure_score(
     _save_technical_report(shell, report)
 
 
+def record_attack_fanout_rollup(
+    shell: ReportShell,
+    *,
+    rollup: list[dict[str, Any]],
+) -> None:
+    """Persist the outbound fan-out ("privilege blast radius") rollup.
+
+    Write-side single source of truth for the collapsed capability nodes so the
+    JSON export carries them and downstream consumers — the PDF report and
+    ``adscan_web`` (Slice 3) — read the engine value instead of recomputing it.
+    Unlike the exposure blocks this is a WORKSPACE-scoped, non-domain TOP-LEVEL
+    key (``report["attack_fanout_rollup"]``): a flat array of already-serialized
+    :func:`adscan_internal.services.attack_fanout_rollup.fanout_step_to_dict`
+    dicts, in collapsed (most-severe-first) order. ``adscan_core`` never imports
+    the engine, so the caller serializes the steps and hands the plain list here.
+    Best-effort: ignores a non-list payload and never raises into the caller.
+    An empty list is still written so a re-render clears a stale rollup.
+
+    Args:
+        shell: Shell object with report paths.
+        rollup: The serialized collapsed fan-out steps (may be empty).
+    """
+    if not isinstance(rollup, list):
+        return
+    report = _load_technical_report(shell)
+    report["attack_fanout_rollup"] = rollup
+    _save_technical_report(shell, report)
+
+
 def record_exposure_kpis(
     shell: ReportShell,
     domain: str,
@@ -562,3 +592,106 @@ def record_compliance(
     domain_entry = _ensure_technical_domain(report, domain)
     domain_entry["compliance"] = compliance
     _save_technical_report(shell, report)
+
+
+# --- Read-side findings bucket (LITE-safe) ----------------------------------
+#
+# The write side above records findings into ``technical_report.json``; this is
+# the reader-side helper the end-of-scan recap consumes to bucket those findings
+# by severity. It lives here (not in ``adscan_internal``) for the same reason
+# the write side does: ``adscan_core`` ships whole in LITE, so the recap can read
+# real finding counts instead of falling back to placeholder dashes.
+
+_SEVERITY_RANK: dict[str, int] = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+@dataclass(frozen=True)
+class FindingRow:
+    """A single finding row for the recap top-list."""
+
+    title: str
+    severity: str  # critical | high | medium | low (lowercased)
+
+
+@dataclass(frozen=True)
+class FindingsSummary:
+    """Severity counts + a small top-list read from ``technical_report.json``.
+
+    ``critical``/``high``/``medium``/``low`` count only findings whose severity
+    is one of those four canonical levels (there is no ``info`` severity on the
+    write side). ``top`` is up to ``top_n`` findings ordered
+    critical > high > medium > low, then by title.
+    """
+
+    critical: int = 0
+    high: int = 0
+    medium: int = 0
+    low: int = 0
+    top: tuple[FindingRow, ...] = field(default_factory=tuple)
+
+    @property
+    def total(self) -> int:
+        """Return the total count across the four canonical severities."""
+        return self.critical + self.high + self.medium + self.low
+
+
+def summarize_findings(
+    shell: ReportShell,
+    *,
+    domain: str | None = None,
+    top_n: int = 3,
+) -> FindingsSummary:
+    """Read ``technical_report.json`` and bucket findings by severity.
+
+    Reuses :func:`_load_technical_report`. When ``domain`` is ``None`` the counts
+    union every domain in the report. Severities are lowercased; unknown
+    severities are ignored for the counts but still eligible for the ``top`` list
+    at the lowest rank. Best-effort: returns an empty :class:`FindingsSummary` on
+    any read error (never raises).
+
+    Args:
+        shell: Shell object carrying the technical-report path.
+        domain: Restrict to a single domain, or ``None`` to union all.
+        top_n: Maximum number of findings in the ``top`` list.
+
+    Returns:
+        A :class:`FindingsSummary` with per-severity counts and a top-list.
+    """
+    try:
+        report = _load_technical_report(shell)
+        domains = report.get("domains")
+        if not isinstance(domains, dict):
+            return FindingsSummary()
+
+        counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        rows: list[FindingRow] = []
+        for dname, dentry in domains.items():
+            if domain is not None and dname != domain:
+                continue
+            if not isinstance(dentry, dict):
+                continue
+            findings = dentry.get("findings")
+            if not isinstance(findings, list):
+                continue
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    continue
+                severity = str(finding.get("severity") or "").strip().lower()
+                title = str(finding.get("title") or "").strip()
+                if severity in counts:
+                    counts[severity] += 1
+                if title:
+                    rows.append(FindingRow(title=title, severity=severity))
+
+        rows.sort(key=lambda row: (_SEVERITY_RANK.get(row.severity, 99), row.title))
+        top = tuple(rows[: max(0, int(top_n))])
+        return FindingsSummary(
+            critical=counts["critical"],
+            high=counts["high"],
+            medium=counts["medium"],
+            low=counts["low"],
+            top=top,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort reader, never breaks exit
+        telemetry.capture_exception(exc)
+        return FindingsSummary()

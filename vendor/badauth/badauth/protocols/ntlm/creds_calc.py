@@ -394,12 +394,32 @@ class netntlm:
 		return ntlm_creds
 
 	def to_credential(self):
-		cred = Credential('netNTLMv1',
-							username = self.username, 
-							fullhash = '%s:$NETNTLM$%s$%s' % (self.username, self.ServerChallenge, self.NTResponse.Response)
-						)
+		username = self.username if self.username is not None else ''
+		domain = getattr(self, 'domain', None) or ''
+
+		lmresponse = self.LMResponse.Response if self.LMResponse is not None else b''
+		if isinstance(lmresponse, bytes):
+			lmresponse = lmresponse.hex()
+
+		ntresponse = self.NTResponse.Response if self.NTResponse is not None else b''
+		if isinstance(ntresponse, bytes):
+			ntresponse = ntresponse.hex()
+
+		serverchallenge = self.ServerChallenge
+		if isinstance(serverchallenge, bytes):
+			serverchallenge = serverchallenge.hex()
+
+		# hashcat mode 5500 (NetNTLMv1): user::domain:LMresp:NTresp:serverchallenge.
+		# This previously emitted a legacy '$NETNTLM$' shape AND interpolated raw
+		# bytes via %s (a b'...' repr), so a captured NetNTLMv1 was uncrackable.
+		# Mirrors netntlm_ess.to_credential's format + hex-encoding of the bytes.
+		cred = Credential(
+			'netNTLMv1',
+			username = username,
+			domain = domain,
+			fullhash = '%s::%s:%s:%s:%s' % (username, domain, lmresponse, ntresponse, serverchallenge)
+		)
 		return cred
-		#username:$NETNTLM$11223333895667788$B2B2220790F40C88BCFF347C652F67A7C4A70D3BEBD70233
 
 	def calc_session_base_key(self, creds, credtype = 'plain'):
 		if credtype == 'plain':

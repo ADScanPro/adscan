@@ -177,7 +177,22 @@ class KerberosClientNative:
 					spn_is_tgt = (
 						str(getattr(spn, 'service', '') or '').lower() == 'krbtgt'
 					)
-					if ccache_has_tgt and not spn_is_tgt:
+					# --- ADscan vendor fix: fresh-TGS gate is SAME-REALM only ---
+					# The gate deliberately does NOT fire for a cross-realm credential
+					# (cross_target/cross_realm set by get_client_newtarget for a
+					# trusted/foreign forest). A cross-realm ccache holds only the AUTH
+					# realm TGT; asking the AUTH KDC directly for a service SPN whose
+					# realm is the TARGET realm returns the cross-realm REFERRAL TGT
+					# (krbtgt/TARGET@AUTH, RC4 inter-realm key), NOT a usable service
+					# ticket — presenting it to the target service yields
+					# SEC_E_LOGON_DENIED. Cross-realm binds therefore fall through to the
+					# ``else`` below (tgs_from_ccache raises 'No TGS found' for the
+					# foreign SPN), into the ``except`` branch, which follows
+					# cred.cross_target → get_referral_ticket → the correct target-realm
+					# service ticket (the ONE existing referral path). Keeping that logic
+					# here too would duplicate it; the gate stays single-responsibility
+					# (same-realm fresh-TGS only).
+					if ccache_has_tgt and not spn_is_tgt and self.credential.cross_target is None:
 						logger.debug(
 							'Fresh-TGS gate: TGT present in ccache and SPN is a service; '
 							'minting a fresh service ticket instead of reusing a cached one.'
@@ -185,6 +200,13 @@ class KerberosClientNative:
 						# Load the TGT from the ccache (get_TGT returns early when the
 						# ccache already holds it), then force a fresh KDC round-trip.
 						await self.kc.with_clock_skew(self.kc.get_TGT, override_etype = self.credential.etypes)
+						# Defensive: a missing/literal-None SPN realm (the badldap
+						# MSLDAPTarget built by get_client_newtarget has no domain →
+						# to_target_string emits ldap/host@None) would make the KDC reject
+						# the TGS-REQ. The gate is same-realm only here, so pin the SPN to
+						# the credential's own realm.
+						if str(getattr(spn, 'domain', None) or '').lower() in ('', 'none'):
+							spn.domain = self.credential.domain
 						tgs, encpart, self.session_key = await self.kc.with_clock_skew(
 							self.kc.get_TGS, spn, force_fresh_tgs = True
 						)

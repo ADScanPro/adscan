@@ -153,9 +153,29 @@ def prompt_ask(
     default: str | None = None,
     *,
     password: bool = False,
+    shell: object | None = None,
     **kwargs: Any,
 ) -> str:
-    """Ask a text prompt with centralized prompt logging and safe fallback."""
+    """Ask a text prompt with centralized prompt logging and safe fallback.
+
+    In non-interactive mode the prompt auto-resolves to ``default`` (or an
+    empty string when no default is provided) instead of blocking on stdin,
+    mirroring the questionary helpers. Pass ``shell`` so the non-interactive
+    predicate can see ``shell.auto`` / the session command type.
+    """
+    if _state._should_disable_prompt_interaction(shell):
+        resolved = "" if default is None else str(default)
+        answer_tag = "[prompt][password][answer]" if password else "[prompt][answer]"
+        data_type = _classify_prompt_answer(
+            resolved, password_mode=password, prompt_message=prompt
+        )
+        print_info_debug(
+            f"[prompt] Non-interactive; auto-resolving '{prompt}' to default"
+        )
+        print_telemetry_only(
+            f"{answer_tag} {prompt}: {_state.mark_sensitive(resolved, data_type)}"
+        )
+        return resolved
     try:
         install_prompt_logging_wrappers()
         from rich.prompt import Prompt

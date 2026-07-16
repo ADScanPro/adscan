@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 import os
-import shlex
 
 from adscan_internal import (
     print_error,
@@ -18,9 +17,6 @@ from adscan_internal import (
 )
 from adscan_core.interaction import is_non_interactive
 from adscan_internal.rich_output import mark_sensitive
-from adscan_internal.integrations.netexec.timeouts import (
-    get_recommended_internal_timeout,
-)
 from adscan_internal.cli.rdp import run_rdp_service_access_sweep
 from adscan_internal.services.service_access_probe_history import (
     load_service_access_probe_history,
@@ -625,6 +621,76 @@ def run_mssql_authorization_collection(
     return summary
 
 
+def _resolve_mssql_ntlm_fallback_secret(
+    shell,
+    *,
+    domain: str,
+    username: str,
+    wire_secret: str,
+    password: str,
+) -> str | None:
+    """Resolve a password / NT hash for the NTLM fallback of a ccache-only sweep.
+
+    A Kerberos-only MSSQL sweep sends a ``.ccache`` on the wire, which forecloses
+    NTLM — so an instance with no ``MSSQLSvc`` SPN (Kerberos fails with
+    ``KDC_ERR_S_PRINCIPAL_UNKNOWN``) is left unassessed. This returns a
+    password / NT hash for the SAME principal so the backend can still try NTLM
+    against those instances. Returns ``None`` (no fallback) when:
+
+    - the wire secret is not a ccache (the primary attempt is already NTLM/SQL);
+    - domain posture reports NTLM known-blocked (HIGH + ``DISABLED``) — never
+      attempt NTLM the DC is known to reject;
+    - only a ccache is available for the principal (no NTLM-usable secret).
+
+    The sweep principal's domain password / NT hash lives in the generic
+    credential store — NOT a host-scoped service ticket or a local credential —
+    so the canonical resolver (:func:`_get_stored_domain_credential_for_user`)
+    is used, credential-store-first.
+    """
+    if not str(wire_secret or "").strip().lower().endswith(".ccache"):
+        return None
+
+    from adscan_internal.services.domain_posture import (
+        ConstraintCategory,
+        SignalConfidence,
+        TriState,
+        get_posture,
+    )
+
+    ntlm_state = get_posture(shell.domains_data, domain=domain).get(
+        ConstraintCategory.NTLM_AUTHENTICATION
+    )
+    if (
+        ntlm_state.confidence is SignalConfidence.HIGH
+        and ntlm_state.effective_state is TriState.DISABLED
+    ):
+        print_info_debug(
+            "[mssql_probe] NTLM known-blocked by posture — "
+            "skipping ccache-only NTLM fallback"
+        )
+        return None
+
+    # Prefer the in-hand sweep secret when it is a usable password / NT hash;
+    # otherwise fall back to the canonical credential-store resolver (covers the
+    # ccache-only case where ``password`` is itself a ticket path).
+    candidate = str(password or "").strip()
+    if not candidate or candidate.lower().endswith(".ccache"):
+        from adscan_internal.cli.attack_path_execution import (
+            _get_stored_domain_credential_for_user,
+        )
+
+        candidate = (
+            _get_stored_domain_credential_for_user(
+                shell, domain=domain, username=username
+            )
+            or ""
+        )
+    candidate = str(candidate).strip()
+    if not candidate or candidate.lower().endswith(".ccache"):
+        return None
+    return candidate
+
+
 def _run_native_mssql_service_access_sweep(
     shell,
     *,
@@ -698,6 +764,18 @@ def _run_native_mssql_service_access_sweep(
             return False
         mssql_secret = mssql_cred.ccache_path or password
 
+    # A ccache-only sweep credential cannot drive an NTLM bind, so instances
+    # with no MSSQLSvc SPN (Kerberos → KDC_ERR_S_PRINCIPAL_UNKNOWN) would be left
+    # unassessed. Thread the principal's stored password / NT hash so the backend
+    # can still try NTLM there — gated on NTLM not being known-blocked by posture.
+    mssql_ntlm_fallback_secret = _resolve_mssql_ntlm_fallback_secret(
+        shell,
+        domain=domain,
+        username=username,
+        wire_secret=mssql_secret,
+        password=password,
+    )
+
     findings = run_async_sync(
         run_mssql_access_probe_sweep(
             domain=domain,
@@ -707,6 +785,7 @@ def _run_native_mssql_service_access_sweep(
             target_hostnames=target_hostnames,
             kdc_host=kdc_host,
             max_workers=get_mssql_probe_worker_count(),
+            ntlm_fallback_secret=mssql_ntlm_fallback_secret,
         )
     )
 
@@ -770,23 +849,6 @@ def _run_native_mssql_service_access_sweep(
             prompt=prompt,
         )
     return bool(confirmed_findings)
-
-
-def _service_backend_is_netexec(service: str) -> bool:
-    """Return whether the operator pinned this service's sweep to netexec.
-
-    Defaults to the native backend. The legacy netexec path is kept one
-    release behind these env flags (set to ``netexec`` to opt back in):
-      - ``ADSCAN_SMB_PRIVS_BACKEND``
-      - ``ADSCAN_MSSQL_PRIVS_BACKEND``
-    """
-    env_var = {
-        "smb": "ADSCAN_SMB_PRIVS_BACKEND",
-        "mssql": "ADSCAN_MSSQL_PRIVS_BACKEND",
-    }.get(service)
-    if not env_var:
-        return False
-    return os.getenv(env_var, "native").strip().lower() == "netexec"
 
 
 
@@ -1385,7 +1447,7 @@ def run_service_access_sweep(
                         prompt=prompt,
                         workflow_intent=workflow_intent,
                     )
-                elif service == "smb" and not _service_backend_is_netexec("smb"):
+                elif service == "smb":
                     print_info(
                         "Using native aiosmb backend for SMB access checks."
                     )
@@ -1406,7 +1468,7 @@ def run_service_access_sweep(
                         targets=effective_target_list,
                         prompt=prompt,
                     )
-                elif service == "mssql" and not _service_backend_is_netexec("mssql"):
+                elif service == "mssql":
                     print_info(
                         "Using native impacket TDS backend for MSSQL access checks."
                     )
@@ -1428,47 +1490,21 @@ def run_service_access_sweep(
                         prompt=prompt,
                     )
                 else:
-                    auth_str = shell.build_auth_nxc(
-                        username,
-                        password,
-                        domain,
-                        kerberos=False,
-                    )
-                    netexec_timeout_seconds = get_recommended_internal_timeout(service)
-                    log_dir = domain_subpath(
-                        workspace_cwd,
-                        domains_dir,
-                        domain,
-                        service,
-                    )
-                    os.makedirs(log_dir, exist_ok=True)
-                    command = (
-                        f"{shlex.quote(shell.netexec_path)} {service} {shlex.quote(targets)} {auth_str} "
-                        f"-t 20 --timeout {netexec_timeout_seconds} --smb-timeout 30 "
-                        f"--log domains/{marked_domain}/{service}/{marked_username}_privs.log"
-                    )
+                    # Every service ADscan sweeps (smb, winrm, rdp, mssql) has a
+                    # native backend handled above; there is no subprocess
+                    # fallback. An unknown service value is a caller bug — skip
+                    # it defensively instead of shelling out.
                     print_info_debug(
                         "[privileges] service access sweep dispatch: "
                         f"domain={marked_domain} user={marked_username} service={service} "
-                        f"backend=netexec prompt_on_success={prompt!r} "
+                        f"backend=none (no native probe for this service) "
+                        f"prompt_on_success={prompt!r} "
                         f"targets={mark_sensitive(str(targets), 'path')}"
                     )
-                    print_info_verbose(f"Command: {command}")
-                    run_service_kwargs: dict[str, Any] = {
-                        "prompt": prompt,
-                    }
-                    if workflow_intent:
-                        run_service_kwargs["workflow_intent"] = workflow_intent
-                    found_hosts = bool(
-                        shell.run_service_command(
-                            command,
-                            domain,
-                            service,
-                            username,
-                            password,
-                            **run_service_kwargs,
-                        )
+                    print_warning(
+                        f"No native access-check backend for service '{service}'; skipping."
                     )
+                    found_hosts = False
                 if found_hosts or cleaned_hosts:
                     break
 

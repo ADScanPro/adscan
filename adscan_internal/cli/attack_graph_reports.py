@@ -2294,6 +2294,30 @@ def run_show_attack_paths(
         # renders. The viability deboost is lost for this call but the
         # execution-selector will still annotate later.
 
+    # Privilege blast radius: collapse any source+right that fans out over many
+    # targets into ONE capability line above the per-path table (the table rows
+    # below are unchanged). Presentation-only view over the same materialized
+    # graph — see ``attack_fanout_rollup``. Best-effort; never blocks the table.
+    try:
+        from adscan_internal.cli.post_scan_suggestions import build_recap_fanout_steps
+        from adscan_internal.cli.widgets.scan_recap import (
+            render_fanout_capability_lines,
+        )
+        from rich.console import Group
+
+        _fanout_steps = build_recap_fanout_steps(shell, target_domain, max_steps=5)
+        _fanout_lines = render_fanout_capability_lines(_fanout_steps, with_header=False)
+        if _fanout_lines:
+            print_panel(
+                Group(*_fanout_lines),
+                title="[bold]Privilege blast radius[/]",
+                border_style=ADSCAN_PRIMARY,
+                title_align="left",
+                padding=(1, 2),
+            )
+    except Exception as _fanout_exc:  # noqa: BLE001 - never block the listing
+        telemetry.capture_exception(_fanout_exc)
+
     _sorted_refs = print_attack_paths_summary(
         target_domain,
         path_refs,

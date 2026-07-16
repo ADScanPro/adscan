@@ -24,9 +24,8 @@ Four invocation modes (set by :class:`SharesViewMode`):
 * ``DELTA`` — fusion, but the table is filtered to rows where
   ``delta == LIVE_EXCEEDS_GRAPH``. The discovery view.
 
-The legacy ``execute_netexec_shares`` path in :mod:`cli/smb.py` is kept
-in place until the broader multi-host sweep flows are migrated; this
-module is the new home of the single-host operator UX.
+This module is the home of the single-host operator UX; the legacy
+``execute_netexec_shares`` nxc multi-host sweep it replaced has been removed.
 """
 
 from __future__ import annotations

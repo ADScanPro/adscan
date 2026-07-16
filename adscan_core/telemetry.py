@@ -2147,6 +2147,194 @@ else:
     print_warning_debug("[telemetry] PostHog proxy not configured")
 
 
+# --- Event-name closed vocabulary (data-protection guard) -------------------
+#
+# The event NAME is the ONE field capture() forwards without sanitization
+# (properties are scrubbed by _sanitize_telemetry_properties). Callers used to
+# feed raw operator tokens here (REPL first token: workspace names, loot/ccache
+# paths, client hostnames, IPs), which then surfaced verbatim as analytics
+# event names. Enforce a closed vocabulary: any name not on this allow-list is
+# coerced to a static bucket and the raw string is dropped from every field.
+#
+# Fail-closed: in doubt, bucket it. Losing one analytics event is acceptable;
+# leaking a customer hostname/path into the backend is not.
+#
+# The set below is the union of: every string-literal first arg to
+# telemetry.capture() across the tree, the names forwarded through the wrapper
+# helpers (_capture_spraying_ux_event, _capture_workspace_dns_repair_event,
+# _capture_user_property_event), and the fully-expanded controlled-enum
+# families ({roast_type}_[no_]users_found, {service}_scan_started,
+# session_{command}_{phase}). Locked by
+# tests/unit/test_telemetry_event_name_allowlist.py.
+_TELEMETRY_UNLISTED_EVENT_BUCKET = "telemetry_event_unlisted"
+
+_ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
+    {
+        "No template found when generating report",
+        "adcs_discovered",
+        "adcs_not_discovered",
+        "asreproast_no_users_found",
+        "asreproast_started",
+        "asreproast_users_found",
+        "attribution_source",
+        "audit_wordlist_cracked",
+        "binary_deploy",
+        "computers_enumerated",
+        "container_runtime_launcher_contract_missing",
+        "cracking_started",
+        "creds_save_requires_start_auth",
+        "ctf_flags.collection",
+        "ctf_pre2k_followup_accepted",
+        "ctf_pre2k_followup_declined",
+        "ctf_pre2k_followup_prompted",
+        "ctf_pre2k_selected",
+        "ctf_recommended_spraying_started",
+        "ctf_spraying_prompt_shown",
+        "ctf_spraying_recommendation_shown",
+        "ctf_spraying_skipped",
+        "dcsync_cracking_summary",
+        "delegation_exploitation_failed",
+        "delegation_exploitation_started",
+        "delegation_exploitation_success",
+        "deliver.navigator_bundled",
+        "dns_resolv_conf_not_local_first",
+        "docker_host_autoremediation_applied",
+        "docker_host_autoremediation_declined",
+        "docker_host_helper_unavailable",
+        "docker_host_resources_context",
+        "docker_install_buildx_conflict",
+        "docker_install_cancelled",
+        "docker_install_check_docker_availability",
+        "docker_install_completed",
+        "docker_install_failed",
+        "docker_install_lock_blocked",
+        "docker_install_pull_adscan_image_completed",
+        "docker_install_pull_adscan_image_failed",
+        "docker_install_pull_adscan_image_started",
+        "docker_install_started",
+        "docker_pull_dns_preflight",
+        "docker_pull_failure_classified",
+        "docker_pull_network_preflight",
+        "docker_pull_preflight_nonblocking_success",
+        "docker_pull_retry",
+        "docker_runtime_context",
+        "docker_runtime_preflight",
+        "docker_workspace_lock_blocked",
+        "doctor_start",
+        "domain_command_requires_initialization",
+        "domain_compromise",
+        "domain_discovered",
+        "domain_inference",
+        "domain_not_discovered",
+        "environment_enumerated",
+        "execute_start",
+        "first_cred_found",
+        "first_install",
+        "hash_cracked",
+        "hash_not_cracked",
+        "help_requested",
+        "hostname_domain_crosscheck",
+        "install_after_fail",
+        "install_blocked_low_disk",
+        "install_started",
+        "installation_mode_selected",
+        "kerberoast_no_users_found",
+        "kerberoast_started",
+        "kerberoast_users_found",
+        "kerberos_ccache_principal_mismatch",
+        "ldap_computers_enumerated",
+        "ldap_scan_started",
+        "metric_ttfh",
+        "mssql_scan_started",
+        "mssql_seimpersonate_checked",
+        "myip_auto_configured",
+        "myip_auto_updated",
+        "native_collection_performance",
+        "pdc_preflight_auto_switched",
+        "pdc_preflight_confirmed",
+        "pdc_preflight_dns_validation",
+        "pdc_preflight_domain_fallback",
+        "pdc_preflight_mismatch",
+        "pdc_preflight_retry_with_fingerprint_domain",
+        "pdc_preflight_validated",
+        "post_ex_dry_run_executed",
+        "post_ex_execute_invoked",
+        "post_ex_menu_viewed",
+        "post_ex_technique_selected",
+        "rdp_scan_started",
+        "reinstall",
+        "repl_command",
+        "repl_command_unknown",
+        "roast_etype_prevalence",
+        "scan_complete",
+        "scan_outcome",
+        "session_ci_check_failed",
+        "session_ci_check_passed",
+        "session_ci_override_accepted",
+        "session_ci_override_declined",
+        "session_ci_override_prompt_shown",
+        "session_end",
+        "session_execute_check_failed",
+        "session_execute_check_passed",
+        "session_execute_override_accepted",
+        "session_execute_override_declined",
+        "session_execute_override_prompt_shown",
+        "session_rating",
+        "session_rating_feedback",
+        "session_start",
+        "session_start_check_failed",
+        "session_start_check_passed",
+        "session_start_override_accepted",
+        "session_start_override_declined",
+        "session_start_override_prompt_shown",
+        "smb_scan_started",
+        "smb_sensitive_auth_normalized",
+        "smb_sensitive_data_analysis",
+        "spray_replica_gate",
+        "spraying_aborted_clock_sync_failed",
+        "spraying_pre2k_selected",
+        "spraying_recommended_started",
+        "star_cta_shown",
+        "start_auth",
+        "start_network_preflight_interface_switch",
+        "start_network_preflight_result",
+        "start_unauth",
+        "start_wizard_interrupted",
+        "telemetry_event_unlisted",
+        "telemetry_system_context",
+        "timeroast_started",
+        "uninstalled",
+        "user_discovery_followups",
+        "users_enumerated",
+        "winrm_scan_started",
+        "workspace_dns_repair_attempted",
+        "workspace_dns_repair_failed",
+        "workspace_dns_repair_skipped",
+        "workspace_dns_repair_succeeded",
+        "workspace_dns_restore_best_effort",
+        "workspace_dns_restore_failed",
+    }
+)
+
+
+def _coerce_event_name(event: str) -> str:
+    """Return the event name if allow-listed, else the static unlisted bucket.
+
+    Fail-closed guard for the telemetry event-NAME channel. The name is the one
+    payload field capture() never sanitizes, so any value outside the closed
+    vocabulary is dropped and replaced by a static bucket. This guarantees no
+    operator/customer string (hostnames, loot paths, IPs) can reach the
+    analytics backend as an event name.
+
+    Args:
+        event: The requested event name.
+
+    Returns:
+        The event name if it is allow-listed, otherwise the static bucket.
+    """
+    return event if event in _ALLOWED_EVENT_NAMES else _TELEMETRY_UNLISTED_EVENT_BUCKET
+
+
 def capture(event: str, properties: Optional[dict[str, Any]] = None):
     """Capture a telemetry event via n8n proxy if enabled.
 
@@ -2232,9 +2420,15 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
             props = _sanitize_telemetry_properties(props)
             props["$set"] = merged_set
 
+            # Fail-closed event-NAME guard: the name is the only payload field
+            # not sanitized above, so coerce any non-allow-listed value to the
+            # static bucket. The raw string is dropped, never forwarded in any
+            # field (not the event, not the props).
+            safe_event = _coerce_event_name(event)
+
             # Send event to n8n proxy (mimics PostHog API format)
             payload = {
-                "event": event,
+                "event": safe_event,
                 "distinct_id": TELEMETRY_ID,
                 "properties": props,
             }
@@ -2254,7 +2448,11 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
             response.raise_for_status()
             # print_info(f'Captured event: {event}: {props}, {TELEMETRY_ID}')
         except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
-            print_warning_debug(f"Telemetry capture failed for event {event}: {exc}")
+            # Log the coerced (allow-listed / bucketed) name, never the raw one,
+            # so an unlisted operator token cannot leak via the debug console.
+            print_warning_debug(
+                f"Telemetry capture failed for event {_coerce_event_name(event)}: {exc}"
+            )
     # else:
     #     print_info("Telemetry disabled")
 
@@ -2305,6 +2503,7 @@ _SAFE_TELEMETRY_STRING_FIELDS: frozenset[str] = frozenset(
         "lab_provider",
         "launcher_version_source",
         "result",
+        "roast_type",
         "runtime_version_source",
         "scan_mode",
         "service",
@@ -3818,7 +4017,7 @@ def _sanitize_rich_output(content: str) -> str:
         content,
     )
     content = re.sub(
-        r"\b[0-9a-f]{32}\b",
+        r"(?i)\b[0-9a-f]{32}\b",
         lambda m: _record_pseudonym(m.group(0), "hash"),
         content,
     )
@@ -4133,17 +4332,43 @@ def _sanitize_rich_output(content: str) -> str:
     return content
 
 
+# C0 control characters that Postgres ``text`` columns cannot store. A NUL
+# (``\x00``) — or any other C0 control except tab/newline/carriage-return — in
+# the uploaded payload makes the ingest DB reject the whole row with
+# ``22P05 / "cannot be converted to text"`` (a deterministic 500 no retry can
+# fix). ``\t`` (0x09), ``\n`` (0x0a) and ``\r`` (0x0d) are legal and preserved.
+_DB_UNSAFE_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _strip_db_unsafe_chars(content: str) -> str:
+    """Remove Postgres-illegal C0 control chars (incl. NUL) from ``content``.
+
+    Deterministic and cheap: a single compiled-regex substitution. Preserves
+    ``\\t``, ``\\n`` and ``\\r`` (the only C0 controls a ``text`` column accepts)
+    and is a byte-identical no-op when there is nothing illegal to strip.
+    """
+    if not content:
+        return content
+    return _DB_UNSAFE_CONTROL_CHARS.sub("", content)
+
+
 def _maybe_sanitize_rich_output(content: str, *, sanitize: bool) -> str:
     """Prepare Rich export for session storage, optionally applying redaction.
 
     When sanitization is disabled, we still normalize the Rich export (strip
     ANSI/HTML) but avoid redaction to preserve debugging context. In that mode we
     also strip invisible markers so they don't affect stored text.
+
+    As the LAST step (after any secret/path redaction) we strip DB-unsafe
+    control characters so the resulting payload field is storable by the ingest
+    DB by construction — this is the single sanitization boundary both the live
+    upload and the on-disk retry queue draw from, so neither can be poisoned by
+    a NUL byte.
     """
     if sanitize:
-        return _sanitize_rich_output(content)
+        return _strip_db_unsafe_chars(_sanitize_rich_output(content))
     prepared = _prepare_rich_content_for_processing(content)
-    return _strip_sensitive_markers(prepared)
+    return _strip_db_unsafe_chars(_strip_sensitive_markers(prepared))
 
 
 def _sanitize_cli_flag(content: str, flag: str, data_type: str) -> str:
@@ -5336,6 +5561,21 @@ _SESSION_MAX_HTML_BYTES: int = 9 * 1024 * 1024  # 9 MiB
 # the saving actually matters.
 _SESSION_GZIP_THRESHOLD_BYTES: int = 4 * 1024  # 4 KiB
 
+# Set to True by ``make_session_streamer`` once a SessionStreamer is
+# started for the current process. A streamed session delivers its full
+# recording incrementally via the chunk endpoint, so the legacy
+# single-shot ``_send_session_to_vercel`` upload is only a redundant
+# duplicate — and for a large (oversize) recording that single-shot path
+# would enqueue a payload the drain discards, silently dropping the
+# backstop. When this flag is set we let a streamed session rely on its
+# chunks and never enqueue an oversize single-shot payload for discard.
+_SESSION_STREAMING_ACTIVE: bool = False
+
+
+def _session_streaming_active() -> bool:
+    """Return True when a SessionStreamer is shipping chunks this run."""
+    return _SESSION_STREAMING_ACTIVE
+
 
 def _resolve_session_ingest_target() -> tuple[str | None, str]:
     """Return ``(url, label)`` for the active session ingest endpoint.
@@ -5363,6 +5603,18 @@ def _resolve_session_ingest_target() -> tuple[str | None, str]:
     if proxy:
         return proxy, "n8n-proxy"
     return None, "no-target"
+
+
+# Bounded same-session retry for the session upload. The upload runs at
+# session-END (often right after Ctrl+C), so the total backoff must stay small
+# — exit must never feel slow. Three total attempts with 0.5s then 1.0s of
+# backoff caps the added wall-clock at ~1.5s. A transient 5xx / connection blip
+# succeeds on the first run; anything still failing after the cap falls through
+# to the durable on-disk queue (retried next run).
+_SESSION_UPLOAD_MAX_ATTEMPTS = 3
+# One entry per gap between attempts (len == max_attempts - 1). Simple
+# exponential with a hard cap so the summed budget stays ~1.5s.
+_SESSION_UPLOAD_BACKOFF_SCHEDULE = (0.5, 1.0)
 
 
 def _upload_session_payload(payload: dict[str, Any]) -> Optional[str]:
@@ -5415,42 +5667,82 @@ def _upload_session_payload(payload: dict[str, Any]) -> Optional[str]:
     print_info_debug(
         f"[telemetry] sessions ingest target={target_label} url={target_url}"
     )
-    try:
-        response = requests.post(
-            target_url,
-            data=request_body,
-            headers=headers,
-            timeout=10,
-        )
-    except requests.exceptions.RequestException as e:
-        print_warning_debug(
-            f"Failed to send session via {target_label} ingest: {e}"
-        )
+
+    # Retry ONLY transient failures (server 5xx, connection errors, timeouts).
+    # A 4xx is a client/payload error that will not improve on retry, so it
+    # fails fast (no sleeps). Idempotency: the payload carries a
+    # ``session_trace_id`` and the server dedups by it, so a retry after a
+    # timeout that actually landed is a low-harm double-insert (telemetry is
+    # non-transactional) — no client-side dedup needed.
+    for attempt in range(1, _SESSION_UPLOAD_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                target_url,
+                data=request_body,
+                headers=headers,
+                timeout=10,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Retryable transport failure.
+            print_warning_debug(
+                f"Failed to send session via {target_label} ingest "
+                f"(attempt {attempt}/{_SESSION_UPLOAD_MAX_ATTEMPTS}): {e}"
+            )
+            print_info_debug(
+                f"Session ingest error details: {type(e).__name__} - {str(e)}"
+            )
+            if attempt < _SESSION_UPLOAD_MAX_ATTEMPTS:
+                time.sleep(_SESSION_UPLOAD_BACKOFF_SCHEDULE[attempt - 1])
+                continue
+            return None
+        except requests.exceptions.RequestException as e:
+            # Non-retryable transport failure — give up immediately.
+            print_warning_debug(
+                f"Failed to send session via {target_label} ingest: {e}"
+            )
+            print_info_debug(
+                f"Session ingest error details: {type(e).__name__} - {str(e)}"
+            )
+            return None
+
         print_info_debug(
-            f"Session ingest error details: {type(e).__name__} - {str(e)}"
+            f"Session ingest ({target_label}) response status: {response.status_code}"
         )
-        return None
 
-    print_info_debug(
-        f"Session ingest ({target_label}) response status: {response.status_code}"
-    )
-    try:
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        print_warning_debug(f"Session ingest ({target_label}) HTTP error: {e}")
-        return None
+        if response.status_code >= 500:
+            # Retryable server error.
+            print_warning_debug(
+                f"Session ingest ({target_label}) server error "
+                f"(attempt {attempt}/{_SESSION_UPLOAD_MAX_ATTEMPTS}): "
+                f"status {response.status_code}"
+            )
+            if attempt < _SESSION_UPLOAD_MAX_ATTEMPTS:
+                time.sleep(_SESSION_UPLOAD_BACKOFF_SCHEDULE[attempt - 1])
+                continue
+            return None
 
-    try:
-        result = response.json()
-        stored_session_id = result.get("session_id") or session_id
-        session_url = result.get("session_url") or (
-            f"https://sessions.adscanpro.com/sessions/{stored_session_id}"
-        )
-        return session_url
-    except (ValueError, json.JSONDecodeError):
-        if response.status_code in (200, 201) and session_id:
-            return f"https://sessions.adscanpro.com/sessions/{session_id}"
-        return None
+        try:
+            # 4xx raises here → non-retryable, caller enqueues to the queue.
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            print_warning_debug(f"Session ingest ({target_label}) HTTP error: {e}")
+            return None
+
+        try:
+            result = response.json()
+            stored_session_id = result.get("session_id") or session_id
+            session_url = result.get("session_url") or (
+                f"https://sessions.adscanpro.com/sessions/{stored_session_id}"
+            )
+            return session_url
+        except (ValueError, json.JSONDecodeError):
+            if response.status_code in (200, 201) and session_id:
+                return f"https://sessions.adscanpro.com/sessions/{session_id}"
+            return None
+
+    # Loop exhausted without a decisive result (defensive; the branches above
+    # always return). Caller enqueues to the durable queue.
+    return None
 
 
 def _send_session_to_vercel(
@@ -5512,6 +5804,20 @@ def _send_session_to_vercel(
         # ``~/.adscan/telemetry-queue/`` and decide whether to bisect
         # the recording or just accept the loss.
         if html_size > _SESSION_MAX_HTML_BYTES:
+            if _session_streaming_active():
+                # A streamed session already delivered the full recording
+                # incrementally through the chunk endpoint (each chunk is
+                # small, well under the ceiling). Enqueuing the oversize
+                # single-shot payload here would only get discarded by the
+                # drain — dropping a backstop that is not needed. Rely on
+                # the chunks; do not enqueue for discard.
+                print_info_debug(
+                    f"Session HTML exceeds single-shot ceiling "
+                    f"({html_size} > {_SESSION_MAX_HTML_BYTES} bytes) but the "
+                    "session was streamed; relying on delivered chunks, "
+                    "skipping the legacy single-shot backstop."
+                )
+                return None
             print_warning_debug(
                 f"Session HTML exceeds upload ceiling "
                 f"({html_size} > {_SESSION_MAX_HTML_BYTES} bytes); "
@@ -5573,11 +5879,42 @@ def _enqueue_oversize_session(payload: dict[str, Any], *, html_size: int) -> Non
 def _drain_queue_upload_fn(payload: dict[str, Any]) -> bool:
     """Bridge between the disk queue and the wire uploader.
 
-    Drops oversize-tagged payloads silently — they were too big when
-    captured and the server cap has not changed since enqueue. Keeping
-    them on disk forever serves no purpose; the helper returns True so
-    ``drain_queue`` deletes them.
+    Routes each queued payload to the endpoint that matches how it was
+    captured — the queue mixes two payload shapes and sending one to the
+    other's endpoint loses the session:
+
+    * ``_chunk_trace_id``-tagged → a retried streaming chunk. Route it
+      back to the per-trace chunk endpoint (``_upload_chunk``). The
+      legacy ``/api/sessions`` single-shot endpoint requires an ``html``
+      field and 400-rejects a chunk payload, so a chunk sent there is
+      lost and the server never assembles the final recording. This is
+      the fix for long-audit ``sessions.html`` staying empty when the
+      final ``is_final`` chunk was retried.
+    * ``_oversize_html_bytes``-tagged → a legacy single-shot payload that
+      was too big for the server body cap when captured. A STREAMED
+      session never enqueues one of these (its chunks are the delivery
+      path), so any oversize payload on disk is from a non-streamed
+      session that genuinely cannot be delivered single-shot; the cap has
+      not changed since enqueue. Return True so ``drain_queue`` deletes
+      it rather than retrying forever.
+    * Everything else → a normal legacy single-shot session payload.
     """
+    chunk_trace_id = payload.get("_chunk_trace_id")
+    if chunk_trace_id:
+        # Strip client-only routing markers so the chunk endpoint sees the
+        # exact wire shape the live streamer sends.
+        chunk_payload = {
+            key: value
+            for key, value in payload.items()
+            if key != "_chunk_trace_id"
+        }
+        ok = _upload_chunk(str(chunk_trace_id), chunk_payload)
+        if ok:
+            print_info_debug(
+                "(telemetry-queue) re-delivered streaming chunk "
+                f"trace={chunk_trace_id} seq={payload.get('seq')}"
+            )
+        return ok
     if payload.get("_oversize_html_bytes"):
         print_info_debug(
             "(telemetry-queue) discarding oversize queued session "
@@ -5705,21 +6042,29 @@ def _upload_chunk(trace_id: str, payload: dict[str, Any]) -> bool:
     return False
 
 
-def _enqueue_chunk_failure(payload: dict[str, Any]) -> None:
+def _enqueue_chunk_failure(trace_id: str, payload: dict[str, Any]) -> None:
     """Persist a failed chunk for next-run drain. Reuses Tier 1 queue.
 
-    Tagged with ``_chunk_trace_id`` so the queue drainer can route it
-    back to the chunk endpoint instead of the single-shot endpoint.
+    Tags the payload with ``_chunk_trace_id`` so ``_drain_queue_upload_fn``
+    routes it back to the per-trace chunk endpoint (``_upload_chunk``)
+    instead of the legacy single-shot ``/api/sessions`` endpoint — which
+    requires an ``html`` field and 400-rejects a chunk payload, losing the
+    chunk (and, for the final ``is_final`` chunk, the whole assembled
+    recording). The chunk wire payload itself carries no ``trace_id`` (the
+    live path passes it in the URL, not the body), so it is captured here
+    from the streamer closure.
     """
     try:
         from adscan_core import telemetry_queue
     except ImportError:
         return
-    queued = telemetry_queue.enqueue_session(payload)
+    tagged = dict(payload)
+    tagged["_chunk_trace_id"] = str(trace_id)
+    queued = telemetry_queue.enqueue_session(tagged)
     if queued is not None:
         print_info_debug(
             f"(telemetry-streamer) enqueued failed chunk "
-            f"seq={payload.get('seq')} path={queued}"
+            f"trace={trace_id} seq={payload.get('seq')} path={queued}"
         )
 
 
@@ -5799,13 +6144,15 @@ def make_session_streamer(
         environment=environment,
         started_at=started_at,
         upload_fn=lambda payload: _upload_chunk(trace_id, payload),
-        enqueue_fn=_enqueue_chunk_failure,
+        enqueue_fn=lambda payload: _enqueue_chunk_failure(trace_id, payload),
         sanitize_fn=_sanitize_rich_output,
         export_html_fn=export_html_fn,
         version_payload_fn=version_payload_fn,
     )
     streamer = SessionStreamer(config)
     streamer.start()
+    global _SESSION_STREAMING_ACTIVE
+    _SESSION_STREAMING_ACTIVE = True
     print_info_debug(
         f"(telemetry-streamer) started: trace={trace_id} command={command_type}"
     )

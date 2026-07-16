@@ -1007,7 +1007,6 @@ def _run_rodc_krbtgt_followup(
     auth_username: str,
     auth_secret: str,
     preferred_transport: str,
-    nxc_auth: str | None = None,
     auth_kind_label: str = "host access credential",
     winrm_secret: str | None = None,
     kdc_ip: str | None = None,
@@ -1200,7 +1199,6 @@ def _run_rodc_krbtgt_followup(
                 target_secret_name=target_secret_name,
                 extractor_local_path=extractor_path,
                 extractor_mode=extractor_mode,
-                nxc_auth=nxc_auth,
                 preferred_transport=preferred_transport,
                 winrm_secret=winrm_secret or None,
                 kdc_ip=kdc_ip or None,
@@ -1285,17 +1283,6 @@ def _run_rbcd_rodc_krbtgt_followup(
     RBCD), WinRM is used as the primary execution transport and SMB/wmiexec
     as the fallback.  Without it, only SMB is available.
     """
-    build_auth = getattr(shell, "build_auth_nxc", None)
-    nxc_auth = None
-    if callable(build_auth):
-        nxc_auth = str(
-            build_auth(
-                delegated_user,
-                ticket_path,
-                target_domain or domain,
-                kerberos=True,
-            )
-        )
     # If we have an http/ ticket, prefer WinRM for exec (better token for SW4)
     # and keep SMB for file transfer (upload/download always via SMB share).
     preferred = "auto" if http_ticket_path else "smb"
@@ -1311,7 +1298,6 @@ def _run_rbcd_rodc_krbtgt_followup(
         auth_username=delegated_user,
         auth_secret=ticket_path,
         preferred_transport=preferred,
-        nxc_auth=nxc_auth,
         auth_kind_label=f"Kerberos ccache ({delegated_user}@cifs_{target_computer})",
         winrm_secret=http_ticket_path or None,
         kdc_ip=kdc_ip or None,
@@ -1328,17 +1314,6 @@ def _run_host_access_rodc_krbtgt_followup(
     password: str,
 ) -> None:
     """Execute the common RODC krbtgt follow-up via reusable host-access creds."""
-    build_auth = getattr(shell, "build_auth_nxc", None)
-    nxc_auth = None
-    if callable(build_auth):
-        nxc_auth = str(
-            build_auth(
-                username,
-                password,
-                target_domain or domain,
-                kerberos=False,
-            )
-        )
     _run_rodc_krbtgt_followup(
         shell,
         domain=domain,
@@ -1347,7 +1322,6 @@ def _run_host_access_rodc_krbtgt_followup(
         auth_username=username,
         auth_secret=password,
         preferred_transport="auto",
-        nxc_auth=nxc_auth,
         auth_kind_label="Reusable host access credential",
     )
 

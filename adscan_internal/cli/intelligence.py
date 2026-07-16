@@ -540,6 +540,11 @@ def run_native_collection(
         )
         _surface_host_enrichment_coverage(shell, target_domain, timing)
         collector_result = collection_results.get(target_domain)
+        # Set the shell's logical domain context to the domain we just collected
+        # BEFORE the persist calls below, so save_domain_data() can write
+        # variables.json. See _ensure_shell_domain_context for why the automated
+        # scan path leaves it unset otherwise.
+        _ensure_shell_domain_context(shell, target_domain)
         _print_collection_summary_from_graph(shell, target_domain, elapsed)
         _print_collector_enrichment_panel(collector_result, target_domain, shell=shell)
         _persist_collector_findings(shell, target_domain, collector_result)
@@ -783,6 +788,40 @@ def _surface_host_enrichment_coverage(
     except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
         telemetry.capture_exception(exc)
         print_info_debug(f"[intelligence] host-coverage persist failed: {exc}")
+
+
+def _ensure_shell_domain_context(shell: Any, target_domain: str) -> None:
+    """Point the shell's logical domain context at ``target_domain`` (in-memory).
+
+    The automated scan / CTF collection path reaches ``run_native_collection``
+    without ever going through the interactive domain selection that calls
+    ``activate_domain`` (``workspaces/domains.py``), so ``current_domain`` /
+    ``current_domain_dir`` stay ``None`` for the whole scan. Every
+    ``save_domain_data()`` in the post-collection persist chain (collector
+    findings, machine-pwd rotation, ADCS detection state) is hard-wired to those
+    two attrs, so with them unset it trips the "No active domain selected ...
+    Cannot save domain data" guard (``workspaces/saver.py``) and silently drops
+    ``variables.json``. This helper sets them via the canonical ``activate_domain``
+    SSOT (in-memory only, no I/O); the resolved dir is identical to the one the
+    collector already wrote its graph/enabled_computers artifacts to. No-op when
+    the context is already on ``target_domain`` or no workspace dir is known.
+    """
+    ws_dir = getattr(shell, "current_workspace_dir", None)
+    if not ws_dir:
+        return
+    if (
+        getattr(shell, "current_domain_dir", None) is not None
+        and getattr(shell, "current_domain", None) == target_domain
+    ):
+        return
+    from adscan_internal.workspaces import activate_domain
+
+    activate_domain(
+        shell,
+        workspace_dir=ws_dir,
+        domains_dir_name=getattr(shell, "domains_dir", "domains"),
+        domain=target_domain,
+    )
 
 
 def _persist_collector_findings(
@@ -1611,33 +1650,15 @@ def _resolve_target_privilege_tier(
 ):
     """Resolve the target node's graded :class:`PrivilegeTier`.
 
-    Grades the Tier 0 boundary so a DC (or the Domain object) is
-    ``TIER0_DIRECT`` and an escalation-capable asset (ADCS CA, Exchange, or a
-    generic Tier 0 host) is ``TIER0_ESCALATION_CAPABLE`` — both Tier 0, not
-    equal. The DC signal reuses the collector SSOT
-    :func:`domain_controller_classifier.classify_computer_node_role`
-    (``primaryGroupID`` 516/521, RODC UAC bit, krbtgt SPN) rather than the
-    sparsely-populated ``is_dc`` flag, then maps role → tier through the
-    group-membership-driven SSOT
-    :func:`compromise_class.privilege_tier_for_computer`. Returns ``None`` for a
-    non-computer, non-domain target (group/user) — the existing
-    compromise-class rules already grade those, and a ``None`` tier keeps the
-    pre-grading behavior for them.
-
-    The resolver works on an attack-graph node that does not carry transitive
-    group memberships, so it uses the SSOT's documented ``is_tier0_asset``
-    degraded-fallback path: any non-DC Tier 0 asset role
-    (``target_role`` set by :func:`_node_tier0_asset_role` — ADCS CA, Exchange,
-    or the generic Tier 0 tag) collapses to ``is_tier0_asset=True`` →
-    escalation-capable. The collector path (``inventory_persistence``) has full
-    membership data and grades by group instead; both converge on the same SSOT.
+    Delegates to the shared SSOT
+    :func:`compromise_class.privilege_tier_for_computer_node` (DC / Tier-0-asset
+    / server / workstation grading) — see that function's docstring for the
+    full derivation. Returns ``None`` for a non-computer, non-domain target
+    (group/user) — the existing compromise-class rules already grade those.
     """
     from adscan_internal.services.compromise_class import (
         PrivilegeTier,
-        privilege_tier_for_computer,
-    )
-    from adscan_internal.services.domain_controller_classifier import (
-        classify_computer_node_role,
+        privilege_tier_for_computer_node,
     )
 
     if target_is_domain:
@@ -1649,29 +1670,11 @@ def _resolve_target_privilege_tier(
         # Group / user / container target — defer to compromise-class grading.
         return None
 
-    # Authoritative DC detection via the collector SSOT (primaryGroupID etc.).
-    dc_role = classify_computer_node_role(target_node)
-
-    # Any non-DC Tier-0 asset role (ADCS CA / Exchange / generic Tier 0 host) →
-    # escalation-capable, via the SSOT's degraded ``is_tier0_asset`` fallback.
-    # ``target_role`` was resolved upstream by ``_node_tier0_asset_role``.
-    is_tier0_asset = target_role is not None
-
-    # Plain member server vs workstation, from the operatingSystem signal.
-    props = target_node.get("properties") if isinstance(target_node.get("properties"), dict) else {}
-    os_str = ""
-    for key in ("operatingsystem", "operatingSystem"):
-        val = (props or {}).get(key) or target_node.get(key)
-        if val:
-            os_str = str(val).lower()
-            break
-
-    # Single mapping path through the SSOT — DC > Tier0-asset > server >
-    # workstation. Same tier numbers as before; only the derivation is unified.
-    return privilege_tier_for_computer(
-        is_dc=dc_role is not None,
-        is_tier0_asset=is_tier0_asset,
-        is_server="server" in os_str,
+    # target_role was resolved upstream by _node_tier0_asset_role (ADCS CA /
+    # Exchange / generic Tier 0 tag) — any non-None role is the degraded
+    # is_tier0_asset signal.
+    return privilege_tier_for_computer_node(
+        target_node, is_tier0_asset=target_role is not None
     )
 
 

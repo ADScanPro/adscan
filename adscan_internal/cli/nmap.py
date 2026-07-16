@@ -99,7 +99,6 @@ class NmapShell(Protocol):
     def consolidate_domain_computers(self, args: str) -> None: ...
     def ask_for_unauth_scan(self, domain: str) -> None: ...
     def ask_for_smb_scan(self, domain: str) -> None: ...
-    def netexec_extract_domains_ldap(self, args: str) -> None: ...
     def _get_dns_discovery_service(self) -> object: ...
     def _get_lab_slug(self) -> str | None: ...
 
@@ -1199,7 +1198,7 @@ def _run_nmap_command_with_optional_sudo_retry(
 # "Discovered open port <port>/tcp on <ip>" line per open port; --stats-every
 # plus -vvv emit periodic "... Timing: About <pct>% done; ETC: <hh:mm> (<rem>
 # remaining)" lines). Used by both the streaming important-port monitor and the
-# legacy monitor_nmap/monitor_nmap_domain loops so the regex lives in one place.
+# monitor_nmap_domain loop so the regex lives in one place.
 _NMAP_DISCOVERED_PORT_RE = re.compile(
     r"Discovered open port (?P<port>\d+)/tcp on (?P<ip>\d+\.\d+\.\d+\.\d+)"
 )
@@ -3207,105 +3206,3 @@ def monitor_nmap_domain(shell: NmapShell, proc: any, domain: str) -> None:
             # Port 443/tcp - HTTPS
             elif b"443/tcp" in line:
                 save_domain_host_to_file(shell, host_ip, shell.https_dir, domain)
-
-
-def monitor_nmap(shell: NmapShell, proc: any) -> None:
-    """Monitor nmap process output for general port scanning.
-
-    This function processes nmap output in real-time, detecting open ports
-    and saving hosts to appropriate service directories. After completion,
-    it triggers domain extraction or SMB scanning if applicable.
-
-    Args:
-        shell: The active shell instance with workspace data.
-        proc: Nmap subprocess object with stdout.
-    """
-    # Single source of truth: shared discovered-port regex.
-    ip_regex = _NMAP_DISCOVERED_PORT_RE
-    process_completed = False
-
-    while True:
-        line = proc.stdout.readline()
-        if not line and proc.poll() is not None:  # Check if the process has ended
-            if not process_completed:
-                print_success("Important port scan completed.")
-                process_completed = True
-                dns_hosts_path = os.path.join(shell.dns_dir, "ips.txt")
-                smb_hosts_path = os.path.join(shell.smb_dir, "ips.txt")
-
-                if (
-                    os.path.exists(dns_hosts_path)
-                    and os.path.getsize(dns_hosts_path) > 0
-                ):
-                    shell.console.print(
-                        "[+] Hosts with open DNS found, extracting domain and DCs",
-                        style="bold cyan",
-                    )
-                    shell.netexec_extract_domains_ldap("")
-                elif (
-                    os.path.exists(smb_hosts_path)
-                    and os.path.getsize(smb_hosts_path) > 0
-                ):
-                    shell.console.print(
-                        "[+] Hosts with SMB found, starting tests...",
-                        style="bold green",
-                    )
-                    shell.ask_for_smb_scan("")
-                else:
-                    print_error("No hosts with SMB found in the scan.")
-            break
-
-        # Attempt to extract the host IP from the nmap output
-        match = ip_regex.search(line.decode("utf-8"))
-        if match:
-            host_ip = match.group("ip")  # Capture the IP
-
-            # Port 445/tcp - SMB
-            if b"445/tcp" in line:
-                print_success(f"Port 445/tcp (SMB) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.smb_dir)
-            # Port 5985/tcp - WinRM
-            elif b"5985/tcp" in line:
-                print_success(f"Port 5985/tcp (WinRM) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.winrm_dir)
-            # Port 3389/tcp - RDP
-            elif b"3389/tcp" in line:
-                print_success(f"Port 3389/tcp (RDP) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.rdp_dir)
-            # Port 88/tcp - Kerberos
-            elif b"88/tcp" in line:
-                print_success(f"Port 88/tcp (Kerberos) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.kerberos_dir)
-            # Port 389/tcp - LDAP
-            elif b"389/tcp" in line:
-                print_success(f"Port 389/tcp (LDAP) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.ldap_dir)
-            # Port 53/tcp - DNS
-            elif b"53/tcp" in line:
-                print_success(f"Port 53/tcp (DNS) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.dns_dir)
-                shell.dns = host_ip
-            # Port 1433/tcp - MSSQL
-            elif b"1433/tcp" in line:
-                print_success(f"Port 1433/tcp (MSSQL) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.mssql_dir)
-            # Port 22/tcp - SSH
-            elif b"22/tcp" in line:
-                print_success(f"Port 22/tcp (SSH) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.ssh_dir)
-            # Port 21/tcp - FTP
-            elif b"21/tcp" in line:
-                print_success(f"Port 21/tcp (FTP) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.ftp_dir)
-            # Port 5900/tcp - VNC
-            elif b"5900/tcp" in line:
-                print_success(f"Port 5900/tcp (VNC) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.vnc_dir)
-            # Port 80/tcp - HTTP
-            elif b"80/tcp" in line:
-                print_success(f"Port 80/tcp (HTTP) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.http_dir)
-            # Port 443/tcp - HTTPS
-            elif b"443/tcp" in line:
-                print_success(f"Port 443/tcp (HTTPS) open on {host_ip}.")
-                save_host_to_file(shell, host_ip, shell.https_dir)

@@ -114,7 +114,14 @@ def _find_cleanup_scope(shell: Any, scope_id: str) -> dict[str, Any] | None:
 
 
 def _resolve_bloody_cleanup_host(shell: Any, *, domain: str) -> str:
-    """Resolve the DC host used for automatic cleanup."""
+    """Resolve the DC FQDN (or IP last-resort) used for automatic cleanup.
+
+    The rollback runs with ``kerberos=True``, so the host must be a real FQDN for
+    the service SPN (CLAUDE.md "Kerberos SPNs — always FQDN"). Routes through the
+    ``resolve_dc_fqdn`` SSOT, which promotes a short ``pdc_hostname`` to
+    ``<host>.<domain>`` and adds the workspace inventory fallback; a bare IP is
+    kept only as the same last resort this helper had before.
+    """
     domain_data = (
         getattr(shell, "domains_data", {}).get(domain, {})
         if isinstance(getattr(shell, "domains_data", None), dict)
@@ -122,10 +129,14 @@ def _resolve_bloody_cleanup_host(shell: Any, *, domain: str) -> str:
     )
     if not isinstance(domain_data, dict):
         domain_data = {}
+    from adscan_internal.models.domain import (  # noqa: PLC0415
+        resolve_dc_fqdn,
+        resolve_dc_ip,
+    )
+
     return str(
-        domain_data.get("pdc_hostname_fqdn")
-        or domain_data.get("pdc_hostname")
-        or domain_data.get("pdc")
+        resolve_dc_fqdn(domain_data, target_domain=domain)
+        or resolve_dc_ip(domain_data)
         or ""
     ).strip()
 

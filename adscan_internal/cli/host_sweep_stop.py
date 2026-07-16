@@ -8,8 +8,8 @@ sweep (not an abort of the whole scan):
     dispatching new hosts, drains the in-flight set, and the scan continues
     (attack-path discovery, report) with the partial host data. A one-line
     confirmation is shown.
-  * SECOND ``Ctrl+C`` within :data:`_DOUBLE_TAP_WINDOW_SECS` — the normal escape
-    hatch: re-raise ``KeyboardInterrupt`` so the whole scan aborts.
+  * SECOND ``Ctrl+C`` within the double-tap window — the normal escape hatch:
+    re-raise ``KeyboardInterrupt`` so the whole scan aborts.
 
 Threading model. Python delivers signals to the MAIN thread only; the collector
 runs its event loop + ``LiveSession`` in a worker thread. So the handler must NOT
@@ -26,58 +26,37 @@ platform stops the sweep via the cross-process sentinel, never ``Ctrl+C``. Under
 ``is_non_interactive`` a stray ``SIGINT`` keeps the default Python behaviour
 (``KeyboardInterrupt``) so an automated run is never silently turned into a
 partial sweep.
+
+This was the ORIGINAL implementation of the "Ctrl+C stop-and-continue" pattern.
+The double-tap state machine and signal-handler factory now live in the generic
+:mod:`adscan_internal.services.cooperative_cancellation` module (reused here) —
+this module keeps its own ``signal`` / ``is_non_interactive`` imports and gate
+so the operator-facing contract (module docstring above) and the test surface
+stay byte-identical; only the shared handler-construction logic was factored out.
 """
 
 from __future__ import annotations
 
 import contextlib
 import signal
-import time
-from dataclasses import dataclass
 from typing import Any
 
 from adscan_core.interaction import is_non_interactive
-from adscan_core.rich_output import print_info_debug, print_warning
+from adscan_core.rich_output import print_info_debug
 
 from adscan_internal.services.collector.host_sweep_cancellation import (
     HostSweepCancellation,
 )
+from adscan_internal.services.cooperative_cancellation import (
+    _CliStopHandlerState,
+    _on_sigint,
+)
 
-# A second Ctrl+C within this window of the first escalates to a hard abort.
-_DOUBLE_TAP_WINDOW_SECS = 3.0
-
-
-@dataclass
-class _HandlerState:
-    cancellation: HostSweepCancellation
-    shell: Any
-    first_tap_at: float = 0.0
-    previous_handler: Any = None
-
-
-def _on_sigint(state: _HandlerState) -> Any:
-    def _handler(signum: int, frame: Any) -> None:  # noqa: ARG001
-        now = time.monotonic()
-        # Double-tap within the window → hard abort (the normal escape hatch).
-        if state.first_tap_at and (now - state.first_tap_at) <= _DOUBLE_TAP_WINDOW_SECS:
-            raise KeyboardInterrupt
-        # If the operator already stopped the sweep, a fresh Ctrl+C means abort.
-        if state.cancellation.is_requested():
-            raise KeyboardInterrupt
-        state.first_tap_at = now
-        # First tap → cooperative stop-and-continue. Flip the thread-safe flag;
-        # the worker drains in-flight hosts and tears its LiveSession down. We do
-        # NOT read stdin here (signal handler on the main thread, worker owns the
-        # alt-screen) — the decision is shown as a non-blocking, deferred notice
-        # that survives the alt-screen pop.
-        state.cancellation.request_stop(source="cli")
-        print_warning(
-            "SMB host enrichment: stopping early and continuing the scan with the "
-            "hosts collected so far (identity graph is already complete). Press "
-            "Ctrl+C again to abort the whole scan."
-        )
-
-    return _handler
+_STOP_MESSAGE = (
+    "SMB host enrichment: stopping early and continuing the scan with the "
+    "hosts collected so far (identity graph is already complete). Press "
+    "Ctrl+C again to abort the whole scan."
+)
 
 
 @contextlib.contextmanager
@@ -103,7 +82,9 @@ def cli_host_sweep_stop(
         yield cancellation
         return
 
-    state = _HandlerState(cancellation=cancellation, shell=shell)
+    state = _CliStopHandlerState(
+        cancellation=cancellation, shell=shell, stop_message=_STOP_MESSAGE
+    )
     installed = False
     try:
         # signal.signal raises ValueError off the main thread — fall back to a

@@ -156,11 +156,19 @@ def compute_maximal_attack_paths_rustworkx(
     target: str = "highvalue",
     terminal_mode: str = "domain",
     start_node_ids: set[str] | None = None,
+    chokepoint_group_ids: set[str] | None = None,
 ) -> list[AttackPath]:
     """Compute maximal attack paths for a full-domain graph using rustworkx adjacency.
 
     Drop-in replacement for ``attack_graph_core.compute_maximal_attack_paths``.
     Falls back to the Python implementation when rustworkx is not available.
+
+    ``chokepoint_group_ids`` (the Layer-3 choke-point-rooted DFS input) is
+    accepted so this engine stays signature-compatible with the local one when
+    swapped in by the dev ``--engine rustworkx`` path.  The rustworkx body does
+    not implement choke-point rooting yet, so it produces the un-optimized (but
+    still fully collapse-corrected, byte-identical) path set; the fallback to the
+    local engine forwards the argument so it IS optimized there.
     """
     if not _RUSTWORKX_AVAILABLE or max_depth <= 0:
         from adscan_internal.services.attack_graph_core import (
@@ -174,6 +182,7 @@ def compute_maximal_attack_paths_rustworkx(
             target=target,
             terminal_mode=terminal_mode,
             start_node_ids=start_node_ids,
+            chokepoint_group_ids=chokepoint_group_ids,
         )
 
     max_paths_cap = (

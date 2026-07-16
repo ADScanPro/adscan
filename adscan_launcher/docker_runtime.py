@@ -12,6 +12,7 @@ orchestration and user experience.
 from __future__ import annotations
 
 import os
+import platform
 import pty
 import re
 import shlex
@@ -20,7 +21,7 @@ import subprocess
 import sys
 import time
 from selectors import DefaultSelector, EVENT_READ
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -142,6 +143,25 @@ def _get_host_xauthority_file() -> Path | None:
     return None
 
 
+def _host_uses_network_host() -> bool:
+    """Return True when the host should run the container with ``--network host``.
+
+    ``--network host`` shares the host network namespace directly, which is the
+    right default on Linux (routed scanning, broadcast poisoning, and the
+    in-container resolver all bind on host interfaces).
+
+    On macOS (Darwin), Docker Desktop runs every container inside a Linux VM, so
+    ``--network host`` shares the *VM's* network, not the Mac's — it silently
+    breaks anything that expects the host interface. There we fall back to
+    bridge/NAT networking (see ``build_adscan_run_command``), which still routes
+    outbound traffic to a reachable AD target; only host-Layer-2 features
+    (broadcast poisoning) are lost, and those cannot work on Docker Desktop
+    regardless. This is the single decision point for the mode — do not scatter
+    per-platform checks at call sites.
+    """
+    return str(platform.system() or "").strip().lower() != "darwin"
+
+
 @dataclass(frozen=True)
 class DockerRunConfig:
     """Configuration for running ADscan in a Docker container."""
@@ -152,7 +172,11 @@ class DockerRunConfig:
     # This keeps workspaces persistent on the host without requiring any
     # container-side code changes.
     workspaces_container_dir: str = "/opt/adscan/workspaces"
-    network_host: bool = True
+    # Default is platform-aware: True (--network host) on Linux, False
+    # (bridge/NAT) on macOS Docker Desktop. Centralized in
+    # ``_host_uses_network_host`` so every call site inherits the correct mode
+    # without passing the flag explicitly.
+    network_host: bool = field(default_factory=_host_uses_network_host)
     interactive: bool = True
     remove: bool = True
     run_as_current_user: bool = True
@@ -899,12 +923,23 @@ def build_adscan_run_command(
 ) -> list[str]:
     """Build docker run argv for running ADscan inside the container."""
     cmd: list[str] = ["docker", "run"]
+    # Track whether ``--add-host host-gateway:host-gateway`` has been added so the
+    # bridge-networking default and the Redis interactive-bridge block below do
+    # not emit it twice.
+    host_gateway_added = False
     if cfg.remove:
         cmd.append("--rm")
     if cfg.interactive:
         cmd.extend(["-it"])
     if cfg.network_host:
         cmd.extend(["--network", "host"])
+    else:
+        # Bridge/NAT networking (macOS Docker Desktop default: --network host only
+        # shares the Linux VM's network, not the Mac host's). Outbound routed
+        # scanning to the DC works over NAT; expose host-gateway so localhost/
+        # 127.0.0.1 rewrites resolve to the host bridge IP.
+        cmd.extend(["--add-host", "host-gateway:host-gateway"])
+        host_gateway_added = True
     # Allow the container to adjust the host clock when needed for Kerberos.
     # This is intentionally narrower than `--privileged` but still grants the
     # ability to change the system time (CAP_SYS_TIME).
@@ -1194,7 +1229,9 @@ def build_adscan_run_command(
         ).strip()
         if _host_redis_url:
             _docker_redis_url = _make_docker_accessible_url(_host_redis_url)
-            cmd.extend(["--add-host", "host-gateway:host-gateway"])
+            if not host_gateway_added:
+                cmd.extend(["--add-host", "host-gateway:host-gateway"])
+                host_gateway_added = True
             cmd.extend(["-e", f"ADSCAN_REDIS_URL={_docker_redis_url}"])
             print_info_debug(
                 f"[docker] forwarding Redis URL for interactive bridge: "

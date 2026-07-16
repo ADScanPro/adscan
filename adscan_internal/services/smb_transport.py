@@ -125,6 +125,17 @@ class SMBConfig:
     ccache_path: str | None = None  # path to .ccache file or KRB5CCNAME
     auth_domain: str | None = None  # credential domain (may differ from domain)
     kdc_ip: str | None = None  # KDC for auth_domain
+    target_kdc_ip: str | None = None
+    """KDC for the TARGET domain, used only for cross-forest Kerberos.
+
+    When ``auth_domain`` differs from ``domain`` (e.g. essos.local credentials
+    enumerating a sevenkingdoms.local host across a forest trust), the bind must
+    follow a cross-realm referral: ask the AUTH KDC (``kdc_ip``) for a
+    ``krbtgt/<target_realm>`` referral, then request the service ticket from the
+    TARGET realm's KDC. ``target_kdc_ip`` is that target-realm KDC. When unset it
+    falls back to ``target_ip`` (correct when the SMB target IS the target DC).
+    Mirrors :class:`KerberosConfig.target_kdc_ip`.
+    """
     port: int = 445
     timeout: int = 30
     use_kerberos: bool = False
@@ -179,6 +190,11 @@ class SMBConfig:
             self.kdc_ip = (
                 normalize_kerberos_target_hostname(self.kdc_ip, self.domain)
                 or self.kdc_ip
+            )
+        if self.target_kdc_ip:
+            self.target_kdc_ip = (
+                normalize_kerberos_target_hostname(self.target_kdc_ip, self.domain)
+                or self.target_kdc_ip
             )
 
         # Auto-route an NT hash that landed in the password field.
@@ -262,6 +278,44 @@ def _build_smb_url(config: SMBConfig) -> str:
                 )
         if kdc:
             params.append(f"dc={_quote(kdc)}")
+
+        # Cross-forest Kerberos: when the credential's realm (auth_domain)
+        # differs from the target realm (domain), the SMB bind must follow a
+        # cross-realm referral. aiosmb has no get_client_newtarget equivalent
+        # (badldap, the LDAP transport, sets cross_target/cross_realm that way),
+        # so without these params badauth's credential carries cross_target=None,
+        # the Fresh-TGS gate's except-branch referral never fires, and the AUTH
+        # KDC hands back the cross-realm REFERRAL TGT (krbtgt/TARGET@AUTH) which
+        # the target SMB service rejects (KRB_ERR_GENERIC / SEC_E_LOGON_DENIED).
+        #
+        # ``dcc`` + ``realmc`` are the badauth URL params (UniCredential.from_url)
+        # that set cred.cross_target (target-realm KDC) + cred.cross_realm
+        # (target realm). The except-branch then does:
+        #   get_referral_ticket(cross_realm, cross_target.ip) → get_TGS(spn)
+        # exactly like the working LDAP path. ``realmc`` is the TARGET realm and
+        # ``dcc`` the TARGET realm's KDC — matching what badldap's
+        # get_client_newtarget(new_domain=target, ip=target_dc_ip) produces (see
+        # ldap_transport_service _build_ldap_connection_url + get_client_newtarget
+        # call site). ``dcc`` defaults to ``target_ip`` when ``target_kdc_ip`` is
+        # unset (correct when the SMB target IS the target DC). Mirrors bloodyAD's
+        # `&dcc=&realmc=`.
+        auth_realm = str(config.auth_domain or "").strip()
+        target_realm = str(config.domain or "").strip()
+        is_cross_forest = bool(
+            auth_realm and target_realm and auth_realm.casefold() != target_realm.casefold()
+        )
+        if is_cross_forest:
+            target_kdc = str(
+                config.target_kdc_ip or config.target_ip or ""
+            ).strip()
+            if target_kdc:
+                params.append(f"dcc={_quote(target_kdc)}")
+            params.append(f"realmc={_quote(target_realm)}")
+            print_info_debug(
+                f"[smb_transport] cross-forest Kerberos {auth_realm} -> "
+                f"{target_realm}: dcc={target_kdc} realmc={target_realm} "
+                "(following cross-realm referral)"
+            )
 
         # Ccache resolution order MUST mirror the hardened LDAP builder
         # (ldap_transport_service.py:567-604): an explicitly-passed
@@ -606,6 +660,120 @@ class SMBSigningNegotiation:
 
     signing_required: bool
     dialect: Optional[Any] = None
+
+
+@dataclass(frozen=True)
+class SMBSessionSetupOutcome:
+    """Raw outcome of one NTLM SMB SESSION_SETUP attempt (posture-probe use).
+
+    Reports what the DC did with an NTLM session-setup WITHOUT interpreting it
+    into a posture verdict. The caller owns the verdict mapping — and it must,
+    because an NTLM-disabled DC (``NTLM_BLOCKED``/``NOT_SUPPORTED``) and a
+    bogus-credential rejection (``LOGON_FAILURE``) are OPPOSITE verdicts for the
+    NTLM_AUTHENTICATION probe and must never share a classifier (see the A3
+    probe in ``posture_probe``; contrast ``_NTLM_BLOCKED_MARKERS`` which
+    deliberately conflates them for the fallback-retry path).
+
+    Attributes:
+        session_established: The SESSION_SETUP fully succeeded — the NTLM SSP
+            reached the credential stage and the DC accepted it. With a bogus
+            credential this only happens on a guest-mapped / NULL-session DC;
+            either way NTLM was reachable, so it means NTLM is enabled.
+        ntstatus_name: The ``NTStatus`` enum name the DC returned when the
+            SESSION_SETUP failed (e.g. ``"LOGON_FAILURE"``, ``"NTLM_BLOCKED"``,
+            ``"NOT_SUPPORTED"``), or ``None`` when no structured NTSTATUS was
+            surfaced.
+        error_text: The lowercased rendered error for substring classification
+            when ``ntstatus_name`` is unavailable (empty on success).
+    """
+
+    session_established: bool
+    ntstatus_name: Optional[str]
+    error_text: str
+
+
+async def smb_probe_ntlm_session_setup(config: SMBConfig) -> SMBSessionSetupOutcome:
+    """Pre-auth NTLM SMB SESSION_SETUP that surfaces the raw NTSTATUS.
+
+    Runs ``connect()`` -> ``negotiate()`` -> ``session_setup()`` over NTLM using
+    the (typically BOGUS) credential baked into ``config``'s URL, then returns
+    the raw DC response without interpreting it. This is the single source of
+    truth for "what did the NTLM SSP do" as an SMB operation — a DIFFERENT
+    protocol from the LDAP signing layer, so the NTLM verdict it produces cannot
+    be masked by an LDAP signing-required policy (the A3 posture-probe bug this
+    primitive exists to fix). Mirrors :func:`smb_negotiate_signing` in shape.
+
+    The auth scheme in ``config`` must be NTLM (``use_kerberos=False``) — the
+    whole point is to exercise the NTLM SSP. The caller is expected to wrap this
+    in an ``asyncio.wait_for`` budget for a hard ceiling.
+
+    Args:
+        config: The :class:`SMBConfig` whose ``target_ip`` / ``port`` /
+            ``username`` / ``password`` (or ``nt_hash``) build the NTLM URL.
+
+    Returns:
+        An :class:`SMBSessionSetupOutcome` describing the raw DC response.
+
+    Raises:
+        SMBConnectionError: TCP connect or NEGOTIATE failed — the NTLM SSP
+            decision was never reached. The A3 probe treats this as UNKNOWN/LOW
+            and does NOT emit a posture signal (observe-don't-infer).
+    """
+    try:
+        from aiosmb.commons.connection.factory import SMBConnectionFactory
+    except ImportError as exc:
+        telemetry.capture_exception(exc)
+        raise SMBConnectionError(
+            f"aiosmb is not available in this runtime environment: {exc}"
+        ) from exc
+
+    url = _build_smb_url(config)
+    print_info_debug(
+        f"[smb-transport] NTLM SESSION_SETUP probe to "
+        f"{config.target_ip}:{config.port} (bogus-cred, raw NTSTATUS)"
+    )
+    connection = SMBConnectionFactory.from_url(url).get_connection()
+
+    _, err = await connection.connect()  # TCP only — no auth
+    if err is not None:
+        telemetry.capture_exception(err)
+        raise SMBConnectionError(
+            f"SMB connect to {config.target_ip} failed during NTLM probe: {err}"
+        ) from err
+
+    try:
+        _, err = await connection.negotiate()
+        if err is not None:
+            telemetry.capture_exception(err)
+            raise SMBConnectionError(
+                f"SMB NEGOTIATE to {config.target_ip} failed during NTLM probe: {err}"
+            ) from err
+
+        # session_setup() catches internally and returns (ok, err); it never
+        # raises. On failure ``err`` is an SMBException carrying ``.ntstatus``
+        # (the DC's reply header status) — LOGON_FAILURE (bogus cred reached the
+        # credential check) vs NTLM_BLOCKED / NOT_SUPPORTED (SSP refused).
+        ok, err = await connection.session_setup()
+        if ok and err is None:
+            return SMBSessionSetupOutcome(
+                session_established=True,
+                ntstatus_name=None,
+                error_text="",
+            )
+        nts = getattr(err, "ntstatus", None)
+        name = getattr(nts, "name", None)
+        return SMBSessionSetupOutcome(
+            session_established=False,
+            ntstatus_name=str(name) if name is not None else None,
+            error_text=(
+                f"{type(err).__name__}: {err}".lower() if err is not None else ""
+            ),
+        )
+    finally:
+        try:
+            await connection.disconnect()
+        except Exception as disc_exc:  # noqa: BLE001
+            telemetry.capture_exception(disc_exc)
 
 
 async def smb_negotiate_signing(config: SMBConfig) -> SMBSigningNegotiation:

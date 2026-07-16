@@ -147,6 +147,7 @@ class CollectionOrchestrator:
         host_progress_callback: "Callable[[HostPhaseProgress], None] | None" = None,
         host_cancellation: "HostSweepCancellation | None" = None,
         host_cap: int = 0,
+        shell: Any = None,
     ) -> tuple[CollectionResult, CollectionTiming]:
         """Collect a single domain and return the raw result with per-phase timing.
 
@@ -171,6 +172,13 @@ class CollectionOrchestrator:
         stays inside a PoV time budget. ``0`` (default) means unlimited — the full
         sweep. The identity graph (LDAP) is always 100%; only deep host enrichment
         is bounded.
+
+        ``shell`` enables host-granular Domain-Collection crash-resume: when
+        supplied (the CLI/web scan path) the per-host SMB sweep records which hosts
+        it enriched under ``domains_data[domain]["collection_progress"]`` and
+        checkpoints the partial graph mid-sweep, so a Ctrl+C / crash resumes from
+        the remaining hosts on reload. ``None`` (default, lab scripts / tests)
+        leaves collection byte-for-byte identical to the pre-resume behaviour.
         """
         timing = CollectionTiming()
         print_info_verbose(
@@ -300,7 +308,37 @@ class CollectionOrchestrator:
             # the unlimited full sweep.
             if host_cap and host_cap > 0:
                 host_cfg.host_cap = int(host_cap)
+            # Host-granular Domain-Collection crash-resume (Slice 1). Only wired
+            # when a shell is available (the CLI/web scan path); the pure-service
+            # callers (lab scripts, unit tests) leave it off and keep byte-for-byte
+            # legacy behaviour. The hooks close over ``shell`` + ``result`` +
+            # ``self._persistence`` so the host_collector service itself stays
+            # shell-free (it only invokes the opaque callables).
+            if shell is not None:
+                self._wire_collection_resume(
+                    host_cfg, shell=shell, domain=target_domain,
+                    collection_scope=collection_scope, result=result,
+                )
             host_timing = collect_domain_hosts(result, host_cfg)
+            # Carry the share-collection abort coverage into domains_data so Phase
+            # 7 (SMB Share Exposure), which runs later off the graph and cannot
+            # re-derive it, can distinguish an aborted enumeration (incomplete)
+            # from a genuine "no shares" result. JSON-safe (list of dicts + int).
+            if shell is not None and collect_shares:
+                try:
+                    domains_data = getattr(shell, "domains_data", None)
+                    if isinstance(domains_data, dict):
+                        domains_data.setdefault(target_domain, {})[
+                            "share_collection"
+                        ] = {
+                            "aborted_hosts": [
+                                {"host": host, "ip": ip}
+                                for (host, ip) in host_timing.shares_aborted_hosts
+                            ],
+                            "reached_hosts": int(host_timing.shares_reached_hosts),
+                        }
+                except Exception as exc:  # noqa: BLE001 — telemetry must never abort collection
+                    telemetry.capture_exception(exc)
             timing.host_negotiate = host_timing.negotiate
             timing.host_samr = host_timing.samr
             timing.host_shares = host_timing.shares
@@ -403,6 +441,100 @@ class CollectionOrchestrator:
             telemetry.capture_exception(exc)
             print_info_debug(f"machine-pwd-policy: inspection failed: {exc}")
 
+    def _wire_collection_resume(
+        self,
+        host_cfg: Any,
+        *,
+        shell: Any,
+        domain: str,
+        collection_scope: str,
+        result: "CollectionResult",
+    ) -> None:
+        """Attach the host-granular Domain-Collection crash-resume hooks to ``host_cfg``.
+
+        Builds the three fan-out callbacks (sweep-start marker, per-host done
+        recorder, mid-sweep graph checkpoint) plus the resume skip-set, closing
+        over ``shell`` / ``domain`` / ``result`` / ``self._persistence`` so the pure
+        host_collector service never touches the shell/workspace SSOT. All hooks
+        are best-effort; the SSOT helpers are themselves fail-open.
+        """
+        from adscan_internal.services.collection_progress import (
+            checkpoint_collection_progress,
+            mark_collection_running,
+            mark_host_done,
+            resumed_done_ids,
+        )
+
+        # Skip-set for a reload that hit a prior interrupted sweep (empty on a
+        # fresh run — a non-``running`` record yields no skips).
+        host_cfg.resumed_host_ids = resumed_done_ids(shell, domain)
+        scan_type = "audit" if collection_scope == "audit" else "ctf"
+        host_cap = int(getattr(host_cfg, "host_cap", 0) or 0)
+
+        def _on_sweep_start(hosts_total: int) -> None:
+            mark_collection_running(
+                shell,
+                domain,
+                scan_type=scan_type,
+                hosts_total=hosts_total,
+                host_cap=host_cap,
+            )
+
+        def _mark_host_done(object_id: str) -> None:
+            mark_host_done(shell, domain, object_id)
+
+        def _checkpoint() -> None:
+            # Ordering is load-bearing: persist the partial graph FIRST so no
+            # done-id is ever flushed for a host whose edges are not yet on disk
+            # (a resume would otherwise skip it and silently drop its enrichment).
+            # Reuses the SAME ``persist`` the end-of-sweep path calls (load-then-
+            # merge, re-entrant) — no duplicate persist logic.
+            try:
+                self._persistence.persist(shell, domain=domain, result=result)
+            except Exception as exc:  # noqa: BLE001 — a failed persist must not flush the done-set
+                telemetry.capture_exception(exc)
+                return
+            checkpoint_collection_progress(shell, domain)
+
+        host_cfg.collection_on_sweep_start = _on_sweep_start
+        host_cfg.collection_mark_host_done = _mark_host_done
+        host_cfg.collection_checkpoint = _checkpoint
+
+    @staticmethod
+    def _finalize_collection_progress(
+        shell: Any, domain: str, timing: "CollectionTiming"
+    ) -> None:
+        """Flip / flush the ``collection_progress`` record after the end-of-sweep persist.
+
+        Called AFTER ``persist`` has written the full partial graph (ordering:
+        graph first, then the record). Only acts on a record left ``running`` by
+        the sweep — a no-op when collection did not run or was already finalized.
+        A clean finish marks it ``complete`` so the reload offer stops; an operator
+        early-stop keeps it ``running`` with the full done-set so a reload resumes
+        only the remaining hosts. Best-effort: never raises.
+        """
+        try:
+            from adscan_internal.services.collection_progress import (
+                STATUS_RUNNING,
+                checkpoint_collection_progress,
+                mark_collection_complete,
+                read_collection_progress,
+            )
+
+            if read_collection_progress(shell, domain).get("status") != STATUS_RUNNING:
+                return
+            early_stopped = bool(
+                (getattr(timing, "host_coverage", None) or {}).get("early_stopped")
+            )
+            if early_stopped:
+                # Flush the done-set (now matching the just-persisted graph) but
+                # keep the record ``running`` so the sweep can be resumed.
+                checkpoint_collection_progress(shell, domain)
+            else:
+                mark_collection_complete(shell, domain)
+        except Exception as exc:  # noqa: BLE001 — finalize is best-effort
+            telemetry.capture_exception(exc)
+
     def collect_scope(
         self,
         *,
@@ -454,6 +586,7 @@ class CollectionOrchestrator:
                 host_progress_callback=host_progress_callback,
                 host_cancellation=host_cancellation,
                 host_cap=host_cap,
+                shell=shell,
             )
             results[scope.domain] = result
             timings[scope.domain] = timing
@@ -470,6 +603,12 @@ class CollectionOrchestrator:
             counters[scope.domain] = self._persistence.persist(
                 shell, domain=scope.domain, result=result
             )
+            # Host-granular Domain-Collection resume: the end-of-sweep persist
+            # above wrote the full partial graph, so finalize the checkpoint now
+            # (ordering: graph first, then the record). A clean sweep flips to
+            # ``complete`` so the reload offer stops; an early-stopped sweep stays
+            # ``running`` with the full done-set so a reload resumes the remainder.
+            self._finalize_collection_progress(shell, scope.domain, timing)
         self._resolve_cross_domain_references(results)
         return counters, results, timings
 

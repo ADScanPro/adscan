@@ -90,6 +90,7 @@ def _probe_one_target(
     kerberos_target_hostname: str | None,
     timeout: int,
     kdc_host: str | None = None,
+    ntlm_fallback_secret: str | None = None,
 ) -> ServiceAccessFinding:
     """Run one blocking MSSQL login + sysadmin probe and normalize the result.
 
@@ -109,6 +110,9 @@ def _probe_one_target(
         )
         # Allow the backend's Kerberos→NTLM infra fallback so a hardened KDC
         # path does not produce a false "no access" when NTLM would work.
+        # ``ntlm_fallback_secret`` carries a password / NT hash so a ccache-only
+        # sweep credential can still reach an instance with no MSSQLSvc SPN
+        # (Kerberos → KDC_ERR_S_PRINCIPAL_UNKNOWN) over NTLM.
         result = backend.execute_query(
             domain=domain,
             username=username,
@@ -117,6 +121,7 @@ def _probe_one_target(
             timeout=timeout,
             use_kerberos=use_kerberos,
             allow_ntlm_fallback=True,
+            ntlm_fallback_secret=ntlm_fallback_secret,
         )
     except Exception as exc:  # noqa: BLE001 — probe must never raise
         telemetry.capture_exception(exc)
@@ -187,6 +192,7 @@ async def run_mssql_access_probe_sweep(
     kdc_host: str | None = None,
     timeout: int = 30,
     max_workers: int | None = None,
+    ntlm_fallback_secret: str | None = None,
 ) -> list[ServiceAccessFinding]:
     """Probe MSSQL login access concurrently using the native impacket backend.
 
@@ -207,6 +213,12 @@ async def run_mssql_access_probe_sweep(
             here (transport target, not a service SPN).
         timeout: Per-host login timeout in seconds.
         max_workers: Bounded concurrency. ``None`` → ``get_mssql_probe_worker_count``.
+        ntlm_fallback_secret: Optional password / NT hash for the same principal,
+            used for the NTLM attempt when ``secret`` is a ccache path. Lets a
+            Kerberos-only sweep still assess instances with no ``MSSQLSvc`` SPN
+            (Kerberos → ``KDC_ERR_S_PRINCIPAL_UNKNOWN``). Callers must gate this
+            on NTLM not being known-blocked by domain posture, and must never
+            pass a ccache here.
 
     Returns:
         One :class:`ServiceAccessFinding` per resolved target, ordered to match
@@ -241,7 +253,8 @@ async def run_mssql_access_probe_sweep(
         f"domain={mark_sensitive(domain, 'domain')} "
         f"user={mark_sensitive(username, 'user')} "
         f"targets={len(resolved_targets)} workers={worker_count} "
-        f"kerberos={effective_use_kerberos}"
+        f"kerberos={effective_use_kerberos} "
+        f"ntlm_fallback={bool(ntlm_fallback_secret)}"
     )
 
     semaphore = asyncio.Semaphore(worker_count)
@@ -261,6 +274,7 @@ async def run_mssql_access_probe_sweep(
                         kerberos_target_hostname=hostname_map.get(host.lower()),
                         kdc_host=kdc_host,
                         timeout=timeout,
+                        ntlm_fallback_secret=ntlm_fallback_secret,
                     ),
                     # Hard ceiling above the per-login timeout so a wedged
                     # TDS socket cannot pin a worker indefinitely.

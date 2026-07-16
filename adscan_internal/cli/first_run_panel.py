@@ -113,10 +113,60 @@ def maybe_show_first_run_panel() -> None:
         show_first_run_panel()
 
 
+def workspace_explainer_should_show(workspaces_dir: str | None = None) -> bool:
+    """Return whether the "what is a workspace" explainer should render.
+
+    True only for a brand-new operator with no workspaces yet. A returning
+    operator (one or more workspaces on disk) never sees it. When
+    ``workspaces_dir`` is provided it is authoritative; otherwise we fall back
+    to the mounted workspaces directory used by the first-run panel.
+    """
+    if workspaces_dir is not None:
+        try:
+            from adscan_internal.workspaces import list_workspaces
+
+            return not list_workspaces(workspaces_dir)
+        except Exception:
+            return _workspaces_dir_is_empty()
+    return _workspaces_dir_is_empty()
+
+
+def show_workspace_explainer() -> None:
+    """Render the one-time, premium "what is a workspace" orientation panel.
+
+    Shown once before the brand-new operator's first workspace-name prompt to
+    remove the "what do I even type" friction that drives step-zero drop-off.
+    Kept intentionally tight (three lines) so it orients without a wall of text.
+    """
+    body = (
+        "[grey70]A workspace is one environment you audit (a domain or forest).[/]\n"
+        "[grey70]ADscan keeps each environment's data, credentials and findings "
+        "isolated from the others.[/]\n"
+        f"[grey50]Name it after the environment, or press [bold {ADSCAN_PRIMARY}]"
+        "Enter[/] to accept the suggested default.[/]"
+    )
+    print_panel(
+        body,
+        title=f"[bold {ADSCAN_PRIMARY}]Your first workspace[/]",
+        title_align="left",
+        border_style=f"dim {ADSCAN_PRIMARY}",
+        padding=(0, 2),
+    )
+
+
+def maybe_show_workspace_explainer(workspaces_dir: str | None = None) -> None:
+    """Render the workspace explainer only for a brand-new operator."""
+    if workspace_explainer_should_show(workspaces_dir):
+        show_workspace_explainer()
+
+
 __all__ = [
     "first_scan_done",
     "mark_first_scan_done",
     "maybe_show_first_run_panel",
+    "maybe_show_workspace_explainer",
     "should_show_first_run_panel",
     "show_first_run_panel",
+    "show_workspace_explainer",
+    "workspace_explainer_should_show",
 ]

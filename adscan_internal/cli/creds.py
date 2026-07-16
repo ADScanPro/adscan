@@ -1052,92 +1052,23 @@ def handle_auth_and_optional_privs(
             force_recheck_user_privs = True
 
     def _choose_authenticated_enumeration_action() -> str:
-        """Return how to proceed when start_auth targets an already-auth domain."""
+        """Return how to proceed when start_auth targets an already-auth domain.
+
+        Consolidation: the old Panel 1 ("Authenticated Domain Already Initialized"
+        — rerun-full vs privs-only) is removed. The workspace-resume panel
+        (``_run_enum_domain_auth`` → ``resolve_workspace_action``) is now the single
+        decision surface for an already-initialized domain, so this resolves to a
+        full authenticated pass here and lets that panel offer Resume / Refresh /
+        Replay / Inspect downstream. The privs-only intent survives as RESUME there.
+
+        ``start_auth`` no longer sets ``prompt_when_already_authenticated`` (the
+        only caller that did), so that branch is dead for the scan path; it is kept
+        resolving to ``full_scan`` without rendering a panel for any other caller.
+        """
         if current_auth_status != "auth":
             return "full_scan"
         if not prompt_when_already_authenticated:
             return "full_scan" if force_authenticated_enumeration else "skip"
-        from adscan_internal.interaction import is_non_interactive as _is_non_interactive
-        if _is_non_interactive(shell):
-            print_info_debug(
-                "[creds] start_auth re-run on already-auth domain in non-interactive mode; "
-                "defaulting to full authenticated scan."
-            )
-            return "full_scan"
-
-        workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-        if workspace_type == "audit":
-            scan_focus = (
-                "Recommended for audits: refresh trust enumeration, BloodHound data, "
-                "and the full authenticated pipeline."
-            )
-            focused_option = "Only inspect this user's privileges and attack paths"
-        elif workspace_type == "ctf":
-            scan_focus = (
-                "Recommended for CTFs when you want a fresh authenticated pass before "
-                "continuing foothold validation or post-auth escalation."
-            )
-            focused_option = (
-                "Only inspect this user's privileges for quick foothold validation"
-            )
-        else:
-            scan_focus = (
-                "Recommended when you want a fresh authenticated pass across the full "
-                "domain pipeline."
-            )
-            focused_option = "Only inspect this user's privileges"
-        options = [
-            "Rerun full authenticated scan (Recommended)",
-            focused_option,
-        ]
-        print_panel(
-            "\n".join(
-                [
-                    f"{GLYPH_ACTIVE} This domain is already marked as authenticated in the current workspace.",
-                    f"Workspace type:  {str(workspace_type or 'unknown').upper()}",
-                    f"Domain:          {marked_domain}",
-                    "",
-                    scan_focus,
-                    "",
-                    "Choose how to proceed:",
-                    "  1. Rerun the full authenticated scan pipeline now",
-                    "  2. Skip the full scan and stay on the current user context",
-                ]
-            ),
-            title=f"[bold {COLOR_STEEL}]{GLYPH_ACTIVE} Authenticated Domain Already Initialized[/bold {COLOR_STEEL}]",
-            border_style=COLOR_STEEL,
-            expand=False,
-        )
-
-        selected_idx: int | None = None
-        selector = getattr(shell, "_questionary_select", None)
-        if callable(selector):
-            try:
-                selected_idx = selector(
-                    "Select how to proceed:", options, default_idx=0
-                )
-            except TypeError:
-                selected_idx = selector("Select how to proceed:", options)
-        if selected_idx is None:
-            selected_choice = Prompt.ask(
-                Text("Select an option", style="cyan"),
-                choices=["1", "2"],
-                default="1",
-            )
-            try:
-                selected_idx = int(selected_choice) - 1
-            except ValueError:
-                selected_idx = 0
-
-        if selected_idx == 1:
-            print_info_debug(
-                "[creds] start_auth re-run on already-auth domain: user selected privileges-only flow."
-            )
-            return "privs_only"
-
-        print_info_debug(
-            "[creds] start_auth re-run on already-auth domain: user selected full authenticated scan."
-        )
         return "full_scan"
 
     enumeration_action = "skip"
@@ -2265,6 +2196,37 @@ def add_credential(
         str(credential_origin or "").strip().lower() in NON_COMPROMISE_ORIGINS
     )
 
+    # SSOT hardening (empty-fed re-verification guard): an EMPTY secret fed for a
+    # DOMAIN user that already has a real (non-empty) stored credential must NEVER
+    # be verified or purged as the empty string — that would delete the captured
+    # credential. This happens when a redundant re-verification / harvest
+    # re-activation of an already-validated hit (e.g. a password-spray hit that
+    # already stored the real password and minted a TGT) calls
+    # add_credential(user, "", allow_empty_credential=True). Reuse the stored
+    # secret instead of verifying the empty string. A GENUINE blank-password
+    # candidate has NO non-empty stored secret for the user, so it stays on the
+    # explicit-blank path untouched. Local credentials (host+service) own a
+    # separate store and verification path, so they are excluded here. Computed
+    # once, before both domain verification sites (subworkspace-creation and the
+    # main domain branch), so neither can purge the real credential.
+    empty_fed_over_stored_secret = False
+    if not (host and service) and allow_empty_credential and cred == "":
+        _domain_data = shell.domains_data.get(domain, {})
+        _credentials_dict = (
+            _domain_data.get("credentials", {}) if isinstance(_domain_data, dict) else {}
+        )
+        _current_domain_cred = (
+            _credentials_dict.get(user) if isinstance(_credentials_dict, dict) else None
+        )
+        if isinstance(_current_domain_cred, str) and _current_domain_cred != "":
+            empty_fed_over_stored_secret = True
+            cred = _current_domain_cred
+            print_info_verbose(
+                "Empty credential supplied for a user with an existing stored "
+                "secret; reusing the stored credential instead of verifying the "
+                "empty string."
+            )
+
     import os
     import time
 
@@ -2302,6 +2264,17 @@ def add_credential(
                 )
                 credential_verified = True
             else:
+                if empty_fed_over_stored_secret:
+                    # Defense in depth: never delete the real stored credential
+                    # because a redundant empty-fed re-verification failed. The
+                    # captured secret (already validated by the flow that stored
+                    # it, e.g. a spray hit that minted a TGT) stays authoritative.
+                    print_info_verbose(
+                        "Keeping the existing stored credential: empty-fed "
+                        "re-verification for a user with a non-empty stored "
+                        "secret must not purge it."
+                    )
+                    return
                 _purge_failed_domain_credential(
                     shell, domain=domain, user=user, ui_silent=ui_silent
                 )
@@ -2501,6 +2474,17 @@ def add_credential(
                 )
                 credential_verified = True
             else:
+                if empty_fed_over_stored_secret:
+                    # Defense in depth: never delete the real stored credential
+                    # because a redundant empty-fed re-verification failed. The
+                    # captured secret (already validated by the flow that stored
+                    # it, e.g. a spray hit that minted a TGT) stays authoritative.
+                    print_info_verbose(
+                        "Keeping the existing stored credential: empty-fed "
+                        "re-verification for a user with a non-empty stored "
+                        "secret must not purge it."
+                    )
+                    return
                 _purge_failed_domain_credential(
                     shell, domain=domain, user=user, ui_silent=ui_silent
                 )
@@ -2764,8 +2748,11 @@ def add_credential(
             )
 
             # Set shell.domain and proceed with enumeration if applicable.
-            if hasattr(shell, "domain"):
-                shell.domain = domain
+            # Single source of truth: ``set_active_domain`` (shared with the
+            # start_unauth/start_auth DNS finalizer) keeps both paths in lockstep.
+            from adscan_internal.cli.common import set_active_domain  # noqa: PLC0415
+
+            set_active_domain(shell, domain)
 
             if (
                 not is_explicit_blank_password
@@ -3383,48 +3370,38 @@ def _check_local_creds_native_smb(
     return False
 
 
-def check_local_creds(
+def _check_local_creds_native_nonsmb(
     shell: Any,
+    *,
     domain_name: str,
     username: str,
     cred_value: str,
     host: str,
     service: str,
 ) -> bool:
-    """Verify host-specific credentials for a service.
+    """Verify a *local* credential for a NON-SMB service via native access probes.
 
-    SMB goes through the native aiosmb path
-    (:func:`_check_local_creds_native_smb`). Non-SMB services
-    (winrm, mssql, ...) keep going through the legacy NetExec
-    subprocess until they are individually migrated.
+    Routes MSSQL and WinRM local-credential verification through the native
+    service-access probes (the impacket MSSQL backend / the PSRP WinRM backend)
+    instead of the NetExec subprocess. Local accounts authenticate over NTLM, so
+    Kerberos is disabled for the probe. Returns True when access is confirmed;
+    admin is sysadmin for MSSQL and a confirmed PSRP shell for WinRM. Never
+    raises to the caller.
     """
-    import os
-
-    from rich.panel import Panel
-
     from adscan_internal import (
         print_error,
-        print_exception,
-        print_info,
-        print_info_debug,
         print_info_verbose,
         print_operation_header,
         print_success,
         print_warning,
     )
     from adscan_internal.rich_output import mark_sensitive
-    from adscan_internal.services.credential_service import CredentialStatus
+    from adscan_internal.services.async_bridge import run_async_sync
+    from adscan_internal.services.service_access_results import ServiceAccessFinding
 
-    if str(service or "").strip().lower() == "smb":
-        return _check_local_creds_native_smb(
-            shell,
-            domain_name=domain_name,
-            username=username,
-            cred_value=cred_value,
-            host=host,
-        )
-
-    cred_type = "Hash" if shell.is_hash(cred_value) else "Password"
+    svc = str(service or "").strip().lower()
+    is_hash = bool(shell.is_hash(cred_value))
+    cred_type = "Hash" if is_hash else "Password"
     print_operation_header(
         "Local Credential Verification",
         details={
@@ -3436,74 +3413,73 @@ def check_local_creds(
         },
         icon="🔑",
     )
-
-    auth_string = shell.build_auth_nxc(username, cred_value)
-    log_file_path = ""
-
-    if shell.current_workspace_dir:
-        log_dir = os.path.join(
-            shell.current_workspace_dir, "domains", domain_name, service
-        )
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            log_file_path = os.path.join(
-                log_dir, f"check_local_{host}_{service}_{username}.log"
-            )
-        except OSError as exc:
-            telemetry.capture_exception(exc)
-            print_error(
-                f"Failed to create log directory '{log_dir}': {exc}. "
-                "Verification cannot proceed with logging."
-            )
-            print_warning("Logging to a relative path due to directory creation error.")
-            log_file_path = f"check_local_{domain_name}_{host}_{service}_{username}.log"
-    else:
-        print_warning(
-            "Current workspace directory not set. Log file path for NetExec will be relative."
-        )
-        log_file_path = f"check_local_{domain_name}_{host}_{service}_{username}.log"
-
+    marked_username = mark_sensitive(username, "user")
     marked_host = mark_sensitive(host, "hostname")
-    marked_log_file_path = mark_sensitive(log_file_path, "path")
-    print_info_verbose("Executing host credential verification")
-    local_timeout_arg = (
-        " --smb-timeout 10" if str(service or "").strip().lower() == "smb" else ""
-    )
-    print_info_debug(
-        f"Command: {shell.netexec_path} {service} {marked_host} "
-        f'{auth_string}{local_timeout_arg} --log "{marked_log_file_path}"'
+    print_info_verbose(
+        f"Executing host credential verification (native {svc} access probe)"
     )
 
-    service_obj = shell._get_credential_service()
-
+    kdc_ip: str | None = None
     try:
-        result = service_obj.verify_local_credentials(
-            domain=domain_name,
-            username=username,
-            credential=cred_value,
-            host=host,
-            service=service,
-            netexec_path=shell.netexec_path,
-            auth_string=auth_string,
-            log_file_path=log_file_path,
-            executor=lambda cmd, timeout: shell._run_netexec(
-                cmd, domain=domain_name, timeout=timeout
-            ),
-        )
+        kdc_ip = resolve_dc_ip((shell.domains_data.get(domain_name, {}) or {}))
+    except Exception:  # noqa: BLE001
+        kdc_ip = None
+
+    finding: ServiceAccessFinding | None = None
+    is_admin = False
+    try:
+        if svc == "mssql":
+            from adscan_internal.services.mssql_access_probe_service import (
+                finding_is_sysadmin,
+                run_mssql_access_probe_sweep,
+            )
+
+            findings = run_async_sync(
+                run_mssql_access_probe_sweep(
+                    domain=domain_name,
+                    username=username,
+                    secret=cred_value,
+                    targets=[host],
+                    use_kerberos=False,
+                    kdc_host=kdc_ip,
+                )
+            )
+            finding = findings[0] if findings else None
+            is_admin = bool(finding and finding_is_sysadmin(finding))
+        elif svc == "winrm":
+            from adscan_internal.services.winrm_access_probe_service import (
+                run_winrm_access_probe_sweep,
+            )
+
+            findings = run_winrm_access_probe_sweep(
+                domain=domain_name,
+                username=username,
+                password=cred_value,
+                targets=[host],
+                workspace_dir=str(getattr(shell, "current_workspace_dir", "") or ""),
+                domains_dir=str(getattr(shell, "domains_dir", "domains")),
+                domain_data=(shell.domains_data.get(domain_name, {}) or {}),
+                auth_mode="ntlm",
+            )
+            finding = findings[0] if findings else None
+            # A confirmed WinRM/PSRP shell requires Remote Management access,
+            # which on a member host is effectively local-admin equivalent.
+            is_admin = bool(finding and finding.is_confirmed)
+        else:
+            print_warning(
+                "Native local-credential verification supports SMB, MSSQL, and "
+                f"WinRM; '{service}' is not supported."
+            )
+            return False
     except Exception as exc:  # pylint: disable=broad-except
         telemetry.capture_exception(exc)
         print_error(
             f"An unexpected error occurred during host credential verification: {exc}"
         )
-        print_exception(show_locals=False, exception=exc)
         return False
 
-    status = result.status
-    marked_username = mark_sensitive(username, "user")
-    marked_host = mark_sensitive(host, "hostname")
-
-    if status == CredentialStatus.VALID:
-        if result.is_admin:
+    if finding is not None and finding.is_confirmed:
+        if is_admin:
             print_success(
                 f"User '[bold]{marked_username}[/bold]' has "
                 f"[bold red]ADMIN[/bold red] access to [bold]{marked_host}[/bold] "
@@ -3518,82 +3494,45 @@ def check_local_creds(
             )
         return True
 
-    if status == CredentialStatus.INVALID:
-        print_error(
-            f"Logon failure for local user '[bold]{marked_username}[/bold]' on "
-            f"host '[bold]{marked_host}[/bold]' via [bold]{service}[/bold]. "
-            "Incorrect credentials."
-        )
-        print_info("Trying with domain credentials instead...")
-        # Local-account credential failed; retried as a domain credential.
-        shell.add_credential(
-            domain_name, username, cred_value, credential_origin="local_cred_retry"
-        )
-        return False
-
-    if status == CredentialStatus.ACCOUNT_LOCKED:
-        print_error(
-            f"Account locked out for user '[bold]{marked_username}[/bold]' on "
-            f"host '[bold]{marked_host}[/bold]'."
-        )
-        return False
-
-    if status == CredentialStatus.ACCOUNT_DISABLED:
-        print_error(
-            f"Account disabled for user '[bold]{marked_username}[/bold]' on "
-            f"host '[bold]{marked_host}[/bold]'."
-        )
-        return False
-
-    if status == CredentialStatus.PASSWORD_EXPIRED:
-        print_warning(
-            f"Password expired for user '[bold]{marked_username}[/bold]' on "
-            f"host '[bold]{marked_host}[/bold]'. Verification failed as the password needs to be changed."
-        )
-        return False
-
-    if status == CredentialStatus.ACCOUNT_RESTRICTION:
-        print_error(
-            f"Account restricted for user '[bold]{marked_username}[/bold]' on "
-            f"host '[bold]{marked_host}[/bold]'."
-        )
-        return False
-
-    if status == CredentialStatus.TIMEOUT:
-        print_error(
-            f"Host credential verification command timed out for user "
-            f"'[bold]{marked_username}[/bold]' on '[bold]{marked_host}[/bold]' "
-            f"via [bold]{service}[/bold]."
-        )
-        return False
-
-    if status == CredentialStatus.USER_NOT_FOUND:
-        print_error(
-            f"User '[bold]{marked_username}[/bold]' not found on host "
-            f"'[bold]{marked_host}[/bold]'."
-        )
-        return False
-
+    reason = finding.reason if finding is not None else "no_result"
     print_error(
-        f"Host credential verification failed for user '[bold]{marked_username}[/bold]' "
-        f"on '[bold]{marked_host}[/bold]' via [bold]{service}[/bold]. NetExec output did not indicate clear success or a known failure."
+        f"Verification failed for local user '[bold]{marked_username}[/bold]' on "
+        f"host '[bold]{marked_host}[/bold]' via [bold]{service}[/bold] ({reason})."
     )
+    return False
 
-    secret_mode = getattr(shell, "SECRET_MODE", False)
-    if result.raw_output and secret_mode:
-        shell.console.print(
-            Panel(
-                result.raw_output.strip(),
-                title=(
-                    f"[bold {COLOR_CRIMSON}]{GLYPH_FAILED} NXC Output[/bold {COLOR_CRIMSON}] "
-                    f"[{COLOR_MUTED}]:[/{COLOR_MUTED}] {username}@{host} ({service})"
-                ),
-                border_style=COLOR_CRIMSON,
-                expand=False,
-            )
+
+def check_local_creds(
+    shell: Any,
+    domain_name: str,
+    username: str,
+    cred_value: str,
+    host: str,
+    service: str,
+) -> bool:
+    """Verify host-specific credentials for a service.
+
+    Every service is verified natively (no subprocess): SMB via aiosmb
+    (:func:`_check_local_creds_native_smb`); MSSQL and WinRM via their native
+    access probes (:func:`_check_local_creds_native_nonsmb`).
+    """
+    if str(service or "").strip().lower() == "smb":
+        return _check_local_creds_native_smb(
+            shell,
+            domain_name=domain_name,
+            username=username,
+            cred_value=cred_value,
+            host=host,
         )
 
-    return False
+    return _check_local_creds_native_nonsmb(
+        shell,
+        domain_name=domain_name,
+        username=username,
+        cred_value=cred_value,
+        host=host,
+        service=service,
+    )
 
 
 def is_hash(cred: str) -> bool:

@@ -93,6 +93,40 @@ def migrate_legacy_attack_graph(graph: dict[str, Any]) -> tuple[dict[str, Any], 
     return graph, changed
 
 
+def _coerce_json_safe(value: Any) -> Any:
+    """Recursively coerce a value into a JSON-serializable form.
+
+    Defense-in-depth over the atomic ``write_json_file`` primitive: even if a
+    non-``_``-prefixed co-tenant (a stray ``set``, ``bytes``, or a custom object)
+    lands in a ``domain_data`` entry, it is normalized here before the write so
+    it cannot poison ``variables.json``.
+
+    * JSON scalars (``str``/``int``/``float``/``bool``/``None``) pass through.
+    * ``bytes`` / ``bytearray`` -> ``None`` (dropped).
+    * ``set`` / ``frozenset`` -> sorted ``list`` (``repr`` order when the members
+      are not mutually comparable).
+    * ``dict`` / ``list`` / ``tuple`` -> recursed.
+    * anything else -> ``str(value)``.
+
+    Deterministic and cheap.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return None
+    if isinstance(value, (set, frozenset)):
+        try:
+            items = sorted(value)
+        except TypeError:
+            items = sorted(value, key=repr)
+        return [_coerce_json_safe(item) for item in items]
+    if isinstance(value, dict):
+        return {key: _coerce_json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_coerce_json_safe(item) for item in value]
+    return str(value)
+
+
 def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
     """Collect workspace-level variables from the CLI shell instance."""
     workspace_vars = {
@@ -141,6 +175,12 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
                     k for k in domain_data.keys() if str(k).startswith("_")
                 ]:
                     domain_data.pop(_transient_key, None)
+                # Belt-and-suspenders over the atomic write: recursively coerce
+                # any non-JSON-serializable co-tenant (set/bytes/custom object)
+                # so it can never poison variables.json.
+                domain_data = {
+                    key: _coerce_json_safe(val) for key, val in domain_data.items()
+                }
             sanitized[domain_key] = domain_data
         workspace_vars["domains_data"] = sanitized
 

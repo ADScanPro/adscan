@@ -746,6 +746,69 @@ def privilege_tier_for_computer(
     return PrivilegeTier.TIER2
 
 
+def privilege_tier_for_computer_node(
+    node: Mapping[str, Any] | None,
+    *,
+    is_tier0_asset: bool = False,
+) -> PrivilegeTier:
+    """Return the :class:`PrivilegeTier` a Computer graph node IS GRANTED.
+
+    The degraded-fallback resolver over :func:`privilege_tier_for_computer` for
+    callers that only have an attack-graph node (no transitive group-membership
+    closure): DC-ness via the collector SSOT
+    (:func:`computer_node_role.classify_computer_node_role`,
+    ``primaryGroupID`` 516/521 + RODC UAC bit + krbtgt SPN), the server-vs-
+    workstation split from ``operatingSystem``, and the caller-supplied
+    ``is_tier0_asset`` degraded signal (a non-DC Tier 0 role — ADCS CA,
+    Exchange, or a generic ``isTierZero``/``highvalue`` tag — the caller
+    resolves what "Tier 0 asset" means for its own context; this function only
+    consumes the boolean).
+
+    This is the single source of truth two callers share:
+    :func:`adscan_internal.cli.intelligence._resolve_target_privilege_tier`
+    (attack-path target nodes) and
+    :func:`adscan_internal.services.credential_harvest_classification.classify_harvested_principal_tier`
+    (a harvested machine-account credential's host). Do not re-derive the
+    DC/server-vs-workstation logic at a new call site — call this function.
+
+    Args:
+        node: A BloodHound/ADscan-shaped Computer node dict (``kind``,
+            ``properties``). Returns :attr:`PrivilegeTier.TIER2` for
+            ``None`` or a non-mapping input — never raises.
+        is_tier0_asset: True when the caller has already determined this
+            host is a Tier 0 asset via a role/tag signal outside group
+            membership (ADCS CA, Exchange, ``isTierZero``, ``highvalue``).
+
+    Returns:
+        :attr:`PrivilegeTier.TIER0_DIRECT` for a DC, the degraded
+        ``TIER0_ESCALATION_CAPABLE`` when ``is_tier0_asset`` and not a DC,
+        :attr:`PrivilegeTier.TIER1` for a plain member server, else
+        :attr:`PrivilegeTier.TIER2`.
+    """
+    from adscan_internal.services.computer_node_role import (  # noqa: PLC0415
+        classify_computer_node_role,
+    )
+
+    if not isinstance(node, Mapping):
+        return PrivilegeTier.TIER2
+
+    dc_role = classify_computer_node_role(dict(node))
+
+    props = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    os_str = ""
+    for key in ("operatingsystem", "operatingSystem"):
+        val = (props or {}).get(key) or node.get(key)
+        if val:
+            os_str = str(val).lower()
+            break
+
+    return privilege_tier_for_computer(
+        is_dc=dc_role is not None,
+        is_tier0_asset=is_tier0_asset,
+        is_server="server" in os_str,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Client label SSOT — the two functions Phase 2 (CLI / report / platform) all
 # translate from. One source; make the strings final and clear.

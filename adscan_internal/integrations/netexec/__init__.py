@@ -7,10 +7,6 @@ so that services and CLI orchestration don't duplicate fragile stdout parsing.
 
 def __getattr__(name: str):
     """Lazily expose common NetExec helpers without package import cycles."""
-    if name in {"NetExecContext", "NetExecRunner"}:
-        from .runner import NetExecContext, NetExecRunner
-
-        return {"NetExecContext": NetExecContext, "NetExecRunner": NetExecRunner}[name]
     if name in {"clean_netexec_workspaces", "get_nxc_workspaces_dir"}:
         from .workspaces import clean_netexec_workspaces, get_nxc_workspaces_dir
 

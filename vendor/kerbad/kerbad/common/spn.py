@@ -40,7 +40,13 @@ class KerberosSPN:
 		kt = KerberosSPN()
 		
 		if s.find('/') != -1:
-			kt.service, s = s.split('/')
+			# A 3-part SPN (serviceclass/host/servicename) is valid and is exactly
+			# what msDS-AllowedToDelegateTo stores; an unbounded split('/') then
+			# yields >2 elements and the 2-way unpack raises
+			# "too many values to unpack". Bound the split so the service class is
+			# taken and the remainder (host[/servicename][@domain][:port]) flows on
+			# to the '@'/':' parsing below unchanged.
+			kt.service, s = s.split('/', 1)
 		if s.find('@') != -1:
 			kt.username, kt.domain = s.rsplit('@', 1)
 		else:

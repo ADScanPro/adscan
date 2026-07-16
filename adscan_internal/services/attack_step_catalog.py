@@ -2526,6 +2526,67 @@ _CATALOG_ENTRIES: tuple[AttackStepCatalogEntry, ...] = (
         source_context_requirement="user_credentials",
         execution_target_access_requirement="computer_reachable",
     ),
+    # ── Broadcast name-resolution poisoning → NetNTLMv2 capture → offline crack ──
+    # Source is the UNAUTHENTICATED_PRINCIPAL: no credential is held. An attacker
+    # sitting on the victim's L2 broadcast segment answers LLMNR / NBT-NS / mDNS
+    # name lookups, captures the responding user's NetNTLMv2 challenge/response,
+    # and recovers the account password by offline cracking. Distinct from the
+    # NTLMv1 steps above by design:
+    #   * NTLMv1 (CrackNTLMv1 / Ntlmv1Relay*) is higher likelihood/impact — the
+    #     DES-based v1 response cracks near-instantly to the raw NT hash and is
+    #     pass-the-hash / silver-ticket capable without recovering the plaintext.
+    #     Those steps keep their own entries + vuln_keys; do NOT fold v1 here.
+    #   * This step is NETNTLMv2-specific: it must be cracked back to the
+    #     cleartext password before it is usable (no PtH from a v2 response), so
+    #     it materializes ONLY on crack success (a proven, usable credential),
+    #     never on bare capture — the capture on its own is the LLMNR/NBT-NS
+    #     poisoning FINDING, materialized separately.
+    # source_context_requirement="none" — like asreproasting/timeroasting, the
+    # technique needs no prior credential. compromise_semantics =
+    # direct_target_compromise: a cracked user NetNTLMv2 IS that user (same as a
+    # cracked AS-REP), so the edge terminates on the compromised principal.
+    _entry(
+        "PoisonCaptureNtlmv2Crack",
+        support_kind="supported",
+        support_reason=(
+            "A rogue name-resolution service on the victim's local broadcast segment "
+            "answered a lookup, captured the victim user's NetNTLMv2 authentication, "
+            "and recovered the account password through offline cracking — yielding a "
+            "usable domain credential from an unauthenticated position."
+        ),
+        compromise_semantics="direct_target_compromise",
+        compromise_effort="high",
+        source_context_requirement="none",
+        category="credential_access",
+        description=(
+            "Broadcast name-resolution poisoning to NetNTLMv2 capture and offline "
+            "crack: an unauthenticated attacker on the same local network segment as "
+            "the victim answers LLMNR, NBT-NS, and mDNS name-resolution requests with "
+            "a rogue address, causing the victim to authenticate to the attacker. The "
+            "captured NetNTLMv2 challenge/response is then cracked offline to recover "
+            "the user's cleartext password, converting a wire capture into a usable "
+            "domain credential without any prior access."
+        ),
+        vuln_key="smb_relay_targets",
+        remediation_complexity="low",
+        remediation_effort=(
+            "Disable multicast and broadcast name resolution so there is nothing to "
+            "poison: turn off LLMNR (GPO: Computer Configuration → Administrative "
+            "Templates → Network → DNS Client → 'Turn off multicast name resolution' "
+            "= Enabled) and disable NetBIOS over TCP/IP (NBT-NS) on all interfaces "
+            "via DHCP option 001 or per-adapter configuration. Enforce a strong "
+            "password policy so any captured response cannot be cracked offline."
+        ),
+        can_fully_mitigate=True,
+        mitre_technique_id="T1557.001",
+        mitre_technique_name=(
+            "Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning and SMB Relay"
+        ),
+        detection_event_ids=("4624", "4648"),
+        bh_native=False,
+        bh_cypher_names=("PoisonCaptureNtlmv2Crack",),
+        execution_target_access_requirement="none",
+    ),
 )
 
 
@@ -2740,6 +2801,22 @@ def get_exploitation_relation_vuln_keys() -> dict[str, str]:
         for relation, entry in ATTACK_STEP_CATALOG.items()
         if isinstance(entry.vuln_key, str) and entry.vuln_key.strip()
     }
+
+
+def ntlmv1_crack_support_for(account_type: str) -> str:
+    """Return the ``CrackNTLMv1`` support classification for a captured account.
+
+    A user account has a human-chosen password, so a captured NetNTLMv1
+    challenge/response for that user is wordlist-crackable ("supported"). A
+    machine account has a random DC-generated password, so only DES rainbow
+    tables recover it ("unsupported" until an on-prem/VPS rainbow backend
+    lands — see BACKLOG "NTLMv1 offline-crack capability"). The catalog's
+    ``CrackNTLMv1`` entry keeps its static ``unsupported`` default (the
+    coercion-relay, machine-targeted avenue); this helper is consulted at the
+    crack-success materialization site to decide whether a SPECIFIC cracked
+    principal should be recorded as an exploited (supported) edge instead.
+    """
+    return "supported" if account_type == "user" else "unsupported"
 
 
 # ── BloodHound CE edge helpers ─────────────────────────────────────────────────

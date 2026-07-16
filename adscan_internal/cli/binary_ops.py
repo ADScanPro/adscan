@@ -358,18 +358,11 @@ def _select_auth(shell: Any, domain: str, host: str) -> RemoteWindowsAuth | None
     else:
         _, username, secret = options[idx]
 
-    nxc_auth = None
-    build_auth = getattr(shell, "build_auth_nxc", None)
-    if callable(build_auth):
-        is_ccache = str(secret).lower().endswith(".ccache")
-        nxc_auth = str(build_auth(username, secret, domain, kerberos=is_ccache))
-
     return RemoteWindowsAuth(
         domain=domain,
         host=host,
         username=username,
         secret=secret,
-        nxc_auth=nxc_auth,
     )
 
 
@@ -562,17 +555,11 @@ def _build_auth(
     username: str,
     secret: str,
 ) -> RemoteWindowsAuth:
-    nxc_auth = None
-    build_fn = getattr(shell, "build_auth_nxc", None)
-    if callable(build_fn):
-        is_ccache = str(secret).lower().endswith(".ccache")
-        nxc_auth = str(build_fn(username, secret, domain, kerberos=is_ccache))
     return RemoteWindowsAuth(
         domain=domain,
         host=host,
         username=username,
         secret=secret,
-        nxc_auth=nxc_auth,
     )
 
 

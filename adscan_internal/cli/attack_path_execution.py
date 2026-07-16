@@ -19,7 +19,6 @@ import asyncio
 import os
 import re
 import secrets
-import shlex
 import time
 
 from rich.prompt import Confirm, Prompt
@@ -463,12 +462,41 @@ def _get_writelogonscript_lockout_policy_state(
     username: str,
     password: str,
 ) -> dict[str, Any]:
-    """Return whether automatic post-stage validation is safe for this domain."""
+    """Return whether automatic post-stage validation is safe for this domain.
+
+    Reads the domain lockout threshold via a FRESH native LDAP query
+    (``fetch_spray_policy_native`` — the same SSOT the spray path uses, which
+    never trusts a cached lockout value because a reactively-tightened GPO can
+    lock real accounts) instead of an ``nxc --pass-pol`` subprocess. Auto-
+    validation is safe iff no lockout is enforced (threshold absent/0); a
+    positive threshold means an auth attempt could count toward lockout, so
+    auto-validation is withheld.
+    """
+    from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.services.async_bridge import run_async_sync
+    from adscan_internal.services.spray_policy_service import (
+        fetch_spray_policy_native,
+    )
+
+    domain_data = getattr(shell, "domains_data", {}).get(domain, {}) or {}
+    dc_ip = resolve_dc_ip(domain_data)
+    if not dc_ip or not username or not password:
+        return {
+            "policy_known": False,
+            "auto_validation_safe": False,
+            "lockout_threshold": None,
+            "explicit_none": False,
+            "error": "Missing PDC or authenticated credential for the lockout-policy read.",
+        }
+
     try:
-        from adscan_internal.cli.spraying import _run_netexec_query_with_parse_retry
-        from adscan_internal.spraying import (
-            build_netexec_pass_pol_command,
-            parse_netexec_lockout_threshold_result,
+        policy = run_async_sync(
+            fetch_spray_policy_native(
+                domain=domain,
+                dc_ip=dc_ip,
+                username=username,
+                password=password,
+            )
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -480,78 +508,32 @@ def _get_writelogonscript_lockout_policy_state(
             "error": str(exc),
         }
 
-    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
-    pdc_ip = str(domain_data.get("pdc") or "").strip()
-    netexec_path = str(getattr(shell, "netexec_path", "") or "").strip()
-    if not pdc_ip or not netexec_path or not username or not password:
+    threshold = getattr(
+        getattr(policy, "default_policy", None), "lockout_threshold", None
+    )
+    if threshold is None:
         return {
             "policy_known": False,
             "auto_validation_safe": False,
             "lockout_threshold": None,
             "explicit_none": False,
-            "error": "Missing NetExec path, PDC, or authenticated credential for pass-pol query.",
+            "error": "Native lockout-policy read returned no parseable threshold.",
         }
-
-    command = build_netexec_pass_pol_command(
-        nxc_path=netexec_path,
-        dc_ip=pdc_ip,
-        username=username,
-        password=password,
-        domain=domain,
-        kerberos=True,
-    )
-    print_info_debug(f"[writelogonscript pass-pol] {command}")
-    proc = _run_netexec_query_with_parse_retry(
-        shell,
-        command=command,
-        domain=domain,
-        query_label="NetExec --pass-pol",
-        parse_ok=lambda output: (
-            parse_netexec_lockout_threshold_result(output).explicit_none
-            or parse_netexec_lockout_threshold_result(output).threshold is not None
-        ),
-    )
-    stdout = str(getattr(proc, "stdout", "") or "")
-    if not stdout:
-        return {
-            "policy_known": False,
-            "auto_validation_safe": False,
-            "lockout_threshold": None,
-            "explicit_none": False,
-            "error": "Password policy query returned no parseable output.",
-        }
-
-    threshold_result = parse_netexec_lockout_threshold_result(stdout)
-    if threshold_result.explicit_none:
-        return {
-            "policy_known": True,
-            "auto_validation_safe": True,
-            "lockout_threshold": None,
-            "explicit_none": True,
-            "error": "",
-        }
-    if threshold_result.threshold == 0:
+    if int(threshold) == 0:
+        # lockoutThreshold=0 → lockout disabled → auto-validation is safe.
         return {
             "policy_known": True,
             "auto_validation_safe": True,
             "lockout_threshold": 0,
-            "explicit_none": False,
-            "error": "",
-        }
-    if threshold_result.threshold is not None:
-        return {
-            "policy_known": True,
-            "auto_validation_safe": False,
-            "lockout_threshold": int(threshold_result.threshold),
-            "explicit_none": False,
+            "explicit_none": True,
             "error": "",
         }
     return {
-        "policy_known": False,
+        "policy_known": True,
         "auto_validation_safe": False,
-        "lockout_threshold": None,
+        "lockout_threshold": int(threshold),
         "explicit_none": False,
-        "error": "Password policy output did not expose a parseable lockout threshold.",
+        "error": "",
     }
 
 
@@ -4685,25 +4667,6 @@ def _generate_policy_compliant_password(
     return generate_compliant_password(policy, machine=machine)
 
 
-def _run_netexec_for_domain(
-    shell: Any,
-    *,
-    domain: str,
-    command: str,
-    timeout: int = 300,
-) -> Any:
-    """Run a NetExec command with domain-aware retry/sync when available."""
-    netexec_runner = getattr(shell, "_run_netexec", None)
-    if callable(netexec_runner):
-        return netexec_runner(command, domain=domain, timeout=timeout)
-    return shell.run_command(command, timeout=timeout)
-
-
-_HASSESSION_LEGACY_NETEXEC = os.getenv(
-    "ADSCAN_HASSESSION_LEGACY_NETEXEC", ""
-).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _looks_like_nt_hash(value: str) -> bool:
     """Return True if ``value`` looks like a 32-hex NT hash (or LM:NT pair)."""
     raw = str(value or "").strip()
@@ -4983,59 +4946,6 @@ def _run_hassession_schtask_command_native(
     return bool(result.success), output
 
 
-def _run_hassession_schtask_command_legacy(
-    shell: Any,
-    *,
-    domain: str,
-    exec_username: str,
-    exec_password: str,
-    target_host: str,
-    session_user: str,
-    command_to_run: str,
-    log_suffix: str,
-) -> tuple[bool, str]:
-    """Legacy NetExec ``-M schtask_as`` path.
-
-    Kept behind the ``ADSCAN_HASSESSION_LEGACY_NETEXEC=1`` env flag for one
-    release as a safety net. Will be removed once the native path has soaked.
-    """
-    marked_host = mark_sensitive(target_host, "hostname")
-    marked_exec_user = mark_sensitive(exec_username, "user")
-    marked_session_user = mark_sensitive(session_user, "user")
-    print_info_debug(
-        "[hassession-legacy] Running schtask_as on "
-        f"{marked_host} as session user {marked_session_user} "
-        f"(executor: {marked_exec_user})."
-    )
-    auth = shell.build_auth_nxc(exec_username, exec_password, domain, kerberos=False)
-    safe_host = _sanitize_filename_token(target_host, fallback="target")
-    safe_exec_user = _sanitize_filename_token(exec_username, fallback="executor")
-    safe_suffix = _sanitize_filename_token(log_suffix, fallback="command")
-    log_path = (
-        f"domains/{domain}/smb/"
-        f"hassession_{safe_suffix}_{safe_exec_user}_{safe_host}.log"
-    )
-    module_command = (
-        f"{shell.netexec_path} smb {shlex.quote(target_host)} {auth} "
-        f"-t 1 --timeout 60 --smb-timeout 10 "
-        f"-M schtask_as "
-        f"-o CMD={shlex.quote(command_to_run)} USER={shlex.quote(session_user)} "
-        f"--log {shlex.quote(log_path)}"
-    )
-    result = _run_netexec_for_domain(
-        shell,
-        domain=domain,
-        command=module_command,
-        timeout=300,
-    )
-    if result is None:
-        return False, ""
-    stdout = str(getattr(result, "stdout", "") or "")
-    stderr = str(getattr(result, "stderr", "") or "")
-    output = "\n".join(part for part in (stdout, stderr) if part)
-    return bool(getattr(result, "returncode", 1) == 0), output
-
-
 def _run_hassession_schtask_command(
     shell: Any,
     *,
@@ -5047,13 +4957,8 @@ def _run_hassession_schtask_command(
     command_to_run: str,
     log_suffix: str,
 ) -> tuple[bool, str]:
-    """Dispatch HasSession schtask_as to the native or legacy backend."""
-    backend = (
-        _run_hassession_schtask_command_legacy
-        if _HASSESSION_LEGACY_NETEXEC
-        else _run_hassession_schtask_command_native
-    )
-    return backend(
+    """Run HasSession schtask_as via the native aiosmb backend."""
+    return _run_hassession_schtask_command_native(
         shell,
         domain=domain,
         exec_username=exec_username,
@@ -5617,27 +5522,28 @@ def _run_hassession_rollback(
         telemetry.capture_exception(exc)
         print_warning(f"[rollback] schtask delete raised: {exc}")
 
-    # Fallback: if the created user has DA creds (target_password), try a
-    # direct netexec delete so the rollback succeeds even if robb.stark
-    # has logged off by this point.
+    # Fallback: if the created user has DA creds (target_password), try a direct
+    # native LDAP delete so the rollback succeeds even if the session user has
+    # logged off by this point.
     if not deleted and target_password:
         try:
-            fallback_cmd = (
-                f"{shell.netexec_path} ldap {shlex.quote(domain)} "
-                f"-u {shlex.quote(target_user)} -p {shlex.quote(target_password)} "
-                f"--del-user {shlex.quote(target_user)}"
+            from adscan_internal.services.native_account_cleanup import (
+                delete_domain_account_via_ldap,
             )
-            result = _run_netexec_for_domain(
-                shell, domain=domain, command=fallback_cmd, timeout=60
-            )
-            if result is not None and getattr(result, "returncode", 1) == 0:
+
+            if delete_domain_account_via_ldap(
+                domains_data=getattr(shell, "domains_data", {}) or {},
+                domain=domain,
+                username=target_user,
+                secret=target_password,
+            ):
                 print_info(
-                    f"[rollback] Account {marked_user} deleted via LDAP fallback."
+                    f"[rollback] Account {marked_user} deleted via native LDAP."
                 )
                 deleted = True
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
-            print_warning(f"[rollback] LDAP fallback delete raised: {exc}")
+            print_warning(f"[rollback] native LDAP delete raised: {exc}")
 
     if not deleted:
         print_warning(

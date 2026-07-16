@@ -111,6 +111,11 @@ class ImpacketMSSQLBackend:
 
         return tds.MSSQL(host, port=port, remoteName=remote_name)
 
+    @staticmethod
+    def _is_ccache_secret(secret: str | None) -> bool:
+        """Return True when ``secret`` is a Kerberos ccache path, not a password."""
+        return str(secret or "").strip().lower().endswith(".ccache")
+
     def execute_query(
         self,
         *,
@@ -122,23 +127,43 @@ class ImpacketMSSQLBackend:
         timeout: int = 120,
         use_kerberos: bool = False,
         allow_ntlm_fallback: bool = False,
+        ntlm_fallback_secret: str | None = None,
     ) -> NativeMSSQLQueryResult:
         """Execute one T-SQL query and return structured output.
 
         When ``use_kerberos`` is True (and the credential is Windows auth),
         Kerberos is used instead of NTLM. Defaults preserve legacy behavior.
+
+        The NTLM fallback (``allow_ntlm_fallback``) reuses ``secret`` directly
+        when it is a password / NT hash. When ``secret`` is a ``.ccache`` path
+        Kerberos-only credential, that ticket cannot drive an NTLM bind — so a
+        password / NT hash for the same principal must be supplied via
+        ``ntlm_fallback_secret`` for the NTLM attempt to be queued. Without it
+        no NTLM attempt is made, and the "retrying with NTLM" log below is not
+        emitted (the log always reflects what is actually attempted). This is
+        what lets an instance with no ``MSSQLSvc`` SPN — where Kerberos fails
+        with ``KDC_ERR_S_PRINCIPAL_UNKNOWN`` — still be assessed over NTLM.
         """
         final_query = self._wrap_linked_query(query, linked_server)
         started_at = time.perf_counter()
         final_error: Exception | None = None
-        auth_attempts = [use_kerberos]
-        if (
-            use_kerberos
-            and allow_ntlm_fallback
-            and not str(secret or "").strip().lower().endswith(".ccache")
-        ):
-            auth_attempts.append(False)
-        for attempt_use_kerberos in auth_attempts:
+        # Each attempt is (use_kerberos, secret). The NTLM fallback slot is only
+        # appended when an NTLM attempt can genuinely be made, so the retry log
+        # below can never claim a fallback that was never queued.
+        auth_attempts: list[tuple[bool, str]] = [(use_kerberos, secret)]
+        if use_kerberos and allow_ntlm_fallback:
+            if not self._is_ccache_secret(secret):
+                # Kerberos was tried with a password / NT hash — reuse it for NTLM.
+                auth_attempts.append((False, secret))
+            elif ntlm_fallback_secret and not self._is_ccache_secret(
+                ntlm_fallback_secret
+            ):
+                # ccache-only Kerberos credential: NTLM needs a real password /
+                # NT hash for the same principal to attempt an SPN-less instance.
+                auth_attempts.append((False, ntlm_fallback_secret))
+
+        for index, (attempt_use_kerberos, attempt_secret) in enumerate(auth_attempts):
+            has_ntlm_fallback_next = index + 1 < len(auth_attempts)
             client = self._client_factory(
                 self.host, self.port, self._kerberos_remote_name
             )
@@ -148,7 +173,7 @@ class ImpacketMSSQLBackend:
                     client,
                     domain=domain,
                     username=username,
-                    secret=secret,
+                    secret=attempt_secret,
                     use_kerberos=attempt_use_kerberos,
                 ):
                     return NativeMSSQLQueryResult(
@@ -181,7 +206,11 @@ class ImpacketMSSQLBackend:
                 return query_result
             except Exception as exc:  # noqa: BLE001
                 final_error = exc
-                if attempt_use_kerberos and self._is_kerberos_infra_error(exc):
+                if (
+                    attempt_use_kerberos
+                    and has_ntlm_fallback_next
+                    and self._is_kerberos_infra_error(exc)
+                ):
                     print_info_debug(
                         "[mssql_native] Kerberos infra error — retrying with NTLM"
                     )
@@ -570,7 +599,7 @@ class ImpacketMSSQLBackend:
         use_kerberos: bool = False,
     ) -> bool:
         """Authenticate against MSSQL using password, NTLM hash, or Kerberos."""
-        if str(secret or "").strip().lower().endswith(".ccache"):
+        if self._is_ccache_secret(secret):
             with self._temporary_kerberos_env(secret):
                 return bool(
                     client.kerberosLogin(

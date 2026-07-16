@@ -37,7 +37,18 @@ try:
 except ImportError:
 	logger.debug('No Qt installed! Converting to qt will not work')
 
-import librlers
+# librlers is an OPTIONAL Rust extension (setup.py declares it optional=True) that
+# aardwolf compiles from its own source for VNC/RDP bitmap decompression. If the
+# rust toolchain is absent at build time it is silently skipped, so this module
+# must import it defensively — otherwise the hard import breaks `import aardwolf`
+# entirely (commons/factory imports VNCConnection), taking down RDP AUTH too even
+# though auth never needs bitmap decode. Mirrors the guard already in
+# utils/rectconvert.py. The two call sites below (mask_rgbx/decode_rre) are
+# VNC-decode only and raise a clear error if reached without librlers.
+try:
+	import librlers
+except ImportError:
+	librlers = None  # type: ignore[assignment]
 
 # https://datatracker.ietf.org/doc/html/rfc6143
 

@@ -76,13 +76,15 @@ class StreamedProcessResult:
     post-run parsing path (``-oG`` / ``-o`` file, stdout scan) unchanged.
 
     Attributes:
-        returncode: Process exit code (negative on timeout/kill).
+        returncode: Process exit code (negative on timeout/kill/cancel).
         stdout: Full captured standard output.
         stderr: Full captured standard error.
         timed_out: True when the wall-clock budget was exceeded.
+        cancelled: True when ``should_cancel`` reported a cooperative stop
+            (an operator/platform early-stop, distinct from a timeout).
     """
 
-    __slots__ = ("returncode", "stdout", "stderr", "timed_out")
+    __slots__ = ("returncode", "stdout", "stderr", "timed_out", "cancelled")
 
     def __init__(
         self,
@@ -91,11 +93,24 @@ class StreamedProcessResult:
         stderr: str,
         *,
         timed_out: bool = False,
+        cancelled: bool = False,
     ) -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
         self.timed_out = timed_out
+        self.cancelled = cancelled
+
+
+# Throttle for ``should_cancel`` polling. A cooperative-cancellation check is
+# typically a file stat (cross-process sentinel poll) — cheap once, but a
+# steadily-emitting tool (kerbrute at hundreds of lines/sec) would otherwise
+# stat the sentinel once per line. Checking at most once per this interval
+# keeps the I/O bounded regardless of line rate; being off by up to this much
+# wall-clock time before actually stopping is an acceptable trade for any
+# cooperative-stop consumer (the whole point is a coarse, operator-scale
+# "stop soon", not a precise per-line cutoff).
+_CANCEL_CHECK_INTERVAL_SECS = 0.5
 
 
 def stream_command_lines(
@@ -106,6 +121,8 @@ def stream_command_lines(
     on_line: Callable[[str], None],
     on_timeout: Optional[Callable[[], None]] = None,
     on_drain: Optional[Callable[[], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    on_cancel: Optional[Callable[[], None]] = None,
 ) -> Optional[StreamedProcessResult]:
     """Spawn ``command`` and stream its stdout line-by-line through ``on_line``.
 
@@ -132,9 +149,22 @@ def stream_command_lines(
             wall-clock budget is exceeded (e.g. to set a timeout marker on the
             shell so a recovery prompt can fire after the Live exits).
         on_drain: Optional zero-arg callback fired exactly once after the
-            stdout stream closes cleanly (no timeout), BEFORE the result is
-            returned. Lets a caller push a final dashboard frame (e.g. snap a
-            determinate bar to 100%) once the tool has finished emitting lines.
+            stdout stream closes cleanly (no timeout, no cancel), BEFORE the
+            result is returned. Lets a caller push a final dashboard frame
+            (e.g. snap a determinate bar to 100%) once the tool has finished
+            emitting lines.
+        should_cancel: Optional zero-arg predicate polled (throttled — see
+            :data:`_CANCEL_CHECK_INTERVAL_SECS`) between lines. A cooperative-
+            cancellation check (e.g.
+            ``CooperativeCancellation.should_stop``) — when it returns
+            ``True`` the process is killed exactly like a timeout, but the
+            result is marked ``cancelled=True`` instead of ``timed_out=True``
+            so the caller can distinguish "operator stopped this early" from
+            "this tool hung" and recover the PARTIAL output the same way.
+        on_cancel: Optional zero-arg callback fired exactly once when
+            ``should_cancel`` triggers a stop, before the result is returned.
+            Mirrors ``on_timeout`` for the cancellation case (e.g. push a
+            final dashboard frame so the partial progress is visible).
 
     Returns:
         A :class:`StreamedProcessResult` on completion, or ``None`` if the
@@ -154,26 +184,34 @@ def stream_command_lines(
     stdout_lines: list[str] = []
     start = time.monotonic()
     timed_out = False
+    cancelled = False
+    last_cancel_check = start
 
     try:
         for raw_line in proc.stdout:
             stdout_lines.append(raw_line)
             on_line(raw_line.rstrip("\n"))
 
-            if (
-                timeout_seconds is not None
-                and (time.monotonic() - start) > timeout_seconds
-            ):
+            now = time.monotonic()
+            if timeout_seconds is not None and (now - start) > timeout_seconds:
                 timed_out = True
                 break
+            if (
+                should_cancel is not None
+                and (now - last_cancel_check) >= _CANCEL_CHECK_INTERVAL_SECS
+            ):
+                last_cancel_check = now
+                if should_cancel():
+                    cancelled = True
+                    break
     finally:
-        if timed_out:
+        if timed_out or cancelled:
             try:
                 proc.kill()
             except Exception:  # noqa: BLE001 -- kill is best-effort
                 pass
 
-    if not timed_out and on_drain is not None:
+    if not timed_out and not cancelled and on_drain is not None:
         try:
             on_drain()
         except Exception:  # noqa: BLE001 -- final-frame callback is best-effort
@@ -198,10 +236,18 @@ def stream_command_lines(
                 on_timeout()
             except Exception:  # noqa: BLE001 -- marker callback is best-effort
                 pass
+    elif cancelled:
+        returncode = -1
+        if on_cancel is not None:
+            try:
+                on_cancel()
+            except Exception:  # noqa: BLE001 -- marker callback is best-effort
+                pass
 
     return StreamedProcessResult(
         returncode=returncode,
         stdout="".join(stdout_lines),
         stderr=stderr_text or "",
         timed_out=timed_out,
+        cancelled=cancelled,
     )

@@ -1360,6 +1360,14 @@ def check_external_tools(
     return all_ok
 
 
+# Cracking-only system packages: required exclusively for offline password
+# cracking (Kerberoast / AS-REP / captured-artifact hashes), never for
+# collection, enumeration, or attack-path analysis. Their absence (or a
+# present-but-unusable build) must WARN and let the scan proceed — it must
+# never hard-abort `adscan start`.
+CRACKING_ONLY_SYSTEM_PACKAGES: frozenset[str] = frozenset({"john", "hashcat"})
+
+
 @dataclass(frozen=True)
 class SystemPackagesCheckConfig:
     """Configuration for checking essential system packages."""
@@ -1367,6 +1375,13 @@ class SystemPackagesCheckConfig:
     system_packages_to_verify: Mapping[str, Dict[str, Any]]
     fix_mode: bool
     full_container_runtime: bool = False
+    # Package names that are optional/cracking-only: missing or broken builds
+    # warn instead of aborting the scan.
+    optional_system_packages: frozenset[str] = CRACKING_ONLY_SYSTEM_PACKAGES
+    # True when running inside a container that is NOT the ADscan runtime image
+    # (foreign container). Used to give a clearer message than a per-tool apt
+    # hint when required packages are missing.
+    foreign_container_runtime: bool = False
 
 
 @dataclass(frozen=True)
@@ -1388,6 +1403,42 @@ class SystemPackagesCheckDeps:
     print_exception: Callable[..., None]
 
 
+def _system_packages_result(required_missing: list[str]) -> tuple[bool, List[str]]:
+    """Map remaining required-missing packages to a (passed, missing) result.
+
+    Only packages that are actually required to run a scan drive the pass/fail
+    verdict. Optional cracking-only tools are handled separately (warn), so an
+    empty ``required_missing`` is a pass even when cracking tools are absent.
+    """
+    if required_missing:
+        return False, required_missing
+    return True, []
+
+
+def _warn_optional_cracking_packages(
+    *,
+    optional_missing: list[str],
+    config: SystemPackagesCheckConfig,
+    deps: SystemPackagesCheckDeps,
+) -> None:
+    """Warn (never abort) that optional cracking-only tools are unavailable."""
+    deps.print_warning(
+        "Optional cracking tools are not available: "
+        f"{', '.join(sorted(optional_missing))}. Offline password cracking "
+        "(Kerberoast / AS-REP / captured hashes) will be skipped; collection, "
+        "enumeration, and attack-path analysis run normally."
+    )
+    if config.foreign_container_runtime:
+        deps.print_info(
+            "These tools ship with the ADscan runtime image, but this session is "
+            "running outside it. Run `adscan start` on the host to use the bundled runtime."
+        )
+    elif not config.full_container_runtime:
+        deps.print_instruction(
+            "To enable offline cracking later, install them with: adscan check --fix"
+        )
+
+
 def check_system_packages(
     *,
     config: SystemPackagesCheckConfig,
@@ -1404,39 +1455,66 @@ def check_system_packages(
         missing_pkgs=missing_pkgs,
         deps=deps,
     )
+
+    optional_names = config.optional_system_packages or frozenset()
+    optional_missing = [pkg for pkg in missing_pkgs if pkg in optional_names]
+    required_missing = [pkg for pkg in missing_pkgs if pkg not in optional_names]
+
+    # Cracking-only tools (John / Hashcat) are used exclusively for offline
+    # password cracking and are never needed for collection, enumeration, or
+    # attack-path analysis. A missing one must WARN and let the scan proceed —
+    # never abort.
+    if optional_missing:
+        _warn_optional_cracking_packages(
+            optional_missing=optional_missing,
+            config=config,
+            deps=deps,
+        )
+
     if missing_pkgs:
         deps.print_info_debug(
             "[check] Missing system packages after runtime normalization: "
             + ", ".join(missing_pkgs)
         )
-        deps.print_error(f"Missing system packages: {', '.join(missing_pkgs)}")
-        if config.full_container_runtime:
-            deps.print_instruction("Run on the host: adscan update")
-            deps.print_info(
-                "This check is running inside the ADscan runtime, so missing runtime-managed "
-                "packages should be repaired by refreshing the host launcher/runtime image."
+        if required_missing:
+            deps.print_error(
+                f"Missing system packages: {', '.join(required_missing)}"
             )
-        else:
-            deps.print_instruction(
-                f"Try installing them with: sudo apt install {' '.join(missing_pkgs)}"
-            )
+            if config.foreign_container_runtime:
+                deps.print_error(
+                    "You are not running inside the ADscan runtime image."
+                )
+                deps.print_instruction(
+                    "Run `adscan start` on the host so the launcher provides the "
+                    "bundled runtime container with all required tools."
+                )
+            elif config.full_container_runtime:
+                deps.print_instruction("Run on the host: adscan update")
+                deps.print_info(
+                    "This check is running inside the ADscan runtime, so missing runtime-managed "
+                    "packages should be repaired by refreshing the host launcher/runtime image."
+                )
+            else:
+                deps.print_instruction(
+                    f"Try installing them with: sudo apt install {' '.join(required_missing)}"
+                )
 
         if config.fix_mode:
             if config.full_container_runtime:
                 deps.print_warning(
                     "Automatic system-package repair is not available inside the ADscan runtime."
                 )
-                return False, missing_pkgs
+                return _system_packages_result(required_missing)
             if not shutil.which("apt-get"):
                 deps.print_warning(
                     "Automatic package installation requires apt-get (Debian-based systems)."
                 )
-                return False, missing_pkgs
+                return _system_packages_result(required_missing)
             if not deps.sudo_validate():
                 deps.print_warning(
                     "Cannot auto-install system packages without sudo privileges."
                 )
-                return False, missing_pkgs
+                return _system_packages_result(required_missing)
             try:
                 deps.print_info(
                     "Attempting to install missing system packages (requested via --fix)..."
@@ -1466,12 +1544,25 @@ def check_system_packages(
                 package_results = deps.verify_system_packages(
                     config.system_packages_to_verify, mode="check"
                 )
-                if package_results.get("missing"):
+                still_missing = list(package_results.get("missing", []))
+                still_required = [
+                    pkg for pkg in still_missing if pkg not in optional_names
+                ]
+                still_optional = [
+                    pkg for pkg in still_missing if pkg in optional_names
+                ]
+                if still_optional:
+                    _warn_optional_cracking_packages(
+                        optional_missing=still_optional,
+                        config=config,
+                        deps=deps,
+                    )
+                if still_required:
                     deps.print_error(
                         "Some system packages are still missing after --fix: "
-                        + ", ".join(package_results["missing"])
+                        + ", ".join(still_required)
                     )
-                    return False, list(package_results["missing"])
+                    return False, still_required
                 deps.print_success(
                     "Essential system packages installed successfully (--fix)."
                 )
@@ -1482,20 +1573,24 @@ def check_system_packages(
                     "Failed to install missing system packages with --fix."
                 )
                 deps.print_exception(show_locals=False, exception=exc)
-                return False, missing_pkgs
+                return _system_packages_result(required_missing)
             except Exception as exc:  # noqa: BLE001
                 deps.telemetry_capture_exception(exc)
                 deps.print_error(
                     "Unexpected error while attempting to install system packages (--fix)."
                 )
                 deps.print_exception(show_locals=False, exception=exc)
-                return False, missing_pkgs
-        return False, missing_pkgs
+                return _system_packages_result(required_missing)
+        return _system_packages_result(required_missing)
 
     if package_issues:
-        deps.print_error("System package validation issues detected:")
+        # `_normalize_missing_system_packages_for_runtime` only records issues for
+        # cracking-only tools (John AVX2/converters, Hashcat version) that are
+        # present but unusable. Same tier as a missing cracking tool: warn and
+        # let the scan proceed — never abort.
+        deps.print_warning("Optional cracking-tool validation issues detected:")
         for issue in package_issues:
-            deps.print_error(f"  - {issue}")
+            deps.print_warning(f"  - {issue}")
         if any("John the Ripper" in issue for issue in package_issues):
             if config.full_container_runtime:
                 deps.print_instruction(
@@ -1509,48 +1604,14 @@ def check_system_packages(
             deps.print_instruction(
                 "Install a working hashcat binary via PATH (>= 7.1.2), for example from the official release."
             )
-        return False, []
+        deps.print_info(
+            "Offline password cracking may be degraded; collection, enumeration, "
+            "and attack-path analysis run normally."
+        )
+        return True, []
 
     deps.print_success("Essential system packages seem to be installed.")
     return True, []
-
-
-@dataclass(frozen=True)
-class LibreOfficeCheckConfig:
-    """Configuration for checking LibreOffice availability (none needed)."""
-
-
-@dataclass(frozen=True)
-class LibreOfficeCheckDeps:
-    """Dependency bundle for LibreOffice check."""
-
-    is_libreoffice_available: Callable[[], tuple[bool, str]]
-    print_info: Callable[[str], None]
-    print_success: Callable[[str], None]
-    print_warning: Callable[[str], None]
-    print_instruction: Callable[[str], None]
-
-
-def check_libreoffice(
-    *,
-    config: LibreOfficeCheckConfig,
-    deps: LibreOfficeCheckDeps,
-) -> bool:
-    """Check whether LibreOffice is available for PDF report generation.
-
-    Returns:
-        True if libreoffice is present, False otherwise. Note: this is optional and
-        should not fail the overall check on its own.
-    """
-    deps.print_info("Checking libreoffice for PDF conversion...")
-    libreoffice_available, libreoffice_info = deps.is_libreoffice_available()
-    if libreoffice_available:
-        deps.print_success(f"libreoffice is available: {libreoffice_info}")
-        return True
-    deps.print_warning(f"libreoffice is not available: {libreoffice_info}")
-    deps.print_info("libreoffice is required for PDF report generation")
-    deps.print_instruction("Install with: sudo apt-get install -y libreoffice")
-    return False
 
 
 @dataclass(frozen=True)
@@ -3007,7 +3068,6 @@ class CheckDeps:
     check_pyenv_status: Callable[..., bool]
 
     # Helper functions
-    is_libreoffice_available: Callable[[], tuple[bool, str]]
     print_check_summary: Callable[[bool], None]
 
     # Wordlist service
@@ -3320,11 +3380,17 @@ def run_check(
 
     system_packages_to_verify = config.system_packages_config.copy()
 
+    # A foreign container is a Docker environment that is NOT the ADscan runtime
+    # image (missing the bundled tools under /opt/adscan). Used to give a clearer
+    # message than a per-tool apt hint when required packages are absent.
+    foreign_container_runtime = deps.is_docker_env() and not full_container_runtime
+
     sp_ok, sp_missing = deps.check_system_packages(
         config=SystemPackagesCheckConfig(
             system_packages_to_verify=system_packages_to_verify,
             fix_mode=fix_mode,
             full_container_runtime=full_container_runtime,
+            foreign_container_runtime=foreign_container_runtime,
         ),
         deps=SystemPackagesCheckDeps(
             verify_system_packages=deps.verify_system_packages,
@@ -3380,18 +3446,6 @@ def run_check(
     )
     if not dns_ok:
         all_ok = False
-
-    # Check libreoffice specifically for PDF conversion capability
-    if not compact_ci_preflight:
-        deps.print_info("Checking libreoffice for PDF conversion...")
-        libreoffice_available, libreoffice_info = deps.is_libreoffice_available()
-        if libreoffice_available:
-            deps.print_success(f"libreoffice is available: {libreoffice_info}")
-        else:
-            deps.print_warning(f"libreoffice is not available: {libreoffice_info}")
-            deps.print_info("libreoffice is required for PDF report generation")
-            deps.print_instruction("Install with: sudo apt-get install -y libreoffice")
-            # Don't set all_ok = False here as libreoffice is optional (only needed for PDF reports)
 
     # 5. Check External Tools (delegated for non-Python tools)
     from adscan_internal.cli.check import (
@@ -3719,7 +3773,6 @@ def build_check_config_deps(
     check_rust_tools_fn: Callable[..., bool],
     check_go_toolchain_fn: Callable[..., bool],
     check_pyenv_status_fn: Callable[..., bool],
-    is_libreoffice_available: Callable[[], tuple[bool, str]],
     print_check_summary: Callable[[bool], None],
     WordlistService: type,
     run_command: Callable[..., object],
@@ -3827,7 +3880,6 @@ def build_check_config_deps(
         check_rust_tools=check_rust_tools_fn,
         check_go_toolchain=check_go_toolchain_fn,
         check_pyenv_status=check_pyenv_status_fn,
-        is_libreoffice_available=is_libreoffice_available,
         print_check_summary=print_check_summary,
         WordlistService=WordlistService,
         run_command=run_command,
@@ -3937,7 +3989,6 @@ class AdscanCheckContext:
     check_rust_tools_fn: Callable[..., bool]
     check_go_toolchain_fn: Callable[..., bool]
     check_pyenv_status_fn: Callable[..., bool]
-    is_libreoffice_available: Callable[[], tuple[bool, str]]
     print_check_summary: Callable[[bool], None]
     WordlistService: type
     run_command: Callable[..., object]
@@ -4035,7 +4086,6 @@ def build_adscan_check_context(
     check_rust_tools_fn: Callable[..., bool],
     check_go_toolchain_fn: Callable[..., bool],
     check_pyenv_status_fn: Callable[..., bool],
-    is_libreoffice_available: Callable[[], tuple[bool, str]],
     print_check_summary: Callable[[bool], None],
     WordlistService: type,
     run_command: Callable[..., object],
@@ -4139,7 +4189,6 @@ def build_adscan_check_context(
         check_rust_tools_fn=check_rust_tools_fn,
         check_go_toolchain_fn=check_go_toolchain_fn,
         check_pyenv_status_fn=check_pyenv_status_fn,
-        is_libreoffice_available=is_libreoffice_available,
         print_check_summary=print_check_summary,
         WordlistService=WordlistService,
         run_command=run_command,
@@ -4256,7 +4305,6 @@ def build_check_from_adscan_context(
         check_rust_tools_fn=context.check_rust_tools_fn,
         check_go_toolchain_fn=context.check_go_toolchain_fn,
         check_pyenv_status_fn=context.check_pyenv_status_fn,
-        is_libreoffice_available=context.is_libreoffice_available,
         print_check_summary=context.print_check_summary,
         WordlistService=context.WordlistService,
         run_command=context.run_command,

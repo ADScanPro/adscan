@@ -481,187 +481,168 @@ def _render_smb_signing_summary_panel(
         )
 
 
-def execute_generate_relay_list(self, command: str, domain: str) -> None:
-    """Executes the command to generate a relay list."""
+def execute_generate_relay_list(self, domain: str) -> None:
+    """Render + record the SMB relay-target list written natively by run_smb_relay_targets (SMB negotiate signing-posture sweep; no subprocess)."""
     try:
-        completed_process = self._run_netexec(
-            command,
-            domain=domain,
-            timeout=_RELAY_LIST_ENUM_TIMEOUT_SECONDS,
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_verbose(f"Relay list generated in domain {marked_domain}")
+        relay_file = os.path.join(
+            self.domains_dir, domain, "smb", "relay_targets.txt"
         )
-        if not completed_process:
-            marked_domain = mark_sensitive(domain, "domain")
-            print_error(
-                "Failed to generate relay list: NetExec did not return a result. "
-                f"Domain: {marked_domain}"
-            )
-            return
 
-        errors = completed_process.stderr
-        if completed_process.returncode == 0:
-            marked_domain = mark_sensitive(domain, "domain")
-            print_info_verbose(f"Relay list generated in domain {marked_domain}")
-            relay_file = os.path.join(
-                self.domains_dir, domain, "smb", "relay_targets.txt"
-            )
+        # Check if the file exists before opening it
+        if os.path.exists(relay_file):
+            try:
+                with open(relay_file, "r", encoding="utf-8") as file:
+                    comps = [line.strip() for line in file if line.strip()]
+                count = len(comps)
+                dc_targets = [
+                    host
+                    for host in comps
+                    if _is_dc_relay_target(self, domain, host)
+                ]
+                non_dc_targets = [
+                    host
+                    for host in comps
+                    if not _is_dc_relay_target(self, domain, host)
+                ]
+                dc_count = len(dc_targets)
+                non_dc_count = len(non_dc_targets)
+                marked_domain = mark_sensitive(domain, "domain")
+                if count == 0:
+                    print_success(
+                        f"No unsigned SMB relay targets found in domain {marked_domain}."
+                    )
+                elif dc_count > 0:
+                    print_warning(
+                        f"Found {count} unsigned SMB relay targets in domain {marked_domain}, "
+                        f"including {dc_count} Domain Controller"
+                        f"{'' if dc_count == 1 else 's'}."
+                    )
+                else:
+                    print_success(
+                        f"Found {count} unsigned SMB relay targets in domain {marked_domain}. "
+                        "No Domain Controllers were identified in the target set."
+                    )
 
-            # Check if the file exists before opening it
-            if os.path.exists(relay_file):
-                try:
-                    with open(relay_file, "r", encoding="utf-8") as file:
-                        comps = [line.strip() for line in file if line.strip()]
-                    count = len(comps)
-                    dc_targets = [
-                        host
-                        for host in comps
-                        if _is_dc_relay_target(self, domain, host)
-                    ]
-                    non_dc_targets = [
-                        host
-                        for host in comps
-                        if not _is_dc_relay_target(self, domain, host)
-                    ]
-                    dc_count = len(dc_targets)
-                    non_dc_count = len(non_dc_targets)
-                    marked_domain = mark_sensitive(domain, "domain")
-                    if count == 0:
-                        print_success(
-                            f"No unsigned SMB relay targets found in domain {marked_domain}."
-                        )
-                    elif dc_count > 0:
-                        print_warning(
-                            f"Found {count} unsigned SMB relay targets in domain {marked_domain}, "
-                            f"including {dc_count} Domain Controller"
-                            f"{'' if dc_count == 1 else 's'}."
-                        )
-                    else:
-                        print_success(
-                            f"Found {count} unsigned SMB relay targets in domain {marked_domain}. "
-                            "No Domain Controllers were identified in the target set."
+                dc_file = None
+                non_dc_file = None
+                if dc_targets:
+                    dc_file = os.path.join(
+                        self.domains_dir, domain, "smb", "relay_targets_dcs.txt"
+                    )
+                    _write_host_list(dc_file, dc_targets)
+                if non_dc_targets:
+                    non_dc_file = os.path.join(
+                        self.domains_dir,
+                        domain,
+                        "smb",
+                        "relay_targets_non_dcs.txt",
+                    )
+                    _write_host_list(non_dc_file, non_dc_targets)
+
+                if count:
+                    _render_smb_signing_summary_panel(
+                        domain=domain,
+                        total_targets=count,
+                        dc_targets=dc_targets,
+                        non_dc_targets=non_dc_targets,
+                        main_file=relay_file,
+                        dc_file=dc_file,
+                        non_dc_file=non_dc_file,
+                    )
+
+                if comps:
+                    try:
+                        from adscan_core.reporting.technical_report import (
+                            record_technical_finding,
                         )
 
-                    dc_file = None
-                    non_dc_file = None
-                    if dc_targets:
-                        dc_file = os.path.join(
-                            self.domains_dir, domain, "smb", "relay_targets_dcs.txt"
-                        )
-                        _write_host_list(dc_file, dc_targets)
-                    if non_dc_targets:
-                        non_dc_file = os.path.join(
-                            self.domains_dir,
+                        record_technical_finding(
+                            self,
                             domain,
-                            "smb",
-                            "relay_targets_non_dcs.txt",
-                        )
-                        _write_host_list(non_dc_file, non_dc_targets)
-
-                    if count:
-                        _render_smb_signing_summary_panel(
-                            domain=domain,
-                            total_targets=count,
-                            dc_targets=dc_targets,
-                            non_dc_targets=non_dc_targets,
-                            main_file=relay_file,
-                            dc_file=dc_file,
-                            non_dc_file=non_dc_file,
-                        )
-
-                    if comps:
-                        try:
-                            from adscan_core.reporting.technical_report import (
-                                record_technical_finding,
-                            )
-
-                            record_technical_finding(
-                                self,
-                                domain,
-                                key="smb_relay_targets",
-                                value={
-                                    "all_computers": comps,
-                                    "dcs": dc_targets or None,
-                                    "non_dcs": non_dc_targets or None,
-                                },
-                                details={
-                                    "count": count,
-                                    "domain_controller_count": dc_count,
-                                    "non_domain_controller_count": non_dc_count,
-                                    "all_computers": comps,
-                                    "dcs": dc_targets or None,
-                                    "non_dcs": non_dc_targets or None,
-                                },
-                                evidence=[
-                                    {
-                                        "type": "artifact",
-                                        "summary": "SMB relay targets list",
-                                        "artifact_path": relay_file,
-                                    },
-                                    *(
-                                        [
-                                            {
-                                                "type": "artifact",
-                                                "summary": "SMB relay targets - Domain Controllers",
-                                                "artifact_path": dc_file,
-                                            }
-                                        ]
-                                        if dc_file
-                                        else []
-                                    ),
-                                    *(
-                                        [
-                                            {
-                                                "type": "artifact",
-                                                "summary": "SMB relay targets - Non-DC hosts",
-                                                "artifact_path": non_dc_file,
-                                            }
-                                        ]
-                                        if non_dc_file
-                                        else []
-                                    ),
-                                ],
-                            )
-                        except Exception as exc:  # pragma: no cover
-                            if not handle_optional_report_service_exception(
-                                exc,
-                                action="Technical finding sync",
-                                debug_printer=print_info,
-                                prefix="[relay-list]",
-                            ):
-                                telemetry.capture_exception(exc)
-                    if comps:
-                        self.update_report_field(
-                            domain,
-                            "smb_relay_targets",
-                            {
+                            key="smb_relay_targets",
+                            value={
                                 "all_computers": comps,
                                 "dcs": dc_targets or None,
                                 "non_dcs": non_dc_targets or None,
                             },
+                            details={
+                                "count": count,
+                                "domain_controller_count": dc_count,
+                                "non_domain_controller_count": non_dc_count,
+                                "all_computers": comps,
+                                "dcs": dc_targets or None,
+                                "non_dcs": non_dc_targets or None,
+                            },
+                            evidence=[
+                                {
+                                    "type": "artifact",
+                                    "summary": "SMB relay targets list",
+                                    "artifact_path": relay_file,
+                                },
+                                *(
+                                    [
+                                        {
+                                            "type": "artifact",
+                                            "summary": "SMB relay targets - Domain Controllers",
+                                            "artifact_path": dc_file,
+                                        }
+                                    ]
+                                    if dc_file
+                                    else []
+                                ),
+                                *(
+                                    [
+                                        {
+                                            "type": "artifact",
+                                            "summary": "SMB relay targets - Non-DC hosts",
+                                            "artifact_path": non_dc_file,
+                                        }
+                                    ]
+                                    if non_dc_file
+                                    else []
+                                ),
+                            ],
                         )
-                    else:
-                        current_value = (
-                            self.report.get(domain, {})
-                            .get("vulnerabilities", {})
-                            .get("smb_relay_targets")
-                            if getattr(self, "report", None)
-                            else None
-                        )
-                        if current_value in (None, "NS", False):
-                            self.update_report_field(domain, "smb_relay_targets", False)
-                except Exception as e:  # noqa: BLE001
-                    telemetry.capture_exception(e)
-                    print_error("Error reading the relay file.")
-                    print_exception(show_locals=False, exception=e)
-            else:
-                marked_domain = mark_sensitive(domain, "domain")
-                print_warning(
-                    f"No output relay file found for domain {marked_domain}. "
-                    "The scan might have found no candidates or failed to write results."
-                )
+                    except Exception as exc:  # pragma: no cover
+                        if not handle_optional_report_service_exception(
+                            exc,
+                            action="Technical finding sync",
+                            debug_printer=print_info,
+                            prefix="[relay-list]",
+                        ):
+                            telemetry.capture_exception(exc)
+                if comps:
+                    self.update_report_field(
+                        domain,
+                        "smb_relay_targets",
+                        {
+                            "all_computers": comps,
+                            "dcs": dc_targets or None,
+                            "non_dcs": non_dc_targets or None,
+                        },
+                    )
+                else:
+                    current_value = (
+                        self.report.get(domain, {})
+                        .get("vulnerabilities", {})
+                        .get("smb_relay_targets")
+                        if getattr(self, "report", None)
+                        else None
+                    )
+                    if current_value in (None, "NS", False):
+                        self.update_report_field(domain, "smb_relay_targets", False)
+            except Exception as e:  # noqa: BLE001
+                telemetry.capture_exception(e)
+                print_error("Error reading the relay file.")
+                print_exception(show_locals=False, exception=e)
         else:
-            print_error("Failed to generate relay list.")
-            if errors:
-                print_error(errors.strip())
+            marked_domain = mark_sensitive(domain, "domain")
+            print_warning(
+                f"No output relay file found for domain {marked_domain}. "
+                "The scan might have found no candidates or failed to write results."
+            )
     except Exception as e:  # noqa: BLE001
         telemetry.capture_exception(e)
         print_error("Error generating relay list.")

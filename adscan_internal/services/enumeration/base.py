@@ -32,7 +32,7 @@ class EnumerationService(BaseService):
         # Web mode with events
         bus = EventBus()
         service = EnumerationService(event_bus=bus)
-        users = service.ldap.enumerate_users(...)
+        computers = service.ldap.enumerate_computers(...)
     """
 
     def __init__(

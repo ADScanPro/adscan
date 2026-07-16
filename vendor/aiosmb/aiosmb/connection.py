@@ -924,6 +924,23 @@ class SMBConnection:
 		Sends an SMB message to teh remote endpoint.
 		msg: SMB2Message or SMBMessage
 		Returns: MessageId integer
+
+		SINGLE-CONNECTION MULTI-PIPE CONCURRENCY LIMITATION (do not remove):
+		SMBConnection is NOT safe for concurrent multi-pipe DCE-RPC. The
+		SequenceWindow / SMB2 credit accounting is mutated on BOTH send (here,
+		self.SequenceWindow += ...) and receive (see recvSMB: self.SequenceWindow
+		+= CreditCharge - 1), and OutstandingResponses / OutstandingResponsesEvent
+		are shared dicts. Two independent send->recv loops running concurrently
+		over ONE connection (e.g. a SRVSVC pipe and a SAMR pipe awaited under one
+		asyncio.gather) interleave and desync the credit window; the client then
+		emits a request the server rejects and the server RSTs the TCP connection,
+		after which __handle_smb_in fails every outstanding + future request with
+		CONNECTION_ABORTED. A send-only serialization lock does NOT fix this (the
+		race is on the receive-side credit bookkeeping, not just frame
+		interleaving) — proven live against GOAD. Run RPC pipes over one
+		connection SEQUENTIALLY, or use one connection per concurrent pipe. See
+		adscan_internal/services/collector/host_collector.py::_do_samr (kept
+		sequential) and tests/unit/vendor/test_aiosmb_single_connection_concurrency.py.
 		"""
 		try:
 			self.activity_at = datetime.datetime.utcnow()

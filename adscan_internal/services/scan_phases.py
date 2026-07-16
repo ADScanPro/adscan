@@ -847,6 +847,15 @@ def phase_is_enabled(shell: object, phase_id: str) -> bool:
         explicitly listed in ``scan_config.phases.disabled``.
     """
     try:
+        # Session phase preset (interactive resume front door) — an explicit
+        # enabled set of OPTIONAL phase ids. None (the default) means "no preset",
+        # so every phase runs and trust-pivot / CI enumeration is unaffected. Only
+        # OPTIONAL phases are ever gated; a mandatory phase always runs.
+        preset = getattr(shell, "_phase_preset_enabled", None)
+        if preset is not None:
+            phase = _PHASES_BY_ID.get(phase_id)
+            if phase is not None and phase.optional and phase_id not in preset:
+                return False
         config = getattr(shell, "scan_config", None)
         if config is None:
             return True

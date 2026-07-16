@@ -76,17 +76,28 @@ def _is_transient_failure(error: BaseException | str | None) -> bool:
 
 
 def _resolve_pdc(shell: Any, domain: str) -> str:
-    """Resolve the PDC hostname/IP for a domain from shell.domains_data."""
+    """Resolve the PDC FQDN (or IP last-resort) for a domain from shell.domains_data.
+
+    The reverts driven off this value authenticate with ``kerberos=True``, so the
+    host must be a real FQDN for the service SPN (CLAUDE.md "Kerberos SPNs — always
+    FQDN"). Routes through the ``resolve_dc_fqdn`` SSOT, which promotes a short
+    ``pdc_hostname`` to ``<host>.<domain>`` and adds the workspace inventory
+    fallback; a bare IP is kept only as the same last resort the caller had before.
+    """
     domains_data = getattr(shell, "domains_data", None)
     if not isinstance(domains_data, dict):
         return ""
     domain_data = domains_data.get(domain) or {}
     if not isinstance(domain_data, dict):
         return ""
+    from adscan_internal.models.domain import (  # noqa: PLC0415
+        resolve_dc_fqdn,
+        resolve_dc_ip,
+    )
+
     return str(
-        domain_data.get("pdc_hostname_fqdn")
-        or domain_data.get("pdc_hostname")
-        or domain_data.get("pdc")
+        resolve_dc_fqdn(domain_data, target_domain=domain)
+        or resolve_dc_ip(domain_data)
         or ""
     ).strip()
 

@@ -273,41 +273,6 @@ def install_system_packages(
                     if "hashcat" in unique_packages_to_install:
                         unique_packages_to_install.remove("hashcat")
 
-        # Special-case libreoffice: install without recommended packages to avoid Java dependencies.
-        if "libreoffice" in unique_packages_to_install:
-            try:
-                deps.print_info(
-                    "Installing libreoffice (without recommended packages to avoid "
-                    "Java dependencies)..."
-                )
-                deps.print_info_verbose(
-                    "Note: LibreOffice will be installed without Java components."
-                )
-                deps.run_command(
-                    ["apt-get", "install", "-y", "--no-install-recommends"]
-                    + config.apt_target
-                    + ["libreoffice"],
-                    check=True,
-                    env=apt_env,
-                )
-                deps.print_success(
-                    "libreoffice installed successfully (without Java dependencies)"
-                )
-                successfully_installed.append("libreoffice")
-                unique_packages_to_install.remove("libreoffice")
-            except subprocess.CalledProcessError as exc:  # noqa: BLE001
-                deps.telemetry_capture_exception(exc)
-                deps.print_warning(
-                    f"Failed to install libreoffice: {exc}. "
-                    "Continuing with other packages..."
-                )
-                deps.print_info_verbose(
-                    "LibreOffice is optional and only needed for PDF report generation. "
-                    "Word reports will still work without it."
-                )
-                if "libreoffice" in unique_packages_to_install:
-                    unique_packages_to_install.remove("libreoffice")
-
         # Special-case ntpsec-ntpdate: install in isolation and fallback to ntpdate.
         if "ntpsec-ntpdate" in unique_packages_to_install:
             try:

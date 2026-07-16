@@ -200,20 +200,75 @@ def start_poisoning(shell: PoisoningShell) -> None:
 
 
 def stop_poisoning(shell: PoisoningShell) -> None:
-    """Stop the native poisoning suite if running."""
+    """Stop broadcast poisoning, however it was launched.
 
+    Poisoning reaches the operator through two launch paths that share the same
+    listener substrate, and this command stops BOTH so the intuitive verb always
+    works regardless of how poisoning started:
+
+    * the **scan flow** (``start_auth`` / ``start_unauth``) launches it as a
+      background job tracked by the ``BackgroundJobRegistry``
+      (``kind="poisoning"``, one job per interface);
+    * the manual ``poisoning`` command starts an **in-process suite** stored on
+      ``shell._poisoning_runtime``.
+
+    A clear count of what was stopped is reported. If nothing is running,
+    the "not running" notice is shown.
+    """
+
+    stopped_scopes: list[str] = []
+    total_captured = 0
+
+    # (1) Registry-tracked background poisoning jobs (the scan-flow launch path).
+    #     Stopping via the registry drives each runtime's stop() and marks the
+    #     job terminal — the SAME path 'jobs stop <id>' uses.
+    try:
+        from adscan_internal.services.background_jobs.registry import (  # noqa: PLC0415
+            get_or_create_registry,
+        )
+
+        registry = get_or_create_registry(shell)
+        for job in registry.active():
+            if job.kind != "poisoning":
+                continue
+            try:
+                total_captured += int(job.result_summary.get("captured", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            registry.stop(job.id)
+            stopped_scopes.append(str(job.scope or "?"))
+    except Exception as exc:  # noqa: BLE001 — a registry hiccup must not block the suite stop
+        telemetry.capture_exception(exc)
+
+    # (2) Legacy in-process suite (the manual `poisoning` command).
     runtime: _PoisoningRuntime | None = getattr(shell, "_poisoning_runtime", None)
-    if runtime is None:
-        print_warning("Poisoning suite is not running.")
+    if runtime is not None:
+        runtime.stop_event.set()
+        # Sentinel so the capture consumer wakes up.
+        runtime.capture_queue.put(None)
+        runtime.thread.join(timeout=10.0)
+        runtime.capture_thread.join(timeout=5.0)
+        shell._poisoning_runtime = None  # type: ignore[attr-defined]
+        stopped_scopes.append(str(getattr(shell, "interface", None) or "?"))
+
+    if not stopped_scopes:
+        print_warning("Poisoning is not running.")
         return
 
-    runtime.stop_event.set()
-    # Sentinel so the capture consumer wakes up.
-    runtime.capture_queue.put(None)
-    runtime.thread.join(timeout=10.0)
-    runtime.capture_thread.join(timeout=5.0)
-    shell._poisoning_runtime = None  # type: ignore[attr-defined]
-    print_success("Poisoning suite stopped.")
+    # De-duplicate scopes (order-preserving) so a job + suite on the same
+    # interface reads as one listener line, not two.
+    scopes = list(dict.fromkeys(stopped_scopes))
+    n = len(scopes)
+    listener_word = "listener" if n == 1 else "listeners"
+    captured_note = ""
+    if total_captured:
+        cred_word = "credential" if total_captured == 1 else "credentials"
+        captured_note = f" {total_captured} {cred_word} captured this session."
+    print_success(
+        f"Stopped broadcast poisoning on {', '.join(scopes)} "
+        f"({n} {listener_word})."
+        f"{captured_note}"
+    )
 
 
 def clear_poisoning_state(shell: PoisoningShell) -> None:
@@ -323,6 +378,35 @@ def _capture_consumer(
             print_exception(show_locals=False, exception=exc)
 
 
+_POISON_CAPTURED_NTLMV2_USERS_KEY = "poison_captured_ntlmv2_users"
+
+
+def _record_poison_captured_ntlmv2_user(
+    shell: PoisoningShell, domain: str, user: str
+) -> None:
+    """Mark ``user`` as a NetNTLMv2 principal captured via broadcast poisoning.
+
+    Persists a JSON-safe per-domain list (never a set) in ``domains_data`` so a
+    later crack-success in the cracking pipeline can distinguish a
+    poisoner-captured NetNTLMv2 hash from any other NetNTLMv2 capture and
+    materialize the ``PoisonCaptureNtlmv2Crack`` edge. Best-effort: provenance
+    tracking must never break the capture flow.
+    """
+    user_clean = str(user or "").strip()
+    if not user_clean:
+        return
+    try:
+        domain_state = shell.domains_data.setdefault(domain, {})
+        captured = domain_state.setdefault(_POISON_CAPTURED_NTLMV2_USERS_KEY, [])
+        if not isinstance(captured, list):
+            captured = []
+            domain_state[_POISON_CAPTURED_NTLMV2_USERS_KEY] = captured
+        if user_clean not in captured:
+            captured.append(user_clean)
+    except Exception as exc:  # noqa: BLE001 — provenance is best-effort
+        telemetry.capture_exception(exc)
+
+
 def _handle_capture(
     shell: PoisoningShell,
     runtime: _PoisoningRuntime | None,
@@ -338,22 +422,40 @@ def _handle_capture(
     if not user:
         return
 
-    domain = _resolve_full_domain(shell, netbios)
-    if not domain:
-        marked = mark_sensitive(netbios or "?", "domain")
-        print_warning(
-            f"Captured hash for {mark_sensitive(user, 'user')} but no workspace "
-            f"domain matches NetBIOS {marked} — skipping crack prompt."
-        )
-        return
-
+    # Dedup FIRST so a victim broadcasting repeatedly is handled once. Previously the
+    # dedup lived AFTER the domain-resolve gate below, so an unmatched NetBIOS re-fired
+    # the skip warning on every capture (~20x per user in a live segment).
     processed_users = runtime.processed_users if runtime is not None else set()
     if user in processed_users:
         return
     processed_users.add(user)
 
+    # Never drop a captured hash: a NetNTLMv2/v1 is crackable regardless of workspace
+    # context, and the domain match is only needed to decide WHERE to store the cracked
+    # credential. When no workspace domain matches the captured NetBIOS (e.g. standalone
+    # `poisoning` run before any domain is initialized), fall back to the NetBIOS short
+    # name as the storage key and still crack. The in-scan wiring resolves the real FQDN.
+    domain = _resolve_full_domain(shell, netbios)
+    if not domain:
+        domain = (netbios or "captured").strip().lower() or "captured"
+        print_info(
+            f"Captured hash for {mark_sensitive(user, 'user')} in NetBIOS "
+            f"{mark_sensitive(netbios or '?', 'domain')} (no workspace domain match) "
+            "— cracking under the captured name.",
+            spacing="none",
+        )
+
     if not save_ntlm_hash(shell, domain, version, user, fullhash):
         return  # already recorded for this user
+
+    # Record provenance so a later crack-success can materialize the
+    # PoisonCaptureNtlmv2Crack attack-graph edge (source = unauthenticated
+    # principal). ONLY NetNTLMv2 — the NetNTLMv1 avenue has its own steps
+    # (higher likelihood/impact) and is not folded in here. Bare capture is the
+    # LLMNR/NBT-NS poisoning FINDING; the edge is materialized only when the
+    # cracking pipeline recovers a usable credential.
+    if version == "v2":
+        _record_poison_captured_ntlmv2_user(shell, domain, user)
 
     print_success(f"New NTLM{version} hash captured:")
     print_info(f"User: {user}", spacing="none")

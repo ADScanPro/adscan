@@ -2649,6 +2649,23 @@ def compute_display_paths_for_domain(
         )
 
     mode = attack_graph_core.normalize_target_mode(target_mode)
+    # Layer 3: node-ids of the collapse choke points (>1-member MemberOf target
+    # groups) for the choke-point-rooted DFS.  Built from the SAME counts index
+    # and SAME canonical label that ``collapse_memberof_prefixes`` uses below, so
+    # the DFS suppresses exactly the leading-MemberOf prefixes the collapse would
+    # strip — byte-identical output, the duplicates simply never generated.
+    chokepoint_group_ids: set[str] | None = None
+    _chokepoint_counts, _ = build_group_membership_index(
+        snapshot, domain, principal_labels=None, sample_limit=0
+    )
+    if _chokepoint_counts:
+        chokepoint_group_ids = set()
+        for nid, node in (runtime_graph.get("nodes") or {}).items():
+            if not isinstance(node, dict):
+                continue
+            clabel = _canonical_membership_label(domain, str(node.get("label") or nid))
+            if clabel and _chokepoint_counts.get(clabel, 0) > 1:
+                chokepoint_group_ids.add(str(nid))
     unfiltered_started_at = time.monotonic()
     unfiltered = attack_graph_core.compute_display_paths_for_domain_unfiltered(
         runtime_graph,
@@ -2657,6 +2674,7 @@ def compute_display_paths_for_domain(
         target=target,
         target_mode=mode,
         start_node_ids=start_node_ids,
+        chokepoint_group_ids=chokepoint_group_ids,
     )
     _log_phase_timing(
         scope="domain",

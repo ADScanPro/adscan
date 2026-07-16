@@ -52,7 +52,6 @@ class DomainShell(Protocol):
     domains_data: dict[str, dict[str, Any]]
     cracking_dir: str
     ldap_dir: str
-    enum_trusts_path: str | None
     netexec_path: str | None
     domain_connectivity: dict[str, dict[str, Any]]
 
@@ -1099,11 +1098,16 @@ def _handle_trust_enumeration_result(
                         os.makedirs(directory)
 
             if pdc_ip:
+                # Trust-enumeration loop over DISCOVERED trusted/foreign domains:
+                # populate each domain's domains_data (pdc/dc_ip/dcs/FQDN keys)
+                # but never flip the operator's active REPL context to a
+                # discovered domain — keep make_active False (the default).
                 finalize_domain_context(
                     shell,
                     domain=main_domain,
                     pdc_ip=pdc_ip,
                     interactive=False,
+                    make_active=False,
                 )
 
         from adscan_internal import (
@@ -1266,60 +1270,42 @@ def _handle_trust_enumeration_result(
             ]
             phase2_all = selected_domains  # every selected domain needs graph rebuilt
 
-            from adscan_internal.cli.intelligence import (
-                run_attack_path_discovery,
-                run_cross_domain_attack_path_discovery,
-            )
-
             # Phase 1: native collection only for domains that haven't been collected yet.
             for main_domain in phase1_needed:
                 shell.do_enum_domain_auth_phase1(main_domain)
 
-            # Announce the Attack Paths Discovery phase transition through the
-            # canonical SSOT, exactly like ``domain_collection`` does in
-            # ``ldap.py``. The per-domain Phase-1 calls above stop at
-            # ``domain_analysis`` (``stop_after_phase=1``), and this multi-domain
-            # pivot computes attack paths OUTSIDE ``run_enumeration`` — so without
-            # this emit the worker's ``current_phase`` would freeze at
-            # ``domain_analysis`` even though paths are computed and ingested.
-            # Emit ONCE here (not per-domain) covering both the merged
-            # cross-domain pass and the single selected-domain pass; the silent
-            # ``build_only=True`` graph builds run inside the same span so its
-            # delta footer reflects the discovery output.
-            _ap_phase_cm = None
-            try:
-                from adscan_internal.services.scan_phases import emit_chapter
-                from adscan_internal.services.scan_timeline import phase_span
+            # Attack Paths Discovery for the trust/cross-domain pivot. This runs
+            # OUTSIDE ``run_enumeration`` because the merged multi-domain graph can
+            # only be built after every selected domain's Phase-1 chunk above has
+            # populated its ``attack_graph.json``. The lifecycle (announce +
+            # compute + checkpoint) is owned by the single seam
+            # ``run_attack_paths_discovery_phase`` — the SAME seam the per-domain
+            # Phase 2 in ``run_enumeration`` routes through — so this pivot can
+            # never again announce the phase without also marking it complete (the
+            # resume-checkpoint HOLE that ``74cb0c72`` half-fixed). ``announce=True``
+            # here (the seam emits the chapter ONCE, covering both the merged
+            # cross-domain pass and the single selected-domain pass, and keeps the
+            # worker's ``current_phase`` advancing past ``domain_analysis``). The
+            # merged-vs-single choice is a parameter (``len(domains)``), not a fork.
+            #
+            # Checkpoint the phase for the source domain plus every domain that
+            # still needs its phases-3+ chunk (``phase1_needed``) — those are the
+            # domains whose ``scan_progress`` record this pivot drives and where the
+            # hole would otherwise be permanent. Already-complete peers keep their
+            # own (complete) checkpoint; the mark is idempotent.
+            from adscan_internal.services.attack_paths_phase import (
+                run_attack_paths_discovery_phase,
+            )
 
-                _scan_type = getattr(shell, "type", "default")
-                emit_chapter("attack_paths_discovery", scan_type=_scan_type)
-                _ap_phase_cm = phase_span(
-                    shell,
-                    domain,
-                    phase_id="attack_paths_discovery",
-                    phase_title="Attack Paths Discovery",
-                )
-                _ap_phase_cm.__enter__()
-            except Exception:  # noqa: BLE001 — telemetry must never block discovery
-                _ap_phase_cm = None
-
-            try:
-                if len(phase2_all) > 1:
-                    # Phase 2 build-only for all: populate every attack_graph.json
-                    # before computing paths so multi-hop cross-domain edges are present.
-                    for main_domain in phase2_all:
-                        run_attack_path_discovery(shell, main_domain, build_only=True)
-                    # Single merged cross-domain path display.
-                    run_cross_domain_attack_path_discovery(shell, phase2_all)
-                else:
-                    # Single domain — build + display in one pass (no merge needed).
-                    run_attack_path_discovery(shell, phase2_all[0])
-            finally:
-                if _ap_phase_cm is not None:
-                    try:
-                        _ap_phase_cm.__exit__(None, None, None)
-                    except Exception:  # noqa: BLE001 — telemetry must never block
-                        pass
+            checkpoint_domains = list(dict.fromkeys([domain, *phase1_needed]))
+            run_attack_paths_discovery_phase(
+                shell,
+                domains=phase2_all,
+                checkpoint_domains=checkpoint_domains,
+                span_domain=domain,
+                scan_type=getattr(shell, "type", "default"),
+                announce=True,
+            )
 
             # Phase 3+: only for new domains (credential spraying, share scan, etc.)
             # Already-enumerated domains completed these phases before the pivot.

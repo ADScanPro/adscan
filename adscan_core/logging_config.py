@@ -71,6 +71,79 @@ class MarkupSafeRichHandler(RichHandler):
         return message_text
 
 
+# Lazily-resolved, cached reference to the ``_TeeConsole`` auto-mirror opt-out
+# context manager. Resolved on first use (never at import time) to sidestep any
+# adscan_core import-order coupling; only cached on success so a transient early
+# import failure does not permanently pin the no-op fallback.
+_explicit_mirror_cm = None
+
+
+def _get_explicit_telemetry_mirror():
+    """Return the tee-console auto-mirror opt-out context manager (or a no-op).
+
+    The visible-console logging handler renders each record through
+    ``self.console.print(...)``. At runtime ``self.console`` is a
+    ``_TeeConsole`` whose ``print`` AUTO-MIRRORS every renderable into the
+    telemetry buffer. Wrapping the render in this context manager suppresses
+    that mirror so a ``logger.*`` record reaches telemetry through EXACTLY ONE
+    path — the dedicated telemetry handler (see ``_VisibleRichHandler``).
+
+    Returns:
+        The ``_explicit_telemetry_mirror`` context manager when the state
+        module is importable, otherwise ``contextlib.nullcontext`` (a no-op
+        that is not cached, so a later successful import still wins).
+    """
+    global _explicit_mirror_cm
+    if _explicit_mirror_cm is not None:
+        return _explicit_mirror_cm
+    try:
+        from adscan_core.output._state import _explicit_telemetry_mirror
+
+        _explicit_mirror_cm = _explicit_telemetry_mirror
+        return _explicit_mirror_cm
+    except Exception:
+        from contextlib import nullcontext
+
+        return nullcontext
+
+
+class _VisibleRichHandler(MarkupSafeRichHandler):
+    """Visible-console handler that renders WITHOUT the tee auto-mirror.
+
+    Single-source-of-truth rule for logger→telemetry: a ``logger.*`` record
+    must land in the telemetry recording exactly once. There are two handlers
+    on the ``"adscan"`` logger that could deliver a record to the telemetry
+    buffer:
+
+    1. this visible handler, bound to the shared ``_TeeConsole`` — its
+       ``console.print`` render auto-mirrors into telemetry as a side effect;
+    2. the dedicated telemetry handler, always at DEBUG, bound directly to the
+       telemetry console.
+
+    Before the ``_TeeConsole`` auto-mirror existed, path (2) was the ONLY
+    logger→telemetry route (one copy). Once auto-mirror shipped, any record the
+    visible handler actually rendered (in ``--debug`` its level is DEBUG, so it
+    renders EVERYTHING) produced a SECOND telemetry copy — every ``logger.*``
+    line doubled in ``--debug`` recordings.
+
+    The telemetry handler is the correct single source: it is always at DEBUG
+    independently of screen verbosity, which is the whole point of telemetry
+    (full recording even when the screen shows only ERROR). So the fix is to
+    stop the VISIBLE render from also mirroring: this subclass wraps
+    ``super().emit`` in the sanctioned ``_explicit_telemetry_mirror`` opt-out.
+    The opt-out disables only the telemetry mirror; it does NOT disable the
+    deferred-live-buffer capture (that append happens before the opt-out check
+    in ``_TeeConsole.print``), so ``LiveSession`` deferred-flush is unaffected.
+
+    Only the VISIBLE handler is this subclass; the telemetry handler stays a
+    plain ``MarkupSafeRichHandler`` so nothing suppresses its (single) write.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        with _get_explicit_telemetry_mirror()():
+            super().emit(record)
+
+
 # Global logger instance (initialized by init_logging)
 _logger: Optional[logging.Logger] = None
 _console_handler: Optional[RichHandler] = None
@@ -473,10 +546,13 @@ def init_logging(
         _workspace_debug_file_handler = None
 
     # Console handler (Rich, conditional based on verbose/debug mode).
-    # MarkupSafeRichHandler: malformed markup (a bracketed path / exception
-    # token reaching logger.* with markup=True) renders literally instead of
-    # raising a MarkupError that would crash the command.
-    console_handler = MarkupSafeRichHandler(
+    # _VisibleRichHandler: MarkupSafeRichHandler that renders WITHOUT triggering
+    # the ``_TeeConsole`` auto-mirror, so a ``logger.*`` record reaches the
+    # telemetry buffer through exactly ONE path (the dedicated telemetry handler
+    # below), never doubled. It also keeps the malformed-markup safety of its
+    # base class (a bracketed path / exception token reaching logger.* with
+    # markup=True renders literally instead of raising a MarkupError).
+    console_handler = _VisibleRichHandler(
         rich_tracebacks=True,
         show_path=bool(debug_mode or secret_mode),
         console=console,

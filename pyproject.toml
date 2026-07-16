@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "9.2.1"
+version = "10.0.0"
 description = "Free Active Directory pentesting CLI for AD enumeration, attack paths, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
@@ -42,6 +42,18 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    # badauth + asysocks are foundational to the native stack (badauth: NTLM/
+    # SPNEGO/credential primitives consumed by aiosmb/badldap/aardwolf/kerbad;
+    # asysocks: the async network layer). They are declared here as DIRECT deps
+    # — not just transitively via their consumers — so the vendor path overrides
+    # in [tool.uv.sources] actually take effect. uv only applies a source
+    # override to a package the project directly depends on; without these two
+    # lines uv resolved badauth/asysocks from PyPI, so the LOCALLY_MAINTAINED
+    # vendor/ patches (e.g. the NetNTLMv1-downgrade crack fix in badauth) were
+    # dead in the uv-managed venv + CI even though production Docker installs
+    # vendor/ directly. Keep in lockstep with the [cli] extra.
+    "badauth>=0.1.6",
+    "asysocks>=0.2.18",
     "badldap>=0.7.5,<0.8",
     "kerbad>=0.5.9",
     "impacket==0.13.1",
@@ -72,6 +84,10 @@ dev = [
     "pycryptodome>=3.20",
 ]
 cli = [
+    # Direct declarations so the vendor/ path overrides in [tool.uv.sources]
+    # take effect for the native stack's foundational libs (see the [dev] note).
+    "badauth>=0.1.6",
+    "asysocks>=0.2.18",
     "badldap>=0.7.5,<0.8",
     "kerbad>=0.5.9",
     "impacket==0.13.1",
@@ -86,19 +102,20 @@ cli = [
     "python-magic>=0.4.27,<0.5; platform_system == 'Linux'",
     "markitdown>=0.1.5,<0.2; python_version >= '3.10'",
     "dnspython>=2.7.0,<3.0",
-    # `pydantic-ai` (full) drags xai-sdk via the `xai` extra, and xai-sdk pins
-    # `packaging<26` upstream — incompatible with packaging>=26 needed by
-    # pyinstaller-hooks-contrib 2026.5 etc. ADscan does not use the xAI/Grok
-    # provider (only openai/anthropic/google/etc. via Agent string config or
-    # external_cli fallback), so we install `pydantic-ai-slim` with every
-    # other extra explicitly enumerated. Same `pydantic_ai` Python module,
-    # just without the xai dependency footprint.
-    "pydantic-ai-slim[ag-ui,anthropic,bedrock,cli,cohere,evals,fastmcp,google,groq,huggingface,logfire,mcp,mistral,openai,retries,temporal,ui,vertexai]>=0.8.1",
+    # `pydantic-ai-slim` (not full `pydantic-ai`, which drags xai-sdk and pins
+    # `packaging<26` — incompatible with packaging>=26 needed elsewhere). Only
+    # the three provider extras the code can actually reach are installed: the
+    # `AIProvider` enum (services/llm/config.py) routes to openai:/anthropic:/
+    # google-gla: model strings (OLLAMA + OPENAI_COMPATIBLE also go via openai);
+    # the *_CLI providers are external subprocesses, not pydantic-ai extras. The
+    # other provider SDKs (bedrock/vertexai/huggingface/cohere/groq/mistral/…)
+    # are unreachable and were dropped to shrink the image. Add an extra here if
+    # a new AIProvider that needs it is introduced.
+    "pydantic-ai-slim[anthropic,google,openai]>=0.8.1",
     "netifaces",
     "scapy>=2.5.0,<3.0",
     "prompt_toolkit",
     "questionary",
-    "posthog",
     "pypsrp[kerberos]==0.8.1; python_version < '3.10'",
     "pypsrp[kerberos]==0.9.0; python_version >= '3.10'",
     "pydantic-settings>=2.4.0",
@@ -158,4 +175,4 @@ include = ["adscan_core*", "adscan_launcher*"]
 
 [tool.setuptools.package-data]
 adscan_launcher = ["assets/**/*.yml", "assets/**/*.yaml"]
-adscan_internal = ["pro/reporting/templates/*.html", "assets/demo_workspace/*.json", "assets/report_samples/*.pdf"]
+adscan_internal = ["pro/reporting/templates/*.html", "assets/demo_workspace/*.json", "assets/report_samples/*.pdf", "assets/rules/*.rule"]

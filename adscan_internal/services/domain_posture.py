@@ -275,6 +275,9 @@ class PasswordPolicySnapshot:
       - ``lockout_window_minutes``  ← ``lockoutObservationWindow`` (FILETIME → minutes)
       - ``lockout_duration_minutes``← ``lockoutDuration`` (FILETIME → minutes;
                                        0 means admin-unlock-only)
+      - ``password_history_length`` ← ``pwdHistoryLength`` (None when not read)
+      - ``minimum_password_age_days``← ``minPwdAge`` (FILETIME → days; None when
+                                       not read)
 
     PSO (Password Settings Object) per-user policies are NOT in scope here —
     only the default domain policy.
@@ -288,6 +291,8 @@ class PasswordPolicySnapshot:
     lockout_threshold: int = 0               # 0 means lockout disabled
     lockout_window_minutes: Optional[int] = None
     lockout_duration_minutes: Optional[int] = None
+    password_history_length: Optional[int] = None  # None when not read; from pwdHistoryLength
+    minimum_password_age_days: Optional[int] = None  # None when not read; from minPwdAge
 
     @property
     def lockout_enabled(self) -> bool:
@@ -675,6 +680,8 @@ def persist_password_policy(
             "lockout_threshold": snapshot.lockout_threshold,
             "lockout_window_minutes": snapshot.lockout_window_minutes,
             "lockout_duration_minutes": snapshot.lockout_duration_minutes,
+            "password_history_length": snapshot.password_history_length,
+            "minimum_password_age_days": snapshot.minimum_password_age_days,
         }
         print_info_debug(
             f"[domain_posture] password_policy persisted: domain={domain_key} "
@@ -728,6 +735,8 @@ def _hydrate_password_policy(
         lockout_threshold_raw = raw.get("lockout_threshold")
         lockout_window_raw = raw.get("lockout_window_minutes")
         lockout_duration_raw = raw.get("lockout_duration_minutes")
+        history_length_raw = raw.get("password_history_length")
+        min_age_raw = raw.get("minimum_password_age_days")
 
         posture.password_policy = PasswordPolicySnapshot(
             min_length=int(min_length),
@@ -741,6 +750,12 @@ def _hydrate_password_policy(
             ),
             lockout_duration_minutes=(
                 int(lockout_duration_raw) if lockout_duration_raw is not None else None
+            ),
+            password_history_length=(
+                int(history_length_raw) if history_length_raw is not None else None
+            ),
+            minimum_password_age_days=(
+                int(min_age_raw) if min_age_raw is not None else None
             ),
         )
     except Exception as exc:  # noqa: BLE001 - defensive

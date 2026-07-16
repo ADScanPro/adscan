@@ -19,11 +19,10 @@ from typing import Any
 import rich.box
 
 from adscan_internal import (
-    print_info,
     print_info_debug,
     telemetry,
 )
-from adscan_internal.rich_output import mark_passthrough, mark_sensitive
+from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.session_compromise_state_service import (
     mark_session_domain_compromised,
 )
@@ -217,7 +216,6 @@ def promote_to_pwned(
     if _adscan_module is not None:
         should_show = getattr(_adscan_module, "should_show_victory_hint", None)
         show_explicit = getattr(_adscan_module, "show_victory_hint_explicit", None)
-        mark_shown = getattr(_adscan_module, "mark_victory_hint_shown", None)
         try:
             if (
                 callable(should_show)
@@ -240,27 +238,22 @@ def promote_to_pwned(
                         "adscanpro.com/pro[/link]"
                     ),
                 )
-            if (
-                callable(should_show)
-                and callable(mark_shown)
-                and should_show("github_star", "explicit")
-            ):
-                raw_url = "https://github.com/ADscanPro/adscan"
-                url = mark_passthrough(raw_url)
-                if getattr(shell, "console", None) is not None:
-                    shell.console.print()
-                print_info(
-                    f"[dim]Enjoying ADscan? A ⭐ on GitHub helps other pentesters "
-                    f"discover it → [link={raw_url}]{url}[/link][/dim]"
+            # The session-exit rating -> star funnel owns the single star ask at
+            # peak goodwill for value-moment sessions (Hormozi give:ask — one
+            # primary ask). Suppress the inline star here when that funnel will
+            # run this session; keep it for the paths the funnel does not cover
+            # (non-interactive runs, or a repeat session already rated).
+            from adscan_internal.services.session_rating import (
+                rating_funnel_will_run,
+                show_github_star_cta,
+            )
+
+            if not rating_funnel_will_run(shell, value_tier="domain_compromise"):
+                show_github_star_cta(
+                    shell,
+                    trigger="domain_compromise",
+                    extra_props={"evidence": str(evidence)},
                 )
-                mark_shown("github_star")
-                try:
-                    telemetry.capture(
-                        "star_cta_shown",
-                        {"trigger": "domain_compromise", "evidence": str(evidence)},
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
 

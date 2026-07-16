@@ -114,10 +114,6 @@ _COMMAND_DOMAIN_CONTEXT_POLICIES: dict[str, DomainContextPolicy] = {
     "rm": "exempt",
     "session": "exempt",
     "set": "exempt",
-    "smb_guest_benchmark": "exempt",
-    "smb_map_benchmark": "exempt",
-    "smb_map_benchmark_history": "exempt",
-    "smb_sensitive_benchmark": "exempt",
     "start_auth": "exempt",
     "start_unauth": "exempt",
     "stop_poisoning": "exempt",
@@ -401,9 +397,54 @@ def resolve_command_context_domain(
                 and command_name not in {"set", "workspace", "session", "help"}
             ):
                 return arg0, "arg0_fallback"
+        # Secondary safety net: when the shell carries exactly one domain in
+        # ``domains_data`` and nothing else resolved (e.g. a workspace saved by
+        # an older ADscan that never persisted ``shell.domain``), that single
+        # domain is unambiguous — adopt it so bare commands are not blocked.
+        # The primary fix populates ``shell.domain`` at the start_unauth/
+        # start_auth source; this only heals the reload edge case.
+        domains_data = getattr(shell, "domains_data", None)
+        if isinstance(domains_data, dict) and len(domains_data) == 1:
+            only_domain = next(iter(domains_data))
+            if only_domain:
+                return only_domain, "single_loaded_domain"
     except Exception:
         pass
     return None, "none"
+
+
+def set_active_domain(shell: Any, domain: str | None) -> None:
+    """Set the shell's active domain context (single source of truth).
+
+    ``shell.domain`` is the domain that bare REPL commands default to when the
+    operator does not pass an explicit ``<domain>`` argument. It MUST be
+    populated as soon as a domain has been resolved and locked — by either the
+    unauthenticated (``start_unauth``) or the authenticated (``start_auth`` /
+    ``add_credential``) entry point — otherwise subsequent commands fail with
+    "Domain not configured; run start_unauth first" even though the domain is
+    fully resolved in ``domains_data``.
+
+    This helper is the ONLY place that should assign ``shell.domain`` so both
+    paths stay in lockstep. It is idempotent and safe to call repeatedly.
+
+    Args:
+        shell: The interactive shell instance.
+        domain: The resolved domain FQDN to make active. No-op when empty.
+    """
+    normalized = str(domain or "").strip().rstrip(".")
+    if not normalized:
+        return
+    if not hasattr(shell, "domain"):
+        return
+    if getattr(shell, "domain", None) == normalized:
+        return
+    shell.domain = normalized
+    try:
+        print_info_debug(
+            f"[domain-context] active domain set to {mark_sensitive(normalized, 'domain')}"
+        )
+    except Exception:
+        pass
 
 
 # Per-command secret POSITIONAL indices for the command-dispatch echo.

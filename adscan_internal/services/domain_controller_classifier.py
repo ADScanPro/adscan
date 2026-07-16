@@ -44,146 +44,26 @@ of that question:
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable
 
-
-RID_DOMAIN_CONTROLLERS = 516
-RID_READ_ONLY_DOMAIN_CONTROLLERS = 521
-RODC_TARGET_PRIORITY_RANK = 25
-
-# UAC bit reserved for RODC machine accounts (MS-ADTS 2.2.16.1).
-UF_PARTIAL_SECRETS_ACCOUNT = 0x04000000
-
-
-DCRole = Literal["writable_dc", "rodc"]
-
-
-def _coerce_boolish(value: object) -> bool:
-    """Return True when *value* clearly represents a boolean true."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes"}
-    return False
-
-
-def _node_kind_matches_computer(node: dict[str, Any]) -> bool:
-    """Return True when the node's ``kind`` field marks it as a Computer."""
-    kind = node.get("kind") or ""
-    kind_values = kind if isinstance(kind, list) else [kind]
-    return any(str(value or "").strip() == "Computer" for value in kind_values)
-
-
-def _node_properties(node: dict[str, Any]) -> dict[str, Any]:
-    """Return the ``properties`` sub-dict of a node, defaulting to empty."""
-    props = node.get("properties")
-    return props if isinstance(props, dict) else {}
-
-
-def _read_int_attr(props: dict[str, Any], *keys: str) -> int | None:
-    """Return the first present property under *keys* as an int, else None."""
-    for key in keys:
-        if key not in props:
-            continue
-        raw = props[key]
-        if raw is None:
-            continue
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _hostname_stem(value: object) -> str:
-    """Return the lowercase hostname stem (no ``$``, no domain suffix)."""
-    token = str(value or "").strip()
-    if not token:
-        return ""
-    if token.endswith("$"):
-        token = token[:-1]
-    if "." in token:
-        token = token.split(".", 1)[0]
-    if "@" in token:
-        token = token.split("@", 1)[0]
-    return token.strip().lower()
-
-
-def _spn_targets_local_krbtgt(props: dict[str, Any]) -> bool:
-    """Return True when any SPN on the node is ``krbtgt/<host-or-fqdn>``.
-
-    Only RODCs publish such an SPN — writable DCs share the single
-    domain-wide ``krbtgt`` user account.  Pattern is robust against
-    case differences and FQDN/short variants.
-    """
-    spns = props.get("serviceprincipalnames")
-    if not isinstance(spns, (list, tuple)):
-        return False
-    samaccount = _hostname_stem(props.get("samaccountname"))
-    dns_host_stem = _hostname_stem(props.get("dnshostname"))
-    name_stem = _hostname_stem(props.get("name"))
-    own_stems = {stem for stem in (samaccount, dns_host_stem, name_stem) if stem}
-    for raw in spns:
-        token = str(raw or "").strip().lower()
-        if not token.startswith("krbtgt/"):
-            continue
-        spn_stem = _hostname_stem(token.split("/", 1)[1])
-        if not spn_stem:
-            continue
-        if not own_stems or spn_stem in own_stems:
-            return True
-    return False
-
-
-def classify_computer_node_role(node: dict[str, Any]) -> DCRole | None:
-    """Classify a Computer node as ``writable_dc``, ``rodc``, or unknown.
-
-    Reads node properties (``primaryGroupID``, SPNs, ``userAccountControl``,
-    explicit RODC flags) and returns the canonical role label, or ``None``
-    when the available signals do not uniquely identify the role.
-
-    The function never raises; missing fields simply lower confidence.
-    """
-    if not isinstance(node, dict):
-        return None
-    if not _node_kind_matches_computer(node):
-        return None
-
-    props = _node_properties(node)
-
-    # 1. primaryGroupID — definitive per AD schema.
-    primary_gid = _read_int_attr(props, "primarygroupid", "primaryGroupID", "primary_group_id")
-    if primary_gid == RID_READ_ONLY_DOMAIN_CONTROLLERS:
-        return "rodc"
-    if primary_gid == RID_DOMAIN_CONTROLLERS:
-        return "writable_dc"
-
-    # 2. Local krbtgt SPN — definitive RODC.
-    if _spn_targets_local_krbtgt(props):
-        return "rodc"
-
-    # 3. UAC bit — definitive RODC.
-    uac = _read_int_attr(props, "useraccountcontrol", "userAccountControl")
-    if uac is not None and (uac & UF_PARTIAL_SECRETS_ACCOUNT):
-        return "rodc"
-
-    # 4. Explicit BloodHound/collector RODC flags.
-    for key in ("msDS-isRODC", "msds-isrodc", "isRODC", "isrodc"):
-        if _coerce_boolish(node.get(key)) or _coerce_boolish(props.get(key)):
-            return "rodc"
-
-    return None
-
-
-def node_is_rodc_computer(node: dict[str, Any]) -> bool:
-    """Return True when an attack-graph node represents an RODC computer.
-
-    Thin wrapper over :func:`classify_computer_node_role` for legacy callers
-    that only need the boolean.
-    """
-    return classify_computer_node_role(node) == "rodc"
+# The pure, native-stack-free node-role classifier lives in its own module
+# (``computer_node_role``) so the readable appliance web backend can bundle it
+# — it grades a target's Privilege Tier — WITHOUT dragging in the
+# credential/Kerberos runtime helpers this module also carries
+# (``is_dc_host``/``expand_host_aliases`` lazily import
+# ``credential_store_service``, whose closure reaches the native stack). The
+# pure symbols are re-exported here so every existing
+# ``domain_controller_classifier`` import path keeps working unchanged.
+from adscan_internal.services.computer_node_role import (  # noqa: F401
+    RID_DOMAIN_CONTROLLERS,
+    RID_READ_ONLY_DOMAIN_CONTROLLERS,
+    RODC_TARGET_PRIORITY_RANK,
+    UF_PARTIAL_SECRETS_ACCOUNT,
+    DCRole,
+    _node_properties,
+    classify_computer_node_role,
+    node_is_rodc_computer,
+)
 
 
 # ---------------------------------------------------------------------------

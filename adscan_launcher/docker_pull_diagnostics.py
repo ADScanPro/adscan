@@ -110,8 +110,10 @@ PullFailureKind = Literal[
     "manifest_not_found",
     "registry_consistency",
     "no_disk_space",
+    "network_dns",
     "network_timeout",
     "daemon_unreachable",
+    "runtime_unsupported",
     "unknown",
 ]
 
@@ -123,7 +125,16 @@ class PullFailureDiagnosis:
     Attributes:
         kind: Best-match failure kind. ``"unknown"`` when no pattern
             matched — the panel falls back to the generic remediation
-            in that case.
+            in that case. ``"runtime_unsupported"`` is not classified
+            from captured stderr/stdout at all — it is recorded directly
+            by the container-runtime preflight (see
+            ``_ensure_supported_container_runtime`` in
+            ``docker_commands.py``) when ADscan refuses to pull because
+            the runtime is a rejected Podman compatibility shim rather
+            than Docker Engine. That refusal already prints its own
+            explanation, so this is a distinct terminal outcome and
+            never falls through to the generic "unclassified error"
+            panel.
         evidence: The cleaned, ANSI-stripped line(s) from the captured
             output that contain the actual error message. Safe to log
             and to display in a debug section of the failure panel.
@@ -169,6 +180,24 @@ _CLASSIFIERS: tuple[tuple[re.Pattern[str], PullFailureKind, bool], ...] = (
             re.IGNORECASE,
         ),
         "registry_consistency",
+        False,
+    ),
+    # DNS resolution failure. Placed BEFORE network_timeout: a name-lookup
+    # error must be diagnosed as DNS, not mis-caught as a generic timeout.
+    # The DNS form is specifically `dial tcp: lookup <host>` (no timeout/
+    # refused token), so it does not collide with the timeout classifier's
+    # `dial tcp ... timeout|refused` pattern above.
+    (
+        re.compile(
+            r"(temporary\s+failure\s+in\s+name\s+resolution|"
+            r"nameresolutionerror|"
+            r"failed\s+to\s+resolve|"
+            r"lookup\s+\S+[^\n]*\b(no\s+such\s+host|server\s+misbehaving|"
+            r"temporary\s+failure)\b|"
+            r"dial\s+tcp:\s+lookup\s+)",
+            re.IGNORECASE,
+        ),
+        "network_dns",
         False,
     ),
     (
@@ -353,6 +382,32 @@ _PRESENTATION: dict[PullFailureKind, PullFailurePresentation] = {
             "`/etc/docker/daemon.json` (`data-root`)."
         ),
     ),
+    "network_dns": PullFailurePresentation(
+        glyph="🌐",
+        title="Could not resolve the registry hostname (DNS)",
+        border_style="yellow",
+        what_lines=(
+            "Docker could not resolve the registry hostname to an IP address, "
+            "so the pull never reached the registry.",
+        ),
+        why_lines=(
+            "The name lookup failed (`Temporary failure in name resolution` / "
+            "`no such host`). Usual causes:",
+            "  1. The machine is offline or has no working DNS server.",
+            "  2. A required VPN is not connected, so the registry name only "
+            "resolves once the tunnel is up.",
+            "  3. `/etc/resolv.conf` points at an unreachable or wrong resolver.",
+        ),
+        fix_steps=(
+            "ping -c1 1.1.1.1                 # confirm the machine is online",
+            "cat /etc/resolv.conf            # confirm a reachable DNS server is set",
+            "{retry_command}                 # retry once name resolution works",
+        ),
+        followup=(
+            "If the registry name only resolves through a corporate VPN, "
+            "connect the VPN first, confirm it resolves, then retry."
+        ),
+    ),
     "network_timeout": PullFailurePresentation(
         glyph="⏱",
         title="Network timeout or connection failure",
@@ -397,6 +452,21 @@ _PRESENTATION: dict[PullFailureKind, PullFailurePresentation] = {
             "If `DOCKER_HOST` is set in your shell, unset it (`unset DOCKER_HOST`) "
             "before retrying."
         ),
+    ),
+    "runtime_unsupported": PullFailurePresentation(
+        glyph="⛔",
+        title="Unsupported container runtime (Podman compatibility mode)",
+        border_style="red",
+        what_lines=(
+            "ADscan refused to pull because the `docker` CLI on this host "
+            "is a Podman compatibility shim, not Docker Engine.",
+        ),
+        why_lines=(
+            "The rejection message printed before this pull attempt "
+            "already explains how to install Docker Engine or opt in to "
+            "Podman compatibility mode.",
+        ),
+        fix_steps=(),
     ),
     "unknown": PullFailurePresentation(
         glyph="❓",

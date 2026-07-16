@@ -80,6 +80,17 @@ _PSO_ATTRS = [
 # sAMAccountType for normal user accounts (excludes computers by default)
 _USER_ONLY_FILTER = "(&(sAMAccountType=805306368)(!(isDeleted=TRUE))(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
 
+# sAMAccountType for machine (computer) accounts. Used by the computer-pre2k
+# spray eligibility path, which needs per-machine badPwdCount + the same
+# observation-window reset as users so a near-lockout computer is not sprayed.
+_COMPUTER_ONLY_FILTER = "(&(sAMAccountType=805306369)(!(isDeleted=TRUE))(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+
+# Account-scope selector for fetch_spray_policy_native / _sync.
+_SCOPE_FILTERS: dict[str, str] = {
+    "user": _USER_ONLY_FILTER,
+    "computer": _COMPUTER_ONLY_FILTER,
+}
+
 # Filter to locate PSO container
 _PSO_FILTER = "(objectClass=msDS-PasswordSettings)"
 
@@ -338,8 +349,19 @@ async def _fetch_user_badpwdcounts(
     domain_nc: str,
     *,
     include_pso: bool = True,
+    spray_filter: str = _USER_ONLY_FILTER,
 ) -> tuple[dict[str, int], dict[str, str], dict[str, datetime], set[str]]:
-    """Fetch badPwdCount, badPasswordTime, resultant PSO DN and lock state per user.
+    """Fetch badPwdCount, badPasswordTime, resultant PSO DN and lock state per account.
+
+    Args:
+        conn: An open badldap connection.
+        domain_nc: Domain naming context (search base).
+        include_pso: Whether to request ``msDS-ResultantPSO``.
+        spray_filter: LDAP filter selecting the account scope. Defaults to the
+            user-account filter; pass ``_COMPUTER_ONLY_FILTER`` for machine
+            accounts (computer-pre2k spray eligibility). Both scopes carry
+            badPwdCount + the live UF_LOCKOUT computed bit, so the same
+            observation-window reset and locked-account exclusion apply.
 
     Returns:
         (badpwd_by_user, pso_dn_by_user, badpwdtime_by_user, locked_users). The
@@ -360,7 +382,7 @@ async def _fetch_user_badpwdcounts(
 
     try:
         async for entry, err in conn.pagedsearch(
-            query=_USER_ONLY_FILTER,
+            query=spray_filter,
             attributes=attrs,
             tree=domain_nc,
         ):
@@ -476,12 +498,12 @@ async def fetch_spray_policy_native(
     kerberos_target_hostname: str | None = None,
     auth_domain: str | None = None,
     auth_kdc: str | None = None,
+    account_scope: str = "user",
 ) -> SprayPolicyResult:
-    """Fetch domain password policy + per-user badPwdCount via native LDAP.
+    """Fetch domain password policy + per-account badPwdCount via native LDAP.
 
     Returns a SprayPolicyResult with all available data. Non-fatal errors
-    are collected in result.fetch_errors so callers can decide whether to
-    fall back to NetExec.
+    are collected in result.fetch_errors so callers can decide how to proceed.
 
     Args:
         domain: Target domain (DNS name).
@@ -492,11 +514,15 @@ async def fetch_spray_policy_native(
         kerberos_target_hostname: Target DC FQDN for the LDAP service SPN.
         auth_domain: Authenticating domain when different from target.
         auth_kdc: Auth KDC IP for cross-realm scenarios.
+        account_scope: ``"user"`` (default) or ``"computer"``. Selects the LDAP
+            account filter for the badPwdCount sweep — computer-pre2k spray
+            eligibility needs the machine-account scope.
 
     Returns:
         SprayPolicyResult (partial results on error).
     """
     result = SprayPolicyResult()
+    spray_filter = _SCOPE_FILTERS.get(account_scope, _USER_ONLY_FILTER)
     try:
         config = ADscanLDAPConfig(
             domain=domain,
@@ -526,7 +552,9 @@ async def fetch_spray_policy_native(
         ) = await asyncio.gather(
             _fetch_domain_policy(conn, domain_nc),
             _fetch_pso_objects(conn, domain_nc),
-            _fetch_user_badpwdcounts(conn, domain_nc, include_pso=True),
+            _fetch_user_badpwdcounts(
+                conn, domain_nc, include_pso=True, spray_filter=spray_filter
+            ),
         )
 
         result.default_policy = policy
@@ -588,6 +616,7 @@ def fetch_spray_policy_sync(
     kerberos_target_hostname: str | None = None,
     auth_domain: str | None = None,
     auth_kdc: str | None = None,
+    account_scope: str = "user",
 ) -> SprayPolicyResult:
     """Synchronous wrapper around fetch_spray_policy_native."""
     try:
@@ -606,6 +635,7 @@ def fetch_spray_policy_sync(
                             kerberos_target_hostname=kerberos_target_hostname,
                             auth_domain=auth_domain,
                             auth_kdc=auth_kdc,
+                            account_scope=account_scope,
                         )
                     )
                 )
@@ -623,5 +653,6 @@ def fetch_spray_policy_sync(
             kerberos_target_hostname=kerberos_target_hostname,
             auth_domain=auth_domain,
             auth_kdc=auth_kdc,
+            account_scope=account_scope,
         )
     )

@@ -34,6 +34,11 @@ The schema (all keys optional)::
     audit_extras:
       target_scope: domain_controllers     # default | domain_controllers | all_hosts
     host_cap: 150           # max hosts actively scanned (0 = unlimited)
+    cracking:
+      effort: balanced       # fast | balanced | thorough (default: balanced)
+      wordlist: ''            # escape hatch: an explicit wordlist path, bypasses effort tiering
+    poisoning:
+      enabled: true           # broadcast poisoning on/off (absent = workspace-type default)
 
 Unknown keys raise :class:`ScanConfigError` — a typo must fail loud, never be
 silently ignored. The web mirrors this same valid-set so both sides validate
@@ -44,7 +49,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Valid sets — the web form MUST mirror these exactly (contract).
@@ -100,15 +105,39 @@ CVE_TARGET_SCOPES: frozenset[str] = frozenset(
 HOST_CAP_DEFAULT = 150
 HOST_CAP_UNLIMITED = 0
 
+# Cracking-effort profiles (the time-budget engine — see
+# docs/superpowers/specs/2026-07-07-cracking-effort-engine-design.md).
+# Intentionally NOT imported from cracking_wordlist_policy.EFFORT_LEVELS —
+# scan_config.py stays dependency-free (no adscan_internal.services imports)
+# so the web's standalone contract test can import it cheaply; the two are
+# locked together by test_web_cracking_effort_levels_match_engine.
+CRACKING_EFFORT_FAST = "fast"
+CRACKING_EFFORT_BALANCED = "balanced"
+CRACKING_EFFORT_THOROUGH = "thorough"
+CRACKING_EFFORT_DEFAULT = CRACKING_EFFORT_BALANCED
+CRACKING_EFFORT_LEVELS: frozenset[str] = frozenset(
+    {CRACKING_EFFORT_FAST, CRACKING_EFFORT_BALANCED, CRACKING_EFFORT_THOROUGH}
+)
+
 # Top-level config keys (anything else is a typo -> ScanConfigError).
 _TOP_LEVEL_KEYS: frozenset[str] = frozenset(
-    {"phases", "trust_enumeration", "attack_paths", "audit_extras", "host_cap"}
+    {
+        "phases",
+        "trust_enumeration",
+        "attack_paths",
+        "audit_extras",
+        "host_cap",
+        "cracking",
+        "poisoning",
+    }
 )
 _PHASES_KEYS: frozenset[str] = frozenset({"disabled", "steps"})
 _TRUST_KEYS: frozenset[str] = frozenset({"policy", "domains"})
 _ATTACK_PATH_KEYS: frozenset[str] = frozenset({"policy", "selected"})
 _AUDIT_EXTRAS_KEYS: frozenset[str] = frozenset({"target_scope"})
 _STEPS_KEYS: frozenset[str] = frozenset({"disabled"})
+_CRACKING_KEYS: frozenset[str] = frozenset({"effort", "wordlist"})
+_POISONING_KEYS: frozenset[str] = frozenset({"enabled"})
 
 
 class ScanConfigError(ValueError):
@@ -200,6 +229,54 @@ class AuditExtrasConfig:
 
 
 @dataclass(frozen=True)
+class CrackingConfig:
+    """Offline-cracking effort section of a scan config.
+
+    Attributes:
+        effort: One of :data:`CRACKING_EFFORT_LEVELS`. ``balanced`` (default)
+            matches today's audit auto-crack behavior upgraded to rules-aware
+            tiering. ``fast`` stays near-instant everywhere; ``thorough``
+            always runs as a background job and auto-downgrades on CPU-only
+            hardware (see the cracking-effort-engine design spec).
+        wordlist: Optional escape hatch — an explicit wordlist file path that
+            bypasses effort-tier resolution entirely and is passed straight
+            to hashcat. Empty (default) defers to the effort tier.
+    """
+
+    effort: str = CRACKING_EFFORT_DEFAULT
+    wordlist: str = ""
+
+
+@dataclass(frozen=True)
+class PoisoningConfig:
+    """Broadcast-poisoning (LLMNR / NBT-NS / mDNS) background-job toggle.
+
+    Poisoning runs as a **background job** (it must wait for a victim to resolve
+    a bad name), never as a sequential scan phase — so this is a sibling of
+    ``cracking``, NOT an entry in ``phases.disabled``. ``enabled`` is
+    tri-state:
+
+    * ``None`` (default) — use the workspace-type default (audit auto-launches,
+      ctf does not). An absent section is therefore a no-op that reproduces
+      today's behavior exactly.
+    * ``True`` — force the background poisoning job on, overriding the type
+      default.
+    * ``False`` — force it off, overriding the type default.
+
+    The gate that consumes this is
+    :func:`adscan_internal.services.background_jobs.scan_seam.maybe_launch_poisoning_job`.
+    The hard opt-out env var ``ADSCAN_NO_POISONING=1`` still takes precedence
+    over an explicit ``True`` (a monitored/out-of-scope engagement kill switch).
+
+    Attributes:
+        enabled: ``None`` = workspace-type default; ``True`` = force on;
+            ``False`` = force off.
+    """
+
+    enabled: Optional[bool] = None
+
+
+@dataclass(frozen=True)
 class ScanConfig:
     """A fully-resolved scan configuration.
 
@@ -218,6 +295,11 @@ class ScanConfig:
     # bounds active scanning on large estates; ``HOST_CAP_UNLIMITED`` (0) restores
     # the full sweep. The directory graph (LDAP) is always mapped in full.
     host_cap: int = HOST_CAP_DEFAULT
+    cracking: CrackingConfig = field(default_factory=CrackingConfig)
+    # Broadcast-poisoning background-job toggle (sibling of ``cracking``, NOT a
+    # phase). ``enabled is None`` = workspace-type default (audit on, ctf off);
+    # so an absent section is a no-op.
+    poisoning: PoisoningConfig = field(default_factory=PoisoningConfig)
 
     # -- convenience predicates used by the gated decision points -----------
 
@@ -231,6 +313,9 @@ class ScanConfig:
             and self.attack_paths.policy == ATTACK_PATH_POLICY_INTERACTIVE
             and self.audit_extras.target_scope == CVE_TARGET_SCOPE_DEFAULT
             and self.host_cap == HOST_CAP_DEFAULT
+            and self.cracking.effort == CRACKING_EFFORT_DEFAULT
+            and not self.cracking.wordlist
+            and self.poisoning.enabled is None
         )
 
     def disabled_phase_ids(self) -> frozenset[str]:
@@ -399,6 +484,33 @@ def _parse_attack_paths(raw: Any) -> AttackPathsConfig:
     return AttackPathsConfig(policy=policy, selected=selected)
 
 
+def _parse_cracking(raw: Any) -> CrackingConfig:
+    mapping = _require_mapping(raw, where="cracking")
+    _reject_unknown_keys(mapping, _CRACKING_KEYS, where="cracking")
+    effort = str(
+        mapping.get("effort", CRACKING_EFFORT_DEFAULT) or CRACKING_EFFORT_DEFAULT
+    ).strip().lower()
+    if effort not in CRACKING_EFFORT_LEVELS:
+        raise ScanConfigError(
+            f"Invalid cracking.effort '{effort}'. "
+            f"Valid values: {', '.join(sorted(CRACKING_EFFORT_LEVELS))}."
+        )
+    wordlist = str(mapping.get("wordlist") or "").strip()
+    return CrackingConfig(effort=effort, wordlist=wordlist)
+
+
+def _parse_poisoning(raw: Any) -> PoisoningConfig:
+    mapping = _require_mapping(raw, where="poisoning")
+    _reject_unknown_keys(mapping, _POISONING_KEYS, where="poisoning")
+    enabled = mapping.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ScanConfigError(
+            f"'poisoning.enabled' must be a boolean or absent, "
+            f"got {type(enabled).__name__}."
+        )
+    return PoisoningConfig(enabled=enabled)
+
+
 def _parse_host_cap(raw: Any) -> int:
     """Parse the top-level ``host_cap`` scalar (a non-negative integer).
 
@@ -444,6 +556,8 @@ def parse_scan_config(data: Any) -> ScanConfig:
         attack_paths=_parse_attack_paths(mapping.get("attack_paths")),
         audit_extras=_parse_audit_extras(mapping.get("audit_extras")),
         host_cap=_parse_host_cap(mapping.get("host_cap")),
+        cracking=_parse_cracking(mapping.get("cracking")),
+        poisoning=_parse_poisoning(mapping.get("poisoning")),
     )
 
 

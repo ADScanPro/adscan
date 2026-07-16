@@ -30,6 +30,7 @@ from adscan_launcher.docker_pull_diagnostics import (
     consume_last_failure,
     get_presentation,
     peek_last_failure,
+    record_last_failure,
 )
 from adscan_launcher.docker_runtime import (
     DockerRunConfig,
@@ -95,6 +96,7 @@ _DOCKER_SERVICE_UNIT_MISSING_RE = re.compile(
 from adscan_core.host_resource_thresholds import (  # noqa: E402
     MIN_DOCKER_INSTALL_FREE_GB as _MIN_DOCKER_INSTALL_FREE_GB,
 )
+from adscan_core.interaction import is_non_interactive  # noqa: E402
 
 _DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3600
 _LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB = 1.0
@@ -864,6 +866,21 @@ def _ensure_supported_container_runtime(*, stage: str) -> bool:
             "runtime": "podman",
             "opt_in": False,
         },
+    )
+    # Record this as a distinct terminal outcome, not a bare `None`. A
+    # policy refusal on a *reachable* runtime (the `docker` CLI answers
+    # fine — it's just Podman) is otherwise indistinguishable from a
+    # genuine unclassified pull failure once it reaches
+    # `_print_docker_image_pull_failure_guidance`: that function sees
+    # daemon_running=True and no recorded diagnosis, and synthesizes a
+    # generic "unclassified error" panel that contradicts the specific
+    # rejection just printed above and dangles an irrelevant legacy-image
+    # fallback hint. See `docker_pull_diagnostics.PullFailureKind`.
+    record_last_failure(
+        PullFailureDiagnosis(
+            kind="runtime_unsupported",
+            evidence=[runtime_detail] if runtime_detail else [],
+        )
     )
     return False
 
@@ -1677,6 +1694,22 @@ def _print_docker_image_pull_failure_guidance(
         return
 
     diagnosis = consume_last_failure()
+    if diagnosis is not None and diagnosis.kind == "runtime_unsupported":
+        # A container-runtime policy refusal is a distinct terminal
+        # outcome, not a genuine unclassified pull failure: the daemon
+        # answered fine (daemon_running is True above), ADscan simply
+        # refused to use it because it's a rejected Podman compatibility
+        # shim. `_ensure_supported_container_runtime` already printed the
+        # exact rejection + remediation for this case. Rendering the
+        # generic "unclassified error" panel here would contradict that
+        # message, and the legacy-image fallback hint below is irrelevant
+        # to a runtime rejection — so stop here with nothing further to add.
+        print_info_debug(
+            "[docker] pull guidance short-circuited: runtime policy refusal "
+            "already explained by the preflight check."
+        )
+        return
+
     if diagnosis is None:
         # Pull failed but no diagnosis was recorded (shouldn't happen in
         # practice — defensive fallback). Synthesize an "unknown" so the
@@ -2395,6 +2428,28 @@ def _ensure_container_shared_token() -> str:
     return _EPHEMERAL_CONTAINER_SHARED_TOKEN
 
 
+def _reset_host_helper_log() -> None:
+    """Truncate the host-helper log so a launch shows only the current run.
+
+    The log is written append-only across launches, so a failure panel would
+    otherwise surface errors mixed across many past runs. Truncating in place
+    at the start of each launch keeps the path stable while scoping the
+    diagnostic tail to this run. Best-effort: never blocks startup.
+    """
+    log_path = _get_logs_dir() / "host-helper.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "w", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_info_debug(
+            "[host-helper] failed to reset log for this run: "
+            f"path={mark_sensitive(str(log_path), 'path')} "
+            f"error={mark_sensitive(str(exc), 'error')}"
+        )
+
+
 def _print_host_helper_log_tail(*, max_lines: int = 40) -> None:
     """Emit the latest host-helper log lines for troubleshooting."""
     log_path = _get_logs_dir() / "host-helper.log"
@@ -2567,7 +2622,21 @@ def _spawn_host_helper_process(
 
         if os.geteuid() != 0:
             preserve = ",".join(preserve_env_vars)
-            sudo_prefix = ["sudo", f"--preserve-env={preserve}", "-n"]
+            # Only force non-interactive sudo (`-n`) when the session cannot
+            # prompt (CI / NOPASSWD), where blocking on a password must never
+            # happen. In an interactive terminal we DROP `-n` so the child
+            # sudo can reuse the cached credential timestamp (or prompt on
+            # /dev/tty when the timestamp is not honoured for this tty),
+            # instead of failing with "a password is required".
+            non_interactive = is_non_interactive()
+            sudo_prefix = ["sudo", f"--preserve-env={preserve}"]
+            if non_interactive:
+                sudo_prefix.append("-n")
+            print_info_debug(
+                "[host-helper] sudo mode: "
+                f"non_interactive={str(non_interactive).lower()} "
+                f"flag_n={'yes' if non_interactive else 'no'}"
+            )
             if launch_mode.startswith("python-") and env.get("PYTHONPATH", "").strip():
                 # `sudo` can filter PYTHONPATH even when preserving env vars.
                 # Pass it via `env` so module resolution remains stable.
@@ -2643,10 +2712,22 @@ def _start_host_helper(*, socket_path: Path) -> subprocess.Popen[str] | None:
         print_info_debug("[host-helper] startup aborted: sudo validation failed")
         return None
 
+    # Scope the log to this launch so the diagnostic tail on failure reflects
+    # only the current run, not errors accumulated across past launches.
+    _reset_host_helper_log()
+
+    # The forced self-executable fallback only makes sense for PyInstaller
+    # (frozen) PRO binaries. For pip/pipx/uv installs it resolves the `adscan`
+    # entrypoint on PATH, which may be a stale wrapper lacking the
+    # `host-helper` subcommand and unable to import `adscan_launcher`. So for
+    # non-frozen installs we never force it: attempt 2 retries the reliable
+    # inline `sys.executable -m` path, recovering only from transient startup
+    # races.
+    is_frozen = bool(getattr(sys, "frozen", False))
     for launch_attempt, force_self_exec in ((1, False), (2, True)):
         proc = _spawn_host_helper_process(
             socket_path=socket_path,
-            force_self_executable=force_self_exec,
+            force_self_executable=force_self_exec and is_frozen,
         )
         if _wait_for_host_helper_ready(proc=proc, socket_path=socket_path):
             return proc

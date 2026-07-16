@@ -30,6 +30,7 @@ from adscan_internal import (
 from adscan_internal.rich_output import (
     confirm_ask,
     mark_sensitive,
+    prompt_ask,
     questionary_select_index,
 )
 from adscan_internal.cli.ci_events import emit_phase
@@ -41,6 +42,11 @@ from adscan_internal.cli.session_preflight import (
 import asyncio
 from adscan_internal.services.posture_orchestration import ensure_posture_fresh
 from adscan_internal.services.posture_probe import ProbePhase
+from adscan_internal.services.cracking_benchmark import warm_benchmark_async
+from adscan_internal.services.background_jobs import (
+    maybe_launch_poisoning_job,
+    reconcile_jobs_at_scan_end,
+)
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
 from adscan_internal.workspaces.subpaths import domain_relpath
@@ -74,6 +80,7 @@ from adscan_internal.services.network_preflight_service import (
 from adscan_internal.services.session_compromise_state_service import (
     mark_session_compromise_evaluable,
 )
+from adscan_internal.services.scan_outcome_telemetry import emit_scan_outcome
 from adscan_core.rich_output_collection import (
     SessionHeader,
     print_session_header,
@@ -152,8 +159,19 @@ def _infer_domain_from_candidate_ip_with_ux(
     mode_label: str,
     timeout_seconds: int = 60,
     interactive: bool | None = None,
+    credential: tuple[str, str] | None = None,
 ) -> str | None:
-    """Infer a domain from a candidate DC/DNS IP and render consistent UX."""
+    """Infer a domain from a candidate DC/DNS IP and render consistent UX.
+
+    Args:
+        credential: Optional ``(username, password)`` the operator already
+            supplied for this scan (authenticated flows only). Used as a
+            RETRY when the anonymous LDAP rootDSE read fails — a hardened DC
+            that blocks anonymous LDAP still answers a bind the operator
+            already holds valid creds for, instead of dead-ending to manual
+            domain entry despite holding credentials. ``None`` (default)
+            keeps unauthenticated flows anonymous-only.
+    """
     interactive_mode = bool(sys.stdin.isatty()) if interactive is None else interactive
     marked_ip = mark_sensitive(candidate_ip, "ip")
     print_info(
@@ -165,6 +183,7 @@ def _infer_domain_from_candidate_ip_with_ux(
         shell,
         candidate_ip=candidate_ip,
         timeout_seconds=timeout_seconds,
+        credential=credential,
     )
     if not inferred_domain or not method:
         return None
@@ -852,6 +871,11 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
     # Ask if user wants to clean workspace before starting scan (only if needed)
     _prompt_workspace_cleanup(shell)
 
+    # Warm the cracking hardware benchmark early + non-blocking (daemon thread,
+    # idempotent) so the effort selector / auto-crack has real time estimates by
+    # the time the scan reaches the crack step. No-op when already cached-fresh.
+    warm_benchmark_async(shell)
+
     # Always show scan-type guidance (even in args mode) to steer credentialed users
     # towards start_auth. Only prompt when interactive so automation doesn't block.
     print_panel(
@@ -934,6 +958,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                     domain=known_domain,
                     pdc_ip=known_pdc_ip,
                     interactive=bool(sys.stdin.isatty()),
+                    make_active=True,
                 )
                 print_info(
                     f"Domain set to: {mark_sensitive(known_domain, 'domain')}\n"
@@ -1131,6 +1156,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                         domain=known_domain,
                         pdc_ip=known_pdc_ip,
                         interactive=bool(sys.stdin.isatty()),
+                        make_active=True,
                     )
         elif decision.action == "fallback":
             args = None
@@ -1149,6 +1175,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                     domain=known_domain,
                     pdc_ip=known_pdc_ip,
                     interactive=bool(sys.stdin.isatty()),
+                    make_active=True,
                 )
 
         if not skip_domain_discovery:
@@ -1258,6 +1285,12 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
         if known_domain not in shell.domains:
             shell.domains.append(known_domain)
             shell.create_sub_workspace_for_domain(known_domain, known_pdc_ip)
+            # Offer broadcast poisoning as a background job (consent-gated,
+            # idempotent by interface). Best-effort; results are deferred (the
+            # launch itself is bounded, it does not wait on captures).
+            maybe_launch_poisoning_job(
+                shell, known_domain, getattr(shell, "interface", None)
+            )
 
         # Check DNS for the known domain
         if known_pdc_ip:
@@ -1288,6 +1321,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
         )
         _maybe_apply_domain_inference(shell, known_domain)
         mark_workspace_start_scan_completed(shell, "start_unauth")
+        emit_scan_outcome(shell, "start_unauth")
         shell.workspace_save()
         if not shell._is_ctf_domain_pwned(known_domain):
             shell.ask_for_unauth_scan(known_domain)
@@ -1434,6 +1468,11 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                     domain=known_domain,
                     pdc_ip=known_pdc_ip,
                     interactive=bool(sys.stdin.isatty()),
+                    make_active=True,
+                )
+                # Background poisoning launch for the discovered primary domain.
+                maybe_launch_poisoning_job(
+                    shell, known_domain, getattr(shell, "interface", None)
                 )
                 if selected_summary is not None:
                     print_panel(
@@ -1477,8 +1516,6 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                 if not shell._is_ctf_domain_pwned(known_domain):
                     shell.ask_for_unauth_scan(known_domain)
                 continue
-
-            shell.scan_service(service, target, domain)
 
     # Reached only after the discovery/enumeration branch ran a scan.
     return True
@@ -2224,9 +2261,23 @@ def _domain_context_wizard_for_unauth(shell: Any) -> tuple[str, str] | None:
     return _domain_context_wizard(shell, allow_blind=True, mode_label="unauth")
 
 
-def _domain_context_wizard_for_auth(shell: Any) -> tuple[str, str] | None:
-    """Collect domain context for authenticated scans (no blind discovery option)."""
-    return _domain_context_wizard(shell, allow_blind=False, mode_label="auth")
+def _domain_context_wizard_for_auth(
+    shell: Any,
+    *,
+    credential: tuple[str, str] | None = None,
+) -> tuple[str, str] | None:
+    """Collect domain context for authenticated scans (no blind discovery option).
+
+    Args:
+        credential: Optional ``(username, password)`` already captured for this
+            authenticated scan. Forwarded to the "I know only a DC/DNS IP"
+            branch so a failed anonymous LDAP rootDSE read retries
+            authenticated with the creds the operator already supplied,
+            instead of dead-ending to manual domain entry.
+    """
+    return _domain_context_wizard(
+        shell, allow_blind=False, mode_label="auth", credential=credential
+    )
 
 
 def _domain_context_wizard(
@@ -2234,6 +2285,7 @@ def _domain_context_wizard(
     *,
     allow_blind: bool,
     mode_label: Literal["unauth", "auth"],
+    credential: tuple[str, str] | None = None,
 ) -> tuple[str, str] | None:
     """Collect the best available (domain, dc_ip) context from partial user inputs.
 
@@ -2241,6 +2293,12 @@ def _domain_context_wizard(
         shell: Interactive shell.
         allow_blind: When True, include a "I know nothing" option and return None.
         mode_label: Telemetry label describing which start flow is using the wizard.
+        credential: Optional ``(username, password)`` already captured for this
+            scan. Only consumed by the "I know only a DC/DNS IP" branch as a
+            RETRY when the anonymous LDAP domain-identity probe fails.
+            Anonymous-first stays the default — creds are never sent unless
+            the anonymous attempt already failed. ``None`` for unauthenticated
+            flows (no credentials to retry with).
 
     Returns:
         (domain, dc_ip) if enough information is confirmed to run direct enumeration,
@@ -2417,6 +2475,7 @@ def _domain_context_wizard(
             candidate_ip=ip,
             mode_label=mode_label,
             timeout_seconds=60,
+            credential=credential,
         )
         if inferred_domain:
             return _confirm_and_preflight(inferred_domain, ip)
@@ -2848,18 +2907,21 @@ def _ensure_workspace_selected_for_start(shell: Any) -> bool:
     return True
 
 
-def _emit_post_scan_panels(verb: str) -> None:
-    """Render post-scan UX panels (next-step suggestions, first-scan flag).
+def _emit_post_scan_panels(shell, verb: str) -> None:
+    """Render post-scan UX panels (premium recap, first-scan flag).
 
-    Best-effort: panel rendering or flag persistence failures must never
-    propagate into the success path of a scan flow.
+    Threads ``shell`` into :func:`print_post_scan_suggestions` so it can build
+    the premium end-of-scan recap (findings + headline attack path + outcome)
+    from the live scan artifacts. Best-effort: panel rendering or flag
+    persistence failures must never propagate into the success path of a scan
+    flow.
     """
     try:
         from adscan_internal.cli.post_scan_suggestions import (
             print_post_scan_suggestions,
         )
 
-        print_post_scan_suggestions(verb)
+        print_post_scan_suggestions(verb, shell=shell)
     except Exception:  # noqa: BLE001 - UX panel must not break the success path
         pass
     try:
@@ -2884,7 +2946,8 @@ def run_start_unauth(shell, args: str | None) -> None:
             # cancelled discovery, preflight abort) and delegation to
             # run_start_auth return False so we don't render a false completion.
             if scan_ran:
-                _emit_post_scan_panels("start_unauth")
+                _emit_post_scan_panels(shell, "start_unauth")
+                reconcile_jobs_at_scan_end(shell)
             return
         except (EOFError, KeyboardInterrupt):
             action = _handle_start_wizard_interrupt(
@@ -2923,8 +2986,103 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
     if not shell._prompt_auto_if_missing():
         return False
 
+    # Smart-resume front door — when this workspace already holds results for one
+    # or more scanned domains and the operator ran ``start_auth`` with NO positional
+    # args interactively, offer a single clean selector: continue an initialized
+    # domain (reuse the stored credential, zero preamble) or scan a new one. Gated
+    # strictly on ``is_non_interactive`` + no args so ``adscan ci`` (args-mode auth)
+    # is byte-identical and never engages the front door.
+    from adscan_internal.interaction import is_non_interactive
+
+    if not (args or "").strip() and not is_non_interactive(shell):
+        from adscan_internal.cli.start_resume_frontdoor import (
+            NEW_SCAN,
+            detect_resumable_domains,
+            prompt_credential_reuse,
+            prompt_frontdoor_choice,
+        )
+
+        resumable = detect_resumable_domains(shell)
+        if resumable:
+            choice = prompt_frontdoor_choice(shell, resumable)
+            if choice != NEW_SCAN:
+                selected = choice.domain
+                # Warm the cracking benchmark on the continue paths too (the
+                # normal call below is skipped when we return early here).
+                warm_benchmark_async(shell)
+                if choice.mode == "continue":
+                    # Primary one-click resume (the collapse): reuse the stored
+                    # credential (no credential re-prompt) AND predecide RESUME so
+                    # ``_run_enum_domain_auth`` skips BOTH the workspace-action
+                    # panel and the phase-scope prompt — a single front-door
+                    # prompt, nothing else. This reuses the exact one-shot flag the
+                    # reload-offer collapse already established; the consumer reads
+                    # and clears it, so a later direct enum_domain_auth / start_auth
+                    # in the same session still gets the genuine four-action panel.
+                    # No extra bind is issued, so this is badPwdCount-safe.
+                    from adscan_internal.cli.workspace_resume_panel import (
+                        WorkspaceAction,
+                    )
+
+                    finalize_domain_context(
+                        shell,
+                        domain=selected.domain,
+                        pdc_ip=selected.pdc,
+                        interactive=True,
+                        make_active=True,
+                    )
+                    try:
+                        shell._resume_action_predecided = WorkspaceAction.RESUME
+                    except Exception:  # noqa: BLE001 - a set failure just re-shows the panel
+                        pass
+                    shell.do_enum_domain_auth(selected.domain)
+                    return True
+
+                # choice.mode == "other": deliberate opt-in to the full
+                # alternative surface. Reproduce today's flow exactly — offer
+                # reuse vs a different credential — and NEVER predecide RESUME, so
+                # the genuine four-action panel (Resume / Refresh / Replay /
+                # Inspect) renders unchanged.
+                cred = prompt_credential_reuse(shell, selected)
+                if cred == "reuse":
+                    # Reuse the stored credential and hand off WITHOUT the flag so
+                    # the workspace-action panel + phase-scope prompt both render.
+                    finalize_domain_context(
+                        shell,
+                        domain=selected.domain,
+                        pdc_ip=selected.pdc,
+                        interactive=True,
+                        make_active=True,
+                    )
+                    shell.do_enum_domain_auth(selected.domain)
+                    return True
+                # "Use a different credential": pre-seed the stored domain + pdc
+                # and run the normal machinery so the UNVERIFIED credential is
+                # live-verified before a fresh authenticated pass.
+                username, password = cred
+                finalize_domain_context(
+                    shell,
+                    domain=selected.domain,
+                    pdc_ip=selected.pdc,
+                    interactive=True,
+                    make_active=True,
+                )
+                return _start_auth_with_params(
+                    shell,
+                    domain=selected.domain,
+                    pdc_ip=selected.pdc,
+                    username=username,
+                    password=password,
+                )
+            # choice == NEW_SCAN: fall through to today's full flow, unchanged.
+
     # Ask if user wants to clean workspace before starting scan (only if needed)
     _prompt_workspace_cleanup(shell)
+
+    # Warm the cracking hardware benchmark early + non-blocking (daemon thread,
+    # idempotent) so the effort selector / auto-crack has real time estimates by
+    # the time the scan reaches the crack step. No-op when already cached-fresh.
+    warm_benchmark_async(shell)
 
     args_list = (args or "").strip().split() if args else []
     if args_list:
@@ -2962,7 +3120,9 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
                     border_style="yellow",
                     padding=(1, 2),
                 )
-                context = _domain_context_wizard_for_auth(shell)
+                context = _domain_context_wizard_for_auth(
+                    shell, credential=(username, password)
+                )
                 if context is None:
                     print_error(
                         "A valid DC/PDC target is required for authenticated scanning."
@@ -2974,6 +3134,7 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
                 domain=domain,
                 pdc_ip=pdc_ip,
                 interactive=bool(sys.stdin.isatty()),
+                make_active=True,
             )
             return _start_auth_with_params(
                 shell,
@@ -2990,6 +3151,16 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
 
     creds = _prompt_auth_credentials_interactive(shell)
     if creds is None:
+        # Cancelled the credential entry (no credentials on hand). Do not
+        # dead-end the operator: offer the unauthenticated scan, which discovers
+        # the domain and can surface a first credential on its own. Guarded on
+        # interactivity so a non-interactive session never blocks on the offer.
+        if not is_non_interactive(shell) and confirm_ask(
+            "No credentials entered. Switch to start_unauth to discover the domain first?",
+            default=False,
+        ):
+            # run_start_unauth emits its own post-scan panel; do not emit another.
+            run_start_unauth(shell, None)
         return False
     username, password = creds
 
@@ -3008,7 +3179,9 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
     from rich.text import Text
 
     while True:
-        context = _domain_context_wizard_for_auth(shell)
+        context = _domain_context_wizard_for_auth(
+            shell, credential=(username, password)
+        )
         if context is not None:
             domain, pdc_ip = context
             finalize_domain_context(
@@ -3016,6 +3189,7 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
                 domain=domain,
                 pdc_ip=pdc_ip,
                 interactive=True,
+                make_active=True,
             )
             return _start_auth_with_params(
                 shell,
@@ -3050,41 +3224,63 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
 def _prompt_auth_credentials_interactive(shell: Any) -> tuple[str, str] | None:
     """Prompt for username + password/hash for an authenticated scan.
 
-    The user must provide both fields; otherwise, they should use `start_unauth`.
+    Empty input is an explicit CANCEL: an operator who chose an authenticated
+    scan but has no credentials on hand leaves the prompt cleanly (the caller
+    then offers ``start_unauth``) instead of being trapped in an endless
+    "cannot be empty, try again" loop. A wrong-but-non-empty entry can still be
+    re-entered a couple of times via the confirm step.
+
+    Non-interactive sessions (``adscan ci`` / the web PoV worker) never block on
+    this prompt — Docker keeps a TTY under ``-it`` so a raw prompt would hang
+    forever, so they cancel immediately and let the caller fall back to an
+    args-driven or unauthenticated path.
 
     Returns:
         (username, password_or_hash) or None if cancelled.
     """
-    from rich.prompt import Confirm, Prompt
+    from adscan_internal.interaction import is_non_interactive
     from rich.text import Text
 
-    while True:
-        print_panel(
-            "[bold]Domain credentials power the authenticated scan.[/bold]\n\n"
-            "No credentials on hand? Switch to [bold yellow]start_unauth[/bold yellow] instead.\n\n"
-            "[dim]Accepted formats:[/dim]\n"
-            "    [cyan]›[/cyan]  cleartext password\n"
-            "    [cyan]›[/cyan]  NTLM hash in [yellow]LM:NT[/yellow] form\n"
-            "    [cyan]›[/cyan]  AES key (for Kerberos-only environments)",
-            title="[bold]» Credentials[/bold]",
-            border_style="cyan",
-            padding=(1, 2),
+    if is_non_interactive(shell):
+        print_info_debug(
+            "start_auth: non-interactive session; cancelling credential prompt "
+            "(caller falls back to start_unauth / args-driven auth)."
         )
+        return None
 
-        username = Prompt.ask(
-            Text("Enter the username (e.g., alice)", style="cyan"), default=""
+    print_panel(
+        "[bold]Domain credentials power the authenticated scan.[/bold]\n\n"
+        "No credentials on hand? Leave the username blank to cancel and switch "
+        "to [bold yellow]start_unauth[/bold yellow] instead.\n\n"
+        "[dim]Accepted formats:[/dim]\n"
+        "    [cyan]›[/cyan]  cleartext password\n"
+        "    [cyan]›[/cyan]  NTLM hash in [yellow]LM:NT[/yellow] form\n"
+        "    [cyan]›[/cyan]  AES key (for Kerberos-only environments)",
+        title="[bold]» Credentials[/bold]",
+        border_style="cyan",
+        padding=(1, 2),
+    )
+
+    # A small retry allowance covers the "not these creds, re-enter" path only.
+    # Empty input is never a retry — it always cancels (returns None).
+    for _attempt in range(3):
+        username = prompt_ask(
+            Text("Enter the username (blank to cancel)", style="cyan"), default=""
         ).strip()
         if not username:
-            print_warning("Username cannot be empty. Please try again.")
-            continue
+            print_info("No username entered — cancelling credential entry.")
+            return None
 
-        password = Prompt.ask(
-            Text("Enter the password or NTLM hash (visible input)", style="cyan"),
+        password = prompt_ask(
+            Text(
+                "Enter the password or NTLM hash (visible input, blank to cancel)",
+                style="cyan",
+            ),
             default="",
         ).strip()
         if not password:
-            print_warning("Password/hash cannot be empty. Please try again.")
-            continue
+            print_info("No password/hash entered — cancelling credential entry.")
+            return None
 
         cred_type = "NTLM hash" if shell.is_hash(password) else "Password"
         print_panel(
@@ -3097,13 +3293,13 @@ def _prompt_auth_credentials_interactive(shell: Any) -> tuple[str, str] | None:
             padding=(1, 2),
         )
 
-        if Confirm.ask(
-            Text("Proceed with these credentials?", style="cyan"), default=True
-        ):
+        if confirm_ask("Proceed with these credentials?", default=True):
             return username, password
 
-        if not Confirm.ask(Text("Re-enter credentials?", style="cyan"), default=True):
+        if not confirm_ask("Re-enter credentials?", default=True):
             return None
+
+    return None
 
 
 def _maybe_apply_domain_inference(shell: Any, domain: str | None) -> None:
@@ -3318,6 +3514,19 @@ def _start_auth_with_params(
     if not shell.do_check_dns(domain, pdc_ip):
         return False
 
+    # Offer broadcast poisoning as a background job HERE — after the domain
+    # subworkspace + DNS are ready, and BEFORE ``add_credential`` below (which
+    # runs the whole authenticated scan: posture -> trust enum -> every phase,
+    # blocking until done). Launching here mirrors the start_unauth seam so the
+    # listener captures DURING the authenticated scan, not after it (the old call
+    # site fired only once the scan had already finished). Consent-gated,
+    # idempotent by interface (kind="poisoning", scope="poisoning@<iface>"): the
+    # trust-enum loop that later creates sibling-domain subworkspaces on the SAME
+    # interface hits ``find_active`` and no-ops, so this never re-prompts. In auth
+    # scans the value is harvesting ADDITIONAL credentials off the segment while
+    # the scan runs — broadening the compromise at zero extra operator effort.
+    maybe_launch_poisoning_job(shell, domain, getattr(shell, "interface", None))
+
     shell.scan_mode = "auth"
     shell.domain_validated_cred_counts = {}
     shell.scan_start_time = time.monotonic()
@@ -3376,7 +3585,12 @@ def _start_auth_with_params(
         password,
         pdc_ip=pdc_ip,
         force_authenticated_enumeration=True,
-        prompt_when_already_authenticated=True,
+        # Consolidation: the workspace-resume panel (_run_enum_domain_auth) is now
+        # the single decision surface for an already-initialized domain. Panel 1
+        # (rerun-full vs privs-only) is removed; a genuinely-new domain has no
+        # prior graph so the resume panel auto-resolves to REFRESH (no prompt),
+        # identical to today's first run.
+        prompt_when_already_authenticated=False,
         # This is the scan's own STARTING credential (the INPUT to the
         # authenticated scan), not a credential compromised during it. Tag its
         # provenance ``authenticated_scan`` so the compromise SSOT excludes it
@@ -3387,6 +3601,7 @@ def _start_auth_with_params(
         credential_origin="authenticated_scan",
     )
     mark_workspace_start_scan_completed(shell, "start_auth")
+    emit_scan_outcome(shell, "start_auth")
     if hasattr(shell, "save_workspace_data"):
         try:
             shell.save_workspace_data()
@@ -3409,7 +3624,8 @@ def run_start_auth(shell, args: str | None) -> None:
             # target, preflight/DNS abort) and delegation to run_start_unauth
             # return False so we don't render a false completion.
             if scan_ran:
-                _emit_post_scan_panels("start_auth")
+                _emit_post_scan_panels(shell, "start_auth")
+                reconcile_jobs_at_scan_end(shell)
             return
         except (EOFError, KeyboardInterrupt):
             action = _handle_start_wizard_interrupt(

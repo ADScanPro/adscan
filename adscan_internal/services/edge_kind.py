@@ -296,6 +296,13 @@ _ESCALATION_EDGES: Final[frozenset[str]] = frozenset(
         # (compromise_semantics=credential_access_only) → no DumpLSA chains; the
         # recovered machine hash IS the credential.
         "CrackNTLMv1",
+        # Broadcast name-resolution poisoning → NetNTLMv2 capture → offline crack.
+        # An unauthenticated attacker on the victim's L2 segment poisons
+        # LLMNR/NBT-NS/mDNS, captures the user's NetNTLMv2 response, and cracks it
+        # offline into the cleartext password. A credential-recovery escalation
+        # (like ASREPRoasting / CrackNTLMv1); source is the unauthenticated
+        # principal, so it materializes only on crack success.
+        "PoisonCaptureNtlmv2Crack",
     }
 )
 

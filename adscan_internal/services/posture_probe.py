@@ -277,7 +277,19 @@ ProbeProgressCallback = Callable[[ConstraintCategory, Optional[ProbeResult]], No
 #                    (`require strong auth=yes`). Busts stale U2-NTLM
 #                    LDAP_SIGNING=DISABLED HIGH verdicts that were false for the
 #                    Kerberos path.
-_PROBE_SCHEMA_VERSION: int = 8
+# v9 (2026-07-13): A3 NTLM_AUTHENTICATION probe reimplemented over an SMB
+#                    SESSION_SETUP (bogus credential) instead of an unsigned
+#                    plain-LDAP/389 NTLM bind. The LDAP bind coupled two
+#                    orthogonal signals — LDAP signing (validated first) masked
+#                    the NTLM SSP verdict, so on every LDAP-signing-REQUIRED
+#                    domain A3 returned PROBE_FAILED and NTLM was never learned.
+#                    SMB is a different protocol from LDAP signing, so the signing
+#                    requirement can no longer mask the NTLM verdict. New markers
+#                    (NTLM_BLOCKED_VIA_SMB / NTLM_REACHED_CRED_CHECK_VIA_SMB) and
+#                    the STATUS_NTLM_BLOCKED-vs-STATUS_LOGON_FAILURE split change
+#                    the technique + classification, so bump to re-probe stale A3
+#                    caches (incl. any PROBE_FAILED/UNKNOWN from the old vehicle).
+_PROBE_SCHEMA_VERSION: int = 9
 
 
 # --------------------------------------------------------------------------- #
@@ -2029,6 +2041,89 @@ async def _probe_ldaps_channel_binding(
     )
 
 
+def _ldap_posture_field_from_result(result: ProbeResult) -> Optional[tuple[str, bool]]:
+    """Map an LDAP signing / channel-binding ``ProbeResult`` to a display field.
+
+    Returns ``(label, hardened)`` when the DC gave a definitive answer, or
+    ``None`` when the result is inconclusive (``succeeded is False`` or
+    ``state == UNKNOWN`` — including a skipped probe). ``TriState.REQUIRED``
+    is the only hardened state; any other observed state (``DISABLED`` /
+    ``ENABLED``) means the policy is present but not enforced.
+    """
+    if not result.succeeded or result.state == TriState.UNKNOWN:
+        return None
+    if result.state == TriState.REQUIRED:
+        return ("Required", True)
+    return ("None", False)
+
+
+async def probe_ldap_security_for_dc(
+    *,
+    domain: str,
+    dc_ip: str,
+    sink: PostureSink,
+    timeout: float = 5.0,
+) -> dict:
+    """Audit one DC's LDAP signing + channel-binding posture natively.
+
+    Reuses the single-source-of-truth detection probes
+    (:func:`_probe_ldap_signing` on LDAP/389 and
+    :func:`_probe_ldaps_channel_binding` on LDAPS/636) instead of parsing a
+    subprocess auditor's banner text, and maps their ``ProbeResult`` outcomes
+    into the per-DC ``parsed`` shape the LDAP-security audit consumes::
+
+        {"entries": [{"signing": <str>, "signing_hardened": <bool>,
+                      "channel_binding": <str>, "channel_binding_hardened": <bool>,
+                      "server_name": <dc_ip>}]}
+
+    Honest-unknown contract: if EITHER probe fails to obtain a definitive
+    answer (``succeeded is False`` or ``state == UNKNOWN``), the DC could not
+    be conclusively audited, so ``{"entries": []}`` is returned — the audit
+    summarizer treats an empty entries list as unreachable, the correct honest
+    outcome when the DC did not answer. This function adds no detection logic:
+    the probes emit only OBSERVED states to ``sink`` (cache-only-observations
+    policy), so the domain posture cache learns the verdict as a side effect.
+
+    Args:
+        domain: Target domain (realm) of the DC being audited.
+        dc_ip: DC address or FQDN to probe (used as ``server_name`` in the
+            returned entry).
+        sink: Posture sink the underlying probes emit observed signals through.
+        timeout: Per-probe wall-clock budget in seconds.
+
+    Returns:
+        The per-DC ``parsed`` dict described above.
+    """
+    signing_result = await _probe_ldap_signing(
+        domain=domain, dc_ip=dc_ip, sink=sink, timeout=timeout
+    )
+    cbt_result = await _probe_ldaps_channel_binding(
+        domain=domain, dc_ip=dc_ip, sink=sink, timeout=timeout
+    )
+
+    signing_field = _ldap_posture_field_from_result(signing_result)
+    cbt_field = _ldap_posture_field_from_result(cbt_result)
+    if signing_field is None or cbt_field is None:
+        # At least one signal was inconclusive — do not fabricate a partial
+        # verdict. An empty entries list is read as unreachable by the audit
+        # summarizer, which is the honest outcome.
+        return {"entries": []}
+
+    signing_label, signing_hardened = signing_field
+    channel_binding_label, channel_binding_hardened = cbt_field
+    return {
+        "entries": [
+            {
+                "signing": signing_label,
+                "signing_hardened": signing_hardened,
+                "channel_binding": channel_binding_label,
+                "channel_binding_hardened": channel_binding_hardened,
+                "server_name": dc_ip,
+            }
+        ]
+    }
+
+
 async def _probe_ldaps_channel_binding_kerberos(
     *,
     domain: str,
@@ -2516,6 +2611,83 @@ async def _probe_kerberos_etype(
         )
 
 
+def _classify_ntlm_session_setup_outcome(
+    outcome: Any,
+) -> Optional[tuple[TriState, str, str]]:
+    """Map a raw SMB SESSION_SETUP outcome to an NTLM enforcement verdict.
+
+    Returns ``(state, signal_code, message)`` for a definitive verdict, or
+    ``None`` when the outcome does not reach a clean NTLM SSP decision
+    (unclassifiable NTSTATUS) — the A3 probe then returns UNKNOWN/LOW and does
+    NOT emit (CLAUDE.md posture policy: cache observations, never absences).
+
+    CRITICAL BOUNDARY (design 2026-07-13 §4.1): the marker tuples below are
+    function-local and MUST NOT reuse ``smb_transport._NTLM_BLOCKED_MARKERS``.
+    That shared set conflates ``STATUS_LOGON_FAILURE`` with
+    ``STATUS_NTLM_BLOCKED`` because for the fallback-retry path both mean "try
+    Kerberos next". For THIS probe they are OPPOSITE verdicts:
+
+      * ``LOGON_FAILURE`` — the DC reached the credential stage and rejected the
+        bogus password: the NTLM SSP processed an authentication -> ENABLED.
+      * ``NTLM_BLOCKED`` / ``NOT_SUPPORTED`` / ``SEC_E_UNSUPPORTED_FUNCTION`` —
+        the NTLM SSP refused the session-setup outright -> DISABLED.
+
+    Sharing the marker set would flip one verdict into its opposite.
+    """
+    if getattr(outcome, "session_established", False):
+        return (
+            TriState.ENABLED,
+            "NTLM_SESSION_SETUP_OK",
+            "SMB NTLM session-setup succeeded (NTLM is enabled)",
+        )
+
+    # NTLM SSP refused the SESSION_SETUP outright -> NTLM disabled by policy.
+    _NTLM_DISABLED_SSP_MARKERS = (
+        "ntlm_blocked",  # NTStatus.NTLM_BLOCKED (0xC0000418)
+        "not_supported",  # NTStatus.NOT_SUPPORTED (0xC00000BB)
+        "sec_e_unsupported_function",
+        "0x80090302",
+        "80090302",
+        "0xc0000418",
+        "c0000418",
+        "0xc00000bb",
+        "c00000bb",
+    )
+    # NTLM SSP reached the credential stage and rejected the bogus credential on
+    # its merits -> NTLM enabled (the DC processed an NTLM authentication).
+    _NTLM_ENABLED_CRED_CHECK_MARKERS = (
+        "logon_failure",  # NTStatus.LOGON_FAILURE (0xC000006D)
+        "0xc000006d",
+        "c000006d",
+        "wrong_password",
+        "account_restriction",  # NTStatus.ACCOUNT_RESTRICTION (0xC000006E)
+        "account_disabled",
+        "account_locked_out",
+        "password_expired",
+        "password_must_change",
+    )
+
+    name = str(getattr(outcome, "ntstatus_name", "") or "").lower()
+    text = str(getattr(outcome, "error_text", "") or "")
+    hay = f"{name} {text}"
+    # SSP-collapse (DISABLED) is checked first: it is the more specific refusal
+    # and never co-occurs with a credential-check reject on the same status.
+    if any(m in hay for m in _NTLM_DISABLED_SSP_MARKERS):
+        return (
+            TriState.DISABLED,
+            "NTLM_BLOCKED_VIA_SMB",
+            "DC refused the NTLM SMB session-setup (NTLM appears disabled by policy)",
+        )
+    if any(m in hay for m in _NTLM_ENABLED_CRED_CHECK_MARKERS):
+        return (
+            TriState.ENABLED,
+            "NTLM_REACHED_CRED_CHECK_VIA_SMB",
+            "DC processed the NTLM SMB session-setup and rejected the bogus "
+            "credential (NTLM is enabled)",
+        )
+    return None
+
+
 async def _probe_ntlm_authentication(
     *,
     domain: str,
@@ -2524,64 +2696,56 @@ async def _probe_ntlm_authentication(
     sink: PostureSink,
     timeout: float,
 ) -> ProbeResult:
-    """Probe A3 — NTLM bind via plain LDAP to detect NTLM enforcement state."""
-    from adscan_internal.services.ldap_transport_service import (
-        ADscanLDAPConfig,
-        async_connect_with_ldap_fallback,
+    """Probe A3 — NTLM enforcement via an SMB SESSION_SETUP (bogus credential).
+
+    WHY SMB, NOT LDAP (design 2026-07-13-posture-probe-dependency-order §4.1):
+    NTLM-disabled and LDAP-signing-required are ORTHOGONAL GPO facts. The old A3
+    measured NTLM via an unsigned plain-LDAP/389 bind — a single operation that
+    exercises TWO layers in series: the LDAP signing layer (validated FIRST) and
+    the NTLM SSP layer (validated SECOND). On a signing-required DC the bind is
+    rejected with ``strongerAuthRequired`` at the signing layer BEFORE the NTLM
+    SSP verdict is reachable, MASKING NTLM -> A3 returned PROBE_FAILED and NTLM
+    was NEVER learned on ANY signing-required domain (a permanent structural
+    blind spot). SMB SESSION_SETUP is a DIFFERENT protocol from LDAP signing, so
+    the signing requirement can no longer mask the NTLM verdict. This mirrors the
+    A4 redesign (measure SMB signing on an auth-independent NEGOTIATE): move the
+    probe off the contaminated vehicle rather than special-case the classifier.
+
+    Uses a BOGUS credential (like the U2/U3 transport-policy probes) so the probe
+    is auth-independent. ``creds`` is accepted for orchestrator-signature parity
+    and is intentionally NOT used for the wire authentication.
+
+    Verdict mapping:
+      * ``STATUS_NTLM_BLOCKED`` / ``STATUS_NOT_SUPPORTED`` / SSP refusal ->
+        ``NTLM_AUTHENTICATION = DISABLED HIGH``, emit.
+      * ``STATUS_LOGON_FAILURE`` / reached the credential check / session
+        established -> ``NTLM_AUTHENTICATION = ENABLED HIGH``, emit.
+      * timeout / 445 unreachable / unclassifiable -> ``UNKNOWN LOW``, NO emit
+        (observe-don't-infer).
+    """
+    from adscan_internal.services.smb_transport import (
+        SMBConfig,
+        SMBConnectionError,
+        smb_probe_ntlm_session_setup,
     )
 
     cat = ConstraintCategory.NTLM_AUTHENTICATION
     started = _now_ms()
-    cfg = ADscanLDAPConfig(
+
+    cfg = SMBConfig(
+        target_ip=dc_ip,
         domain=domain,
-        dc_ip=dc_ip,
-        use_ldaps=False,
+        username=_make_bogus_probe_user(),
+        password=_BOGUS_CRED_PASSWORD,
         use_kerberos=False,
-        username=creds.username,
-        password=creds.password,
-        # Wire NT hash via the password slot when the config supports the
-        # standard "NT hash as password" convention used by badldap's
-        # ldap+ntlm-nt scheme. ``ADscanLDAPConfig`` autodetects via
-        # ``_is_nt_hash`` inside ``_build_ldap_connection_url``.
-        # Probe needs the raw NTLM rejection to surface so it can emit
-        # ``NTLM_AUTHENTICATION=DISABLED``. Without this flag, the
-        # transport's signing self-heal could retry with sign=True and
-        # the NTLM bind would succeed, falsifying the result.
+        kdc_ip=dc_ip,
+        # Probe wants the raw NTLM SSP verdict to surface, not a healed retry.
         disable_self_heal=True,
     )
-    if creds.password is None and creds.nt_hash is not None:
-        cfg.password = creds.nt_hash
 
     try:
-        conn, _ = await asyncio.wait_for(
-            async_connect_with_ldap_fallback(cfg), timeout=timeout
-        )
-        try:
-            disc = getattr(conn, "disconnect", None)
-            if disc is not None:
-                res = disc()
-                if asyncio.iscoroutine(res):
-                    await res
-        except Exception as disc_exc:  # noqa: BLE001
-            telemetry.capture_exception(disc_exc)
-        _emit(
-            sink,
-            domain=domain,
-            category=cat,
-            state=TriState.ENABLED,
-            confidence=SignalConfidence.HIGH,
-            signal_code="NTLM_BIND_OK",
-            message="NTLM bind via LDAP succeeded",
-            protocol="ldap",
-        )
-        return ProbeResult(
-            category=cat,
-            state=TriState.ENABLED,
-            confidence=SignalConfidence.HIGH,
-            signal_code="NTLM_BIND_OK",
-            message="NTLM bind via LDAP succeeded",
-            duration_ms=_now_ms() - started,
-            succeeded=True,
+        outcome = await asyncio.wait_for(
+            smb_probe_ntlm_session_setup(cfg), timeout=timeout
         )
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
@@ -2590,82 +2754,73 @@ async def _probe_ntlm_authentication(
             state=TriState.UNKNOWN,
             confidence=SignalConfidence.LOW,
             signal_code="PROBE_TIMEOUT",
-            message=f"NTLM probe timed out after {timeout}s",
+            message=f"NTLM SMB probe timed out after {timeout}s",
             duration_ms=_now_ms() - started,
             succeeded=False,
         )
-    except Exception as exc:  # noqa: BLE001
+    except SMBConnectionError as exc:
+        # TCP connect / NEGOTIATE failed -> the NTLM SSP decision was never
+        # reached. Observe-don't-infer: UNKNOWN/LOW, no emit.
         telemetry.capture_exception(exc)
-        text = _chain_text(exc)
-        # CRITICAL BOUNDARY (design §5.2): this marker set is function-local and
-        # MUST NOT become a module-level shared constant. The bind here is a
-        # PLAIN NTLM bind with NO sealing requested (use_ldaps=False,
-        # use_kerberos=False, disable_self_heal=True above), so in THIS context
-        # every one of these substrings means "the DC refused plain NTLM" —
-        # i.e. NTLM is disabled by policy. The SAME ``sec_e_unsupported_function``
-        # marker means something different (seal-layer could not negotiate ->
-        # cleartext downgrade) in ``ldap_transport_service._is_seal_negotiation_failure``
-        # where sealing WAS requested; those NTLM-refused markers are deliberately
-        # NOT added to that classifier. See the boundary structural test.
-        _NTLM_REFUSED_PLAIN_BIND_MARKERS = (
-            "sec_e_unsupported_function",
-            "0x80090302",
-            "80090302",
-            "status_not_supported",
-            "status_ntlm_blocked",
-        )
-        # A bare ``invalidCredentials`` / ``SEC_E_LOGON_DENIED`` (no SSP-collapse
-        # marker) is AMBIGUOUS for a single bogus-cred bind: an NTLM-ENABLED DC
-        # returns it after rejecting the fake password (the DC reached the
-        # credential check -> NTLM is alive). The vendor formatter strips the
-        # ``data 52e`` token, so we cannot distinguish "wrong cred on a healthy
-        # DC" from "NTLM disabled" from this signal alone. The reliable
-        # NTLM-disabled discriminator requires a concurrently-valid credential
-        # (Kerberos TGT), which this unauth probe lacks; that determination is
-        # owned by the credential-validated transport detector (Rule 3 in
-        # ``ldap_transport_service``). So only the genuine SSP-collapse markers
-        # below (which mean the NTLM SSP refused the bind outright, NOT a
-        # credential rejection) emit DISABLED here.
-        ntlm_disabled = any(m in text for m in _NTLM_REFUSED_PLAIN_BIND_MARKERS)
-        if ntlm_disabled:
-            code = (
-                "NTLM_REJECTED_VIA_LDAP"
-                if "sec_e_logon_denied" in text
-                else "NTLM_REFUSED_UNSUPPORTED_FUNCTION"
-            )
-            message = (
-                "DC rejected NTLM bind with SEC_E_LOGON_DENIED"
-                if code == "NTLM_REJECTED_VIA_LDAP"
-                else "DC refused plain NTLM bind (NTLM appears disabled by policy)"
-            )
-            _emit(
-                sink,
-                domain=domain,
-                category=cat,
-                state=TriState.DISABLED,
-                confidence=SignalConfidence.HIGH,
-                signal_code=code,
-                message=message,
-                protocol="ldap",
-            )
-            return ProbeResult(
-                category=cat,
-                state=TriState.DISABLED,
-                confidence=SignalConfidence.HIGH,
-                signal_code=code,
-                message=message,
-                duration_ms=_now_ms() - started,
-                succeeded=True,
-            )
         return ProbeResult(
             category=cat,
             state=TriState.UNKNOWN,
             confidence=SignalConfidence.LOW,
             signal_code="PROBE_FAILED",
-            message=f"NTLM probe failed: {type(exc).__name__}",
+            message=f"NTLM SMB probe could not reach the SSP: {type(exc).__name__}",
             duration_ms=_now_ms() - started,
             succeeded=False,
         )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return ProbeResult(
+            category=cat,
+            state=TriState.UNKNOWN,
+            confidence=SignalConfidence.LOW,
+            signal_code="PROBE_FAILED",
+            message=f"NTLM SMB probe failed: {type(exc).__name__}",
+            duration_ms=_now_ms() - started,
+            succeeded=False,
+        )
+
+    verdict = _classify_ntlm_session_setup_outcome(outcome)
+    if verdict is None:
+        # Reached the DC but the response does not map to a clean NTLM SSP
+        # decision (unclassifiable NTSTATUS). Cache nothing — the next probe
+        # re-measures (CLAUDE.md: never cache an absence).
+        return ProbeResult(
+            category=cat,
+            state=TriState.UNKNOWN,
+            confidence=SignalConfidence.LOW,
+            signal_code="NTLM_INDETERMINATE",
+            message=(
+                "SMB session-setup did not yield a classifiable NTLM verdict "
+                f"(ntstatus={getattr(outcome, 'ntstatus_name', None) or 'unknown'})"
+            ),
+            duration_ms=_now_ms() - started,
+            succeeded=False,
+        )
+
+    state, code, message = verdict
+    _emit(
+        sink,
+        domain=domain,
+        category=cat,
+        state=state,
+        confidence=SignalConfidence.HIGH,
+        signal_code=code,
+        message=message,
+        protocol="smb",
+    )
+    return ProbeResult(
+        category=cat,
+        state=state,
+        confidence=SignalConfidence.HIGH,
+        signal_code=code,
+        message=message,
+        duration_ms=_now_ms() - started,
+        succeeded=True,
+    )
 
 
 async def _probe_smb_signing(
@@ -3722,6 +3877,8 @@ async def probe_password_policy(
                 "minPwdLength",
                 "pwdProperties",
                 "maxPwdAge",
+                "minPwdAge",
+                "pwdHistoryLength",
                 "lockoutThreshold",
                 "lockoutObservationWindow",
                 "lockoutDuration",
@@ -3771,6 +3928,23 @@ async def probe_password_policy(
             raw_max_age = raw_max_age[0] if raw_max_age else None
         max_age_days = _filetime_to_days(raw_max_age)
 
+        raw_min_age = attrs.get("minPwdAge")
+        if isinstance(raw_min_age, (list, tuple)):
+            raw_min_age = raw_min_age[0] if raw_min_age else None
+        min_age_days = _filetime_to_days(raw_min_age)
+
+        # Password history length — plain integer attribute; keep nullable so a
+        # missing value is distinguishable from an explicit zero.
+        raw_history = attrs.get("pwdHistoryLength")
+        if isinstance(raw_history, (list, tuple)):
+            raw_history = raw_history[0] if raw_history else None
+        try:
+            password_history_length = (
+                int(raw_history) if raw_history is not None else None
+            )
+        except (ValueError, TypeError):
+            password_history_length = None
+
         # Lockout attributes — same domain object, same round-trip. Critical for
         # spraying decisions (stale lockoutThreshold can lock real accounts).
         lockout_threshold = _first_int("lockoutThreshold", 0)
@@ -3794,11 +3968,15 @@ async def probe_password_policy(
             lockout_threshold=lockout_threshold,
             lockout_window_minutes=lockout_window_minutes,
             lockout_duration_minutes=lockout_duration_minutes,
+            password_history_length=password_history_length,
+            minimum_password_age_days=min_age_days,
         )
         print_info_debug(
             f"[posture] Password policy detected: domain={domain} "
             f"min_length={min_pwd_len} require_complexity={require_complexity} "
-            f"max_age_days={max_age_days} lockout_threshold={lockout_threshold} "
+            f"max_age_days={max_age_days} min_age_days={min_age_days} "
+            f"history_length={password_history_length} "
+            f"lockout_threshold={lockout_threshold} "
             f"lockout_window_minutes={lockout_window_minutes}"
         )
         return snapshot

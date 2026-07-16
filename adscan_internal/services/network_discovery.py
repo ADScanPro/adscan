@@ -9,10 +9,9 @@ thin wrappers while still preserving legacy behaviour.
 
 from __future__ import annotations
 
-from typing import Protocol
-import re
+from typing import Any, Protocol
+import asyncio
 import secrets
-import shlex
 import socket
 import struct
 import time
@@ -37,124 +36,82 @@ class NetworkDiscoveryHost(Protocol):
     netexec_path: str | None
 
 
-_BANNER_DOMAIN_PATTERN = re.compile(r"\(domain:(\S+?)\)", flags=re.IGNORECASE)
-_BANNER_NAME_PATTERN = re.compile(r"\(name:(\S+?)\)", flags=re.IGNORECASE)
-
-
-def _infer_domain_from_netexec_banner(
-    host: NetworkDiscoveryHost,
+async def _infer_domain_from_smb_native(
+    dc_ip: str,
     *,
-    protocol: str,
-    target_ip: str,
-    timeout_seconds: int = 60,
-    attempts: int = 3,
-    retry_delay_seconds: float = 1.0,
-    auth_args: str = "",
+    port: int = 445,
+    timeout: int = 8,
 ) -> tuple[str | None, str | None]:
-    """Infer a domain from a NetExec protocol banner.
+    """Infer domain FQDN and hostname from the SMB NTLM challenge (Type 2).
 
-    Args:
-        host: Object providing ``run_command`` and optionally ``netexec_path``.
-        protocol: NetExec protocol to probe (for example ``smb`` or ``ldap``).
-        target_ip: Target host IP address (DC/DNS candidate).
-        timeout_seconds: Max time allowed for the NetExec probe.
-        attempts: Number of retries when the probe returns no banner.
-        retry_delay_seconds: Delay between retries.
-        auth_args: Optional additional CLI arguments for NetExec.
+    Native aiosmb replacement for ``nxc smb <ip>``: an unauthenticated SMB2
+    negotiate followed by a single ``session_setup(fake_auth=True)`` round-trip
+    yields the server's NTLM CHALLENGE, whose AV_PAIR target info carries the
+    DNS domain name, DNS/NetBIOS computer name and NetBIOS domain — exactly the
+    fields nxc parses from its login banner. ``fake_auth`` returns as soon as the
+    challenge is received, so no credential is ever validated.
 
-    Returns:
-        Tuple of ``(domain_fqdn, hostname)``. Values are ``None`` when inference
-        fails.
+    Returns ``(domain_fqdn, hostname)`` or ``(None, None)`` on failure. Only a
+    dotted FQDN is returned as the domain (matching the legacy nxc contract).
     """
     try:
-        netexec_path = getattr(host, "netexec_path", None)
-        if not netexec_path:
-            return None, None
-
-        ip_clean = (target_ip or "").strip()
-        if not ip_clean:
-            return None, None
-
-        auth_suffix = f" {auth_args.strip()}" if auth_args.strip() else ""
-        cmd = (
-            f"{shlex.quote(netexec_path)} {shlex.quote(protocol)} "
-            f"{shlex.quote(ip_clean)}{auth_suffix}"
-        )
-
-        last_hostname: str | None = None
-        protocol_label = protocol.lower()
-        for attempt in range(1, max(attempts, 1) + 1):
-            proc = host.run_command(
-                cmd,
-                timeout=timeout_seconds,
-                ignore_errors=True,
-                allow_timeout_recovery=False,
-            )
-            if not proc:
-                if attempt < attempts:
-                    marked_ip = mark_sensitive(ip_clean, "ip")
-                    print_info_debug(
-                        f"[{protocol_label}_infer] NetExec returned no result for "
-                        f"{marked_ip}; retrying ({attempt}/{attempts})"
-                    )
-                    time.sleep(retry_delay_seconds)
-                    continue
-                return None, None
-
-            stdout = (getattr(proc, "stdout", "") or "").strip()
-            stderr = (getattr(proc, "stderr", "") or "").strip()
-            combined = stdout or stderr
-            if not combined:
-                if attempt < attempts:
-                    print_info_debug(
-                        f"[{protocol_label}_infer] Empty {protocol_label.upper()} "
-                        f"banner output; retrying ({attempt}/{attempts})"
-                    )
-                    time.sleep(retry_delay_seconds)
-                    continue
-                return None, None
-
-            if getattr(proc, "returncode", 0) != 0:
-                marked_ip = mark_sensitive(ip_clean, "ip")
-                print_info_debug(
-                    f"[{protocol_label}_infer] NetExec returned non-zero exit code "
-                    f"for {marked_ip}, attempting to parse output anyway."
-                )
-
-            domain_matches = _BANNER_DOMAIN_PATTERN.findall(combined)
-            name_matches = _BANNER_NAME_PATTERN.findall(combined)
-            hostname = name_matches[0].strip().rstrip(".") if name_matches else None
-            last_hostname = hostname or last_hostname
-
-            domain = domain_matches[0].strip().rstrip(".") if domain_matches else None
-            if not domain:
-                if (
-                    "first time use detected" in stdout.lower()
-                    or "creating home directory structure" in stdout.lower()
-                    or "copying default configuration file" in stdout.lower()
-                ) and attempt < attempts:
-                    print_info_debug(
-                        f"[{protocol_label}_infer] NetExec initialization detected; "
-                        f"retrying {protocol_label.upper()} banner."
-                    )
-                    time.sleep(retry_delay_seconds)
-                    continue
-                return None, hostname
-
-            domain_norm = domain.strip().lower()
-            if domain_norm in {"workgroup", "unknown"}:
-                return None, hostname
-
-            if "." not in domain_norm:
-                return None, hostname
-
-            return domain_norm, hostname
-
-        return None, last_hostname
-    except Exception as exc:  # noqa: BLE001 - preserve legacy catch-all semantics
-        telemetry.capture_exception(exc)
-        print_exception(show_locals=False, exception=exc)
+        from aiosmb.commons.connection.factory import SMBConnectionFactory
+    except ImportError:
         return None, None
+
+    # Guest/anonymous URL: the factory wires an NTLM gssapi so session_setup can
+    # process the server challenge. No real credential is sent (fake_auth).
+    url = f"smb+ntlm-password://WORKGROUP\\guest:@{dc_ip}:{port}"
+    info: dict | None = None
+    try:
+        factory = SMBConnectionFactory.from_url(url)
+        conn = factory.get_connection()
+        try:
+            _, err = await asyncio.wait_for(conn.connect(), timeout=timeout)
+            if err is not None:
+                return None, None
+            # A normal SMB2 negotiate (NOT protocol_test=True, which selects the
+            # SMBv1 wildcard dialect and leaves session_setup unusable).
+            res, err = await asyncio.wait_for(conn.negotiate(), timeout=timeout)
+            if not res or err is not None:
+                return None, None
+            ok, err = await asyncio.wait_for(
+                conn.session_setup(fake_auth=True), timeout=timeout
+            )
+            if not ok or err is not None:
+                return None, None
+            info = conn.get_extra_info()
+        finally:
+            try:
+                await conn.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"[smb_infer] native SMB banner probe failed: {exc}")
+        return None, None
+
+    ntlm_data = info.get("ntlm_data") if isinstance(info, dict) else None
+    if not isinstance(ntlm_data, dict):
+        return None, None
+
+    domain = str(ntlm_data.get("dnsdomainname") or "").strip().rstrip(".").lower() or None
+    hostname = (
+        str(ntlm_data.get("dnscomputername") or "").strip().rstrip(".")
+        or str(ntlm_data.get("computername") or "").strip()
+    ) or None
+
+    # Match the nxc contract: only a dotted FQDN counts as a domain.
+    if domain:
+        if domain in {"workgroup", "unknown"} or "." not in domain:
+            domain = None
+
+    if domain:
+        print_info_debug(
+            f"[smb_infer] native NTLM challenge ({dc_ip}): "
+            f"domain={mark_sensitive(domain, 'domain')} "
+            f"host={mark_sensitive(hostname or 'N/A', 'hostname')}"
+        )
+    return domain, hostname
 
 
 def _nc_to_fqdn(nc: str) -> str | None:
@@ -171,10 +128,120 @@ def _nc_to_fqdn(nc: str) -> str | None:
     return ".".join(parts).lower() if parts else None
 
 
+def _domain_hostname_from_rootdse_info(
+    server_info: dict,
+) -> tuple[str | None, str | None]:
+    """Extract ``(domain_fqdn, dc_hostname)`` from a bound client's rootDSE info.
+
+    Shared by the anonymous and authenticated rootDSE readers so the
+    ``defaultNamingContext`` / ``dnsHostName`` parsing lives in exactly one
+    place.
+    """
+    # defaultNamingContext → "DC=ais,DC=local" → "ais.local"
+    raw_nc = server_info.get("defaultNamingContext")
+    if not raw_nc:
+        raw_nc = (server_info.get("namingContexts") or [None])[0]
+    nc_str = str(raw_nc[0] if isinstance(raw_nc, list) else raw_nc).strip() if raw_nc else ""
+    domain = _nc_to_fqdn(nc_str) if nc_str else None
+
+    # dnsHostName → "dc01.ais.local"
+    raw_host = server_info.get("dnsHostName")
+    hostname: str | None = None
+    if raw_host:
+        hostname = str(raw_host[0] if isinstance(raw_host, list) else raw_host).strip() or None
+    return domain, hostname
+
+
+async def _infer_domain_from_ldap_authenticated(
+    dc_ip: str,
+    *,
+    username: str,
+    password: str,
+    timeout: int = 8,
+) -> tuple[str | None, str | None]:
+    """Infer domain FQDN and hostname from an AUTHENTICATED LDAP rootDSE read.
+
+    Fallback used only when the anonymous rootDSE read failed — the common
+    case on a hardened DC that disables anonymous LDAP/SMB — and the operator
+    already supplied credentials for the target moments earlier (e.g.
+    ``start_auth`` -> "I know only a DC/DNS IP"). Binding with those
+    credentials recovers ``defaultNamingContext``/``dnsHostName`` instead of
+    dead-ending to manual domain entry despite holding valid creds.
+
+    An NTLM bind is used deliberately: it needs no domain context, which is
+    exactly the piece being discovered here (a Kerberos bind would need the
+    realm upfront). Goes through the mandatory LDAPS->LDAP fallback SSOT
+    (``async_connect_with_ldap_fallback``) — never a direct badldap factory
+    call. Best-effort and bounded to ``timeout`` seconds (this is a domain-
+    identity probe, not a full scan): any failure returns ``(None, None)`` so
+    the caller falls through to the existing PTR / manual-entry recovery; it
+    never raises.
+    """
+    try:
+        from adscan_internal.services.ldap_transport_service import (
+            ADscanLDAPConfig,
+            async_connect_with_ldap_fallback,
+        )
+    except ImportError:
+        return None, None
+
+    config = ADscanLDAPConfig(
+        domain="",
+        dc_ip=dc_ip,
+        use_ldaps=True,
+        use_kerberos=False,
+        username=username,
+        password=password,
+    )
+
+    client: Any = None
+    try:
+        # Outer hard ceiling on the whole confidentiality ladder (LDAPS ->
+        # StartTLS -> SASL sign+seal -> cleartext) — this is a domain-identity
+        # probe, not a full scan, so it must fail fast rather than hang.
+        # Mirrors the bounded posture-probe LDAP binds in posture_probe.py.
+        client, used_ldaps = await asyncio.wait_for(
+            async_connect_with_ldap_fallback(config), timeout=timeout
+        )
+
+        server_info: dict | None = None
+        if hasattr(client, "get_server_info"):
+            server_info = client.get_server_info()
+        if not isinstance(server_info, dict):
+            server_info = getattr(client, "_serverinfo", None)
+        if not isinstance(server_info, dict):
+            return None, None
+
+        domain, hostname = _domain_hostname_from_rootdse_info(server_info)
+        if domain:
+            transport = "LDAPS" if used_ldaps else "LDAP"
+            print_info_debug(
+                f"[ldap_infer] authenticated rootDSE ({transport} {dc_ip}): "
+                f"domain={mark_sensitive(domain, 'domain')} "
+                f"host={mark_sensitive(hostname or 'N/A', 'hostname')}"
+            )
+            return domain, hostname
+        return None, None
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"[ldap_infer] authenticated LDAP probe failed: {exc}")
+        return None, None
+    finally:
+        if client is not None:
+            try:
+                disconnect = getattr(client, "disconnect", None)
+                if disconnect is not None:
+                    maybe = disconnect()
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
+            except Exception:  # noqa: BLE001
+                pass
+
+
 async def _infer_domain_from_ldap_native(
     dc_ip: str,
     *,
     timeout: int = 8,
+    credential: tuple[str, str] | None = None,
 ) -> tuple[str | None, str | None]:
     """Infer domain FQDN and hostname from an anonymous LDAP rootDSE read.
 
@@ -182,11 +249,17 @@ async def _infer_domain_from_ldap_native(
     for the domain and ``dnsHostName`` for the hostname — both attributes are
     always returned in the rootDSE from Windows DCs, even with anonymous access.
 
+    When the anonymous read fails AND ``credential`` (``(username, password)``)
+    is supplied, retries once with an AUTHENTICATED rootDSE read (see
+    :func:`_infer_domain_from_ldap_authenticated`) before giving up — a
+    hardened DC that blocks anonymous LDAP still answers a bind the operator
+    already holds valid creds for. Anonymous-first stays the default: no
+    credential is sent unless the anonymous attempt already failed.
+
     Returns ``(domain_fqdn, hostname)`` or ``(None, None)`` on failure.
 
-    This replaces the ``nxc ldap -u '' -p ''`` subprocess call for the common
-    case. The nxc path in ``infer_domain_from_ldap_banner`` is retained as a
-    fallback for environments where LDAP is firewalled on both 389 and 636.
+    This is the sole implementation behind ``infer_domain_from_ldap_banner``;
+    the legacy ``nxc ldap -u '' -p ''`` subprocess fallback was removed.
     """
     try:
         from adscan_internal.services.ldap_transport_service import (
@@ -209,20 +282,13 @@ async def _infer_domain_from_ldap_native(
             if not isinstance(server_info, dict):
                 server_info = getattr(client, "_serverinfo", None)
             if not isinstance(server_info, dict):
-                return None, None
+                server_info = None
 
-            # defaultNamingContext → "DC=ais,DC=local" → "ais.local"
-            raw_nc = server_info.get("defaultNamingContext")
-            if not raw_nc:
-                raw_nc = (server_info.get("namingContexts") or [None])[0]
-            nc_str = str(raw_nc[0] if isinstance(raw_nc, list) else raw_nc).strip() if raw_nc else ""
-            domain = _nc_to_fqdn(nc_str) if nc_str else None
-
-            # dnsHostName → "dc01.ais.local"
-            raw_host = server_info.get("dnsHostName")
-            hostname: str | None = None
-            if raw_host:
-                hostname = str(raw_host[0] if isinstance(raw_host, list) else raw_host).strip() or None
+            domain, hostname = (
+                _domain_hostname_from_rootdse_info(server_info)
+                if server_info
+                else (None, None)
+            )
 
             if domain:
                 transport = "LDAPS" if used_ldaps else "LDAP"
@@ -232,10 +298,20 @@ async def _infer_domain_from_ldap_native(
                     f"host={mark_sensitive(hostname or 'N/A', 'hostname')}"
                 )
                 return domain, hostname
-            return None, None
     except Exception as exc:  # noqa: BLE001
         print_info_debug(f"[ldap_infer] native LDAP anonymous probe failed: {exc}")
-        return None, None
+
+    # Anonymous inference failed (blocked, or answered with no naming context).
+    # Only retry authenticated when the operator already supplied credentials
+    # for THIS probe — never send credentials speculatively.
+    if credential:
+        username, password = credential
+        if username and password is not None:
+            return await _infer_domain_from_ldap_authenticated(
+                dc_ip, username=username, password=password, timeout=timeout
+            )
+
+    return None, None
 
 
 def infer_domain_from_smb_banner(
@@ -246,27 +322,52 @@ def infer_domain_from_smb_banner(
     attempts: int = 3,
     retry_delay_seconds: float = 1.0,
 ) -> tuple[str | None, str | None]:
-    """Infer a domain (FQDN) from NetExec SMB banner output against a target IP.
+    """Infer a domain (FQDN) and hostname from a target IP via native SMB.
 
-    This is used as a best-effort fallback when DNS (PTR/SRV) is unavailable but
-    SMB is reachable and NetExec can fingerprint the remote host.
+    Reads the server's NTLM CHALLENGE target info (DNS domain, DNS/NetBIOS
+    computer name) via an aiosmb negotiate + ``fake_auth`` session-setup — the
+    same data nxc surfaces from its SMB login banner, with no subprocess. Falls
+    back to a native NBSTAT (UDP/137) query for the NetBIOS hostname when the
+    challenge does not expose a computer name.
 
     Args:
-        host: Object providing ``run_command`` and optionally ``netexec_path``.
+        host: Retained for signature compatibility with the DNS candidate flow.
         target_ip: Target host IP address (DC/DNS candidate).
-        timeout_seconds: Max time allowed for the NetExec probe.
+        timeout_seconds: Overall probe budget; the native SMB probe caps its own
+            per-round-trip timeout at ≤8s for fast failure.
+        attempts: Number of native probe attempts when nothing is returned.
+        retry_delay_seconds: Delay between attempts.
 
     Returns:
         Tuple of (domain_fqdn, hostname). Values are ``None`` when inference fails.
     """
-    return _infer_domain_from_netexec_banner(
-        host,
-        protocol="smb",
-        target_ip=target_ip,
-        timeout_seconds=timeout_seconds,
-        attempts=attempts,
-        retry_delay_seconds=retry_delay_seconds,
-    )
+    _ = host  # native probe needs no shell/run_command context
+    ip_clean = (target_ip or "").strip()
+    if not ip_clean:
+        return None, None
+
+    native_timeout = min(timeout_seconds, 8)
+    domain: str | None = None
+    hostname: str | None = None
+    for attempt in range(1, max(attempts, 1) + 1):
+        try:
+            domain, hostname = run_async_sync(
+                _infer_domain_from_smb_native(ip_clean, timeout=native_timeout)
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_info_debug(f"[smb_infer] native SMB path raised unexpectedly: {exc}")
+            domain, hostname = None, None
+        if domain or hostname:
+            break
+        if attempt < max(attempts, 1):
+            time.sleep(retry_delay_seconds)
+
+    # NBSTAT fallback for the NetBIOS hostname when the challenge lacked one.
+    if not hostname:
+        hostname = _query_netbios_name_native(ip_clean)
+
+    return domain, hostname
 
 
 def infer_domain_from_ldap_banner(
@@ -276,48 +377,44 @@ def infer_domain_from_ldap_banner(
     timeout_seconds: int = 60,
     attempts: int = 3,
     retry_delay_seconds: float = 1.0,
+    credential: tuple[str, str] | None = None,
 ) -> tuple[str | None, str | None]:
-    """Infer a domain (FQDN) and DC hostname from a target IP via LDAP.
+    """Infer a domain (FQDN) and DC hostname from a target IP via native LDAP.
 
-    Tries an anonymous rootDSE read (native, no subprocess) first — this
-    covers >99% of DCs where port 389 or 636 is reachable. Falls back to
-    the nxc subprocess path only when the native probe fails (e.g. both LDAP
-    ports blocked by firewall, or badldap import unavailable).
+    Performs an anonymous rootDSE read (native badldap, no subprocess): reads
+    ``defaultNamingContext`` for the domain and ``dnsHostName`` for the DC
+    hostname. Covers the DCs where port 389 or 636 is reachable.
 
-    Returns ``(domain_fqdn, hostname)`` or ``(None, None)`` when both paths fail.
+    Args:
+        credential: Optional ``(username, password)`` already captured for
+            this scan (e.g. an authenticated ``start_auth`` flow). Only used
+            as a RETRY when the anonymous rootDSE read fails — a hardened DC
+            that disables anonymous LDAP still answers a bind the operator
+            already holds valid credentials for, instead of dead-ending to
+            manual domain entry. ``None`` (default) preserves the
+            anonymous-only legacy behaviour.
+
+    Returns ``(domain_fqdn, hostname)`` or ``(None, None)`` when the probe fails.
     """
+    _ = (host, attempts, retry_delay_seconds)  # retained for signature compat
     ip_clean = (target_ip or "").strip()
     if not ip_clean:
         return None, None
 
-    # Native path — anonymous LDAP bind → rootDSE (defaultNamingContext + dnsHostName).
+    # Native path — anonymous LDAP bind → rootDSE (defaultNamingContext + dnsHostName),
+    # authenticated retry when creds are available and anonymous failed.
     # Uses a short timeout (≤8s) so it fails fast when LDAP is not available.
     native_timeout = min(timeout_seconds, 8)
     try:
-        domain, hostname = run_async_sync(
-            _infer_domain_from_ldap_native(ip_clean, timeout=native_timeout)
+        return run_async_sync(
+            _infer_domain_from_ldap_native(
+                ip_clean, timeout=native_timeout, credential=credential
+            )
         )
-        if domain:
-            return domain, hostname
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_info_debug(f"[ldap_infer] native path raised unexpectedly: {exc}")
-
-    # Subprocess fallback — nxc ldap, used when native probe cannot connect
-    # (both 389 and 636 firewalled, or badldap import unavailable in this env).
-    print_info_debug(
-        f"[ldap_infer] native LDAP probe returned no domain for "
-        f"{mark_sensitive(ip_clean, 'ip')}; falling back to nxc"
-    )
-    return _infer_domain_from_netexec_banner(
-        host,
-        protocol="ldap",
-        target_ip=ip_clean,
-        timeout_seconds=timeout_seconds,
-        attempts=attempts,
-        retry_delay_seconds=retry_delay_seconds,
-        auth_args="-u '' -p ''",
-    )
+        return None, None
 
 
 def _encode_nbns_name(name: str = "*") -> bytes:

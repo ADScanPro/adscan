@@ -66,7 +66,17 @@ class _ClockSkewRetryCoordinator:
         self._lock = threading.Lock()
 
     def next_retry_generation(self, *, seen_generation: int) -> int | None:
-        """Return a new retry generation after one shared clock sync, if possible."""
+        """Return a new retry generation after one shared clock sync, if possible.
+
+        The clock sync is performed while holding ``self._lock`` so that only ONE
+        worker per generation ever syncs: a concurrent worker blocks on the lock
+        and, once it acquires it, observes the already-bumped generation and skips
+        its own sync. Releasing the lock across the sync (the previous shape) let
+        two workers both pass the ``_generation > seen_generation`` check before
+        either bumped it, so both stepped the clock — defeating the "one shared
+        sync" contract this coordinator exists to enforce.
+        """
+        marked_domain = mark_sensitive(self.domain, "domain")
         with self._lock:
             if self._generation > seen_generation:
                 return self._generation
@@ -77,25 +87,24 @@ class _ClockSkewRetryCoordinator:
             self._attempts += 1
             attempt = self._attempts
 
-        marked_domain = mark_sensitive(self.domain, "domain")
-        print_info_debug(
-            "[winrm_probe] clock-skew retry requested: "
-            f"domain={marked_domain} "
-            f"attempt={attempt}/{self.max_attempts}"
-        )
-        sync_ok = bool(self.sync_clock_with_pdc(self.domain))
-        if not sync_ok:
             print_info_debug(
-                "[winrm_probe] clock-skew retry aborted: "
+                "[winrm_probe] clock-skew retry requested: "
                 f"domain={marked_domain} "
-                f"attempt={attempt}/{self.max_attempts} "
-                "reason=clock_sync_failed"
+                f"attempt={attempt}/{self.max_attempts}"
             )
-            return None
+            sync_ok = bool(self.sync_clock_with_pdc(self.domain))
+            if not sync_ok:
+                print_info_debug(
+                    "[winrm_probe] clock-skew retry aborted: "
+                    f"domain={marked_domain} "
+                    f"attempt={attempt}/{self.max_attempts} "
+                    "reason=clock_sync_failed"
+                )
+                return None
 
-        with self._lock:
             self._generation += 1
             generation = self._generation
+
         print_info_debug(
             "[winrm_probe] clock-skew retry scheduled: "
             f"domain={marked_domain} "

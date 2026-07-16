@@ -81,6 +81,20 @@ _SESSION_CAPTURE_FINALIZED = False
 _ALLOW_UNSUPPORTED_PLATFORM_ENV = "ADSCAN_ALLOW_UNSUPPORTED_PLATFORM"
 _ALLOW_UNSUPPORTED_ARCH_ENV = "ADSCAN_ALLOW_UNSUPPORTED_ARCH"
 _ALLOW_UNSUPPORTED_WSL_ENV = "ADSCAN_ALLOW_UNSUPPORTED_WSL"
+# Host architectures for which multi-arch runtime images are published (see
+# scripts/build_docker_lite_image.sh --multiarch + Dockerfile TARGETARCH).
+# x86_64/amd64 and arm64/aarch64 (Apple-Silicon Macs, Graviton, arm64 Linux)
+# have native image variants; Docker auto-selects the right one on pull.
+_SUPPORTED_HOST_ARCHES = frozenset({"x86_64", "amd64", "arm64", "aarch64"})
+# Host operating systems the launcher supports in Docker mode. Linux runs
+# containers on the host network namespace directly; macOS (Darwin) runs them
+# inside Docker Desktop's Linux VM over bridge/NAT (see docker_runtime
+# `_host_uses_network_host`). Windows remains unsupported (WSL is blocked
+# separately below).
+_SUPPORTED_HOST_PLATFORMS = frozenset({"linux", "darwin"})
+# One-time guard so the macOS networking caveat is printed at most once per
+# launcher invocation.
+_MACOS_CAVEAT_SHOWN = False
 _LINUX_REQUIRED_COMMANDS = {
     "install",
     "check",
@@ -260,6 +274,28 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    # Top-level twin of the subcommand --no-update-check (defined on
+    # update_check_parent below). Declaring it here too lets the flag be used as
+    # a PREFIX before ANY command — including the container passthroughs `doctor`
+    # / `execute`, which are argparse.REMAINDER and would otherwise forward the
+    # flag verbatim to the in-container engine ("unrecognized arguments:
+    # --no-update-check"). The air-gapped appliance relies on exactly this: it
+    # sets ADSCAN_CLI_PATH="adscan --no-update-check" as a universal prefix
+    # (appliance-celery.sh), so EVERY launched command (ci, doctor, ...) must
+    # accept it at the top level and have the launcher consume it (skip the
+    # PyPI/Docker-Hub probe) instead of leaking it into the container.
+    parser.add_argument(
+        "--no-update-check",
+        action="store_true",
+        dest="no_update_check",
+        default=False,
+        help=(
+            "Skip the launcher/runtime version probe and update prompts (no "
+            "PyPI / Docker Hub call). Usable as a prefix before any command, "
+            "including container passthroughs. Mid-engagement / airgapped / "
+            "version-pinned use only."
+        ),
+    )
     # ``metavar="command"`` keeps the usage synopsis to ``adscan ... command``
     # (follows the convention used by `git`, `gh`, `docker`) so subcommands
     # we want to hide (e.g. the work-in-progress ``tui``) don't leak into
@@ -305,6 +341,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-update-check",
         action="store_true",
         dest="no_update_check",
+        # SUPPRESS so this subcommand-level copy never WRITES the dest when the
+        # flag is absent — otherwise `adscan --no-update-check ci` (prefix form)
+        # would have the top-level True reset to the subparser default False.
+        # The top-level twin (above) owns the default; this copy only flips it
+        # True when the flag is typed AFTER the verb (`adscan ci --no-update-check`).
+        default=argparse.SUPPRESS,
         help=(
             "Skip the launcher/runtime version probe and update prompts for "
             "this run. Use only when you intentionally want to stay on the "
@@ -1059,6 +1101,33 @@ def _is_windows_subsystem_for_linux() -> bool:
     return False
 
 
+def _warn_macos_networking_caveat() -> None:
+    """Warn once that broadcast poisoning is unavailable on macOS Docker Desktop.
+
+    On macOS the container runs inside Docker Desktop's Linux VM, so it cannot
+    reach the Mac's own network interface at Layer 2. Routed scanning works over
+    NAT; broadcast poisoning does not. Tell the operator plainly, once.
+    """
+    global _MACOS_CAVEAT_SHOWN
+    if _MACOS_CAVEAT_SHOWN:
+        return
+    _MACOS_CAVEAT_SHOWN = True
+    print_warning(
+        "Running on macOS. Docker Desktop runs containers inside a Linux VM, so "
+        "ADscan cannot reach your Mac's network interface directly."
+    )
+    print_instruction(
+        "Routed scanning works normally: authenticated and unauthenticated "
+        "enumeration against a reachable AD target (LDAP, Kerberos, SMB) runs "
+        "over Docker's NAT."
+    )
+    print_instruction(
+        "Broadcast poisoning (LLMNR, NBT-NS, mDNS) is unavailable on macOS: it "
+        "needs Layer-2 access to the local network, which Docker Desktop does not "
+        "provide. Run ADscan on a Linux host or Linux VM if you need it."
+    )
+
+
 def _guard_supported_host_platform(
     *,
     command: str | None,
@@ -1066,8 +1135,10 @@ def _guard_supported_host_platform(
 ) -> None:
     """Block launcher runtime commands on unsupported host platforms.
 
-    ADscan launcher Docker-mode runtime is Linux-first. Fail fast with a clear
-    message on unsupported host OSes so users do not hit deeper runtime errors.
+    ADscan launcher Docker-mode runtime supports Linux and macOS hosts. Fail
+    fast with a clear message on unsupported host OSes (e.g. native Windows) so
+    users do not hit deeper runtime errors, and surface the macOS networking
+    caveat up front.
     """
     host_platform = str(platform.system() or "").strip() or "Unknown"
     needs_linux = bool(command in _LINUX_REQUIRED_COMMANDS or has_passthrough_args)
@@ -1077,7 +1148,7 @@ def _guard_supported_host_platform(
     host_arch = str(platform.machine() or "").strip() or "unknown"
     normalized_arch = host_arch.lower()
 
-    if host_platform.lower() != "linux":
+    if host_platform.lower() not in _SUPPORTED_HOST_PLATFORMS:
         if _allow_unsupported_platform_override():
             print_warning(
                 "Proceeding on an unsupported host platform because "
@@ -1102,11 +1173,12 @@ def _guard_supported_host_platform(
             return
 
         print_error(
-            "ADscan launcher Docker mode is currently supported on Linux hosts only."
+            "ADscan launcher Docker mode is supported on Linux and macOS hosts."
         )
         print_instruction(f"Detected platform: {host_platform}")
         print_instruction(
-            "Use a supported Linux host (recommended: Kali, Ubuntu, Debian, or Parrot) and retry."
+            "Use a supported host: Linux (recommended: Kali, Ubuntu, Debian, or "
+            "Parrot) or macOS with Docker Desktop, then retry."
         )
         print_instruction(
             "System requirements: https://www.adscanpro.com/docs/getting-started/system-requirements"
@@ -1128,6 +1200,23 @@ def _guard_supported_host_platform(
             },
         )
         raise SystemExit(2)
+
+    if host_platform.lower() == "darwin":
+        # macOS is supported over bridge/NAT networking. Surface the poisoning
+        # caveat up front, then fall through to the shared architecture check
+        # (Apple-Silicon arm64 and Intel x86_64 both have native images).
+        _warn_macos_networking_caveat()
+        capture(
+            "launcher_platform_guard",
+            {
+                "blocked": False,
+                "override": False,
+                "platform": host_platform,
+                "architecture": host_arch,
+                "reason": "supported_platform_macos",
+                "command": command or "passthrough",
+            },
+        )
 
     if _is_windows_subsystem_for_linux():
         if _allow_unsupported_wsl_override():
@@ -1181,7 +1270,7 @@ def _guard_supported_host_platform(
         )
         raise SystemExit(2)
 
-    if normalized_arch in {"x86_64", "amd64"}:
+    if normalized_arch in _SUPPORTED_HOST_ARCHES:
         return
 
     if _allow_unsupported_arch_override():
@@ -1208,11 +1297,11 @@ def _guard_supported_host_platform(
         return
 
     print_error(
-        "ADscan launcher Docker mode currently supports x86_64/amd64 Linux hosts only."
+        "ADscan launcher Docker mode supports x86_64/amd64 and arm64/aarch64 Linux hosts."
     )
     print_instruction(f"Detected architecture: {host_arch}")
     print_instruction(
-        "Use a x86_64 Linux host, or rebuild/run the container stack with compatible images."
+        "Use an x86_64 or arm64 Linux host, or rebuild/run the container stack with compatible images."
     )
     print_instruction(
         "System requirements: https://www.adscanpro.com/docs/getting-started/system-requirements"

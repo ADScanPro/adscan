@@ -36,10 +36,10 @@ from adscan_internal.services.workspace_resume import (
 
 
 _ACTION_LABELS: dict[WorkspaceAction, str] = {
-    WorkspaceAction.RESUME: "Resume   · keep cached graph, run pending phases",
-    WorkspaceAction.REFRESH: "Refresh  · re-collect from AD, then re-run analysis",
-    WorkspaceAction.REPLAY: "Replay   · keep cached graph, re-run all analysis",
-    WorkspaceAction.INSPECT: "Inspect  · open shell, run nothing",
+    WorkspaceAction.RESUME: "Resume   · keep the collected graph, run the pending phases",
+    WorkspaceAction.REFRESH: "Refresh  · re-collect from AD, then re-run the full analysis",
+    WorkspaceAction.REPLAY: "Replay   · keep the graph, re-run all analysis (new ADscan rules)",
+    WorkspaceAction.INSPECT: "Inspect  · open the workspace, run nothing",
 }
 
 _ENV_OVERRIDE_VAR: str = "ADSCAN_WORKSPACE_ACTION"

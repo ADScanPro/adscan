@@ -60,30 +60,30 @@ class WordlistService(BaseService):
         self._repo_wordlists_dir = Path(__file__).resolve().parents[2] / "wordlists"
         self._definitions: Dict[str, WordlistDefinition] = {}
 
+        # Default definitions = the wordlist FILES that actually ship in the
+        # runtime image and that `adscan check` must verify are present:
+        #   - rockyou.txt              (the CTF/fast base, downloaded at build)
+        #   - combined_audit_base.txt  (the ~94M audit base, a build-time merge)
+        #
+        # The audit base is a build-time merge (hashmob-large + kerberoast_pws +
+        # kaonashi_10K, order-preserving rling dedup) produced by
+        # scripts/build_combined_audit_wordlist.sh; its raw components are staged
+        # from wordlists/manifest.json and DROPPED after the merge, so the image
+        # ships the combined only. Those raw components are therefore NOT checked
+        # here (they never exist at runtime) and combined_audit_base.txt has no
+        # runtime download URL — a missing combined is a genuinely-broken install
+        # that cannot be auto-fixed, so verify_all correctly reports it missing.
+        # See adscan_internal.services.cracking_wordlist_policy.
         raw_defs = definitions or {
             "rockyou.txt": {
                 "url": "https://github.com/brannondorsey/naive-hashcat/"
                 "releases/download/data/rockyou.txt",
                 "dest": "rockyou.txt",
             },
-            "kerberoast_pws": {
-                "url": (
-                    "https://gist.github.com/The-Viper-One/"
-                    "a1ee60d8b3607807cc387d794e809f0b/raw/"
-                    "b7d83af6a8bbb43013e04f78328687d19d0cf9a7/kerberoast_pws.xz"
-                ),
-                "dest": "kerberoast_pws.xz",
-                "extract_xz": True,
-            },
-            "hashmob_medium_2025": {
-                "url": "https://weakpass.com/download/2073/hashmob.net_2025.medium.found.7z",
-                "dest": "hashmob.net_2025.medium.found.7z",
-                "extract_7z": True,
-            },
-            "kaonashi14M": {
-                "url": "https://weakpass.com/download/1938/kaonashi14M.txt.7z",
-                "dest": "kaonashi14M.txt.7z",
-                "extract_7z": True,
+            "combined_audit_base.txt": {
+                # Build-time artifact — no runtime download source.
+                "url": "",
+                "dest": "combined_audit_base.txt",
             },
         }
 
@@ -174,13 +174,6 @@ class WordlistService(BaseService):
             self._repo_wordlists_dir / final_name,
             self._repo_wordlists_dir / definition.dest,
         ]
-        if definition.name == "hashmob_medium_2025":
-            candidates.extend(
-                [
-                    self._repo_wordlists_dir / "hashmob.net_2025.micro.found",
-                    self._repo_wordlists_dir / "hashmob.net_2025.micro.found.7z",
-                ]
-            )
         return candidates
 
     def _copy_or_extract_repo_wordlist(self, definition: WordlistDefinition, final_wl_path: str) -> bool:
@@ -266,6 +259,13 @@ class WordlistService(BaseService):
             return True
 
         if not fix:
+            return False
+
+        # Build-time-only artifacts (e.g. combined_audit_base.txt) carry no
+        # download URL — they are baked into the image, never fetched at runtime.
+        # If such a file is missing and no repo-local copy exists, it cannot be
+        # auto-fixed; report failure instead of attempting an empty-URL download.
+        if not definition.url:
             return False
 
         try:

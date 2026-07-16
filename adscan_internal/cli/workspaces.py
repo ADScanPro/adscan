@@ -21,6 +21,7 @@ from adscan_internal.rich_output import (
     mark_sensitive,
     print_error,
     print_exception,
+    print_info,
     print_info_debug,
     print_info_verbose,
     print_instruction,
@@ -28,6 +29,7 @@ from adscan_internal.rich_output import (
     print_success,
     print_table,
     print_warning,
+    prompt_ask,
 )
 
 
@@ -59,6 +61,61 @@ class WorkspaceSelectionOption:
 
     name: str
     is_create_new: bool = False
+
+
+def _default_workspace_name(workspaces_dir: str) -> str:
+    """Return a sensible, non-colliding default workspace name.
+
+    Uses a date-stamped ``audit-YYYY-MM-DD`` base so a brand-new operator can
+    press Enter at the name prompt and proceed without inventing a name. When
+    that base already exists, a numeric suffix (``-2``, ``-3``, ...) is appended
+    until a free name is found. This is the single source of truth for the
+    pre-filled default across every workspace-name prompt.
+
+    Args:
+        workspaces_dir: Directory that holds the operator's workspaces.
+    """
+    from datetime import date
+
+    try:
+        from adscan_internal.workspaces import list_workspaces
+
+        existing = set(list_workspaces(workspaces_dir))
+    except Exception:  # noqa: BLE001 - a naming default must never block creation
+        existing = set()
+
+    base = f"audit-{date.today().isoformat()}"
+    if base not in existing:
+        return base
+    suffix = 2
+    while f"{base}-{suffix}" in existing:
+        suffix += 1
+    return f"{base}-{suffix}"
+
+
+def _prompt_for_new_workspace_name(shell: WorkspaceShell) -> str:
+    """Prompt for a new workspace name with a pre-filled, editable default.
+
+    Shows the one-time "what is a workspace" explainer for a brand-new operator
+    (no workspaces yet), then renders a name prompt pre-filled with
+    :func:`_default_workspace_name`. Pressing Enter accepts the default; a
+    non-interactive run auto-resolves to it without blocking. Returns the
+    stripped name, or an empty string when the operator cancels.
+    """
+    try:
+        from adscan_internal.cli.first_run_panel import maybe_show_workspace_explainer
+
+        maybe_show_workspace_explainer(shell.workspaces_dir)
+    except Exception:  # noqa: BLE001 - orientation panel must never block creation
+        pass
+
+    default_name = _default_workspace_name(shell.workspaces_dir)
+    answer = prompt_ask(
+        "Enter name for a new workspace",
+        default=default_name,
+        shell=shell,
+    )
+    return (answer or "").strip()
 
 
 def _confirm_workspace_delete(workspace_name: str) -> bool:
@@ -114,9 +171,24 @@ def do_workspace(shell: WorkspaceShell, args: str) -> None:
     elif command == "list":
         workspace_list(shell)
     else:
-        print_error(f"Command '{command}' not recognized for workspace operations.")
+        # Mirror the friendly, guidance-bearing hint the main REPL gives for an
+        # unknown command (warning + did-you-mean + next step), rather than a
+        # hard `✗` error — a mistyped subcommand is a near miss, not a failure.
+        from rich.markup import escape as _rich_escape
+        import difflib
+
+        valid_commands = ["create", "delete", "select", "show", "save", "list"]
+        print_warning(
+            f"`workspace {_rich_escape(command)}` is not a recognized workspace command."
+        )
+        close = difflib.get_close_matches(command, valid_commands, n=1, cutoff=0.6)
+        if close:
+            print_info(
+                f"Did you mean `workspace {close[0]}`? Type `workspace {close[0]}` to run it."
+            )
         print_instruction(
-            "Available commands: create, delete, select, show, save, list"
+            "Available commands: create, delete, select, show, save, list. "
+            "Type `help` for the full command list."
         )
 
 
@@ -178,13 +250,10 @@ def workspace_create(shell: WorkspaceShell, workspace_name: str | None = None) -
         workspace_name: Optional workspace name. When omitted, the user is prompted.
     """
     if not workspace_name:
-        workspace_name = Prompt.ask(
-            Text("Enter name for a new workspace: ", style="input")
-        )
-        if not workspace_name or not workspace_name.strip():
+        workspace_name = _prompt_for_new_workspace_name(shell)
+        if not workspace_name:
             print_warning("Workspace creation cancelled.")
             return
-        workspace_name = workspace_name.strip()
 
     from adscan_internal.workspaces import (
         create_workspace_dir,
@@ -297,11 +366,9 @@ def workspace_select(shell: WorkspaceShell) -> None:
             "[DEBUG] workspace_select: 'if not workspaces' condition met. About to call queued_print_warning."
         )
         print_warning("No workspaces detected.")
-        new_ws_name = Prompt.ask(
-            Text("Enter name for a new workspace: ", style="input")
-        )
-        if new_ws_name.strip():
-            workspace_create(shell, new_ws_name.strip())
+        new_ws_name = _prompt_for_new_workspace_name(shell)
+        if new_ws_name:
+            workspace_create(shell, new_ws_name)
 
             from adscan_internal.workspaces import (
                 activate_workspace,
@@ -340,11 +407,9 @@ def workspace_select(shell: WorkspaceShell) -> None:
         return
 
     if selected_idx == len(workspaces):
-        new_ws_name = Prompt.ask(
-            Text("Enter name for a new workspace: ", style="input")
-        )
-        if new_ws_name.strip():
-            workspace_create(shell, new_ws_name.strip())
+        new_ws_name = _prompt_for_new_workspace_name(shell)
+        if new_ws_name:
+            workspace_create(shell, new_ws_name)
 
             from adscan_internal.workspaces import (
                 activate_workspace,

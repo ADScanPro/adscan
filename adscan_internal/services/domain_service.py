@@ -14,10 +14,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from adscan_core import telemetry
-from adscan_core.rich_output import (
-    print_info_debug,
-    print_warning,
-)
+from adscan_core.rich_output import print_warning
 
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.ldap_transport_service import (
@@ -470,60 +467,3 @@ class DomainService(BaseService):
             )
             print_warning(f"Connectivity check failed: {e}")
             return False
-
-    def get_domain_info(
-        self,
-        domain: str,
-        pdc: str,
-        username: str,
-        password: str,
-        netexec_path: str,
-        scan_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get domain information using NetExec (legacy)."""
-        self._emit_progress(
-            scan_id=scan_id,
-            phase="domain_info",
-            progress=0.0,
-            message=f"Retrieving domain information for {domain}",
-        )
-
-        domain_info: Dict[str, Any] = {
-            "domain": domain,
-            "pdc": pdc,
-            "functional_level": None,
-            "dc_count": 0,
-        }
-
-        is_hash = len(password) == 32 and all(
-            c in "0123456789abcdef" for c in password.lower()
-        )
-        command = [netexec_path, "ldap", pdc, "-u", username]
-        if is_hash:
-            command.extend(["-H", password])
-        else:
-            command.extend(["-p", password])
-
-        try:
-            clean_env = get_clean_env_for_compilation()
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-                env=clean_env,
-            )
-            domain_info["retrieved"] = result.returncode == 0
-        except subprocess.TimeoutExpired as exc:
-            telemetry.capture_exception(exc)
-            domain_info["retrieved"] = False
-            print_info_debug(f"Domain info retrieval timed out for {domain}")
-
-        self._emit_progress(
-            scan_id=scan_id,
-            phase="domain_info",
-            progress=1.0,
-            message="Domain information retrieval completed",
-        )
-        return domain_info

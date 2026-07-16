@@ -33,6 +33,9 @@ PATIENCE_BUCKETS: tuple[tuple[int, str], ...] = (
     (500, "a few minutes"),
     (2000, "several minutes — grab a coffee"),
     (10000, "ten minutes or more"),
+    (50000, "roughly an hour or more"),
+    (150000, "several hours"),
+    (500000, "the better part of a day"),
 )
 
 
@@ -82,6 +85,7 @@ def maybe_show_patience_notice(
     *,
     count: int,
     non_interactive: bool,
+    rate_per_second: Optional[float] = None,
     _printer: Optional[Callable[..., None]] = None,
     _panel_printer: Optional[Callable[..., None]] = None,
 ) -> bool:
@@ -91,6 +95,11 @@ def maybe_show_patience_notice(
         config: The operation's :class:`PatienceNoticeConfig`.
         count: Number of items the op will process.
         non_interactive: When ``True``, emit a single info line, never a panel.
+        rate_per_second: Optional known throughput (items/sec). When provided
+            and positive, the notice shows a computed ETA (``count /
+            rate_per_second``) instead of the generic count-scaled bucket
+            label — callers with real calibration data (e.g. kerbrute
+            userenum) get an accurate wait estimate rather than a guess.
         _printer: Injected ``print_info``-style fn (tests). Defaults to the
             real ``print_info``.
         _panel_printer: Injected panel printer (tests). Defaults to
@@ -103,7 +112,12 @@ def maybe_show_patience_notice(
     if count < threshold:
         return False
 
-    _, expectation = _select_bucket(count)
+    if rate_per_second and rate_per_second > 0:
+        from adscan_core.tui.progress_dashboard import format_eta
+
+        expectation = f"roughly {format_eta(count / rate_per_second)}"
+    else:
+        _, expectation = _select_bucket(count)
     headline = (
         f"{config.operation}: processing {count} {config.unit}. "
         f"This may take {expectation}. Progress will be shown live — "

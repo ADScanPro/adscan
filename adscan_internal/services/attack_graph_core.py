@@ -892,6 +892,7 @@ def compute_display_paths_for_domain_unfiltered(
     target: str = "highvalue",
     target_mode: str = "object",
     start_node_ids: set[str] | None = None,
+    chokepoint_group_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute maximal attack paths for a domain (graph-only, unfiltered).
 
@@ -929,6 +930,7 @@ def compute_display_paths_for_domain_unfiltered(
         terminal_mode=mode,
         start_node_ids=effective_start_node_ids,
         reachable_node_ids=high_value_reachable_node_ids,
+        chokepoint_group_ids=chokepoint_group_ids,
     )
 
     results: list[dict[str, Any]] = []
@@ -1128,49 +1130,72 @@ def filter_contained_paths_for_domain_listing(
         # same-terminal suffix coincide because context hops are already stripped.
         kept_entries: list[tuple[AttackCore | None, dict[str, Any]]] = []
         kept_terminal_by_id: dict[int, str | None] = {}
+        # Sub-quadratic scheduling index (byte-identical to the naive all-pairs
+        # scan).  A kept path can only be CONTAINED (prefix OR contiguous
+        # sub-sequence) in the candidate when the kept core's FIRST actionable
+        # step appears among the candidate's steps — a NECESSARY condition of
+        # containment (``attack_core_is_prefix``/``_is_subsequence`` both require
+        # the kept step tuple to be a contiguous block of the candidate's, so its
+        # first step must be one of the candidate's steps).  Indexing kept cores by
+        # their first step lets each candidate test only the kept paths that could
+        # possibly contain-match, instead of every kept path.  The predicate and
+        # the tier/terminal guards below are unchanged; only the set of pairs they
+        # run on is pruned.  ``is_super_path`` is an existence (OR) over the
+        # qualifying kept paths, so the pruned iteration order does not change it.
+        kept_by_first_step: dict[
+            tuple[str, str], list[tuple[AttackCore, dict[str, Any]]]
+        ] = {}
         removed_multi = 0
         for nodes_t, rels_t, record in normalized:
             cand_core = cores_by_id[id(record)]
             cand_tier = tiers_by_id[id(record)]
             cand_terminal = nodes_t[-1] if nodes_t else None
             is_super_path = False
-            if cand_core is not None:
-                for kept_core, kept_rec in kept_entries:
-                    if kept_core is None:
-                        continue
-                    contained = attack_core_is_prefix(
-                        kept_core, cand_core
-                    ) or attack_core_is_subsequence(kept_core, cand_core)
-                    if not contained:
-                        continue
-                    kept_tier = tiers_by_id[id(kept_rec)]
-                    # Keep the longer candidate when it reaches a strictly higher
-                    # domain-compromise tier than the kept sub-path.
-                    if cand_tier > kept_tier:
-                        continue
-                    # Keep the longer candidate when it reaches a DISTINCT terminal
-                    # of EQUAL domain-compromise tier: it is a separately
-                    # compromisable target, not merely a longer route to the same
-                    # place.  (Vintage: ``FS01$→…→GMSA01$`` is a prefix of three
-                    # distinct equal-tier service-account terminals SVC_ARK /
-                    # SVC_LDAP / SVC_SQL — all three must survive, not collapse into
-                    # the bare GMSA01$ prefix.)  The redundant bare prefix is
-                    # dropped in Pass 2 instead.  Same-terminal longer routes still
-                    # collapse here, and a lower-tier wander past the kept terminal
-                    # (cand_tier < kept_tier) still collapses as noise.
-                    if (
-                        cand_tier == kept_tier
-                        and cand_terminal is not None
-                        and cand_terminal != kept_terminal_by_id.get(id(kept_rec))
-                    ):
-                        continue
-                    is_super_path = True
-                    break
+            if cand_core is not None and cand_core[1]:
+                for step in set(cand_core[1]):
+                    if is_super_path:
+                        break
+                    for kept_core, kept_rec in kept_by_first_step.get(step, ()):
+                        contained = attack_core_is_prefix(
+                            kept_core, cand_core
+                        ) or attack_core_is_subsequence(kept_core, cand_core)
+                        if not contained:
+                            continue
+                        kept_tier = tiers_by_id[id(kept_rec)]
+                        # Keep the longer candidate when it reaches a strictly higher
+                        # domain-compromise tier than the kept sub-path.
+                        if cand_tier > kept_tier:
+                            continue
+                        # Keep the longer candidate when it reaches a DISTINCT terminal
+                        # of EQUAL domain-compromise tier: it is a separately
+                        # compromisable target, not merely a longer route to the same
+                        # place.  (Vintage: ``FS01$→…→GMSA01$`` is a prefix of three
+                        # distinct equal-tier service-account terminals SVC_ARK /
+                        # SVC_LDAP / SVC_SQL — all three must survive, not collapse into
+                        # the bare GMSA01$ prefix.)  The redundant bare prefix is
+                        # dropped in Pass 2 instead.  Same-terminal longer routes still
+                        # collapse here, and a lower-tier wander past the kept terminal
+                        # (cand_tier < kept_tier) still collapses as noise.
+                        if (
+                            cand_tier == kept_tier
+                            and cand_terminal is not None
+                            and cand_terminal != kept_terminal_by_id.get(id(kept_rec))
+                        ):
+                            continue
+                        is_super_path = True
+                        break
             if is_super_path:
                 removed_multi += 1
             else:
                 kept_entries.append((cand_core, record))
                 kept_terminal_by_id[id(record)] = cand_terminal
+                # Index this kept path by its first step so later candidates can
+                # find it as a possible contained sub-path.  Empty-step cores never
+                # contain-match (the predicates guard ``n == 0``), so skip them.
+                if cand_core is not None and cand_core[1]:
+                    kept_by_first_step.setdefault(cand_core[1][0], []).append(
+                        (cand_core, record)
+                    )
 
         # Pass 2 — remove a kept path A when a kept super-path B strictly contains
         # A's attack core as a prefix/sub-sequence AND B's domain-compromise tier is
@@ -1181,15 +1206,28 @@ def filter_contained_paths_for_domain_listing(
         #     ``…→DCSync→Domain`` super-path it prefixes (4 >= 3);
         #   • a T4 Domain-object prefix is NEVER dropped by a longer T1-host
         #     super-path (1 >= 4 is False) — preserves the F2 anti-regression.
+        # Sub-quadratic scheduling index (byte-identical to the naive all-pairs
+        # scan).  Path A is dominated only by a super-path B that CONTAINS A's core
+        # (prefix OR contiguous sub-sequence) — which requires A's FIRST step to
+        # appear among B's steps.  Index every kept super-path B under EACH of its
+        # steps, so a given A tests only the B's that carry A's first step, instead
+        # of every kept path.  ``dominated`` is an existence (OR) over qualifying
+        # B's, so the pruned iteration order does not change it.
+        super_path_by_step: dict[str, list[tuple[AttackCore, dict[str, Any]]]] = {}
+        for b_core, other in kept_entries:
+            if b_core is None or not b_core[1]:
+                continue
+            for step in set(b_core[1]):
+                super_path_by_step.setdefault(step, []).append((b_core, other))
         pass2_kept: list[dict[str, Any]] = []
         pass2_removed = 0
         for a_core, record in kept_entries:
             a_tier = tiers_by_id[id(record)]
             rec_is_hv = is_hv_terminal(record) if is_hv_terminal is not None else False
             dominated = False
-            if a_core is not None and not rec_is_hv:
-                for b_core, other in kept_entries:
-                    if other is record or b_core is None:
+            if a_core is not None and a_core[1] and not rec_is_hv:
+                for b_core, other in super_path_by_step.get(a_core[1][0], ()):
+                    if other is record:
                         continue
                     if not (
                         attack_core_is_prefix(a_core, b_core)
@@ -1346,6 +1384,27 @@ def filter_prefix_paths_dominated_by_super_path(
         )
         cores.append((core, domain_compromise_tier_from_record(record), record))
 
+    # Sub-quadratic scheduling index (byte-identical to the naive all-pairs scan).
+    # A is dropped only by a super-path B whose core strictly CONTAINS A's core as a
+    # LEADING prefix (``attack_core_is_prefix`` — same start node, A's step tuple is
+    # B's first ``len(A)`` steps, A strictly shorter) AND ``tier(B) >= tier(A)``.
+    # So index, for every B, each of its PROPER-prefix keys ``(start, steps[:k])``
+    # (k = 1..len(B)-1) → the MAX B-tier registered at that key.  A is then dominated
+    # iff its own ``(start, steps)`` key is registered with a tier >= A's — an O(1)
+    # lookup that replaces the inner all-pairs loop.  A never registers its own full
+    # key (only strictly shorter prefixes), so it can never dominate itself and two
+    # equal-core paths never dominate each other (matching the strict-prefix guard).
+    prefix_dominator_tier: dict[tuple[str, tuple[tuple[str, str], ...]], int] = {}
+    for b_core, b_tier, _b_record in cores:
+        if b_core is None:
+            continue
+        b_start, b_steps = b_core[0], b_core[1]
+        for k in range(1, len(b_steps)):
+            key = (b_start, b_steps[:k])
+            cur = prefix_dominator_tier.get(key)
+            if cur is None or b_tier > cur:
+                prefix_dominator_tier[key] = b_tier
+
     kept: list[dict[str, Any]] = []
     removed = 0
     for a_core, a_tier, record in cores:
@@ -1353,14 +1412,9 @@ def filter_prefix_paths_dominated_by_super_path(
             kept.append(record)
             continue
         dominated = False
-        for b_core, b_tier, other in cores:
-            if other is record or b_core is None:
-                continue
-            # A is dropped only by a super-path B that strictly contains A's core as a
-            # leading prefix AND whose domain-compromise tier is >= A's.
-            if attack_core_is_prefix(a_core, b_core) and b_tier >= a_tier:
-                dominated = True
-                break
+        if a_core[1]:
+            best = prefix_dominator_tier.get((a_core[0], a_core[1]))
+            dominated = best is not None and best >= a_tier
         if dominated:
             removed += 1
         else:
@@ -2246,6 +2300,11 @@ _W_LOCAL_REUSE_EXISTING_PAIRS: set[tuple[str, str]] = set()
 _W_LOCAL_REUSE_USEFUL_NODES: set[str] = set()
 _W_TERMINAL_SET: set[str] = set()
 _W_IMPLICIT_EDGE_OVERLAY: dict[str, list[dict[str, Any]]] = {}
+# Reverse-reachable set (nodes that can reach a high-value/Tier-0 sink). Empty
+# when the caller did not request reachability pruning (i.e. every target except
+# `highvalue`), in which case the expansion guard is a no-op and no node is
+# skipped — see _dfs_sources_batch_worker.
+_W_REACHABLE_NODE_IDS: set[str] = set()
 
 
 def _dfs_worker_init(
@@ -2255,17 +2314,19 @@ def _dfs_worker_init(
     local_reuse_useful_nodes: set[str],
     terminal_set: set[str],
     implicit_edge_overlay: dict[str, list[dict[str, Any]]],
+    reachable_node_ids: set[str],
 ) -> None:
     """Populate per-worker globals. Called once per worker process by the pool initializer."""
     global _W_ADJACENCY, _W_LOCAL_REUSE_BY_NODE  # noqa: PLW0603
     global _W_LOCAL_REUSE_EXISTING_PAIRS, _W_LOCAL_REUSE_USEFUL_NODES, _W_TERMINAL_SET  # noqa: PLW0603
-    global _W_IMPLICIT_EDGE_OVERLAY  # noqa: PLW0603
+    global _W_IMPLICIT_EDGE_OVERLAY, _W_REACHABLE_NODE_IDS  # noqa: PLW0603
     _W_ADJACENCY = adjacency
     _W_LOCAL_REUSE_BY_NODE = local_reuse_by_node
     _W_LOCAL_REUSE_EXISTING_PAIRS = local_reuse_existing_pairs
     _W_LOCAL_REUSE_USEFUL_NODES = local_reuse_useful_nodes
     _W_TERMINAL_SET = terminal_set
     _W_IMPLICIT_EDGE_OVERLAY = implicit_edge_overlay
+    _W_REACHABLE_NODE_IDS = reachable_node_ids
 
 
 def _dfs_sources_batch_worker(
@@ -2287,6 +2348,7 @@ def _dfs_sources_batch_worker(
     local_reuse_useful_nodes = _W_LOCAL_REUSE_USEFUL_NODES
     terminal_set = _W_TERMINAL_SET
     implicit_edge_overlay = _W_IMPLICIT_EDGE_OVERLAY
+    reachable_node_ids = _W_REACHABLE_NODE_IDS
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
@@ -2364,6 +2426,22 @@ def _dfs_sources_batch_worker(
             is_self_loop = to_id == current
             if not is_self_loop and to_id in visited:
                 continue
+            # ── Reverse-reachability expansion guard ─────────────────────────
+            # Mirror of the sequential DFS guard in compute_maximal_attack_paths:
+            # never expand into a node that can neither reach a high-value/Tier-0
+            # sink nor is itself a terminal sink. reachable_node_ids is empty
+            # unless the caller requested reachability pruning (highvalue target
+            # only), so this is a no-op for target=all/lowpriv — no coverage loss.
+            # A skipped node cannot be an intermediate of any Tier-0-terminating
+            # path (emit() already discards non-terminal endpoints), so the
+            # emitted highvalue path set is provably unchanged.
+            if (
+                reachable_node_ids
+                and to_id not in reachable_node_ids
+                and to_id not in terminal_set
+            ):
+                continue
+            # ── End guard ────────────────────────────────────────────────────
             step = AttackPathStep(
                 from_id=current,
                 relation=str(edge.get("relation") or ""),
@@ -2421,6 +2499,7 @@ def _run_parallel_domain_dfs(
     max_paths_cap: int | None,
     n_workers: int,
     implicit_edge_overlay: dict[str, list[dict[str, Any]]] | None = None,
+    reachable_node_ids: set[str] | None = None,
 ) -> list[AttackPath]:
     """Distribute the DFS over *n_workers* spawn-context processes.
 
@@ -2428,6 +2507,11 @@ def _run_parallel_domain_dfs(
     Each task only carries a small source-batch list.
     Results are merged and globally deduplicated in the main process.
     Falls back to sequential on any error.
+
+    *reachable_node_ids* is the reverse-reachable set (nodes that can reach a
+    high-value/Tier-0 sink). When non-empty, each worker honours it as an
+    expansion guard, mirroring the sequential DFS. Empty/None disables the
+    guard (target=all/lowpriv), so no node is pruned.
     """
     import concurrent.futures
     import multiprocessing
@@ -2454,6 +2538,7 @@ def _run_parallel_domain_dfs(
                 local_reuse_useful_nodes,
                 terminal_set,
                 implicit_edge_overlay or {},
+                reachable_node_ids or set(),
             ),
         ) as pool:
             futures = [
@@ -2627,8 +2712,24 @@ def compute_maximal_attack_paths(
     terminal_mode: str = "domain",
     start_node_ids: set[str] | None = None,
     reachable_node_ids: set[str] | None = None,
+    chokepoint_group_ids: set[str] | None = None,
 ) -> list[AttackPath]:
-    """Compute maximal paths up to depth for a full-domain graph."""
+    """Compute maximal paths up to depth for a full-domain graph.
+
+    Layer 3 — choke-point-rooted DFS (``chokepoint_group_ids``): the node-ids of
+    ``>1``-member ``MemberOf`` target groups (the collapse choke points, computed
+    by the caller from the membership snapshot).  When supplied, each such group
+    that has a source direct-member is added as an extra DFS root and walked
+    ONCE, while the redundant leading ``member -> MemberOf -> G`` hop is
+    suppressed per source.  This turns the ``O(members x subtree)`` Cartesian
+    re-walk into ``O(members + subtree)`` without changing the final emitted +
+    collapsed path set (``collapse_memberof_prefixes`` still runs and would have
+    stripped exactly these prefixes).  Two guards keep byte-identity when a
+    subtree loops back to a choke-point member: an emit-span guard drops an
+    over-long path whose span already holds EVERY member (no member outside it
+    could have generated it), and a truncation emit re-adds the shorter
+    member-blocked maximal path a per-source walk would have produced.
+    """
     if max_depth <= 0:
         return []
     max_paths_cap = (
@@ -2713,12 +2814,54 @@ def compute_maximal_attack_paths(
             continue
         sources.append(node_id)
 
+    # --- Layer 3: choke-point-rooted DFS setup -------------------------------
+    # Identify the collapse choke points (>1-member groups) that at least one
+    # source is a direct member of.  Those groups become extra DFS roots walked
+    # ONCE; the redundant leading ``source -> MemberOf -> G`` hop is suppressed
+    # (``collapse_memberof_prefixes`` would strip it anyway).  Membership is read
+    # from the SAME post-suppression adjacency the DFS walks, so the suppression
+    # set and the guard member-set stay exactly consistent with what collapses.
+    chokepoint_ids = chokepoint_group_ids or set()
+    chokepoint_root_members: dict[str, set[str]] = {}
+    if chokepoint_ids:
+        for src in sources:
+            for edge in adjacency.get(src, ()):
+                if str(edge.get("relation") or "") != "MemberOf":
+                    continue
+                gid = str(edge.get("to") or "")
+                if gid and gid in chokepoint_ids:
+                    chokepoint_root_members.setdefault(gid, set()).add(src)
+    # Only groups that pass the same start/reachable/outgoing gates as sources
+    # are actually rooted; suppression is tied strictly to this rooted set so a
+    # suppressed leading hop always has a root that regenerates its subtree.
+    chokepoint_roots: list[str] = []
+    for gid in sorted(chokepoint_root_members):
+        if allowed_start_ids and gid not in allowed_start_ids:
+            continue
+        if allowed_reachable_ids and gid not in allowed_reachable_ids:
+            continue
+        if outgoing.get(gid, 0) <= 0:
+            continue
+        chokepoint_roots.append(gid)
+    chokepoint_root_set: set[str] = set(chokepoint_roots)
+
     # --- Parallel DFS (domain scope) -----------------------------------------
     # When ADSCAN_ATTACK_PATH_WORKERS != 0 and the source set is large enough,
     # distribute the per-source DFS across spawn-context worker processes.
     # Worker processes receive the pre-built adjacency and local-reuse indexes
     # via the pool initializer (pickled once per worker, not per task).
     # On any failure the result list is empty and we fall through to sequential.
+    #
+    # NOTE (Layer 3): the parallel worker path does NOT yet apply the
+    # choke-point-rooted DFS (``chokepoint_group_ids``).  It runs the plain
+    # per-source DFS, so its output is byte-IDENTICAL to the sequential engine
+    # only AFTER ``collapse_memberof_prefixes`` (which still strips the
+    # duplicated MemberOf prefixes downstream) — correctness is preserved, but
+    # the parallel path pays the full O(members x subtree) cost.  Porting the
+    # root-set + suppression + guards into ``_dfs_sources_batch_worker`` (via the
+    # pool initializer) is the follow-up to give workers the same speedup; the
+    # DEFAULT engine is sequential (``ADSCAN_ATTACK_PATH_WORKERS=0``), which is
+    # fully optimized.
     n_workers = _effective_domain_dfs_workers(len(sources))
     if n_workers >= 2:
         from adscan_internal.rich_output import print_info_debug  # noqa: PLC0415
@@ -2743,6 +2886,7 @@ def compute_maximal_attack_paths(
             max_paths_cap,
             n_workers,
             implicit_edge_overlay,
+            allowed_reachable_ids,
         )
         if parallel_paths or not sources:
             return parallel_paths
@@ -2756,6 +2900,17 @@ def compute_maximal_attack_paths(
 
     paths: list[AttackPath] = []
     seen_signatures: set[tuple[tuple[str, str, str, str], ...]] = set()
+    # Layer 3: the source-member set of the choke point currently being rooted
+    # (None while walking a real source).  Two byte-identity guards use it:
+    #   * emit guard — drop a choke-point-rooted path whose span already contains
+    #     EVERY source-member of the root: no member is left outside it to have
+    #     generated it under per-source blocking, so the post-hoc collapse would
+    #     not have produced it either (it would be an over-long extra).
+    #   * truncation emit (in the DFS) — when the ONLY onward continuation from a
+    #     node is a single source-member ``m``, that member's own DFS would block
+    #     there and emit the shorter path; the shared root walk continues past
+    #     ``m``, so it must ALSO emit the truncated path to stay byte-identical.
+    active_guard_members: set[str] | None = None
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
@@ -2766,6 +2921,17 @@ def compute_maximal_attack_paths(
             target == "lowpriv" and is_terminal(acc_steps[-1].to_id)
         ):
             return
+        if active_guard_members is not None and len(active_guard_members) <= len(
+            acc_steps
+        ) + 1:
+            # A span of N nodes can contain EVERY member only when members <= N,
+            # so this O(members) subset test is skipped entirely at scale (a
+            # universal group's member count vastly exceeds any path length) —
+            # keeping the choke-point rooting O(members + subtree), never O(M*S).
+            span = {acc_steps[0].from_id}
+            span.update(s.to_id for s in acc_steps)
+            if active_guard_members.issubset(span):
+                return
         signature = tuple(attack_path_step_signature(s) for s in acc_steps)
         if signature in seen_signatures:
             return
@@ -2805,6 +2971,8 @@ def compute_maximal_attack_paths(
             return
 
         extended = False
+        new_targets: set[str] = set()
+        self_loop_extended = False
         _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
         for edge in next_edges:
             last_step = acc_steps[-1] if acc_steps else None
@@ -2823,6 +2991,21 @@ def compute_maximal_attack_paths(
 
             to_id = str(edge.get("to") or "")
             if not to_id:
+                continue
+            # Layer 3: suppress the redundant LEADING (depth-0) ``MemberOf`` hop
+            # from a REAL SOURCE into a rooted choke point.  That subtree is
+            # walked ONCE from the choke-point root below (``current`` is a
+            # choke-point root when it is already in the rooted set, and those
+            # walk their MemberOf hops normally so deeper frontiers still root).
+            # The post-hoc collapse strips exactly this leading prefix, so
+            # dropping it here is byte-identical, not lossy.
+            if (
+                not acc_steps
+                and chokepoint_root_set
+                and _cand_rel == "memberof"
+                and to_id in chokepoint_root_set
+                and current not in chokepoint_root_set
+            ):
                 continue
             # Self-loop edges (to_id == current) are context-upgrading derived
             # steps (e.g. DumpLSASS on the same node).  They don't advance the
@@ -2849,14 +3032,48 @@ def compute_maximal_attack_paths(
             if not is_self_loop:
                 visited.remove(to_id)
             extended = True
+            if is_self_loop:
+                self_loop_extended = True
+            else:
+                new_targets.add(to_id)
+
+        # Layer 3 — member-loop-back truncation: when the ONLY onward move from
+        # here is a single source-member ``m`` of the choke point being rooted
+        # (and there is no self-loop ``m`` could otherwise take), ``m``'s own DFS
+        # would block on itself and emit the path truncated HERE.  The shared
+        # root walk continues past ``m``, so it must emit that truncated path too
+        # — otherwise a real, shorter maximal path (the one the post-hoc collapse
+        # kept) would go missing.
+        if (
+            active_guard_members is not None
+            and acc_steps
+            and not self_loop_extended
+            and len(new_targets) == 1
+            and next(iter(new_targets)) in active_guard_members
+        ):
+            emit(acc_steps)
 
         if not extended:
             emit(acc_steps)
 
+    # Sources first: they drop their redundant leading MemberOf hop into every
+    # rooted choke point (see the DFS suppression), so each shared subtree is
+    # walked once below instead of once per member.
     for source in sources:
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
             break
         dfs(source, visited={source}, acc_steps=[])
+
+    # Then walk each choke-point subtree ONCE, rooted at the group, with the two
+    # byte-identity guards active (emit-span guard for over-long extras, and the
+    # member-loop-back truncation emit).  ``active_guard_members`` is the root's
+    # own source-member set.
+    for chokepoint in chokepoint_roots:
+        if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            break
+        active_guard_members = chokepoint_root_members.get(chokepoint)
+        dfs(chokepoint, visited={chokepoint}, acc_steps=[])
+    active_guard_members = None
 
     return paths
 

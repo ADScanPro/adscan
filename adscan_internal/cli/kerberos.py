@@ -663,6 +663,53 @@ def _load_valid_roast_hash_entries(
     return []
 
 
+# Hashcat roast lines embed the Kerberos etype number:
+#   Kerberoast (TGS-REP): $krb5tgs$<etype>$...   AS-REP Roast: $krb5asrep$<etype>$...
+# RC4-HMAC = etype 23, AES128-CTS = 17, AES256-CTS = 18. The encryption type of
+# every captured roastable hash is therefore derivable from the line prefix
+# WITHOUT reading the ciphertext, username, SPN, or any secret material.
+_ROAST_ETYPE_RE = re.compile(r"\$krb5(?:tgs|asrep)\$(\d+)\$")
+
+
+def _summarize_roast_etypes(
+    parsed_hash_entries: list[tuple[str, str]],
+) -> dict[str, int]:
+    """Return sanitized per-encryption-type counts for a set of roast hashes.
+
+    Only the Kerberos etype number embedded in each hashcat line is inspected;
+    no username, SPN, ciphertext, realm, or secret material is read or emitted.
+    The result is pure integer counts, safe for telemetry.
+
+    Args:
+        parsed_hash_entries: ``(username, hash_line)`` pairs from one roast run.
+
+    Returns:
+        Dict of etype-family counts: ``rc4_count`` (etype 23), ``aes128_count``
+        (17), ``aes256_count`` (18), ``aes_count`` (17+18), ``other_count``
+        (any other/unparseable etype), and ``hash_total``.
+    """
+    rc4 = aes128 = aes256 = other = 0
+    for _username, hash_line in parsed_hash_entries:
+        match = _ROAST_ETYPE_RE.search(hash_line or "")
+        etype = match.group(1) if match else None
+        if etype == "23":
+            rc4 += 1
+        elif etype == "17":
+            aes128 += 1
+        elif etype == "18":
+            aes256 += 1
+        else:
+            other += 1
+    return {
+        "rc4_count": rc4,
+        "aes128_count": aes128,
+        "aes256_count": aes256,
+        "aes_count": aes128 + aes256,
+        "other_count": other,
+        "hash_total": rc4 + aes128 + aes256 + other,
+    }
+
+
 def _extract_roast_candidate_users_from_stdout(
     roast_type: str,
     output: str | None,
@@ -1222,6 +1269,30 @@ def finalize_roast_results(
         }
         base_properties.update(build_lab_event_fields(shell=shell, include_slug=True))
         telemetry.capture(f"{roast_type}_users_found", base_properties)
+
+        # RC4-vs-AES prevalence of the roastable hashes captured this run.
+        # Sanitized by construction: only counts + the Kerberos etype (derived
+        # from the hashcat line prefix) leave the host — never a hash, username,
+        # SPN, realm, or any secret. One event per roast run, tagged with
+        # roast_type + workspace_type so production-audit prevalence can be
+        # measured in PostHog by filtering to workspace_type = audit (ctf is
+        # lab noise). Only emitted when hashes were actually written.
+        if parsed_hash_entries:
+            etype_properties: dict[str, Any] = {
+                "roast_type": roast_type,
+                "scan_mode": getattr(shell, "scan_mode", None),
+                "auth_type": domain_data.get("auth", "unknown"),
+                "workspace_type": getattr(shell, "type", None),
+                "auto_mode": getattr(shell, "auto", False),
+            }
+            etype_counts = _summarize_roast_etypes(parsed_hash_entries)
+            etype_properties.update(etype_counts)
+            etype_properties["rc4_present"] = etype_counts["rc4_count"] > 0
+            etype_properties["aes_present"] = etype_counts["aes_count"] > 0
+            etype_properties.update(
+                build_lab_event_fields(shell=shell, include_slug=True)
+            )
+            telemetry.capture("roast_etype_prevalence", etype_properties)
 
         # Track TTFH (Time To First Hash) for case study metrics
         # Use scan_start_time (not session_start_time) for accurate timing

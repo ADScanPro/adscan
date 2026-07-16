@@ -30,6 +30,12 @@ class DCERPC5Connection:
 		self.auth_level = RPC_C_AUTHN_LEVEL_NONE
 		self.ctx = 0
 		self.callid = 1
+		# ADSCAN: serializes each request()'s send+recv round-trip on this
+		# association. recv() returns the NEXT frame off the wire without
+		# correlating call_id, so concurrent request() coroutines sharing one
+		# connection would otherwise steal each other's responses (observed:
+		# SAMR description / UAC-flag scramble -> wrong-principal attribution).
+		self._request_lock = asyncio.Lock()
 		self.__auth_ctx_id = None  # Set during initial bind, reused for alter context
 
 		self.NDRSyntax   = uuidtup_to_bin(('8a885d04-1ceb-11c9-9fe8-08002b104860', '2.0'))
@@ -371,14 +377,20 @@ class DCERPC5Connection:
 			else:
 				isNDR64 = False
 			
-			_, err = await self.call(request.opnum, request, uuid)
-			if err is not None:
-				raise err
-			
-			answer, err = await self.recv()
-			if err is not None:
-				raise err
-			
+			# ADSCAN: the send+recv pair MUST be atomic per connection. recv()
+			# reads the next frame off the transport without matching call_id to
+			# the caller, so without this lock a concurrent request() on the same
+			# association can consume this call's response (and vice-versa),
+			# scrambling which response is paired with which request.
+			async with self._request_lock:
+				_, err = await self.call(request.opnum, request, uuid)
+				if err is not None:
+					raise err
+
+				answer, err = await self.recv()
+				if err is not None:
+					raise err
+
 			__import__(request.__module__)
 			module = sys.modules[request.__module__]
 			respClass = getattr(module, request.__class__.__name__ + 'Response')

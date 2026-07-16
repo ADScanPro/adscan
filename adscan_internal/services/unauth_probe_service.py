@@ -129,6 +129,26 @@ class UnauthProbeResults:
 # ---------------------------------------------------------------------------
 
 
+def _concise_exc_reason(exc: BaseException) -> str:
+    """Return a one-line cause for *exc* -- ``TypeName: errno=N: short msg``.
+
+    Used on EXPECTED failure paths (LDAPS/389 connectivity timeouts on a
+    known-disabled DC, anonymous-search denials on hardened AD) so the recording
+    carries the diagnostic cause without a multi-frame Python traceback. Full
+    tracebacks are reserved for genuinely unexpected failures.
+    """
+    parts = [type(exc).__name__]
+    errno = getattr(exc, "errno", None)
+    if errno is not None:
+        parts.append(f"errno={errno}")
+    message = " ".join(str(exc).split()).strip()
+    if message:
+        if len(message) > 200:
+            message = message[:197] + "..."
+        parts.append(message)
+    return ": ".join(parts)
+
+
 async def _probe_smb_session(
     target: str,
     auth_label: Literal["null", "guest"],
@@ -351,11 +371,24 @@ async def _probe_ldap_anonymous(
             used_ldaps = transport == "ldaps"
             break
         except Exception as exc:  # noqa: BLE001
-            import traceback as _tb
-            print_info_debug(
-                f"ldap_probe: {transport.upper()}:{port} exception: {type(exc).__name__}: {exc}\n"
-                + "".join(_tb.format_tb(exc.__traceback__))
-            )
+            # A connectivity failure here (timeout when 636 is filtered, RST when
+            # refused, TLS handshake error) is EXPECTED on a hardened/known-
+            # disabled DC and simply falls through to the next transport, so log a
+            # concise one-line cause instead of flooding the recording with a
+            # multi-frame traceback per fallback. A full traceback is kept only
+            # for a genuinely unexpected exception.
+            if is_ldaps_transport_failure(exc):
+                print_info_debug(
+                    f"ldap_probe: {transport.upper()}:{port} transport failure: "
+                    f"{_concise_exc_reason(exc)}"
+                )
+            else:
+                import traceback as _tb
+                print_info_debug(
+                    f"ldap_probe: {transport.upper()}:{port} unexpected exception: "
+                    f"{type(exc).__name__}: {exc}\n"
+                    + "".join(_tb.format_tb(exc.__traceback__))
+                )
             last_exc = exc
             # Record whether the most recent attempt failed for a timeout
             # reason so that, once every transport is exhausted, we can report
@@ -459,11 +492,6 @@ async def _probe_ldap_anonymous(
                     saw_entry = True
                     break  # one entry is enough — search is allowed
         except Exception as search_exc:  # noqa: BLE001
-            import traceback as _tb
-            print_info_debug(
-                f"ldap_probe: pagedsearch exception: {type(search_exc).__name__}: {search_exc}\n"
-                + "".join(_tb.format_tb(search_exc.__traceback__))
-            )
             msg = str(search_exc)
             lower = msg.lower()
             denial_markers = (
@@ -477,6 +505,12 @@ async def _probe_ldap_anonymous(
                 "connected, but not bound",
             )
             if any(m in lower for m in denial_markers):
+                # Anonymous bind allowed but search denied (RootDSE-only, hardened
+                # AD) is an EXPECTED outcome -- log a concise one-line cause, not a
+                # multi-frame traceback.
+                print_info_debug(
+                    f"ldap_probe: anonymous search denied: {_concise_exc_reason(search_exc)}"
+                )
                 return LDAPAnonResult(
                     target=dc_ip,
                     status="denied",
@@ -485,6 +519,13 @@ async def _probe_ldap_anonymous(
                     naming_contexts=naming_contexts,
                     error="anonymous bind allowed but search denied (RootDSE only)",
                 )
+            # Genuinely unexpected search failure -- keep the full traceback.
+            import traceback as _tb
+            print_info_debug(
+                f"ldap_probe: pagedsearch unexpected exception: "
+                f"{type(search_exc).__name__}: {search_exc}\n"
+                + "".join(_tb.format_tb(search_exc.__traceback__))
+            )
             telemetry.capture_exception(search_exc)
             return LDAPAnonResult(
                 target=dc_ip,

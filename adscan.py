@@ -102,7 +102,7 @@ from adscan_internal import (
     telemetry,
     update_modes,
     print_exception,
-    TelemetryAwareConsole,
+    wrap_console_for_telemetry,
 )
 from adscan_internal.command_runner import build_timeout_output_preview
 from adscan_internal.cli.ci_events import emit_phase
@@ -395,38 +395,35 @@ def _run_pip_install_with_retries(
         raise last_exc
 
 
-def _is_netexec_like_command(command: str, netexec_path: str | None = None) -> bool:
-    """Return True if the command should be treated as a NetExec/NXC invocation.
+# Short, read-only diagnostic commands whose stdout/stderr head-preview adds no
+# value but floods the session recording. The DNS-update path runs these on a
+# tight loop (`ip route get`, `pgrep`, `unbound-checkconf`, `ps -o pid,args -C
+# dhcpcd`), so their preview panels were the single largest noise source in
+# field recordings. Suppressing only the debug PREVIEW (never execution, never
+# the one-line result summary) keeps recordings readable with zero behavior
+# change.
+_BENIGN_DIAGNOSTIC_COMMANDS: frozenset[str] = frozenset(
+    {"ip", "pgrep", "pidof", "unbound-checkconf", "ps"}
+)
 
-    We consider a command NetExec-like when:
-    - It contains the resolved NetExec path (normal case), or
-    - The first executable token is `nxc` or `netexec` (including absolute paths).
 
-    This keeps retry/clock-skew handling consistent even when callers use the
-    `nxc` binary directly instead of the `netexec` wrapper.
-    """
+def _first_executable_basename(command: str) -> str:
+    """Return the basename of a command's first token, skipping a leading sudo."""
     if not command:
-        return False
-    if netexec_path and netexec_path in command:
-        # Avoid treating helper wrappers (e.g. enum-trusts --nxc-path <path>) as NXC.
-        if (
-            f"--nxc-path {netexec_path}" in command
-            or f"--nxc-path={netexec_path}" in command
-        ):
-            return False
-        escaped = re.escape(netexec_path)
-        pattern = rf"(^|\s)(sudo\s+)?{escaped}(\s|$)"
-        if re.search(pattern, command):
-            return True
-
+        return ""
     try:
-        first_token = re.split(r"\s+", command.strip(), maxsplit=1)[0]
+        tokens = re.split(r"\s+", command.strip(), maxsplit=2)
     except Exception:
-        first_token = command.strip().split(" ")[0] if command.strip() else ""
+        tokens = command.strip().split(" ")
+    first = (tokens[0] if tokens else "").strip().strip("'\"")
+    if os.path.basename(first) == "sudo" and len(tokens) > 1:
+        first = tokens[1].strip().strip("'\"")
+    return os.path.basename(first)
 
-    first_token = first_token.strip().strip("'\"")
-    basename = os.path.basename(first_token)
-    return basename in {"nxc", "netexec"}
+
+def _is_benign_diagnostic_command(command: str) -> bool:
+    """Return True for trivial internal diagnostics whose output preview is noise."""
+    return _first_executable_basename(command) in _BENIGN_DIAGNOSTIC_COMMANDS
 
 
 def _is_arch_like_distro(distro_info: dict[str, Any]) -> bool:
@@ -806,7 +803,7 @@ def _process_exit_cleanup():
     try:
         if shell and not getattr(shell, "_shutdown_in_progress", False):
             print_info_debug("[atexit] Cleanup handler invoking do_exit")
-            shell.do_exit(exit=False)
+            shell.do_exit(exit=False, from_signal=True)
             return
     except Exception as exc:  # pragma: no cover - best-effort shutdown
         telemetry.capture_exception(exc)
@@ -1827,6 +1824,38 @@ def _guard_root_shell_without_user_context(command: str) -> None:
         telemetry.capture_exception(exc)
 
 
+def _is_rootless_container_runtime() -> bool:
+    """Best-effort detection of a rootless / user-namespaced container runtime.
+
+    Returns True when the FULL runtime is running under rootless Docker,
+    Podman (rootless), or a Docker ``userns-remap`` user namespace. Detection
+    is read-only and never raises. Signals, in order of reliability:
+
+    1. Podman writes ``rootless=1`` into ``/run/.containerenv``.
+    2. A user-namespaced container maps container UID 0 to a NON-zero host UID
+       in ``/proc/self/uid_map`` (a plain rootful container maps ``0 0 <range>``,
+       so a non-zero host-side base indicates a remapped / rootless namespace).
+    """
+    try:
+        with open("/run/.containerenv", "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if line.strip() == "rootless=1":
+                    return True
+    except OSError:
+        pass
+
+    try:
+        with open("/proc/self/uid_map", "r", encoding="utf-8", errors="ignore") as fh:
+            first_mapping = fh.readline().split()
+        # Format per line: "<container_uid> <host_uid> <count>".
+        if len(first_mapping) == 3 and int(first_mapping[1]) != 0:
+            return True
+    except (OSError, ValueError):
+        pass
+
+    return False
+
+
 def _container_runtime_launcher_contract_issues() -> list[str]:
     """Return missing launcher-managed runtime requirements for FULL container mode."""
     issues: list[str] = []
@@ -1876,18 +1905,20 @@ def _guard_container_runtime_launcher_contract(command: str | None) -> None:
     marked_helper_sock = mark_sensitive(helper_sock or "<unset>", "path")
     marked_runtime_image = mark_sensitive(runtime_image, "path")
 
+    launcher_marker_missing = "official_launcher_marker" in issues
+    is_rootless = _is_rootless_container_runtime()
+
     print_info_debug(
-        "[container_guard] Refusing direct in-container launch without official launcher "
-        f"(command={command}, issues={issues}, helper_sock={marked_helper_sock})"
+        "container_guard: Refusing direct in-container launch "
+        f"(command={command}, issues={issues}, rootless={is_rootless}, "
+        f"helper_sock={marked_helper_sock})"
     )
     telemetry.capture(
         "container_runtime_launcher_contract_missing",
         {
             "command": str(command or ""),
             "issues": list(issues),
-            "has_official_launcher_marker": str(
-                str(os.getenv("ADSCAN_OFFICIAL_LAUNCHER") or "").strip() == "1"
-            ).lower(),
+            "has_official_launcher_marker": str(not launcher_marker_missing).lower(),
             "has_host_helper_sock_env": str(bool(helper_sock)).lower(),
             "host_helper_sock_exists": str(
                 bool(helper_sock and os.path.exists(helper_sock))
@@ -1895,6 +1926,7 @@ def _guard_container_runtime_launcher_contract(command: str | None) -> None:
             "has_local_resolver_ip": str(
                 bool(str(os.getenv("ADSCAN_LOCAL_RESOLVER_IP") or "").strip())
             ).lower(),
+            "is_rootless_runtime": str(is_rootless).lower(),
         },
     )
 
@@ -1905,28 +1937,81 @@ def _guard_container_runtime_launcher_contract(command: str | None) -> None:
         "local_resolver_ip": "- Missing launcher-provided local resolver IP (`ADSCAN_LOCAL_RESOLVER_IP`).",
     }
     detail_lines = [issue_map[issue] for issue in issues if issue in issue_map]
+    requirements_block = "Missing runtime requirements:\n" + "\n".join(detail_lines)
 
-    print_panel(
-        "[bold]This ADscan FULL runtime must be launched from the official host launcher.[/bold]\n\n"
-        "The current container session is missing launcher-managed runtime wiring, so "
-        "ADscan will not run from this shell.\n\n"
-        f"Runtime image: {marked_runtime_image}\n"
-        f"Host-helper socket: {marked_helper_sock}\n\n"
-        "Missing runtime requirements:\n" + "\n".join(detail_lines) + "\n\n"
-        "The official launcher sets up the host-helper, loopback DNS context, "
-        "workspace/state mounts, and container runtime environment before ADscan starts.",
-        title="[bold]🧭 Official Launcher Required[/bold]",
-        border_style="yellow",
-        padding=(1, 2),
-    )
-    print_instruction(
-        "Install the official launcher on the host with `pipx install adscan`."
-    )
-    print_instruction("Alternative: `pip install adscan`.")
-    print_instruction("Exit the container shell and run `adscan start` from the host.")
-    print_instruction(
-        "Do not launch ADscan manually from inside the FULL runtime container."
-    )
+    if launcher_marker_missing:
+        # The runtime was NOT started through the official launcher at all —
+        # install / use it.
+        print_panel(
+            "[bold]This ADscan FULL runtime must be launched from the official host launcher.[/bold]\n\n"
+            "The current container session is missing launcher-managed runtime wiring, so "
+            "ADscan will not run from this shell.\n\n"
+            f"Runtime image: {marked_runtime_image}\n"
+            f"Host-helper socket: {marked_helper_sock}\n\n"
+            f"{requirements_block}\n\n"
+            "The official launcher sets up the host-helper, loopback DNS context, "
+            "workspace/state mounts, and container runtime environment before ADscan starts.",
+            title="[bold]🧭 Official Launcher Required[/bold]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        print_instruction(
+            "Install the official launcher on the host with `pipx install adscan`."
+        )
+        print_instruction("Alternative: `pip install adscan`.")
+        print_instruction("Exit the container shell and run `adscan start` from the host.")
+        print_instruction(
+            "Do not launch ADscan manually from inside the FULL runtime container."
+        )
+    elif is_rootless:
+        # The launcher marker IS present (the user DID use the launcher), but a
+        # rootless / user-namespaced container runtime prevented the host-helper
+        # socket and loopback resolver from being wired in. Do NOT tell them to
+        # install the launcher — that is not the problem.
+        print_panel(
+            "[bold]ADscan was launched correctly, but this session is running under a "
+            "rootless container runtime.[/bold]\n\n"
+            "Under rootless Docker, Podman, or a user-namespaced runtime the launcher "
+            "cannot mount the host-helper socket or set up the loopback DNS resolver "
+            "the FULL runtime needs, so ADscan will not run from this shell.\n\n"
+            f"Runtime image: {marked_runtime_image}\n"
+            f"Host-helper socket: {marked_helper_sock}\n\n"
+            f"{requirements_block}\n\n"
+            "Rootless runtime support is on the roadmap. For now the FULL runtime "
+            "needs a standard (rootful) Docker Engine.",
+            title="[bold]🧭 Rootless Runtime Not Yet Supported[/bold]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        print_instruction(
+            "Run the launcher against a standard rootful Docker Engine, not rootless Docker or Podman."
+        )
+        print_instruction(
+            "Check your runtime with `docker info` — rootless mode reports `rootless: true`."
+        )
+    else:
+        # Launcher marker present, not rootless, yet launcher-managed wiring is
+        # still missing (helper did not start, or a mount was dropped). A fresh
+        # session usually fixes it — again, do NOT push the launcher install.
+        print_panel(
+            "[bold]ADscan was launched from the official launcher, but launcher-managed "
+            "runtime wiring is missing from this session.[/bold]\n\n"
+            "The host-helper socket or loopback DNS resolver was not wired in, so "
+            "ADscan will not run from this shell.\n\n"
+            f"Runtime image: {marked_runtime_image}\n"
+            f"Host-helper socket: {marked_helper_sock}\n\n"
+            f"{requirements_block}\n\n"
+            "This usually means the host helper did not start or a mount was dropped.",
+            title="[bold]🧭 Runtime Wiring Incomplete[/bold]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        print_instruction(
+            "Exit this shell and start a fresh session with `adscan start` from the host."
+        )
+        print_instruction(
+            "If it persists, run `adscan check` on the host to diagnose the host-helper setup."
+        )
     raise SystemExit(1)
 
 
@@ -2125,7 +2210,6 @@ SYSTEM_PACKAGES_CONFIG = {
     # "rustc": "rustc",  # Disabled - using rustup instead
     # "cargo": "cargo",  # Disabled - using rustup instead
     "bat": "batcat",
-    "samba": "smbclient",
     "samba-common-bin": "net",
     "mono-devel": "mono",
     "mingw-w64": "x86_64-w64-mingw32-gcc",
@@ -2141,7 +2225,6 @@ SYSTEM_PACKAGES_CONFIG = {
     "python3-pip": "pip3",
     "unzip": "unzip",
     "p7zip-full": "7z",
-    "hydra": "hydra",
     "aardwolf": "aardwolf",
     "freerdp3-x11": "xfreerdp",
     "tesseract-ocr": "tesseract",
@@ -2174,11 +2257,10 @@ SYSTEM_PACKAGES_CONFIG = {
     # Note: Go is installed from official golang.org source
     # (see _install_go_official function)
     # "golang-go": "go",  # Disabled - using official golang.org installation instead
-    "musl-tools": "musl-tools",
+    # musl-tools removed 2026-07-08: no musl build target ships in the image, so
+    # verifying it made `adscan check` fail on a package that is never installed.
     # Cross-compilation support for Windows targets
     "gcc-mingw-w64-x86-64": "x86_64-w64-mingw32-gcc",
-    # Required for Word to PDF conversion in report generation
-    "libreoffice": "libreoffice",
     # manspider depends on python-magic, which requires the system libmagic runtime.
     "libmagic1": "libmagic1",
 }
@@ -2198,12 +2280,6 @@ EXTERNAL_TOOLS_CONFIG = {
         "req_url": "https://raw.githubusercontent.com/lclevy/firepwd/refs/heads/master/requirements.txt",
         "req_file": "requirements.txt",
         "check_path": "firepwd/firepwd.py",
-    },
-    "LSA-Reaper": {
-        "url": "https://github.com/spextat0r/LSA-Reaper.git",
-        "type": "git",
-        "req_file": "requirements.txt",
-        "check_path": "LSA-Reaper/lsa-reaper.py",
     },
     "PKINITtools": {
         "type": "multi_curl",
@@ -2226,12 +2302,6 @@ EXTERNAL_TOOLS_CONFIG = {
         "name": "kerbrute",
         "check_path": "kerbrute/kerbrute",
         "check_venv_link": True,
-    },
-    "coercer": {
-        "url": "https://github.com/p0dalirius/Coercer.git",
-        "type": "git",
-        "req_file": "requirements.txt",
-        "check_path": "coercer/Coercer.py",
     },
     "syswhispers4": {
         # SysWhispers4 – generates direct-syscall stubs for evasion-compiled binaries.
@@ -2258,26 +2328,20 @@ EXTERNAL_TOOLS_CONFIG = {
     # },
 }
 
-# Global wordlists configuration - shared between handle_install and handle_check
+# Global wordlists configuration for the `handle_install` download flow.
+#
+# Only runtime-DOWNLOADABLE lists belong here. rockyou.txt is the single such
+# list. The audit base ships as combined_audit_base.txt — a ~94M build-time
+# merge (hashmob-large + kerberoast_pws + kaonashi_10K, order-preserving rling
+# dedup) produced by scripts/build_combined_audit_wordlist.sh and baked into the
+# image; its raw components are staged from wordlists/manifest.json at build time
+# and dropped afterwards, so they never ship and are NOT installable at runtime.
+# The runtime EXISTENCE check (adscan check) is driven separately by the
+# WordlistService default definitions and asserts rockyou.txt + combined_audit_base.txt.
 WORDLISTS_CONFIG = {
     "rockyou.txt": {
         "url": "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt",
         "dest": "rockyou.txt",
-    },
-    "kerberoast_pws": {
-        "url": "https://gist.github.com/The-Viper-One/a1ee60d8b3607807cc387d794e809f0b/raw/b7d83af6a8bbb43013e04f78328687d19d0cf9a7/kerberoast_pws.xz",
-        "dest": "kerberoast_pws.xz",
-        "extract_xz": True,
-    },
-    "hashmob_medium_2025": {
-        "url": "https://weakpass.com/download/2073/hashmob.net_2025.medium.found.7z",
-        "dest": "hashmob.net_2025.medium.found.7z",
-        "extract_7z": True,
-    },
-    "kaonashi14M": {
-        "url": "https://weakpass.com/download/1938/kaonashi14M.txt.7z",
-        "dest": "kaonashi14M.txt.7z",
-        "extract_7z": True,
     },
 }
 
@@ -2505,12 +2569,6 @@ def _setup_external_tool(
 
                 clean_env = _get_clean_env_for_compilation()
                 venv_args = [pyenv_python, "-m", "venv"]
-                if tool_name == "LSA-Reaper":
-                    # LSA-Reaper imports python-apt and also shells out to
-                    # ``sudo python3 -m pypykatz`` internally. A normal isolated
-                    # venv cannot see distro-provided python3-apt, so it must be
-                    # created with system site-packages enabled.
-                    venv_args.append("--system-site-packages")
                 venv_args.append(tool_specific_venv_path)
                 result = run_command(
                     venv_args,
@@ -2608,10 +2666,6 @@ def _setup_external_tool(
                 "-r",
                 os.path.join(tool_path, req_file_path),
             ]
-            if tool_name == "LSA-Reaper":
-                # LSA-Reaper depends on Impacket explicitly at runtime even
-                # though its upstream requirements.txt omits it.
-                pip_install_command.append("impacket")
             run_command(
                 pip_install_command,
                 env=pip_env,
@@ -3054,28 +3108,6 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         "check_type": "executable",
         "exe_name": "nxc",
     },
-    "certipy": {
-        "spec": "certipy-ad==5.0.4",
-        "check_target": "certipy",
-        "check_type": "executable",
-        "exe_name": "certipy",
-    },
-    "bloodyad": {
-        "spec": "bloodyAD==2.5.4",
-        "check_target": "bloodyAD",
-        "check_type": "executable",
-        "exe_name": "bloodyAD",
-        # bloodyAD (via kerbad) requires minikerberos at runtime, but some
-        # dependency chains don't pull it in reliably. Install it explicitly
-        # inside the bloodyad isolated venv so `bloodyAD --help` works.
-        "extra_specs": ["minikerberos==0.4.9"],
-    },
-    "enum-trusts": {
-        "spec": "git+https://github.com/ADScanPro/enum-trusts.git@f7eae14",
-        "check_target": "enum-trusts",
-        "check_type": "executable",
-        "exe_name": "enum-trusts",
-    },
     "manspider": {
         "spec": "git+https://github.com/ADScanPro/MANSPIDER@cedb138",
         "check_target": "manspider",
@@ -3099,12 +3131,6 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         "check_target": "pypykatz",
         "check_type": "executable",
         "exe_name": "pypykatz",
-    },
-    "lsassy": {
-        "spec": "lsassy==3.1.16",
-        "check_target": "lsassy",
-        "check_type": "executable",
-        "exe_name": "lsassy",
     },
 }
 
@@ -4067,11 +4093,15 @@ def _maybe_ask_attribution(shell) -> None:
         )
     except Exception:
         idx = None
-    finally:
-        _mark_attribution_asked()
 
     if idx is None:
+        # Cancelled / interrupted (e.g. Ctrl+C at the prompt) — do NOT persist
+        # the once-ever flag, so the next CLEAN exit asks again. Marking here
+        # would permanently lose attribution for exactly the users who bounce.
         return
+
+    # Only mark asked once the user actually answered.
+    _mark_attribution_asked()
 
     source = _ATTR_KEYS[idx] if 0 <= idx < len(_ATTR_KEYS) else "other"
     try:
@@ -4080,6 +4110,27 @@ def _maybe_ask_attribution(shell) -> None:
         )
     except Exception:
         pass
+
+
+def _maybe_run_rating_funnel(shell, value_tier: str | None) -> bool:
+    """Run the peak-value 1-5 rating funnel once ever, at a real value moment.
+
+    Delegates to the SSOT in ``services.session_rating``. Returns True when the
+    rating prompt took this exit's primary-ask slot (so the caller skips the
+    attribution question this exit). Fast no-op when the session produced no
+    value moment (``value_tier`` is None / not a value tier).
+    """
+    from adscan_internal.services.session_rating import VALUE_TIERS
+
+    if value_tier not in VALUE_TIERS:
+        return False
+    try:
+        from adscan_internal.services.session_rating import run_rating_funnel
+
+        return bool(run_rating_funnel(shell, value_tier=value_tier))
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        return False
 
 
 def _show_exit_summary(shell) -> str | None:
@@ -8975,6 +9026,31 @@ class PentestShell:
         domain_data = self.domains_data.get(domain, {})
         return domain_data.get("auth") == "pwned"
 
+    def _domain_flow_completed_by_pwn(self, domain: str) -> bool:
+        """Return True when the domain is compromised and per-credential follow-up work is redundant.
+
+        Once ``domains_data[domain]["auth"] == "pwned"`` the objective is already
+        met: in CTF the flags are captured, in audit the domain is owned. Every
+        subsequent per-credential follow-up — user privilege enumeration and the
+        per-principal attack-path search + execution it drives via
+        ``ask_for_user_privs`` — is noise and wasted work. This is the single
+        source of truth for that gate (type-agnostic, unlike
+        ``_is_ctf_domain_pwned``).
+
+        It deliberately does NOT gate the sanctioned audit post-compromise
+        re-offer (``run_enumeration`` → ``offer_attack_paths_for_execution_summaries``
+        with ``scope="domain"``), which is a SEPARATE entry point and must keep
+        surfacing remaining unvalidated paths from other principals after
+        compromise so the operator can attempt them.
+
+        Args:
+            domain: Domain name key in ``self.domains_data``.
+
+        Returns:
+            True when the domain auth status is ``"pwned"``.
+        """
+        return self.domains_data.get(domain, {}).get("auth") == "pwned"
+
     def _dig_srv_records(
         self,
         *,
@@ -10512,12 +10588,16 @@ class PentestShell:
             console_instance if console_instance is not None else get_console()
         )
 
-        # Wrap console to ensure direct print calls are captured in telemetry.
-        # This fixes the regression where PentestShell output (like help tables)
-        # was not being recorded because it bypassed the logging system.
+        # Ensure direct console.print calls in the shell are captured in the
+        # session recording exactly once. The shared console is already a
+        # ``_TeeConsole`` (auto-mirrors every print into telemetry), so
+        # ``wrap_console_for_telemetry`` returns it unchanged and does NOT add a
+        # second manual mirror — that double-mirror was doubling every session
+        # recording. A genuine plain console (no auto-mirror) is still wrapped so
+        # its prints are captured once.
         telemetry_console = globals().get("TELEMETRY_CONSOLE")
         if telemetry_console:
-            self.console = TelemetryAwareConsole(self.console, telemetry_console)
+            self.console = wrap_console_for_telemetry(self.console, telemetry_console)
         normalized_license_mode = (license_mode or "LITE").strip().upper()
         self.license_mode = (
             normalized_license_mode
@@ -10575,11 +10655,6 @@ class PentestShell:
         # Initialize paths for external tools
         # These paths are resolved once when the shell starts.
         self.netexec_path = get_tool_executable_path("netexec")
-        self.certipy_path = get_tool_executable_path("certipy")
-        self.bloodyad_path = get_tool_executable_path(
-            "bloodyad"
-        )  # exe_name is 'bloodyAD'
-        self.enum_trusts_path = get_tool_executable_path("enum-trusts")
         self.manspider_path = get_tool_executable_path("manspider")
         self.credsweeper_path = get_tool_executable_path("credsweeper")
         if not self.credsweeper_path:
@@ -10593,7 +10668,6 @@ class PentestShell:
             except Exception:  # noqa: BLE001
                 self.credsweeper_path = None
         self.pypykatz_path = get_tool_executable_path("pypykatz")
-        self.lsassy_path = get_tool_executable_path("lsassy")
         self.kerbrute_path = get_external_tool_executable("kerbrute")
         self.medusa_path = None  # replaced by aardwolf native RDP stack
 
@@ -10608,11 +10682,9 @@ class PentestShell:
             # Optionally, print a warning if impacket is expected to be always available
             # print_warning("[PentestShell] Impacket scripts directory not found. Some Impacket-based commands may not work.")
 
-        # For external tools with isolated venvs (firepwd, LSA-Reaper, PKINITtools, responder)
+        # For external tools with isolated venvs (firepwd, PKINITtools)
         self.firepwd_python = get_external_tool_python("firepwd")
-        self.lsa_reaper_python = get_external_tool_python("LSA-Reaper")
         self.pkinittools_python = get_external_tool_python("PKINITtools")
-        self.coercer_python = get_external_tool_python("coercer")
 
         # Add more tool paths here as needed, for example:
         # self.dploot_path = get_tool_executable_path("dploot")
@@ -10631,6 +10703,14 @@ class PentestShell:
         # New initializations for handling nested prompts
         self.prompt_interaction_lock = threading.Lock()
         self.is_sub_prompt_active = False
+        # Foreground-state SSOT for the background-job idle-prompt wake gate.
+        # Defaults to COMMAND_RUNNING (the safe, non-idle default) so no wake can
+        # fire before the REPL loop has begun blocking on the main prompt; the
+        # loop stamps IDLE_AT_MAIN_PROMPT / COMMAND_RUNNING around session.prompt.
+        from adscan_internal.cli.repl_background_surfacing import ForegroundState
+
+        self._foreground_state = ForegroundState.COMMAND_RUNNING
+        self._background_wake_hook_registered = False
         # Track whether the auto-save background thread has been started
         self._auto_save_thread_started = False
         # Track DCSync context to allow automatic privilege reapplication
@@ -11076,135 +11156,6 @@ class PentestShell:
         self.lab_name = None  # Specific lab/machine name for CTF workspaces (e.g., "Forest" for HTB)
         self.lab_name_whitelisted = None  # Whether lab_name is in whitelist (None if no lab_name, True/False if lab_name exists)
 
-    def _extract_domain_from_netexec_command(self, command: str) -> str | None:
-        """Extract domain name from a NetExec command string.
-
-        Extraction priority:
-        1. First, extract from the `-d` or `--domain` parameter if present
-        2. Fallback: Extract from the FQDN that comes after the service command
-           (e.g., "smb forest.htb.local" -> extract "htb.local" by removing hostname)
-
-        Args:
-            command: NetExec command string to analyze.
-
-        Returns:
-            str | None: Extracted domain name, or None if not found.
-        """
-        from adscan_internal.integrations.netexec.helpers import (
-            extract_domain_from_netexec_command,
-        )
-
-        domain, debug_messages = extract_domain_from_netexec_command(command)
-        for msg in debug_messages:
-            # Keep debug output behavior, but apply markers where we can.
-            # We only mark the last token when it looks like a domain.
-            try:
-                parts = msg.rsplit(" ", 1)
-                if len(parts) == 2 and "." in parts[1]:
-                    msg = parts[0] + " " + mark_sensitive(parts[1], "domain")
-            except Exception:
-                pass
-            print_info_debug(f"[_extract_domain_from_netexec_command] {msg}")
-        return domain
-
-    def _detect_output_redirection(self, command: str) -> tuple[bool, str | None]:
-        """Detect if command has output redirection to a file.
-
-        Detects redirections like:
-        - `> file.txt`
-        - `>> file.txt`
-        - `> file.txt 2>&1`
-        - `>> file.txt 2>&1`
-        - `| command > file.txt`
-        - `| command >> file.txt`
-
-        Args:
-            command: Command string to analyze.
-
-        Returns:
-            tuple: (has_redirection, file_path) where:
-                - has_redirection: True if redirection detected
-                - file_path: Path to output file if detected, None otherwise
-        """
-        from adscan_internal.integrations.netexec.helpers import (
-            detect_output_redirection,
-        )
-
-        return detect_output_redirection(command)
-
-    def _check_redirected_file_has_content(self, file_path: str) -> bool:
-        """Check if a redirected output file exists and has content.
-
-        Args:
-            file_path: Path to the file to check.
-
-        Returns:
-            bool: True if file exists and has non-empty content, False otherwise.
-        """
-        from adscan_internal.integrations.netexec.helpers import (
-            redirected_file_has_content,
-        )
-
-        return redirected_file_has_content(
-            file_path,
-            expand_user=_expand_effective_user_path,
-        )
-
-    def _run_netexec(
-        self,
-        command: str,
-        *,
-        domain: str | None = None,
-        timeout: int | None = None,
-        pre_sync: bool = True,
-        **kwargs,
-    ) -> subprocess.CompletedProcess[str] | None:
-        """Run a NetExec command using the shared NetExec runner."""
-        from adscan_internal.integrations.netexec.runner import (
-            NetExecContext,
-            NetExecRunner,
-        )
-
-        runner = getattr(self, "_netexec_runner", None)
-        if runner is None:
-            runner = NetExecRunner(
-                command_runner=self.command_runner,
-            )
-            setattr(self, "_netexec_runner", runner)
-
-        ctx = NetExecContext(
-            state_owner=self,
-            default_domain=getattr(self, "domain", None),
-            extract_domain=self._extract_domain_from_netexec_command,
-            is_domain_configured=lambda value: (
-                value in getattr(self, "domains_data", {})
-            ),
-            sync_clock_with_pdc=lambda value: bool(
-                self.do_sync_clock_with_pdc(value, verbose=True)
-            ),
-            detect_output_redirection=self._detect_output_redirection,
-            redirected_file_has_content=self._check_redirected_file_has_content,
-            clean_workspaces=lambda use_sudo: bool(
-                self._clean_netexec_workspaces(use_sudo_if_needed=use_sudo)
-            ),
-            get_workspaces_dir=self._get_nxc_workspaces_dir,
-            confirm_ask=lambda question, default: Confirm.ask(
-                question, default=default
-            ),
-            refresh_delegated_ticket=lambda ticket_path: (
-                self.refresh_last_delegated_service_ticket(ticket_path)
-            ),
-        )
-
-        return runner.run(
-            command,
-            ctx=ctx,
-            domain=domain,
-            timeout=timeout,
-            pre_sync=pre_sync,
-            **kwargs,
-        )
-
     def run_command(
         self,
         command: str,
@@ -11218,6 +11169,9 @@ class PentestShell:
         cwd: str | None = None,
         ignore_errors: bool = False,
         use_clean_env: bool | None = None,
+        untrusted_output: bool = False,
+        on_line: Callable[[str], None] | None = None,
+        silence_timeout: float | None = None,
         **kwargs,
     ) -> subprocess.CompletedProcess[str] | None:
         """
@@ -11226,11 +11180,6 @@ class PentestShell:
         By default, automatically uses clean_env for external commands to avoid
         PyInstaller library conflicts. Set use_clean_env=False to disable, or
         use_clean_env=True to force it even for Python commands.
-
-        NetExec commands are automatically detected and handled with error
-        handling and retry logic. If the command contains the NetExec path, it will
-        be routed through ``_run_netexec()`` which automatically handles common
-        NetExec errors (e.g., ``KRB_AP_ERR_SKEW``, ``SCHED_S_TASK_HAS_NOT_RUN``).
 
         Args:
             command: Command string to execute
@@ -11244,32 +11193,36 @@ class PentestShell:
             ignore_errors: Whether to ignore exceptions (default: False)
             use_clean_env: If True, always use clean_env. If False, never use it.
                           If None (default), auto-detect based on command type.
+            untrusted_output: If True, the command's stdout/stderr is arbitrary,
+                          operator-chosen content (e.g. `system cat secrets.txt`)
+                          that the telemetry pattern-sanitizer cannot redact. The
+                          debug head/tail preview is then suppressed so no line of
+                          that content reaches the session recording ahead of the
+                          caller's own privacy-omission guard. The command still
+                          runs and its output is still returned to the caller.
+            on_line: Optional per-line callback. When set the command runs in
+                          STREAMING mode — each stdout line reaches the callback
+                          the moment it is emitted (not only after the process
+                          exits), while the full output is still accumulated and
+                          returned. Used for long-running commands whose
+                          incremental output carries live progress (e.g. a hashcat
+                          crack emitting ``--status-json`` ticks). The callback is
+                          best-effort and MUST NOT print (it may run on a
+                          background worker thread). Clean-env / timeout / recording
+                          are preserved exactly as for the blocking path.
+            silence_timeout: STREAMING mode only (requires ``on_line``). When set,
+                          an output-SILENCE watchdog kills the process and raises
+                          ``TimeoutExpired`` if it emits NO output for this many
+                          seconds — independent of ``timeout``. Bounds a WEDGED
+                          long-running command (e.g. a hung hashcat) without an
+                          elapsed cap that would kill a healthy one still emitting
+                          incremental output. ``None`` (default) disables it.
             **kwargs: Additional arguments passed to subprocess.run
         """
         # Never pass invisible sensitive markers to external binaries.
         command = strip_sensitive_markers(command)
 
-        # Auto-detect NetExec/NXC commands and route them through the error handling helper
-        netexec_path = getattr(self, "netexec_path", None)
-        if _is_netexec_like_command(command, netexec_path):
-            # This is a NetExec command - use the specialized helper
-            return self._run_netexec(
-                command,
-                domain=None,  # Will be auto-extracted from command or use self.domain
-                timeout=timeout,
-                pre_sync=False,  # Only sync on error, not preemptively
-                shell=shell,
-                capture_output=capture_output,
-                text=text,
-                check=check,
-                env=env,
-                cwd=cwd,
-                ignore_errors=ignore_errors,
-                use_clean_env=use_clean_env,
-                **kwargs,
-            )
-
-        # For non-NetExec commands, log the command about to be executed.
+        # Log the command about to be executed.
         try:
             print_info_debug(f"[cmd] Running: {command}")
         except Exception:
@@ -11295,6 +11248,8 @@ class PentestShell:
                 env=env,
                 cwd=cwd,
                 extra=kwargs or None,
+                on_line=on_line,
+                silence_timeout=silence_timeout,
             )
             result = self.command_runner.run(spec)
             elapsed_seconds = getattr(result, "_adscan_elapsed_seconds", None)
@@ -11336,28 +11291,41 @@ class PentestShell:
                     f"duration={duration_text}"
                 )
 
-                preview: list[str] = []
-                head = stdout_lines[:10]
-                tail = (
-                    stdout_lines[-10:] if len(stdout_lines) > 20 else stdout_lines[10:]
+                # Suppress the content head/tail preview when it is either pure
+                # noise (short internal diagnostics run in a tight loop like
+                # `ip route get` / `pgrep` / `unbound-checkconf`) or untrusted
+                # operator output whose arbitrary content the pattern-sanitizer
+                # cannot redact (`system cat secrets.txt`). The concise result
+                # summary above (counts only, no content) is still recorded.
+                suppress_output_preview = (
+                    untrusted_output or _is_benign_diagnostic_command(command)
                 )
-                if head:
-                    preview.append("STDOUT (head):")
-                    preview.extend(head)
-                if tail:
-                    preview.append("STDOUT (tail):")
-                    preview.extend(tail)
-                if stderr_lines:
-                    preview.append("STDERR (head):")
-                    preview.extend(stderr_lines[:10])
-                    stderr_tail = (
-                        stderr_lines[-10:]
-                        if len(stderr_lines) > 20
-                        else stderr_lines[10:]
+
+                preview: list[str] = []
+                if not suppress_output_preview:
+                    head = stdout_lines[:10]
+                    tail = (
+                        stdout_lines[-10:]
+                        if len(stdout_lines) > 20
+                        else stdout_lines[10:]
                     )
-                    if stderr_tail:
-                        preview.append("STDERR (tail):")
-                        preview.extend(stderr_tail)
+                    if head:
+                        preview.append("STDOUT (head):")
+                        preview.extend(head)
+                    if tail:
+                        preview.append("STDOUT (tail):")
+                        preview.extend(tail)
+                    if stderr_lines:
+                        preview.append("STDERR (head):")
+                        preview.extend(stderr_lines[:10])
+                        stderr_tail = (
+                            stderr_lines[-10:]
+                            if len(stderr_lines) > 20
+                            else stderr_lines[10:]
+                        )
+                        if stderr_tail:
+                            preview.append("STDERR (tail):")
+                            preview.extend(stderr_tail)
 
                 if preview:
                     print_info_debug(
@@ -11818,7 +11786,7 @@ class PentestShell:
         print_info_debug("Signal handler invoked; running graceful shutdown")
 
         try:
-            self.do_exit(exit=False)
+            self.do_exit(exit=False, from_signal=True)
         except Exception as e:
             telemetry.capture_exception(e)
             print_error("Error saving data.")
@@ -12430,7 +12398,7 @@ class PentestShell:
             # rely on the listener to detect the incoming session.
             try:
                 # Try to sync clock once before spawning to reduce Kerberos
-                # clock-skew issues, mimicking _run_netexec(pre_sync=True).
+                # clock-skew issues.
                 if domain:
                     self.do_sync_clock_with_pdc(domain, verbose=True)
             except Exception as exc:  # pragma: no cover - defensive
@@ -13061,111 +13029,54 @@ class PentestShell:
         if service not in {"smb", "winrm"}:
             return False
 
-        try:
-            auth = self.build_auth_nxc(
-                username=username,
-                password=password,
-                domain=domain,
-                kerberos=False,
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            telemetry.capture_exception(exc)
-            print_warning_debug(
-                f"[session launch] Failed to build NetExec auth for Python "
-                f"agent check: {exc}"
-            )
-            return False
-
-        # Log path under current workspace when available, mirroring the main
-        # session-launch logging layout but keeping a dedicated filename.
-        if getattr(self, "current_workspace_dir", None):
-            log_dir = os.path.join(
-                self.current_workspace_dir, "domains", domain, service
-            )
-        else:
-            log_dir = os.path.join("domains", domain, service)
-
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-        except OSError as exc:  # pragma: no cover - defensive
-            telemetry.capture_exception(exc)
-            print_warning_debug(
-                f"[session launch] Failed to create log directory for Python "
-                f"agent check '{log_dir}': {exc}. Falling back to relative path."
-            )
-            log_dir = os.path.join("domains", domain, service)
-
-        log_file = os.path.join(log_dir, f"{host}_{username}_python_check.log")
-        marker = "ADSCAN_PY_AGENT_OK"
-        python_check_cmd = f'python -c "print(\\"{marker}\\")"'
-
-        if service == "winrm":
-            nxc_cmd = (
-                f"{self.netexec_path} winrm {host} {auth} "
-                f"--log {log_file} -X '{python_check_cmd}'"
-            )
-        else:
-            nxc_cmd = (
-                f"{self.netexec_path} smb {host} {auth} "
-                f"--log {log_file} -x '{python_check_cmd}'"
-            )
-
-        print_info_debug(
-            f"[session launch] Probing remote Python support with: {nxc_cmd}"
+        from adscan_internal.services.exploitation.remote_windows_execution import (
+            RemoteWindowsAuth,
+            RemoteWindowsExecutionService,
         )
 
+        marker = "ADSCAN_PY_AGENT_OK"
+        # Native replacement for the nxc winrm -X / smb -x probe: run a tiny
+        # interpreter check through PowerShell (WinRM PSRP) or the native SMB
+        # exec path. Single-quoted marker inside the python -c keeps the outer
+        # PowerShell double-quotes intact. Any failure (timeout, no interpreter,
+        # transport error) is treated as "no Python" so the caller falls back to
+        # a classic reverse-shell payload — conservative parity with the old path.
+        python_check_script = f"python -c \"print('{marker}')\""
+
         try:
-            proc = self.spawn_command(
-                nxc_cmd,
-                shell=True,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                ignore_errors=True,
-                use_clean_env=True,
+            auth = RemoteWindowsAuth(
+                domain=domain,
+                host=host,
+                username=username,
+                secret=password,
             )
-            if proc is None:
-                return False
-
-            try:
-                stdout_data, stderr_data = proc.communicate(timeout=60)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout_data, stderr_data = proc.communicate()
-                print_warning_debug(
-                    "[session launch] Remote Python probe timed out; "
-                    "falling back to non-agent payload."
-                )
-                return False
-
-            rc = proc.returncode
-            if rc != 0:
-                print_warning_debug(
-                    "[session launch] Remote Python probe exited with "
-                    f"code {rc}. Stdout: {stdout_data[:200]!r} "
-                    f"Stderr: {stderr_data[:200]!r}"
-                )
-                return False
-
-            if marker in stdout_data:
-                print_info_debug(
-                    "[session launch] Remote Python interpreter detected; "
-                    "enabling Python agent payload."
-                )
-                return True
-
-            print_warning_debug(
-                "[session launch] Remote Python probe succeeded but marker "
-                "was not found in stdout; treating as no Python."
+            result = RemoteWindowsExecutionService(self).execute_powershell(
+                auth,
+                python_check_script,
+                operation_name="python_agent_probe",
+                preferred_transport=service,
+                timeout=60,
             )
-            return False
         except Exception as exc:  # pragma: no cover - defensive
             telemetry.capture_exception(exc)
             print_warning_debug(
-                f"[session launch] Unexpected error during Python agent "
-                f"probe: {exc}. Falling back to non-agent payload."
+                f"[session launch] Remote Python probe error: {exc}. "
+                "Falling back to non-agent payload."
             )
             return False
+
+        if result.success and marker in (result.stdout or ""):
+            print_info_debug(
+                "[session launch] Remote Python interpreter detected; "
+                "enabling Python agent payload."
+            )
+            return True
+
+        print_warning_debug(
+            "[session launch] Remote Python probe did not confirm an "
+            "interpreter; treating as no Python."
+        )
+        return False
 
     def _build_reverse_shell_payloads(
         self, target_os: str, lhost: str, lport: int
@@ -13379,8 +13290,437 @@ class PentestShell:
                     self.commands[name[3:]] = method
 
     def check_background_tasks(self):
-        """Cleans completed tasks from the list"""
+        """Reap finished threads and drain any deferred background-job results.
+
+        The PRE-PROMPT poll — runs on the foreground REPL thread BETWEEN commands
+        (never mid scan/command, which blocks the loop). Reaps dead threads, then
+        delegates the notification drain+render to the single kind-agnostic method
+        :meth:`_drain_and_render_background_notifications` (shared with the
+        idle-prompt wake, so both surfacing points run identical logic).
+        """
         self.background_tasks = [t for t in self.background_tasks if t.is_alive()]
+        # Register the idle-wake hook once the registry exists so a job that
+        # completes while the operator is PARKED at the idle prompt surfaces live
+        # (see _on_background_notification_enqueued), not only at the next command.
+        self._ensure_background_wake_hook_registered()
+        self._drain_and_render_background_notifications()
+
+    def _drain_and_render_background_notifications(self) -> None:
+        """Flush deferred console + drain the results bus + render each result.
+
+        The ONE kind-agnostic drain+render, reused by BOTH the pre-prompt poll
+        (:meth:`check_background_tasks`) and the idle-prompt wake. Both converge
+        on THIS method running on the loop-free foreground REPL thread: the
+        pre-prompt poll is already there; the idle-wake gets there by exiting the
+        prompt with ``BACKGROUND_DRAIN_SENTINEL`` (see the sentinel branch in
+        ``cmdloop``) rather than running inside prompt_toolkit's event loop.
+        Background worker threads never print — the deferred bus exists precisely
+        so rendering (and the heavy async job action it can trigger) happens here.
+
+        Order:
+          1. Flush console output withheld from background worker threads
+             (poisoning listener, benchmark warm-up, background cracking) so their
+             diagnostics surface here rather than colliding with the live flow.
+             Unconditional — the benchmark warm-up is a plain daemon thread, not a
+             registered job.
+          2. Defer everything else while a sub-prompt is live — a panel/line
+             printed over an active prompt collides; the queued results drain at
+             the next clean poll.
+          3. Loop-free guard — if an asyncio event loop is somehow running when
+             this is reached (a future regression that re-introduces a with-loop
+             trigger), DEFER: the heavy job action drives the native async stack
+             (``asyncio.run``), which cannot nest. Leave the notifications queued
+             for the next loop-free drain instead of raising the nested-loop error.
+          4. Drain the bus and dispatch each result to its kind renderer.
+
+        Best-effort throughout: any failure is captured and swallowed so a drain
+        problem never breaks the REPL prompt loop.
+        """
+        try:
+            from adscan_core.rich_output import flush_deferred_background_console
+
+            flush_deferred_background_console()
+        except Exception as exc:  # noqa: BLE001 -- a flush failure must not break the loop
+            telemetry.capture_exception(exc)
+        if bool(getattr(self, "is_sub_prompt_active", False)):
+            return
+        # Loop-free guard (belt-and-suspenders). The drain can run an interactive
+        # activation selector -> add_credential -> authenticated enumeration,
+        # which calls asyncio.run(); that raises under an already-running loop.
+        # Both surfacing triggers are designed to reach here loop-free, so this
+        # should never fire — but if it does, DEFER (leave notifications queued)
+        # instead of crashing. Guard BEFORE draining so nothing is lost.
+        from adscan_internal.cli.repl_background_surfacing import (
+            running_event_loop_present,
+        )
+
+        if running_event_loop_present():
+            print_info_debug(
+                "background drain requested under a running event loop; deferring "
+                "to the next loop-free pre-prompt drain"
+            )
+            return
+        try:
+            registry = getattr(self, "_background_jobs", None)
+            if registry is None:
+                return
+            results = registry.drain_notifications()
+            if not results:
+                return
+            self._dispatch_background_job_results(results)
+        except Exception as exc:  # noqa: BLE001 — notification flush must never break the loop
+            telemetry.capture_exception(exc)
+
+    def _consume_background_drain_sentinel(self, user_input) -> bool:
+        """Handle the idle-wake sentinel returned by ``session.prompt``.
+
+        The idle-wake exits the blocked main prompt with
+        :data:`BACKGROUND_DRAIN_SENTINEL` (via ``app.exit``) so ``session.prompt``
+        returns it in place of a typed line. This is the REPL-loop seam that
+        recognizes it: on a match it runs the kind-agnostic drain+render on THIS
+        loop-free foreground thread (never inside prompt_toolkit's event loop, so
+        the heavy async job action is legal), and returns ``True`` so the caller
+        ``continue``s and re-shows the prompt. A normal typed line returns
+        ``False`` and dispatches as usual.
+
+        Extracted from the ``cmdloop`` body so the sentinel semantics are
+        unit-testable without driving a live prompt_toolkit app.
+
+        Args:
+            user_input: The value ``session.prompt`` returned.
+
+        Returns:
+            ``True`` when ``user_input`` was the background-drain sentinel (and
+            the drain was run); ``False`` for a normal command line.
+        """
+        from adscan_internal.cli.repl_background_surfacing import (
+            BACKGROUND_DRAIN_SENTINEL,
+        )
+
+        if user_input is BACKGROUND_DRAIN_SENTINEL:
+            self._drain_and_render_background_notifications()
+            return True
+        return False
+
+    def _background_job_result_renderers(self):
+        """Return the ``job_kind -> renderer(results)`` dispatch map.
+
+        The extension point for surfacing a NEW background-job kind: register one
+        entry here mapping the kind string to a bound method taking the list of
+        that kind's :class:`JobResult`s. Everything with no entry falls back to
+        the compact one-line notification (:meth:`_render_background_notification_line`),
+        so a new kind gets a sensible default with zero core edits and can then be
+        upgraded to a bespoke renderer by adding a single row.
+
+        Currently registered:
+          * ``cracking`` -> the credential-harvest review (persist + shared table +
+            value-aware activation follow-up).
+
+        Future kinds (write-share upload-on-write, mitm6, …) plug in the same way.
+        """
+        return {
+            "cracking": self._render_cracking_job_results,
+        }
+
+    def _dispatch_background_job_results(self, results) -> None:
+        """Group drained results by kind and route each to its renderer.
+
+        Results whose kind has a registered renderer go to it (grouped); every
+        other kind is collected and passed together to the one-line fallback so a
+        batch of miscellaneous results still yields a single compact notification.
+        """
+        renderers = self._background_job_result_renderers()
+        by_kind: dict[str, list] = {}
+        fallback: list = []
+        for result in results:
+            kind = getattr(result, "kind", "")
+            if kind in renderers:
+                by_kind.setdefault(kind, []).append(result)
+            else:
+                fallback.append(result)
+        # crack-drain: greppable, --debug-only. The foreground drain sees these
+        # kinds — if a cracked result was enqueued but this shows no "cracking",
+        # the loss is between enqueue and drain (a re-drain race / lost bus entry).
+        try:
+            kinds = ", ".join(getattr(r, "kind", "") for r in results)
+            print_info_debug(f"crack-drain: dispatching total={len(results)} kinds={kinds}")
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+        for kind, kind_results in by_kind.items():
+            try:
+                renderers[kind](kind_results)
+            except Exception as exc:  # noqa: BLE001 — one renderer must not break others
+                telemetry.capture_exception(exc)
+        if fallback:
+            self._render_background_notification_line(fallback)
+
+    def _render_cracking_job_results(self, results) -> None:
+        """Persist + render the harvest review for drained ``cracking`` results.
+
+        The credential-harvest surfacing: real cracks usually finish AFTER the
+        fast scan ends, so tying the review to scan-end alone meant it never
+        appeared — rendering it at this foreground-safe drain is the fix. Both the
+        reach classification (inside the persist step) and the shared review are
+        run under ``suppress_dev_engine_picker`` so the incidental dev attack-path
+        engine/parallelism picker never fires on this non-interactive render path;
+        the INTENDED activation selector inside the review stays interactive.
+        """
+        from adscan_internal.services.attack_graph_service import (
+            suppress_dev_engine_picker,
+        )
+
+        with suppress_dev_engine_picker():
+            newly_cracked = self._persist_cracking_job_harvest(results)
+            self._render_harvest_review_at_drain(newly_cracked)
+
+    def _render_background_notification_line(self, results) -> None:
+        """Fallback renderer: one compact line summarizing miscellaneous results."""
+        from adscan_internal.services.background_jobs.jobs_view import (
+            format_notification_line,
+        )
+
+        line = format_notification_line(results)
+        if line:
+            get_console().print(line)
+
+    def _ensure_background_wake_hook_registered(self) -> None:
+        """Register the idle-prompt wake hook on the registry, once.
+
+        Idempotent: registers :meth:`_on_background_notification_enqueued` as the
+        registry's notification hook the first time the registry exists. The hook
+        fires on the JOB thread the moment a result is enqueued; it wakes the idle
+        main prompt (only when idle) to surface the drain live. Best-effort — a
+        registration failure just falls back to pre-prompt-drain surfacing.
+        """
+        if getattr(self, "_background_wake_hook_registered", False):
+            return
+        registry = getattr(self, "_background_jobs", None)
+        if registry is None:
+            return
+        setter = getattr(registry, "set_notification_hook", None)
+        if not callable(setter):
+            return
+        try:
+            # `callable(setter)` above is the runtime guard; pylint does not model
+            # it as a type-narrow, hence the disable.
+            setter(self._on_background_notification_enqueued)  # pylint: disable=not-callable
+            self._background_wake_hook_registered = True
+        except Exception as exc:  # noqa: BLE001 — wake registration is best-effort
+            telemetry.capture_exception(exc)
+
+    def _current_foreground_state(self):
+        """Return the foreground-state SSOT for the idle-wake gate.
+
+        ``is_sub_prompt_active`` (set by the output-processor thread) takes
+        precedence; otherwise the REPL loop's ``_foreground_state`` (stamped
+        around ``session.prompt``) is authoritative. Read under the prompt lock so
+        the job thread sees a consistent value. Defaults to ``COMMAND_RUNNING``
+        (the safe non-idle default) before the loop has stamped anything.
+        """
+        from adscan_internal.cli.repl_background_surfacing import ForegroundState
+
+        lock = getattr(self, "prompt_interaction_lock", None)
+        if lock is None:
+            if bool(getattr(self, "is_sub_prompt_active", False)):
+                return ForegroundState.SUB_PROMPT_ACTIVE
+            return getattr(self, "_foreground_state", ForegroundState.COMMAND_RUNNING)
+        with lock:
+            if bool(getattr(self, "is_sub_prompt_active", False)):
+                return ForegroundState.SUB_PROMPT_ACTIVE
+            return getattr(self, "_foreground_state", ForegroundState.COMMAND_RUNNING)
+
+    def _set_foreground_state(self, state) -> None:
+        """Stamp the foreground-state SSOT (under the prompt lock)."""
+        lock = getattr(self, "prompt_interaction_lock", None)
+        if lock is None:
+            self._foreground_state = state
+            return
+        with lock:
+            self._foreground_state = state
+
+    def _on_background_notification_enqueued(self) -> None:
+        """Job-thread hook: wake the idle main prompt to surface the new result.
+
+        Registered as the registry's notification hook, so it fires on the
+        BACKGROUND job thread the instant a result is enqueued. It delegates to
+        :func:`schedule_idle_prompt_wake`, which — ONLY when the foreground is
+        idle at the main prompt (never mid-command / mid-sub-prompt) — schedules
+        an ``app.exit(sentinel)`` on the prompt_toolkit loop. That makes the
+        blocked ``session.prompt`` return the sentinel so the REPL loop drains +
+        renders on ITS loop-free thread (see the sentinel branch in ``cmdloop``);
+        otherwise the result stays queued for the next pre-prompt drain.
+        Best-effort — a wake must never crash the job thread.
+        """
+        try:
+            from adscan_internal.cli.repl_background_surfacing import (
+                ForegroundState,
+                schedule_idle_prompt_wake,
+            )
+
+            schedule_idle_prompt_wake(
+                is_idle=lambda: (
+                    self._current_foreground_state()
+                    is ForegroundState.IDLE_AT_MAIN_PROMPT
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — the wake hook must never raise
+            telemetry.capture_exception(exc)
+
+    def _render_harvest_review_at_drain(self, newly_cracked_usernames) -> None:
+        """Render the harvest review at this foreground-safe drain (best-effort).
+
+        Delegates to the shared renderer so the between-commands drain, the
+        scan-end summary and the ``harvest`` command all reuse ONE review UX. The
+        ``newly_cracked_usernames`` gate the value-aware follow-up: a headline
+        (Tier 0 / path-to-Tier-0) crack offers the activation selector, a routine
+        capture just points at ``harvest``.
+
+        When the Phase-2d between-phase break point routed us here (it sets
+        ``_harvest_between_phase_active`` before calling the central drain), the
+        shared renderer switches to the MID-SCAN value-gate + delta-dedup policy:
+        only a NEW Tier 0 / path-to-Tier-0 crack interrupts with a prompt; a
+        lower-value crack is notify-only.
+        """
+        try:
+            from adscan_internal.cli.widgets.credential_harvest_panel import (
+                render_harvest_review_at_drain,
+            )
+
+            domain = str(getattr(self, "domain", "") or "")
+            between_phase = bool(getattr(self, "_harvest_between_phase_active", False))
+            render_harvest_review_at_drain(
+                self,
+                domain,
+                newly_cracked_usernames=list(newly_cracked_usernames or []),
+                between_phase_value_gate=between_phase,
+            )
+        except Exception as exc:  # noqa: BLE001 — the review render must never break the loop
+            telemetry.capture_exception(exc)
+
+    def _persist_cracking_job_harvest(self, cracking_results) -> list:
+        """Persist ``HarvestedPrincipal`` records for drained cracking results.
+
+        Runs on the foreground thread only (called from
+        ``check_background_tasks``, the REPL's own poll — never from the job
+        thread, which never prints per the background-job invariant). It writes
+        the classified records to the workspace harvest store. The premium
+        review table + activation/escalation selector is rendered by the caller
+        (``_render_harvest_review_at_drain``) right after this returns — this
+        method only handles persistence. Fully best-effort: any failure is
+        captured and swallowed so a harvest-persist problem never breaks the
+        prompt loop.
+
+        A BACKGROUND crack carries the recovered secret + effort tier on its
+        result detail (it did NOT auto-``add_credential``): the secret rides
+        into the record so the operator can activate it from the review. A
+        machine NetNTLMv2 ("uncrackable_machine") and a machine NetNTLMv1
+        ("rainbow_pending") also flow here so the review lists them.
+
+        Returns:
+            The sAMAccountNames whose crack JUST succeeded this drain — the
+            caller uses them to gate the value-aware review follow-up.
+        """
+        from datetime import datetime, timezone
+
+        from adscan_internal.services.captured_credential_policy import (
+            classify_principal,
+        )
+        from adscan_internal.services.compromise_class import CompromiseClass
+        from adscan_internal.services.credential_harvest_classification import (
+            classify_harvested_principal_tier,
+            classify_harvested_principals_reach,
+        )
+        from adscan_internal.services.credential_harvest_record import (
+            HarvestedPrincipal,
+        )
+        from adscan_internal.services.credential_harvest_store import (
+            append_harvest_records,
+        )
+        from adscan_internal.services.high_value import normalize_samaccountname
+
+        try:
+            domain = str(getattr(self, "domain", "") or "")
+            # crack-persist: greppable, --debug-only. What the persist step
+            # received and under which domain it writes — the checkpoint for "the
+            # result drained but the harvest store stayed empty".
+            try:
+                statuses = ", ".join(str(r.detail.get("status") or "") for r in cracking_results)
+                print_info_debug(
+                    "crack-persist: received "
+                    f"count={len(cracking_results)} domain={domain} statuses={statuses}"
+                )
+            except Exception as log_exc:  # noqa: BLE001
+                telemetry.capture_exception(log_exc)
+            usernames = [
+                str(r.detail.get("user") or "")
+                for r in cracking_results
+                if r.detail.get("user")
+            ]
+            reach_by_user = classify_harvested_principals_reach(
+                self, domain=domain, usernames=usernames
+            )
+            records: list[HarvestedPrincipal] = []
+            cracked_users: list[str] = []
+            for result in cracking_results:
+                username = str(result.detail.get("user") or "")
+                if not username:
+                    continue
+                status = str(result.detail.get("status") or "uncracked")
+                if status == "cracked":
+                    cracked_users.append(username)
+                ntlm_version = str(result.detail.get("version") or "")
+                account_type = classify_principal(username, self.domains_data, domain)
+                tier = classify_harvested_principal_tier(
+                    self, domain=domain, username=username, account_type=account_type
+                )
+                reach = reach_by_user.get(
+                    normalize_samaccountname(username), CompromiseClass.NONE
+                )
+                records.append(
+                    HarvestedPrincipal(
+                        domain=domain,
+                        username=username,
+                        source="poisoning",
+                        account_type=account_type,
+                        ntlm_version=ntlm_version,
+                        crack_status=status,
+                        privilege_tier=tier.value if tier is not None else None,
+                        compromise_reach=reach.value if reach is not None else None,
+                        hash_file=str(result.detail.get("hash_file") or ""),
+                        captured_at=datetime.now(timezone.utc)
+                        .replace(microsecond=0)
+                        .isoformat(),
+                        mode=str(result.detail.get("mode") or ""),
+                        max_effort=str(result.detail.get("max_effort") or ""),
+                        secret=str(result.detail.get("secret") or ""),
+                        method=str(result.detail.get("method") or ""),
+                    )
+                )
+            if not records:
+                print_info_debug("crack-persist: no records built — nothing appended to the harvest store")
+                return []
+            append_harvest_records(self, records)
+            # crack-persist: greppable, --debug-only. Confirms the store write and
+            # which principals cracked — the final checkpoint before `harvest` reads.
+            try:
+                from adscan_internal.rich_output import mark_sensitive
+
+                marked = ", ".join(mark_sensitive(u, "user") for u in cracked_users)
+                print_info_debug(
+                    "crack-persist: appended "
+                    f"records={len(records)} cracked_users={marked} domain={domain}"
+                )
+            except Exception as log_exc:  # noqa: BLE001
+                telemetry.capture_exception(log_exc)
+            return cracked_users
+        except Exception as exc:  # noqa: BLE001 — harvest persist must never break the loop
+            telemetry.capture_exception(exc)
+            # crack-persist: greppable, --debug-only. A swallowed persist failure
+            # here leaves the harvest store empty despite a drained cracked result
+            # (the exact class of bug that made a real crack "vanish"); surface it
+            # under --debug so it is never invisible again.
+            print_info_debug(f"crack-persist: FAILED to persist harvest records — {type(exc).__name__}: {exc}")
+            return []
 
     def do_clear(self, _arg):
         """Clears the terminal screen."""
@@ -13746,7 +14086,32 @@ class PentestShell:
 
                     return ANSI(ansi_prompt_string)  # Return ANSI formatted string
 
-                user_input = session.prompt(get_prompt_message_callable)
+                # Stamp IDLE right before blocking on the prompt so a background
+                # job completing while the operator is parked here can wake the
+                # prompt and surface its result live; flip back to COMMAND_RUNNING
+                # the instant the prompt returns (a wake mid-command would collide
+                # with live output — the gate defers it to the next pre-prompt
+                # drain instead).
+                from adscan_internal.cli.repl_background_surfacing import (
+                    ForegroundState as _ForegroundState,
+                )
+
+                self._set_foreground_state(_ForegroundState.IDLE_AT_MAIN_PROMPT)
+                try:
+                    user_input = session.prompt(get_prompt_message_callable)
+                finally:
+                    self._set_foreground_state(_ForegroundState.COMMAND_RUNNING)
+
+                # Background-drain wake: a job posted a notification while we were
+                # parked idle here and woke the prompt via app.exit(sentinel).
+                # This is NOT a typed command — drain + render on THIS loop-free
+                # foreground thread (the finally above already flipped the state
+                # to COMMAND_RUNNING, so nested notifications defer), so the heavy
+                # async job action (cracking activation -> authenticated
+                # enumeration -> asyncio.run) runs with no event loop active.
+                # Then loop back to re-show the prompt.
+                if self._consume_background_drain_sentinel(user_input):
+                    continue
 
                 if not user_input.strip():
                     continue
@@ -13778,6 +14143,13 @@ class PentestShell:
 
                 command_name = parts[0].lower()
                 args_list = parts[1:]
+                # Slash affordance: operators arriving from modern CLI / AI
+                # tools reflexively type `/help`, `/start_auth`, `/cves`. Strip a
+                # single leading slash so the token dispatches like a normal
+                # command; if it is still unknown it falls through to the
+                # did-you-mean recovery in the unknown-command handler below.
+                if len(command_name) > 1 and command_name.startswith("/"):
+                    command_name = command_name[1:]
                 normalized_command, normalized_args, command_alias_used = (
                     normalize_command_alias(
                         command_name,
@@ -13833,19 +14205,29 @@ class PentestShell:
                 )
                 raw_arg_string = _extract_raw_args(user_input, parts[0])
 
-                # Send telemetry event for commands (excluding blacklist)
+                # Send telemetry event for commands (excluding blacklist).
+                #
+                # The event NAME must never carry raw operator input. The first
+                # token is arbitrary (a pasted hostname, a loot/ccache path, an
+                # IP), so emit a STATIC event name and record the command
+                # identity only for a KNOWN command, through a sanitized
+                # property (`command_type` is an allow-listed safe field). An
+                # unknown/typo/pasted token is recorded as {"known": False} with
+                # NO raw string in any field. (The old form concatenated the
+                # first arg into the event name, which leaked workspace names,
+                # hostnames and paths as PostHog event names.)
                 telemetry_blacklist = {"start_auth", "start_unauth", "exit", "quit"}
                 if command_name not in telemetry_blacklist:
                     try:
-                        if command_name in ("set", "workspace", "creds"):
-                            # For commands with arguments, use "command arg" as event name
-                            if args_list:
-                                event_name = f"{command_name} {args_list[0]}"
-                            else:
-                                event_name = command_name
-                            telemetry.capture(event_name)
+                        if command_name in self.commands:
+                            telemetry.capture(
+                                "repl_command",
+                                {"command_type": command_name, "known": True},
+                            )
                         else:
-                            telemetry.capture(command_name)
+                            telemetry.capture(
+                                "repl_command_unknown", {"known": False}
+                            )
 
                         # Increment command count for session tracking
                         self._session_commands_count += 1
@@ -13908,20 +14290,41 @@ class PentestShell:
                                 + _rich_escape(tb_text)
                             )
                 else:
-                    print_warning(f"Unknown command: {command_name}")
-                    if should_show_workspace_getting_started(self):
-                        print_info(
-                            "This workspace has not started a scan yet. "
-                            "Run `start_unauth` or `start_auth` to begin."
-                        )
-                        print_info(
-                            "Need examples? Type `help` or open "
-                            "https://www.adscanpro.com/docs"
-                        )
-                    print_info(
-                        "If you want to execute a command, use the 'system' command. "
-                        "Example: system ping 127.0.0.1"
+                    # Escape the (uncontrolled) user token before it reaches a
+                    # Rich-rendered sink: a bracketed input like `[/x]` would
+                    # otherwise be parsed as markup.
+                    from rich.markup import escape as _rich_escape
+
+                    print_warning(
+                        f"Unknown command: {_rich_escape(command_name)}"
                     )
+                    # Did-you-mean recovery: fuzzy-match the unknown token
+                    # against the registered REPL commands so a near miss
+                    # (`cve` → `cves`, `serach` → `search`) gets a one-line
+                    # nudge instead of a dead end.
+                    import difflib
+
+                    close = difflib.get_close_matches(
+                        command_name, list(self.commands.keys()), n=1, cutoff=0.6
+                    )
+                    if close:
+                        print_info(
+                            f"Did you mean `{close[0]}`? Type `{close[0]}` to run it."
+                        )
+                    else:
+                        if should_show_workspace_getting_started(self):
+                            print_info(
+                                "This workspace has not started a scan yet. "
+                                "Run `start_unauth` or `start_auth` to begin."
+                            )
+                            print_info(
+                                "Need examples? Type `help` or open "
+                                "https://www.adscanpro.com/docs"
+                            )
+                        print_info(
+                            "If you want to execute a command, use the 'system' command. "
+                            "Example: system ping 127.0.0.1"
+                        )
 
             except KeyboardInterrupt:
                 _log_interrupt_debug(
@@ -14327,6 +14730,22 @@ class PentestShell:
         from adscan_internal.cli.posture import handle_posture_command
 
         handle_posture_command(self, args)
+
+    def do_benchmark(self, args):
+        """Measure (or re-measure) the local hashcat hardware benchmark used
+        to time-budget cracking effort tiers (fast/balanced/thorough).
+
+        Usage: benchmark [refresh]
+            benchmark          Show the cached benchmark, running it once if
+                                none exists yet.
+            benchmark refresh  Force a fresh measurement even if the cache is
+                                warm.
+        """
+        from adscan_internal.cli.cracking_benchmark_cli import (
+            handle_benchmark_command,
+        )
+
+        handle_benchmark_command(self, args)
 
     def do_workspace(self, args):
         """
@@ -15209,7 +15628,14 @@ class PentestShell:
                     "PDC": pdc_host,
                     "PDC FQDN": pdc_fqdn,
                     "Username": user,
-                    cred_type: cred_value,
+                    # Mark at the SOURCE (mirrors creds.py verification panel).
+                    # The _mark_operation_details fallback only marks values with
+                    # len>8, and passwords have no structural net in telemetry.py,
+                    # so a <=8-char password (legacy AD minimum) would otherwise
+                    # reach the uploaded recording in cleartext. mark_sensitive
+                    # keeps it cleartext on the operator's screen, scrubbed in
+                    # telemetry.
+                    cred_type: mark_sensitive(cred_value, "password"),
                     # Primary path is Kerberos (requesting a TGT IS the
                     # verification). If the KDC is unreachable and the secret is
                     # NTLM-native, the service falls back to an NTLM bind; the
@@ -15919,21 +16345,11 @@ class PentestShell:
 
         Usage: enum_trusts <domain>
 
-        Performs the enumeration of trust relationships for the domain by executing the
-        enum-trusts command.
+        Performs native enumeration of the domain's trust relationships over Kerberos/LDAP.
 
         Requires that the domain's PDC is defined in the domains list and that a username and password have been specified for authentication.
 
-        If an error occurs while executing the command, an error message is displayed and it continues with the next domain.
-        """
-        from adscan_internal.cli.domains import run_enum_trusts
-
-        run_enum_trusts(self, domain)
-
-    def execute_enum_trusts(self, command, domain):
-        """[DEPRECATED] Legacy entrypoint kept for backward compatibility.
-
-        New code paths should use `adscan_internal.cli.domains.run_enum_trusts`.
+        If an error occurs during enumeration, an error message is displayed and it continues with the next domain.
         """
         from adscan_internal.cli.domains import run_enum_trusts
 
@@ -16127,15 +16543,60 @@ class PentestShell:
             except Exception:  # noqa: BLE001 — telemetry must never block
                 pass
 
+        def _maybe_surface_between_phase_cracks(entering_title: str) -> None:
+            """Phase-2d break point: surface a NEW high-value background crack.
+
+            Fires at each phase boundary FROM Attack Paths Discovery onward
+            (before that there is no attack graph, so tier / path-to-Tier-0
+            classification is impossible). This is the SYNCHRONOUS scan flow —
+            the previous phase's ``asyncio.run()`` has already returned, so the
+            activation action's async stack runs with no loop active; the entry
+            point re-checks ``running_event_loop_present()`` and routes through
+            the central loop-guarded drain as belt-and-suspenders. Best-effort:
+            a break-point failure never breaks the scan.
+            """
+            try:
+                from adscan_internal.services.scan_phases import phase_order
+
+                entering = next(
+                    (p for p in _SCAN_PHASES_REG if p.title == entering_title), None
+                )
+                if entering is None:
+                    return
+                if phase_order(entering.phase_id) < phase_order(
+                    "attack_paths_discovery"
+                ):
+                    return
+                from adscan_internal.cli.widgets.credential_harvest_panel import (
+                    maybe_surface_high_value_cracks_between_phases,
+                )
+
+                maybe_surface_high_value_cracks_between_phases(self, domain)
+            except Exception as exc:  # noqa: BLE001 — the break point is best-effort
+                telemetry.capture_exception(exc)
+
         def _enter_phase(title: str) -> None:
             """Render the chapter for ``title`` and open a fresh timeline span."""
             _close_active_phase()
+            # Phase-2d: at a loop-free boundary (previous phase's asyncio.run has
+            # returned), surface any NEW Tier 0 / path-to-Tier-0 background crack
+            # BEFORE announcing the next phase, so a DA captured mid-scan is not
+            # held until scan-end. No-op before Attack Paths Discovery / when
+            # nothing new cracked.
+            _maybe_surface_between_phase_cracks(title)
             _emit_scan_chapter(title)
             phase = next(
                 (p for p in _SCAN_PHASES_REG if p.title == title), None
             )
             if phase is None:
                 return
+            # Record entry into this phase so the checkpoint tracks the phase in
+            # progress when the process dies (``last_phase_reached``) and stamps
+            # ``status="running"``. Idempotent + preserves ``phases_complete``.
+            if _manage_progress:
+                _scan_progress.mark_scan_running(
+                    self, domain, self.type, phase_id=phase.phase_id
+                )
             try:
                 cm = _phase_span(
                     self,
@@ -16226,6 +16687,44 @@ class PentestShell:
             )
             return os.path.exists(computers_file) and os.path.exists(users_file)
 
+        # ---- Per-phase crash-resume checkpoint -------------------------------
+        # Manage the ``scan_progress`` record for EVERY ``run_enumeration``
+        # invocation, because every invocation is part of a genuine scan
+        # progression: the single-domain full run, the multi-domain **Phase-1
+        # chunk** (``stop_after_phase=1``), and the trust-pivot **phases-3+ chunk**
+        # (``start_from_phase=3``). The old gate managed the checkpoint ONLY for a
+        # full run, so on any real (trusted / multi-domain) environment — where the
+        # orchestrator chunks Phase 1 per domain via ``stop_after_phase=1`` and
+        # resumes 3+ via ``start_from_phase=3`` — NOTHING was ever checkpointed,
+        # and a Ctrl+C mid Domain Intelligence left no resumable record.
+        #
+        # Composition (why broadening is safe): a phase completed in one chunk is
+        # SKIPPED when a later chunk re-enters it (``_phase_done``); ``start_from_phase``
+        # still skips its pre-window phases via the engine's own gate
+        # (``_skip_phase2`` etc.); and ``mark_scan_complete`` fires only at the
+        # natural end below — a ``stop_after_phase`` chunk returns EARLY, before it,
+        # so the Phase-1 chunk never marks the whole scan complete. The
+        # LOCKOUT-critical Password Spraying gate is preserved: a completed spray is
+        # never blind-re-run.
+        #
+        # The gate decision is the ``scan_progress`` SSOT so a future invocation
+        # shape that must opt out changes one function, not an inline boolean here.
+        from adscan_internal.services import scan_progress as _scan_progress
+
+        _manage_progress = _scan_progress.should_manage_progress(
+            stop_after_phase=stop_after_phase,
+            start_from_phase=start_from_phase,
+        )
+
+        def _phase_done(phase_id: str) -> bool:
+            if not _manage_progress:
+                return False
+            return _scan_progress.phase_already_complete(self, domain, phase_id)
+
+        def _mark_done(phase_id: str) -> None:
+            if _manage_progress:
+                _scan_progress.mark_phase_complete(self, domain, phase_id)
+
         _skip_phase1 = bool(start_from_phase and start_from_phase > 1)
 
         phase1_marked_complete = bool(
@@ -16269,6 +16768,9 @@ class PentestShell:
                 total_steps=2,
                 details="Using existing Phase 1 results",
             )
+            # Phase 1 is already done (cached results reused) — record it so the
+            # checkpoint's completed set stays consistent for the resume gate.
+            _mark_done("domain_analysis")
         else:
             if _run_step(
                 "Host Inventory",
@@ -16333,6 +16835,11 @@ class PentestShell:
             self.domains_data.setdefault(domain, {})["phase1_complete"] = (
                 _phase1_outputs_ready()
             )
+            # Mirror into the checkpoint — only when the outputs truly landed, so
+            # a half-run Phase 1 is never recorded complete (same guard as the
+            # phase1_complete write above).
+            if _phase1_outputs_ready():
+                _mark_done("domain_analysis")
 
             # Capture environment metrics for case studies after Phase 1 completes
             try:
@@ -16408,15 +16915,36 @@ class PentestShell:
                 getattr(self, "domains_data", {}).get(domain, {}).get("auth") or ""
             ).strip().lower() == "pwned"
         )
-        _skip_phase2 = bool(start_from_phase and start_from_phase > 2) or _domain_already_pwned
+        _skip_phase2 = (
+            bool(start_from_phase and start_from_phase > 2)
+            or _domain_already_pwned
+            or _phase_done("attack_paths_discovery")
+        )
         if not _skip_phase2:
+            # The ``attack_paths_discovery`` phase lifecycle (compute +
+            # checkpoint) is owned by the single seam
+            # ``run_attack_paths_discovery_phase`` so the trust/cross-domain
+            # pivot in ``cli/domains.py`` and this per-domain Phase 2 can never
+            # diverge on the checkpoint obligation again. Announce stays here
+            # (``announce=False`` below) because ``_enter_phase`` integrates with
+            # the run-level span tracker, the between-phase crack surfacing, and
+            # ``mark_scan_running``; the seam owns only compute + mark. The
+            # ``_run_step`` closure carries the CTF-pwned early-stop + step UX;
+            # when it signals an early stop the seam does NOT mark the phase.
+            from adscan_internal.services.attack_paths_phase import (
+                run_attack_paths_discovery_phase,
+            )
+
             _enter_phase("Attack Paths Discovery")
             emit_phase("attack_paths_discovery")
-            if _run_step(
-                "Attack Paths Discovery",
-                lambda: self.do_attack_path_discovery(domain),
-                step_number=1,
-                total_steps=1,
+            if run_attack_paths_discovery_phase(
+                self,
+                domains=[domain],
+                checkpoint_domains=[domain] if _manage_progress else [],
+                span_domain=domain,
+                scan_type=self.type,
+                announce=False,
+                run_step=_run_step,
             ):
                 return
 
@@ -16428,33 +16956,16 @@ class PentestShell:
         # case we want to re-introduce an early takeover-CVE scan later.
 
         # ========== PHASE 3: Quick Credential Wins ==========
-        _enter_phase("Quick Credential Wins")
-        step_num = 1
-        total_quickwin_steps = 2 + (2 if self.type == "audit" else 0)
+        # Skipped on resume when a prior run already completed it (read-only /
+        # low-noise, but resume should not re-run what finished).
+        if not _phase_done("quick_credential_wins"):
+            _enter_phase("Quick Credential Wins")
+            step_num = 1
+            total_quickwin_steps = 2 + (2 if self.type == "audit" else 0)
 
-        if _run_step(
-            "Timeroast Candidate Check",
-            lambda: self.ask_for_timeroast(domain),
-            step_number=step_num,
-            total_steps=total_quickwin_steps,
-        ):
-            return
-        step_num += 1
-
-        if _run_step(
-            "LDAP Description Parsing",
-            lambda: self.ask_for_ldap_descriptions(domain),
-            step_number=step_num,
-            total_steps=total_quickwin_steps,
-        ):
-            return
-        step_num += 1
-
-        # GPP enumeration (audit mode only)
-        if self.type == "audit":
             if _run_step(
-                "GPP Autologin Search",
-                lambda: self.ask_for_smb_gpp_autologin(domain),
+                "Timeroast Candidate Check",
+                lambda: self.ask_for_timeroast(domain),
                 step_number=step_num,
                 total_steps=total_quickwin_steps,
             ):
@@ -16462,13 +16973,35 @@ class PentestShell:
             step_num += 1
 
             if _run_step(
-                "GPP Password Search",
-                lambda: self.ask_for_smb_gpp_passwords(domain),
+                "LDAP Description Parsing",
+                lambda: self.ask_for_ldap_descriptions(domain),
                 step_number=step_num,
                 total_steps=total_quickwin_steps,
             ):
                 return
             step_num += 1
+
+            # GPP enumeration (audit mode only)
+            if self.type == "audit":
+                if _run_step(
+                    "GPP Autologin Search",
+                    lambda: self.ask_for_smb_gpp_autologin(domain),
+                    step_number=step_num,
+                    total_steps=total_quickwin_steps,
+                ):
+                    return
+                step_num += 1
+
+                if _run_step(
+                    "GPP Password Search",
+                    lambda: self.ask_for_smb_gpp_passwords(domain),
+                    step_number=step_num,
+                    total_steps=total_quickwin_steps,
+                ):
+                    return
+                step_num += 1
+
+            _mark_done("quick_credential_wins")
 
         # NTLM auth-type detection (per-host sweep + DC-only classification) is
         # fully consolidated into Phase 3 (Domain Intelligence): every sweep path
@@ -16491,14 +17024,22 @@ class PentestShell:
         # workflow narrative tight. The ask_for_kerberoast / ask_for_asreproast
         # / ask_for_user_privs methods themselves still exist and remain
         # available for manual invocation and attack-path execution.
-        _enter_phase("Password Spraying")
-        if _run_step(
-            "Password Spraying",
-            lambda: self.ask_for_spraying(domain),
-            step_number=1,
-            total_steps=1,
-        ):
-            return
+        # Skipped on resume when a prior run already completed it. This gate is
+        # LOCKOUT-CRITICAL: a completed spray must never blind-re-run — re-binding
+        # accrues badPwdCount toward a domain lockout. (A spray interrupted
+        # mid-run is NOT marked complete, so it re-runs; the observation-window /
+        # badPwdCount safety inside ask_for_spraying is the second line of
+        # defense there.)
+        if not _phase_done("password_spraying"):
+            _enter_phase("Password Spraying")
+            if _run_step(
+                "Password Spraying",
+                lambda: self.ask_for_spraying(domain),
+                step_number=1,
+                total_steps=1,
+            ):
+                return
+            _mark_done("password_spraying")
         # NOTE: no post-phase pre2k follow-up here. Pre2k is now Step 1 of the
         # spray phase itself (run_spray_coverage -> _run_pre2k_step, with its own
         # education panel + default-yes prompt), so re-offering it after the phase
@@ -16514,29 +17055,35 @@ class PentestShell:
         # during Phase 1 collection (attack graph edges), displays the SMB
         # resources panel, and offers a credential scan on writable shares.
         # In non-interactive / CI mode it auto-selects all writable shares.
-        _enter_phase("SMB Share Exposure")
-        emit_phase("share_credential_hunt")
-        if _run_step(
-            "SMB Share Exposure",
-            lambda: self.ask_for_share_credential_hunt(domain),
-            step_number=1,
-            total_steps=1,
-        ):
-            return
+        # Skipped on resume when a prior run already completed it — re-running
+        # re-touches shares (OPSEC + possible duplicate credential drops).
+        if not _phase_done("share_credential_hunt"):
+            _enter_phase("SMB Share Exposure")
+            emit_phase("share_credential_hunt")
+            if _run_step(
+                "SMB Share Exposure",
+                lambda: self.ask_for_share_credential_hunt(domain),
+                step_number=1,
+                total_steps=1,
+            ):
+                return
+            _mark_done("share_credential_hunt")
 
         if stop_after_phase == 5:
             return
 
         # ========== PHASE 6: Audit-only Unauthenticated Attack Surface ==========
         if self.type == "audit":
-            _enter_phase("Unauthenticated Attack Surface")
-            if _run_step(
-                "Unauthenticated Scan",
-                lambda: self.ask_for_unauth_scan(domain),
-                step_number=1,
-                total_steps=1,
-            ):
-                return
+            if not _phase_done("unauthenticated_attack_surface"):
+                _enter_phase("Unauthenticated Attack Surface")
+                if _run_step(
+                    "Unauthenticated Scan",
+                    lambda: self.ask_for_unauth_scan(domain),
+                    step_number=1,
+                    total_steps=1,
+                ):
+                    return
+                _mark_done("unauthenticated_attack_surface")
 
             if stop_after_phase == 6:
                 return
@@ -16557,21 +17104,23 @@ class PentestShell:
         # summary that rehydrates hygiene findings + CVE results from disk into
         # a single closing panel for the auditor.
         if self.type == "audit":
-            _enter_phase("CVE Verification")
-            if _run_step(
-                "CVE Vulnerability Check",
-                lambda: self.ask_for_enum_cve(domain),
-                step_number=1,
-                total_steps=1,
-            ):
-                return
-            try:
-                self._render_audit_summary_panel(domain)
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_warning_debug(
-                    f"[audit_summary] render failed: {type(exc).__name__}: {exc}"
-                )
+            if not _phase_done("audit_extras"):
+                _enter_phase("CVE Verification")
+                if _run_step(
+                    "CVE Vulnerability Check",
+                    lambda: self.ask_for_enum_cve(domain),
+                    step_number=1,
+                    total_steps=1,
+                ):
+                    return
+                try:
+                    self._render_audit_summary_panel(domain)
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_warning_debug(
+                        f"[audit_summary] render failed: {type(exc).__name__}: {exc}"
+                    )
+                _mark_done("audit_extras")
 
         # In audit post-compromise we want to map as much as possible, then let the
         # operator decide which remaining paths to validate/exploit.
@@ -16629,6 +17178,12 @@ class PentestShell:
 
         # Capture scan_complete event with case study metrics
         self._capture_scan_complete(domain)
+
+        # Durable completion state: flips the checkpoint to "complete" so the
+        # resume front door stops offering to continue this scan. Anything left
+        # at "running" on next load == an interrupted scan.
+        if _manage_progress:
+            _scan_progress.mark_scan_complete(self, domain)
 
         # Report CTA and zero-findings diagnostic after scan
         # Hormozi: CTA with "what + why now" at victory (show the stack);
@@ -17114,13 +17669,13 @@ class PentestShell:
 
         return run_smb_relay_targets(self, domain=domain)
 
-    def execute_generate_relay_list(self, command, domain):
+    def execute_generate_relay_list(self, domain):
         """Thin wrapper → adscan_internal.cli.enum.execute_generate_relay_list"""
         from adscan_internal.cli.enum import (
             execute_generate_relay_list as _execute_generate_relay_list,
         )
 
-        return _execute_generate_relay_list(self, command, domain)
+        return _execute_generate_relay_list(self, domain)
 
     def _build_probe_credentials(self, domain):
         """Return :class:`ProbeCredentials` from ``domains_data[domain]`` or None."""
@@ -17413,148 +17968,6 @@ class PentestShell:
             password=password,
             hosts=hosts,
             share_map=share_map,
-        )
-
-    def do_smb_map_benchmark(self, args):
-        """Benchmark SMB share mapping backends and compare execution times.
-
-        Usage: smb_map_benchmark <domain> [credential_username]
-        """
-        import shlex
-
-        from adscan_internal import print_error
-        from adscan_internal.cli.smb import run_smb_map_benchmark
-
-        parts = shlex.split(str(args or ""))
-        if not parts or len(parts) > 2:
-            print_error("Usage: smb_map_benchmark <domain> [credential_username]")
-            return
-
-        domain = parts[0]
-        credential_username = parts[1] if len(parts) == 2 else None
-        return run_smb_map_benchmark(
-            self,
-            domain=domain,
-            credential_username=credential_username,
-        )
-
-    def do_smb_sensitive_benchmark(self, args):
-        """Benchmark deterministic SMB sensitive-data backends.
-
-        Usage: smb_sensitive_benchmark <domain> [credential_username]
-        """
-        import shlex
-
-        from adscan_internal import print_error
-        from adscan_internal.cli.smb import run_smb_sensitive_benchmark
-
-        parts = shlex.split(str(args or ""))
-        if not parts or len(parts) > 2:
-            print_error("Usage: smb_sensitive_benchmark <domain> [credential_username]")
-            return
-
-        domain = parts[0]
-        credential_username = parts[1] if len(parts) == 2 else None
-        return run_smb_sensitive_benchmark(
-            self,
-            domain=domain,
-            credential_username=credential_username,
-        )
-
-    def do_smb_guest_benchmark(self, args):
-        """Benchmark guest SMB share strategies and compare speed/coverage.
-
-        Usage: smb_guest_benchmark <domain>
-        """
-        import shlex
-
-        from adscan_internal import print_error
-        from adscan_internal.cli.smb import run_smb_guest_strategy_benchmark
-
-        parts = shlex.split(str(args or ""))
-        if len(parts) != 1:
-            print_error("Usage: smb_guest_benchmark <domain>")
-            return
-
-        return run_smb_guest_strategy_benchmark(
-            self,
-            domain=parts[0],
-        )
-
-    def do_smb_map_benchmark_history(self, args):
-        """Show historical SMB mapping benchmark comparison.
-
-        Usage:
-            smb_map_benchmark_history <domain>
-            smb_map_benchmark_history <domain> <recent_limit>
-            smb_map_benchmark_history <domain> [recent_limit] [--days <N>] [--csv [path]]
-        """
-        import shlex
-
-        from adscan_internal.cli.smb import run_smb_map_benchmark_history
-        from adscan_internal import print_error
-
-        parts = shlex.split(str(args or ""))
-        if not parts:
-            print_error(
-                "Usage: smb_map_benchmark_history <domain> [recent_limit] "
-                "[--days <N>] [--csv [path]]"
-            )
-            return
-        domain = parts[0]
-        recent_limit = 10
-        days: int | None = None
-        csv_output_path: str | None = None
-
-        idx = 1
-        if len(parts) >= 2 and not parts[1].startswith("--"):
-            try:
-                recent_limit = int(parts[1])
-            except Exception:
-                print_error(
-                    "Invalid recent_limit. Usage: smb_map_benchmark_history "
-                    "<domain> [recent_limit] [--days <N>] [--csv [path]]"
-                )
-                return
-            idx = 2
-
-        while idx < len(parts):
-            token = parts[idx]
-            if token == "--days":
-                if idx + 1 >= len(parts):
-                    print_error("Missing value for --days.")
-                    return
-                try:
-                    parsed_days = int(parts[idx + 1])
-                except Exception:
-                    print_error("Invalid value for --days. It must be an integer.")
-                    return
-                if parsed_days <= 0:
-                    print_error("Invalid value for --days. It must be > 0.")
-                    return
-                days = parsed_days
-                idx += 2
-                continue
-            if token == "--csv":
-                if idx + 1 < len(parts) and not parts[idx + 1].startswith("--"):
-                    csv_output_path = parts[idx + 1]
-                    idx += 2
-                else:
-                    csv_output_path = ""
-                    idx += 1
-                continue
-            print_error(
-                "Unknown argument. Usage: smb_map_benchmark_history "
-                "<domain> [recent_limit] [--days <N>] [--csv [path]]"
-            )
-            return
-
-        return run_smb_map_benchmark_history(
-            self,
-            domain=domain,
-            recent_limit=recent_limit,
-            days=days,
-            csv_output_path=csv_output_path,
         )
 
     def do_cracking_history(self, args):
@@ -17854,8 +18267,78 @@ class PentestShell:
         clear_poisoning_state(self)
 
     def do_stop_poisoning(self, _arg):
-        """Stop the native poisoning suite."""
+        """Stop broadcast poisoning, whether started by a scan or the 'poisoning' command."""
         stop_poisoning(self)
+
+    def do_jobs(self, args):
+        """List background jobs, or stop one with 'jobs stop <id>'.
+
+        Background jobs (e.g. broadcast poisoning) run off the sequential scan
+        flow; their results surface as deferred notifications between commands.
+        """
+        from adscan_internal.services.background_jobs import (
+            format_jobs_table,
+            get_or_create_registry,
+        )
+
+        registry = get_or_create_registry(self)
+        tokens = (args or "").split()
+        if len(tokens) >= 2 and tokens[0].lower() == "stop":
+            target = tokens[1]
+            match = next(
+                (j for j in registry.list_jobs() if j.id.startswith(target)), None
+            )
+            if match is None:
+                from rich.markup import escape as _escape_markup
+
+                print_warning(
+                    f"No background job matches id '{_escape_markup(target)}'."
+                )
+                return
+            registry.stop(match.id)
+            print_success(f"Stopped background job {match.id[:8]} ({match.kind}@{match.scope}).")
+            return
+        jobs = registry.list_jobs()
+        if not jobs:
+            print_info("No background jobs.")
+            return
+        get_console().print(format_jobs_table(jobs))
+
+    def do_harvest(self, _args):
+        """Review harvested credentials, then activate or escalate them.
+
+        The one place to see every credential ADscan has captured off the scan
+        flow — broadcast poisoning (NetNTLMv1/v2), kerberoasting and AS-REP
+        roasting — with each principal's Privilege Tier and validated attack
+        reach, its crack status (cracked / cracking / uncracked / not crackable),
+        and any hash still in flight. From the review you can add the cracked
+        credentials and pivot from them, or escalate a still-uncracked hash to a
+        stronger cracking tier. Safe to run anytime; it reads the persisted
+        harvest store plus any live cracks, so nothing is missed even if a crack
+        finished after the scan ended.
+        """
+        from adscan_internal.cli.widgets.credential_harvest_panel import (
+            render_harvest_command,
+        )
+        from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.services.credential_harvest_store import (
+            load_harvest_records,
+        )
+
+        domain = str(getattr(self, "domain", "") or "")
+        # crack-harvest-load: greppable, --debug-only. What `harvest` sees in the
+        # persisted store + under which domain — the final read checkpoint for
+        # "the crack cracked but harvest shows nothing".
+        try:
+            loaded = load_harvest_records(self)
+            marked_users = ", ".join(mark_sensitive(r.username, "user") for r in loaded)
+            print_info_debug(
+                "crack-harvest-load: "
+                f"domain={domain} store_records={len(loaded)} users={marked_users}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+        render_harvest_command(self, domain)
 
     def do_check_ntlm_auth(self, args):
         """Coerce a target host and classify NTLMv1 vs NTLMv2.
@@ -18982,7 +19465,7 @@ class PentestShell:
         )
 
     def dump_lsass(self, domain, host, username, password, _islocal):
-        """Dump LSASS using LSA-Reaper."""
+        """Dump LSASS using the native LSASS dump path (NativeDumpService)."""
         from adscan_internal.cli.dumps import run_dump_lsass
 
         return run_dump_lsass(
@@ -19998,25 +20481,6 @@ class PentestShell:
 
         return _dispatch_cves(self, args)
 
-    def netexec_extract_domains_ldap(self, arg):
-        command = f"{shlex.quote(self.netexec_path)} smb ldap/ips.txt"
-        self.extract_domains(command)
-
-    def netexec_extract_services(self, domain):
-        from adscan_internal.cli.service_lists import netexec_extract_services
-
-        netexec_extract_services(self, domain=domain)
-
-    def extract_service_for_domain(self, domain, service):
-        from adscan_internal.cli.service_lists import extract_service_for_domain
-
-        extract_service_for_domain(self, domain=domain, service=service)
-
-    def extract_services(self, command, domain, service):
-        from adscan_internal.cli.service_lists import extract_services
-
-        extract_services(self, command=command, domain=domain, service=service)
-
     def netexec_extract_dcs(self, domain):
         from adscan_internal.rich_output import mark_sensitive
 
@@ -20030,43 +20494,6 @@ class PentestShell:
             f"[netexec_extract_dcs] DC extraction completed for domain: {marked_domain}, DCs: {self.dcs}"
         )
 
-    def netexec_extract_smb(self, domain):
-        from adscan_internal.cli.service_lists import extract_services
-
-        command = (
-            f"{shlex.quote(self.netexec_path)} smb smb/ips.txt "
-            f"| grep -F {shlex.quote(domain)}"
-        )
-        extract_services(self, command=command, domain=domain, service="smb")
-
-    def netexec_extract_rdp(self, domain):
-        from adscan_internal.cli.service_lists import extract_services
-
-        command = (
-            f"{shlex.quote(self.netexec_path)} smb rdp/ips.txt "
-            f"| grep -F {shlex.quote(domain)}"
-        )
-        extract_services(self, command=command, domain=domain, service="rdp")
-
-    def netexec_extract_mssql(self, domain):
-        from adscan_internal.cli.service_lists import extract_services
-
-        command = (
-            f"{shlex.quote(self.netexec_path)} smb mssql/ips.txt "
-            f"| grep -F {shlex.quote(domain)}"
-        )
-        extract_services(self, command=command, domain=domain, service="mssql")
-
-    def netexec_extract_winrm(self, domain):
-        from adscan_internal.cli.winrm import netexec_extract_winrm
-
-        netexec_extract_winrm(self, domain=domain)
-
-    def netexec_guest_shares_local(self, domain):
-        from adscan_internal.cli.smb import run_guest_shares_local
-
-        run_guest_shares_local(self, domain=domain)
-
     def do_rid_cycling(self, domain):
         from adscan_internal.cli.smb import run_rid_cycling
 
@@ -20077,26 +20504,13 @@ class PentestShell:
 
         run_rid_cycling_local(self, domain=domain)
 
-    def execute_netexec_ldap_descriptions(self, command, domain):
-        """
-        Executes LDAP descriptions command, finds and moves netexec's UserDesc log file,
-        parses it, displays with Rich, and analyzes descriptions for passwords using CredSweeper.
-        """
-        from adscan_internal.cli.ldap import execute_netexec_ldap_descriptions
-
-        execute_netexec_ldap_descriptions(shell=self, command=command, domain=domain)
-
-    def execute_smb_rid_cycling(self, command, domain):
-        """Executes the RID cycling command and displays the results."""
+    def execute_smb_rid_cycling(self, domain, *, rid_max=2000, local_auth=False):
+        """Run native LSARPC RID cycling and display the results."""
         from adscan_internal.cli.smb import execute_smb_rid_cycling
 
-        execute_smb_rid_cycling(self, command=command, domain=domain)
-
-    def execute_netexec_smb_descriptions(self, command, domain):
-        """Wrapper for execute_netexec_smb_descriptions in smb.py."""
-        from adscan_internal.cli.smb import execute_netexec_smb_descriptions
-
-        execute_netexec_smb_descriptions(self, command=command, domain=domain)
+        execute_smb_rid_cycling(
+            self, domain=domain, rid_max=rid_max, local_auth=local_auth
+        )
 
     def execute_cracking(self, command, type, domain, hash, wordlist_name=None):
         """Execute the cracking command and process results."""
@@ -20608,22 +21022,16 @@ class PentestShell:
 
         run_enum_with_users(self, domain)
 
-    def execute_netexec_pass_policy(self, command, domain):
+    def execute_netexec_pass_policy(self, domain):
         from adscan_internal.cli.smb import execute_netexec_pass_policy
 
-        execute_netexec_pass_policy(shell=self, command=command, domain=domain)
+        execute_netexec_pass_policy(shell=self, domain=domain)
 
-    def execute_netexec_smbv1(self, command, domain):
-        """Execute the NetExec SMBv1 audit command."""
-        from adscan_internal.cli.smb import execute_netexec_smbv1
-
-        execute_netexec_smbv1(shell=self, command=command, domain=domain)
-
-    def execute_netexec_obsolete(self, command, domain):
-        """Execute the NetExec LDAP obsolete-module command."""
+    def execute_netexec_obsolete(self, domain):
+        """Audit obsolete operating systems from the native collector inventory."""
         from adscan_internal.cli.ldap import execute_netexec_obsolete
 
-        execute_netexec_obsolete(shell=self, command=command, domain=domain)
+        execute_netexec_obsolete(shell=self, domain=domain)
 
     def execute_rdp_access(self, command):
         """Execute an RDP access command.
@@ -22306,47 +22714,6 @@ class PentestShell:
 
         return auth
 
-    def build_auth_bloody(self, username, password, domain=None, kerberos=False):
-        """
-        Builds the authentication string for bloodyAD commands.
-
-        Args:
-            username (str): The username
-            password (str): The password or NT hash
-            domain (str, optional): The domain if needed
-
-        Returns:
-            str: The authentication string formatted for bloodyAD
-        """
-        # Check if it is an NT hash (32 hexadecimal characters)
-        is_hash = len(password) == 32 and all(
-            c in "0123456789abcdef" for c in password.lower()
-        )
-
-        # Build the base string
-        auth = ""
-
-        # Add the domain if provided
-        if domain:
-            auth += f" -d {domain} "
-
-        # Add username and password
-        auth += f"-u '{username}' "
-
-        # If it is a hash, add a colon before it
-        if is_hash:
-            if kerberos:
-                auth += f"-p '{password}' -f rc4"
-            else:
-                auth += f"-p ':{password}'"
-        else:
-            auth += f"-p '{password}'"
-
-        if kerberos:
-            auth += " -k"
-
-        return auth
-
     def build_auth_impacket(self, username, password, domain, kerberos=False):
         """
         Builds the authentication string for netexec commands.
@@ -22403,29 +22770,6 @@ class PentestShell:
 
         if kerberos:
             auth += "-k"
-
-        return auth
-
-    def build_auth_certipy(self, domain, username, password):
-        """
-        Builds the authentication string for netexec commands.
-
-        Args:
-            username (str): The username
-            password (str): The password or NT hash
-            domain (str, optional): The domain if needed
-
-        Returns:
-            str: The authentication string formatted for netexec
-        """
-        # Check if it is an NT hash (32 hexadecimal characters)
-        is_hash = len(password) == 32 and all(
-            c in "0123456789abcdef" for c in password.lower()
-        )
-
-        # Build the authentication part
-        auth = f"-u '{username}'@{domain}"
-        auth += f" -hashes :{password}" if is_hash else f" -p '{password}'"
 
         return auth
 
@@ -23320,11 +23664,35 @@ class PentestShell:
             resolve_privileged_followup_decision,
         )
 
-        if self.domains_data[domain]["auth"] == "pwned" and self.type == "ctf":
+        # SSOT gate: once the domain is compromised (flags captured in CTF, domain
+        # owned in audit), stop all per-credential privilege enumeration and the
+        # per-principal attack-path search/execution it drives. This covers a
+        # credential obtained AFTER the pwn (e.g. a later credential in the batch,
+        # a DC machine account re-offered for follow-up). The sanctioned audit
+        # post-compromise re-offer runs via a SEPARATE entry point
+        # (run_enumeration → offer_attack_paths_for_execution_summaries, scope=domain)
+        # and is unaffected. See _domain_flow_completed_by_pwn.
+        if self._domain_flow_completed_by_pwn(domain):
+            print_info_verbose(
+                f"Skipping user privilege enumeration for {mark_sensitive(username, 'user')}: "
+                "domain is already pwned."
+            )
             return
         self.do_sync_clock_with_pdc(domain)
 
         def _offer_attack_paths() -> None:
+            # Re-check AFTER the terminal action: the credential that ACHIEVES the
+            # pwn is NOT pwned when ask_for_user_privs starts — its terminal action
+            # (check_privileged_groups → DCSync/escalation, or an executed path)
+            # flips auth to "pwned" DURING this call. Re-reading here stops the
+            # now-redundant per-principal attack-path search + auto-execution that
+            # ran for the DC machine account after the domain was already pwned.
+            if self._domain_flow_completed_by_pwn(domain):
+                print_info_verbose(
+                    f"Skipping attack-path search for {mark_sensitive(username, 'user')}: "
+                    "domain is already pwned."
+                )
+                return
             # Reuse the centralized UX: show paths, allow inspecting details, and
             # optionally execute one (step mapping is handled by the helper).
             #
@@ -23387,7 +23755,7 @@ class PentestShell:
                 # If the user is already privileged, direct follow-up beats
                 # showing noisy attack paths from that same user.
                 if followup_decision.skip_attack_path_search:
-                    if self.domains_data.get(domain, {}).get("auth") == "pwned":
+                    if self._domain_flow_completed_by_pwn(domain):
                         print_info_verbose(
                             f"Skipping user privilege enumeration for {marked_username}: domain is already pwned."
                         )
@@ -23461,7 +23829,7 @@ class PentestShell:
 
                 # If the user does not have adminCount=1, ask if privilege enumeration should be executed
                 _offer_attack_paths()
-                if self.domains_data.get(domain, {}).get("auth") == "pwned":
+                if self._domain_flow_completed_by_pwn(domain):
                     print_info_verbose(
                         f"Skipping user privilege enumeration for {marked_username}: domain is already pwned."
                     )
@@ -26473,55 +26841,6 @@ class PentestShell:
 
         return decrypt_cpassword(cpassword)
 
-    def execute_netexec_shares(self, command, domain, username, password):
-        from adscan_internal.cli.smb import execute_netexec_shares
-
-        execute_netexec_shares(
-            self,
-            command=command,
-            domain=domain,
-            username=username,
-            password=password,
-        )
-
-    def extract_domains(self, command):
-        """Extracts domains from the output and stores them in self.domains."""
-        try:
-            completed_process = self.run_command(command, timeout=300)
-            output = completed_process.stdout
-            errors = completed_process.stderr
-
-            if completed_process.returncode == 0:
-                output_str = output
-                # Adjusted pattern to capture multiple domains
-                domain_pattern = (
-                    r"\(domain:(\S+?)\)"  # Matches all occurrences of the domain format
-                )
-                matches = re.findall(domain_pattern, output_str)
-
-                if matches:
-                    # Use a set to avoid duplicates
-                    unique_domains = set(matches)
-                    self.domains = list(unique_domains)
-                    marked_domains_1 = mark_sensitive(", ".join(self.domains), "domain")
-                    print_success(f"Domains found: {marked_domains_1}")
-
-                    # Create a sub-workspace for each domain
-                    for domain in self.domains:
-                        self.create_sub_workspace_for_domain(domain)
-                else:
-                    print_error("No domains found in the output.")
-            else:
-                print_error("Error executing netexec.")
-                if errors:
-                    print_error(errors.strip())
-        except Exception as e:
-            telemetry.capture_exception(e)
-
-            print_error("An error occurred while executing the command.")
-            print_exception(show_locals=False, exception=e)
-            print_exception(exception=e)
-
     def create_sub_workspace_for_domain(self, domain, pdc_ip=None):
         """Creates a sub-workspace within the current workspace for a specific domain."""
         from adscan_internal.rich_output import mark_sensitive
@@ -27025,6 +27344,19 @@ class PentestShell:
                 ``--theme corporate_light``. With no flags an interactive
                 checkbox picks the deliverables (all by default).
         """
+        # PRO gate — runs BEFORE the PRO-only ``adscan_internal.cli.deliver``
+        # import so a LITE operator sees the canonical PRO upsell panel instead
+        # of an ``ImportError`` crash ("No module named
+        # 'adscan_internal.cli.deliver'"). The reporting aliases (``report`` /
+        # ``reporting`` / ``generate_report``) all dispatch to this method, so
+        # this single gate covers every on-ramp into the deliverable kit.
+        from adscan_core import tier as _tier
+        if not _tier.is_pro():
+            from adscan_core.pro_upsell import print_pro_upsell
+
+            print_pro_upsell("deliver", "direct_invocation")
+            return None
+
         import argparse as _argparse
         import shlex as _shlex
 
@@ -27332,16 +27664,6 @@ class PentestShell:
             telemetry.capture_exception(e)
             print_error("Error closing the SMB process.")
             print_exception(show_locals=False, exception=e)
-
-    def monitor_nmap(self, proc):
-        """Monitor nmap process output for general port scanning.
-
-        This is a thin wrapper around :mod:`adscan_internal.cli.nmap` so that
-        the core logic can be reused by other UX layers.
-        """
-        from adscan_internal.cli.nmap import monitor_nmap
-
-        monitor_nmap(self, proc)
 
     def save_host_to_file(self, host, service_dir):
         """Save the host IP to the corresponding file for the service, avoiding duplicates.
@@ -28152,14 +28474,25 @@ class PentestShell:
             marked_domain = mark_sensitive(domain, "domain")
             local_resolver_ip = _get_adscan_local_resolver_ip()
             marked_local_resolver_ip = mark_sensitive(local_resolver_ip, "ip")
-            # Fast check: ensure something is listening on the local resolver IP so the DNS check doesn't hang.
+            # Fast check: ensure something is listening on the local resolver IP so
+            # the DNS check doesn't hang. Unbound briefly not listening right after a
+            # reconfigure/restart is a normal transient state that self-heals via the
+            # restart below, and verification usually succeeds immediately after —
+            # so this is logged at debug level, not surfaced as a warning yet. The
+            # warning is only shown to the operator further down, and only if
+            # verification still fails after the restart attempt (never a
+            # warn-then-instant-success pair for the same reconfigure).
+            resolver_was_not_listening = False
             try:
-                if not _is_unbound_listening_local(resolver_ip=local_resolver_ip):
-                    print_warning(
-                        "Local DNS resolver is not listening on "
-                        f"{marked_local_resolver_ip}:53 for {marked_domain}."
+                resolver_was_not_listening = not _is_unbound_listening_local(
+                    resolver_ip=local_resolver_ip
+                )
+                if resolver_was_not_listening:
+                    print_info_debug(
+                        "[dns] Local DNS resolver not listening on "
+                        f"{marked_local_resolver_ip}:53 for {marked_domain}; "
+                        "restarting Unbound."
                     )
-                    print_info_verbose("Attempting to restart Unbound...")
                     self._restart_unbound()
             except Exception as exc:
                 telemetry.capture_exception(exc)
@@ -28175,6 +28508,12 @@ class PentestShell:
                     f"DNS resolution configured correctly for {marked_domain}"
                 )
                 return True
+
+            if resolver_was_not_listening:
+                print_warning(
+                    "Local DNS resolver is not listening on "
+                    f"{marked_local_resolver_ip}:53 for {marked_domain}."
+                )
 
             if error_kind == "timeout":
                 print_info_verbose(
@@ -28838,10 +29177,16 @@ class PentestShell:
     def _finalise_telemetry_streamer(self) -> None:
         """Close the streamer and ship the final chunk with ``is_final``.
 
-        Called from ``capture_session_end`` BEFORE the legacy
-        single-shot export runs — if the streamer was active for this
-        session, the legacy export is then skipped (the server already
-        has the full content via assembled chunks).
+        Called BEFORE ``capture_session_end`` runs its legacy single-shot
+        export. When the streamer was active this session, the full
+        recording is already delivered incrementally via assembled chunks,
+        so the legacy path no longer carries the recording: telemetry marks
+        the run as streamed (``_SESSION_STREAMING_ACTIVE``) and its
+        single-shot upload skips the oversize backstop that the drain would
+        otherwise discard — a streamed session relies on its chunks, not
+        the legacy single-shot path. ``capture_session_end`` still runs
+        (it is the canonical sink for the PostHog event, exit summary, and
+        case-study metrics).
         """
         streamer = getattr(self, "_telemetry_streamer", None)
         if streamer is None:
@@ -28863,12 +29208,6 @@ class PentestShell:
         finally:
             self._telemetry_streamer = None
 
-    def scan_service(self, service, hosts, domain=None):
-        """Scans a specific service using netexec."""
-        from adscan_internal.cli.scan import run_scan_service
-
-        run_scan_service(self, service, hosts, domain)
-
     def consolidate_service_ips(self, service):
         """Consolidates the IPs from all domains for a specific service."""
         from adscan_internal.cli.scan import (
@@ -28885,12 +29224,6 @@ class PentestShell:
 
         _consolidate_domain_computers(self, args)
 
-    def process_service_output(self, line, service):
-        """Processes each output line from a service scan."""
-        from adscan_internal.cli.scan import process_service_output_line
-
-        process_service_output_line(self, line, service)
-
     def do_system(self, arg):
         """Usage: system <command>
         Executes a system command.
@@ -28904,7 +29237,11 @@ class PentestShell:
             # when executed as root inside the container.
             arg = _maybe_wrap_hashcat_for_container(arg)
 
-            # Use run_command to automatically handle clean_env and avoid PyInstaller conflicts
+            # Use run_command to automatically handle clean_env and avoid PyInstaller conflicts.
+            # untrusted_output=True suppresses run_command's debug head/tail preview: this is
+            # arbitrary operator-chosen content the telemetry pattern-sanitizer cannot redact,
+            # so it must not reach the recording ahead of the print_untrusted_command_output
+            # omission guard below.
             completed_process = self.run_command(
                 arg,
                 shell=True,
@@ -28912,6 +29249,7 @@ class PentestShell:
                 text=True,
                 timeout=300,
                 check=False,
+                untrusted_output=True,
             )
 
             # This check is crucial for when the command times out, as run_command returns None.
@@ -29367,8 +29705,16 @@ class PentestShell:
         self.domain = None
         print_success("Credentials and auths cleared.")
 
-    def do_exit(self, exit=True):
-        """Exits the shell."""
+    def do_exit(self, exit=True, *, from_signal: bool = False):
+        """Exits the shell.
+
+        Args:
+            exit: Legacy positional flag / raw REPL arg string; coerced to bool.
+            from_signal: True when the shutdown was initiated by a Ctrl+C /
+                signal handler or the abrupt-exit atexit hook. In that case the
+                optional attribution question is skipped — asking during an
+                interrupt is bad timing and would block the abort.
+        """
         global _SESSION_CAPTURE_FINALIZED
         exit_requested = exit if isinstance(exit, bool) else True
         if getattr(self, "_shutdown_in_progress", False):
@@ -29425,6 +29771,15 @@ class PentestShell:
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_info_debug(f"[ledger] exit panel failed: {exc}")
+
+        # Session-death guarantee for background jobs: force any still-running
+        # job to 'stopped' + persist, on graceful OR abrupt (atexit) exit.
+        try:
+            background_jobs = getattr(self, "_background_jobs", None)
+            if background_jobs is not None:
+                background_jobs.finalize()
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
         # Use telemetry console for session recording export. This console
         # records a superset of what the user sees in the terminal and is
         # only used for sanitized session uploads.
@@ -29451,9 +29806,16 @@ class PentestShell:
             telemetry.capture_exception(exc)
             print_info_debug(f"[ledger] failed to attach to technical_report: {exc}")
         print_info("Workspace saved.")
-        # Context-aware exit: attribution (once-ever) → summary → CTAs
-        _maybe_ask_attribution(self)
-        _show_exit_summary(self)
+        # Context-aware exit: summary → single primary ask → report CTA.
+        # The primary ask at peak goodwill is EITHER the 1-5 session rating
+        # funnel (when the session hit a real value moment) OR the once-ever
+        # attribution question — never both the same exit. Rating takes
+        # priority; attribution waits for another exit. Neither runs on a
+        # signal / abrupt shutdown (bad timing, would block the abort).
+        value_tier = _show_exit_summary(self)
+        if not from_signal:
+            if not _maybe_run_rating_funnel(self, value_tier):
+                _maybe_ask_attribution(self)
         _maybe_show_report_cta(self)
         # Build metadata from workspace context
         command_type = _resolve_command_type(shell=self)
@@ -29633,6 +29995,7 @@ class PentestShell:
                 "clear_poisoning",
                 "stop_poisoning",
                 "check_dc_ntlm_auth_type",
+                "jobs",
             ],
             "Flags": ["get_flags"],
             "MSSQL": [
@@ -29651,7 +30014,7 @@ class PentestShell:
                 "dump_host",
             ],
             "Spraying": ["spraying", "netexec_pass_policy"],
-            "Cracking": ["cracking"],
+            "Cracking": ["cracking", "benchmark"],
             "Privileges": [
                 "enum_all_user_postauth_access",
                 "netexec_user_postauth_access",
@@ -29871,7 +30234,7 @@ def get_tool_executable_path(tool_key):
 def get_external_tool_python(tool_name):
     """Gets the Python executable path for an external tool with isolated venv.
 
-    External tools with requirements.txt (firepwd, LSA-Reaper, PKINITtools)
+    External tools with requirements.txt (firepwd, PKINITtools)
     are installed in isolated venvs at TOOL_VENVS_BASE_DIR/tool_name/venv/
 
     Args:
@@ -30375,7 +30738,6 @@ def _build_check_context(handle_check_fn):
         check_rust_tools_fn=check_rust_tools,
         check_go_toolchain_fn=check_go_toolchain,
         check_pyenv_status_fn=check_pyenv_status,
-        is_libreoffice_available=_is_libreoffice_available,
         print_check_summary=_print_check_summary,
         WordlistService=WordlistService,
         run_command=run_command,

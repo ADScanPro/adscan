@@ -48,6 +48,9 @@ from adscan_internal.services.ldap_transport_service import (
     prepare_kerberos_ldap_environment,
     resolve_ldap_target_endpoints,
 )
+from adscan_internal.services.cooperative_cancellation import (
+    CooperativeCancellation,
+)
 from adscan_internal.integrations.impacket import (
     KerberoastHash,
     ASREPHash,
@@ -80,6 +83,115 @@ _UF_DONT_REQUIRE_PREAUTH = 0x400000
 
 
 CommandExecutor = Callable[[str, int], subprocess.CompletedProcess[str]]
+
+
+# --- kerbrute throughput / ETA / cap SSOT -----------------------------------
+#
+# Calibrated from a real audit run against a lab DC: kerbrute ``userenum`` at
+# its Go-default 10 threads sustained ~11 valid-username checks/sec. userenum
+# is RTT-bound (one Kerberos AS-REQ round-trip per candidate per worker
+# thread), so throughput scales ~linearly with ``--threads``.
+_KERBRUTE_BASELINE_THREADS = 10
+_KERBRUTE_BASELINE_RATE_PER_SEC = 11.0
+
+# 5x the Go default. Still comfortably RTT-bound against a single DC (no
+# packet-flood risk -- see adscan-ad-constraints Sec 10 scale/OPSEC), and
+# turns a ~6h "statistically likely usernames" run into roughly an hour.
+KERBRUTE_THREADS = 50
+
+# No opted-in run, however large, should be allowed to hang indefinitely.
+_KERBRUTE_TIMEOUT_HARD_CAP_SECONDS = 6 * 3600
+
+# Headroom over the raw projection for network jitter / VPN latency.
+_KERBRUTE_TIMEOUT_MARGIN = 1.2
+
+# Wall-clock budget (seconds) a wordlist auto-selected without an explicit
+# opt-in must complete within.
+_KERBRUTE_DEFAULT_BUDGET_SECONDS = 300
+
+
+def estimate_kerbrute_throughput_per_sec(*, threads: int = KERBRUTE_THREADS) -> float:
+    """Estimate kerbrute ``userenum`` throughput (valid usernames/sec).
+
+    Args:
+        threads: ``--threads`` value the run will use.
+
+    Returns:
+        Estimated candidates-per-second throughput, linearly scaled from the
+        calibrated baseline (~11/s @ 10 threads).
+    """
+    effective_threads = threads if threads > 0 else _KERBRUTE_BASELINE_THREADS
+    return _KERBRUTE_BASELINE_RATE_PER_SEC * (
+        effective_threads / _KERBRUTE_BASELINE_THREADS
+    )
+
+
+def estimate_kerbrute_duration_seconds(
+    count: int, *, threads: int = KERBRUTE_THREADS
+) -> float:
+    """Project kerbrute ``userenum`` wall-clock duration for ``count`` candidates.
+
+    Args:
+        count: Number of username candidates in the wordlist.
+        threads: ``--threads`` value the run will use.
+
+    Returns:
+        Projected wall-clock seconds, or ``0.0`` for a non-positive count.
+    """
+    if count <= 0:
+        return 0.0
+    rate = estimate_kerbrute_throughput_per_sec(threads=threads)
+    if rate <= 0:
+        return 0.0
+    return count / rate
+
+
+def compute_default_wordlist_cap(
+    *,
+    target_seconds: int = _KERBRUTE_DEFAULT_BUDGET_SECONDS,
+    threads: int = KERBRUTE_THREADS,
+) -> int:
+    """Largest candidate count that completes unattended within ``target_seconds``.
+
+    Used to cap the default "statistically likely usernames" source so an
+    ``audit`` workspace never silently launches an hours-long kerbrute run.
+
+    Args:
+        target_seconds: Safe wall-clock budget for an unattended default run.
+        threads: ``--threads`` value the run will use.
+
+    Returns:
+        Candidate count cap, always >= 1.
+    """
+    rate = estimate_kerbrute_throughput_per_sec(threads=threads)
+    return max(1, round(rate * target_seconds))
+
+
+def estimate_kerbrute_subprocess_timeout_seconds(
+    count: int,
+    *,
+    floor_seconds: int = 300,
+    threads: int = KERBRUTE_THREADS,
+) -> int:
+    """Subprocess timeout budget covering the full projected run.
+
+    Floors at the caller's existing timeout (so small-wordlist callers, e.g.
+    the CN-inference / format-inference validation paths, are unaffected) and
+    hard-caps at ~6h so an opted-in run of any size still terminates.
+
+    Args:
+        count: Number of username candidates in the wordlist.
+        floor_seconds: The caller's pre-existing timeout -- never go below it.
+        threads: ``--threads`` value the run will use.
+
+    Returns:
+        Subprocess timeout in whole seconds.
+    """
+    projected = (
+        estimate_kerbrute_duration_seconds(count, threads=threads)
+        * _KERBRUTE_TIMEOUT_MARGIN
+    )
+    return int(min(_KERBRUTE_TIMEOUT_HARD_CAP_SECONDS, max(floor_seconds, projected)))
 
 
 # ``shell.spawn_command``-shaped callable: returns a text-mode Popen (or None).
@@ -299,6 +411,7 @@ def _stream_userenum_into_dashboard(
     dashboard: "ProgressDashboard",
     *,
     total: "int | None" = None,
+    cancellation: "CooperativeCancellation | None" = None,
 ) -> "StreamedProcessResult | None":
     """Stream kerbrute ``userenum`` stdout, driving the live progress bar.
 
@@ -332,6 +445,12 @@ def _stream_userenum_into_dashboard(
         dashboard: Live dashboard to drive.
         total: Userlist line count for the determinate bar, or ``None`` for the
             indeterminate "found N" mode.
+        cancellation: Optional cooperative-cancellation token (operator
+            Ctrl+C / platform "Stop" sentinel). When it fires mid-run the
+            kerbrute process is stopped exactly like a wall-clock timeout --
+            the caller tells the two apart via ``result.cancelled`` and
+            recovers the usernames found before the stop the same way it
+            recovers a timeout's partial output.
 
     Returns:
         A :class:`StreamedProcessResult` on completion, or ``None`` if the
@@ -405,6 +524,8 @@ def _stream_userenum_into_dashboard(
         timeout_seconds=timeout,
         on_line=_on_line,
         on_drain=_on_drain,
+        should_cancel=cancellation.should_stop if cancellation is not None else None,
+        on_cancel=(lambda: _push_frame(None)) if cancellation is not None else None,
     )
 
 
@@ -417,6 +538,7 @@ def _run_userenum_with_dashboard(
     spawn: "SpawnCommand | None" = None,
     domain: str = "",
     total: "int | None" = None,
+    cancellation: "CooperativeCancellation | None" = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Run kerbrute ``userenum`` under a live progress dashboard.
 
@@ -447,6 +569,10 @@ def _run_userenum_with_dashboard(
         domain: Target domain, threaded to the streaming parser.
         total: Userlist line count for the determinate ``tested / N`` bar, or
             ``None`` for the indeterminate "found N" mode.
+        cancellation: Optional cooperative-cancellation token, forwarded to
+            :func:`_stream_userenum_into_dashboard`. ``None`` (the default)
+            preserves the exact legacy behaviour for every caller that has
+            not opted in.
 
     Returns:
         The :class:`subprocess.CompletedProcess` (or
@@ -466,7 +592,13 @@ def _run_userenum_with_dashboard(
         try:
             with dashboard.live_session():
                 streamed = _stream_userenum_into_dashboard(
-                    spawn, cmd, timeout, domain, dashboard, total=total
+                    spawn,
+                    cmd,
+                    timeout,
+                    domain,
+                    dashboard,
+                    total=total,
+                    cancellation=cancellation,
                 )
             if streamed is not None:
                 if streamed.timed_out:
@@ -874,6 +1006,7 @@ class KerberosEnumerationMixin:
         scan_id: Optional[str] = None,
         timeout: int = 300,
         auth_mode: AuthMode = AuthMode.UNAUTHENTICATED,
+        cancellation: "CooperativeCancellation | None" = None,
     ) -> List[str]:
         """Enumerate users via Kerberos without LDAP access.
 
@@ -903,6 +1036,15 @@ class KerberosEnumerationMixin:
                 ``UNAUTHENTICATED``; callers on the unauth path pass it
                 explicitly to suppress the decorator's "assuming authenticated"
                 debug line.
+            cancellation: Optional cooperative-cancellation token (see
+                ``adscan_internal.services.cooperative_cancellation``). On a
+                large wordlist this run can take minutes to hours; when the
+                operator (Ctrl+C) or the platform ("Stop" sentinel) requests
+                an early stop mid-run, the kerbrute process is stopped and
+                the usernames found BEFORE the stop are returned -- the scan
+                continues with that partial list rather than aborting. Kept
+                ``None`` by default so existing callers are unaffected; only
+                the CLI's main wordlist-driven entry point wires a token.
 
         Returns:
             List of unique usernames (lowercase) discovered.
@@ -923,8 +1065,12 @@ class KerberosEnumerationMixin:
         # is ``VALID USERNAME``-anchored (see _parse_userenum_output_lines), so
         # the invalid lines ``-v`` adds to BOTH stdout and the ``-o`` file are
         # ignored for credential capture and never mis-reported as valid.
+        # ``--threads`` -- Go default is 10 (~11 candidates/sec observed).
+        # KERBRUTE_THREADS is a 5x bump, still RTT-bound against a single DC
+        # (see the SSOT throughput/ETA block above this method's class).
         cmd = (
             f"{shlex.quote(kerbrute_path)} userenum -v "
+            f"--threads {KERBRUTE_THREADS} "
             f"-d {shlex.quote(domain)} "
             f"--dc {shlex.quote(pdc)} "
             f"{shlex.quote(wordlist)} "
@@ -948,6 +1094,16 @@ class KerberosEnumerationMixin:
         except OSError:
             candidate_count = 0
 
+        # Expand the subprocess timeout to cover the projected run (hard-cap
+        # ~6h), flooring at the caller's own timeout so small-wordlist callers
+        # (the 180s/300s CN-inference and format-inference validation paths)
+        # are unaffected. Without this, an opted-in full statistically-likely
+        # run would be killed at the caller's flat 300s long before it could
+        # finish.
+        effective_timeout = estimate_kerbrute_subprocess_timeout_seconds(
+            candidate_count, floor_seconds=timeout
+        )
+
         try:
             maybe_show_patience_notice(
                 PatienceNoticeConfig(
@@ -958,6 +1114,7 @@ class KerberosEnumerationMixin:
                 ),
                 count=candidate_count,
                 non_interactive=is_non_interactive(),
+                rate_per_second=estimate_kerbrute_throughput_per_sec(),
             )
         except Exception:  # noqa: BLE001 -- notice must never abort the scan
             pass
@@ -990,11 +1147,12 @@ class KerberosEnumerationMixin:
             result = _run_userenum_with_dashboard(
                 exec_fn,
                 cmd,
-                timeout,
+                effective_timeout,
                 _count_found,
                 spawn=spawn,
                 domain=domain,
                 total=candidate_count or None,
+                cancellation=cancellation,
             )
         except subprocess.TimeoutExpired as exc:
             # Recover users found before the timeout fired. kerbrute streams
@@ -1035,6 +1193,33 @@ class KerberosEnumerationMixin:
                 message="Kerberos user enumeration failed",
             )
             return []
+
+        if getattr(result, "cancelled", False):
+            # The operator (Ctrl+C) or the platform ("Stop" sentinel) requested
+            # an early stop mid-run. This is a STOP, never an abort -- recover
+            # the usernames found before the stop the same way a timeout's
+            # partial output is recovered, and let the scan continue with them.
+            recovered = self._recover_partial_userenum(
+                getattr(result, "stdout", None),
+                output_file,
+                domain,
+            )
+            self.logger.info(
+                "Kerberos user enumeration stopped early by operator/platform",
+                extra={"domain": domain, "pdc": pdc, "recovered": len(recovered)},
+            )
+            self.parent._emit_progress(
+                scan_id=scan_id,
+                phase="kerberos_user_enumeration",
+                progress=1.0,
+                message=(
+                    "Kerberos user enumeration stopped early "
+                    f"({len(recovered)} user(s) found before stopping)"
+                    if recovered
+                    else "Kerberos user enumeration stopped early (no users found yet)"
+                ),
+            )
+            return recovered
 
         if result.returncode != 0:
             # A non-zero exit can still follow a partially populated -o file

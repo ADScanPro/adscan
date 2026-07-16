@@ -2417,17 +2417,13 @@ def run_mssql_impersonate(
 def _classify_minted_secret_kind(secret: str) -> str:
     """Classify a minted account secret for transport config builders.
 
-    Returns one of ``"password"`` / ``"nt_hash"`` / ``"ccache"``. The minted
-    account is normally created with a generated password, but the operator can
-    override the identity with an NT hash or a ccache path, so classify
-    defensively.
+    Delegates to the SSOT ``native_account_cleanup.classify_secret_kind`` so the
+    minted-account LDAP-delete and remote-exec paths share one classifier.
+    Returns one of ``"password"`` / ``"nt_hash"`` / ``"ccache"``.
     """
-    value = str(secret or "").strip()
-    if value.lower().endswith(".ccache"):
-        return "ccache"
-    if len(value) == 32 and all(c in "0123456789abcdefABCDEF" for c in value):
-        return "nt_hash"
-    return "password"
+    from adscan_internal.services.native_account_cleanup import classify_secret_kind
+
+    return classify_secret_kind(secret)
 
 
 def _delete_minted_account_via_ldap(
@@ -2440,96 +2436,31 @@ def _delete_minted_account_via_ldap(
     """Delete a freshly-minted DOMAIN account via native LDAP, as that account.
 
     A brand-new Domain Admin has full LDAP rights but is NOT a SQL sysadmin
-    login, so it cannot run ``xp_cmdshell``. The minted DA credential is used to
-    bind to the DC over the canonical ADscan LDAP entry point (LDAPS with the
-    transparent LDAPS->LDAP fallback), resolve the account DN by
-    sAMAccountName, and delete the object. Returns True only when the object is
-    confirmed gone (delete succeeded or a follow-up resolve finds nothing).
+    login, so it cannot run ``xp_cmdshell``. Thin wrapper over the SSOT
+    ``native_account_cleanup.delete_domain_account_via_ldap`` (the same helper the
+    HasSession del-user rollback uses): binds AS the minted account over the
+    canonical LDAPS->LDAP fallback transport, resolves the DN by sAMAccountName
+    and deletes it. Returns True only when the object is confirmed gone.
     """
-    from adscan_internal.models.domain import (  # noqa: PLC0415
-        resolve_dc_fqdn,
-        resolve_dc_ip,
-    )
-    from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
-    from adscan_internal.services.domain_posture import get_posture  # noqa: PLC0415
-    from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
-        ADscanLDAPConfig,
-        async_connect_with_ldap_fallback,
+    from adscan_internal.services.native_account_cleanup import (  # noqa: PLC0415
+        delete_domain_account_via_ldap,
     )
 
     marked = mark_sensitive(admin_username, "user")
     marked_domain = mark_sensitive(domain, "domain")
 
-    domain_record = (getattr(shell, "domains_data", None) or {}).get(domain) or {}
-    dc_ip = resolve_dc_ip(domain_record)
-    if not dc_ip:
-        print_warning(
-            f"LDAP delete of {marked} skipped: no DC IP resolved for {marked_domain}."
-        )
-        return False
-    # FQDN is required for the Kerberos SPN when the credential is a ccache/AES
-    # ticket; for a password/NT-hash bind a plain LDAPS/LDAP bind is fine.
-    dc_fqdn = resolve_dc_fqdn(domain_record, target_domain=domain)
-    secret_kind = _classify_minted_secret_kind(admin_password)
-    use_kerberos = secret_kind == "ccache"
-
-    try:
-        posture_snapshot = get_posture(
-            getattr(shell, "domains_data", {}), domain=domain
-        )
-    except Exception:  # noqa: BLE001
-        posture_snapshot = None
-
-    config = ADscanLDAPConfig(
+    ok = delete_domain_account_via_ldap(
+        domains_data=getattr(shell, "domains_data", None) or {},
         domain=domain,
-        dc_ip=dc_ip,
-        use_ldaps=True,
-        use_kerberos=use_kerberos,
-        username=admin_username if secret_kind != "ccache" else None,
-        # badldap takes both passwords and NT hashes through the password field
-        # (NTLM mechanism); a ccache path goes through ``ccache_path`` instead.
-        password=admin_password if secret_kind in {"password", "nt_hash"} else None,
-        kerberos_target_hostname=dc_fqdn if use_kerberos else None,
-        ccache_path=admin_password if secret_kind == "ccache" else None,
-        posture_snapshot=posture_snapshot,
+        username=admin_username,
+        secret=admin_password,
     )
-
-    async def _delete() -> bool:
-        conn = None
-        try:
-            conn, _used_ldaps = await async_connect_with_ldap_fallback(config)
-            user, err = await conn.get_user(admin_username)
-            if err is not None:
-                raise err
-            if user is None:
-                # Already gone — treat as a confirmed deletion.
-                return True
-            user_dn = getattr(user, "distinguishedName", None)
-            if not user_dn:
-                return False
-            ok, del_err = await conn.delete_user(user_dn)
-            if del_err is not None:
-                raise del_err
-            if ok:
-                return True
-            # Verify by re-resolving: a missing object confirms deletion.
-            check, check_err = await conn.get_user(admin_username)
-            return check_err is None and check is None
-        finally:
-            if conn is not None:
-                try:
-                    await conn.disconnect()
-                except Exception:  # noqa: BLE001
-                    pass
-
-    try:
-        return bool(run_async_sync(_delete()))
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
+    if not ok:
         print_info_debug(
-            f"[mssql][revert] LDAP delete of {marked} on {marked_domain} failed: {exc}"
+            f"[mssql][revert] native LDAP delete of {marked} on {marked_domain} "
+            "did not confirm."
         )
-        return False
+    return ok
 
 
 def _delete_minted_account_via_remote_exec(

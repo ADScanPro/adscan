@@ -1110,18 +1110,20 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         dcsync_username = context.exec_username
         dcsync_password = context.exec_password
         try:
-            from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+            from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
             from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
                 resolve_execution_credential,
             )
 
             _domain_data = getattr(shell, "domains_data", {}).get(context.domain, {})
-            _dc_host = (
-                _domain_data.get("dc_fqdn")
-                or _domain_data.get("pdc_hostname_fqdn")
-                or resolve_dc_ip(_domain_data)
-                or ""
-            )
+            # Resolve the DC via the FQDN SSOT (CLAUDE.md "Kerberos SPNs — always
+            # FQDN"). The old ``dc_fqdn -> pdc_hostname_fqdn -> resolve_dc_ip``
+            # chain skipped the short ``pdc_hostname`` rung and returned a raw IP
+            # in best-effort mode, which cannot serve a ``cifs`` service ticket
+            # (SEC_E_LOGON_DENIED). ``resolve_dc_fqdn`` promotes a short hostname
+            # to ``<host>.<domain>`` and adds the workspace inventory fallback, so
+            # the scoped-ticket lookup below keys on a real FQDN, never an IP.
+            _dc_host = resolve_dc_fqdn(_domain_data, target_domain=context.domain) or ""
             if _dc_host:
                 # relation="dcsync" -> cifs (DRSUAPI replicates over an aiosmb SMB
                 # connection, NOT ldap). The central map owns the service class so

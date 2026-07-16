@@ -210,82 +210,83 @@ class LdapShell(Protocol):
     base_dn: str | None
 
 
-_IP_TOKEN_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-_OBSOLETE_OS_PATTERN = re.compile(
-    r"(?i)\b(windows(?:\s+server)?\s+[0-9a-z][0-9a-z .\-]*?(?:r2)?)(?=\s+is\s+obsolete\b|\s*$)"
-)
-_NETEXEC_LDAP_FIELD_PATTERN = re.compile(r"\(([^:()]+):([^)]+)\)")
-_NETEXEC_OBSOLETE_HOST_LINE_PATTERN = re.compile(
-    r"(?i)\bobsolete\b.*?\b(?P<host>[a-z0-9][a-z0-9_.-]*)\s+\((?P<ip>[^)]+)\)\s*:\s*(?P<operating_system>windows[^\r\n]+?)\s*$"
-)
-
-
 def _normalize_obsolete_host_key(value: object) -> str:
     """Return a stable case-insensitive key for obsolete-host deduplication."""
     return str(value or "").strip().rstrip(".").lower()
 
 
-def parse_netexec_obsolete_output(output: str) -> dict[str, object]:
-    """Parse NetExec LDAP obsolete-module output into structured evidence."""
-    try:
-        from adscan_internal.text_utils import strip_ansi_codes
-    except Exception:  # pragma: no cover
+def _obsolete_host_label_for_node(
+    node: dict[str, object],
+    props: dict[str, object],
+) -> str:
+    """Pick the best operator-facing host label for one Computer node.
 
-        def strip_ansi_codes(value: str) -> str:
-            return value
+    Prefers the DNS host name (an FQDN the current-vantage resolver can match),
+    then the sAMAccountName stem, then the node label. Trailing ``$`` and any
+    ``@DOMAIN`` suffix are stripped so the value flows cleanly into viability
+    resolution and the summary table.
+    """
+    dnshostname = str(props.get("dnshostname") or "").strip()
+    if dnshostname:
+        return dnshostname
+    samaccountname = str(props.get("samaccountname") or "").strip().rstrip("$")
+    if samaccountname:
+        return samaccountname
+    name = str(props.get("name") or node.get("label") or "").strip()
+    return name.split("@", 1)[0].strip().rstrip("$")
 
-    normalized = strip_ansi_codes(output or "").strip()
-    if not normalized:
-        return {}
 
-    entries: list[dict[str, str]] = []
+def collect_obsolete_computers_from_graph(
+    shell: LdapShell,
+    *,
+    domain: str,
+) -> dict[str, object] | None:
+    """Build obsolete-host evidence from the native collector's computer inventory.
+
+    Reads the collected attack graph for ``domain`` and flags every Computer node
+    whose ``operatingSystem`` (persisted as the ``os`` node property) matches the
+    native obsolete-OS classifier (``audit_analyzer._is_obsolete_os`` — the single
+    source of truth also used by the audit findings pipeline). The returned payload
+    mirrors the structure the former NetExec parser produced, so the existing
+    renderers and technical-report persistence stay untouched.
+
+    Returns ``None`` when no computer inventory has been collected yet (attack graph
+    missing or containing no Computer nodes), so the caller can prompt the operator
+    to run graph collection instead of showing a misleading "no obsolete hosts"
+    result.
+    """
+    from adscan_internal.services.attack_graph_service import load_attack_graph
+    from adscan_internal.services.collector.audit_analyzer import _is_obsolete_os
+
+    graph = load_attack_graph(shell, domain)
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    if not isinstance(nodes, dict):
+        return None
+
+    computer_nodes = [
+        node
+        for node in nodes.values()
+        if isinstance(node, dict)
+        and str(node.get("kind") or "").strip().lower() == "computer"
+    ]
+    if not computer_nodes:
+        return None
+
+    entries: list[dict[str, object]] = []
     seen_hosts: set[str] = set()
     hosts: list[str] = []
     operating_system_counts: dict[str, int] = {}
 
-    for raw_line in normalized.splitlines():
-        line = raw_line.strip()
-        if not line or "obsolete" not in line.lower():
+    for node in computer_nodes:
+        props = node.get("properties")
+        props = props if isinstance(props, dict) else {}
+        operating_system = str(props.get("os") or "").strip()
+        if not operating_system or not _is_obsolete_os(operating_system):
             continue
 
-        entry: dict[str, str] = {"raw_line": line}
-        host: str | None = None
-        operating_system: str | None = None
-
-        detailed_match = _NETEXEC_OBSOLETE_HOST_LINE_PATTERN.search(line)
-        if detailed_match:
-            host = detailed_match.group("host").strip()
-            operating_system = detailed_match.group("operating_system").strip()
-            entry["host"] = host
-            entry["ip"] = detailed_match.group("ip").strip()
-            entry["operating_system"] = operating_system
-        else:
-            tokens = line.split()
-            if len(tokens) >= 4 and tokens[0].upper() in {"LDAP", "SMB"}:
-                if _IP_TOKEN_PATTERN.match(tokens[1]) and tokens[2].isdigit():
-                    host = tokens[3]
-
-            if not host:
-                host_match = re.search(
-                    r"(?i)\b([a-z0-9][a-z0-9_.-]*\.[a-z0-9.-]+|[a-z0-9][a-z0-9_-]{1,63})\b",
-                    line,
-                )
-                if host_match:
-                    candidate = host_match.group(1)
-                    if candidate.lower() not in {"ldap", "smb", "obsolete", "module"}:
-                        host = candidate
-
-            if host:
-                entry["host"] = host
-
-            os_match = _OBSOLETE_OS_PATTERN.search(line)
-            if os_match:
-                operating_system = os_match.group(1).strip()
-                entry["operating_system"] = operating_system
-
-        if not host or not operating_system:
+        host = _obsolete_host_label_for_node(node, props)
+        if not host:
             continue
-
         host_key = _normalize_obsolete_host_key(host)
         if host_key in seen_hosts:
             continue
@@ -294,10 +295,19 @@ def parse_netexec_obsolete_output(output: str) -> dict[str, object]:
         operating_system_counts[operating_system] = (
             int(operating_system_counts.get(operating_system) or 0) + 1
         )
+
+        entry: dict[str, object] = {
+            "host": host,
+            "operating_system": operating_system,
+            "raw_line": f"{host} : {operating_system}",
+        }
+        ip_address = str(props.get("ip_address") or "").strip()
+        if ip_address:
+            entry["ip"] = ip_address
         entries.append(entry)
 
     return {
-        "raw_output": normalized,
+        "source": "native_collector",
         "count": len(hosts),
         "hosts": hosts,
         "entries": entries,
@@ -642,119 +652,6 @@ def _render_obsolete_computers_summary(
         )
 
 
-def _is_ldap_signing_hardened(value: str | None) -> bool:
-    """Return whether the reported LDAP signing posture looks hardened."""
-    normalized = str(value or "").strip().lower()
-    if not normalized:
-        return False
-    return normalized not in {"none", "false", "disabled", "off", "no"}
-
-
-def _is_ldap_channel_binding_hardened(value: str | None) -> bool:
-    """Return whether the reported channel binding posture looks hardened."""
-    normalized = str(value or "").strip().lower()
-    if not normalized:
-        return False
-    return normalized not in {
-        "none",
-        "false",
-        "disabled",
-        "off",
-        "no",
-        "never",
-        "no tls cert",
-        "not supported",
-    }
-
-
-def parse_netexec_ldap_security_output(output: str) -> dict[str, object]:
-    """Parse NetExec LDAP banner lines into signing/channel binding posture."""
-    try:
-        from adscan_internal.text_utils import strip_ansi_codes
-    except Exception:  # pragma: no cover
-
-        def strip_ansi_codes(value: str) -> str:
-            return value
-
-    normalized = strip_ansi_codes(output or "").strip()
-    if not normalized:
-        return {}
-
-    entries: list[dict[str, object]] = []
-    for raw_line in normalized.splitlines():
-        line = raw_line.strip()
-        if (
-            not line
-            or "(signing:" not in line.lower()
-            or "(channel binding:" not in line.lower()
-        ):
-            continue
-
-        entry: dict[str, object] = {"raw_line": line}
-        tokens = line.split()
-        if len(tokens) >= 4 and tokens[0].upper() == "LDAP":
-            if _IP_TOKEN_PATTERN.match(tokens[1]) and tokens[2].isdigit():
-                entry["target_ip"] = tokens[1]
-                entry["port"] = tokens[2]
-                entry["target_name"] = tokens[3]
-
-        field_map: dict[str, str] = {}
-        for match in _NETEXEC_LDAP_FIELD_PATTERN.finditer(line):
-            key = str(match.group(1) or "").strip().lower()
-            value = str(match.group(2) or "").strip()
-            if key:
-                field_map[key] = value
-
-        signing = field_map.get("signing")
-        channel_binding = field_map.get("channel binding")
-        if signing is not None:
-            entry["signing"] = signing
-            entry["signing_hardened"] = _is_ldap_signing_hardened(signing)
-        if channel_binding is not None:
-            entry["channel_binding"] = channel_binding
-            entry["channel_binding_hardened"] = _is_ldap_channel_binding_hardened(
-                channel_binding
-            )
-        if "name" in field_map:
-            entry["server_name"] = field_map["name"]
-        if "domain" in field_map:
-            entry["domain_name"] = field_map["domain"]
-
-        entries.append(entry)
-
-    if not entries:
-        return {}
-
-    insecure_signing_targets: list[str] = []
-    insecure_channel_binding_targets: list[str] = []
-    risky_targets: list[str] = []
-
-    for entry in entries:
-        target_name = str(
-            entry.get("server_name")
-            or entry.get("target_name")
-            or entry.get("target_ip")
-            or "unknown"
-        )
-        signing_hardened = bool(entry.get("signing_hardened"))
-        channel_binding_hardened = bool(entry.get("channel_binding_hardened"))
-        if not signing_hardened:
-            insecure_signing_targets.append(target_name)
-        if not channel_binding_hardened:
-            insecure_channel_binding_targets.append(target_name)
-        if not signing_hardened or not channel_binding_hardened:
-            risky_targets.append(target_name)
-
-    return {
-        "raw_output": normalized,
-        "dc_count": len(entries),
-        "entries": entries,
-        "insecure_signing_targets": insecure_signing_targets,
-        "insecure_channel_binding_targets": insecure_channel_binding_targets,
-        "risky_targets": risky_targets,
-    }
-
-
 def _build_ldap_security_targets(
     shell: LdapShell, *, domain: str
 ) -> list[dict[str, str]]:
@@ -1036,33 +933,33 @@ def _record_obsolete_computers_finding(
     shell: LdapShell,
     *,
     domain: str,
-    command_output: str | None = None,
     parsed: dict[str, object] | None = None,
 ) -> None:
     """Persist obsolete-computer evidence into the technical report."""
-    parsed_payload = parsed or parse_netexec_obsolete_output(command_output or "")
-    if parsed and not isinstance(parsed_payload.get("entries"), list):
-        parsed_payload = parse_netexec_obsolete_output(command_output or "")
-    if not parsed_payload:
+    if not parsed or not isinstance(parsed, dict):
         return
 
     try:
         from adscan_core.reporting.technical_report import record_technical_finding
 
         workspace_cwd = shell._get_workspace_cwd()
-        ldap_dir = domain_subpath(workspace_cwd, shell.domains_dir, domain, "ldap")
-        artifact_path = os.path.join(ldap_dir, "obsolete.log")
+        artifact_path = domain_subpath(
+            workspace_cwd, shell.domains_dir, domain, "attack_graph.json"
+        )
 
         record_technical_finding(
             shell,
             domain,
             key="obsolete_computers",
-            value=bool(parsed_payload.get("hosts")),
-            details=parsed_payload,
+            value=bool(parsed.get("hosts")),
+            details=parsed,
             evidence=[
                 {
                     "type": "artifact",
-                    "summary": "NetExec obsolete operating systems output",
+                    "summary": (
+                        "Obsolete operating systems derived from the collected "
+                        "computer inventory"
+                    ),
                     "artifact_path": artifact_path,
                 }
             ],
@@ -1080,34 +977,29 @@ def _record_obsolete_computers_finding(
             )
 
 
-def execute_netexec_obsolete(shell: LdapShell, *, command: str, domain: str) -> None:
-    """Execute NetExec obsolete-module command and persist structured results."""
-    try:
-        completed_process = shell._run_netexec(
-            command,
-            domain=domain,
-            timeout=900,
-            operation_kind="obsolete_os",
-            service="ldap",
-            target_count=1,
-        )
+def execute_netexec_obsolete(shell: LdapShell, *, domain: str) -> None:
+    """Audit obsolete operating systems from the native collector inventory.
 
-        if completed_process.returncode != 0:
-            print_error(
-                "Error searching for obsolete operating systems. "
-                f"Return code: {completed_process.returncode}"
+    Derives the obsolete-host list from the collected attack-graph Computer nodes
+    (``os`` node property + the native ``_is_obsolete_os`` classifier) instead of
+    shelling out to a subprocess auditor. When no computer inventory has been
+    collected yet, the operator is prompted to run graph collection first rather
+    than being shown a misleading empty result.
+    """
+    try:
+        parsed = collect_obsolete_computers_from_graph(shell, domain=domain)
+        if parsed is None:
+            marked_domain = mark_sensitive(domain, "domain")
+            print_warning(
+                f"No collected computer inventory is available for {marked_domain}, "
+                "so obsolete operating systems cannot be audited yet."
             )
-            error_message = (
-                completed_process.stderr.strip()
-                if getattr(completed_process, "stderr", "")
-                else getattr(completed_process, "stdout", "").strip()
+            print_info(
+                "Run graph collection first (for example `adscan enum "
+                f"{marked_domain}`), then re-run this audit."
             )
-            if error_message:
-                print_error(f"Details: {error_message}")
             return
 
-        clean_stdout = str(getattr(completed_process, "stdout", "") or "").strip()
-        parsed = parse_netexec_obsolete_output(clean_stdout)
         parsed = _enrich_obsolete_entries_with_current_vantage(
             shell,
             domain=domain,
@@ -1127,12 +1019,11 @@ def execute_netexec_obsolete(shell: LdapShell, *, command: str, domain: str) -> 
         _record_obsolete_computers_finding(
             shell,
             domain=domain,
-            command_output=clean_stdout,
             parsed=parsed if isinstance(parsed, dict) else None,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
-        print_error("Error executing netexec obsolete operating system audit.")
+        print_error("Error auditing obsolete operating systems.")
         print_exception(show_locals=False, exception=exc)
 
 
@@ -1152,7 +1043,16 @@ def execute_netexec_ldap_security(
 
     results: list[dict[str, object]] = []
     combined_output_blocks: list[str] = []
-    target_count = len(targets)
+
+    # Native LDAP posture: reuse the single-source-of-truth detection probes
+    # (posture_probe) per DC instead of parsing a subprocess auditor's banner.
+    # The shared workspace sink lets the domain posture cache learn each
+    # observed signing/CBT verdict as a side effect.
+    from adscan_internal.services.async_bridge import run_async_sync
+    from adscan_internal.services.posture_probe import probe_ldap_security_for_dc
+    from adscan_internal.services.posture_sink import make_workspace_posture_sink
+
+    posture_sink = make_workspace_posture_sink(shell.domains_data)
 
     for target in targets:
         connect_target = str(target.get("connect_target") or "").strip()
@@ -1160,32 +1060,38 @@ def execute_netexec_ldap_security(
         if not connect_target:
             continue
 
-        command = f"{shell.netexec_path} ldap {connect_target}"
         try:
-            completed_process = shell._run_netexec(
-                command,
-                domain=domain,
-                timeout=300,
-                operation_kind="ldap_security_posture",
-                service="ldap",
-                target_count=target_count,
-            )
-
-            stdout = str(getattr(completed_process, "stdout", "") or "").strip()
-            stderr = str(getattr(completed_process, "stderr", "") or "").strip()
-            if stdout:
-                combined_output_blocks.append(f"# Target: {target_label}\n{stdout}")
-            elif stderr:
-                combined_output_blocks.append(
-                    f"# Target: {target_label}\n[stderr]\n{stderr}"
+            parsed = run_async_sync(
+                probe_ldap_security_for_dc(
+                    domain=domain,
+                    dc_ip=connect_target,
+                    sink=posture_sink,
+                    timeout=5.0,
                 )
-
-            parsed = parse_netexec_ldap_security_output(stdout)
+            )
+            if not isinstance(parsed, dict):
+                parsed = {}
+            entries = parsed.get("entries")
+            if isinstance(entries, list) and entries:
+                entry = entries[0]
+                block = (
+                    f"# Target: {target_label}\n"
+                    f"signing: {entry.get('signing')} "
+                    f"(hardened={entry.get('signing_hardened')}); "
+                    f"channel binding: {entry.get('channel_binding')} "
+                    f"(hardened={entry.get('channel_binding_hardened')})"
+                )
+            else:
+                block = (
+                    f"# Target: {target_label}\n"
+                    "[unreachable] the DC did not return a conclusive LDAP posture."
+                )
+            combined_output_blocks.append(block)
             results.append(
                 {
                     "target_label": target_label,
-                    "command": command,
-                    "returncode": int(getattr(completed_process, "returncode", 0) or 0),
+                    "command": "native:ldap-posture-probe",
+                    "returncode": 0,
                     "parsed": parsed,
                 }
             )
@@ -1197,7 +1103,7 @@ def execute_netexec_ldap_security(
             results.append(
                 {
                     "target_label": target_label,
-                    "command": command,
+                    "command": "native:ldap-posture-probe",
                     "returncode": 1,
                     "parsed": {},
                 }
@@ -1233,57 +1139,22 @@ def execute_netexec_ldap_security(
 
 
 def run_netexec_obsolete(shell: LdapShell, *, domain: str) -> None:
-    """Run NetExec LDAP obsolete-module against the domain controller."""
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-        )
-        return
+    """Audit obsolete operating systems from the native collector's inventory.
 
-    domain_creds = shell.domains_data.get(domain, {})
-    username = domain_creds.get("username")
-    password = domain_creds.get("password")
-    if not username or not password:
-        marked_domain = mark_sensitive(domain, "domain")
-        print_error(
-            f"Missing credentials for {marked_domain}. Cannot audit obsolete operating systems."
-        )
-        return
-
-    use_kerberos = False
-    if hasattr(shell, "do_sync_clock_with_pdc"):
-        use_kerberos = bool(shell.do_sync_clock_with_pdc(domain))
-
-    auth = shell.build_auth_nxc(
-        username,
-        password,
-        domain,
-        kerberos=use_kerberos,
-    )
-    pdc_target = shell.domains_data[domain]["pdc"]
-    pdc_hostname = str(shell.domains_data[domain].get("pdc_hostname") or "").strip()
-    if use_kerberos and pdc_hostname:
-        pdc_target = f"{pdc_hostname}.{domain}"
-
-    log_path = domain_relpath(shell.domains_dir, domain, "ldap", "obsolete.log")
+    The obsolete-OS list is derived from the already-collected attack-graph
+    Computer nodes (the ``operatingSystem`` LDAP attribute the native collector
+    stores as the ``os`` node property), so this is a read-only display over
+    existing data — no additional network traffic or subprocess auditor.
+    """
     marked_domain = mark_sensitive(domain, "domain")
-    command = (
-        f"{shell.netexec_path} ldap {pdc_target} {auth} -M obsolete --log {log_path}"
-    )
     print_info_verbose(
         f"Auditing obsolete operating systems for domain {marked_domain}"
     )
-    execute_netexec_obsolete(shell, command=command, domain=domain)
+    execute_netexec_obsolete(shell, domain=domain)
 
 
 def run_netexec_ldap_security(shell: LdapShell, *, domain: str) -> None:
-    """Run LDAP signing/channel binding posture checks against known DCs."""
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-        )
-        return
-
+    """Audit LDAP signing / channel-binding posture against known DCs natively."""
     targets = _build_ldap_security_targets(shell, domain=domain)
     marked_domain = mark_sensitive(domain, "domain")
     print_info_verbose(
@@ -2149,17 +2020,16 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
 
 
 def run_ldap_computers(shell: LdapShell, target_domain: str) -> list[str] | None:
-    """Enumerate LDAP computers (authenticated) using NetExec LDAP --computers."""
+    """Enumerate LDAP computers (authenticated) via a native badldap search.
+
+    Prefers the persisted collector inventory (``inventory/computers.json``)
+    when the native collector has already enumerated the domain; otherwise
+    falls back to a live native ``(objectCategory=computer)`` LDAP query.
+    """
     if target_domain not in shell.domains:
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_error(
             f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
-        )
-        return None
-
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
         )
         return None
 
@@ -2168,7 +2038,9 @@ def run_ldap_computers(shell: LdapShell, target_domain: str) -> list[str] | None
         return None
 
     username = shell.domains_data[shell.domain].get("username")
-    password = shell.domains_data[shell.domain].get("password")
+    password = shell.domains_data[shell.domain].get("password") or shell.domains_data[
+        shell.domain
+    ].get("nt_hash")
     if not username or not password:
         print_error(
             "Missing credentials (username/password) for LDAP computer enumeration."
@@ -2176,37 +2048,85 @@ def run_ldap_computers(shell: LdapShell, target_domain: str) -> list[str] | None
         return None
 
     output_rel = domain_relpath(shell.domains_dir, target_domain, "computers.txt")
-    print_operation_header(
-        "LDAP Computer Enumeration",
-        details={
-            "Target Domain": target_domain,
-            "Auth Domain": shell.domain,
-            "Username": username,
-            "LDAP Server": shell.domains_data[target_domain]["pdc"],
-            "Output": output_rel,
-        },
-        icon="💻",
-    )
 
-    enum_service = EnumerationService()
-    executor = shell._get_service_executor()
-    computers = enum_service.ldap.enumerate_computers(
-        domain=target_domain,
-        pdc=shell.domains_data[target_domain]["pdc"],
-        auth_mode=AuthMode.AUTHENTICATED,
-        username=username,
-        password=password,
-        netexec_path=shell.netexec_path,
-        executor=executor,
-        scan_id=None,
-        timeout=120,
-    )
+    # ── Source selection: prefer the persisted collector inventory ──────────
+    # The native LDAP collector already enumerated every computer object into
+    # ``inventory/computers.json``. When that snapshot exists, reuse it and
+    # skip the live LDAP query entirely; otherwise fall back to a native search.
+    inventory_hostnames = _load_computer_hostnames_from_inventory(shell, target_domain)
+    if inventory_hostnames is not None:
+        print_operation_header(
+            "LDAP Computer Enumeration",
+            details={
+                "Target Domain": target_domain,
+                "Auth Domain": shell.domain,
+                "Username": username,
+                "Source": "Collector inventory (computers.json)",
+                "Output": output_rel,
+            },
+            icon="💻",
+        )
+        hostnames = inventory_hostnames
+    else:
+        print_operation_header(
+            "LDAP Computer Enumeration",
+            details={
+                "Target Domain": target_domain,
+                "Auth Domain": shell.domain,
+                "Username": username,
+                "LDAP Server": shell.domains_data[target_domain]["pdc"],
+                "Mode": "Native badldap (single paged search)",
+                "Output": output_rel,
+            },
+            icon="💻",
+        )
 
-    hostnames = [
-        c.dns_hostname or c.hostname
-        for c in computers
-        if (c.dns_hostname or c.hostname)
-    ]
+        # Posture wiring: let the auth planner skip a doomed LDAPS:636 connect
+        # when the workspace already knows LDAPS is unavailable, and let a fresh
+        # 636 transport failure record the signal for downstream consumers.
+        posture_snapshot = None
+        posture_sink = None
+        domains_data = getattr(shell, "domains_data", None)
+        if domains_data is not None:
+            try:
+                from adscan_internal import get_console
+                from adscan_internal.cli.widgets.intelligence_update import (
+                    render_intelligence_update,
+                )
+                from adscan_internal.services.domain_posture import get_posture
+                from adscan_internal.services.posture_sink import (
+                    make_workspace_posture_sink,
+                )
+
+                posture_snapshot = get_posture(domains_data, domain=target_domain)
+                posture_sink = make_workspace_posture_sink(
+                    domains_data,
+                    on_finding=lambda finding: get_console().print(
+                        render_intelligence_update(finding)
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_info_debug(f"[ldap-computers] posture wiring skipped: {exc}")
+
+        enum_service = EnumerationService()
+        computers = enum_service.ldap.enumerate_computers(
+            domain=target_domain,
+            pdc=shell.domains_data[target_domain]["pdc"],
+            auth_mode=AuthMode.AUTHENTICATED,
+            username=username,
+            password=password,
+            scan_id=None,
+            timeout=120,
+            posture_snapshot=posture_snapshot,
+            posture_sink=posture_sink,
+        )
+
+        hostnames = [
+            c.dns_hostname or c.hostname
+            for c in computers
+            if (c.dns_hostname or c.hostname)
+        ]
     shell._write_domain_list_file(target_domain, "computers.txt", hostnames)
     shell._display_items(hostnames, "Computers")
 
@@ -2278,18 +2198,60 @@ def _run_enum_domain_auth(
             f"domain_auth={snapshot.domain_auth!r}"
         )
         if snapshot.has_attack_graph or snapshot.phase1_complete:
-            action, _ = resolve_workspace_action(shell, domain, snapshot=snapshot)
-            workspace_action = action.value
-            print_info_debug(
-                f"[ldap._run_enum_domain_auth] resolved action={action.value!r} for {domain}"
-            )
+            # One-shot resume-offer collapse: when the operator already chose
+            # "Resume" in the incomplete-scan offer (workspace_resume_offer), the
+            # workspace-action panel and the phase-scope prompt below are the same
+            # decision asked twice. Read-and-clear the flag so it fires EXACTLY
+            # once — a later direct enum_domain_auth / start_auth in the same
+            # session still gets the genuine four-action panel.
+            predecided = getattr(shell, "_resume_action_predecided", None)
+            if predecided is not None:
+                try:
+                    shell._resume_action_predecided = None
+                except Exception:  # noqa: BLE001 - clearing must never break the scan
+                    pass
 
-            if action is WorkspaceAction.INSPECT:
-                print_info(
-                    "Workspace opened for inspection. Run `adscan show` "
-                    "or re-invoke the scan when ready."
+            if predecided is WorkspaceAction.RESUME:
+                # Skip resolve_workspace_action (the workspace-action panel) AND
+                # maybe_prompt_phase_preset (the phase-scope prompt): the offer we
+                # already showed carries the orientation + the RESUME choice, and
+                # the preset's default ("Run all phases") equals the resume
+                # default, so skipping is behaviour-identical minus the click.
+                # Still record the decision on the event sink so the web dashboard
+                # sees the same RESUME the operator made.
+                from adscan_internal.cli.workspace_resume_panel import (
+                    _emit_action_event,
                 )
-                return
+
+                action = WorkspaceAction.RESUME
+                workspace_action = action.value
+                _emit_action_event(action, snapshot, source="resume_offer")
+                print_info_debug(
+                    "[ldap._run_enum_domain_auth] resume-offer predecided RESUME: "
+                    "skipping workspace-action panel + phase-scope prompt"
+                )
+            else:
+                action, _ = resolve_workspace_action(shell, domain, snapshot=snapshot)
+                workspace_action = action.value
+                print_info_debug(
+                    f"[ldap._run_enum_domain_auth] resolved action={action.value!r} for {domain}"
+                )
+
+                if action is WorkspaceAction.INSPECT:
+                    print_info(
+                        "Workspace opened for inspection. Run `adscan show` "
+                        "or re-invoke the scan when ready."
+                    )
+                    return
+
+                # Optional power-user phase preset — offered once here (interactive
+                # only, default all phases) so it applies to whichever of Resume /
+                # Refresh / Replay runs below. No-op non-interactively.
+                from adscan_internal.cli.start_resume_frontdoor import (
+                    maybe_prompt_phase_preset,
+                )
+
+                maybe_prompt_phase_preset(shell)
 
             if action is WorkspaceAction.RESUME:
                 # Skip collection entirely, jump to analysis with cached graph.
@@ -2314,6 +2276,14 @@ def _run_enum_domain_auth(
                 )
                 shell.domains_data.setdefault(domain, {})["phase1_complete"] = False
                 shell.domains_data[domain]["_workspace_action"] = workspace_action
+                # Replay is a deliberate end-to-end re-run — drop the crash-resume
+                # checkpoint so every phase runs (not just the ones a prior
+                # interrupted run had not reached).
+                from adscan_internal.services.scan_progress import (
+                    reset_scan_progress,
+                )
+
+                reset_scan_progress(shell, domain)
                 try:
                     shell.do_sync_clock_with_pdc(domain)  # type: ignore[attr-defined]
                 except Exception as exc:  # noqa: BLE001
@@ -2328,6 +2298,11 @@ def _run_enum_domain_auth(
             )
             shell.domains_data.setdefault(domain, {})["phase1_complete"] = False
             shell.domains_data[domain]["_workspace_action"] = workspace_action
+            # Refresh re-collects + re-analyses end to end — drop the checkpoint
+            # so the resume gate does not skip phases on this deliberate re-run.
+            from adscan_internal.services.scan_progress import reset_scan_progress
+
+            reset_scan_progress(shell, domain)
 
     # Clock sync must be done against the KDC/realm used for Kerberos authentication.
     # In multi-domain setups, we may be scanning a target domain without having
@@ -2557,6 +2532,40 @@ def run_ldap_admincount_and_signing(
     return False
 
 
+def _group_names_from_memberof_dns(member_of_dns: list[str]) -> list[str]:
+    """Extract group names from a list of ``memberOf`` distinguished names.
+
+    ``CN=Domain Admins,CN=Users,DC=corp,DC=local`` -> ``Domain Admins``.
+
+    Pure logic (no network) so it is unit-testable. The first RDN value of each
+    DN is the group's common name; DNs with an escaped comma inside the CN are
+    handled by only splitting on the first unescaped ``,``.
+
+    Args:
+        member_of_dns: Raw ``memberOf`` DN strings.
+
+    Returns:
+        De-duplicated, order-preserving list of group common names.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for dn in member_of_dns:
+        text = str(dn or "").strip()
+        if not text:
+            continue
+        # First RDN, respecting a backslash-escaped comma inside the CN value.
+        first_rdn = re.split(r"(?<!\\),", text, maxsplit=1)[0].strip()
+        if "=" in first_rdn:
+            name = first_rdn.split("=", 1)[1].strip().replace("\\,", ",")
+        else:
+            name = first_rdn
+        key = name.casefold()
+        if name and key not in seen:
+            seen.add(key)
+            names.append(name)
+    return names
+
+
 def run_ldap_groupmembership_privileged(
     shell: LdapShell,
     *,
@@ -2564,69 +2573,66 @@ def run_ldap_groupmembership_privileged(
     username: str,
     password: str,
 ) -> dict | None:
-    """Fallback privilege check using NetExec LDAP `groupmembership` module."""
+    """Native fallback privilege check via the user's direct ``memberOf``.
+
+    Replaces the legacy ``nxc ldap -M groupmembership`` subprocess. Runs a
+    single native badldap query (Kerberos-first with NTLM fallback, through the
+    same posture-aware ``_run_native_ldap_query_attribute_values`` plumbing the
+    recursive lookups use) for the principal's direct ``memberOf`` group DNs,
+    then feeds the resolved group names into ``_parse_privileged_group_output``
+    so the returned dict shape is identical to the legacy path. This is the
+    non-recursive last-resort fallback reached only when the recursive in-chain
+    lookups return no data.
+    """
     if domain not in shell.domains_data:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"Domain {marked_domain} is not configured.")
         return None
 
-    if not shell.netexec_path:
-        print_error(
-            "NetExec (nxc) path not configured. Please ensure it's installed via 'adscan install'."
-        )
-        return None
-
-    if shell.do_sync_clock_with_pdc(domain):
-        auth_str = shell.build_auth_nxc(username, password, domain, kerberos=True)
-    else:
-        auth_str = shell.build_auth_nxc(username, password, domain)
-
-    pdc_hostname = shell.domains_data[domain]["pdc_hostname"]
-    pdc_fqdn = f"{pdc_hostname}.{domain}"
-    log_path = domain_relpath(
-        shell.domains_dir, domain, shell.ldap_dir, f"groupmembership_{username}.txt"
-    )
-    command = (
-        f"{shell.netexec_path} ldap {pdc_fqdn} {auth_str} "
-        f"--log {log_path} -M groupmembership -o USER={username}"
-    )
-
-    print_info_debug(f"[ldap-groupmembership] Command: {command}")
-    completed_process = shell.run_command(command, timeout=300)
-    if not completed_process:
-        marked_username = mark_sensitive(username, "user")
+    pdc = str(shell.domains_data[domain].get("pdc") or "").strip()
+    if not pdc:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(
-            f"Failed to execute LDAP group membership command for {marked_username}@{marked_domain}."
+            f"No PDC recorded for domain {marked_domain}; cannot query group membership."
         )
         return None
 
-    if _is_exact_ldap_connection_timeout_result(completed_process):
-        mark_exact_ldap_connection_timeout_state(shell)
-        print_info_debug(
-            "[ldap-groupmembership] Exact LDAP connection timeout detected; "
-            "skipping further LDAP groupmembership handling."
-        )
-        return None
-
-    if completed_process.returncode != 0:
-        output_str = completed_process.stdout or ""
-        errors_str = completed_process.stderr or ""
-        error_detail = errors_str.strip() if errors_str else output_str.strip()
+    sanitized_user = str(username).replace("'", "\\'")
+    member_query = (
+        f"(&(|(objectClass=user)(objectClass=computer))"
+        f"(sAMAccountName={sanitized_user}))"
+    )
+    member_of_dns = _run_native_ldap_query_attribute_values(
+        shell,
+        domain=domain,
+        ldap_query=member_query,
+        attribute="memberOf",
+        auth_username=str(username),
+        auth_password=str(password),
+        pdc=pdc,
+        timeout=300,
+        retries=2,
+        require_non_empty=False,
+        prefer_kerberos=True,
+        allow_ntlm_fallback=True,
+        debug_label="Direct memberOf",
+    )
+    if member_of_dns is None:
         marked_username = mark_sensitive(username, "user")
-        print_error(
-            f"Error executing NetExec for group membership check on {marked_username}. "
-            f"Return code: {completed_process.returncode}"
+        marked_domain = mark_sensitive(domain, "domain")
+        print_info_debug(
+            "[ldap-groupmembership] Native memberOf query returned no data for "
+            f"{marked_username}@{marked_domain}."
         )
-        if error_detail:
-            print_error(f"Details: {error_detail}")
         return None
 
-    output_str = completed_process.stdout or ""
+    group_names = _group_names_from_memberof_dns(member_of_dns)
+    raw_text = "\n".join(f"{name}@{domain}" for name in group_names)
+
     # Reuse the parser already exposed by the shell, when available.
     parser = getattr(shell, "_parse_privileged_group_output", None)
     if callable(parser):
-        return parser(output_str)
+        return parser(raw_text)
 
     return None
 
@@ -3238,17 +3244,51 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
 
     enum_service = EnumerationService()
     executor = shell._get_service_executor()
-    users = enum_service.kerberos.enumerate_users_kerberos(
-        domain=domain,
-        pdc=shell.domains_data[domain]["pdc"],
-        wordlist=wordlist,
-        kerbrute_path=kerbrute_path,
-        output_file=output_file,
-        executor=executor,
-        spawn=shell._get_service_spawner(),
-        scan_id=None,
-        timeout=300,
+
+    # Operator early-stop for this run. On a large wordlist (statistically-
+    # likely-usernames, thousands of candidates) this can take minutes to
+    # hours; the operator's first Ctrl+C (or the platform "Stop" sentinel)
+    # stops feeding candidates and continues the scan with the usernames
+    # found so far -- the SAME cooperative-stop contract as the SMB host
+    # enrichment sweep, via the generic token (see
+    # ``adscan_internal.services.cooperative_cancellation``).
+    from adscan_internal.services.cooperative_cancellation import (  # noqa: PLC0415
+        CooperativeCancellation,
+        cli_cooperative_stop,
+        cooperative_stop_sentinel_path,
     )
+
+    _workspace_root = getattr(shell, "current_workspace_dir", None)
+    user_enum_cancellation = CooperativeCancellation(
+        operation="kerberos_user_enum",
+        sentinel_path=(
+            cooperative_stop_sentinel_path(_workspace_root, "kerberos_user_enum")
+            if _workspace_root
+            else None
+        ),
+    )
+
+    with cli_cooperative_stop(
+        user_enum_cancellation,
+        shell=shell,
+        stop_message=(
+            "Kerberos user enumeration: stopping early and continuing the scan "
+            "with the usernames found so far. Press Ctrl+C again to abort the "
+            "whole scan."
+        ),
+    ):
+        users = enum_service.kerberos.enumerate_users_kerberos(
+            domain=domain,
+            pdc=shell.domains_data[domain]["pdc"],
+            wordlist=wordlist,
+            kerbrute_path=kerbrute_path,
+            output_file=output_file,
+            executor=executor,
+            spawn=shell._get_service_spawner(),
+            scan_id=None,
+            timeout=300,
+            cancellation=user_enum_cancellation,
+        )
     _record_kerberos_wordlist_attempt(
         domain=domain,
         kerberos_dir=Path(kerberos_dir),
@@ -3925,6 +3965,87 @@ def _infer_kerberos_username_pattern_via_runtime_probe(
     return "pattern", detected_pattern
 
 
+def _load_statistically_likely_candidates_with_cap(
+    shell: LdapShell,
+    wordlist_service: KerberosUsernameWordlistService,
+    stat_path: Path,
+    *,
+    domain: str,
+) -> set[str]:
+    """Load the statistically-likely wordlist, capped to a safe unattended budget.
+
+    The built-in statistically-likely wordlists are frequency-ordered (the
+    most common username ever the top of the file), so capping reads the TOP
+    of the file -- the highest-value candidates are never dropped. When the
+    list already fits within a safe unattended budget it is loaded whole,
+    unchanged from prior behavior. When it does not, the real candidate count
+    and true ETA are shown and the operator explicitly opts in to the full
+    run through the centralized non-interactive-safe prompt (default = the
+    capped/safe choice, so ``adscan ci`` never hangs on an hours-long
+    kerbrute run).
+
+    Args:
+        shell: The active shell, used for the opt-in prompt.
+        wordlist_service: Service used for the unchanged, below-cap load path.
+        stat_path: Path to the frequency-ordered statistically-likely wordlist.
+        domain: Target domain, used only for the operator-facing message.
+
+    Returns:
+        The set of normalized username candidates to use.
+    """
+    from adscan_internal.services.enumeration.kerberos import (
+        compute_default_wordlist_cap,
+        estimate_kerbrute_duration_seconds,
+    )
+    from adscan_core.tui.progress_dashboard import format_eta
+
+    try:
+        with stat_path.open(encoding="utf-8", errors="ignore") as handle:
+            total_candidates = sum(1 for line in handle if line.strip())
+    except OSError:
+        return wordlist_service.load_candidates_from_file(stat_path)
+
+    default_cap = compute_default_wordlist_cap()
+    if total_candidates <= default_cap:
+        return wordlist_service.load_candidates_from_file(stat_path)
+
+    marked_domain = mark_sensitive(domain, "domain")
+    full_eta = format_eta(estimate_kerbrute_duration_seconds(total_candidates))
+    capped_eta = format_eta(estimate_kerbrute_duration_seconds(default_cap))
+
+    print_warning(
+        f"The statistically-likely username list for {marked_domain} has "
+        f"{total_candidates:,} candidates -- a full Kerberos enumeration run "
+        f"would take {full_eta}."
+    )
+
+    choice_idx = shell._questionary_select(
+        "How do you want to proceed?",
+        [
+            f"Use the {default_cap:,} most likely candidates (~{capped_eta}) — Recommended",
+            f"Run the full {total_candidates:,}-candidate list (~{full_eta})",
+        ],
+        default_idx=0,
+    )
+
+    if choice_idx == 1:
+        return wordlist_service.load_candidates_from_file(stat_path)
+
+    capped_candidates: set[str] = set()
+    try:
+        with stat_path.open(encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                candidate = normalize_username_candidate(line)
+                if not candidate:
+                    continue
+                capped_candidates.add(candidate)
+                if len(capped_candidates) >= default_cap:
+                    break
+    except OSError:
+        pass
+    return capped_candidates
+
+
 def _build_focused_kerberos_wordlist_for_pattern(
     shell: LdapShell,
     domain: str,
@@ -3998,7 +4119,9 @@ def _build_focused_kerberos_wordlist_for_pattern(
                 f"'{USERNAME_PATTERN_LABELS.get(pattern_key, pattern_key)}' format."
             )
         else:
-            stat_candidates = wordlist_service.load_candidates_from_file(stat_path)
+            stat_candidates = _load_statistically_likely_candidates_with_cap(
+                shell, wordlist_service, stat_path, domain=domain
+            )
             merged_candidates.update(stat_candidates)
             source_metadata.append(
                 KerberosWordlistSourceMetadata(
@@ -5237,6 +5360,64 @@ _CRED_FIELD_LIVE_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _load_computer_hostnames_from_inventory(
+    shell: LdapShell, domain: str
+) -> list[str] | None:
+    """Read persisted computer hostnames from ``inventory/computers.json``.
+
+    The native LDAP collector persists every computer object (with its
+    ``dnshostname`` property and ``samaccountname``) into the domain inventory.
+    Reuse that snapshot so this flow does not re-query LDAP when the collector
+    has already run. Uses the same workspace-aware inventory path API
+    (``domain_subpath`` + ``read_json_file``) as the users-inventory loader.
+
+    Returns:
+        A de-duplicated, sorted list of hostnames (``dnshostname`` when present,
+        else ``samaccountname`` without the trailing ``$``) when the inventory
+        file exists and holds computer records, otherwise ``None`` so the caller
+        falls back to a live native query.
+    """
+    workspace_cwd = (
+        shell._get_workspace_cwd()  # noqa: SLF001
+        if hasattr(shell, "_get_workspace_cwd")
+        else getattr(shell, "current_workspace_dir", "")
+    )
+    domains_dir = getattr(shell, "domains_dir", "domains")
+    inventory_path = domain_subpath(
+        workspace_cwd, domains_dir, domain, "inventory", "computers.json"
+    )
+    if not os.path.exists(inventory_path):
+        return None
+
+    try:
+        payload = read_json_file(inventory_path)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_info_debug(f"[ldap-computers] failed to read computers inventory: {exc}")
+        return None
+
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return None
+
+    hostnames: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        properties = record.get("properties")
+        dns_name = ""
+        if isinstance(properties, dict):
+            dns_name = str(properties.get("dnshostname") or "").strip()
+        sam = str(record.get("samaccountname") or "").strip().rstrip("$")
+        hostname = dns_name or sam
+        if hostname:
+            hostnames.append(hostname)
+
+    if not hostnames:
+        return None
+    return sorted(set(hostnames), key=str.lower)
+
+
 def _load_credential_fields_from_inventory(
     shell: LdapShell, domain: str
 ) -> dict[str, dict[str, str]]:
@@ -5633,81 +5814,6 @@ def _build_user_description_source_steps(
             },
         )
     ]
-
-
-def execute_netexec_ldap_descriptions(
-    shell: LdapShell, *, command: str, domain: str, anonymous: bool = False
-) -> None:
-    """Execute LDAP descriptions command, find and move netexec's UserDesc log file,
-    parse it, display with Rich, and analyze descriptions for passwords using CredSweeper.
-
-    Args:
-        shell: Shell instance with NetExec execution and CredSweeper helpers.
-        command: Full NetExec command to run.
-        domain: Target domain.
-    """
-    try:
-        completed_process = shell._run_netexec(command)
-
-        # Check the process output
-        if completed_process.returncode == 0:
-            # Find and move the netexec-generated UserDesc log file
-            descriptions_file = _find_and_move_userdesc_log(shell, domain)
-
-            if not descriptions_file or not os.path.exists(descriptions_file):
-                print_warning(
-                    "No UserDesc log file found from netexec. Descriptions may not have been generated."
-                )
-                return
-
-            # Parse user descriptions from the moved file
-            user_descriptions = _parse_userdesc_log_file(descriptions_file)
-
-            # Debug: show parsing results
-            if SECRET_MODE:
-                print_info_debug(
-                    f"Parsed {len(user_descriptions)} user descriptions: {list(user_descriptions.keys())}"
-                )
-
-            if user_descriptions:
-                # Save to JSON file (for our own format)
-                _save_ldap_descriptions_json(shell, user_descriptions, domain)
-
-                # Display with Rich
-                _display_ldap_descriptions_with_rich(user_descriptions)
-
-                # Analyze descriptions for passwords (regex-only, no ML).
-                # The NetExec UserDesc log only carries the description field;
-                # wrap it into the per-field map the analyser now expects.
-                if descriptions_file:
-                    cred_fields = {
-                        sam: {"description": desc}
-                        for sam, desc in user_descriptions.items()
-                        if desc
-                    }
-                    _analyze_descriptions_for_passwords(
-                        shell,
-                        descriptions_file,
-                        cred_fields,
-                        domain,
-                        anonymous=anonymous,
-                    )
-            else:
-                print_warning("No user descriptions found in UserDesc log file.")
-                if SECRET_MODE:
-                    print_info_debug(
-                        f"File content (first 500 chars):\n{open(descriptions_file, 'r').read()[:500]}"
-                    )
-        else:
-            print_error("Error listing LDAP descriptions.")
-            if completed_process.stderr:
-                print_error(completed_process.stderr)
-            elif completed_process.stdout:  # Sometimes errors go to stdout
-                print_error(completed_process.stdout)
-    except Exception as e:
-        telemetry.capture_exception(e)
-        print_error("Error executing netexec for LDAP descriptions.")
-        print_exception(show_locals=False, exception=e)
 
 
 def execute_netexec_users(

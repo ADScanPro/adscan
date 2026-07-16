@@ -56,9 +56,6 @@ from adscan_internal.workspaces.computers import (
     has_enabled_computer_list,
     load_enabled_computer_samaccounts,
 )
-from adscan_internal.integrations.netexec.parsers import (
-    parse_netexec_computer_badpwd,
-)
 from adscan_internal.services.credentials.privilege_role import (
     set_credential_origin as _set_credential_origin,
 )
@@ -70,6 +67,19 @@ from adscan_internal.services.credentials.credential_origin import (
     ORIGIN_SPRAY,
     ORIGIN_USERNAME_AS_PASSWORD,
 )
+from adscan_internal.services.captured_credential_policy import classify_principal
+from adscan_internal.services.compromise_class import CompromiseClass, PrivilegeTier
+from adscan_internal.services.credential_harvest_classification import (
+    classify_harvested_principal_tier,
+    classify_harvested_principals_reach,
+)
+from adscan_internal.services.credential_harvest_record import HarvestedPrincipal
+from adscan_internal.services.credential_harvest_store import append_harvest_records
+from adscan_internal.cli.widgets.credential_harvest_panel import (
+    build_credential_harvest_panel,
+    offer_credential_harvest_actions,
+)
+from rich.markup import escape as _rich_markup_escape
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
@@ -78,13 +88,7 @@ from adscan_internal.spraying import (
     SprayEligibilityResult,
     build_kerbrute_command,
     build_kerbrute_bruteforce_command,
-    build_netexec_computers_query_command,
-    build_netexec_pass_pol_command,
-    build_netexec_password_spray_command,
-    build_netexec_users_command,
     compute_spray_eligibility,
-    parse_netexec_lockout_threshold_result,
-    parse_netexec_users_badpwd,
     read_user_list,
     safe_log_filename_fragment,
     write_temp_combo_file,
@@ -194,14 +198,7 @@ def handle_validated_domain_hits_followup(
         offer_attack_paths_for_execution_for_principals,
     )
     from adscan_internal.services.credential_store_service import CredentialStoreService
-    from adscan_internal.services.high_value import (
-        UserRiskFlags,
-        classify_users_tier0_high_value,
-    )
-    from adscan_internal.rich_output import print_panel
     from rich.prompt import Confirm
-    from rich.table import Table
-    from rich.text import Text
 
     normalized_hits = _normalize_validated_domain_hits(shell, hits)
     if not normalized_hits:
@@ -239,157 +236,82 @@ def handle_validated_domain_hits_followup(
         except Exception:  # noqa: BLE001
             pass
 
-    risk_flags_by_user: dict[str, UserRiskFlags] = {}
-    try:
-        risk_flags_by_user = classify_users_tier0_high_value(
-            shell,
-            domain=domain,
-            usernames=[str(hit.get("username") or "") for hit in normalized_hits],
+    # Build a classified HarvestedPrincipal record for EVERY validated hit —
+    # covering all three tiers (user Tier-0/high-value AND machine-account
+    # Tier 1), routed through the shared classification SSOT (Task 3). This
+    # fixes the pre-existing gap where the bespoke user-only classifier never
+    # graded machine-account harvests. Reach (axis 2) is computed once in a
+    # single batched attack-path call.
+    usernames = [str(hit.get("username") or "") for hit in normalized_hits]
+    reach_by_user = classify_harvested_principals_reach(
+        shell, domain=domain, usernames=usernames
+    )
+    harvest_records: list[HarvestedPrincipal] = []
+    for hit in normalized_hits:
+        user = str(hit.get("username") or "")
+        if not user:
+            continue
+        account_type = classify_principal(user, shell.domains_data, domain)
+        tier = classify_harvested_principal_tier(
+            shell, domain=domain, username=user, account_type=account_type
         )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_info_debug(
-            "[domain-hits] Failed to classify validated users as Tier-0/high-value (continuing)."
+        # ``tier`` / ``reach`` may be None (UNDETERMINED — no membership/graph
+        # data yet); persist None so the row renders "Unknown" / "Not assessed"
+        # rather than a false Tier 2 / Standard reach.
+        reach = reach_by_user.get(user.strip().lower())
+        harvest_records.append(
+            HarvestedPrincipal(
+                domain=domain,
+                username=user,
+                source="spraying",
+                account_type=account_type,
+                ntlm_version="",
+                crack_status="captured",
+                privilege_tier=tier.value if tier is not None else None,
+                compromise_reach=reach.value if reach is not None else None,
+                hash_file="",
+                captured_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            )
         )
 
+    if harvest_records:
+        append_harvest_records(shell, harvest_records)
+        console = getattr(shell, "console", None)
+        if console is not None:
+            console.print(build_credential_harvest_panel(harvest_records))
+
+    harvest_by_user = {r.username: r for r in harvest_records}
+    _neutral_record = HarvestedPrincipal(
+        domain=domain,
+        username="",
+        source="",
+        account_type="user",
+        ntlm_version="",
+        crack_status="captured",
+        privilege_tier=PrivilegeTier.TIER2.value,
+        compromise_reach=CompromiseClass.NONE.value,
+        hash_file="",
+        captured_at="",
+    )
     privileged_hits = [
         hit
         for hit in normalized_hits
-        if (
-            risk_flags_by_user.get(
-                str(hit.get("username") or "").strip().lower(),
-                UserRiskFlags(),
-            ).is_tier0
-            or risk_flags_by_user.get(
-                str(hit.get("username") or "").strip().lower(),
-                UserRiskFlags(),
-            ).is_high_value
+        if harvest_by_user.get(
+            str(hit.get("username") or ""), _neutral_record
+        ).privilege_tier
+        in (
+            PrivilegeTier.TIER0_DIRECT.value,
+            PrivilegeTier.TIER0_ESCALATION_CAPABLE.value,
         )
     ]
 
     if privileged_hits:
-        from adscan_core.theme import COLOR_AMBER, COLOR_CRIMSON
-
-        tier0_hits = [
-            h for h in privileged_hits
-            if risk_flags_by_user.get(
-                str(h.get("username") or "").strip().lower(), UserRiskFlags()
-            ).is_tier0
-        ]
-        highvalue_hits = [
-            h for h in privileged_hits
-            if not risk_flags_by_user.get(
-                str(h.get("username") or "").strip().lower(), UserRiskFlags()
-            ).is_tier0
-        ]
-
-        privileged_table = Table(
-            show_header=True,
-            header_style=f"bold {COLOR_CRIMSON}",
-            show_lines=True,
-            box=None,
-        )
-        privileged_table.add_column("#", style="dim", width=4, justify="right")
-        privileged_table.add_column("Privilege", width=18)
-        privileged_table.add_column("Username", style="bold")
-        # Per-row command hint — concrete, copyable, not a restatement of the
-        # alert summary above (impeccable § Copy: no restated headings).
-        privileged_table.add_column("Run next", style="dim")
-
-        for idx, hit in enumerate(privileged_hits, start=1):
-            user = str(hit.get("username") or "")
-            flags = risk_flags_by_user.get(user.strip().lower(), UserRiskFlags())
-            if flags.is_tier0:
-                # ▲ glyph + text so the badge does not depend on red color.
-                # CLI syntax — domain is positional #1, `owned` is the user
-                # scope; tier-0 filtering happens via the `--tier0-only`
-                # flag (not a second positional, which the parser would
-                # reject as an unknown username).
-                priv_badge = Text("▲ TIER-0 / DA", style=f"bold {COLOR_CRIMSON}")
-                action_hint = (
-                    f"attack_paths {domain} owned --tier0-only  ·  enum {user}"
-                )
-            else:
-                priv_badge = Text("◆ HIGH VALUE", style=f"bold {COLOR_AMBER}")
-                # Default scope is high-value targets, so no extra flag needed.
-                action_hint = f"attack_paths {domain} owned  ·  enum {user}"
-            privileged_table.add_row(
-                str(idx),
-                priv_badge,
-                mark_sensitive(user, "user"),
-                action_hint,
-            )
-
-        alert_text = Text()
-        alert_text.append(
-            f"  {len(privileged_hits)} privileged credential"
-            f"{'s' if len(privileged_hits) != 1 else ''} validated\n\n",
-            style=f"bold {COLOR_CRIMSON}",
-        )
-        if tier0_hits:
-            alert_text.append(
-                f"  {len(tier0_hits)} Tier-0 (Domain Admin equivalent) "
-                f"account{'s' if len(tier0_hits) != 1 else ''} captured.\n",
-                style=f"bold {COLOR_CRIMSON}",
-            )
-            alert_text.append(
-                "  Immediate pivot opportunity — ADscan will offer attack paths next.\n",
-                style=COLOR_CRIMSON,
-            )
-        elif highvalue_hits:
-            alert_text.append(
-                f"  {len(highvalue_hits)} high-value "
-                f"account{'s' if len(highvalue_hits) != 1 else ''} captured.\n",
-                style=f"bold {COLOR_AMBER}",
-            )
-            alert_text.append(
-                "  Run attack_paths to identify escalation routes.\n",
-                style=COLOR_AMBER,
-            )
-
-        print_panel(
-            [alert_text, privileged_table],
-            title=Text(
-                " PRIVILEGED CREDENTIALS CAPTURED ",
-                style=f"bold {COLOR_CRIMSON}",
-            ),
-            border_style=COLOR_CRIMSON,
-            expand=False,
-        )
-
-
-        pivot_now = (
-            Confirm.ask(
-                "Do you want to continue with one of these privileged users now?",
-                default=True,
-            )
-            if is_interactive
-            else False
-        )
-
-        if pivot_now:
-            selected = privileged_hits[0]
-            if len(privileged_hits) > 1 and hasattr(shell, "_questionary_select"):
-                options = [
-                    str(hit.get("username") or "") for hit in privileged_hits
-                ] + ["Cancel"]
-                selected_idx = shell._questionary_select(
-                    "Select a privileged user to continue with:",
-                    options,
-                    default_idx=0,
-                )
-                if selected_idx is None or selected_idx >= len(options) - 1:
-                    selected = privileged_hits[0]
-                else:
-                    selected = privileged_hits[selected_idx]
-
-            shell.add_credential(
-                domain,
-                str(selected.get("username") or ""),
-                str(selected.get("credential") or ""),
-                source_steps=source_steps,
-                credential_origin=credential_origin,
-            )
+        # The shared actions helper (Task 6) now owns the select -> add_credential
+        # -> pivot UX centrally, non-interactive-safe. If it authenticated the
+        # domain as one of these principals, stop here.
+        offer_credential_harvest_actions(shell, domain, harvest_records)
+        auth_state_after = shell.domains_data.get(domain, {}).get("auth", "")
+        if auth_state_after in {"auth", "pwned"}:
             return True
 
     principals = [str(hit.get("username") or "") for hit in normalized_hits]
@@ -639,12 +561,62 @@ _DOMAIN_HASH_SPRAY_LINE_RE = re.compile(
 _DOMAIN_SPRAY_FAILURE_CODE_RE = re.compile(
     r"\b(?P<code>(?:STATUS|NT_STATUS|KDC_ERR)_[A-Z0-9_]+)\b"
 )
-_NETEXEC_POLICY_QUERY_MAX_ATTEMPTS = 3
 _DEFAULT_MULTI_SPRAY_RESERVE = 2
 _MAX_MULTI_SPRAY_PREVIEW = 10
 _ADAPTIVE_YEAR_SUMMARY_PREVIEW_PER_YEAR = 5
 
 LOCKOUT_FREE_VARIATION_SPRAY_ENABLED: bool = True
+
+# Substrings marking an EXPECTED authentication negative -- the normal outcome of
+# spraying a wrong/blank password (a rejected credential), NOT a tool or transport
+# error. Such a line may still contain the words "failed"/"error" (e.g.
+# "KDC_ERR_PREAUTH_FAILED", "authentication failed"), so a naive substring grep
+# false-positives on every empty spray. These must never be surfaced as errors.
+_EXPECTED_SPRAY_AUTH_NEGATIVE_MARKERS: tuple[str, ...] = (
+    "kdc_err_preauth_failed",
+    "preauth failed",
+    "preauth_failed",
+    "authentication failed",
+    "logon failure",
+    "logon_failure",
+    "status_logon_failure",
+    "kdc_err_c_principal_unknown",  # account does not exist -- expected, not an error
+    "kdc_err_client_revoked",  # account disabled/locked-out -- reported elsewhere
+    "account_locked_out",
+    "status_account_locked_out",
+    "wrong password",
+    "invalid credentials",
+)
+
+
+def _is_expected_spray_auth_negative(line: str) -> bool:
+    """Return True when *line* is an expected auth negative, not a real error.
+
+    A rejected credential (wrong/blank password, unknown/locked account) is the
+    normal result of a spray and must never be reported as an error even though
+    the underlying tool prints it with the words "failed"/"error".
+    """
+    lowered = line.lower()
+    return any(marker in lowered for marker in _EXPECTED_SPRAY_AUTH_NEGATIVE_MARKERS)
+
+
+def _genuine_spray_error_lines(output_lines: list[str]) -> list[str]:
+    """Return only genuine tool/transport error lines from spray output.
+
+    Keeps lines mentioning "error"/"failed" that are NOT an expected auth
+    negative -- i.e. real failures the operator should see (connection refused,
+    timeouts, unhandled tracebacks), never the routine rejected-credential lines
+    an empty spray produces.
+    """
+    genuine: list[str] = []
+    for line in output_lines:
+        lowered = line.lower()
+        if "error" not in lowered and "failed" not in lowered:
+            continue
+        if _is_expected_spray_auth_negative(line):
+            continue
+        genuine.append(line)
+    return genuine
 
 
 @dataclass(frozen=True, slots=True)
@@ -699,74 +671,6 @@ class PendingDomainReuseValidationCandidate:
     source_scope: str
     reason_not_validated: str
     deferred_at: str
-
-
-def _run_netexec_query_with_parse_retry(
-    shell: SprayShell,
-    *,
-    command: str,
-    domain: str,
-    query_label: str,
-    parse_ok: Callable[[str], bool],
-    timeout: int = 300,
-) -> subprocess.CompletedProcess[str] | None:
-    """Run a NetExec query and retry when output is present but not parseable."""
-
-    def _drop_kerberos_flag(cmd: str) -> tuple[str, bool]:
-        try:
-            argv = shlex.split(cmd)
-        except ValueError:
-            return cmd, False
-        filtered: list[str] = []
-        removed = False
-        for token in argv:
-            if not removed and token == "-k":
-                removed = True
-                continue
-            filtered.append(token)
-        if not removed:
-            return cmd, False
-        return shlex.join(filtered), True
-
-    last_proc: subprocess.CompletedProcess[str] | None = None
-    current_command = command
-    kerberos_fallback_used = False
-    for attempt in range(1, _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS + 1):
-        proc = shell._run_netexec(
-            current_command,
-            domain=domain,
-            timeout=timeout,
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
-        last_proc = proc
-        stdout = strip_ansi_codes(getattr(proc, "stdout", "") or "")
-        if stdout and parse_ok(stdout):
-            if attempt > 1:
-                print_info_debug(
-                    f"[eligibility] {query_label} output became parseable on retry "
-                    f"{attempt}/{_NETEXEC_POLICY_QUERY_MAX_ATTEMPTS}."
-                )
-            return proc
-        if not kerberos_fallback_used:
-            ntlm_command, removed_kerberos = _drop_kerberos_flag(current_command)
-            if removed_kerberos:
-                kerberos_fallback_used = True
-                current_command = ntlm_command
-                if attempt < _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS:
-                    print_warning_debug(
-                        f"{query_label} output was empty or not parseable while using "
-                        f"Kerberos (attempt {attempt}/{_NETEXEC_POLICY_QUERY_MAX_ATTEMPTS}). "
-                        "Retrying with NTLM fallback."
-                    )
-                    continue
-        if attempt < _NETEXEC_POLICY_QUERY_MAX_ATTEMPTS:
-            print_warning_debug(
-                f"{query_label} output was empty or not parseable "
-                f"(attempt {attempt}/{_NETEXEC_POLICY_QUERY_MAX_ATTEMPTS}). Retrying."
-            )
-    return last_proc
 
 
 def _get_spraying_ux_state(shell: SprayShell, domain: str) -> dict[str, object]:
@@ -1956,14 +1860,13 @@ def validate_domain_reuse_with_ntlm_hash(
     eligibility: SprayEligibilityResult | None = None,
 ) -> dict[str, object]:
     """Validate SAM-derived credential reuse against domain accounts using NTLM hash spray."""
-    from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
     from adscan_internal.services.credential_store_service import CredentialStoreService
 
     normalized_hash = str(nt_hash or "").strip()
     marked_domain = mark_sensitive(domain, "domain")
     result: dict[str, object] = {
         "status": "error",
-        "method": "netexec_ntlm_hash",
+        "method": "native_ntlm_hash",
         "credential_type": "hash",
         "credential": normalized_hash,
         "attempted_users": 0,
@@ -1972,11 +1875,6 @@ def validate_domain_reuse_with_ntlm_hash(
         "error": None,
     }
 
-    if not getattr(shell, "netexec_path", None):
-        message = "NetExec is not configured."
-        print_warning(f"Skipping domain reuse validation in {marked_domain}: {message}")
-        result["error"] = message
-        return result
     if not re.fullmatch(r"[0-9a-fA-F]{32}", normalized_hash):
         message = "Credential is not a valid NTLM hash."
         print_warning(f"Skipping domain reuse validation in {marked_domain}: {message}")
@@ -1990,83 +1888,70 @@ def validate_domain_reuse_with_ntlm_hash(
         result["status"] = "skipped"
         return result
 
-    result["attempted_users"] = len(effective_eligibility.eligible_users)
-    kerberos_output_dir = ensure_kerberos_output_dir(shell, domain)
-    temp_users_path = write_temp_users_file(
-        list(effective_eligibility.eligible_users),
-        directory=kerberos_output_dir,
-    )
-    workspace_cwd = shell.current_workspace_dir or os.getcwd()
-    log_rel = domain_relpath(
-        shell.domains_dir,
-        domain,
-        "smb",
-        f"sam_domain_hash_spray_{safe_log_filename_fragment(normalized_hash, max_length=16)}.log",
-    )
-    log_abs = domain_subpath(
-        workspace_cwd,
-        shell.domains_dir,
-        domain,
-        "smb",
-        f"sam_domain_hash_spray_{safe_log_filename_fragment(normalized_hash, max_length=16)}.log",
-    )
-    os.makedirs(os.path.dirname(log_abs), exist_ok=True)
-    command = (
-        f"{shell.netexec_path} smb {shell.domains_data[domain]['pdc']} "
-        f"-u {shlex.quote(temp_users_path)} -H {shlex.quote(normalized_hash)} "
-        f"-d {shlex.quote(domain)} --log {shlex.quote(log_rel)}"
-    )
-    print_info_debug(f"[sam-domain-reuse] Hash spray command: {command}")
+    eligible_users = list(effective_eligibility.eligible_users)
+    result["attempted_users"] = len(eligible_users)
+    if not eligible_users:
+        result["status"] = "no_hits"
+        return result
+
+    from adscan_internal.models.domain import resolve_dc_ip
+    from adscan_internal.services.domain_posture import get_posture
+
+    domain_data = shell.domains_data.get(domain, {}) or {}
+    dc_ip = resolve_dc_ip(domain_data) or domain_data.get("pdc")
+    if not dc_ip:
+        message = "Cannot resolve the domain controller IP for the hash-reuse spray."
+        print_warning(f"Skipping domain reuse validation in {marked_domain}: {message}")
+        result["error"] = message
+        return result
+    posture_snapshot = get_posture(shell.domains_data, domain=domain)
+
+    # Mass-auth safety (sweep_credential SSOT): pass-the-hash reuse validation
+    # tests MANY domain principals — each eligible user tried ONCE with the SAME
+    # NT hash — against the single DC. That is NOT one owned principal across many
+    # hosts, so ``resolve_sweep_credential``'s single-TGT pre-mint does not apply
+    # (there is no one principal to mint for). The hash flows through the canonical
+    # single-attempt verifier (``_run_native_domain_spray`` →
+    # ``CredentialService._verify_via_kerberos``), which makes exactly ONE
+    # credential-checking auth per user with NO NTLM<->Kerberos re-attempt — so
+    # each user's badPwdCount rises at most once, the same lockout-safety invariant
+    # the native password spray relies on.
+    import asyncio
 
     try:
-        completed = shell.run_command(
-            command,
-            timeout=1200,
-            shell=True,
-            capture_output=True,
-            text=True,
-            use_clean_env=command_string_needs_clean_env(command),
-        )
-        stdout_text = str(getattr(completed, "stdout", "") or "") if completed else ""
-        stderr_text = str(getattr(completed, "stderr", "") or "") if completed else ""
-        log_text = ""
-        if os.path.exists(log_abs):
-            try:
-                with open(log_abs, "r", encoding="utf-8", errors="ignore") as handle:
-                    log_text = handle.read()
-            except OSError as exc:
-                telemetry.capture_exception(exc)
-
-        hits, outcomes = _summarize_domain_spray_outcomes(
-            "\n".join(text for text in (stdout_text, stderr_text, log_text) if text)
-        )
-        result["hits"] = hits
-        result["outcome_counts"] = outcomes
-        store = CredentialStoreService()
-        for username in hits:
-            store.update_domain_credential(
-                domains_data=shell.domains_data,
+        hits, outcomes = asyncio.run(
+            _run_native_domain_spray(
                 domain=domain,
-                username=username,
-                credential=normalized_hash,
-                is_hash=True,
+                dc_ip=str(dc_ip),
+                users=eligible_users,
+                password=normalized_hash,
+                posture_snapshot=posture_snapshot,
+                credential_type="hash",
             )
-            # NTLM-hash reuse spray bypasses add_credential; tag the provenance.
-            _set_credential_origin(
-                shell, domain=domain, username=username, origin=ORIGIN_CREDENTIAL_REUSE
-            )
-
-        result["status"] = "success" if hits else "no_hits"
-        return result
+        )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         result["error"] = str(exc)
         return result
-    finally:
-        try:
-            os.remove(temp_users_path)
-        except OSError:
-            pass
+
+    result["hits"] = hits
+    result["outcome_counts"] = outcomes
+    store = CredentialStoreService()
+    for username in hits:
+        store.update_domain_credential(
+            domains_data=shell.domains_data,
+            domain=domain,
+            username=username,
+            credential=normalized_hash,
+            is_hash=True,
+        )
+        # NTLM-hash reuse spray bypasses add_credential; tag the provenance.
+        _set_credential_origin(
+            shell, domain=domain, username=username, origin=ORIGIN_CREDENTIAL_REUSE
+        )
+
+    result["status"] = "success" if hits else "no_hits"
+    return result
 
 
 def validate_domain_reuse_with_password(
@@ -2830,6 +2715,199 @@ def _exclude_locked_from_result(
     )
 
 
+@dataclass(frozen=True)
+class LockoutAuthorityTarget:
+    """Where to READ account-lockout counters (badPwdCount / observation window).
+
+    Scope-aware DC/PDC selection (2026-07-12): when the operator knowingly kept
+    a non-PDC replica as the operational DC (``lockout_authority == "replica"``),
+    the replica's local badPwdCount can lag the PDC and read stale-low — spraying
+    off it risks locking live accounts. This resolves the read target:
+
+    * ``read_ip`` — the IP to read lockout counters from. The true PDC when it is
+      reachable-for-reads (even if out of scope for active auth); otherwise the
+      operational DC.
+    * ``kerberos_hostname`` — the FQDN for the LDAP service SPN when ``read_ip``
+      is the authoritative PDC (a Kerberos read against an IP with the wrong SPN
+      fails; see CLAUDE.md "Kerberos SPNs — always FQDN").
+    * ``is_authoritative_pdc`` — True when the read is redirected to the true PDC.
+    * ``conservative`` — True when the domain is on a replica AND the true PDC is
+      NOT reachable-for-reads: the caller MUST spray conservatively (strict
+      exclude of unknown counts, at most one attempt per window) or skip.
+
+    The OPERATIONAL auth attempts (the actual spray + LDAP/SMB) still go to the
+    chosen operational DC — only the *counting read* is authoritative-sourced.
+    """
+
+    read_ip: str | None
+    kerberos_hostname: str | None
+    is_authoritative_pdc: bool
+    conservative: bool
+
+
+def _tcp_reachable_for_ldap_reads(ip: str, timeout: float = 2.0) -> bool:
+    """Best-effort sync check that ``ip`` accepts an LDAP(S) connection.
+
+    Tries LDAPS (636) then LDAP (389), mirroring the transport's LDAPS→LDAP
+    fallback. "Reachable for reads" means either port completes a TCP connect —
+    the PDC can be out of scope for active auth yet still answer read-only
+    lockout queries. Never raises; a filtered PDC simply reads unreachable.
+    """
+    import socket  # noqa: PLC0415
+
+    for port in (636, 389):
+        sock = None
+        try:
+            sock = socket.create_connection((ip, port), timeout=timeout)
+            return True
+        except OSError:
+            continue
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    return False
+
+
+def resolve_lockout_authority_ip(
+    shell: SprayShell, domain: str
+) -> LockoutAuthorityTarget:
+    """Resolve where to read account-lockout counters for spray safety.
+
+    See :class:`LockoutAuthorityTarget`. Redirects the lockout-accounting read to
+    the true PDC when the operator overrode the operational DC with a replica and
+    the PDC is reachable-for-reads; otherwise signals conservative mode (or the
+    normal operational DC when no override is in effect).
+    """
+    from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+
+    domain_info = shell.domains_data.get(domain, {}) or {}
+    operational_ip = resolve_dc_ip(domain_info) or domain_info.get("pdc")
+
+    authority = str(domain_info.get("lockout_authority", "")).strip().lower()
+    if authority != "replica":
+        # No override: the operational DC IS the lockout authority (unchanged
+        # behaviour for every existing workspace / non-override path).
+        return LockoutAuthorityTarget(
+            read_ip=operational_ip,
+            kerberos_hostname=None,
+            is_authoritative_pdc=False,
+            conservative=False,
+        )
+
+    pdc_ip = str(domain_info.get("authoritative_pdc_ip") or "").strip() or None
+    pdc_hostname = (
+        str(domain_info.get("authoritative_pdc_hostname") or "").strip() or None
+    )
+    # A Kerberos read against the PDC needs its FQDN for the LDAP SPN. Without
+    # both the PDC IP AND its FQDN we cannot safely redirect the (Kerberos) read
+    # — fall to conservative mode rather than reading stale replica counters.
+    if pdc_ip and pdc_hostname and _tcp_reachable_for_ldap_reads(pdc_ip):
+        return LockoutAuthorityTarget(
+            read_ip=pdc_ip,
+            kerberos_hostname=pdc_hostname,
+            is_authoritative_pdc=True,
+            conservative=False,
+        )
+
+    return LockoutAuthorityTarget(
+        read_ip=operational_ip,
+        kerberos_hostname=None,
+        is_authoritative_pdc=False,
+        conservative=True,
+    )
+
+
+def maybe_gate_replica_spraying(shell: SprayShell, domain: str) -> bool:
+    """Spray-entry safety gate for a replica-DC override (2026-07-12).
+
+    When the operator kept a non-PDC replica as the operational DC, decide how
+    spraying should proceed based on whether the true PDC is reachable for
+    lockout reads:
+
+    * PDC reachable-for-reads → confirmation toast (mockup C); spraying stays
+      lockout-safe because the counting reads redirect to the PDC. Proceeds.
+    * PDC unreachable-for-reads → persistent posture panel (mockup B) + an
+      explicit confirm (default No). Only a knowing "yes" proceeds — otherwise
+      spraying is skipped to protect live accounts. Non-interactive runs
+      auto-resolve to No (skip), so ``adscan ci`` never sprays off an
+      unverified replica.
+
+    Returns True to proceed with spraying, False to abort. A no-op (returns
+    True) for every non-override domain, keeping the normal path unchanged.
+    """
+    domain_info = shell.domains_data.get(domain, {}) or {}
+    if str(domain_info.get("lockout_authority", "")).strip().lower() != "replica":
+        return True
+
+    shown = getattr(shell, "_spray_replica_gate_shown", None)
+    if not isinstance(shown, set):
+        shown = set()
+        shell._spray_replica_gate_shown = shown
+
+    target = resolve_lockout_authority_ip(shell, domain)
+    operational_ip = domain_info.get("pdc")
+    pdc_ip = domain_info.get("authoritative_pdc_ip")
+    marked_op = (
+        mark_sensitive(str(operational_ip), "ip") if operational_ip else "the scan DC"
+    )
+    marked_pdc = mark_sensitive(str(pdc_ip), "ip") if pdc_ip else "the PDC"
+
+    if target.is_authoritative_pdc:
+        # Mockup C — reachable PDC, once per domain.
+        if domain not in shown:
+            print_success(
+                f"Using {marked_op} as the scan DC. Lockout counters will be read "
+                f"from the PDC {marked_pdc} (reachable for reads), so spraying "
+                "stays lockout-safe."
+            )
+            shown.add(domain)
+        return True
+
+    # Conservative mode — the true PDC is out of scope AND not reachable for
+    # reads (or unknown). Render the posture panel (mockup B) once per domain,
+    # then require an explicit acknowledgement every time before spraying.
+    if domain not in shown:
+        print_panel(
+            "[bold]This scan uses a replica Domain Controller. The PDC "
+            "emulator is out of scope and not reachable for lockout reads.[/bold]"
+            "\n\n"
+            f"  Scan DC (replica)     {marked_op}\n"
+            f"  PDC emulator          {marked_pdc}  [dim](unreachable)[/dim]\n\n"
+            "badPwdCount on a replica can lag the PDC, so attempts-remaining may "
+            "be optimistic. ADscan sprays at most one attempt per observation "
+            "window and excludes any account whose count is unknown, to avoid "
+            "locking out live accounts.\n\n"
+            "  Mode                  conservative (replica-sourced counters)",
+            title="[bold]⚠ Spraying against a replica DC[/bold]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        shown.add(domain)
+
+    proceed = confirm_ask(
+        "Proceed with conservative spraying against the replica?",
+        default=False,
+    )
+    if not proceed:
+        print_warning(
+            "Spraying skipped: on a replica DC with the PDC unreachable for "
+            "lockout reads, ADscan will not spray to protect live accounts."
+        )
+        telemetry.capture(
+            "spray_replica_gate",
+            properties={"domain_scope": "replica", "action": "skipped"},
+        )
+        return False
+    telemetry.capture(
+        "spray_replica_gate",
+        properties={"domain_scope": "replica", "action": "proceed_conservative"},
+    )
+    return True
+
+
 def compute_spraying_eligibility(
     shell: SprayShell,
     *,
@@ -2925,13 +3003,22 @@ def compute_spraying_eligibility(
                 domain_data=shell.domains_data.get(domain, {}),
                 kerberos_ready=True,
             )
+            # Scope-aware DC/PDC selection (2026-07-12): read lockout counters
+            # from the true PDC when the operational DC is a replica override and
+            # the PDC is reachable-for-reads. The operational auth still targets
+            # the chosen DC — only this counting read is authority-sourced.
+            lockout_target = resolve_lockout_authority_ip(shell, domain)
             spray_policy = fetch_spray_policy_sync(
                 domain=domain,
-                dc_ip=pdc_ip,
+                dc_ip=lockout_target.read_ip or pdc_ip,
                 username=auth_username,
                 password=auth_password,
                 use_kerberos=True,
-                kerberos_target_hostname=ldap_endpoints.kerberos_target_hostname,
+                kerberos_target_hostname=(
+                    lockout_target.kerberos_hostname
+                    if lockout_target.is_authoritative_pdc
+                    else ldap_endpoints.kerberos_target_hostname
+                ),
                 auth_domain=auth_domain,
             )
 
@@ -3031,97 +3118,16 @@ def compute_spraying_eligibility(
                 "Falling back to NetExec."
             )
 
-        # --- NetExec fallback ---
-        if not native_policy_ok and shell.netexec_path:
-            pass_pol_cmd = build_netexec_pass_pol_command(
-                nxc_path=shell.netexec_path,
-                dc_ip=pdc_ip,
-                username=auth_username,
-                password=auth_password,
-                domain=auth_domain,
-                kerberos=True,
-            )
-            print_info_debug(f"[netexec pass-pol] {pass_pol_cmd}")
-
-            users_cmd = build_netexec_users_command(
-                nxc_path=shell.netexec_path,
-                dc_ip=pdc_ip,
-                username=auth_username,
-                password=auth_password,
-                domain=auth_domain,
-                kerberos=True,
-            )
-
-            pass_pol_proc = _run_netexec_query_with_parse_retry(
-                shell,
-                command=pass_pol_cmd,
-                domain=auth_domain,
-                query_label="NetExec --pass-pol",
-                parse_ok=lambda output: (
-                    parse_netexec_lockout_threshold_result(output).explicit_none
-                    or parse_netexec_lockout_threshold_result(output).threshold
-                    is not None
-                ),
-            )
-            if pass_pol_proc and pass_pol_proc.stdout:
-                threshold_result = parse_netexec_lockout_threshold_result(
-                    strip_ansi_codes(pass_pol_proc.stdout)
-                )
-                lockout_threshold = threshold_result.threshold
-                if threshold_result.explicit_none:
-                    no_lockout_enforced = True
-                    print_info_verbose(
-                        "Password policy returned 'None' for account lockout threshold. "
-                        "No lockout is enforced; spraying cannot lock accounts."
-                    )
-                elif lockout_threshold is not None:
-                    print_info_verbose(
-                        f"Parsed account lockout threshold={lockout_threshold}."
-                    )
-                else:
-                    print_warning_verbose(
-                        "Password policy output did not contain a parseable account "
-                        "lockout threshold; treating the policy as unknown."
-                    )
-            else:
-                print_warning_verbose(
-                    "Password policy command produced no output; "
-                    "lockout threshold unavailable."
-                )
-
-            if no_lockout_enforced or lockout_threshold == 0:
-                print_info_debug(
-                    "[eligibility] Skipping user BadPwdCount lookup because "
-                    f"no lockout is enforced (threshold={lockout_threshold})."
-                )
-            else:
-                users_proc = _run_netexec_query_with_parse_retry(
-                    shell,
-                    command=users_cmd,
-                    domain=auth_domain,
-                    query_label="NetExec --users",
-                    parse_ok=lambda output: bool(parse_netexec_users_badpwd(output)),
-                )
-                if users_proc and users_proc.stdout:
-                    badpwd_by_user = parse_netexec_users_badpwd(
-                        strip_ansi_codes(users_proc.stdout)
-                    )
-                    print_info_verbose(
-                        f"Parsed BadPwdCount data for {len(badpwd_by_user)} user(s)."
-                    )
-                    if len(badpwd_by_user) == 0:
-                        print_warning_verbose(
-                            "User query returned output but no BadPwdCount values were "
-                            "recognized."
-                        )
-                else:
-                    print_warning_verbose(
-                        "User query command produced no output; BadPwdCount data "
-                        "unavailable."
-                    )
-        elif not native_policy_ok and not shell.netexec_path:
+        if not native_policy_ok:
+            # Native (LDAP) password-policy fetch failed. There is no NetExec
+            # fallback here: the native path and NetExec both query the same DC
+            # over LDAP, so a native failure almost always means the DC is
+            # unreachable and NetExec would fail identically. Fail CLOSED —
+            # compute_spray_eligibility(strict_missing_badpwd=True) below then
+            # conservatively excludes users with unknown badPwdCount.
             print_warning_verbose(
-                "Policy lookup failed and no fallback tool is available."
+                "Native password-policy fetch failed; account lockout policy and "
+                "badPwdCount are unknown — excluding users conservatively."
             )
     else:
         if not is_auth:
@@ -3190,10 +3196,20 @@ def compute_computer_spraying_eligibility(
     computer_sams: list[str],
     safe_threshold: int,
 ) -> SprayEligibilityResult | None:
-    """Compute eligible computer accounts for pre2k checks."""
+    """Compute eligible computer accounts for pre2k checks.
+
+    The lockout policy and per-machine ``badPwdCount`` are read via native LDAP
+    (``spray_policy_service``, the same PSO-aware, observation-window-reset path
+    the user spray uses) — no subprocess. Machine accounts carry ``badPwdCount``
+    and the live ``msDS-User-Account-Control-Computed`` UF_LOCKOUT bit exactly
+    like user accounts, so the identical safety controls apply: near-lockout
+    machines are excluded, currently-locked machines are dropped, and a failed
+    policy fetch fails CLOSED via ``strict_missing_badpwd=True``.
+    """
     lockout_threshold = None
     badpwd_by_user = None
     no_lockout_enforced = False
+    locked_users_for_result: set[str] = set()
 
     auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
     is_auth = auth_state in {"auth", "pwned"}
@@ -3205,7 +3221,7 @@ def compute_computer_spraying_eligibility(
         f"(safe remaining threshold={safe_threshold}, computers={len(computer_sams)})."
     )
 
-    if is_auth and shell.netexec_path:
+    if is_auth:
         auth_domain: str | None = None
         preferred_domain_data = shell.domains_data.get(domain, {})
         preferred_username = preferred_domain_data.get("username")
@@ -3230,110 +3246,114 @@ def compute_computer_spraying_eligibility(
                 strict_missing_badpwd=True,
             )
 
-        pass_pol_cmd = build_netexec_pass_pol_command(
-            nxc_path=shell.netexec_path,
-            dc_ip=pdc_ip,
-            username=auth_username,
-            password=auth_password,
-            domain=auth_domain,
-        )
-        print_info_debug(f"[netexec pass-pol] {pass_pol_cmd}")
-
-        computers_cmd = build_netexec_computers_query_command(
-            nxc_path=shell.netexec_path,
-            dc_ip=pdc_ip,
-            username=auth_username,
-            password=auth_password,
-            domain=auth_domain,
-            kerberos=True,
-        )
-        print_info_debug(f"[netexec computers] {computers_cmd}")
-
-        pass_pol_proc = _run_netexec_query_with_parse_retry(
-            shell,
-            command=pass_pol_cmd,
-            domain=auth_domain,
-            query_label="NetExec --pass-pol",
-            parse_ok=lambda output: (
-                parse_netexec_lockout_threshold_result(output).explicit_none
-                or parse_netexec_lockout_threshold_result(output).threshold is not None
-            ),
-        )
-        if pass_pol_proc and pass_pol_proc.stdout:
-            threshold_result = parse_netexec_lockout_threshold_result(
-                strip_ansi_codes(pass_pol_proc.stdout)
+        native_policy_ok = False
+        try:
+            from adscan_internal.services.spray_policy_service import (  # noqa: PLC0415
+                fetch_spray_policy_sync,
             )
-            lockout_threshold = threshold_result.threshold
-            if threshold_result.explicit_none:
-                no_lockout_enforced = True
-                print_info_verbose(
-                    "Password policy returned 'None' for account lockout threshold. "
-                    "No lockout is enforced; spraying cannot lock accounts."
-                )
-            elif lockout_threshold is not None:
-                print_info_verbose(
-                    f"Parsed account lockout threshold={lockout_threshold}."
-                )
-            else:
-                print_warning_verbose(
-                    "Password policy output did not contain a parseable account "
-                    "lockout threshold; treating the policy as unknown."
-                )
-        else:
-            print_warning_verbose(
-                "Password policy command produced no output; "
-                "lockout threshold unavailable."
+            from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
+                resolve_ldap_target_endpoints,
             )
 
-        if no_lockout_enforced:
-            print_info_debug(
-                "[eligibility] Skipping computer BadPwdCount lookup because "
-                "the domain reports no lockout threshold."
+            print_info_verbose(
+                "Fetching lockout policy + computer BadPwdCount via native LDAP..."
             )
-        else:
-            computers_proc = _run_netexec_query_with_parse_retry(
-                shell,
-                command=computers_cmd,
-                domain=auth_domain,
-                query_label="NetExec computer BadPwdCount query",
-                parse_ok=lambda output: bool(parse_netexec_computer_badpwd(output)),
+            ldap_endpoints = resolve_ldap_target_endpoints(
+                target_domain=domain,
+                domain_data=shell.domains_data.get(domain, {}),
+                kerberos_ready=True,
             )
-            if computers_proc and computers_proc.stdout:
-                badpwd_by_user = parse_netexec_computer_badpwd(
-                    strip_ansi_codes(computers_proc.stdout)
+            # Scope-aware DC/PDC selection (2026-07-12): redirect the lockout
+            # counting read to the true PDC on a replica override (see the user
+            # spray path above for the full rationale).
+            lockout_target = resolve_lockout_authority_ip(shell, domain)
+            spray_policy = fetch_spray_policy_sync(
+                domain=domain,
+                dc_ip=lockout_target.read_ip or pdc_ip,
+                username=auth_username,
+                password=auth_password,
+                use_kerberos=True,
+                kerberos_target_hostname=(
+                    lockout_target.kerberos_hostname
+                    if lockout_target.is_authoritative_pdc
+                    else ldap_endpoints.kerberos_target_hostname
+                ),
+                auth_domain=auth_domain,
+                account_scope="computer",
+            )
+
+            if not spray_policy.fetch_errors:
+                locked_users_for_result = spray_policy.locked_users
+                dp = spray_policy.default_policy
+                lockout_threshold = dp.lockout_threshold
+                no_lockout_enforced = (
+                    dp.no_lockout_enforced or lockout_threshold == 0
                 )
-                print_info_verbose(
-                    f"Parsed BadPwdCount data for {len(badpwd_by_user)} computer(s)."
-                )
-                if len(badpwd_by_user) == 0:
-                    print_warning_verbose(
-                        "Computer query returned output but no BadPwdCount values were "
-                        "recognized."
+                native_policy_ok = True
+
+                if no_lockout_enforced:
+                    print_info_verbose(
+                        "Password policy: no lockout enforced (threshold=0 or None). "
+                        "Spraying cannot lock computer accounts."
                     )
+                elif lockout_threshold is not None:
+                    print_info_verbose(
+                        f"Password policy: lockout threshold={lockout_threshold}."
+                    )
+                else:
+                    print_warning_verbose(
+                        "Password policy: lockout threshold unavailable from native LDAP."
+                    )
+                    native_policy_ok = False
+
+                if native_policy_ok and not no_lockout_enforced:
+                    if spray_policy.badpwd_by_user:
+                        badpwd_by_user = dict(spray_policy.badpwd_by_user)
+                        print_info_verbose(
+                            f"Fetched BadPwdCount for {len(badpwd_by_user)} computer(s)."
+                        )
+                    else:
+                        print_warning_verbose(
+                            "Native LDAP returned policy but no computer BadPwdCount data."
+                        )
+                        native_policy_ok = False
             else:
                 print_warning_verbose(
-                    "Computer query command produced no output; BadPwdCount data "
-                    "unavailable."
+                    "Native policy fetch had errors: "
+                    f"{'; '.join(spray_policy.fetch_errors)}."
                 )
-    else:
-        if not is_auth:
+        except Exception as _native_exc:  # noqa: BLE001
+            telemetry.capture_exception(_native_exc)
             print_warning_verbose(
-                f"Skipping computer BadPwdCount lookup for {marked_domain} because the "
-                "current domain context is not authenticated."
+                f"Native policy fetch raised an exception: {_native_exc}."
             )
-        elif not shell.netexec_path:
-            print_warning_verbose(
-                "Skipping computer BadPwdCount lookup because the query tool is "
-                "not configured."
-            )
+            native_policy_ok = False
 
-    return compute_spray_eligibility(
-        file_users=computer_sams,
-        lockout_threshold=lockout_threshold,
-        badpwd_by_user=badpwd_by_user,
-        safe_remaining_threshold=safe_threshold,
-        no_lockout_enforced=no_lockout_enforced,
-        strict_missing_badpwd=True,
+        if not native_policy_ok and not no_lockout_enforced:
+            # Fail CLOSED: the native LDAP fetch failed, so lockout policy and
+            # computer BadPwdCount are unknown. compute_spray_eligibility with
+            # strict_missing_badpwd=True conservatively excludes machines with
+            # unknown BadPwdCount below.
+            print_warning_verbose(
+                "Native lockout-policy fetch failed; account lockout policy and "
+                "computer BadPwdCount are unknown — excluding conservatively."
+            )
+    else:
+        print_warning_verbose(
+            f"Skipping computer BadPwdCount lookup for {marked_domain} because the "
+            "current domain context is not authenticated."
+        )
+
+    return _exclude_locked_from_result(
+        compute_spray_eligibility(
+            file_users=computer_sams,
+            lockout_threshold=lockout_threshold,
+            badpwd_by_user=badpwd_by_user,
+            safe_remaining_threshold=safe_threshold,
+            no_lockout_enforced=no_lockout_enforced,
+            strict_missing_badpwd=True,
+        ),
+        locked_users_for_result,
     )
 
 
@@ -4469,6 +4489,12 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     # Ensure kerberos output directory exists for spray logs
     ensure_kerberos_output_dir(shell, domain)
 
+    # Scope-aware DC/PDC selection (2026-07-12): when the operational DC is a
+    # replica override, gate spraying on whether the true PDC is reachable for
+    # lockout reads (toast when it is, conservative confirm/skip when it is not).
+    if not maybe_gate_replica_spraying(shell, domain):
+        return
+
     auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
     requires_auth_users = auth_state in {"auth", "pwned"}
     user_list_file = get_spraying_user_list_path(
@@ -4707,24 +4733,14 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
             )
 
         if spray_category == "blank_password":
-            output_file = os.path.join(
-                "domains",
-                domain,
-                "smb",
-                "auth_spray_blank.log" if is_auth else "unauth_spray_blank.log",
-            )
-            netexec_cmd = build_netexec_password_spray_command(
-                nxc_path=shell.netexec_path,
-                dc_ip=pdc_ip,
-                users_file=temp_users_path,
-                password=spray_password,
-                domain=domain,
-                log_file=output_file,
-            )
-            netexec_spraying_command(
+            # Native blank-password sweep against the DC — one auth attempt per
+            # eligible user (no NetExec subprocess). Uses the same eligible-user
+            # set already gated by the lockout-safe eligibility computation.
+            domain_spray_command(
                 shell,
-                netexec_cmd,
+                list(eligibility.eligible_users),
                 domain,
+                password=spray_password or "",
                 spray_type=spray_type,
             )
         else:
@@ -7105,17 +7121,22 @@ def spraying_command(
     )
 
 
-def netexec_spraying_command(
+def domain_spray_command(
     shell: SprayShell,
-    command: str,
+    users: list[str],
     domain: str,
     *,
+    password: str = "",
     spray_type: str | None = None,
     entry_label: str | None = None,
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
 ) -> None:
-    """Wrapper for NetExec-based spraying commands with the standard header."""
+    """Wrapper for the native domain spray (blank/single-candidate) with a header.
+
+    Runs a native authentication sweep against the DC — one attempt per eligible
+    user with the candidate ``password`` — instead of shelling out to NetExec.
+    """
     from adscan_internal import print_operation_header
 
     resolved_spray_type = spray_type or "Custom Password"
@@ -7126,16 +7147,16 @@ def netexec_spraying_command(
             "Spray Type": resolved_spray_type,
             "User List": "Domain Users",
             "PDC": shell.domains_data[domain].get("pdc", "N/A"),
-            "Protocol": "SMB (NetExec)",
+            "Protocol": "Kerberos / SMB (native)",
         },
         icon="💧",
     )
 
-    print_info_debug(f"Command: {command}")
-    execute_netexec_spraying_command(
+    execute_domain_spray_native(
         shell,
-        command,
-        domain,
+        users=users,
+        domain=domain,
+        password=password,
         spray_type=resolved_spray_type,
         entry_label=entry_label,
         source_context=source_context,
@@ -7453,16 +7474,16 @@ def execute_spraying_command(
                 for line in output_lines:
                     print_info_verbose(f"  {line}")
             elif output_lines:
-                # Show summary even in non-SECRET mode
-                error_lines = [
-                    line
-                    for line in output_lines
-                    if "error" in line.lower() or "failed" in line.lower()
-                ]
+                # Show summary even in non-SECRET mode. An empty spray is a normal
+                # negative: rejected credentials (KDC_ERR_PREAUTH_FAILED,
+                # "authentication failed") are NOT errors, so filter them out and
+                # only warn on genuine tool/transport failures. Detail lines are
+                # print_info (visible) so the header is never left dangling.
+                error_lines = _genuine_spray_error_lines(output_lines)
                 if error_lines:
                     print_warning("Errors detected in output:")
-                    for line in error_lines[:5]:  # Show first 5 error lines
-                        print_info_verbose(f"  {line}")
+                    for line in error_lines[:5]:  # Show first 5 genuine error lines
+                        print_info(f"  {_rich_markup_escape(line)}")
     except Exception as e:
         telemetry.capture_exception(e)
         print_error("Error executing password spraying command.")
@@ -7471,60 +7492,194 @@ def execute_spraying_command(
     return list(hits_by_user.values()) if found_credentials else []
 
 
-def execute_netexec_spraying_command(
-    shell: SprayShell,
-    command: str,
-    domain: str,
+# Bounded concurrency for the native domain spray. Kept modest so a large spray
+# does not flood the KDC with simultaneous AS-REQs (OPSEC + DoS avoidance). Each
+# user is an independent principal, so concurrency never changes per-account
+# badPwdCount — the one-attempt-per-user invariant is preserved regardless.
+_NATIVE_SPRAY_CONCURRENCY = 5
+
+# Native CredentialStatus -> spray outcome-code mapping. VALID and
+# PASSWORD_MUST_CHANGE are HITS (the candidate is the correct password — a
+# must-change account still proves the password), mirroring the retired NetExec
+# path which treated STATUS_PASSWORD_MUST_CHANGE / KDC_ERR_KEY_EXPIRED as valid.
+_NATIVE_SPRAY_HIT_STATUSES = frozenset({"valid", "password_must_change"})
+_NATIVE_SPRAY_OUTCOME_CODE: dict[str, str] = {
+    "valid": "SUCCESS",
+    "password_must_change": "STATUS_PASSWORD_MUST_CHANGE",
+    "account_locked": "STATUS_ACCOUNT_LOCKED_OUT",
+    "account_disabled": "STATUS_ACCOUNT_DISABLED",
+    "password_expired": "STATUS_PASSWORD_EXPIRED",
+    "invalid": "STATUS_LOGON_FAILURE",
+    "user_not_found": "USER_NOT_FOUND",
+    "timeout": "CONNECTION_ERROR",
+    "error": "OTHER_FAILURE",
+}
+
+
+async def _run_native_domain_spray(
     *,
+    domain: str,
+    dc_ip: str,
+    users: list[str],
+    password: str,
+    posture_snapshot: object | None,
+    credential_type: str = "password",
+) -> tuple[list[str], dict[str, int]]:
+    """Authenticate the candidate credential as each user, ONE attempt each.
+
+    Uses the native, Kerberos-first credential verifier
+    (:meth:`CredentialService._verify_via_kerberos`), which performs exactly one
+    credential-checking authentication per call — etype/no-verdict retries never
+    touch badPwdCount, and there is NO NTLM<->Kerberos re-attempt on a wrong
+    credential. So each (user, candidate) increments badPwdCount at most once, the
+    core lockout-safety invariant. Runs with bounded concurrency against the DC.
+
+    ``password`` is the candidate credential value; ``credential_type`` selects
+    how it is used — ``"password"`` (default, cleartext spray) or ``"hash"``
+    (pass-the-hash domain-reuse validation, where ``password`` carries the 32-hex
+    NT hash). Both flow through the same single-attempt verifier, so the
+    hash-reuse path inherits the identical lockout-safety guarantee.
+
+    Returns ``(hit_usernames, outcome_counts)`` in the same shape the retired
+    NetExec parser produced, so downstream rendering/persistence is unchanged.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from adscan_internal.services.credential_service import (  # noqa: PLC0415
+        CredentialService,
+    )
+
+    service = CredentialService()
+    semaphore = asyncio.Semaphore(_NATIVE_SPRAY_CONCURRENCY)
+    hit_usernames: dict[str, str] = {}
+    outcome_counts: dict[str, int] = {}
+
+    async def _verify_one(user: str) -> tuple[str, str]:
+        async with semaphore:
+            try:
+                # Deliberate reuse of the canonical native, Kerberos-first
+                # credential verifier — the single-attempt classifier ADscan
+                # already trusts for VALID / INVALID / LOCKED / MUST_CHANGE.
+                result = await service._verify_via_kerberos(  # pylint: disable=protected-access
+                    domain=domain,
+                    kdc_ip=dc_ip,
+                    username=user,
+                    credential=password,
+                    credential_type=credential_type,
+                    posture_snapshot=posture_snapshot,
+                )
+                return user, str(getattr(result.status, "value", result.status))
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                return user, "error"
+
+    tasks = [asyncio.ensure_future(_verify_one(user)) for user in users]
+    for coro in asyncio.as_completed(tasks):
+        user, status = await coro
+        code = _NATIVE_SPRAY_OUTCOME_CODE.get(status, "OTHER_FAILURE")
+        outcome_counts[code] = outcome_counts.get(code, 0) + 1
+        if status in _NATIVE_SPRAY_HIT_STATUSES:
+            hit_usernames.setdefault(user.lower(), user)
+
+    return sorted(hit_usernames.values(), key=str.lower), outcome_counts
+
+
+def execute_domain_spray_native(
+    shell: SprayShell,
+    *,
+    users: list[str],
+    domain: str,
+    password: str = "",
     spray_type: str | None = None,
     entry_label: str | None = None,
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
     lockout_context: dict[str, object] | None = None,
 ) -> None:
-    """Execute a NetExec-based spray and process its hits."""
+    """Run a native authentication sweep against the DC and process its hits.
+
+    Replaces the ``nxc smb <dc> -u <users> -p <pass>`` subprocess: for each
+    eligible user, a single native Kerberos/NTLM authentication attempt with the
+    candidate ``password`` (blank for the blank-password spray) is made against
+    the DC and classified as valid / must-change / locked / logon-failure. Hits
+    (valid + must-change) are rendered and persisted identically to the prior
+    path.
+
+    Note on pre-mint: unlike a mass-auth SWEEP as one owned principal (where
+    ``resolve_sweep_credential`` pre-mints a single TGT so the operator secret
+    hits the wire once), a password spray tests the candidate AS each target
+    user — there is no owned principal to mint a TGT for. The invariant that
+    protects (secret on the wire once, no per-host lockout amplification) holds
+    structurally here: a single target host (the DC) and exactly one attempt per
+    user.
+    """
     from adscan_internal.cli.common import SECRET_MODE
 
     marked_domain = mark_sensitive(domain, "domain")
-    _spinner_label_parts: list[str] = []
-    if spray_type:
-        _spinner_label_parts.append(spray_type)
-    _spinner_label_parts.append(f"on {marked_domain}")
-    _spinner_label = " ".join(_spinner_label_parts)
+
+    # De-duplicate the user list case-insensitively so a repeated entry can never
+    # produce a second attempt against the same account within one spray window.
+    seen_users: set[str] = set()
+    unique_users: list[str] = []
+    for raw_user in users:
+        user = str(raw_user or "").strip()
+        if not user:
+            continue
+        key = user.lower()
+        if key in seen_users:
+            continue
+        seen_users.add(key)
+        unique_users.append(user)
+
+    if not unique_users:
+        print_warning("No eligible users to spray.")
+        return
 
     try:
+        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+        from adscan_internal.services.domain_posture import get_posture  # noqa: PLC0415
+
+        dc_ip = resolve_dc_ip(shell.domains_data.get(domain, {}) or {})
+        if not dc_ip:
+            print_error(
+                "Cannot resolve the domain controller IP for the spray; aborting."
+            )
+            return
+        posture_snapshot = get_posture(shell.domains_data, domain=domain)
+
+        _spinner_label_parts: list[str] = []
+        if spray_type:
+            _spinner_label_parts.append(spray_type)
+        _spinner_label_parts.append(f"on {marked_domain}")
+        _spinner_label = " ".join(_spinner_label_parts)
+
+        import asyncio  # noqa: PLC0415
+
         print_info_debug(
-            f"[spray] Executing NetExec spraying command on domain {marked_domain}"
+            f"[spray] Native domain spray on {marked_domain}: "
+            f"{len(unique_users)} user(s), one attempt each."
         )
-        from adscan_core.output._state import _get_console
+        from adscan_core.output._state import _get_console  # noqa: PLC0415
         _console = _get_console()
         with _console.status(
-            f"[bold {ADSCAN_PRIMARY}]Spraying {_spinner_label} via NetExec …[/bold {ADSCAN_PRIMARY}] "
-            "[dim](SMB auth attempts streaming, results render when complete)[/dim]",
+            f"[bold {ADSCAN_PRIMARY}]Spraying {_spinner_label} …[/bold {ADSCAN_PRIMARY}] "
+            "[dim](native auth attempts, results render when complete)[/dim]",
             spinner="dots",
         ):
-            completed_process = shell._run_netexec(
-                command,
-                domain=domain,
-                timeout=None,
-                shell=True,
-                capture_output=True,
-                text=True,
+            hit_usernames, outcome_counts = asyncio.run(
+                _run_native_domain_spray(
+                    domain=domain,
+                    dc_ip=dc_ip,
+                    users=unique_users,
+                    password=password,
+                    posture_snapshot=posture_snapshot,
+                )
             )
 
-        if completed_process is None:
-            print_error("Failed to execute password spraying command")
-            return
-
-        raw_output = str(getattr(completed_process, "stdout", "") or "")
-        raw_stderr_output = str(getattr(completed_process, "stderr", "") or "")
-        combined_output = "\n".join(
-            text for text in (raw_output, raw_stderr_output) if text
-        )
-        hit_usernames, outcome_counts = _summarize_domain_spray_outcomes(
-            combined_output
-        )
-        hits = [{"username": username, "password": ""} for username in hit_usernames]
+        hits = [
+            {"username": username, "password": password}
+            for username in hit_usernames
+        ]
 
         if hits:
             _render_valid_spray_hits_panel(
@@ -7544,35 +7699,23 @@ def execute_netexec_spraying_command(
                 persist_via_add_credential=True,
                 allow_empty_credential=True,
             )
-
-        if completed_process.returncode != 0 and not hits:
-            print_error(
-                f"Password spraying command failed with return code: {completed_process.returncode}"
-            )
+            print_info_verbose("Password spraying completed successfully")
+        else:
             outcome_summary = _summarize_outcomes_for_table(outcome_counts, limit=4)
             if outcome_summary != "-":
                 print_warning(
-                    f"NetExec spray outcomes for {marked_domain}: {outcome_summary}"
-                )
-            if raw_stderr_output:
-                print_warning_debug(f"stderr: {raw_stderr_output}")
-        elif not hits:
-            outcome_summary = _summarize_outcomes_for_table(outcome_counts, limit=4)
-            if outcome_summary != "-":
-                print_warning(
-                    f"No credentials found during spraying. NetExec outcomes: {outcome_summary}"
+                    f"No credentials found during spraying. Outcomes for "
+                    f"{marked_domain}: {outcome_summary}"
                 )
             else:
                 print_warning("No valid credentials found.")
-        else:
-            print_info_verbose("Password spraying completed successfully")
     except Exception as e:  # noqa: BLE001
         telemetry.capture_exception(e)
         if not SECRET_MODE:
-            print_error("Error executing password spraying command.")
+            print_error("Error executing password spraying.")
             print_warning(
-                "No credentials were captured during spraying. Check the log above for signs of must-change accounts, "
-                "logon failures, or connectivity issues."
+                "No credentials were captured during spraying. Check the log above for signs of "
+                "must-change accounts, logon failures, or connectivity issues."
             )
         else:
             print_exception(show_locals=False, exception=e)
@@ -8069,6 +8212,9 @@ def _interactive_select_spray(
         )
     keys.append("custom")
     labels.append("Custom password (type a password to spray)")
+    if _resolve_mined_spray_candidates(shell, domain):
+        keys.append("mined")
+        labels.append("Environment-mined base word (targeted spray)")
     if has_pending:
         keys.append("retry_found")
         labels.append("Retry passwords found in shares")
@@ -8122,10 +8268,75 @@ def _dispatch_spray_choice(
         pwd = Prompt.ask("Enter the password to spray")
         if pwd:
             spraying_with_password(shell, domain, pwd)
+    elif choice == "mined":
+        _spray_mined_base_word(shell, domain)
     elif choice == "retry_found":
         retry_pending_password_spraying(shell, domain)
     elif choice == "retry_reuse":
         retry_pending_domain_reuse_validation(shell, domain)
+
+
+def _resolve_mined_spray_candidates(shell: "SprayShell", domain: str) -> list[str]:
+    """Return environment-mined base-word candidates for a targeted spray.
+
+    Thin wrapper over the SSOT ``custom_wordlist_service.build_spray_candidates``:
+    resolves the workspace inventory dir + the domain's ``domains_data`` and asks
+    the generator for the mined seed words (company/netbios/OU/description/host
+    tokens). Best-effort — any failure yields an empty list so the selector just
+    omits the option. These are SEED passwords the operator opts into; each is
+    sprayed through the existing lockout-aware executor unchanged.
+    """
+    try:
+        from adscan_internal.services import custom_wordlist_service as cwl
+
+        try:
+            workspace_cwd = shell._get_workspace_cwd()  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            workspace_cwd = getattr(shell, "current_workspace_dir", "") or os.getcwd()
+        domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain, {}) or {}
+        return cwl.build_spray_candidates(
+            workspace_dir=workspace_cwd, domain=domain, domain_data=domain_data
+        )
+    except Exception as exc:  # noqa: BLE001 — mining is optional, never blocks spray
+        telemetry.capture_exception(exc)
+        return []
+
+
+def _spray_mined_base_word(shell: "SprayShell", domain: str) -> None:
+    """Offer environment-mined base words as opt-in spray seeds, spray the pick.
+
+    The operator selects ONE mined base word (or types their own); it is sprayed
+    via the existing :func:`spraying_with_password` executor, so the observation
+    window + ``badPwdCount`` lockout safety and policy filtering are unchanged —
+    this only pre-populates the base password from environment intelligence.
+    """
+    candidates = _resolve_mined_spray_candidates(shell, domain)
+    if not candidates:
+        print_info(
+            "No environment-mined base words available "
+            "(collect inventory first, then retry)."
+        )
+        return
+    # Cap the menu so a large mined set stays readable; the highest-signal words
+    # (env-structural provenance) are already ordered first by the generator.
+    shortlist = candidates[:20]
+    labels = list(shortlist) + ["Type a custom base word"]
+    idx = shell._questionary_select(  # noqa: SLF001
+        f"Select an environment-mined base word to spray on {domain}:",
+        labels,
+        default_idx=0,
+    )
+    if idx is None:
+        return
+    if idx == len(labels) - 1:
+        base_word = Prompt.ask("Enter the base word to spray")
+    else:
+        base_word = shortlist[idx] if 0 <= idx < len(shortlist) else ""
+    base_word = str(base_word or "").strip()
+    if base_word:
+        spraying_with_password(
+            shell, domain, base_word, entry_label="environment-mined base word"
+        )
 
 
 def run_spray_coverage(

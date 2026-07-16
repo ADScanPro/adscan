@@ -336,6 +336,25 @@ def run_smb_share_exposure_phase(shell: Any, *, domain: str) -> None:
         telemetry.capture_exception(exc)
         return
     if not rows:
+        # No share-access rows in the graph. Distinguish a genuine "no exposure"
+        # result (stay quiet) from an aborted collection (surface it): otherwise
+        # the phase "Completes" silently and an incomplete enumeration reads as
+        # "no shares". The collector persisted the abort coverage into domains_data.
+        _share_coverage = domain_data.get("share_collection")
+        if isinstance(_share_coverage, dict):
+            _aborted = [
+                (str(h.get("host") or ""), str(h.get("ip") or ""))
+                for h in (_share_coverage.get("aborted_hosts") or [])
+                if isinstance(h, dict)
+            ]
+            if _aborted:
+                from adscan_internal.services.collector.share_collection_notify import (  # noqa: PLC0415
+                    emit_phase_share_abort_notice,
+                )
+
+                emit_phase_share_abort_notice(
+                    _aborted, int(_share_coverage.get("reached_hosts") or 0)
+                )
         return
 
     # -- Global overview (Access column already encodes R/W severity) --
