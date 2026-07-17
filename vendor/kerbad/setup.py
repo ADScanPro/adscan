@@ -49,7 +49,15 @@ setup(
 	],
 	install_requires=[
 		'asn1crypto>=1.5.1',
-		'cryptography>=44.0.2',
+		# Floor kept at 42.0.8 (NOT the "latest-at-vendor-split" 44.0.2): kerbad only
+		# uses stable cryptography APIs (x509/pkcs12/hashes/padding/serialization/dh)
+		# present since <=42, and certipy-ad (a NetExec tool-venv dep) pins
+		# cryptography~=42.0.8 (<43). A 44.x floor made <43 ∩ >=44.2 empty ->
+		# ResolutionImpossible on the NetExec arm64 leg (where our vendor
+		# aardwolf->badauth->kerbad chain is the only installable aardwolf, unlike
+		# amd64 which silently uses the upstream asyauth-based wheel). Locked by
+		# tests/unit/vendor/test_kerbad_cryptography_floor.py.
+		'cryptography>=42.0.8',
 		'asysocks>=0.2.18',
 		'unicrypto>=0.0.12',
 		'tqdm',

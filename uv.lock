@@ -2328,7 +2328,7 @@ wheels = [
 
 [[package]]
 name = "kerbad"
-version = "0.5.10"
+version = "0.6.0"
 source = { editable = "vendor/kerbad" }
 dependencies = [
     { name = "asn1crypto" },
@@ -2345,7 +2345,7 @@ dependencies = [
 requires-dist = [
     { name = "asn1crypto", specifier = ">=1.5.1" },
     { name = "asysocks", specifier = ">=0.2.18" },
-    { name = "cryptography", specifier = ">=44.0.2" },
+    { name = "cryptography", specifier = ">=42.0.8" },
     { name = "dnspython", specifier = ">=2.7.0" },
     { name = "six" },
     { name = "tqdm" },

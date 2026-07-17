@@ -19,6 +19,12 @@
 ARG JOHN_SOURCE_STAGE=john_builder
 ARG FREERDP_SOURCE_STAGE=freerdp_none
 ARG SLU_SOURCE_STAGE=slu_none
+# hashcat source selector (host-side build mirror, same pattern as John). amd64
+# ships the official prebuilt .7z at runtime, so on that arch the hashcat_builder
+# stage is a NO-OP (empty install tree) and the runtime layer downloads the .7z;
+# on arm64 there is NO upstream release, so hashcat_builder compiles it from
+# source (SSE2->NEON via deps/sse2neon) and the runtime layer COPYs that tree.
+ARG HASHCAT_SOURCE_STAGE=hashcat_builder
 
 ###############################################################################
 # John the Ripper build stage (generic john binary + official converters)
@@ -61,6 +67,17 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 # accepts a COMPLETE archive. git fetch (HTTP/1.1, low-speed abort) is the
 # fallback for the rare case codeload is unavailable but the git endpoint works.
 # git config is global so it also covers the converter build below.
+#
+# arm64 note: this John commit has a Makefile.legacy defect on the linux-arm64le
+# target. arm64le.h enables NEON (SIMD_COEF_32=4), so format plugins (wpapsk,
+# zipmonster, ...) reference SIMDSHA1body/SIMDmd5body, but the linux-arm64le
+# target omits simd-intrinsics.o from JOHN_OBJS (the linux-x86-64 target links
+# it and is fine) -> "undefined reference to SIMDSHA1body" at the final link and
+# the arm64 leg of a multi-arch build fails. The RUN below patches only that
+# target's JOHN_OBJS to add simd-intrinsics.o before the legacy build. NEON is
+# mandatory on every AArch64 CPU, so the resulting binary is still a portable
+# fallback. The patch is scoped to the arm64le target and is a no-op if a future
+# commit bump fixes it upstream (the pattern stops matching). amd64 is untouched.
 RUN set -eux; \
   git config --global http.version HTTP/1.1; \
   git config --global http.lowSpeedLimit 1000; \
@@ -107,6 +124,10 @@ RUN set -eux; \
     *) john_mk_target="generic"; john_configure=(./configure --disable-native-tests) ;; \
   esac; \
   echo "[john_builder] arch=${jarch} legacy-target=${john_mk_target}" >&2; \
+  if [ "${jarch}" = "arm64" ]; then \
+    echo "[john_builder] patching Makefile.legacy linux-arm64le: linking the missing simd-intrinsics.o (NEON SIMD bodies)" >&2; \
+    sed -i '/^linux-arm64le:/,/^linux-arm32le-neon:/ s|JOHN_OBJS="$(JOHN_OBJS) c3_fmt.o"|JOHN_OBJS="$(JOHN_OBJS) c3_fmt.o simd-intrinsics.o"|' /opt/adscan/tools/john/src/Makefile.legacy; \
+  fi; \
   ( \
     cd /opt/adscan/tools/john/src && \
     make -s -f Makefile.legacy clean && \
@@ -125,7 +146,12 @@ RUN set -eux; \
 #
 # Selected via `--build-arg JOHN_SOURCE_STAGE=john_prebuilt` when the build
 # script has seeded a host-cached, commit-keyed `run/` dir into the build
-# context at `john-prebuilt/run/` (see scripts/build_docker_lite_image.sh).
+# context at `john-prebuilt/<arch>/run/` (see scripts/build_docker_lite_image.sh).
+# The John binary is arch-specific ELF, so the seed is PER-ARCH: the COPY below
+# selects the right one via ${TARGETARCH} (BuildKit-provided). For a single-arch
+# `docker build`, TARGETARCH == the host arch, which is exactly the arch the seed
+# was cached/compiled for; for a multi-platform buildx build, each leg COPYs its
+# own arch's prebuilt (both seeded by build_mirror_ensure_arch).
 # This reuses a known-good John binary instead of fetching + compiling from
 # GitHub, which is the robust path when GitHub's CDN is degraded (it cannot even
 # serve the source tarball completely). The host cache is keyed by the pinned
@@ -134,7 +160,8 @@ RUN set -eux; \
 # stage is never referenced, and John is fetched + built from source as usual.
 ###############################################################################
 FROM debian:trixie-slim AS john_prebuilt
-COPY john-prebuilt/run /opt/adscan/tools/john/run
+ARG TARGETARCH
+COPY john-prebuilt/${TARGETARCH}/run /opt/adscan/tools/john/run
 
 # Resolve the selected John source (john_builder | john_prebuilt) to a fixed
 # alias so the downstream COPY uses a static --from (no ARG in --from, which the
@@ -143,6 +170,114 @@ COPY john-prebuilt/run /opt/adscan/tools/john/run
 # fetch, and john_builder selection never requires a seeded artifact.
 ARG JOHN_SOURCE_STAGE
 FROM ${JOHN_SOURCE_STAGE} AS john_source
+
+###############################################################################
+# kerbrute build stage (cross-compiled Go binary — no arm64 upstream release)
+#
+# ropnop/kerbrute publishes only linux/amd64 (+ windows/darwin) release assets:
+# `kerbrute_linux_arm64` 404s, which HARD-BREAKS the arm64 image build. kerbrute
+# is pure Go with no cgo, so it cross-compiles trivially. This stage runs on the
+# BUILD host's native arch (`--platform=$BUILDPLATFORM`) and emits a static
+# binary for the TARGET arch via `GOOS/GOARCH` — so BOTH the amd64 and arm64 legs
+# of a multi-arch build compile in ~30s each with NO QEMU (no emulated toolchain).
+# Cheap + reproducible, so it does NOT need the host build-mirror; the builder
+# stage alone is enough. Pinned to v1.0.3 to match the previous release download.
+###############################################################################
+FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS kerbrute_builder
+ARG TARGETARCH
+ARG KERBRUTE_VERSION=v1.0.3
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# HTTP/1.1 + low-speed abort hardens the clone against GitHub's HTTP/2 stream
+# CANCEL / CDN throttle (same class the John builder guards against). The bare
+# `.` build target is used deliberately: the Makefile's per-arch targets omit
+# arm64, but `go build .` from the repo root works for every GOARCH.
+RUN set -eux; \
+  git config --global http.version HTTP/1.1; \
+  git config --global http.lowSpeedLimit 1000; \
+  git config --global http.lowSpeedTime 60; \
+  for attempt in 1 2 3; do \
+    if git clone --depth 1 --branch "${KERBRUTE_VERSION}" https://github.com/ropnop/kerbrute.git /src; then \
+      break; \
+    fi; \
+    echo "[kerbrute_builder] clone attempt ${attempt} failed, retrying in $((attempt * 5))s..." >&2; \
+    rm -rf /src; \
+    sleep "$((attempt * 5))"; \
+  done; \
+  test -d /src; \
+  mkdir -p /out; \
+  cd /src; \
+  GOOS=linux GOARCH="${TARGETARCH}" CGO_ENABLED=0 go build -ldflags "-s -w" -o /out/kerbrute .; \
+  test -x /out/kerbrute
+
+###############################################################################
+# hashcat build stage (source-compiled — no arm64 upstream release)
+#
+# hashcat ships an OFFICIAL prebuilt binary for amd64 ONLY (the .7z carries an
+# x86_64 hashcat.bin). On arm64 there is NO release, and hashcat is the SOLE
+# engine for kerberoast(13100)/asrep(18200)/timeroast(31300)/NetNTLMv1(5500)/
+# NetNTLMv2(5600)/NTLM(1000) — John only cracks file artifacts (office/keepass/
+# zip/pfx), so an arm64 image without hashcat loses ALL online-hash cracking.
+# hashcat 7.x ports SSE2->NEON via deps/sse2neon and builds cleanly from source
+# with build-essential (~343s under QEMU), so we compile it for the target arch.
+#
+# amd64 CARVE-OUT: the runtime layer keeps the official .7z on amd64 (faster,
+# known-good), so this stage produces an EMPTY install tree on amd64 (no compile)
+# and only compiles on arm64. That keeps the amd64 path byte-identical while the
+# unconditional `COPY --from=hashcat_source` in runtime-common resolves on both
+# legs. The compiled-in -DSHARED_FOLDER points at the FINAL runtime path so the
+# binary finds its OpenCL/ kernels + modules/ at /opt/adscan/tools/hashcat/install.
+###############################################################################
+FROM debian:trixie-slim AS hashcat_builder
+ARG DEBIAN_FRONTEND=noninteractive
+ARG HASHCAT_VERSION=7.1.2
+ARG TARGETARCH
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+RUN set -eux; \
+  hcarch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+  if [ "${hcarch}" != "arm64" ]; then \
+    echo "[hashcat_builder] arch=${hcarch}: runtime ships the official .7z on this arch; producing an EMPTY install tree (no source build)" >&2; \
+    mkdir -p /opt/adscan/tools/hashcat/install; \
+    exit 0; \
+  fi; \
+  apt-get update -y && apt-get install -y --no-install-recommends \
+      ca-certificates git build-essential \
+    && rm -rf /var/lib/apt/lists/*; \
+  git config --global http.version HTTP/1.1; \
+  git config --global http.lowSpeedLimit 1000; \
+  git config --global http.lowSpeedTime 60; \
+  for attempt in 1 2 3; do \
+    if git clone --depth 1 --branch "v${HASHCAT_VERSION}" https://github.com/hashcat/hashcat.git /src; then \
+      break; \
+    fi; \
+    echo "[hashcat_builder] clone attempt ${attempt} failed, retrying in $((attempt * 5))s..." >&2; \
+    rm -rf /src; \
+    sleep "$((attempt * 5))"; \
+  done; \
+  test -d /src; \
+  make -C /src -j"$(nproc)" PREFIX=/opt/adscan/tools/hashcat/install; \
+  make -C /src install PREFIX=/opt/adscan/tools/hashcat/install; \
+  test -x /opt/adscan/tools/hashcat/install/bin/hashcat
+
+###############################################################################
+# hashcat prebuilt-artifact stage (host-side build mirror — per arch)
+#
+# Selected via `--build-arg HASHCAT_SOURCE_STAGE=hashcat_prebuilt` when the build
+# script seeded a host-cached, commit-keyed `install/` tree into the build
+# context at `hashcat-prebuilt/<arch>/install/` (see lib_build_mirror.sh +
+# build_docker_lite_image.sh). The hashcat binary is arch-specific ELF, so the
+# seed is PER-ARCH: the COPY selects the right one via ${TARGETARCH}. On amd64
+# the seeded tree is intentionally EMPTY (runtime uses the .7z); on arm64 it is
+# the cached source-built tree. Cold cache / new version → HASHCAT_SOURCE_STAGE
+# defaults to `hashcat_builder`, this stage is never referenced.
+###############################################################################
+FROM debian:trixie-slim AS hashcat_prebuilt
+ARG TARGETARCH
+COPY hashcat-prebuilt/${TARGETARCH}/install /opt/adscan/tools/hashcat/install
+
+# Resolve the selected hashcat source (hashcat_builder | hashcat_prebuilt) to a
+# fixed alias so the downstream COPY uses a static --from (no ARG in --from).
+ARG HASHCAT_SOURCE_STAGE
+FROM ${HASHCAT_SOURCE_STAGE} AS hashcat_source
 
 ###############################################################################
 # FreeRDP source selector (host-side build mirror — skips the cmake compile)
@@ -160,6 +295,13 @@ FROM ${JOHN_SOURCE_STAGE} AS john_source
 # Only the selected stage is built; the other is pruned. So freerdp_prebuilt
 # selection never requires a seeded artifact to be absent, and freerdp_none
 # selection never requires the seeded dir to exist.
+#
+# Multi-arch note: unlike John (per-arch host mirror, seeded via
+# build_mirror_ensure_arch), FreeRDP is EXCLUDED from per-arch multi-arch mirror
+# caching BY DESIGN — its inline cmake compile is entangled with runtime-common's
+# -dev libs, and a cross-arch builder stage would risk RDP runtime linkage drift
+# (needs separate L3 RDP validation). So in a multi-platform build FreeRDP always
+# compiles inline per-leg (freerdp_none). Deferred follow-up.
 ###############################################################################
 FROM debian:trixie-slim AS freerdp_prebuilt
 COPY freerdp-prebuilt/install /opt/adscan/tools/freerdp/install
@@ -206,8 +348,10 @@ ARG SLU_COMMIT=31132bd5da19787152a354e6adad18b2c8432e73
 ARG ADSCAN_RUNTIME_CONTRACT_VERSION="1"
 # Target architecture (amd64 / arm64), auto-provided by BuildKit for both
 # `docker build` and `docker buildx build`. Arch-specific tool downloads below
-# (kerbrute, ligolo proxy) and the amd64-only tools (hashcat, donut) branch on
-# it so an arm64 image pulls native binaries instead of amd64 ones.
+# (ligolo proxy) and per-arch tools (hashcat: .7z on amd64 vs source-built on
+# arm64; donut: amd64-only) branch on it so an arm64 image ships native binaries
+# instead of amd64 ones. kerbrute + hashcat(arm64) are COPYed from cross/source
+# builder stages, so they no longer 404 / skip on arm64.
 ARG TARGETARCH
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
@@ -399,6 +543,17 @@ COPY src/windows_tools/ /workspace_build/src/windows_tools/
 
 COPY --from=john_source /opt/adscan/tools/john/run /opt/adscan/tools/john/run
 
+# kerbrute — cross-compiled in the kerbrute_builder stage for ${TARGETARCH}
+# (ropnop publishes no arm64 release). Same path the runtime code resolves
+# (/opt/adscan/tools/kerbrute/kerbrute); the External-tools RUN only chmods it.
+COPY --from=kerbrute_builder /out/kerbrute /opt/adscan/tools/kerbrute/kerbrute
+
+# hashcat source-built install tree (EMPTY on amd64 — that leg uses the official
+# .7z downloaded in the External-tools RUN below; POPULATED on arm64, where there
+# is no upstream release). The binary's -DSHARED_FOLDER is baked to this exact
+# path so it finds its OpenCL/ kernels + modules/ at runtime.
+COPY --from=hashcat_source /opt/adscan/tools/hashcat/install /opt/adscan/tools/hashcat/install
+
 # Prebuilt FreeRDP install tree (empty when building from source — see the
 # freerdp_source selector above). The External-tools RUN below compiles FreeRDP
 # only when this tree is absent (no xfreerdp binary present).
@@ -417,7 +572,15 @@ COPY --from=slu_source /usr/share/wordlists/statistically-likely-usernames /usr/
 # compiler is present (exactly how the main venv at the bottom already installs
 # it). Pre-seeding it into the NetExec venv is what makes this layer build cold
 # (the failure only surfaced in CI because the warm local layer cache hid it).
+# Vendored skelsec auth chain needed to build the NetExec tool venv below.
+# Forcing our vendor aardwolf (Rust-optional wheel) pulls its badauth dep, which
+# in turn pulls asysocks>=0.2.18 + kerbad — a set PyPI does not always have
+# published consistently at build time. We wheel all four from vendored source so
+# the netexec venv resolves without depending on PyPI's skelsec publishing state.
 COPY vendor/aardwolf /opt/adscan-src/vendor/aardwolf
+COPY vendor/asysocks /opt/adscan-src/vendor/asysocks
+COPY vendor/badauth /opt/adscan-src/vendor/badauth
+COPY vendor/kerbad /opt/adscan-src/vendor/kerbad
 
 # Install Python tool environments (mirrors `PipToolsConfig` from adscan.py)
 # BuildKit cache mount persists pip's wheel cache ACROSS builds (in the builder
@@ -471,15 +634,44 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
   # A plain pre-seed install is NOT enough: pip re-resolves aardwolf during the
   # NetExec install and rebuilds the PyPI sdist across every retry — forcing
   # binary-only for aardwolf is what actually prevents that.
-  /opt/adscan/tool_venvs/netexec/venv/bin/python -m pip wheel --no-deps \
-    --wheel-dir /tmp/aardwolf-wheel /opt/adscan-src/vendor/aardwolf; \
+  # Vendor aardwolf depends on badauth, and badauth pulls asysocks>=0.2.18 +
+  # kerbad — a skelsec set PyPI does NOT always have published consistently at
+  # build time (badauth 0.1.6 shipped requiring an asysocks that lagged on PyPI,
+  # so FRESH CI builds hit ResolutionImpossible while warm local caches passed).
+  # Build the WHOLE forced chain (asysocks, kerbad, badauth, aardwolf) as wheels
+  # from our vendored source and install from those --find-links, so the netexec
+  # venv resolution is INDEPENDENT of PyPI's skelsec publishing state. Pre-install
+  # the chain first so the NetExec resolve finds it satisfied instead of re-
+  # fetching from PyPI. --only-binary stays scoped to aardwolf (only its sdist is
+  # Rust-fatal); asysocks/kerbad/badauth are pure Python.
+  mkdir -p /tmp/skelsec-wheels; \
+  for _skelsec_lib in asysocks kerbad badauth aardwolf; do \
+    /opt/adscan/tool_venvs/netexec/venv/bin/python -m pip wheel --no-deps \
+      --wheel-dir /tmp/skelsec-wheels "/opt/adscan-src/vendor/${_skelsec_lib}"; \
+  done; \
   pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python \
-    --find-links /tmp/aardwolf-wheel --only-binary=aardwolf aardwolf; \
+    --find-links /tmp/skelsec-wheels --only-binary=aardwolf \
+    asysocks kerbad badauth aardwolf; \
   pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python \
-    --find-links /tmp/aardwolf-wheel --only-binary=aardwolf \
+    --find-links /tmp/skelsec-wheels --only-binary=aardwolf \
     "git+https://github.com/Pennyw0rth/NetExec.git@73ccf0d"; \
-  rm -rf /tmp/aardwolf-wheel; \
+  rm -rf /tmp/skelsec-wheels; \
   \
+  # TODO(arm64-extractous-cache): MANSPIDER pulls extractous>=0.3.0,<0.4.0, which
+  # has NO linux/aarch64 wheel on PyPI for any version — so on the arm64 leg pip
+  # source-builds it (GraalVM native-image, ~2h under QEMU) on EVERY build. The
+  # amd64 leg installs the published manylinux wheel in seconds. To cache the arm64
+  # build once (per the John/hashcat mirror pattern): add an `extractous_builder`
+  # stage that `pip wheel "extractous>=0.3.0,<0.4.0" --wheel-dir /wheelhouse` for
+  # TARGETARCH (arm64 → the 2h GraalVM build; amd64 → a no-op empty wheelhouse),
+  # a per-arch `build_mirror_spec_extractous` (BM_SUBDIR=wheelhouse,
+  # BM_INTEGRITY=<the extractous-*.whl>, BM_CTX_PER_ARCH=1), wire it into both build
+  # scripts, COPY the wheelhouse here and pass `--find-links /wheelhouse` to the
+  # install below so pip prefers the cached wheel. Deferred: the extractous
+  # toolchain (GraalVM + Rust) is heavy to stand up correctly in an isolated
+  # builder stage and the 2h build is impractical to validate here; the manspider
+  # venv stays FULLY WORKING on arm64 today (it just source-builds extractous),
+  # which is the invariant not to break. amd64 is unaffected (published wheel).
   python3 -m venv /opt/adscan/tool_venvs/manspider/venv; \
   pip_retry /opt/adscan/tool_venvs/manspider/venv/bin/python -U pip; \
   pip_retry /opt/adscan/tool_venvs/manspider/venv/bin/python "git+https://github.com/ADScanPro/MANSPIDER@cedb138"; \
@@ -518,10 +710,13 @@ RUN set -eux; \
   mkdir -p /opt/adscan/tools; \
   effarch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
   echo "[external-tools] target arch=${effarch}" >&2; \
-  # hashcat ships an OFFICIAL prebuilt binary for amd64 only (the .7z carries an
-  # x86_64 hashcat.bin). No arm64 release exists, so on arm64 the offline GPU/CPU
-  # cracking engine is John the Ripper (compiled natively above) instead. Skip
-  # the amd64 download on arm64 rather than shipping a non-executable x86_64 bin.
+  # hashcat is the SOLE engine for online-hash cracking — kerberoast(13100),
+  # asrep(18200), timeroast(31300), NetNTLMv1(5500), NetNTLMv2(5600), NTLM(1000).
+  # John the Ripper only covers FILE artifacts (office/keepass/zip/pfx), so hashcat
+  # must ship on EVERY arch. amd64 uses the official prebuilt .7z (the x86_64
+  # hashcat.bin — faster/known-good); arm64 has NO upstream release, so it ships a
+  # source-built hashcat (compiled in the hashcat_builder stage, COPYed to
+  # /opt/adscan/tools/hashcat/install above) driven by the PoCL CPU-OpenCL runtime.
   if [ "${effarch}" = "amd64" ]; then \
     if ! adscan-curl -fsSL "https://hashcat.net/files/hashcat-${HASHCAT_VERSION}.7z" -o /tmp/hashcat.7z; then \
       echo "warning: official hashcat download failed; falling back to SourceForge mirror" >&2; \
@@ -534,7 +729,16 @@ RUN set -eux; \
     /opt/adscan/bin/hashcat --version | grep -F "v${HASHCAT_VERSION}"; \
     rm -f /tmp/hashcat.7z; \
   else \
-    echo "warning: hashcat has no ${effarch} prebuilt binary; skipping (John the Ripper handles cracking on this arch)" >&2; \
+    # arm64: use the source-built install tree COPYed from hashcat_source and
+    # install PoCL (the CPU OpenCL ICD hashcat dlopens on hosts with no GPU). Both
+    # pocl-opencl-icd and ocl-icd-libopencl1 exist on debian:trixie arm64. This
+    # adds ~300-400MB (LLVM JIT) to the arm64 image — inherent + acceptable.
+    test -x /opt/adscan/tools/hashcat/install/bin/hashcat; \
+    ln -sf /opt/adscan/tools/hashcat/install/bin/hashcat /opt/adscan/bin/hashcat; \
+    apt-get update -y && apt-get install -y --no-install-recommends \
+        pocl-opencl-icd ocl-icd-libopencl1; \
+    apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    /opt/adscan/bin/hashcat --version | grep -F "v${HASHCAT_VERSION}"; \
   fi; \
   \
   git clone --depth 1 https://github.com/Greenwolf/ntlm_theft.git /opt/adscan/tools/ntlm_theft; \
@@ -553,8 +757,9 @@ RUN set -eux; \
   /opt/adscan/tool_venvs/PKINITtools/venv/bin/python -m pip install --no-cache-dir -U pip; \
   /opt/adscan/tool_venvs/PKINITtools/venv/bin/python -m pip install --no-cache-dir -r /opt/adscan/tools/PKINITtools/requirements.txt; \
   \
-  mkdir -p /opt/adscan/tools/kerbrute; \
-  adscan-curl -fsSL "https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_${effarch}" -o /opt/adscan/tools/kerbrute/kerbrute; \
+  # kerbrute is cross-compiled in the kerbrute_builder stage for ${TARGETARCH}
+  # and COPYed to /opt/adscan/tools/kerbrute/kerbrute above (ropnop publishes no
+  # arm64 release, which used to 404 the arm64 build). Just ensure it is exec.
   chmod +x /opt/adscan/tools/kerbrute/kerbrute; \
   \
   # ligolo-ng PROXY runs on the ADscan host, so it must match the host arch —
