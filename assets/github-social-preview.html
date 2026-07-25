@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ADscan — GitHub social preview</title>
+<style>
+  :root{
+    --ink:#05090B;
+    --ink2:#081115;
+    --teal-deep:#0E6E78;
+    --teal:#1AA0AE;
+    --teal-bright:#3CC5D3;
+    --text:#F2F6F7;
+    --muted:#8DA6AB;
+    --line:#15343B;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:1280px;height:640px}
+  body{
+    font-family:'Lato','Nimbus Sans',sans-serif;
+    background:var(--ink);
+    color:var(--text);
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+  }
+  .card{
+    position:relative;
+    width:1280px;height:640px;
+    /* layered atmosphere: deep-teal glow low-left, cool vignette to near-black */
+    background:
+      radial-gradient(120% 140% at 18% 118%, rgba(26,160,174,.20) 0%, rgba(14,110,120,.10) 30%, rgba(5,9,11,0) 58%),
+      radial-gradient(90% 120% at 92% -20%, rgba(60,197,211,.10) 0%, rgba(5,9,11,0) 55%),
+      linear-gradient(160deg,#071013 0%, #05090B 60%, #04070A 100%);
+    overflow:hidden;
+  }
+  /* faint horizontal scan texture — the "scan" in ADscan */
+  .card::before{
+    content:"";position:absolute;inset:0;
+    background:repeating-linear-gradient(0deg, rgba(255,255,255,.020) 0 1px, transparent 1px 4px);
+    mix-blend-mode:overlay;opacity:.5;pointer-events:none;
+  }
+  /* vertical edge accent lines, echoing the site OG */
+  .edge{position:absolute;top:0;bottom:0;width:2px;background:linear-gradient(180deg,transparent,var(--teal) 24%,var(--teal) 76%,transparent);opacity:.55}
+  .edge.l{left:40px}
+  .edge.r{right:40px;opacity:.30}
+
+  .inner{position:absolute;inset:0;padding:70px 92px 66px;display:flex;flex-direction:column}
+
+  /* --- top row: wordmark + repo handle --- */
+  .top{display:flex;align-items:center;justify-content:space-between}
+  .wordmark{height:74px;width:auto;display:block}
+  .handle{
+    font-family:'DejaVu Sans Mono',monospace;
+    font-size:19px;color:var(--muted);letter-spacing:.02em;
+    display:flex;align-items:center;gap:10px;
+  }
+  .handle .star{color:var(--teal-bright)}
+
+  /* --- eyebrow --- */
+  .eyebrow{
+    margin-top:44px;
+    font-family:'DejaVu Sans Mono',monospace;
+    font-size:16px;font-weight:700;letter-spacing:.34em;
+    color:var(--teal-bright);text-transform:uppercase;
+  }
+
+  /* --- headline --- */
+  h1{
+    margin-top:16px;
+    font-weight:900;font-size:74px;line-height:1.02;
+    letter-spacing:-0.025em;color:var(--text);
+  }
+  h1 .accent{color:var(--teal-bright)}
+  .sub{
+    margin-top:20px;font-weight:400;font-size:23px;line-height:1.4;
+    color:var(--muted);max-width:820px;letter-spacing:.002em;
+  }
+  .sub b{color:#C7D6D9;font-weight:700}
+
+  /* --- chips --- */
+  .chips{margin-top:26px;display:flex;gap:14px;flex-wrap:wrap}
+  .chip{
+    display:inline-flex;align-items:center;gap:9px;
+    padding:10px 16px;border-radius:9px;
+    background:rgba(26,160,174,.07);
+    border:1px solid rgba(26,160,174,.30);
+    font-size:18px;font-weight:700;color:#DCE9EB;letter-spacing:.01em;
+  }
+  .chip .dot{width:8px;height:8px;border-radius:50%;background:var(--teal-bright);box-shadow:0 0 10px rgba(60,197,211,.7)}
+  .chip .n{font-family:'DejaVu Sans Mono',monospace;color:var(--teal-bright);font-weight:700}
+
+  /* --- signature: attack-path chain --- */
+  .path{margin-top:auto;padding-top:30px}
+  .pathcap{
+    font-family:'DejaVu Sans Mono',monospace;font-size:15.5px;color:var(--muted);
+    letter-spacing:.02em;margin-top:16px;
+  }
+  .pathcap .sep{color:var(--teal-deep)}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="edge l"></div>
+    <div class="edge r"></div>
+
+    <div class="inner">
+      <div class="top">
+        <!-- ADscan wordmark (white + teal scan-line) -->
+        <svg class="wordmark" viewBox="-6 -6 752 218" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ADscan">
+          <path fill="#FFFFFF" fill-rule="evenodd" d="M56.19,175.90C57.39,175.26 60.88,169.27 64.63,161.41L71.02,148.03 L103.76,147.76L136.50,147.50 L136.82,145.23C137.15,142.91 124.74,117.14 122.63,115.77C122.01,115.36 113.74,115.02 104.25,115.02C89.92,115.00 87.00,114.76 87.00,113.56C87.00,111.36 110.51,60.84 111.57,60.76C112.79,60.66 117.42,69.89 141.00,119.50C157.80,154.84 168.18,175.02 170.07,176.04C171.55,176.83 182.24,177.03 206.33,176.73C236.70,176.35 241.28,176.08 247.50,174.30C263.65,169.68 274.65,163.38 285.52,152.52C308.46,129.60 312.95,94.09 296.75,63.68C288.51,48.21 271.03,33.92 251.63,26.78C237.39,21.54 232.24,21.07 188.72,21.03C154.68,21.01 148.86,21.21 148.38,22.47C148.07,23.27 150.33,29.35 153.41,35.97C156.48,42.60 159.00,48.43 159.00,48.94C159.00,49.44 159.71,50.56 160.57,51.43C161.94,52.79 166.46,53.00 194.93,53.00C212.97,53.00 229.94,53.42 232.65,53.93C256.22,58.40 271.37,75.07 272.74,98.06C273.85,116.57 265.09,132.82 249.89,140.42C239.94,145.40 235.13,146.08 212.17,145.77L191.87,145.50 L190.45,143.00C189.67,141.62 176.23,114.00 160.58,81.62C144.93,49.23 131.71,22.31 131.19,21.79C130.66,21.26 123.32,21.00 114.21,21.18C98.21,21.50 98.15,21.51 93.88,24.51C88.50,28.30 89.29,26.77 53.29,103.00C46.41,117.58 36.33,138.83 30.89,150.23C25.45,161.62 21.00,171.77 21.00,172.78C21.00,176.56 22.87,177.00 38.77,177.00C48.02,177.00 54.95,176.56 56.19,175.90Z M389.23,160.54C398.22,158.63 403.87,156.02 409.03,151.36C414.70,146.25 416.95,141.10 416.98,133.15C417.01,125.35 415.25,121.41 409.33,115.95C403.99,111.03 397.77,108.15 382.40,103.49C368.40,99.25 365.20,97.66 363.93,94.32C361.35,87.52 366.52,84.49 380.50,84.61C388.53,84.67 392.14,85.23 398.84,87.42C403.43,88.92 407.29,90.00 407.41,89.82C409.30,87.08 414.08,73.70 413.40,73.06C411.12,70.91 396.86,66.86 388.07,65.86C366.01,63.35 346.50,69.97 340.27,82.05C337.16,88.10 336.56,92.55 337.94,99.21C340.22,110.22 348.16,116.04 369.66,122.49C384.78,127.03 386.35,127.67 388.98,130.48C392.18,133.88 391.38,137.89 387.00,140.45C384.03,142.19 381.83,142.49 372.50,142.46C361.48,142.42 355.01,141.06 344.84,136.64L341.18,135.05 L337.55,143.71C333.42,153.57 333.04,152.63 342.96,156.76C354.85,161.71 375.69,163.41 389.23,160.54Z M499.92,158.68C510.88,154.84 510.93,154.75 506.99,144.98C503.34,135.93 503.79,136.13 495.00,139.63C491.75,140.93 487.72,141.44 480.50,141.46C471.65,141.50 469.99,141.21 466.05,139.00C463.60,137.62 460.14,134.60 458.37,132.27C450.70,122.20 451.66,103.72 460.34,94.11C466.18,87.66 480.36,85.42 493.00,88.95C497.12,90.10 501.15,91.15 501.95,91.27C502.89,91.42 504.57,88.85 506.70,84.00C509.98,76.51 509.98,76.50 507.95,74.81C506.83,73.88 503.35,72.13 500.21,70.93C492.14,67.84 472.24,67.07 463.00,69.48C437.11,76.26 423.13,96.71 426.75,122.52C429.41,141.51 441.54,154.72 461.19,160.04C471.87,162.93 489.58,162.31 499.92,158.68Z M566.50,160.64C573.35,158.82 577.83,156.42 582.19,152.24L585.89,148.70 L586.42,151.10C586.71,152.42 587.07,154.85 587.23,156.50L587.50,159.50 L598.82,159.78L610.15,160.07 L609.79,127.78C609.50,101.08 609.16,94.76 607.82,91.20C604.10,81.33 597.23,74.81 586.17,70.67C578.31,67.72 555.17,67.57 544.00,70.40C536.40,72.32 526.00,76.41 526.00,77.47C526.00,77.97 532.88,92.08 533.44,92.74C533.55,92.87 538.11,91.80 543.57,90.36C556.75,86.88 571.79,86.50 576.90,89.50C581.78,92.38 584.05,95.91 584.29,101.04L584.50,105.50 L568.00,106.16C546.28,107.02 537.14,109.55 528.60,117.05C523.39,121.62 521.00,127.38 521.00,135.36C521.00,143.37 523.02,147.98 528.84,153.24C533.45,157.40 535.96,158.87 541.50,160.61C546.82,162.28 560.28,162.30 566.50,160.64Z M653.01,132.00C653.55,102.68 653.83,100.93 658.81,95.66C663.07,91.16 666.80,89.71 674.09,89.71C682.38,89.71 687.73,92.43 691.13,98.37C693.43,102.38 693.51,103.31 694.00,131.00L694.50,159.50 L707.00,159.50L719.50,159.50 L719.22,130.00C718.95,100.92 718.26,93.57 715.24,87.50C712.32,81.62 707.07,76.32 700.83,72.93C694.66,69.59 694.20,69.50 683.00,69.50C672.34,69.50 671.07,69.71 665.61,72.39C662.36,73.99 658.01,76.99 655.93,79.07L652.15,82.85 L651.50,78.67C650.21,70.38 651.11,70.90 638.71,71.22L627.57,71.50 L627.28,114.50C627.13,138.15 627.22,158.08 627.48,158.78C627.84,159.75 630.97,159.99 640.23,159.78L652.50,159.50 L653.01,132.00Z M560.50,144.50C559.95,144.32 557.87,143.89 555.87,143.56C550.27,142.63 547.00,139.01 547.00,133.73C547.00,130.27 547.56,128.85 549.75,126.81C553.87,122.96 558.81,121.84 572.29,121.66L584.50,121.50 L584.85,123.96C585.81,130.78 579.85,139.82 572.70,142.37C568.17,143.99 562.12,145.05 560.50,144.50Z"/>
+          <g stroke-linecap="round">
+            <line x1="22" y1="190" x2="718" y2="190" stroke="#1AA0AE" stroke-width="4"/>
+            <path d="M568 181 L586 190 L568 199 Z" fill="#1AA0AE"/>
+            <circle cx="22" cy="190" r="6" fill="#1AA0AE"/>
+            <circle cx="370" cy="190" r="6" fill="#1AA0AE"/>
+            <circle cx="718" cy="190" r="12" fill="none" stroke="#1AA0AE" stroke-width="3"/>
+            <circle cx="718" cy="190" r="6" fill="#1AA0AE"/>
+          </g>
+        </svg>
+
+        <div class="handle"><span class="star">★</span>github.com/ADScanPro/adscan</div>
+      </div>
+
+      <div class="eyebrow">Open-source · Active Directory security</div>
+
+      <h1>Pentest Active Directory<br>from Linux — <span class="accent">one CLI.</span></h1>
+
+      <p class="sub">Authenticated and unauthenticated attack paths, from first foothold to
+        Domain Admin — <b>no Windows box, no agents on targets.</b></p>
+
+      <div class="chips">
+        <div class="chip"><span class="n">104</span> AD attack techniques</div>
+        <div class="chip"><span class="dot"></span>No Windows required</div>
+        <div class="chip"><span class="dot"></span>Free &amp; open community CLI</div>
+      </div>
+
+      <div class="path">
+        <svg width="1096" height="76" viewBox="0 0 1096 76" xmlns="http://www.w3.org/2000/svg" aria-label="attack path from foothold to Domain Admin">
+          <defs>
+            <marker id="arrow" markerWidth="11" markerHeight="11" refX="4" refY="5" orient="auto">
+              <path d="M0 0 L9 5 L0 10 Z" fill="#1AA0AE"/>
+            </marker>
+          </defs>
+          <!-- baseline segments with arrowheads -->
+          <g stroke="#1AA0AE" stroke-width="3" fill="none" stroke-linecap="round">
+            <line x1="30"  y1="46" x2="248" y2="46" marker-end="url(#arrow)"/>
+            <line x1="278" y1="46" x2="500" y2="46" marker-end="url(#arrow)"/>
+            <line x1="530" y1="46" x2="738" y2="46" marker-end="url(#arrow)"/>
+            <line x1="768" y1="46" x2="1000" y2="46" marker-end="url(#arrow)"/>
+          </g>
+          <!-- node cores -->
+          <g>
+            <circle cx="30"   cy="46" r="7" fill="#3CC5D3"/>
+            <circle cx="264"  cy="46" r="7" fill="#1AA0AE"/>
+            <circle cx="516"  cy="46" r="7" fill="#1AA0AE"/>
+            <circle cx="754"  cy="46" r="7" fill="#1AA0AE"/>
+            <!-- terminal: Domain Admin target ring -->
+            <circle cx="1030" cy="46" r="15" fill="none" stroke="#3CC5D3" stroke-width="3"/>
+            <circle cx="1030" cy="46" r="7"  fill="#3CC5D3"/>
+          </g>
+          <!-- labels -->
+          <g font-family="'DejaVu Sans Mono',monospace" font-size="16.5" font-weight="700" text-anchor="middle">
+            <text x="24"   y="24" fill="#9FB6BA" text-anchor="start">foothold</text>
+            <text x="264"  y="24" fill="#CFE1E4">Kerberoast</text>
+            <text x="516"  y="24" fill="#CFE1E4">ADCS ESC</text>
+            <text x="754"  y="24" fill="#CFE1E4">DCSync</text>
+            <text x="1030" y="24" fill="#3CC5D3">Domain Admin</text>
+          </g>
+        </svg>
+        <div class="pathcap">Kerberoasting <span class="sep">·</span> AS-REP <span class="sep">·</span> ADCS/ESC <span class="sep">·</span> DCSync <span class="sep">·</span> coercion <span class="sep">·</span> BloodHound-style attack-path mapping</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

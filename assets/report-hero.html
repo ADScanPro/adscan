@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    /* ADscan brand */
+    --teal-deep: #0E6E78;
+    --teal: #1AA0AE;
+    --teal-bright: #3CC5D3;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: transparent; }
+
+  /* The exported region */
+  #stage {
+    width: 1600px;
+    height: 1000px;
+    position: relative;
+    overflow: hidden;
+    border-radius: 26px;
+    /* Subtle brand-teal wash — light enough to read as an intentional card
+       on both GitHub light and dark themes. */
+    background:
+      radial-gradient(120% 90% at 50% -10%, rgba(60,197,211,0.16) 0%, rgba(26,160,174,0.05) 34%, rgba(255,255,255,0) 60%),
+      linear-gradient(155deg, #f4fbfc 0%, #eef7f8 46%, #ffffff 100%);
+    border: 1px solid rgba(14,110,120,0.12);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  /* faint teal glow anchoring the centre page */
+  #stage::before {
+    content: "";
+    position: absolute;
+    left: 50%; top: 54%;
+    width: 760px; height: 760px;
+    transform: translate(-50%, -50%);
+    background: radial-gradient(circle, rgba(14,110,120,0.18) 0%, rgba(14,110,120,0.0) 65%);
+    filter: blur(8px);
+    z-index: 0;
+  }
+
+  .page {
+    position: absolute;
+    width: 596px;               /* A4 ratio 0.7066 -> h 843 */
+    height: 843px;
+    top: 78px;
+    left: 502px;
+    border-radius: 7px;
+    background: #fff;
+    overflow: hidden;
+    border: 1px solid rgba(20,40,45,0.10);
+  }
+  .page img { display: block; width: 100%; height: 100%; object-fit: cover; }
+
+  /* left: exposure page (the differentiator) */
+  .p-left {
+    transform: translate(-352px, 60px) rotate(-8.5deg);
+    z-index: 1;
+    box-shadow: -26px 34px 60px -18px rgba(11,46,52,0.42);
+  }
+  /* right: DORA compliance page */
+  .p-right {
+    transform: translate(352px, 60px) rotate(8.5deg);
+    z-index: 2;
+    box-shadow: 26px 34px 60px -18px rgba(11,46,52,0.42);
+  }
+  /* centre front: cover */
+  .p-cover {
+    transform: translate(0, -6px) rotate(-1.4deg);
+    z-index: 3;
+    box-shadow: 0 40px 70px -22px rgba(11,46,52,0.5);
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <div class="page p-left"><img src="report-pages/exposure-02.png"></div>
+    <div class="page p-right"><img src="report-pages/dora-93.png"></div>
+    <div class="page p-cover"><img src="report-pages/cover-01.png"></div>
+  </div>
+</body>
+</html>

@@ -117,7 +117,7 @@ ADscan covers 104 Active Directory attack techniques across the kill chain:
 - Algorithmic attack graph generation
 - Auto-exploitation chains (unauthenticated to Domain Admin)
 - ADCS ESC1-16 auto-exploitation
-- MITRE-mapped Word/PDF reports
+- MITRE-mapped PDF reports
 - Multi-domain trust spidering
 - Advanced privilege escalation chains
 - Priority enterprise support
@@ -171,12 +171,17 @@ More walkthroughs:
 
 ## Want the Full Client Report?
 
-ADscan LITE gives you enumeration, attack paths, and findings in the terminal. **ADscan PRO** generates four PDF deliverables in 90 seconds:
+<a href="https://adscanpro.com/pro?utm_source=github&utm_medium=readme&utm_campaign=report_hero">
+  <img src="assets/report-hero.png" alt="ADscan PRO client report: cover, AD exposure score with severity breakdown, and per-framework compliance mapping, generated as an audit-ready PDF" width="880">
+</a>
 
-- **Executive Assessment Report** — risk narrative, attack chains, posture score for the CISO and board
-- **MITRE Remediation Checklist** — ATT&CK-mapped action items filtered to your actual findings
-- **AD Hardening Playbook** — 30-day remediation roadmap with effort and ownership
-- **Coverage Matrix** — MITRE x ENS Alto / NIS2 / ISO 27001, audit-ready
+The PRO deliverable is an audit-ready PDF an executive and a sysadmin can both act on: a posture score, attack-path analysis, and per-framework compliance mapping. The pages above come from a sample engagement against a lab domain.
+
+ADscan LITE gives you enumeration, attack paths, and findings in the terminal. **ADscan PRO** turns them into three client-ready PDFs in 90 seconds:
+
+- **Security Assessment Report:** the risk narrative, attack chains, and posture score a CISO and board can act on
+- **AD Hardening Playbook:** a 30-day remediation roadmap with effort and ownership per item
+- **AD Control Coverage Report:** your findings mapped to ENS Alto, NIS2, and ISO 27001 for the auditor
 
 Beta access is free for security consultants. [adscanpro.com/pro](https://adscanpro.com/pro?utm_source=github&utm_medium=readme&utm_campaign=pro_cta)
 
